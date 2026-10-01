@@ -14217,6 +14217,36 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             if (!dop) return nullptr;
             return decCmp(scrut, dop, rp->op);
         }
+        // fix #5220 / §19.3 / §4.6 (spec v0.313 line 511, v0.313 line 502):
+        // a relational pattern over a `string` scrutinee is a §4.6 ordinal
+        // lexicographic compare (§19.3 "the relational pattern compares
+        // under the ordering of the scrutinee's type"), NOT a pointer
+        // ICmp on the two `bz_string*` handles — that would compare heap
+        // addresses (allocation order) and silently return the wrong arm
+        // (the original #5173 silent-wrong-code shape, e.g. `"z" > "a"`
+        // exits 0 instead of 1). Use the same `emitStringOrdCmp`
+        // intrinsic that the binary `<`/`<=`/`>`/`>=` path in
+        // `lowerBinary` already uses (#4487 fix, stdlib §9.6 / spec §4.6)
+        // — it routes through `bz_str_compare_cp(a, b, ignoreCase=0)`,
+        // returning -1/0/+1, which we reduce to the requested comparison.
+        // The scrutinee is non-nullable here: nullable `string?` is
+        // REJECTED at sema by `checkOrderingPatternsOverNullableScrutinee`
+        // (the #5173 predicate), and the narrowed form is admitted by the
+        // same predicate and routes through `nullablePrimValue` → payload
+        // `string` → this arm. `lowerExpr(*rp->expr)` lowers the bound
+        // expression; for a string literal that produces the global
+        // `bz_string*` ptr the literal materializes into (CG27a).
+        if (isStr) {
+            llvm::Value* rv = rp->expr ? lowerExpr(*rp->expr) : nullptr;
+            if (!rv) return nullptr;
+            llvm::Value* cmp = emitStringOrdCmp(scrut, rv);
+            llvm::Value* zero = llvm::ConstantInt::get(i32(), 0);
+            if (rp->op == "<")  return builder_.CreateICmpSLT(cmp, zero);
+            if (rp->op == ">")  return builder_.CreateICmpSGT(cmp, zero);
+            if (rp->op == "<=") return builder_.CreateICmpSLE(cmp, zero);
+            if (rp->op == ">=") return builder_.CreateICmpSGE(cmp, zero);
+            return nullptr;
+        }
         llvm::Value* rv =
             rp->expr ? litAtWidth(*rp->expr, scrut->getType()) : nullptr;  // #836
         if (!rv && rp->expr) rv = reconcile(lowerExpr(*rp->expr), scrut->getType());
@@ -14264,33 +14294,67 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // a sema exprType does not default to double.
             bool dec = scrut->getType() == decimalStructType();
             // §19.3: range patterns — use FP comparisons for float scrutinees.
+            // fix #5220 / §19.3 / §4.6 (spec v0.313 line 511, v0.313 line 502):
+            // for a `string` scrutinee the bound comparison is the §4.6
+            // ordinal lexicographic compare (`bz_str_compare_cp`, the same
+            // intrinsic the binary `<`/`<=`/`>`/`>=` path in `lowerBinary`
+            // uses — #4487 fix, stdlib §9.6 / spec §4.6), NOT a pointer ICmp
+            // on the `bz_string*` handles. `lowerExpr` lowers a string
+            // literal bound to the global `bz_string*` ptr the literal
+            // materializes into (CG27a).
             llvm::Value* geL = builder_.getInt1(true);
             if (range->lo) {
-                llvm::Value* lo = dec ? decOperand(*range->lo)
-                                      : litAtWidth(*range->lo, scrut->getType());  // #836
+                llvm::Value* lo = nullptr;
+                if (dec) {
+                    lo = decOperand(*range->lo);
+                } else if (isStr) {
+                    lo = lowerExpr(*range->lo);
+                } else {
+                    lo = litAtWidth(*range->lo, scrut->getType());  // #836
+                }
                 if (!lo && !dec) lo = reconcile(lowerExpr(*range->lo), scrut->getType());
                 if (!lo) return nullptr;
-                geL = dec ? decCmp(scrut, lo, ">=")
-                          : fp ? builder_.CreateFCmpOGE(scrut, lo)
-                               : (scrutUnsigned ? builder_.CreateICmpUGE(scrut, lo)
-                                                : builder_.CreateICmpSGE(scrut, lo));
+                if (isStr) {
+                    llvm::Value* cmp = emitStringOrdCmp(scrut, lo);
+                    llvm::Value* zero = llvm::ConstantInt::get(i32(), 0);
+                    geL = builder_.CreateICmpSGE(cmp, zero);
+                } else {
+                    geL = dec ? decCmp(scrut, lo, ">=")
+                              : fp ? builder_.CreateFCmpOGE(scrut, lo)
+                                   : (scrutUnsigned ? builder_.CreateICmpUGE(scrut, lo)
+                                                    : builder_.CreateICmpSGE(scrut, lo));
+                }
             }
             llvm::Value* leH = builder_.getInt1(true);
             if (range->hi) {
-                llvm::Value* hi = dec ? decOperand(*range->hi)
-                                      : litAtWidth(*range->hi, scrut->getType());  // #836
+                llvm::Value* hi = nullptr;
+                if (dec) {
+                    hi = decOperand(*range->hi);
+                } else if (isStr) {
+                    hi = lowerExpr(*range->hi);
+                } else {
+                    hi = litAtWidth(*range->hi, scrut->getType());  // #836
+                }
                 if (!hi && !dec) hi = reconcile(lowerExpr(*range->hi), scrut->getType());
                 if (!hi) return nullptr;
-                leH = dec
-                    ? decCmp(scrut, hi, range->inclusive ? "<=" : "<")
-                    : fp
-                    ? (range->inclusive ? builder_.CreateFCmpOLE(scrut, hi)
-                                        : builder_.CreateFCmpOLT(scrut, hi))
-                    : (range->inclusive
-                           ? (scrutUnsigned ? builder_.CreateICmpULE(scrut, hi)
-                                            : builder_.CreateICmpSLE(scrut, hi))
-                           : (scrutUnsigned ? builder_.CreateICmpULT(scrut, hi)
-                                            : builder_.CreateICmpSLT(scrut, hi)));
+                if (isStr) {
+                    llvm::Value* cmp = emitStringOrdCmp(scrut, hi);
+                    llvm::Value* zero = llvm::ConstantInt::get(i32(), 0);
+                    leH = range->inclusive
+                        ? builder_.CreateICmpSLE(cmp, zero)
+                        : builder_.CreateICmpSLT(cmp, zero);
+                } else {
+                    leH = dec
+                        ? decCmp(scrut, hi, range->inclusive ? "<=" : "<")
+                        : fp
+                        ? (range->inclusive ? builder_.CreateFCmpOLE(scrut, hi)
+                                            : builder_.CreateFCmpOLT(scrut, hi))
+                        : (range->inclusive
+                               ? (scrutUnsigned ? builder_.CreateICmpULE(scrut, hi)
+                                                : builder_.CreateICmpSLE(scrut, hi))
+                               : (scrutUnsigned ? builder_.CreateICmpULT(scrut, hi)
+                                                : builder_.CreateICmpSLT(scrut, hi)));
+                }
             }
             return builder_.CreateAnd(geL, leH);
         }
