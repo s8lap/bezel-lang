@@ -182,3 +182,44 @@ end Program;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "5\n");
 }
+
+// Change-2 pin: a property read passed straight into an `owned` parameter.
+// §28.3 producers table, "Property access `obj.P` (instance getter) |
+// Borrowed (source: `obj`)", and A4 (v0.313): accessor read faces are
+// lend-only, so the read is a borrow and §28.8 rejects it at an `owned` sink.
+BEZEL_TEST(set_owned_accessor_borrow_sink_5236, property_read_into_owned_param_rejected) {
+    expectOwnedSinkReject5236(std::string(kPre5236) + kProp5236 + R"BZL(
+public class Program
+  public static method Take(owned x: Item) end Take;
+  public static method Feed(b: B) Take(b.Val); end Feed;
+  public static method Main(): int return 0; end Main;
+end Program;
+)BZL");
+}
+
+// Accept control for the same pin: a value-typed (int) property read is a
+// copy, not a borrowable reference, so passing it on still compiles and runs
+// (§28.3 producers table, A4, v0.313: the rule concerns borrowable types;
+// `owned` is not admissible on a primitive parameter, §28.1, so a plain one).
+BEZEL_TEST(set_owned_accessor_borrow_sink_5236, value_typed_property_read_into_param_accepted) {
+    auto r = runAot(R"BZL(
+module M;
+public class B
+  public n: int := 7;
+  public property Val: int
+    get => n;
+  end Val;
+end B;
+public class Program
+  public static method Take(x: int): int return x + 1; end Take;
+  public static method Main(): int
+    using var b := new B();
+    Console.WriteLine(Take(b.Val).ToString());
+    return 0;
+  end Main;
+end Program;
+)BZL");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "8\n");
+}
