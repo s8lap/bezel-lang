@@ -13084,6 +13084,22 @@ bool MethodOwnership::indexerSetterTakesOwned(const ast::Expr& target) {
     return false;
 }
 
+// fix #5236 (§23.3 "Explicit setter parameter modifier", §28.3 K3.1, §28.8,
+// v0.313): the PROPERTY twin of indexerSetterTakesOwned. `b.Val := x` /
+// `this.Val := x` / bare `Val := x` where `Val`'s setter is `set(owned)` is a
+// store into an owned sink (K3.1 "including through a `set(owned)`
+// accessor"), so a borrow RHS must be rejected exactly as for an `owned`
+// parameter. Resolved through the PropertySymbol's `setterTakesOwned` (set on
+// both the local and imported side), so interface / virtual / imported
+// accessors take the same rule.
+bool MethodOwnership::propertySetterTakesOwned(const ast::Expr& target) {
+    if (!dynamic_cast<const ast::MemberAccessExpr*>(&target) &&
+        !dynamic_cast<const ast::IdentifierExpr*>(&target))
+        return false;
+    const auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
+    return ps && ps->setterTakesOwned;
+}
+
 // §22.3 "ref and out argument locations" (v0.184, #1682). See the header for
 // the full contract.
 void MethodOwnership::checkRefOutOwnedOperand(const ast::CallArgument& a) {
@@ -14187,6 +14203,11 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
             if (sema::Symbol* msym = ctx_.exprSymbol(*ma)) {
                 if (dynamic_cast<sema::FieldSymbol*>(msym))
                     return isBorrowableType(ctx_.exprType(*e));
+                // fix #5236 (A4, §28.8, v0.313): "Accessor read faces are
+                // lend-only ... every accessor read classifies as a borrow" —
+                // a property read `obj.P` is a borrow, never an owned producer.
+                if (dynamic_cast<sema::PropertySymbol*>(msym))
+                    return isBorrowableType(ctx_.exprType(*e));
             }
         }
     }
@@ -14304,6 +14325,11 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // unwrapped to the bare `ex` above is no more an owned value than the bare
     // binding — the runtime, not this scope, owns it.) // per §31.1, §28.8
     if (isCatchBorrow(sym)) return true;
+    // fix #5236 (A4, §28.8, v0.313): a bare identifier resolving to a property
+    // (implicit-`this` accessor read) is a borrow — accessor read faces are
+    // lend-only. The type gate excludes value-typed properties.
+    if (!unwrappedMove && dynamic_cast<sema::PropertySymbol*>(sym))
+        return isBorrowableType(ctx_.exprType(*id));
     // A bare identifier resolving to a non-`owned` parameter is a borrowed
     // parameter (source: the caller's frame, §28.3 producers "Parameter `p`
     // (no modifier) | Borrowed (source: caller)") — handing it to an `owned`

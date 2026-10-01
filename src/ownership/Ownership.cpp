@@ -7827,7 +7827,8 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // owned slot would be disposed by the slot (and by its real owner): a
     // double-dispose. Run after recordMovesIn so a `move`d-owned RHS has
     // already transferred and is correctly NOT seen as a borrow.
-    if (indexerSetterTakesOwned(*as.target)) {
+    if (indexerSetterTakesOwned(*as.target) ||
+        propertySetterTakesOwned(*as.target)) {
         // §28.11 (#395/#1167): the owning-collection indexer setter TAKES
         // ownership of the RHS exactly like `Add` — so a bare owned LOCAL must
         // be CONSUMED (marked moved-from), or it is disposed TWICE: once by the

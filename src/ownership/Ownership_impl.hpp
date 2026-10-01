@@ -4696,6 +4696,12 @@ private:
     // owned by definition. // per §28.11
     bool indexerSetterTakesOwned(const ast::Expr& target);
 
+    // fix #5236 (§23.3, §28.3 K3.1, §28.8, v0.313): true when `target` is a
+    // property store (`b.Val` / `this.Val` / bare `Val`) whose setter is
+    // declared `set(owned)` — an owned sink, so a borrow RHS is rejected and a
+    // bare owned-local RHS is consumed. Property twin of the above.
+    bool propertySetterTakesOwned(const ast::Expr& target);
+
     // §22.3 "ref and out argument locations" (v0.184, #1682): the DATAFLOW
     // half of the ref/out operand-category rule — no location of OWNED
     // state may be passed by `ref`/`out`, because a ref/out write is an
