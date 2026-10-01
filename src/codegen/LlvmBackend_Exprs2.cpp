@@ -8293,11 +8293,22 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     const sema::ConstructorSymbol* importedGenericExplicitCs = nullptr;
     if (importedGeneric && !importedGenericNoBody &&
         t->kind == ast::TypeDeclKind::Class) {
-        for (sema::Symbol* m : t->members) {
-            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-            if (cs && !cs->isStatic && cs->decl != nullptr) {
-                importedGenericExplicitCs = cs;
-                break;
+        // fix #5213 (§22.5 / §22.6, v0.313; §2.5): the constructor this `new`
+        // runs is the §22.6 winner sema selected (`ctorForArgs` adopts
+        // `SemaContext::resolvedNewCtor`), not the first declared constructor
+        // that carries a body — with several constructors the first-declared
+        // pick bound the wrong parameter list, failed to build the arguments,
+        // and ran no constructor body at all, silently.
+        if (auto* pick = ctorForArgs(t, ne.args);
+            pick && !pick->isStatic && pick->decl != nullptr)
+            importedGenericExplicitCs = pick;
+        if (!importedGenericExplicitCs) {
+            for (sema::Symbol* m : t->members) {
+                auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+                if (cs && !cs->isStatic && cs->decl != nullptr) {
+                    importedGenericExplicitCs = cs;
+                    break;
+                }
             }
         }
     }
@@ -8871,6 +8882,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // or args size mismatched) — release the pinned receiver/index
                 // values so their refcount isn't stranded.
                 emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+                // fix #5213 (§22.5 / §22.6, v0.313): never leave this silent.
+                // Sema accepted the call, so a constructor whose arguments
+                // cannot be built here would otherwise produce an instance
+                // whose constructor body never ran, with no diagnostic.
+                if (!diverged_ && !ctx_.diagnostics().hasErrors())
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne.span.begin,
+                        "internal: cannot lower this `new` of an imported "
+                        "generic class — its constructor arguments could not "
+                        "be bound to the selected constructor, so the "
+                        "constructor body would not run (§22.5, §22.6, "
+                        "#5213)");
             }
         }
         emitNewPendingCheck(obj);

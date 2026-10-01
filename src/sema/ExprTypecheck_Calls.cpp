@@ -18723,9 +18723,9 @@ void ExprTC::checkImportedNewExprArgs(
         // call-site modifier or discard stays deferred, as on the local arm.
         for (const auto& a : ne.args)
             if (!a.modifier.empty() || a.isDiscard) return;
-        std::vector<const ConstructorSymbol*> cands;
+        std::vector<ConstructorSymbol*> cands;
         std::vector<BindResult> binds;
-        for (const ConstructorSymbol* c : ctors) {
+        for (ConstructorSymbol* c : ctors) {
             BindResult b = bindArgsToParams(sema::FormalsView::of(*c), ne.args,
                                             ne.span.begin, std::string(),
                                             /*emit=*/false);
@@ -18806,9 +18806,25 @@ void ExprTC::checkImportedNewExprArgs(
         }
         // resolveOverload reports the ambiguous / unreachable diagnostic
         // itself; Undecidable (unresolved types) defers, as before.
-        (void)resolveOverload(paramTypes, argTypes, fillsDefault, candNames,
-                              ne.span.begin, newDesc, std::string(),
-                              argExprs);
+        //
+        // fix #5213 (§22.5 / §22.6, v0.313; §2.5): the §22.6 winner is
+        // PUBLISHED for codegen (`ctx_.setResolvedNewCtor`, the imported twin
+        // of the local arm's #4853 publication), so the imported `new` lowers
+        // the constructor sema chose instead of re-selecting through
+        // `ctorForArgs`'s proxy (which missed generic-parameter and named-arg
+        // shapes and silently ran no constructor body).
+        OverloadResult impRes = resolveOverload(
+            paramTypes, argTypes, fillsDefault, candNames, ne.span.begin,
+            newDesc, std::string(), argExprs);
+        if (impRes.outcome == OverloadOutcome::Resolved &&
+            impRes.winnerIndex < cands.size()) {
+            ctx_.setResolvedNewCtor(&ne.args, cands[impRes.winnerIndex]);
+            // The winner's §22.5 binding (formal -> call-argument index) rides
+            // the same side table the single-constructor arm writes, so the
+            // named-argument lowering reorders to declaration order.
+            ctx_.setNewExprPositionalBinding(
+                &ne, binds[impRes.winnerIndex].paramToArg);
+        }
         return;
     }
     ConstructorSymbol* cs = ctors[0];
