@@ -23,6 +23,17 @@ systemd-run):
   * `dev_heavy.sh probe|suite <build>`: builds belong in `build`
   * setting BEZEL_JOBSERVER to anything but on, MAKEFLAGS/MFLAGS/
     GNUMAKEFLAGS, BEZEL_BUILD_TOKEN_*, or passing --jobserver-auth
+It also denies kills that pick processes by name or pattern, because several
+sessions and ~20 lanes share this machine and such a kill takes everyone's
+processes (2026-10-01: a lane's `pkill` by name killed other lanes' test runs):
+  * `pkill` / `killall` matched by name, or by a pattern that is not a path
+    inside one lane's own directory (e.g. `/mnt/fast/worktrees/<wt>/`)
+  * `kill $(pgrep ...)`, `kill `pidof ...``, `pgrep ... | xargs kill`, and
+    `kill $p` where `p` came from `pgrep`/`pidof`/`ps` in the same command
+  * `kill -1` / `kill -- -1` (every process the user owns)
+`kill <PID>`, `kill -0 <PID>`, `kill %job`, `kill $!`, `pkill -P <ppid>`,
+`pkill -F <pidfile>` and a path-scoped `pkill -f /mnt/fast/worktrees/<wt>/` stay
+allowed.
 Agent / SendMessage prompts and Write/Edit of a *brief* file are linted for the
 same commands written as instructions. A line that says "never ..." is left
 alone.
@@ -81,12 +92,54 @@ WRAPPERS = {
 # After options, these take positional words before the command.
 WRAPPER_POSITIONALS = {"timeout": 1, "taskset": 1, "chrt": 1, "flock": 1}
 
+# Kills. Name-matching killers, the commands that list PIDs by name, and the
+# pkill options that select by PID (which are scoped and so allowed).
+NAME_KILLERS = {"killall", "skill", "slay"}
+PID_FINDERS = {"pgrep", "pidof", "ps", "lsof", "fuser", "pstree"}
+PKILL_VALUE_OPTS = set("dgGPstuUFOrq")  # short options that take a value
+PKILL_LONG_VALUE_OPTS = {"--delimiter", "--pgroup", "--group", "--parent", "--session",
+                         "--terminal", "--euid", "--uid", "--pidfile", "--older",
+                         "--runstates", "--queue", "--signal", "--ns", "--nslist",
+                         "--cgroup", "--env"}
+PKILL_PID_SCOPES = {"-P", "--parent", "-F", "--pidfile", "-s", "--session", "-g", "--pgroup"}
+# Directories under a --root that hold state every lane shares: a pattern
+# inside them is not one lane's own.
+PS_PID_SCOPES = {"-p", "--pid", "-q", "--quick-pid", "--ppid"}
+SHARED_DIRS = {"aot-harness", "aot-bincache", "ccache", "build", "wt-jobserver",
+               "jobserver", "tmp"}
+KILL_REFUSAL = ("build_guard: refused, this kill selects processes by name or pattern. Several "
+                "Claude sessions and ~20 lanes share this machine, so it would also kill other "
+                "lanes' builds and test runs (2026-10-01 incident).")
+KILL_INSTEAD = ("list the candidates first (`pgrep -af <pattern>`), keep only PIDs that "
+                "belong to your own lane, then `kill <PID>` (then `kill -9 <PID>` after 2 s); "
+                "or match your own lane's path: "
+                "pkill -f \"$(readlink -f /mnt/fast/worktrees/<your-wt>/build)/\"")
+
 
 def _base(word: str) -> str:
     return os.path.basename(word.rstrip("/"))
 
 
 # ---------------------------------------------------------------- tokenizer --
+
+def _substitutions(word: str) -> list[str]:
+    """The bodies of the $( ) and `...` substitutions inside one word."""
+    out: list[str] = []
+    i, n = 0, len(word)
+    while i < n:
+        if word.startswith("$(", i) and not word.startswith("$((", i):
+            k = _match_close(word, i + 1)
+            out.append(word[i + 2:k])
+            i = k + 1
+        elif word[i] == "`":
+            k = word.find("`", i + 1)
+            k = n if k < 0 else k
+            out.append(word[i + 1:k])
+            i = k + 1
+        else:
+            i += 1
+    return out
+
 
 def _match_close(s: str, i: int) -> int:
     """s[i] == '(' -> index of the matching ')' (quote-aware), or len(s)."""
@@ -215,6 +268,7 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
                     k = s.find("`", j + 1)
                     k = n if k < 0 else k
                     nested.append(s[j + 1:k])
+                    buf.append(s[j:k + 1])
                     j = k + 1
                     continue
                 buf.append(s[j])
@@ -232,6 +286,7 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
             k = s.find("`", i + 1)
             k = n if k < 0 else k
             nested.append(s[i + 1:k])
+            add(s[i:k + 1])  # keep it in the word, like $( ): `kill `pgrep x``
             i = k + 1
             continue
         if c in "<>":
@@ -277,15 +332,24 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
 # ----------------------------------------------------------------- analysis --
 
 class Guard:
-    def __init__(self, cwd: str):
+    def __init__(self, cwd: str, roots: list[str] | None = None):
         self.cwd = cwd
         self.vcwd = cwd
+        self.roots = roots or []
         self.reasons: list[str] = []
+        self.kill_reasons: list[str] = []
+        self.pid_vars: set[str] = set()  # shell variables holding pgrep/pidof output
+        self.unscoped_finder = False  # this script runs a by-name pgrep/pidof/ps
 
     def deny(self, why: str, instead: str | None = None):
         msg = why if not instead else f"{why}\n  Run instead: {instead}"
         if msg not in self.reasons:
             self.reasons.append(msg)
+
+    def deny_kill(self, why: str):
+        msg = f"{why}\n  Run instead: {KILL_INSTEAD}"
+        if msg not in self.kill_reasons:
+            self.kill_reasons.append(msg)
 
     # -- entry --------------------------------------------------------------
     def check_script(self, text: str, depth: int = 0):
@@ -293,8 +357,12 @@ class Guard:
             return
         text, shell_bodies = _split_heredocs(text)
         cmds, nested = tokenize(text)
-        for words in cmds:
+        outer = self.unscoped_finder
+        for k, words in enumerate(cmds):
+            # Only a listing that runs before an `xargs kill` can feed it.
+            self.unscoped_finder = outer or self.finds_by_name(cmds[:k])
             self.check_words(words, depth)
+        self.unscoped_finder = outer
         for sub in nested + shell_bodies:
             self.check_script(sub, depth + 1)
 
@@ -302,11 +370,20 @@ class Guard:
     def check_words(self, words: list[str], depth: int):
         for w in words:
             self.check_tamper(w)
+            m = ASSIGN.match(w)
+            if m and self.lists_pids(m.group(2)):
+                self.pid_vars.add(m.group(1))
+        if len(words) >= 4 and words[0] == "for" and words[2] == "in" and \
+                any(self.lists_pids(w) for w in words[3:]):
+            self.pid_vars.add(words[1])
         c = self.command_index(words, 0)
         if c is None:
             return
         name = _base(words[c])
         args = words[c + 1:]
+        if name in ("kill", "pkill") or name in NAME_KILLERS:
+            self.check_kill(name, args, via_xargs=any(_base(w) == "xargs" for w in words[:c]))
+            return
         if name in ("cd", "pushd") and c == 0:
             self.change_dir(args)
             return
@@ -395,6 +472,197 @@ class Guard:
         path = os.path.expandvars(os.path.expanduser(path))
         return os.path.normpath(os.path.join(base, path))
 
+    # -- kills -----------------------------------------------------------------
+    def lists_pids(self, word: str, depth: int = 0) -> bool:
+        """`word` holds a $( ) or `` ` `` substitution that lists PIDs by name
+        (pgrep/pidof/ps not scoped to one lane's path)."""
+        if depth > MAX_DEPTH:
+            return False
+        for inner in _substitutions(word):
+            text, _ = _split_heredocs(inner)
+            cmds, nested = tokenize(text)
+            if self.finds_by_name(cmds):
+                return True
+            if any(self.lists_pids(f"$({n})", depth + 1) for n in nested):
+                return True
+        return False
+
+    def finds_by_name(self, cmds: list[list[str]]) -> bool:
+        """Some command in `cmds` lists PIDs by name. A finder is scoped when it is
+        `pgrep` with a -P/-F/-s/-g scope or a lane-path pattern, or a `ps` whose
+        output a `grep` on a lane path filters."""
+        finders, lane_grep = [], False
+        for ws in cmds:
+            c = self.command_index(ws, 0)
+            if c is None:
+                continue
+            name, args = _base(ws[c]), ws[c + 1:]
+            if name in ("grep", "egrep") and self.lane_scoped_path(self.grep_pattern(args) or ""):
+                lane_grep = True
+            elif name in PID_FINDERS:
+                finders.append((name, args))
+        for name, args in finders:
+            if name == "pgrep":
+                pattern, pid_scoped = self.pkill_pattern(args)
+                if pid_scoped or (pattern is not None and self.lane_scoped_path(pattern)):
+                    continue
+            elif name == "ps" and (lane_grep or any(
+                    a in PS_PID_SCOPES or re.match(r"^-[pq]\d", a) or a.split("=")[0] in PS_PID_SCOPES
+                    for a in args)):
+                continue  # filtered to one lane, or `ps -p <PIDs>`
+            return True
+        return False
+
+    @staticmethod
+    def grep_pattern(args: list[str]) -> str | None:
+        for k, a in enumerate(args):
+            if a in ("-e", "--regexp") and k + 1 < len(args):
+                return args[k + 1]
+            if a.startswith("--regexp="):
+                return a.split("=", 1)[1]
+            if not a.startswith("-"):
+                return a
+        return None
+
+    def check_kill(self, name: str, args: list[str], via_xargs: bool):
+        if name in NAME_KILLERS:
+            self.deny_kill(f"`{name}` kills every process with that name on the machine, "
+                           "including other lanes' and other sessions'.")
+            return
+        if name == "pkill":
+            self.check_pkill(args)
+            return
+        # kill [-s SIG | -n NUM | -SIG] [--] target...
+        targets: list[str] = []
+        signal = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                targets.extend(args[i + 1:])
+                break
+            if a in ("-l", "-L", "--list", "--table"):
+                return
+            if a in ("-s", "-n", "--signal"):
+                signal = args[i + 1] if i + 1 < len(args) else ""
+                i += 2
+                continue
+            if a.startswith("-") and signal is None and not targets:
+                signal = a[1:]  # -9, -TERM, -0
+                i += 1
+                continue
+            targets.append(a)
+            i += 1
+        if signal == "0":
+            return  # `kill -0` only probes whether the PID is alive
+        if via_xargs:
+            if self.unscoped_finder:
+                self.deny_kill("`xargs kill` kills whatever PIDs the pipe produced; fed from "
+                               "pgrep/ps/grep that is a by-name kill across every lane.")
+            return
+        for t in targets:
+            if t == "-1":
+                self.deny_kill("`kill -1` signals every process you own, in every session.")
+            elif self.lists_pids(t):
+                self.deny_kill(f"`kill {t}` kills every process the PID listing matches by "
+                               "name, including other lanes' and other sessions'.")
+            else:
+                m = re.match(r'^"?\$\{?([A-Za-z_][A-Za-z0-9_]*)', t)
+                if m and m.group(1) in self.pid_vars:
+                    self.deny_kill(f"`kill {t}`: `${m.group(1)}` holds a by-name PID listing "
+                                   "(pgrep/pidof/ps), which matches other lanes' processes.")
+
+    def check_pkill(self, args: list[str]):
+        pattern, pid_scoped = self.pkill_pattern(args)
+        if pid_scoped:
+            return
+        if pattern is None:
+            self.deny_kill("`pkill` with no pattern and no -P/-F/-s/-g PID scope matches "
+                           "processes machine-wide.")
+            return
+        if not self.lane_scoped_path(pattern):
+            self.deny_kill(f"`pkill ... {pattern}` matches by name or pattern across every "
+                           "lane and session on this machine. Only a path inside one lane's own "
+                           "directory (ending in `/`) is scoped.")
+
+    @staticmethod
+    def pkill_pattern(args: list[str]) -> tuple[str | None, bool]:
+        """(pattern, scoped by -P/-F/-s/-g) from pkill/pgrep arguments."""
+        pattern = None
+        pid_scoped = False
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                if i + 1 < len(args) and pattern is None:
+                    pattern = args[i + 1]
+                break
+            if a.startswith("--"):
+                opt = a.split("=", 1)[0]
+                if opt in PKILL_PID_SCOPES:
+                    pid_scoped = True
+                i += 2 if (opt in PKILL_LONG_VALUE_OPTS and "=" not in a) else 1
+                continue
+            if a.startswith("-") and len(a) > 1:
+                body = a[1:]
+                if body.isdigit() or (body.isupper() and len(body) > 1):
+                    i += 1  # a signal: -9, -KILL
+                    continue
+                step = 1
+                for k, ch in enumerate(body):
+                    if ch in PKILL_VALUE_OPTS:
+                        if f"-{ch}" in PKILL_PID_SCOPES:
+                            pid_scoped = True
+                        if k == len(body) - 1:
+                            step = 2  # the value is the next word
+                        break
+                i += step
+                continue
+            if pattern is None:
+                pattern = a
+            i += 1
+        return pattern, pid_scoped
+
+    def lane_scoped_path(self, pattern: str) -> bool:
+        """The pattern requires a path inside one lane's own directory: under a
+        --root, not in a shared dir, and the lane-level component is closed by
+        `/`, so `.../a24-wt-5188` cannot also match `.../a24-wt-5188-rv`. Plain
+        text may precede the path (`codegen_half.sh /mnt/fast/worktrees/x/`);
+        alternation and optional groups would let the pattern match without
+        the path, so they are refused."""
+        if "|" in pattern:
+            return False
+        p = pattern.lstrip("^")
+        m = re.match(r"^\$\((?:readlink\s+-f|realpath)\s+([^)]+)\)(.*)$", p)
+        if m:
+            inner = self.resolve(m.group(1).strip().strip("'\""), self.vcwd)
+            p = os.path.realpath(inner) + m.group(2)
+        p = re.sub(r"^(\$PWD|\$\{PWD\}|\$\(pwd(?:\s+-P)?\))", lambda _: self.vcwd, p)
+        for r in self.roots:
+            for root in {r.rstrip("/"), os.path.realpath(r).rstrip("/")}:
+                at = p.find(root + "/")
+                # Only plain text before the path: no quantifier, group or class
+                # that could make the path optional.
+                if at < 0 or re.search(r"[*+?\[\](){}\\$]", p[:at]):
+                    continue
+                rel = p[at + len(root) + 1:]
+                parts = rel.split("/")
+                if parts[0] == ".claude":  # <repo>/.claude/worktrees/<wt>/
+                    parts = parts[1:]
+                # `worktrees/<wt>/...`: at least two components, the second closed by
+                # a `/` that no quantifier makes optional.
+                if len(parts) >= 3 and parts[0] and parts[1] and parts[0] not in SHARED_DIRS \
+                        and not re.search(r"[.*+?\[\]()|{}^$\\]", parts[0] + parts[1]) \
+                        and not re.match(r"[*?{]", parts[2]):
+                    return True
+        # A relative `worktrees/<wt>/` or `lane-builds/<wt-hash>/` names one lane too.
+        for m in re.finditer(r"(?:^|(?<=[/\s]))(?:worktrees|lane-builds)/([^/]+)/(.?)", p):
+            if not re.search(r"[*+?\[\](){}\\$]", p[:m.start()]) \
+                    and not re.search(r"[.*+?\[\]()|{}^$\\]", m.group(1)) \
+                    and m.group(2) not in ("*", "?", "{"):
+                return True
+        return False
+
     # -- dev_heavy.sh --------------------------------------------------------
     def check_dev_heavy(self, args: list[str], depth: int):
         if not args:
@@ -422,7 +690,7 @@ class Guard:
                       "(or scripts/agent_check.sh --area <group> --build-only)")
 
     def contains_build(self, words: list[str], depth: int) -> bool:
-        probe = Guard(self.cwd)
+        probe = Guard(self.cwd, self.roots)
         probe.vcwd = self.vcwd
         probe.check_words(words, depth + 1)
         return bool(probe.reasons)
@@ -590,28 +858,49 @@ class Guard:
 # ------------------------------------------------------------- prose / briefs --
 
 NEGATION = re.compile(r"\b(never|don'?t|do not|not|no|forbidden|prohibited|avoid|instead|"
-                      r"bypass(es|ed)?|wrong|incident|withdrawn|unlimited|unbounded)\b|❌|✗",
+                      r"bypass(es|ed)?|wrong|incident|withdrawn|unlimited|unbounded|against)\b|❌|✗",
                       re.I)
+# Command-shaped mentions only: `pkill <arg>` in backticks, at a line start or with an
+# option; not prose like "a pkill-by-name" or "name-scoped pkill is machine-wide".
+PROSE_PKILL = re.compile(r"(?<![\w/.-])(pkill|killall)\s+((?:-[\w=-]+\s+)*)['\"]?[\w/^.$]")
+PROSE_LINE_START = re.compile(r"^\s*(?:[-*>]|\d+[.)])?\s*(?:\$\s*)?$")
 PROSE_RULES = [
-    (re.compile(r"\bcmake\s+--build\b"), "`cmake --build` outside `scripts/dev_heavy.sh build`"),
-    (re.compile(r"(?<![\w/.-])(g?make|ninja(-build)?)\s+(\S+\s+)*?-j"), "a `make`/`ninja` with `-j`"),
-    (re.compile(r"\bBEZEL_JOBSERVER=(?!on\b)\S"), "`BEZEL_JOBSERVER=off`"),
-    (re.compile(r"\b(MAKEFLAGS|MFLAGS)="), "a hand-set MAKEFLAGS"),
+    (re.compile(r"\bcmake\s+--build\b"), "`cmake --build` outside `scripts/dev_heavy.sh build`",
+     "build"),
+    (re.compile(r"(?<![\w/.-])(g?make|ninja(-build)?)\s+(\S+\s+)*?-j"), "a `make`/`ninja` with `-j`",
+     "build"),
+    (re.compile(r"\bBEZEL_JOBSERVER=(?!on\b)\S"), "`BEZEL_JOBSERVER=off`", "build"),
+    (re.compile(r"\b(MAKEFLAGS|MFLAGS)="), "a hand-set MAKEFLAGS", "build"),
+    (PROSE_PKILL, "a by-name `pkill`/`killall`", "kill"),
+    (re.compile(r"\bxargs\s+(-\S+\s+)*kill\b"), "`xargs kill`", "kill"),
+    (re.compile(r"\bkill\s+(-\S+\s+)*['\"]?(\$\(|`)\s*(pgrep|pidof)\b"), "`kill $(pgrep ...)`",
+     "kill"),
 ]
+# A pkill line that is scoped by PID or by a lane's own path is not a by-name kill.
+PROSE_KILL_SCOPED = re.compile(r"readlink -f|realpath|/worktrees/[^/\s]+/|/lane-builds/[^/\s]+/|"
+                               r"\s-(P|F|s|g)\s|--parent|--pidfile")
 
 
-def lint_prose(text: str) -> list[str]:
-    bad: list[str] = []
+def lint_prose(text: str) -> list[tuple[str, str]]:
+    """(kind, finding) for each line that instructs a forbidden build or kill."""
+    bad: list[tuple[str, str]] = []
     for line in text.splitlines():
         if NEGATION.search(line):
             continue
-        for rx, what in PROSE_RULES:
+        for rx, what, kind in PROSE_RULES:
             m = rx.search(line)
             if not m:
                 continue
-            if "dev_heavy.sh build" in line[:m.start()] or "agent_check.sh" in line[:m.start()]:
+            if kind == "build" and ("dev_heavy.sh build" in line[:m.start()] or
+                                    "agent_check.sh" in line[:m.start()]):
                 continue
-            bad.append(f"{what}: {line.strip()[:160]}")
+            if kind == "kill" and PROSE_KILL_SCOPED.search(line[m.start():]):
+                continue
+            if rx is PROSE_PKILL and not (line[:m.start()].count("`") % 2 or
+                                          PROSE_LINE_START.match(line[:m.start()]) or
+                                          m.group(2)):
+                continue  # an English mention ("a pkill is machine-wide"), not a command
+            bad.append((kind, f"{what}: {line.strip()[:160]}"))
             break
     return bad
 
@@ -643,15 +932,18 @@ def decide(event: dict, roots: list[str]) -> str | None:
         cmd = ti.get("command") or ""
         if not in_scope and not any(r in cmd for r in roots):
             return None
-        g = Guard(cwd)
+        g = Guard(cwd, roots)
         g.check_script(cmd)
-        if not g.reasons:
-            return None
-        return ("build_guard: refused, this build would bypass the machine-wide build "
-                "jobserver.\n- " + "\n- ".join(g.reasons) +
-                "\nWhy: scripts/build_token.sh header (2026-09-30 OOM). "
-                "Builds go through scripts/agent_check.sh or `scripts/dev_heavy.sh build "
-                "<cmake|make|ninja> ...` with the build tool right after `build`.")
+        parts = []
+        if g.reasons:
+            parts.append("build_guard: refused, this build would bypass the machine-wide build "
+                         "jobserver.\n- " + "\n- ".join(g.reasons) +
+                         "\nWhy: scripts/build_token.sh header (2026-09-30 OOM). "
+                         "Builds go through scripts/agent_check.sh or `scripts/dev_heavy.sh "
+                         "build <cmake|make|ninja> ...` with the build tool right after `build`.")
+        if g.kill_reasons:
+            parts.append(KILL_REFUSAL + "\n- " + "\n- ".join(g.kill_reasons))
+        return "\n\n".join(parts) or None
     if not in_scope:
         return None
     if tool in ("Agent", "Task", "SendMessage"):
@@ -666,6 +958,12 @@ def decide(event: dict, roots: list[str]) -> str | None:
     bad = lint_prose(text)
     if not bad:
         return None
+    kills = [b for kind, b in bad if kind == "kill"]
+    bad = [b for kind, b in bad if kind == "build"]
+    if not bad:
+        return (KILL_REFUSAL + " This text tells an agent to run such a kill.\n- " +
+                "\n- ".join(kills) + "\nWrite the step as: " + KILL_INSTEAD +
+                ". A line that forbids it (\"never ...\") is fine as it is.")
     return ("build_guard: refused, this text tells an agent to build outside the "
             "machine-wide jobserver (the 2026-09-30 OOM started from exactly such a brief "
             "step).\n- " + "\n- ".join(bad) +

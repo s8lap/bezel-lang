@@ -285,6 +285,156 @@ class BriefLintTest(HookTestBase):
                                                         "content": f"{INCIDENT}\n"}}))
 
 
+class KillTest(HookTestBase):
+    """2026-10-01: a lane killed a stray run with a by-name kill and took other
+    lanes' test processes with it. By-name/pattern kills are denied; kills by
+    PID, by parent/pidfile/session, or by one lane's own path are allowed."""
+
+    def agent(self, prompt):
+        return self.decision({"tool_name": "Agent", "cwd": self.repo,
+                              "tool_input": {"prompt": prompt, "description": "x"}})
+
+    def test_by_name_kills_denied(self):
+        wt = f"{self.plain}/worktrees/wt1"
+        for cmd in ("pkill clang",
+                    "pkill -f bezel_tests",
+                    "pkill -9 -f cc1plus",
+                    "pkill -KILL -f 'build/tests/bezel_tests_codegen'",
+                    "pkill -u stepan",
+                    "pkill -f /usr/bin/clang",
+                    f"pkill -f {self.plain}/",            # the whole root
+                    f"pkill -f {self.plain}/worktrees/",  # every lane
+                    f"pkill -f {wt}",                     # also matches wt1-rv
+                    f"pkill -f {self.plain}/aot-harness/bezel_",  # shared dir
+                    f"pkill -f '{self.plain}/worktrees/wt.*/'",  # regex in the lane level
+                    f"pkill -f 'clang|{wt}/'",            # alternation drops the path
+                    f"pkill -f '(x)?{wt}/'",              # group before the path
+                    f"pkill -f '{wt}/?'",                 # closing `/` made optional
+                    f"pkill -f 'a24-wt-5173-rv.*bezel_tests_codegen'",  # not a path
+                    "pkill -f 'agent_check.sh.*sema'",
+                    "pkill -9 -f 'cmake --build.*bezel_tests'",
+                    "pgrep -f 'a24-wt-5191/build' | xargs -r kill",  # relative, not a lane path
+                    "pgrep -f 'worktrees/wt.*/' | xargs kill",       # regex in the lane level
+                    "pkill -f 'worktrees/r20-coord'",                 # lane level not closed
+                    "left=$(ps -eo pid= ); kill $left",
+                    f"pgrep -f '{wt}' | xargs kill",      # lane level not closed
+                    f"ps aux | grep bezel_tests_codegen | grep {wt}/ ; pgrep make | xargs kill",
+                    "kill -9 $(pgrep -f bezel_tests_codegen) 2>/dev/null; kill -0 $(pgrep x)",
+                    "killall clang++",
+                    "killall -9 make",
+                    "kill $(pgrep clang)",
+                    "kill -9 $(pgrep -f bezel_tests)",
+                    "kill `pidof cc1plus`",
+                    "kill -TERM \"$(ps -eo pid,cmd | grep cmake | awk '{print $1}')\"",
+                    "pgrep -f cmake | xargs kill",
+                    "pgrep cc1plus | xargs -r kill -9",
+                    "ps aux | grep clang | awk '{print $2}' | xargs kill",
+                    "for p in $(pgrep clang); do kill $p; done",
+                    "pids=$(pgrep -f bezel); kill -9 $pids",
+                    "P=`pgrep make`; kill \"${P}\"",
+                    "kill -9 -1",
+                    "kill -- -1",
+                    "bash -c 'pkill clang'",
+                    "nohup pkill -f x > /dev/null 2>&1 &",
+                    "timeout 5 killall make",
+                    "sudo pkill cmake",
+                    f"cd {self.repo} && pkill -f bezel_tests_sema"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd, needle="selects processes by name or pattern")
+
+    def test_scoped_kills_allowed(self):
+        wt = f"{self.plain}/worktrees/wt1"
+        for cmd in ("kill 12345",
+                    "kill -9 12345 12346",
+                    "kill -TERM 123",
+                    "kill -s KILL 123",
+                    "kill -0 2586497",
+                    "kill -0 $PID 2>/dev/null && echo alive",
+                    # liveness probes send no signal
+                    "while kill -0 $(pgrep -f 'agent_check.sh --area sema' | head -1) 2>/dev/null; "
+                    "do sleep 20; done",
+                    "P=$(ps -eo pid,args | awk '/codegen_half.sh/ {print $1; exit}'); "
+                    "kill -0 $P && echo running",
+                    "kill -s 0 $(pidof make)",
+                    # PIDs listed by a lane-scoped finder
+                    f"P=$(pgrep -f '^{wt}/build/tests/bezel_tests_codegen'); [ -n \"$P\" ] && kill $P",
+                    f"pgrep -f '{wt}/build/tests/bezel_tests_codegen' | xargs kill 2>/dev/null",
+                    f"ps aux | grep '{wt}/build/' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9",
+                    f"kill -9 $(pgrep -f {wt}/build/)",
+                    f"for p in $(pgrep -P 1234); do kill $p; done",
+                    "cat /var/tmp/bezel-scratch/r25/x.pids | xargs kill",
+                    # a by-name listing after the kill cannot feed it
+                    f"pgrep -f '{wt}/build/tests/x' | xargs kill; sleep 2; ps aux | grep x | wc -l",
+                    # `ps -p <PIDs>` lists only the PIDs it was given
+                    "left=$(ps -o pid= -p 2243003,2243001); [ -n \"$left\" ] && kill -9 $left",
+                    "kill -TERM -- -$(ps -o pgid= -p 974410 | tr -d ' ')",
+                    # a relative `worktrees/<wt>/` names one lane
+                    "pgrep -f 'worktrees/r20-coord/build' | xargs -r kill -TERM",
+                    "pkill -f lane-builds/r20-l1-e031b0e1/",
+                    f"pkill -f 'codegen_half.sh {wt}/'",  # plain text before the lane path
+                    "kill %1",
+                    "kill $!",
+                    "kill \"$pid\"",
+                    "kill $(cat /var/tmp/bezel-scratch/r25/x.pid)",
+                    "kill -l",
+                    "pgrep -af clang",
+                    "ps -eo pid,cmd | grep cmake",
+                    "pkill -P 12345",
+                    "pkill -TERM -P 12345",
+                    "pkill --parent=12345",
+                    "pkill -F /var/tmp/bezel-scratch/r25/run.pid",
+                    "pkill -s 4321",
+                    f"pkill -f {wt}/",
+                    f"pkill -f '{wt}/.*cmake'",
+                    f"pkill -9 -f {wt}/build/tests/bezel_tests_codegen",
+                    f"pkill -f \"$(readlink -f {wt}/build)/\"",
+                    f"pkill -f {self.repo}/.claude/worktrees/x/build/",
+                    "echo 'pkill clang'",
+                    'git commit -m "never pkill by name"',
+                    "grep -rn 'pkill' scripts",
+                    "# pkill clang\ntrue"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertAllowed("pkill -f \"$PWD/\"", cwd=f"{wt}/sub")
+
+    def test_kill_denial_says_what_to_run_instead(self):
+        reason = self.assertDenied("pkill clang")
+        self.assertIn("Run instead:", reason)
+        self.assertIn("kill <PID>", reason)
+        self.assertNotIn("jobserver", reason)  # not the build message
+
+    def test_build_and_kill_in_one_command_report_both(self):
+        reason = self.assertDenied(f"pkill clang; {INCIDENT}")
+        self.assertIn("jobserver", reason)
+        self.assertIn("selects processes by name or pattern", reason)
+
+    def test_brief_with_by_name_kill_denied(self):
+        for text in ("Clean up with `pkill -f bezel_tests` first.",
+                     "2. Kill the codegen build you started: `pkill -f 'cmake.*--build.*lane-57-5201'`.",
+                     "If a run hangs: pgrep cmake | xargs kill",
+                     "Step 4: kill $(pgrep clang)",
+                     "killall cc1plus if the build stalls"):
+            with self.subTest(text=text):
+                reason = self.agent(text)
+                self.assertIsNotNone(reason)
+                self.assertIn("selects processes by name or pattern", reason)
+
+    def test_brief_that_forbids_or_scopes_is_allowed(self):
+        for text in ("Name-scoped pkill is machine-wide; PID-scoped kill preferred.",
+                     "Never use pkill/killall by name; kill by PID.",
+                     "Name-scoped kills (`pkill clang`) are FORBIDDEN.",
+                     "Kill your own build: pkill -f \"$(readlink -f /mnt/fast/worktrees/x/build)/\"",
+                     "Stop it with `pkill -P 1234`.",
+                     "Wait with `kill -0 PID` in a loop.",
+                     # narrative, not an instruction (replayed from real peer messages)
+                     "My apologies for the kill of pid 3853030 — my `pgrep -f 'x.*y'` regex matched.",
+                     "Explicit warning against pkill-by-name. Lane will report the kill.",
+                     "Pattern `while pgrep -f X; do sleep N` hangs; kill the loop by PID.",
+                     "The reviewer killed the stray with a name-scoped pkill."):
+            with self.subTest(text=text):
+                self.assertIsNone(self.agent(text))
+
+
 class PlumbingTest(HookTestBase):
     def test_malformed_input_exits_zero_silently(self):
         for raw in ("", "not json", "[]", '{"tool_name": "Bash", "tool_input": null}'):
