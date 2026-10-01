@@ -50,6 +50,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 namespace {
 
@@ -81,9 +82,8 @@ namespace fs = std::filesystem;
 int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1747_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_1747");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe = (dir / stem).string();
     std::string runErr = (dir / (stem + ".run.err")).string();

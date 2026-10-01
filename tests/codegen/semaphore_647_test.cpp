@@ -53,6 +53,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 namespace fs = std::filesystem;
 using bezel::test::runAot;
@@ -82,9 +83,8 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_647sem_lsan_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_647sem_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 
@@ -141,9 +141,8 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
 
 // Compile + run AOT (for async tests via Driver).
 static int compileAndRunAsync(const std::string& source) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_647sem_async_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_647sem_async");
     std::string srcPath = (dir / (stem + ".bzl")).string();
     std::string exe     = (dir / stem).string();
     {

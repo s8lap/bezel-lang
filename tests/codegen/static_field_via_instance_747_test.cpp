@@ -18,15 +18,15 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 namespace {
 namespace fs = std::filesystem;
 
 // True when `source` FAILS to compile (a diagnostic is raised — NOT a crash).
 bool compileFails(const std::string& source) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_747sfi_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_747sfi");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << source; }

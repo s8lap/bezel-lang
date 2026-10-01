@@ -48,6 +48,7 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 namespace {
 
@@ -56,9 +57,8 @@ namespace fs = std::filesystem;
 // Compile `source` to a temp native AOT binary (no sanitizer) and run it.
 // Returns exit code, or -1 on compile/link/run failure.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_704_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_704");
     std::string src  = (dir / (stem + ".bzl")).string();
     std::string exe  = (dir / stem).string();
     {
@@ -86,9 +86,8 @@ std::string runUnderTSanCaptureOutput(const std::string& source,
     if (exitCode) *exitCode = -1;
     if (std::system("clang++ --version > /dev/null 2>&1") != 0) return "";
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem    = "bezel_704_tsan_" + std::to_string(counter++);
+    std::string stem    = unique_stem("bezel_704_tsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string rtObj   = (dir / (stem + "_rt.o")).string();
     std::string exe     = (dir / stem).string();

@@ -44,6 +44,7 @@
 #include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 using bezel::test::runAot;
 using bezel::test::JitResult;
@@ -69,9 +70,8 @@ int run(const std::string& program) {
 // move_result_owned_724_test.cpp's compileAndRun helper.
 namespace fs = std::filesystem;
 int compileAndRun(const std::string& program) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1594_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_1594");
     std::string src = (dir / (stem + ".bz")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << program; }

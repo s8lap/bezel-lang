@@ -42,6 +42,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 using bezel::test::runAot;
 
@@ -61,9 +62,8 @@ bool compileFails(const std::string& src) {
 // returns the process exit code, or -1 if compilation/link/run failed.
 // per §33.3: Main's return value is the process exit code.
 int compileAndRun668(const std::string& source) {
-    static int counter = 0;
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_668_aot_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_668_aot");
     std::string src  = (dir / (stem + ".bzl")).string();
     std::string exe  = (dir / stem).string();
     {
@@ -89,9 +89,8 @@ int runUnderLeakSanitizer668(const std::string& source, bool detectLeaks = true)
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_668_lsan_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_668_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 

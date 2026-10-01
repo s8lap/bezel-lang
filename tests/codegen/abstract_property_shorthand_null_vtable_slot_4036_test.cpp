@@ -43,6 +43,7 @@
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 namespace {
 
@@ -64,11 +65,10 @@ std::string bezelcPath() {
 // subprocess is used instead of an in-process Driver call (LLVM's `errs()`
 // raw_fd_ostream capture is unreliable in-process).
 std::string compileAndCaptureIR(const std::string& source) {
-    static int counter = 0;
     std::string bezelc = bezelcPath();
     if (bezelc.empty() || !fs::exists(bezelc)) return "";
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_4036_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_4036");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string obj = (dir / (stem + ".o")).string();
     {

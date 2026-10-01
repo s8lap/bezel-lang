@@ -83,6 +83,7 @@
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
@@ -146,11 +147,10 @@ std::string bezelcPath() {
 // caller treats an empty result as a hard failure, never confused with "0
 // lines of IR" by the size check below.
 std::string compileDiamondAndCaptureIR(const std::string& source) {
-    static int counter = 0;
     std::string bezelc = bezelcPath();
     if (bezelc.empty() || !std::filesystem::exists(bezelc)) return "";
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_4234_ir_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_4234_ir");
     std::string srcPath = (dir / (stem + ".bzl")).string();
     std::string objPath = (dir / (stem + ".o")).string();
     {

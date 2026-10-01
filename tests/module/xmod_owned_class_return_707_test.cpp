@@ -142,8 +142,7 @@ static int xmodLsan707(
 
     namespace fs = std::filesystem;
     auto tmpDir = fs::temp_directory_path();
-    static int ctr = 0;
-    std::string stem = "bz707_lsan_" + std::to_string(ctr++);
+    std::string stem = unique_stem("bz707_lsan");
     std::string bObjPath = (tmpDir / (stem + "_b.o")).string();
     std::string exePath  = (tmpDir / (stem + "_exe")).string();
 

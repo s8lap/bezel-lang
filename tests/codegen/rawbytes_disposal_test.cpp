@@ -57,6 +57,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 namespace {
 
@@ -65,9 +66,8 @@ namespace fs = std::filesystem;
 // Compile `source` to a temp native executable via the real Driver pipeline and
 // run it; returns the exit code, or -1 on compile/link/run failure.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_985rb_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_985rb");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -102,9 +102,8 @@ int runUnderAsanNoCorruption(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_985rb_asan_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_985rb_asan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 
@@ -171,9 +170,8 @@ int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_998rb_lsan_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_998rb_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 

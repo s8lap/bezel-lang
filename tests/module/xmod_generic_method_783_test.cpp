@@ -147,8 +147,7 @@ static int xmodAsan783(const std::string& aObj, const std::string& bSrc,
 
     namespace fs = std::filesystem;
     auto tmpDir = fs::temp_directory_path();
-    static int ctr = 0;
-    std::string stem = "bz783_asan_" + std::to_string(ctr++);
+    std::string stem = unique_stem("bz783_asan");
     std::string bSrcPath = (tmpDir / (stem + "_b.bzl")).string();
     std::string exePath = (tmpDir / (stem + "_exe")).string();
     writeSource783(bSrcPath, bSrc);

@@ -100,7 +100,7 @@ void scrub(const std::string& path) {
 BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
            malformed_const_initializer_does_not_crash_exe_path) {
     auto dir = fs::temp_directory_path();
-    std::string exePath = (dir / "bezel_1622_const_crash_out").string();
+    std::string exePath = (dir / unique_stem("bezel_1622_const_crash_out")).string();
     scrub(exePath);
 
     bezel::CompileResult r = compileToExe(
@@ -124,7 +124,7 @@ BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
 BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
            malformed_const_initializer_paren_variant_does_not_crash) {
     auto dir = fs::temp_directory_path();
-    std::string exePath = (dir / "bezel_1622_const_paren_crash_out").string();
+    std::string exePath = (dir / unique_stem("bezel_1622_const_paren_crash_out")).string();
     scrub(exePath);
 
     bezel::CompileResult r = compileToExe(
@@ -144,7 +144,7 @@ BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
 BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
            malformed_const_initializer_does_not_crash_object_path) {
     auto dir = fs::temp_directory_path();
-    std::string objPath = (dir / "bezel_1622_obj_crash_out.o").string();
+    std::string objPath = (dir / (unique_stem("bezel_1622_obj_crash_out") + ".o")).string();
     scrub(objPath);
 
     bezel::CompileResult r = compileToObj(
@@ -165,7 +165,7 @@ BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
 BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
            valid_program_still_compiles_exe_path) {
     auto dir = fs::temp_directory_path();
-    std::string exePath = (dir / "bezel_1622_valid_exe_out").string();
+    std::string exePath = (dir / unique_stem("bezel_1622_valid_exe_out")).string();
     scrub(exePath);
 
     bezel::CompileResult r = compileToExe(
@@ -182,7 +182,7 @@ BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
 BEZEL_TEST(codegen_driver_no_crash_after_parse_error_1622,
            valid_library_still_compiles_object_path) {
     auto dir = fs::temp_directory_path();
-    std::string objPath = (dir / "bezel_1622_valid_obj_out.o").string();
+    std::string objPath = (dir / (unique_stem("bezel_1622_valid_obj_out") + ".o")).string();
     scrub(objPath);
 
     bezel::CompileResult r = compileToObj(

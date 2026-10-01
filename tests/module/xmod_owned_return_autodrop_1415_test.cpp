@@ -168,8 +168,7 @@ static int xmodLsan1415(const std::string& aObj, const std::string& bSrc,
     if (rt.empty()) return -1;
 
     auto tmpDir = fs::path(wtDir1415());
-    static int ctr = 0;
-    std::string stem = "bz1415_lsan_" + std::to_string(ctr++);
+    std::string stem = unique_stem("bz1415_lsan");
     std::string bObjPath = (tmpDir / (stem + "_b.o")).string();
     std::string exePath  = (tmpDir / (stem + "_exe")).string();
 

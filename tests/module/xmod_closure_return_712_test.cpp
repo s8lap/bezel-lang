@@ -150,8 +150,7 @@ static int xmodLsan712(
 
     namespace fs = std::filesystem;
     auto tmpDir = fs::temp_directory_path();
-    static int ctr = 0;
-    std::string stem = "bz712_lsan_" + std::to_string(ctr++);
+    std::string stem = unique_stem("bz712_lsan");
     std::string bObjPath = (tmpDir / (stem + "_b.o")).string();
     std::string exePath  = (tmpDir / (stem + "_exe")).string();
 
@@ -218,8 +217,7 @@ static int singleModLsan712(const std::string& src, int expectedCode) {
 
     namespace fs = std::filesystem;
     auto tmpDir = fs::temp_directory_path();
-    static int sctr = 0;
-    std::string stem = "bz712_singlemod_" + std::to_string(sctr++);
+    std::string stem = unique_stem("bz712_singlemod");
     std::string objPath = (tmpDir / (stem + "_a.o")).string();
     std::string exePath = (tmpDir / (stem + "_exe")).string();
 

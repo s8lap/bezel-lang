@@ -67,6 +67,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 namespace fs = std::filesystem;
 
@@ -114,9 +115,8 @@ RunResult runUnderAsanCaptured(const std::string& source,
                                int expectedExitCode) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return {-1, 0, ""};
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_rstr2321_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_rstr2321");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe = (dir / stem).string();
     if (lowerToObject(source, objPath) != 0) return {-1, 0, ""};

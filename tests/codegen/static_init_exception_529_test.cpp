@@ -55,6 +55,7 @@
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 using bezel::test::runAot;
 
@@ -76,10 +77,9 @@ int run(const std::string& program) {
 // exit code.  Returns -1 on compile or run failure.  Mirrors the approach
 // in property_exception_test.cpp and cross_module_exception_test.cpp.
 int buildAndRun(const std::string& source, const std::string& tag) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
     std::string stem =
-        "bezel_sinit529_" + tag + "_" + std::to_string(counter++);
+        unique_stem(("bezel_sinit529_" + tag).c_str());
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {

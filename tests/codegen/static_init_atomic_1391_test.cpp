@@ -70,6 +70,7 @@
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 namespace {
 
@@ -101,11 +102,10 @@ std::string bezelcPath() {
 // failure to locate/run bezelc (never mistaken for "no atomic ops emitted" by
 // the assertions below, which require both non-empty AND the markers).
 std::string compileAndCaptureIR(const std::string& source) {
-    static int counter = 0;
     std::string bezelc = bezelcPath();
     if (bezelc.empty() || !fs::exists(bezelc)) return "";
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_staticatomic1391_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_staticatomic1391");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string obj = (dir / (stem + ".o")).string();
     {

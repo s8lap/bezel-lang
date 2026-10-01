@@ -148,8 +148,7 @@ static int xmodLsan694(
 
     namespace fs = std::filesystem;
     auto tmpDir = fs::temp_directory_path();
-    static int ctr = 0;
-    std::string stem = "bz694_lsan_" + std::to_string(ctr++);
+    std::string stem = unique_stem("bz694_lsan");
     std::string bObjPath = (tmpDir / (stem + "_b.o")).string();
     std::string exePath  = (tmpDir / (stem + "_exe")).string();
 
@@ -560,8 +559,7 @@ BEZEL_TEST(xmod_string_refcount_694, s6_imported_string_escaping_no_asan_abort_4
     if (rt.empty()) return;  // toolchain unavailable: skip
 
     auto tmpDir = fs::temp_directory_path();
-    static int ctr6 = 0;
-    std::string stem6 = "bz694_s6_safe_" + std::to_string(ctr6++);
+    std::string stem6 = unique_stem("bz694_s6_safe");
     std::string bObjPath = (tmpDir / (stem6 + "_b.o")).string();
     std::string exePath  = (tmpDir / (stem6 + "_exe")).string();
 

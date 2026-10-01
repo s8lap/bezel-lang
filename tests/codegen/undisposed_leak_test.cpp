@@ -57,6 +57,7 @@
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 using bezel::test::runAot;
 
@@ -126,9 +127,8 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_383_lsan_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_383_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 

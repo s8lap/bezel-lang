@@ -69,7 +69,7 @@ bezel::CompileResult compileToExe(const std::string& source,
 BEZEL_TEST(codegen_driver_ir_fail_exit, ir_fail_returns_failure_status) {
     auto dir = fs::temp_directory_path();
     std::string exePath =
-        (dir / "bezel_506_ir_fail_control_out").string();
+        (dir / unique_stem("bezel_506_ir_fail_control_out")).string();
 
     // Remove any stale output from a prior run.
     std::remove(exePath.c_str());
@@ -101,7 +101,7 @@ BEZEL_TEST(codegen_driver_ir_fail_exit, ir_fail_returns_failure_status) {
 BEZEL_TEST(codegen_driver_ir_fail_exit, clean_program_still_succeeds) {
     auto dir = fs::temp_directory_path();
     std::string exePath =
-        (dir / "bezel_506_clean_out").string();
+        (dir / unique_stem("bezel_506_clean_out")).string();
 
     std::remove(exePath.c_str());
 

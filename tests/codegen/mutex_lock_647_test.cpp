@@ -453,9 +453,8 @@ BEZEL_TEST(codegen_mutex_lock_6_2_v0138, mutex_spawn_arg_compiles_to_valid_ir) {
 // Compile source to a native binary via the Driver and run it; return the
 // exit code or -1 on failure.  Mirrors async_618_domain_serial_test.cpp.
 static int compileAndRunAsync(const std::string& source) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_647_async_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_647_async");
     std::string srcPath = (dir / (stem + ".bzl")).string();
     std::string exe     = (dir / stem).string();
     {

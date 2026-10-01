@@ -65,6 +65,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 using bezel::test::runAot;
 
@@ -83,9 +84,8 @@ int run(const std::string& src) {
 // is the process exit code.  This path runs the LLVM verifier during
 // emitObjectFile, so a ptr/i32 signature mismatch (the #1390 defect) fails here.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1390_aot_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_1390_aot");
     std::string src  = (dir / (stem + ".bzl")).string();
     std::string exe  = (dir / stem).string();
     {

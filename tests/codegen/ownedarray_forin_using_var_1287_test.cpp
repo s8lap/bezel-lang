@@ -51,6 +51,7 @@
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/unique_stem.hpp"
 
 namespace {
 
@@ -119,9 +120,8 @@ int runUnderASan(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1287_asan_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_1287_asan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 

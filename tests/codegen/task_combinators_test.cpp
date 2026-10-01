@@ -32,6 +32,7 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "support/unique_stem.hpp"
 
 namespace {
 
@@ -40,9 +41,8 @@ namespace fs = std::filesystem;
 // Compile `source` to a temp native executable via the real Driver and run it;
 // returns the exit code, or -1 on compile/link/run failure.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_taskcomb_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_taskcomb");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -66,9 +66,8 @@ int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
 
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_taskcomb_san_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_taskcomb_san");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 
@@ -137,9 +136,8 @@ void expectValueLeakFree(const std::string& source, int expectedExitCode) {
 // results are disposed via the RUNTIME bz_dispose_class_obj helper, and no
 // existing WhenAllOwned cell exercises the checked-disposal codegen path.
 int compileAndRunCheckedDisposal(const std::string& source) {
-    static int counter = 0;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_taskcomb_cd_" + std::to_string(counter++);
+    std::string stem = unique_stem("bezel_taskcomb_cd");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
