@@ -45,6 +45,22 @@ static bool fitsInIntType(long long v, PrimitiveType t) {
     }
 }
 
+// §5.2 (v0.313, #5217): does the compile-time integer constant `v` fit the
+// range of a `char` target? `char`'s value set is U+0000–U+10FFFF excluding
+// the surrogate block [0xD800, 0xDFFF] (per the §5.2 "integer-to-`char`
+// code-point range" wording: "`char(0xD800)` is a compile error" — a
+// surrogate is not a valid `char` value, and §17.14 makes that decision at
+// compile time for any compile-time constant). Mirrors fitsInIntType's
+// admission pattern (returns true for types the gate does not apply to; here
+// the gate is `char`-only). Used by the char compound uint/ulong RHS check
+// to gate §5.1's constant narrowing — the #5211 predicate `isLitDerived`
+// was purely syntactic literal-derived and admitted out-of-range literals
+// like `c += 4294967295U;` to silent wrap (the codegen path stored char 99
+// without raising OverflowException).
+static bool charIntConstantFits(long long v) {
+    return v >= 0 && v <= 0x10FFFF && !(v >= 0xD800 && v <= 0xDFFF);
+}
+
 // §5.1 / §19 (#1153): the closed representable range [lo, hi] of an integer
 // scrutinee type that is NARROWER than the i64 constant-fold width, so a
 // `case` constant / range-bound literal that falls outside it can be rejected
@@ -20156,27 +20172,81 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // (#2153: lifted forms like `int? += ulong?` reach this
                     // branch on the underlying primitives and reject
                     // identically.)
-                    // §6.6 (v0.313, #5211): a `char` target's right operand is
-                    // typed as in `int op e` under §6.2 — "a non-constant `uint`
-                    // or `ulong` operand has no §6.2 promotion with `int` and is
-                    // a compile error". `char` widens to `uint`/`ulong` under
-                    // §5.1, so the generic no-conversion test above never sees
-                    // the pair; reject it here (a constant stays admitted under
-                    // §5.1 constant narrowing).
+                    // §6.6 (v0.313, #5211; narrowed by #5217): a `char`
+                    // target's right operand is typed as in `int op e` under
+                    // §6.2 — "a non-constant `uint` or `ulong` operand has no
+                    // §6.2 promotion with `int` and is a compile error".
+                    // `char` widens to `uint`/`ulong` under §5.1, so the
+                    // generic no-conversion test above never sees the pair;
+                    // reject it here. A constant uint/ulong is admitted under
+                    // §5.1's constant narrowing — value-based across
+                    // signedness, in-range only — so the genuine compile-time
+                    // `const K: uint := 5` / `const L: uint := 3` cases (§17.14
+                    // constant expressions, references via `IdentifierExpr` or
+                    // `MemberAccessExpr`) admit (the #5211 predicate
+                    // `isLitDerived` was purely syntactic literal-derived and
+                    // false-rejected them); an out-of-range constant
+                    // (`c += 4294967295U;`, value 4294967295 above `char`'s
+                    // 0x10FFFF) is rejected at the conversion site per §5.1,
+                    // never silently wrapping in codegen (the #5211 path stored
+                    // char 99 without raising OverflowException). The
+                    // §17.14 constant predicate is `isConstInitExpr` —
+                    // literals, unary/binary/conditional over constants,
+                    // `nameof`, parenthesized, and references to a local
+                    // `const`, a class-level `const`, or an enum constant.
+                    // Read once so both sub-checks see the same answer.
                     if (tTy->primitive == P::Char &&
                         (rTy->primitive == P::UInt ||
-                         rTy->primitive == P::ULong) &&
-                        !isLitDerived(as->value.get())) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, as->value->span.begin,
-                            std::string("compound assignment `") +
-                            std::string(as->op) + "` on a `char` target has "
-                            "no `" + spellN(rTy) + "` right operand: the "
-                            "right operand is typed as in `int " + binOp +
-                            " e` (§6.2), and a non-constant `uint` or `ulong` "
-                            "has no §6.2 promotion with `int` — convert "
-                            "explicitly, e.g. `c := char(long(c) " + binOp +
-                            " long(e));` (§6.6, v0.313)");
+                         rTy->primitive == P::ULong)) {
+                        const bool rhsIsConst =
+                            isConstInitExpr(*as->value);
+                        if (!rhsIsConst) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, as->value->span.begin,
+                                std::string("compound assignment `") +
+                                std::string(as->op) +
+                                "` on a `char` target has "
+                                "no `" + spellN(rTy) +
+                                "` right operand: the "
+                                "right operand is typed as in `int " + binOp +
+                                " e` (§6.2), and a non-constant `uint` or "
+                                "`ulong` has no §6.2 promotion with `int` "
+                                "— convert explicitly, e.g. "
+                                "`c := char(long(c) " + binOp +
+                                " long(e));` (§6.6, v0.313)");
+                        } else if (auto cv = foldIntConstExprTC(*as->value)) {
+                            // §5.1 / §5.2: constant narrowing admits an
+                            // in-range compile-time constant across
+                            // signedness; a value outside the target's
+                            // range is a compile error at the conversion
+                            // site, never a silent truncation. `char`'s
+                            // range per §5.2 is [0, 0x10FFFF] excluding
+                            // the surrogate block [0xD800, 0xDFFF] — a
+                            // surrogate is not a valid `char` value
+                            // (`char(0xD800)` is a compile error).
+                            // `foldIntConstExprTC` returns `long long`; a
+                            // uint constant (max 4_294_967_295) always
+                            // fits; a ulong constant > LLONG_MAX folds
+                            // to nullopt, which is conservatively
+                            // admitted here (the existing write-back
+                            // path raises OverflowException at run time
+                            // for an out-of-range non-foldable value,
+                            // matching §5.2's checked-narrowing posture).
+                            if (!charIntConstantFits(*cv)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error,
+                                    as->value->span.begin,
+                                    std::string("compound assignment `") +
+                                    std::string(as->op) +
+                                    "` on a `char` target: the constant `" +
+                                    std::to_string(*cv) +
+                                    "` does not fit `char`'s code-point "
+                                    "range (§5.2: [0, 0x10FFFF] excluding "
+                                    "the surrogate block [0xD800, 0xDFFF]) "
+                                    "— constant narrowing is rejected for an "
+                                    "out-of-range value (§5.1, v0.313)");
+                            }
+                        }
                     } else
                     if (integerWriteBack &&
                         !primitiveWidens(tTy->primitive,
