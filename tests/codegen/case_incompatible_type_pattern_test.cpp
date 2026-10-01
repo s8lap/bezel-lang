@@ -14,12 +14,25 @@
 // (never matches). A primitive type pattern against a different concrete
 // primitive also returns false. Such an arm is dead and falls through to the
 // wildcard. §19.3 / §19.5.
+//
+// UPDATE (#5188, §19.3 v0.311/v0.313, Appendix C.1): a class/interface/`string`/
+// `Object` type pattern over a VALUE-type scrutinee (primitive, record, enum,
+// choice, inline array, unit, or their nullable forms) is now a COMPILE ERROR
+// ("a value-type scrutinee can never match a reference-typed type pattern"),
+// not a dead arm. Two rows below that pinned the old accept-and-fall-through
+// behaviour over an `int` scrutinee are flipped to expect that reject:
+// class_pattern_on_int_never_matches and primitive_pattern_mismatch_no_match.
+// The string-scrutinee row (a reference type) and the Object-scrutinee control
+// are unchanged.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -28,15 +41,19 @@ int run(const std::string& prog) {
 }
 }  // namespace
 
-// class type-test on an int scrutinee (was a bezelc SIGABRT) → never matches.
+// class type-test on an int scrutinee (was a bezelc SIGABRT; §19.3 v0.313 /
+// C.1, #5188: now a compile-time reject).
 BEZEL_TEST(case_incompatible_type_pattern, class_pattern_on_int_never_matches) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; "
         "class Box private _x: int := 0; destructor end destructor; end Box; "
         "class C public static method Main(): int "
         "  var n: int := 5; "
-        "  return (case n of  Box => 1, _ => 0); "  // 0
-        "end Main; end C;"), 0);
+        "  return (case n of  Box => 1, _ => 0); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "value-type scrutinee can never match a reference-typed type pattern"));
 }
 
 // class type-test on a string scrutinee (was a runtime SIGSEGV) → never matches.
@@ -50,14 +67,18 @@ BEZEL_TEST(case_incompatible_type_pattern, class_pattern_on_string_never_matches
         "end Main; end C;"), 0);
 }
 
-// primitive type pattern of a different primitive (was a wrong value) → no match.
+// `string` type pattern over an int scrutinee (was a wrong value; §19.3 v0.313
+// / C.1, #5188: `string` is a reference-typed pattern, so a compile-time reject).
 BEZEL_TEST(case_incompatible_type_pattern, primitive_pattern_mismatch_no_match) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; "
         "class C public static method Main(): int "
         "  var x: int := 42; "
-        "  return (case x of  string => 1, _ => 0); "  // 0
-        "end Main; end C;"), 0);
+        "  return (case x of  string => 1, _ => 0); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "value-type scrutinee can never match a reference-typed type pattern"));
 }
 
 // Control: a VALID class type-test on an Object scrutinee that holds that class

@@ -12132,6 +12132,34 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             if (auto* np =
                     dynamic_cast<const ast::NamedPattern*>(arm.pattern.get()))
                 checkTopLevelNamedPattern(np, scrutTy);
+            // §19.3 (v0.311, #5188): primitive-keyword-led TypePattern
+            // (`case c of string`, `case c of int`, …). Mirror of the
+            // CaseStmt arm in ExprTypecheck.cpp — the parser routes the bare
+            // keyword through a dedicated TypePattern node, separate from
+            // the NamedPattern shape `case c of IShape`. Without this
+            // parallel check, the bare `string` / `Object` form over a
+            // value-shaped scrutinee reaches codegen and tries the same
+            // emitIsA / boxing path the binding-form predicate rejects.
+            if (auto* tp =
+                    dynamic_cast<const ast::TypePattern*>(arm.pattern.get())) {
+                if (scrutTy && tp->type) {
+                    TypeRef* tpTy = ctx_.resolvedType(*tp->type);
+                    std::string_view tpName =
+                        (tp->type->name && !tp->type->name->parts.empty())
+                            ? tp->type->name->parts.back()
+                            : std::string_view{};
+                    if (isValueScrutineeShapeForTypePattern(scrutTy) &&
+                        isReferenceTypePattern(tpTy, tpName)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, tp->span.begin,
+                            "type pattern `" + std::string(tpName) +
+                                "` is incompatible with the scrutinee's "
+                                "static type — a value-type scrutinee can "
+                                "never match a reference-typed type pattern "
+                                "(§19.3 / §19.5)");
+                    }
+                }
+            }
             // §19: a BindingPattern arm introduces a new scope with the
             // bound name visible inside the guard and body (per §19.2).
             auto* bp =
@@ -12147,55 +12175,40 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                           : scrutTy;
                 armScope.names[bp->name] = lsym;
-                // §19.5 (#1203, #1936): a typed binding pattern `var n: T` is a
-                // type-test + binding. If T is a reference type (class,
-                // interface, string, or a BUILT-IN exception) but the scrutinee's
-                // static type is a VALUE type (a primitive — non-nullable, not
-                // string, not Object — or a record/enum), the test can NEVER
-                // match: a value type is never a reference type. Reject it here
-                // rather than miscompiling (an unconditional wrong-value match for
+                // §19.5 (#1203, #1936, #5188): a typed binding pattern
+                // `var n: T` is a type-test + binding. If T is a reference
+                // type (class, interface, string, Object, or a BUILT-IN
+                // exception) but the scrutinee's static type is a VALUE
+                // type (a value primitive — int, bool, …, NOT string/Object
+                // which are the reference primitives — or a record/enum/
+                // choice/inline-array/unit, plus the nullable form of any
+                // of them, §19.3 v0.311), the test can NEVER match: a value
+                // type is never a reference type. Reject it here rather
+                // than miscompiling (an unconditional wrong-value match for
                 // a string-typed binding, or — in codegen's emitIsA over a
-                // non-pointer scrutinee — an ICmpInst assertion / malformed IR).
-                // #1936 broadened #1203 two ways: (a) a BUILT-IN exception pattern
-                // (`var x: IOException`) carries no user TypeSymbol so its bndTy
-                // has a null `declaration` — the declaration-gated class/interface
-                // test below missed it, and the arm reached codegen and emitted
-                // malformed IR; (b) a RECORD or ENUM scrutinee is likewise a
-                // sealed value type (§9/§10) — `case p of var q: C` over a record
-                // `p` hit the same emitIsA crash. per §19.5 (#1203/#1936)
+                // non-pointer scrutinee — an ICmpInst assertion / malformed
+                // IR).
+                // #1936 broadened #1203 two ways: (a) a BUILT-IN exception
+                // pattern (`var x: IOException`) carries no user TypeSymbol
+                // so its bndTy has a null `declaration` — the declaration-
+                // gated class/interface test below missed it, and the arm
+                // reached codegen and emitted malformed IR; (b) a RECORD or
+                // ENUM scrutinee is likewise a sealed value type (§9/§10) —
+                // `case p of var q: C` over a record `p` hit the same
+                // emitIsA crash. #5188 (v0.311) closes the remaining gaps:
+                // (c) the scrutinee-side check now also covers choice,
+                // inline-array, and unit scrutinees, AND the nullable
+                // form of any value-shaped scrutinee (`int?`, `Pt?`, etc.,
+                // the §7.2 nullable value-type) — the runtime test still
+                // cannot match, the boxing requirement still applies, and
+                // codegen's emitIsA still does not have a sound path for
+                // them; (d) `Object` is added to the pattern-side set
+                // (`case c of var s: Object` over a value scrutinee is the
+                // same shape). The bare-form twin at `checkTopLevelNamedPattern`
+                // fires the same rejection on a top-level NamedPattern
+                // `case c of IShape`. per §19.5 (#1203/#1936/#5188)
                 if (bp->type && scrutTy && lsym->declType) {
                     TypeRef* bndTy = lsym->declType;
-                    bool bndIsRefType =
-                        (bndTy->kind == TypeRef::Kind::Primitive &&
-                         bndTy->primitive == PrimitiveType::String) ||
-                        (bndTy->kind == TypeRef::Kind::Named &&
-                         bndTy->declaration &&
-                         (bndTy->declaration->kind ==
-                              ast::TypeDeclKind::Class ||
-                          bndTy->declaration->kind ==
-                              ast::TypeDeclKind::Interface)) ||
-                        // #1936 / §31: a built-in exception (declaration-less
-                        // Named), recognized by name via the shared registry —
-                        // the sema counterpart of codegen isBuiltinExceptionTypeRef.
-                        (bndTy->kind == TypeRef::Kind::Named &&
-                         !bndTy->declaration && bp->type->name &&
-                         !bp->type->name->parts.empty() &&
-                         common::isBuiltinExceptionName(
-                             bp->type->name->parts.back()));
-                    bool scrutIsValuePrim =
-                        scrutTy->kind == TypeRef::Kind::Primitive &&
-                        !scrutTy->nullable &&
-                        scrutTy->primitive != PrimitiveType::String &&
-                        scrutTy->primitive != PrimitiveType::Object;
-                    // #1936 / §9/§10: a record/enum scrutinee is a sealed value
-                    // type — never a reference.
-                    bool scrutIsValueRecEnum =
-                        scrutTy->kind == TypeRef::Kind::Named &&
-                        scrutTy->declaration && !scrutTy->nullable &&
-                        (scrutTy->declaration->kind ==
-                             ast::TypeDeclKind::Record ||
-                         scrutTy->declaration->kind ==
-                             ast::TypeDeclKind::Enum);
                     // fix #5176 (§19.3 v0.310 #5156, §12.7) — the CaseExpr sibling of
                     // ExprTypecheck.cpp's CaseStmt recorder trigger (same
                     // posture, same shared Pass-2 join
@@ -12205,7 +12218,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // T or a class-level T) is decided per instantiation
                     // (§3.6 rule 2). At a value substitution the binding is
                     // rejected at the instantiation site (no box possible).
-                    // Record here; replay at each instantiation site.
+                    // Record here; replay at each instantiation site. Runs
+                    // BEFORE the `scrutIsValueShape` arm so a value-shaped
+                    // scrutinee that happens to resolve to a bare parameter
+                    // (none today, but defensively) does not match the first
+                    // shape instead.
+                    bool bndIsRefType = isReferenceTypePattern(
+                        bndTy, bp->type->name && !bp->type->name->parts.empty()
+                                  ? bp->type->name->parts.back()
+                                  : std::string_view{});
                     if (bndIsRefType && scrutTy->kind == TypeRef::Kind::Named &&
                         !scrutTy->declaration) {
                         std::string_view scrutName = scrutTy->headName();
@@ -12236,7 +12257,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             }
                         }
                     }
-                    if (scrutIsValuePrim) {
+                    // fix #5188 (§19.3 v0.311) — admission reject of ref-type
+                    // binding over any concrete value-shaped scrutinee
+                    // (record/enum/choice/inline-array/unit + nullable forms;
+                    // primitives excluding the §3.2 reference pair
+                    // string/Object). Distinct from the #5176 arm above: that
+                    // one fires at the instantiation site for a BARE
+                    // generic-parameter scrutinee; this one fires at admission
+                    // on a concrete value-shaped scrutinee. Both stay live.
+                    bool scrutIsValueShape =
+                        isValueScrutineeShapeForTypePattern(scrutTy);
+                    if (scrutIsValueShape) {
                         if (bndIsRefType)
                             ctx_.diagnostics().report(
                                 Severity::Error, bp->span.begin,
@@ -12249,13 +12280,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // pattern — inserted as an else-if so a record scrutinee vs a
                     // non-reference (record/enum) pattern still falls through to
                     // the generic-instantiation checks below, unchanged.
-                    else if (scrutIsValueRecEnum && bndIsRefType)
-                        ctx_.diagnostics().report(
-                            Severity::Error, bp->span.begin,
-                            "binding pattern type is incompatible with "
-                            "the scrutinee's static type — a value-type "
-                            "scrutinee can never match a reference-typed "
-                            "binding (§19.5)");
+                    // (Consolidated into the `scrutIsValueShape` arm by #5188 —
+                    // the predicate now covers all value-shaped scrutinees,
+                    // so the per-kind else-if is unnecessary.)
                     // §19.3/§19.5/§5.1/§12.9 (#1913): a typed binding whose
                     // generic INSTANTIATION is incompatible with the scrutinee
                     // (`var x: Ok<string>` at `Result<int>`) — the erased
@@ -13536,6 +13563,116 @@ std::string rangeElementTypeName_inner(const sema::TypeRef* ty) {
     }
     if (ty->kind == sema::TypeRef::Kind::Error) return "<unresolved>";
     return "<unknown>";
+}
+
+// §19.3 (v0.311, #5171 / #5188): value-shaped scrutinee test. Covers every
+// primitive (string and Object are the reference primitives, but the
+// ISSUE BODY of #5188 lists "primitive" as one shape and the predicate's
+// intent — "the runtime test can never discriminate" — applies equally to
+// every primitive: a value is a value; matching it against a class/interface
+// name is impossible without boxing, which pattern position forbids), record,
+// enum, choice, inline-array, and unit, AND the nullable form of any of
+// them. A bare type parameter `T` is excluded: the per-instantiation
+// reading is the predicate's companion (§12.7 / #5176), and the value-vs-
+// reference rejection is not re-applied through a substitution (§19.3, v0.310
+// ruling #5156: "a substitution never re-applies [the rejection]"). A
+// generic-parameter declaration is `nullptr` on a Named TypeRef — same
+// shape codegen keys on for `isTypeParamRef` — and that path is below.
+bool isValueScrutineeShapeForTypePattern(const sema::TypeRef* scrutTy) {
+    if (!scrutTy) return false;
+    if (scrutTy->kind == sema::TypeRef::Kind::Error) return false;
+    // A bare generic-parameter scrutinee (Named with declaration==nullptr)
+    // is decided per instantiation, NOT here — the rejection's §3.6 rule 2
+    // join lands at each instantiation site (#5176 / #5156). Returning
+    // false below is what keeps this predicate sound against a generic
+    // body: the admission counter-rule fires there.
+    if (scrutTy->kind == sema::TypeRef::Kind::Primitive) {
+        // §3.2: `string` and `Object` are the REFERENCE primitives (every
+        // value of them is already a heap-managed reference). The
+        // value-vs-reference rejection's premise — "matching would need an
+        // implicit boxing conversion" — does NOT apply when the scrutinee
+        // is one of them: `case s of var x: string` over `s: string` is
+        // the legitimate same-type-always-matches shape §19.3/§19.5 admit.
+        // Every OTHER primitive (int, bool, byte, char, ...) is value-
+        // shaped: matching it against a reference pattern would need a
+        // box, which pattern position forbids (§8.6).
+        return scrutTy->primitive != sema::PrimitiveType::String &&
+               scrutTy->primitive != sema::PrimitiveType::Object;
+    }
+    if (scrutTy->kind == sema::TypeRef::Kind::Unit) return true;
+    if (scrutTy->kind == sema::TypeRef::Kind::InlineArray) return true;
+    if (scrutTy->kind == sema::TypeRef::Kind::Named) {
+        if (!scrutTy->declaration) return false;  // bare type parameter — out of scope
+        switch (scrutTy->declaration->kind) {
+            case ast::TypeDeclKind::Record:
+            case ast::TypeDeclKind::Enum:
+            case ast::TypeDeclKind::Choice:
+                return true;
+            default:
+                return false;  // Class, Interface — reference-typed scrutinee
+        }
+    }
+    return false;
+}
+
+// §19.3 (v0.311, #5188): reference-typed pattern test — the pattern
+// counterpart of `isValueScrutineeShapeForTypePattern`. Mirrors the
+// `bndIsRefType` half of the #1936 predicate at ExprTypecheck.cpp:~21909,
+// with `Object` added per the issue body of #5188. A bare built-in
+// exception carries no user TypeDecl (its bndTy has a null `declaration`
+// — the same shape codegen's `isBuiltinExceptionTypeRef` keys on), so the
+// registry is consulted when `patTy` is Named-without-declaration and
+// `nameHint` carries the last name part. Pass `""` when `patTy` is a
+// Primitive — the function returns true for string/Object without
+// consulting the registry (they have no nameHint to look up).
+bool isReferenceTypePattern(const sema::TypeRef* patTy,
+                            std::string_view nameHint) {
+    if (!patTy) return false;
+    if (patTy->kind == sema::TypeRef::Kind::Error) return false;
+    if (patTy->kind == sema::TypeRef::Kind::Primitive) {
+        return patTy->primitive == sema::PrimitiveType::String ||
+               patTy->primitive == sema::PrimitiveType::Object;
+    }
+    if (patTy->kind == sema::TypeRef::Kind::Named) {
+        if (patTy->declaration) {
+            switch (patTy->declaration->kind) {
+                case ast::TypeDeclKind::Class:
+                case ast::TypeDeclKind::Interface:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        // Declaration-less Named: a built-in exception pattern. The
+        // sema counterpart of codegen's `isBuiltinExceptionTypeRef` —
+        // consult the shared registry against the LAST name part of the
+        // pattern's qualified name (the same shape `bndIsRefType`'s
+        // built-in branch reads at ExprTypecheck.cpp:~21921).
+        return !nameHint.empty() && common::isBuiltinExceptionName(nameHint);
+    }
+    return false;
+}
+
+bool isReferenceTypePatternName(std::string_view name,
+                                const TypeSymbol* ts) {
+    // (a) Built-in reference primitives. Per §3.2, `string` and `Object` are
+    // the REFERENCE primitives — heap-managed, never matched by a value
+    // scrutinee via a static-type identity test. The bare `case c of Object`
+    // / `case c of string` form over a value-shaped scrutinee is the
+    // §19.3/#5188 reject target alongside Class/Interface/exception.
+    if (name == "string" || name == "Object") return true;
+    // (b) Built-in exception names (`IOException`, `KeyNotFoundException`,
+    // …). A declaration-less Named ref, the same shape the binding-form
+    // `isReferenceTypePattern` resolves via the shared registry.
+    if (common::isBuiltinExceptionName(name)) return true;
+    // (c) User TypeSymbol: a Class or Interface declaration. The symbol
+    // loop at checkTopLevelNamedPattern's entry passes the resolved
+    // TypeSymbol in here; null on a built-in or alias path.
+    if (ts) {
+        return ts->kind == ast::TypeDeclKind::Class ||
+               ts->kind == ast::TypeDeclKind::Interface;
+    }
+    return false;
 }
 
 } // namespace bezel::sema

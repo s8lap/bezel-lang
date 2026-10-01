@@ -133,6 +133,47 @@ bool refOutParamTypeMentionsTypeParam(
 bool isValidRangeElementType(const TypeRef* ty);
 std::string rangeElementTypeName(const TypeRef* ty);
 
+// §19.3 (v0.311, #5171 / #5188): true iff `scrutTy` is a VALUE-shaped
+// scrutinee against which a reference-typed pattern is always a compile
+// error (the value-vs-reference rejection §19.3 spells out, plus the wider
+// #5188 coverage that closes the gaps #1936's predicate left). Covers
+// every value primitive (int, bool, byte, char, …, AND the nullable form
+// of any — the §7.2 nullable value type), record, enum, choice, inline-
+// array, and unit (plus their nullable forms). The reference primitives
+// `string` and `Object` (§3.2) are EXCLUDED: matching a reference-typed
+// scrutinee against a reference-typed pattern never needs an implicit box
+// (§8.6's premise), so the rejection does not fire — `case s of var x:
+// string` over `s: string` is the legitimate same-type-always-matches
+// shape §19.3/§19.5 admit. A bare type parameter `T` is excluded: the
+// per-instantiation reading is the predicate's companion (§12.7 / #5176),
+// and the value-vs-reference rejection is not re-applied through a
+// substitution (§19.3, v0.310 ruling #5156).
+bool isValueScrutineeShapeForTypePattern(const TypeRef* scrutTy);
+
+// §19.3 (v0.311, #5188): true iff `patTy` is a REFERENCE-typed pattern —
+// a class, interface, string, Object, or built-in exception. The shape
+// matches the `bndIsRefType` half of the #1936 predicate at
+// ExprTypecheck.cpp:~21909 (the BINDING-form half, with Object added per
+// #5188), so the bare-form predicate at checkTopLevelNamedPattern and the
+// binding-form predicate at the typed-binding site agree on the pattern
+// classification. Built-in exceptions carry a null `declaration` (they
+// resolve as declaration-less Named refs, the same shape codegen's
+// isBuiltinExceptionTypeRef recognizes); `nameHint` carries the last name
+// part of the pattern's type so the registry can be consulted. Pass an
+// empty string when `patTy` is a Primitive — the function returns true
+// for string/Object without consulting the registry.
+bool isReferenceTypePattern(const TypeRef* patTy, std::string_view nameHint);
+// Name-only twin used by the BARE-form predicate in checkTopLevelNamedPattern
+// (ExprTypecheck.cpp:2xxx). A top-level NamedPattern carries no TypeRef until
+// resolver lookup runs — this overload asks the same question from the bare
+// last-segment name: is this name a reference-typed type pattern? Built-in
+// reference primitives (string, Object) are handled here too, so the bare
+// `case c of Object` form reaches the §19.3/#5188 reject. `ts` is the
+// resolved TypeSymbol when one was found in the symbol table (nullptr
+// otherwise), allowing the same Class/Interface test the binding-form
+// predicate uses.
+bool isReferenceTypePatternName(std::string_view name, const TypeSymbol* ts);
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
