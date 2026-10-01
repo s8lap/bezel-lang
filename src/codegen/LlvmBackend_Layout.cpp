@@ -5445,6 +5445,17 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // yields the value. So extRef is true ONLY for the unbound case.
     bool extRef = isExtensionMethod(ms) && !receiverVal;
     if (extRef) instMethod = false;
+    // fix #5237 (§27.6, v0.313): an ordinary (non-extension) method declared on
+    // a RECORD captures its receiver BY COPY — the env block holds the record's
+    // VALUE (struct bytes), never a pointer; the thunk below reloads the struct
+    // and spills it to hand origFn its `this` (a pointer to a spilled copy,
+    // §26.1 / #433). A receiver lowered as a pointer (`this` inside a record
+    // method) is loaded to its value here so the cached thunk sees ONE env shape.
+    const bool recordRecvRef =
+        instMethod && receiverVal && !isExtensionMethod(ms) && ms->parent &&
+        ms->parent->kind == ast::TypeDeclKind::Record;
+    if (recordRecvRef && receiverVal->getType()->isPointerTy())
+        receiverVal = builder_.CreateLoad(recordStruct(ms->parent), receiverVal);
     auto ifaceIt = ifaceMethodIndex_.find(ms);
     auto vtSlotIt = vtableSlot_.find(ms);
     bool dynamicDispatch = instMethod &&
@@ -5804,6 +5815,12 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                     recordEnv = true;
                 }
             }
+        }
+        if (!isExtensionMethod(ms) && ms->parent &&
+            ms->parent->kind == ast::TypeDeclKind::Record) {
+            // fix #5237 (§27.6, v0.313): record-declared method, by-copy env.
+            thisLoadTy = recordStruct(ms->parent);
+            recordEnv = true;
         }
         llvm::Value* loadedThis = builder_.CreateLoad(thisLoadTy, envPtrArg);
         if (recordEnv) {
