@@ -1255,7 +1255,34 @@ private:
             // before the §22.7 field-DA bookkeeping below so it fires regardless
             // of whether the target is §7.9-strict (a nullable readonly field —
             // the exploit's `_f: string?` — is not, yet still narrows).
-            if (roCtorMode_ && as->target)
+            //
+            // fix #4673 (stdlib §6.5, §24; spec §22.8, v0.307): for `+=`/`-=`
+            // on a field typed EventSource<T>/AsyncEventSource<T>/SharedEventSource<T>,
+            // the compound form desugars to `.Add(h)`/`.Remove(h)` (§17.2) — it
+            // neither reads nor writes the field's value, so §22.8's single-
+            // assignment rule does not apply. Skip the onceness check for these
+            // compound forms; ExprTC::checkEventSubscriptionHandler validates the
+            // handler in the normal way.
+            bool isEventSourceCompoundAssign = false;
+            if (roCtorMode_ && as->target &&
+                (as->op == "+=" || as->op == "-=")) {
+                if (auto* fs = dynamic_cast<FieldSymbol*>(
+                        ctx_.exprSymbol(*as->target))) {
+                    if (TypeRef* fty = ctx_.exprType(*as->target)) {
+                        if (fty->kind == TypeRef::Kind::Named &&
+                            !fty->genericArgs.empty() &&
+                            fty->genericArgs[0]) {
+                            std::string_view hn = fty->headName();
+                            if (hn == "EventSource" ||
+                                hn == "AsyncEventSource" ||
+                                hn == "SharedEventSource") {
+                                isEventSourceCompoundAssign = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (roCtorMode_ && as->target && !isEventSourceCompoundAssign)
                 checkReadonlyOnceness(*as->target, as->span.begin);
             // §22.7 rule 1 (v0.184): a `:=` store to a field or auto-property of
             // `this` marks that field definitely assigned toward the
