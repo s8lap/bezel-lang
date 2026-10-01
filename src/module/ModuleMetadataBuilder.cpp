@@ -190,7 +190,12 @@ MetaType convertType(const sema::TypeRef* ref) {
                     std::string_view home =
                         common::builtinTypeHomeModuleOf(t.namedName);
                     if (!home.empty())
-                        t.namedName = std::string(home) + "." + t.namedName;
+                        // fix #5255: the leading '@' is a marker no user
+                        // type path (`qualifiedTypeName()`, identifiers
+                        // only) can produce, so a nested user type spelled
+                        // `System.Diagnostics.Stopwatch` stays distinct.
+                        t.namedName =
+                            "@" + std::string(home) + "." + t.namedName;
                 }
             }
             for (const sema::TypeRef* arg : ref->genericArgs)

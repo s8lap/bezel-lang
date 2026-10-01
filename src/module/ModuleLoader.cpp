@@ -341,13 +341,17 @@ struct Loader {
                 // (ModuleMetadataBuilder::convertType). It names the stdlib
                 // type, never an exported user type, so it takes the builtin
                 // shape (`importedName` = bare name) with NO by-name lookup.
-                {
-                    auto dot = mt.namedName.rfind('.');
+                // fix #5255: only the '@'-marked spelling is the builtin; an
+                // unmarked `System.Diagnostics.Stopwatch` is a nested user
+                // type path (§11.6) and goes through `lookupNamed`.
+                if (!mt.namedName.empty() && mt.namedName[0] == '@') {
+                    std::string_view full =
+                        std::string_view(mt.namedName).substr(1);
+                    auto dot = full.rfind('.');
                     if (dot != std::string::npos) {
-                        std::string_view bare =
-                            std::string_view(mt.namedName).substr(dot + 1);
+                        std::string_view bare = full.substr(dot + 1);
                         if (common::builtinTypeHomeModuleOf(bare) ==
-                            std::string_view(mt.namedName).substr(0, dot)) {
+                            full.substr(0, dot)) {
                             ref->importedName = ctx.internString(std::string(bare));
                             for (const MetaType& ga : mt.genericArgs)
                                 ref->genericArgs.push_back(convert(ga));
