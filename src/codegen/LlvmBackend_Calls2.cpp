@@ -12820,6 +12820,39 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     }
                 }
             }
+        } else if (!ms->parent->genericParams.empty() &&
+                   dynamic_cast<const ast::IdentifierExpr*>(
+                       call.callee.get())) {
+            // §22.12 (v0.313, #5215 — the RECEIVERLESS sibling of #5204): an
+            // unqualified `Bump()` is an ordinary member lookup (§22.6) that
+            // resolves to the static inherited from a generic base; it runs
+            // at the substitution the ENCLOSING class's base clause supplies
+            // (`E: B<int>` -> T=int; `D<T>: B<T>` inside `D<string>` -> T=
+            // string), so `B<T>._c` is the declaring instantiation's cell.
+            // Mirrors the #1101-C bare instance arm above.
+            const sema::TypeSymbol* enclosingCls = nullptr;
+            if (currentFn_) {
+                for (const auto& [m2, fn] : methodFns_)
+                    if (fn == currentFn_ && m2->parent) {
+                        enclosingCls = m2->parent;
+                        break;
+                    }
+                if (!enclosingCls && currentSpecMethodSymbol_)
+                    enclosingCls = currentSpecMethodSymbol_->parent;
+            }
+            if (enclosingCls && enclosingCls != ms->parent) {
+                sema::TypeRef synth;
+                synth.kind = sema::TypeRef::Kind::Named;
+                synth.declaration = const_cast<sema::TypeSymbol*>(enclosingCls);
+                std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*>
+                    ancSema;
+                if (computeAncestorGenericSubst(&synth, ms->parent, ancSubst,
+                                                ancSema)) {
+                    genericSubst_ = std::move(ancSubst);
+                    genericSubstSemaTy_ = std::move(ancSema);
+                }
+            }
         }
     }
     // per §14.1/§14.2 (issue #1278): a generic *method* (its own `<T>`
