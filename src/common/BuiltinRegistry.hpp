@@ -533,6 +533,16 @@ bool isBuiltinExceptionName(std::string_view name);
 // §8.5 / stdlib §2.13 rule 1, fix #3119
 std::string_view builtinClassModulePathOf(std::string_view name);
 
+// fix #4698 (spec §2.2, v0.313 "an alias is an additional qualifier"): the
+// module a compiler-built-in type or static class is DECLARED in, for the
+// alias-qualified spelling `Alias.Name` (type and expression position). This
+// is `builtinClassModulePathOf` plus the built-in static classes that have no
+// §8.5 row (`Debug`, stdlib §8.2). Empty when `name` is not a built-in whose
+// home module is known. Built-ins have no exported TypeSymbol in their module
+// (`importedTypesOf` never lists them), so sema consults this table to decide
+// that `Alias.Name` names the same entity as the bare `Name`.
+std::string_view builtinTypeHomeModuleOf(std::string_view name);
+
 // fix #3119 (spec §3.4; stdlib §2.13 rule 2, v0.252): true when `name` is one
 // of the 14 keyword-aliased built-in types — `string` plus the 13 primitive
 // value-type keywords (`bool`, `byte`, `sbyte`, `short`, `ushort`, `int`,

@@ -2563,6 +2563,35 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         return;
     }
     std::string_view first = t.name->parts.front();
+    // fix #4698 (§2.2, v0.313; §2.7 rule 1): `Alias.Builtin` where `Alias` is
+    // an unshadowed import alias of the module that declares the compiler-
+    // built-in `Builtin` (`Th.CancellationTokenSource` under `import
+    // System.Threading as Th;`). Built-ins are not in their module's exported
+    // TypeSymbol list, so the alias arm below would reject the name; the
+    // qualifier adds nothing ("an additional qualifier, not a rename"), so
+    // drop it and resolve the bare name. Idempotent across re-resolution.
+    if (t.name->parts.size() >= 2 && !importAliases_.empty()) {
+        auto aliasIt = importAliases_.find(std::string(first));
+        // §2.7 rule 1 / §2.3: an always-available bare name outranks a
+        // same-named alias (the alias is unreachable).
+        if (aliasIt != importAliases_.end() && !lookupName(first, scope) &&
+            !isAlwaysAvailableBareName(first)) {
+            bool isGenericMarker = false;
+            for (Scope* s = scope; s; s = s->parent)
+                if (s->names.count(first)) { isGenericMarker = true; break; }
+            const std::string& modName = aliasIt->second;
+            std::string_view cand = t.name->parts[1];
+            bool exportedByModule = false;
+            if (const auto* exported = ctx_.importedTypesOf(modName))
+                for (TypeSymbol* ts : *exported)
+                    if (ts->name == cand) { exportedByModule = true; break; }
+            if (!isGenericMarker && !exportedByModule &&
+                common::builtinTypeHomeModuleOf(cand) == modName) {
+                t.name->parts.erase(t.name->parts.begin());
+                first = t.name->parts.front();
+            }
+        }
+    }
     // Primitive check first.
     if (t.name->parts.size() == 1) {
         PrimitiveType prim = primitiveFromName(first);

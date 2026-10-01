@@ -1605,7 +1605,44 @@ ExprTC::ClauseStaticGuard::~ClauseStaticGuard() {
     if (entered) tc->currentClauseIsStatic_ = saved;
 }
 
+void ExprTC::normalizeAliasQualifiedBuiltinHead(
+    const ast::MemberAccessExpr& ma) {
+    if (importAliases_.empty()) return;
+    auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get());
+    if (!inner || !inner->target || !inner->typeArgs.empty()) return;
+    auto* aid = dynamic_cast<const ast::IdentifierExpr*>(inner->target.get());
+    if (!aid) return;
+    auto aliasIt = importAliases_.find(std::string(aid->name));
+    if (aliasIt == importAliases_.end()) return;
+    // §2.7 rule 1: a local / parameter / field / declared type of the alias's
+    // name resolves first — the alias is then not in play.
+    if (lookupName(std::string_view(aid->name))) return;
+    // §2.7 rule 1 / §2.3: an always-available bare name (`Task`, ...) outranks
+    // a same-named alias, which is unreachable (task_completed_task_4977).
+    if (isAlwaysAvailableBareName(aid->name)) return;
+    const std::string& modName = aliasIt->second;
+    if (common::builtinTypeHomeModuleOf(inner->member) != modName) return;
+    // A type the module really exports under that name wins (resolved by the
+    // imported-type path in resolveMemberAccess).
+    if (const auto* exported = ctx_.importedTypesOf(modName))
+        for (TypeSymbol* ts : *exported)
+            if (ts->name == inner->member) return;
+    auto bare = std::make_unique<ast::IdentifierExpr>();
+    bare->span = inner->span;
+    bare->name = inner->member;
+    const_cast<ast::MemberAccessExpr&>(ma).target = std::move(bare);
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
+    // fix #4698 (§2.2, v0.313): normalize `Alias.Builtin.…` heads to the bare
+    // built-in before any consumer classifies the expression.
+    if (auto* nma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        normalizeAliasQualifiedBuiltinHead(*nma);
+    } else if (auto* nce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
+                nce->callee.get()))
+            normalizeAliasQualifiedBuiltinHead(*cma);
+    }
     // §22.16: detect top-level visit of a clause expression (sub-expression
     // recursive visits never match the clause expression's pointer, so the
     // flag is set once at entry and persists across the recursive walk).

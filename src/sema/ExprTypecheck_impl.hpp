@@ -3750,6 +3750,17 @@ private:
     bool isQualifiedBuiltinThreadingHead(const ast::Expr* headExpr,
                                          std::string_view clsName);
 
+    // fix #4698 (§2.2, v0.313; §2.7 rule 1): `Alias.Builtin.Member` where
+    // `Alias` is an unshadowed import alias of the module that declares the
+    // compiler-built-in `Builtin` (`D.Stopwatch.StartNew()` under
+    // `import System.Diagnostics as D;`). Built-ins have no exported
+    // TypeSymbol in their module, and the static-call classification in sema
+    // and codegen keys on the bare head identifier, so the qualified head is
+    // normalized to the bare `Builtin` identifier — the same entity by the
+    // §2.2 "additional qualifier, not a rename" rule. `ma`'s TARGET is the
+    // node rewritten.
+    void normalizeAliasQualifiedBuiltinHead(const ast::MemberAccessExpr& ma);
+
     // fix #3177 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §7.5, v0.254): the
     // #2884 + #2943 imported-property access declines, asked ONCE for both
     // the `.` and the `?.` spelling (they are distinct AST nodes and only

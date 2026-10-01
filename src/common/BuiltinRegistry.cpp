@@ -1404,6 +1404,13 @@ std::string_view builtinClassModulePathOf(std::string_view name) {
     return {};
 }  // per §8.5 / stdlib §2.13 rule 1, fix #3119 — reserved built-in type → module path
 
+// fix #4698 (§2.2, v0.313): see the header. `Debug` (stdlib §8.2) is a static
+// class with no §8.5 row, so it is added here rather than to the table.
+std::string_view builtinTypeHomeModuleOf(std::string_view name) {
+    if (name == "Debug") return "System.Diagnostics";
+    return builtinClassModulePathOf(name);
+}
+
 // fix #3119: the 14 keyword-aliased built-in types (spec §3.4) — `string`
 // plus the 13 primitive value-type keywords. Per stdlib §2.13 rule 2, they
 // render as their lowercase keyword in BOTH `Name` and `FullName`; the
