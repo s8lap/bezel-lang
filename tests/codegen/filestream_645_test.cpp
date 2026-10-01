@@ -33,10 +33,10 @@
 //   - Using FileStream through its `Stream` base (§7.1) — `Stream` is not a
 //     compiler-known type; only the concrete FileStream face is wired.
 //
-// Paths are unique per test (/tmp/bzt645_*) to avoid cross-test interference —
+// Paths are unique per test (@DATA@/bzt645_*, a per-process dir, #5230) to avoid cross-test interference —
 // the same convention as file_io_644_test.cpp. No two tests here share a path,
 // and no test depends on a file another test left behind (verified by running
-// the whole filter from a cleaned /tmp).
+// the whole filter from a clean scratch dir).
 //
 // If one of the runAotChecked cases below ever fails with a bare -999 (`ran` is
 // false), suspect BUILD CONTENTION before suspecting the code: these are the
@@ -47,6 +47,7 @@
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked
 #include "support/codegen_support.hpp"
+#include "support/test_data_paths.hpp"  // #5230: per-process @DATA@ paths
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -55,7 +56,7 @@ using bezel::test::runAotChecked;
 namespace {
 
 int run(const std::string& program) {
-    auto r = runAot(program);
+    auto r = runAot(bezel::test::spliceDataPaths(program, "bzt645"));
     return r.ran ? r.exitCode : -999;
 }
 
@@ -66,7 +67,7 @@ int run(const std::string& program) {
 // leak class, reproducible with `var t := File.ReadAllText(p);` alone), which
 // would trip LeakSanitizer for a reason unrelated to FileStream.
 int runChecked(const std::string& program) {
-    auto r = runAotChecked(program);
+    auto r = runAotChecked(bezel::test::spliceDataPaths(program, "bzt645"));
     return r.ran ? r.exitCode : -999;
 }
 
@@ -166,9 +167,9 @@ BEZEL_TEST(filestream_645_7_2, write_reaches_the_file_at_using_var_scope_exit) {
         "    fs.Write(b, 0, 3); "
         "  end W; "
         "  public static method Main(): int "
-        "    W(\"/tmp/bzt645_flush.bin\"); "
-        "    using var back := File.ReadAllBytes(\"/tmp/bzt645_flush.bin\"); "
-        "    File.Delete(\"/tmp/bzt645_flush.bin\"); "
+        "    W(\"@DATA@/bzt645_flush.bin\"); "
+        "    using var back := File.ReadAllBytes(\"@DATA@/bzt645_flush.bin\"); "
+        "    File.Delete(\"@DATA@/bzt645_flush.bin\"); "
         "    if back.Count = 3 and back[1] = byte(20) then return 1; end; "
         "    return 0; "
         "  end Main; end C;"), 1);
@@ -184,10 +185,10 @@ BEZEL_TEST(filestream_645_7_2, append_mode_extends_an_existing_file) {
         "    fs.Write(b, 0, 1); "
         "  end Put; "
         "  public static method Main(): int "
-        "    Put(\"/tmp/bzt645_app.bin\", byte(1), FileMode.Create); "
-        "    Put(\"/tmp/bzt645_app.bin\", byte(2), FileMode.Append); "
-        "    using var back := File.ReadAllBytes(\"/tmp/bzt645_app.bin\"); "
-        "    File.Delete(\"/tmp/bzt645_app.bin\"); "
+        "    Put(\"@DATA@/bzt645_app.bin\", byte(1), FileMode.Create); "
+        "    Put(\"@DATA@/bzt645_app.bin\", byte(2), FileMode.Append); "
+        "    using var back := File.ReadAllBytes(\"@DATA@/bzt645_app.bin\"); "
+        "    File.Delete(\"@DATA@/bzt645_app.bin\"); "
         "    if back.Count = 2 and back[0] = byte(1) and back[1] = byte(2) then "
         "      return 1; end; "
         "    return 0; "
@@ -205,10 +206,10 @@ BEZEL_TEST(filestream_645_7_2, create_mode_truncates_an_existing_file) {
         "    fs.Write(b, 0, 2); "
         "  end Put; "
         "  public static method Main(): int "
-        "    Put(\"/tmp/bzt645_trunc.bin\", byte(1)); "
-        "    Put(\"/tmp/bzt645_trunc.bin\", byte(9)); "
-        "    using var back := File.ReadAllBytes(\"/tmp/bzt645_trunc.bin\"); "
-        "    File.Delete(\"/tmp/bzt645_trunc.bin\"); "
+        "    Put(\"@DATA@/bzt645_trunc.bin\", byte(1)); "
+        "    Put(\"@DATA@/bzt645_trunc.bin\", byte(9)); "
+        "    using var back := File.ReadAllBytes(\"@DATA@/bzt645_trunc.bin\"); "
+        "    File.Delete(\"@DATA@/bzt645_trunc.bin\"); "
         "    if back.Count = 2 and back[0] = byte(9) then return 1; end; "
         "    return 0; "
         "  end Main; end C;"), 1);
@@ -220,9 +221,9 @@ BEZEL_TEST(filestream_645_7_2, create_mode_truncates_an_existing_file) {
 // This test pins that choice so a later spec ruling has to update it visibly.
 BEZEL_TEST(filestream_645_7_2, two_argument_constructor_defaults_to_readwrite) {
     BEZEL_EXPECT_EQ(runChecked(prog(
-        "using var w := new FileStream(\"/tmp/bzt645_2arg.bin\", FileMode.Create); "
+        "using var w := new FileStream(\"@DATA@/bzt645_2arg.bin\", FileMode.Create); "
         "w.Dispose(); "
-        "using var rw := new FileStream(\"/tmp/bzt645_2arg.bin\", FileMode.Open); "
+        "using var rw := new FileStream(\"@DATA@/bzt645_2arg.bin\", FileMode.Open); "
         "if rw.CanRead and rw.CanWrite then return 1; end; "
         "return 0; ")), 1);
 }
@@ -237,10 +238,10 @@ BEZEL_TEST(filestream_645_7_1, read_fills_the_window_and_returns_the_count) {
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); "
         "src.Add(byte(7)); src.Add(byte(8)); src.Add(byte(9)); "
-        "using var w := new FileStream(\"/tmp/bzt645_read.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_read.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 3); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt645_read.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt645_read.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "using var buf := new Array<byte>(3, byte(0)); "
         "var n := r.Read(buf, 0, 3); "
@@ -253,10 +254,10 @@ BEZEL_TEST(filestream_645_7_1, read_fills_the_window_and_returns_the_count) {
 BEZEL_TEST(filestream_645_7_1, read_returns_zero_at_end_of_stream) {
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); src.Add(byte(1)); "
-        "using var w := new FileStream(\"/tmp/bzt645_eof.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_eof.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 1); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt645_eof.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt645_eof.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "using var buf := new Array<byte>(2, byte(0)); "
         "var first := r.Read(buf, 0, 2); "
@@ -269,10 +270,10 @@ BEZEL_TEST(filestream_645_7_1, read_returns_zero_at_end_of_stream) {
 BEZEL_TEST(filestream_645_7_1, zero_length_window_returns_zero) {
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); src.Add(byte(1)); src.Add(byte(2)); "
-        "using var w := new FileStream(\"/tmp/bzt645_zerow.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_zerow.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 2); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt645_zerow.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt645_zerow.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "using var buf := new Array<byte>(2, byte(0)); "
         "if r.Read(buf, 0, 0) = 0 then return 1; end; "
@@ -286,7 +287,7 @@ BEZEL_TEST(filestream_645_7_1, zero_length_window_returns_zero) {
 BEZEL_TEST(filestream_645_7_1, out_of_range_write_window_raises_index_out_of_range) {
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); src.Add(byte(1)); src.Add(byte(2)); "
-        "using var w := new FileStream(\"/tmp/bzt645_oorw.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_oorw.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "try "
         "  w.Write(src, 0, 5); "
@@ -298,7 +299,7 @@ BEZEL_TEST(filestream_645_7_1, out_of_range_write_window_raises_index_out_of_ran
 // §7.1: the same window rule on the READ side.
 BEZEL_TEST(filestream_645_7_1, out_of_range_read_window_raises_index_out_of_range) {
     BEZEL_EXPECT_EQ(runChecked(prog(
-        "using var w := new FileStream(\"/tmp/bzt645_oorr.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_oorr.bin\", "
         "                              FileMode.Create, FileAccess.ReadWrite); "
         "using var buf := new Array<byte>(2, byte(0)); "
         "try "
@@ -318,10 +319,10 @@ BEZEL_TEST(filestream_645_7_1, seek_position_and_length) {
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); "
         "src.Add(byte(1)); src.Add(byte(2)); src.Add(byte(3)); src.Add(byte(4)); "
-        "using var w := new FileStream(\"/tmp/bzt645_seek.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_seek.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 4); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt645_seek.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt645_seek.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var mask := 0; "
         "if r.Length = 4 then mask := mask + 1; end; "
@@ -340,10 +341,10 @@ BEZEL_TEST(filestream_645_7_1, read_all_reads_from_current_position_to_end) {
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); "
         "src.Add(byte(1)); src.Add(byte(2)); src.Add(byte(3)); src.Add(byte(4)); "
-        "using var w := new FileStream(\"/tmp/bzt645_all.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_all.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 4); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt645_all.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt645_all.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "r.Position := 1; "
         "using var rest := r.ReadAll(); "
@@ -356,14 +357,14 @@ BEZEL_TEST(filestream_645_7_1, read_all_reads_from_current_position_to_end) {
 // opened with; a regular file is seekable.
 BEZEL_TEST(filestream_645_7_1, can_read_can_write_can_seek_follow_file_access) {
     BEZEL_EXPECT_EQ(runChecked(prog(
-        "using var w := new FileStream(\"/tmp/bzt645_caps.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_caps.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "var mask := 0; "
         "if w.CanWrite then mask := mask + 1; end; "
         "if not w.CanRead then mask := mask + 2; end; "
         "if w.CanSeek then mask := mask + 4; end; "
         "w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt645_caps.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt645_caps.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "if r.CanRead then mask := mask + 8; end; "
         "if not r.CanWrite then mask := mask + 16; end; "
@@ -376,10 +377,10 @@ BEZEL_TEST(filestream_645_7_1, can_read_can_write_can_seek_follow_file_access) {
 // `File.ReadAllText` (see the note on runChecked above).
 BEZEL_TEST(filestream_645_7_2, path_property_returns_the_constructor_path) {
     BEZEL_EXPECT_EQ(run(prog(
-        "using var w := new FileStream(\"/tmp/bzt645_path.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt645_path.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "var p := w.Path; "
-        "if p = \"/tmp/bzt645_path.bin\" then return 1; end; "
+        "if p = \"@DATA@/bzt645_path.bin\" then return 1; end; "
         "return 0; ")), 1);
 }
 
@@ -392,7 +393,7 @@ BEZEL_TEST(filestream_645_7_2, path_property_returns_the_constructor_path) {
 // double-free ASan reports at the allocator.
 BEZEL_TEST(filestream_645_7_2, explicit_dispose_then_scope_exit_is_not_a_double_free) {
     BEZEL_EXPECT_EQ(runChecked(prog(
-        "using var fs := new FileStream(\"/tmp/bzt645_dd.bin\", "
+        "using var fs := new FileStream(\"@DATA@/bzt645_dd.bin\", "
         "                               FileMode.Create, FileAccess.Write); "
         "fs.Dispose(); "
         "return 5; ")), 5);
@@ -404,7 +405,7 @@ BEZEL_TEST(filestream_645_7_2, using_var_disposes_on_the_exception_exit_edge) {
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  private static method Boom() "
-        "    using var fs := new FileStream(\"/tmp/bzt645_exc.bin\", "
+        "    using var fs := new FileStream(\"@DATA@/bzt645_exc.bin\", "
         "                                   FileMode.Create, FileAccess.Write); "
         "    throw new InvalidOperationException(\"x\"); "
         "  end Boom; "
@@ -420,7 +421,7 @@ BEZEL_TEST(filestream_645_7_2, repeated_open_and_dispose_leaks_nothing) {
     BEZEL_EXPECT_EQ(runChecked(
         "module M; class C "
         "  private static method Once() "
-        "    using var fs := new FileStream(\"/tmp/bzt645_loop.bin\", "
+        "    using var fs := new FileStream(\"@DATA@/bzt645_loop.bin\", "
         "                                   FileMode.Create, FileAccess.Write); "
         "    using var b := new Array<byte>(); b.Add(byte(1)); "
         "    fs.Write(b, 0, 1); "
@@ -442,7 +443,7 @@ BEZEL_TEST(filestream_645_7_2, repeated_open_and_dispose_leaks_nothing) {
 // reason.
 BEZEL_TEST(filestream_645_7_5, no_crash_on_missing_file_open) {
     BEZEL_EXPECT_EQ(runChecked(prog(
-        "using var r := new FileStream(\"/tmp/bzt645_no_such_dir/absent.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt645_no_such_dir/absent.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "using var buf := new Array<byte>(4, byte(0)); "
         "var n := r.Read(buf, 0, 4); "
@@ -483,10 +484,10 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_long_nullable_position_set) {
         "using var src := new Array<byte>(); "
         "src.Add(byte(10)); src.Add(byte(11)); "
         "src.Add(byte(12)); src.Add(byte(13)); "
-        "using var w := new FileStream(\"/tmp/bzt2617_long.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_long.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 4); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_long.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_long.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var p: long? := 2L; "
         "if p = null then return 0; end; "
@@ -508,10 +509,10 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_int_nullable_position_set) {
         "using var src := new Array<byte>(); "
         "src.Add(byte(10)); src.Add(byte(11)); "
         "src.Add(byte(12)); src.Add(byte(13)); "
-        "using var w := new FileStream(\"/tmp/bzt2617_int.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_int.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 4); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_int.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_int.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var q: int? := 3; "
         "if q = null then return 0; end; "
@@ -531,10 +532,10 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_long_nullable_position_set_in_if_block)
         "using var src := new Array<byte>(); "
         "src.Add(byte(10)); src.Add(byte(11)); "
         "src.Add(byte(12)); src.Add(byte(13)); "
-        "using var w := new FileStream(\"/tmp/bzt2617_ifblk.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_ifblk.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 4); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_ifblk.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_ifblk.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var p: long? := 1L; "
         "if p <> null then r.Position := p; end; "
@@ -562,10 +563,10 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_nullable_in_lifted_operator_position_se
         "using var src := new Array<byte>(); "
         "src.Add(byte(10)); src.Add(byte(11)); "
         "src.Add(byte(12)); src.Add(byte(13)); "
-        "using var w := new FileStream(\"/tmp/bzt2617_lift.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_lift.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 4); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_lift.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_lift.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var p: long? := 1L; "
         "if p = null then return 0; end; "
@@ -607,10 +608,10 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_byte_nullable_position_set_zero_extends
         "using var src := new Array<byte>(); "
         "var i := 0; "
         "while i < 256 do src.Add(byte(i)); i := i + 1; end; "
-        "using var w := new FileStream(\"/tmp/bzt2617_byte.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_byte.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 256); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_byte.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_byte.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var b: byte? := byte(200); "
         "if b = null then return 0; end; "
@@ -631,10 +632,10 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_ushort_nullable_position_set_zero_exten
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); "
         "src.Add(byte(1)); src.Add(byte(2)); "
-        "using var w := new FileStream(\"/tmp/bzt2617_ushort.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_ushort.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 2); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_ushort.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_ushort.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var s: ushort? := ushort(40000); "
         "if s = null then return 0; end; "
@@ -651,10 +652,10 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_uint_nullable_position_set_zero_extends
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); "
         "src.Add(byte(1)); src.Add(byte(2)); "
-        "using var w := new FileStream(\"/tmp/bzt2617_uint.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_uint.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 2); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_uint.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_uint.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var u: uint? := uint(2147483648L); "
         "if u = null then return 0; end; "
@@ -671,10 +672,10 @@ BEZEL_TEST(filestream_2617_7_4, plain_byte_position_set_zero_extends) {
         "using var src := new Array<byte>(); "
         "var i := 0; "
         "while i < 256 do src.Add(byte(i)); i := i + 1; end; "
-        "using var w := new FileStream(\"/tmp/bzt2617_pbyte.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_pbyte.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 256); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_pbyte.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_pbyte.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var c: byte := byte(200); "
         "r.Position := c; "
@@ -696,10 +697,10 @@ BEZEL_TEST(filestream_2617_7_4, plain_long_and_int_position_set_unchanged) {
         "using var src := new Array<byte>(); "
         "src.Add(byte(10)); src.Add(byte(11)); "
         "src.Add(byte(12)); src.Add(byte(13)); "
-        "using var w := new FileStream(\"/tmp/bzt2617_plain.bin\", "
+        "using var w := new FileStream(\"@DATA@/bzt2617_plain.bin\", "
         "                              FileMode.Create, FileAccess.Write); "
         "w.Write(src, 0, 4); w.Dispose(); "
-        "using var r := new FileStream(\"/tmp/bzt2617_plain.bin\", "
+        "using var r := new FileStream(\"@DATA@/bzt2617_plain.bin\", "
         "                              FileMode.Open, FileAccess.Read); "
         "var mask := 0; "
         "var a: long := 2L; "

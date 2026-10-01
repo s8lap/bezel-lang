@@ -109,7 +109,7 @@ BEZEL_TEST(aot_result_asserts_5014,
         "0x7c19b3be001c is located 0 bytes after 12-byte region "
         "[0x7c19b3be0010,0x7c19b3be001c)\n"
         "allocated by thread T0 here:\n"
-        "    #0 0x0000004a5bd8 in malloc (/tmp/asan_repro+0x4a5bd8)\n"
+        "    #0 0x0000004a5bd8 in malloc (/tmp/asan_repro+0x4a5bd8)\n" // 5230-allow: ASan trace text, not a file path
         "    #1 0x0000004eb358 in main prog.bzl:4:22\n"
         "SUMMARY: AddressSanitizer: heap-buffer-overflow prog.bzl:5:11 in main\n";
     auto r = jitResultWithOneDiag(msg);
@@ -149,7 +149,7 @@ BEZEL_TEST(aot_result_asserts_5014,
         "ERROR: LeakSanitizer: detected memory leaks\n"
         "Direct leak of 24 byte(s) in 1 object(s) allocated from:\n"
         "    #0 0x0000004eb391 in main prog.bzl:5:11\n"
-        "    #1 0x0000004a5bd8 in malloc (/tmp/asan_repro+0x4a5bd8)\n"
+        "    #1 0x0000004a5bd8 in malloc (/tmp/asan_repro+0x4a5bd8)\n" // 5230-allow: ASan trace text, not a file path
         "SUMMARY: LeakSanitizer: 24 byte(s) leaked in 1 allocation(s).\n";
     auto r = jitResultWithOneDiag(msg);
     BEZEL_EXPECT_FALSE(r.ran);

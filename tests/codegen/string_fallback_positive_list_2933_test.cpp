@@ -91,6 +91,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/test_data_paths.hpp"  // #5230: per-process @DATA@ paths
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -104,7 +105,7 @@ namespace {
 // arm would surface as -999, not as a wrong exit code, and the assertion
 // catches it.
 int run(const std::string& program) {
-    auto r = runAot(program);
+    auto r = runAot(bezel::test::spliceDataPaths(program, "bzt2933"));
     return r.ran ? r.exitCode : -999;
 }
 
@@ -298,7 +299,7 @@ BEZEL_TEST(string_fallback_positive_list_2933, filestream_param_length_is_filest
         "    return 0; "
         "  end Len; "
         "  public static method Main(): int "
-        "    var path := \"/tmp/bzt2933_filestream.bin\"; "
+        "    var path := \"@DATA@/bzt2933_filestream.bin\"; "
         "    using var w := new FileStream(path, FileMode.Create, FileAccess.Write); "
         "    using var b := new Array<byte>(5, byte(0)); "
         "    b[0] := byte(1); b[1] := byte(2); b[2] := byte(3); b[3] := byte(4); b[4] := byte(5); "

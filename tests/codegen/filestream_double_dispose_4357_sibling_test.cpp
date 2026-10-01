@@ -142,7 +142,7 @@ BEZEL_TEST(filestream_double_dispose_4357_sibling,
     std::string stem = unique_stem("repro4357fs");
     std::string src = (dir / (stem + ".cpp")).string();
     std::string exe = (dir / stem).string();
-    std::string path = "/tmp/bzt4357fs_dd_plain.bin";
+    std::string path = (dir / (stem + "_dd_plain.bin")).string();
     {
         std::ofstream out(src);
         out << reproSource(path);

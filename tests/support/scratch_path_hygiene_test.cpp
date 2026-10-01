@@ -52,7 +52,7 @@ struct Hit {
 // in Bezel source text, or in an expected diagnostic string.
 const char* const kBannedLiterals[] = {
     "path(\"/tmp\")",
-    "path(\"/tmp/\")",
+    "path(\"/tmp/\")", // 5230-allow: forbidden-literal list of the scratch hygiene ratchet
     "path(\"/var/tmp\")",
     "path(\"/var/tmp/bezel-scratch\")",
     "\"/var/tmp/bezel-scratch\" /",

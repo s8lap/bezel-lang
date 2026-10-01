@@ -14,11 +14,13 @@
 //     returns errno codes, not Bezel exceptions; error-path tests deferred.
 //
 // Each test cites the stdlib section and the exact behaviour it verifies.
-// Tests use unique /tmp paths per test to avoid cross-test interference.
+// Data paths are @DATA@/<name>, spliced per process (#5230) so concurrent runs
+// cannot collide.
 
 #include "support/aot_result_asserts.hpp"   // fix #3892: failedAtCompileTimeNotRuntime
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
+#include "support/test_data_paths.hpp"  // #5230: per-process @DATA@ paths
 #include "test_harness.hpp"
 
 using bezel::test::failedAtCompileTimeNotRuntime;
@@ -27,7 +29,7 @@ using bezel::test::runAot;
 namespace {
 
 int run(const std::string& program) {
-    auto r = runAot(program);
+    auto r = runAot(bezel::test::spliceDataPaths(program, "bzt644"));
     return r.ran ? r.exitCode : -999;
 }
 
@@ -51,9 +53,9 @@ BEZEL_TEST(file_io_644_7_3, write_read_all_bytes_round_trip) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var bytes := new Array<byte>(); "
         "bytes.Add(1); bytes.Add(2); bytes.Add(3); "
-        "File.WriteAllBytes(\"/tmp/bzt644_wrab.bin\", bytes); "
-        "using var back := File.ReadAllBytes(\"/tmp/bzt644_wrab.bin\"); "
-        "File.Delete(\"/tmp/bzt644_wrab.bin\"); "
+        "File.WriteAllBytes(\"@DATA@/bzt644_wrab.bin\", bytes); "
+        "using var back := File.ReadAllBytes(\"@DATA@/bzt644_wrab.bin\"); "
+        "File.Delete(\"@DATA@/bzt644_wrab.bin\"); "
         "if back.Count = 3 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -65,9 +67,9 @@ BEZEL_TEST(file_io_644_7_3, write_read_all_bytes_values_exact) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var bytes := new Array<byte>(); "
         "bytes.Add(byte(255)); bytes.Add(byte(0)); bytes.Add(byte(127)); "
-        "File.WriteAllBytes(\"/tmp/bzt644_wrab2.bin\", bytes); "
-        "using var back := File.ReadAllBytes(\"/tmp/bzt644_wrab2.bin\"); "
-        "File.Delete(\"/tmp/bzt644_wrab2.bin\"); "
+        "File.WriteAllBytes(\"@DATA@/bzt644_wrab2.bin\", bytes); "
+        "using var back := File.ReadAllBytes(\"@DATA@/bzt644_wrab2.bin\"); "
+        "File.Delete(\"@DATA@/bzt644_wrab2.bin\"); "
         "if back.Count = 3 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -76,9 +78,9 @@ BEZEL_TEST(file_io_644_7_3, write_read_all_bytes_values_exact) {
 // "Hi" in UTF-8 is 2 bytes; verifies ReadAllBytes works on text files too.
 BEZEL_TEST(file_io_644_7_3, read_all_bytes_from_text_file) {
     BEZEL_EXPECT_EQ(run(prog(
-        "File.WriteAllText(\"/tmp/bzt644_rabtxt.txt\", \"Hi\"); "
-        "using var b := File.ReadAllBytes(\"/tmp/bzt644_rabtxt.txt\"); "
-        "File.Delete(\"/tmp/bzt644_rabtxt.txt\"); "
+        "File.WriteAllText(\"@DATA@/bzt644_rabtxt.txt\", \"Hi\"); "
+        "using var b := File.ReadAllBytes(\"@DATA@/bzt644_rabtxt.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_rabtxt.txt\"); "
         "if b.Count = 2 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -92,9 +94,9 @@ BEZEL_TEST(file_io_644_7_3, write_all_lines_round_trip) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var lines := new Array<string>(); "
         "lines.Add(\"alpha\"); lines.Add(\"beta\"); "
-        "File.WriteAllLines(\"/tmp/bzt644_wal.txt\", lines); "
-        "using var back := File.ReadAllLines(\"/tmp/bzt644_wal.txt\"); "
-        "File.Delete(\"/tmp/bzt644_wal.txt\"); "
+        "File.WriteAllLines(\"@DATA@/bzt644_wal.txt\", lines); "
+        "using var back := File.ReadAllLines(\"@DATA@/bzt644_wal.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_wal.txt\"); "
         "if back.Count = 2 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -103,9 +105,9 @@ BEZEL_TEST(file_io_644_7_3, write_all_lines_round_trip) {
 // Write single line via WriteAllText; ReadAllLines should return 1 element.
 BEZEL_TEST(file_io_644_7_3, read_all_lines_count_after_write_all_text) {
     BEZEL_EXPECT_EQ(run(prog(
-        "File.WriteAllText(\"/tmp/bzt644_rall.txt\", \"one line\"); "
-        "using var lines := File.ReadAllLines(\"/tmp/bzt644_rall.txt\"); "
-        "File.Delete(\"/tmp/bzt644_rall.txt\"); "
+        "File.WriteAllText(\"@DATA@/bzt644_rall.txt\", \"one line\"); "
+        "using var lines := File.ReadAllLines(\"@DATA@/bzt644_rall.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_rall.txt\"); "
         "if lines.Count = 1 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -116,11 +118,11 @@ BEZEL_TEST(file_io_644_7_3, read_all_lines_count_after_write_all_text) {
 BEZEL_TEST(file_io_644_7_3, copy_creates_destination) {
     // Write src; Copy(src, dst, overwrite=false); dst should exist.
     BEZEL_EXPECT_EQ(run(prog(
-        "File.WriteAllText(\"/tmp/bzt644_copy_src.txt\", \"copy me\"); "
-        "File.Copy(\"/tmp/bzt644_copy_src.txt\", \"/tmp/bzt644_copy_dst.txt\", false); "
-        "var dstExists := File.Exists(\"/tmp/bzt644_copy_dst.txt\"); "
-        "File.Delete(\"/tmp/bzt644_copy_src.txt\"); "
-        "File.Delete(\"/tmp/bzt644_copy_dst.txt\"); "
+        "File.WriteAllText(\"@DATA@/bzt644_copy_src.txt\", \"copy me\"); "
+        "File.Copy(\"@DATA@/bzt644_copy_src.txt\", \"@DATA@/bzt644_copy_dst.txt\", false); "
+        "var dstExists := File.Exists(\"@DATA@/bzt644_copy_dst.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_copy_src.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_copy_dst.txt\"); "
         "if dstExists then return 1; end; "
         "return 0; ")), 1);
 }
@@ -128,11 +130,11 @@ BEZEL_TEST(file_io_644_7_3, copy_creates_destination) {
 // §7.3 File.Copy — source still exists after copy.
 BEZEL_TEST(file_io_644_7_3, copy_leaves_source) {
     BEZEL_EXPECT_EQ(run(prog(
-        "File.WriteAllText(\"/tmp/bzt644_copy2_src.txt\", \"hello\"); "
-        "File.Copy(\"/tmp/bzt644_copy2_src.txt\", \"/tmp/bzt644_copy2_dst.txt\", true); "
-        "var srcExists := File.Exists(\"/tmp/bzt644_copy2_src.txt\"); "
-        "File.Delete(\"/tmp/bzt644_copy2_src.txt\"); "
-        "File.Delete(\"/tmp/bzt644_copy2_dst.txt\"); "
+        "File.WriteAllText(\"@DATA@/bzt644_copy2_src.txt\", \"hello\"); "
+        "File.Copy(\"@DATA@/bzt644_copy2_src.txt\", \"@DATA@/bzt644_copy2_dst.txt\", true); "
+        "var srcExists := File.Exists(\"@DATA@/bzt644_copy2_src.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_copy2_src.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_copy2_dst.txt\"); "
         "if srcExists then return 1; end; "
         "return 0; ")), 1);
 }
@@ -142,11 +144,11 @@ BEZEL_TEST(file_io_644_7_3, copy_content_preserved) {
     BEZEL_EXPECT_EQ(run(prog(
         "using var b := new Array<byte>(); "
         "b.Add(byte(42)); b.Add(byte(99)); "
-        "File.WriteAllBytes(\"/tmp/bzt644_copy3_src.bin\", b); "
-        "File.Copy(\"/tmp/bzt644_copy3_src.bin\", \"/tmp/bzt644_copy3_dst.bin\", true); "
-        "using var back := File.ReadAllBytes(\"/tmp/bzt644_copy3_dst.bin\"); "
-        "File.Delete(\"/tmp/bzt644_copy3_src.bin\"); "
-        "File.Delete(\"/tmp/bzt644_copy3_dst.bin\"); "
+        "File.WriteAllBytes(\"@DATA@/bzt644_copy3_src.bin\", b); "
+        "File.Copy(\"@DATA@/bzt644_copy3_src.bin\", \"@DATA@/bzt644_copy3_dst.bin\", true); "
+        "using var back := File.ReadAllBytes(\"@DATA@/bzt644_copy3_dst.bin\"); "
+        "File.Delete(\"@DATA@/bzt644_copy3_src.bin\"); "
+        "File.Delete(\"@DATA@/bzt644_copy3_dst.bin\"); "
         "if back.Count = 2 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -157,11 +159,11 @@ BEZEL_TEST(file_io_644_7_3, copy_content_preserved) {
 BEZEL_TEST(file_io_644_7_3, move_destination_exists_source_gone) {
     // Write src; Move(src, dst); src gone, dst present.
     BEZEL_EXPECT_EQ(run(prog(
-        "File.WriteAllText(\"/tmp/bzt644_move_src.txt\", \"move me\"); "
-        "File.Move(\"/tmp/bzt644_move_src.txt\", \"/tmp/bzt644_move_dst.txt\"); "
-        "var srcGone := not File.Exists(\"/tmp/bzt644_move_src.txt\"); "
-        "var dstHere := File.Exists(\"/tmp/bzt644_move_dst.txt\"); "
-        "File.Delete(\"/tmp/bzt644_move_dst.txt\"); "
+        "File.WriteAllText(\"@DATA@/bzt644_move_src.txt\", \"move me\"); "
+        "File.Move(\"@DATA@/bzt644_move_src.txt\", \"@DATA@/bzt644_move_dst.txt\"); "
+        "var srcGone := not File.Exists(\"@DATA@/bzt644_move_src.txt\"); "
+        "var dstHere := File.Exists(\"@DATA@/bzt644_move_dst.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_move_dst.txt\"); "
         "if srcGone and dstHere then return 1; end; "
         "return 0; ")), 1);
 }
@@ -169,10 +171,10 @@ BEZEL_TEST(file_io_644_7_3, move_destination_exists_source_gone) {
 // §7.3 File.Move + ReadAllText: content survives move.
 BEZEL_TEST(file_io_644_7_3, move_content_readable_at_destination) {
     BEZEL_EXPECT_EQ(run(prog(
-        "File.WriteAllText(\"/tmp/bzt644_movc_src.txt\", \"payload\"); "
-        "File.Move(\"/tmp/bzt644_movc_src.txt\", \"/tmp/bzt644_movc_dst.txt\"); "
-        "var txt := File.ReadAllText(\"/tmp/bzt644_movc_dst.txt\"); "
-        "File.Delete(\"/tmp/bzt644_movc_dst.txt\"); "
+        "File.WriteAllText(\"@DATA@/bzt644_movc_src.txt\", \"payload\"); "
+        "File.Move(\"@DATA@/bzt644_movc_src.txt\", \"@DATA@/bzt644_movc_dst.txt\"); "
+        "var txt := File.ReadAllText(\"@DATA@/bzt644_movc_dst.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_movc_dst.txt\"); "
         "if txt = \"payload\" then return 1; end; "
         "return 0; ")), 1);
 }
@@ -181,14 +183,14 @@ BEZEL_TEST(file_io_644_7_3, move_content_readable_at_destination) {
 BEZEL_TEST(file_io_644_7_3, copy_then_move_chain) {
     // src → copy → copyDst; copyDst → move → moveDst; src still present.
     BEZEL_EXPECT_EQ(run(prog(
-        "File.WriteAllText(\"/tmp/bzt644_chain_src.txt\", \"chain\"); "
-        "File.Copy(\"/tmp/bzt644_chain_src.txt\", \"/tmp/bzt644_chain_mid.txt\", false); "
-        "File.Move(\"/tmp/bzt644_chain_mid.txt\", \"/tmp/bzt644_chain_dst.txt\"); "
-        "var srcOk := File.Exists(\"/tmp/bzt644_chain_src.txt\"); "
-        "var midGone := not File.Exists(\"/tmp/bzt644_chain_mid.txt\"); "
-        "var dstOk := File.Exists(\"/tmp/bzt644_chain_dst.txt\"); "
-        "File.Delete(\"/tmp/bzt644_chain_src.txt\"); "
-        "File.Delete(\"/tmp/bzt644_chain_dst.txt\"); "
+        "File.WriteAllText(\"@DATA@/bzt644_chain_src.txt\", \"chain\"); "
+        "File.Copy(\"@DATA@/bzt644_chain_src.txt\", \"@DATA@/bzt644_chain_mid.txt\", false); "
+        "File.Move(\"@DATA@/bzt644_chain_mid.txt\", \"@DATA@/bzt644_chain_dst.txt\"); "
+        "var srcOk := File.Exists(\"@DATA@/bzt644_chain_src.txt\"); "
+        "var midGone := not File.Exists(\"@DATA@/bzt644_chain_mid.txt\"); "
+        "var dstOk := File.Exists(\"@DATA@/bzt644_chain_dst.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_chain_src.txt\"); "
+        "File.Delete(\"@DATA@/bzt644_chain_dst.txt\"); "
         "if srcOk and midGone and dstOk then return 1; end; "
         "return 0; ")), 1);
 }
@@ -221,9 +223,9 @@ BEZEL_TEST(file_io_644_7_3, copy_then_move_chain) {
 // rejected at compile time, never miscompiled into the span-unpack path.
 BEZEL_TEST(file_io_644_7_3,
            write_all_bytes_range_argument_rejected_not_miscompiled_3891) {
-    auto r = runAot(prog(
-        "File.WriteAllBytes(\"/tmp/bzt3891_range.bin\", 1..5); "
-        "return 0; "));
+    auto r = runAot(bezel::test::spliceDataPaths(prog(
+        "File.WriteAllBytes(\"@DATA@/bzt3891_range.bin\", 1..5); "
+        "return 0; "), "bzt644"));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
 }
 
@@ -231,13 +233,13 @@ BEZEL_TEST(file_io_644_7_3,
 // same requirement.
 BEZEL_TEST(file_io_644_7_3,
            write_all_bytes_record_argument_rejected_not_miscompiled_3891) {
-    auto r = runAot(
+    auto r = runAot(bezel::test::spliceDataPaths(
         "module M; record Pair(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(1, 2); "
-        "  File.WriteAllBytes(\"/tmp/bzt3891_record.bin\", p); "
+        "  File.WriteAllBytes(\"@DATA@/bzt3891_record.bin\", p); "
         "  return 0; "
-        "end Main; end C;");
+        "end Main; end C;", "bzt644"));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
 }
 
@@ -250,9 +252,9 @@ BEZEL_TEST(file_io_644_7_3,
     BEZEL_EXPECT_EQ(run(prog(
         "using var bytes := new Array<byte>(); "
         "bytes.Add(byte(5)); bytes.Add(byte(6)); "
-        "File.WriteAllBytes(\"/tmp/bzt3891_arr_ok.bin\", bytes); "
-        "var back := File.ReadAllBytes(\"/tmp/bzt3891_arr_ok.bin\"); "
-        "File.Delete(\"/tmp/bzt3891_arr_ok.bin\"); "
+        "File.WriteAllBytes(\"@DATA@/bzt3891_arr_ok.bin\", bytes); "
+        "var back := File.ReadAllBytes(\"@DATA@/bzt3891_arr_ok.bin\"); "
+        "File.Delete(\"@DATA@/bzt3891_arr_ok.bin\"); "
         "if back.Count = 2 then return 1; end; "
         "return 0; ")), 1);
 }
@@ -264,9 +266,9 @@ BEZEL_TEST(file_io_644_7_3,
     BEZEL_EXPECT_EQ(run(prog(
         "using var bytes := new Array<byte>(); "
         "bytes.Add(byte(9)); bytes.Add(byte(8)); bytes.Add(byte(7)); bytes.Add(byte(6)); "
-        "File.WriteAllBytes(\"/tmp/bzt3891_span_ok.bin\", bytes.AsReadOnlySpan(1, 2)); "
-        "var back := File.ReadAllBytes(\"/tmp/bzt3891_span_ok.bin\"); "
-        "File.Delete(\"/tmp/bzt3891_span_ok.bin\"); "
+        "File.WriteAllBytes(\"@DATA@/bzt3891_span_ok.bin\", bytes.AsReadOnlySpan(1, 2)); "
+        "var back := File.ReadAllBytes(\"@DATA@/bzt3891_span_ok.bin\"); "
+        "File.Delete(\"@DATA@/bzt3891_span_ok.bin\"); "
         "if back.Count = 2 then return 1; end; "
         "return 0; ")), 1);
 }
