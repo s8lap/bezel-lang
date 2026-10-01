@@ -549,6 +549,18 @@ public:
                          std::vector<Symbol*> syms) {
         lambdaParams_[lam] = std::move(syms);
     }
+    // fix #5226 (§22.12 / §14.1, v0.313): the type whose member body lexically
+    // encloses a lambda (sema's `currentType_` while checking it). Codegen
+    // emits member bodies lazily from OTHER members, so any emitter-global
+    // "current method" is stale there; this table is the lexical answer.
+    void setLambdaEnclosingType(const ast::LambdaExpr* lam,
+                                const TypeSymbol* ts) {
+        lambdaEnclosingType_[lam] = ts;
+    }
+    const TypeSymbol* lambdaEnclosingType(const ast::LambdaExpr* lam) const {
+        auto it = lambdaEnclosingType_.find(lam);
+        return it == lambdaEnclosingType_.end() ? nullptr : it->second;
+    }
     const std::vector<Symbol*>* lambdaParams(
         const ast::LambdaExpr* lam) const {
         auto it = lambdaParams_.find(lam);
@@ -1190,6 +1202,7 @@ private:
     // §19.3 (#1853): see setPatternSymbol — a bare-name local-const NamedPattern.
     std::unordered_map<const ast::Pattern*, Symbol*> patternSymbols_;
     std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>> lambdaParams_;
+    std::unordered_map<const ast::LambdaExpr*, const TypeSymbol*> lambdaEnclosingType_;  // #5226
     // fix #3196 (§22.5 / §22.10 / v0.254): per-NewExpr §22.5 binding of call
     // arguments to positional primary-ctor field slots. Populated by
     // `checkPositionalNewArgsFromSymbols`, read by codegen's

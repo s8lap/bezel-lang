@@ -11204,6 +11204,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             if (!p.name.empty()) lamScope.names[p.name] = ps;
         }
         ctx_.setLambdaParams(lam, std::move(lamParamSyms));
+        if (currentType_) ctx_.setLambdaEnclosingType(lam, currentType_);  // #5226
         // §21.7: suppress enclosing callable's return context;
         // §21.5: reset loop/catch depth across the lambda boundary.
         Scope* saveScope = currentScope_;

@@ -2993,6 +2993,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     auto savedClosureRelEligOuter = closureReleaseEligible_;
     llvm::Function* savedClosureRelEligFnOuter = closureReleaseEligibleFn_;
     currentFn_ = fn;
+    if (const sema::TypeSymbol* lt = ctx_.lambdaEnclosingType(&lam))
+        lambdaFnEnclosingType_[fn] = lt;  // #5226
     currentThis_ = nullptr;
     // #2515 / §27.3: a lambda body is NOT a method body — its `return` is an
     // internal transfer to the trampoline, not a method-contract return that

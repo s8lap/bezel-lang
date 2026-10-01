@@ -12667,19 +12667,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // the `this`/`base` keyword branch above.
             const sema::TypeSymbol* enclosingCls = nullptr;
             if (currentFn_) {
-                for (const auto& [m2, fn] : methodFns_)
-                    if (fn == currentFn_ && m2->parent) {
-                        enclosingCls = m2->parent;
-                        break;
-                    }
-                if (!enclosingCls && currentSpecMethodSymbol_)
-                    enclosingCls = currentSpecMethodSymbol_->parent;
                 // §22.12 / §14.1 (v0.313, #5226): inside a LAMBDA body
                 // `currentFn_` is the lambda's own function (never in
-                // methodFns_), so the lookups above miss; the method whose
-                // body encloses the lambda is `currentMethod_`.
-                if (!enclosingCls && currentMethod_)
-                    enclosingCls = currentMethod_->parent;
+                // methodFns_); its LEXICAL enclosing type was recorded by sema
+                // and registered by lowerLambda. Keyed by function, so a body
+                // emitted lazily from another member cannot see a stale one.
+                auto lit = lambdaFnEnclosingType_.find(currentFn_);
+                if (lit != lambdaFnEnclosingType_.end())
+                    enclosingCls = lit->second;
+                if (!enclosingCls)
+                    for (const auto& [m2, fn] : methodFns_)
+                        if (fn == currentFn_ && m2->parent) {
+                            enclosingCls = m2->parent;
+                            break;
+                        }
+                if (!enclosingCls && currentSpecMethodSymbol_)
+                    enclosingCls = currentSpecMethodSymbol_->parent;
             }
             if (enclosingCls && enclosingCls != ms->parent) {
                 sema::TypeRef synth;
@@ -12863,19 +12866,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // Mirrors the #1101-C bare instance arm above.
             const sema::TypeSymbol* enclosingCls = nullptr;
             if (currentFn_) {
-                for (const auto& [m2, fn] : methodFns_)
-                    if (fn == currentFn_ && m2->parent) {
-                        enclosingCls = m2->parent;
-                        break;
-                    }
-                if (!enclosingCls && currentSpecMethodSymbol_)
-                    enclosingCls = currentSpecMethodSymbol_->parent;
                 // §22.12 / §14.1 (v0.313, #5226): inside a LAMBDA body
                 // `currentFn_` is the lambda's own function (never in
-                // methodFns_), so the lookups above miss; the method whose
-                // body encloses the lambda is `currentMethod_`.
-                if (!enclosingCls && currentMethod_)
-                    enclosingCls = currentMethod_->parent;
+                // methodFns_); its LEXICAL enclosing type was recorded by sema
+                // and registered by lowerLambda. Keyed by function, so a body
+                // emitted lazily from another member cannot see a stale one.
+                auto lit = lambdaFnEnclosingType_.find(currentFn_);
+                if (lit != lambdaFnEnclosingType_.end())
+                    enclosingCls = lit->second;
+                if (!enclosingCls)
+                    for (const auto& [m2, fn] : methodFns_)
+                        if (fn == currentFn_ && m2->parent) {
+                            enclosingCls = m2->parent;
+                            break;
+                        }
+                if (!enclosingCls && currentSpecMethodSymbol_)
+                    enclosingCls = currentSpecMethodSymbol_->parent;
             }
             if (enclosingCls && enclosingCls != ms->parent) {
                 sema::TypeRef synth;

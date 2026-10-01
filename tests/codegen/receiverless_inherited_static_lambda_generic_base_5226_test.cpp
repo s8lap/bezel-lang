@@ -243,3 +243,142 @@ public class Program
 end Program;
 )BZL", "hello\n");
 }
+
+// NO-REGRESSION rows (fix-forward of #5226): a lambda in a member body that is
+// emitted LAZILY from another member (here `class E: B<int>`'s `Run()` forces
+// `D<string>`'s specialized ctor / field initializer) must resolve its enclosing
+// class lexically (D<T>), never from a stale emitter-global "current method"
+// (E). These pass on the base too; they pin that the fix does not break them.
+BEZEL_TEST(receiverless_inherited_static_lambda_generic_base_5226, ctor_body_lambda_forced_from_other_class) {
+    expectPlain(R"BZL(
+module M;
+public class B<T>
+  public static _c: int := 0;
+  public _i: int := 0;
+  public constructor() end constructor;
+  public static method Bump(): int
+    B<T>._c := B<T>._c + 1;
+    return B<T>._c;
+  end Bump;
+  public method IBump(): int
+    B<T>._c := B<T>._c + 10;
+    return B<T>._c;
+  end IBump;
+end B;
+public class D<T>: B<T>
+  public _r: int := 0;
+  public constructor()
+    base();
+    var f := lambda(): int => Bump();
+    _r := f();
+  end constructor;
+end D;
+public class E: B<int>
+  public constructor() base(); end constructor;
+  public method Run(): int
+    var d := new D<string>();
+    return d._r;
+  end Run;
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E();
+    Console.WriteLine(e.Run());
+    Console.WriteLine(B<string>._c);
+    Console.WriteLine(B<int>._c);
+    return 0;
+  end Main;
+end Program;
+)BZL", "1\n1\n0\n");
+}
+
+BEZEL_TEST(receiverless_inherited_static_lambda_generic_base_5226, field_init_lambda_forced_from_other_class) {
+    expectPlain(R"BZL(
+module M;
+public class B<T>
+  public static _c: int := 0;
+  public _i: int := 0;
+  public constructor() end constructor;
+  public static method Bump(): int
+    B<T>._c := B<T>._c + 1;
+    return B<T>._c;
+  end Bump;
+  public method IBump(): int
+    B<T>._c := B<T>._c + 10;
+    return B<T>._c;
+  end IBump;
+end B;
+public class D<T>: B<T>
+  public _f: () -> int := lambda(): int => Bump();
+  public constructor() base(); end constructor;
+  public static method Inner(): int
+    var f := lambda(): int => Bump();
+    return f();
+  end Inner;
+  public method I(): int
+    var f := lambda(): int => IBump();
+    return f();
+  end I;
+end D;
+public class E: B<int>
+  public constructor() base(); end constructor;
+  public method Run(): int
+    var d := new D<string>();
+    var a := d._f();
+    Console.WriteLine($"f={a}");
+    var b := D<string>.Inner();
+    Console.WriteLine($"inner={b}");
+    var c := d.I();
+    Console.WriteLine($"I={c}");
+    return 0;
+  end Run;
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E();
+    Console.WriteLine(e.Run());
+    Console.WriteLine(B<string>._c);
+    Console.WriteLine(B<int>._c);
+    return 0;
+  end Main;
+end Program;
+)BZL", "f=1\ninner=2\nI=12\n0\n12\n0\n");
+}
+
+BEZEL_TEST(receiverless_inherited_static_lambda_generic_base_5226, static_field_init_lambda_forced_from_other_class) {
+    expectBoth(R"BZL(
+module M;
+public class B<T>
+  public static _c: int := 0;
+  public _i: int := 0;
+  public constructor() end constructor;
+  public static method Bump(): int
+    B<T>._c := B<T>._c + 1;
+    return B<T>._c;
+  end Bump;
+  public method IBump(): int
+    B<T>._c := B<T>._c + 10;
+    return B<T>._c;
+  end IBump;
+end B;
+public class F: B<int>
+  public static readonly _sf: () -> int := lambda(): int => Bump();
+  public constructor() base(); end constructor;
+end F;
+public class G: B<string>
+  public constructor() base(); end constructor;
+  public method Run(): int
+    return F._sf();
+  end Run;
+end G;
+public class Program
+  public static method Main(): int
+    var g := new G();
+    Console.WriteLine(g.Run());
+    Console.WriteLine(B<int>._c);
+    Console.WriteLine(B<string>._c);
+    return 0;
+  end Main;
+end Program;
+)BZL", "1\n1\n0\n");
+}

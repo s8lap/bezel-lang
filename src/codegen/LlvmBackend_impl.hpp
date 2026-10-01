@@ -3057,6 +3057,13 @@ private:
     // carries the ORIGINAL MethodSymbol* being specialized so lowerWith can find
     // the parent TypeSymbol without requiring specFn to be in methodFns_.
     sema::MethodSymbol* currentSpecMethodSymbol_ = nullptr;
+    // fix #5226 (§22.12 / §14.1, v0.313): lambda function -> the type whose
+    // member body lexically encloses the lambda (SemaContext::
+    // lambdaEnclosingType), registered when lowerLambda enters the lambda's
+    // function. Keyed by function, so no emitter-global state can go stale when
+    // a body is emitted lazily from another member.
+    std::unordered_map<const llvm::Function*, const sema::TypeSymbol*>
+        lambdaFnEnclosingType_;
     // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): the record TypeSymbol of the
     // CONSTRUCTOR currently being emitted. `currentReceiverRecordType`'s
     // methodFns_/currentSpecMethodSymbol_ lookup misses ctor bodies because

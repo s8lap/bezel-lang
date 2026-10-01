@@ -69,6 +69,15 @@ const Entry kAstKeyedTables[] = {
     {"lambdaParams_",
      "CARRIED verbatim by all four paths: method + ctor (#2839), "
      "field-init (#2856), dtor (#2855)"},
+    {"lambdaEnclosingType_",
+     "NOT carried (fix #5226). Its value is a TypeSymbol* of the compiling "
+     "context; a re-parsed imported generic body's fresh context holds "
+     "DIFFERENT TypeSymbol objects, so a verbatim copy would dangle into the "
+     "wrong arena and a remap is not warranted for one consumer. The consumer "
+     "(lowerCallDispatch's receiverless inherited-call arms) treats a missing "
+     "entry as 'unknown' and falls back to the pre-#5226 methodFns_ / "
+     "currentSpecMethodSymbol_ chain, i.e. an unchanged degradation for a "
+     "lambda inside an imported generic body"},
     {"exprExtBindings_",
      "NOT carried, and proven UNREACHABLE: a body naming an extension method "
      "declines reconstruction at #783's gate before this table is consulted"},
