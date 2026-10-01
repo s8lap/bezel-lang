@@ -11940,6 +11940,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(ce->scrutinee.get(), scrutTy);
+        // §19.3 (v0.313, #5188): the scrutinee's DECLARED type, for the
+        // different-value-type type-pattern reject.
+        TypeRef* scrutDecl5188 =
+            caseScrutineeDeclaredType(ce->scrutinee.get(), scrutTy);
         // §19.3 / §16.6 / §7.11 (v0.286, #3298; v0.310, #5143 ruling): a
         // relational or range pattern requires a NON-NULLABLE scrutinee —
         // value or reference, and keyed on the pattern's KIND rather than on
@@ -12157,7 +12161,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // codegen leaves `case.end` unterminated (malformed IR / ICE).
             if (auto* np =
                     dynamic_cast<const ast::NamedPattern*>(arm.pattern.get()))
-                checkTopLevelNamedPattern(np, scrutTy);
+                checkTopLevelNamedPattern(np, scrutTy, scrutDecl5188);
             // §19.3 (v0.311, #5188): primitive-keyword-led TypePattern
             // (`case c of string`, `case c of int`, …). Mirror of the
             // CaseStmt arm in ExprTypecheck.cpp — the parser routes the bare
@@ -12183,6 +12187,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 "static type — a value-type scrutinee can "
                                 "never match a reference-typed type pattern "
                                 "(§19.3 / §19.5)");
+                    }
+                    // §19.3 / Appendix C.1 (v0.313, #5188): a concrete value
+                    // scrutinee against a pattern naming a different value
+                    // type could never succeed.
+                    else if (valueTypeMismatchForCasePattern(scrutDecl5188,
+                                                             tpTy)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, tp->span.begin,
+                            otherValueTypePatternMessage(tpName));
                     }
                 }
             }
@@ -12291,6 +12304,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // one fires at the instantiation site for a BARE
                     // generic-parameter scrutinee; this one fires at admission
                     // on a concrete value-shaped scrutinee. Both stay live.
+                    // §19.3 / Appendix C.1 (v0.313, #5188): a typed binding
+                    // naming a value type other than the (concrete value)
+                    // scrutinee's own could never match.
+                    if (valueTypeMismatchForCasePattern(scrutDecl5188,
+                                                        bndTy))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            otherValueTypePatternMessage(
+                                bp->type->name && !bp->type->name->parts.empty()
+                                    ? bp->type->name->parts.back()
+                                    : std::string_view{}));
                     bool scrutIsValueShape =
                         isValueScrutineeShapeForTypePattern(scrutTy);
                     if (scrutIsValueShape) {
@@ -13699,6 +13723,19 @@ bool isReferenceTypePatternName(std::string_view name,
                ts->kind == ast::TypeDeclKind::Interface;
     }
     return false;
+}
+
+bool valueTypeMismatchForCasePattern(const sema::TypeRef* scrutDecl,
+                                     const sema::TypeRef* patTy) {
+    return valueTypeMismatch5175(scrutDecl, patTy);
+}
+
+std::string otherValueTypePatternMessage(std::string_view patName) {
+    return "type pattern `" + std::string(patName) +
+           "` is incompatible with the scrutinee's static type — a "
+           "value-type scrutinee can never match a type pattern naming a "
+           "different value type; only its own type or the nullable form of "
+           "its own type is admitted (§19.3, Appendix C.1)";
 }
 
 } // namespace bezel::sema

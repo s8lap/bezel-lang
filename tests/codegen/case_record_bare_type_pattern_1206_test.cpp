@@ -12,10 +12,13 @@
 // handled `var q: Pt =>`.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -35,15 +38,19 @@ BEZEL_TEST(case_record_bare_type_pattern_1206, record_bare_type_matches) {
         "end Main; end C;"), 7);
 }
 
-// §19.5 (#1206): a bare record type-name pattern over a DIFFERENT record type
-// never matches; the wildcard arm fires.  Tests the sameType=false path.
-BEZEL_TEST(case_record_bare_type_pattern_1206, record_bare_type_nonmatch_falls_through) {
-    BEZEL_EXPECT_EQ(run(
+// §19.3 / Appendix C.1 (v0.313, #5188) FLIP (was: never matches, wildcard
+// fires, exit 0): a bare record type-name pattern over a DIFFERENT record type
+// can never succeed and is now a compile error. The same-type row above is
+// unchanged.
+BEZEL_TEST(case_record_bare_type_pattern_1206, record_bare_type_nonmatch_rejected_5188) {
+    auto r = runAot(
         "module M; record Pt(x: int, y: int); record Qt(a: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(1, 2); "
-        "  return (case p of Qt => 5, _ => 0); "  // Qt ≠ Pt → 0
-        "end Main; end C;"), 0);
+        "  return (case p of Qt => 5, _ => 0); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "naming a different value type"));
 }
 
 // §10 (#1206): a bare ENUM type-name pattern over an enum scrutinee.

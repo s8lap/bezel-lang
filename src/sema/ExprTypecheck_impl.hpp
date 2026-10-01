@@ -174,6 +174,19 @@ bool isReferenceTypePattern(const TypeRef* patTy, std::string_view nameHint);
 // predicate uses.
 bool isReferenceTypePatternName(std::string_view name, const TypeSymbol* ts);
 
+// §19.3 / Appendix C.1 (v0.313, #5188): the "different value type" half of
+// the value-scrutinee type-pattern reject. True iff `scrutDecl` (the
+// scrutinee's DECLARED type) and `patTy` are both concrete value types
+// (primitive other than string/Object, unit, inline array, record/enum/choice
+// declaration; a nullable form counts as its underlying type; a type
+// parameter, a Named with no declaration, never does) and `patTy` is not the
+// scrutinee's own type. Shares its decision with the is/is not/as rule
+// (§12.7, #5175: valueTypeMismatch5175) so the two stay consistent.
+bool valueTypeMismatchForCasePattern(const TypeRef* scrutDecl,
+                                     const TypeRef* patTy);
+// Diagnostic text for the above, shared by every case-pattern site.
+std::string otherValueTypePatternMessage(std::string_view patName);
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
@@ -1591,7 +1604,13 @@ private:
     // §19.6); in expression position `case.end` was left unterminated (malformed
     // IR / ICE). Engaged for a top-level NamedPattern from both the CaseExpr and
     // CaseStmt handlers.
-    void checkTopLevelNamedPattern(const ast::NamedPattern* np, TypeRef* scrutTy);
+    void checkTopLevelNamedPattern(const ast::NamedPattern* np, TypeRef* scrutTy,
+                                   TypeRef* scrutDecl = nullptr);
+    // §19.3 (v0.313, #5188): the scrutinee's DECLARED type for the
+    // different-value-type reject — `declaredTypeOf` for a simple local /
+    // parameter (a carrier narrowed to a value type keeps its declared
+    // Object/interface kind, §12.7 "Value-typed operands"), else `scrutTy`.
+    TypeRef* caseScrutineeDeclaredType(const ast::Expr* scrut, TypeRef* scrutTy);
 
     // §19.3 (#1847): shared diagnostic for a top-level bare-identifier pattern
     // that resolves to a runtime VALUE (a local, parameter, or field) rather

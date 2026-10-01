@@ -3058,7 +3058,9 @@ bool ExprTC::caseArmsExhaustive(
 // is rejected here (codegen would otherwise silently drop the arm / emit
 // malformed IR).
 void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
-                                       TypeRef* scrutTy) {
+                                       TypeRef* scrutTy,
+                                       TypeRef* scrutDecl) {
+    if (!scrutDecl) scrutDecl = scrutTy;
     if (!np || !np->name || np->name->parts.empty()) return;
     // A scrutinee-less `case`/`when` (its arms are boolean CONDITION patterns,
     // §19.1) and a scrutinee whose type failed to resolve (Error kind — a
@@ -3142,6 +3144,28 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
                     "type — a value-type scrutinee can never match "
                     "a reference-typed type pattern (§19.3 / §19.5)");
         }
+        // §19.3 / Appendix C.1 (v0.313, #5188): the pattern names a VALUE
+        // type (record/enum/choice) other than the concrete value
+        // scrutinee's own (nullable form counts as its own). A type
+        // parameter is never a TypeSymbol here, so it stays admitted.
+        if (scrutDecl && isValueScrutineeShapeForTypePattern(scrutDecl) &&
+            (foundTs->kind == ast::TypeDeclKind::Record ||
+             foundTs->kind == ast::TypeDeclKind::Enum ||
+             foundTs->kind == ast::TypeDeclKind::Choice)) {
+            bool isOwn = false;
+            if (scrutDecl->kind == TypeRef::Kind::Named)
+                for (const auto& sym : ctx_.symbols())
+                    if (auto* ts = dynamic_cast<const TypeSymbol*>(sym.get()))
+                        if (ts->name == last &&
+                            static_cast<const void*>(ts) ==
+                                static_cast<const void*>(
+                                    scrutDecl->declaration))
+                            isOwn = true;
+            if (!isOwn)
+                ctx_.diagnostics().report(
+                    Severity::Error, np->span.begin,
+                    otherValueTypePatternMessage(last));
+        }
         return;  // valid type-test pattern
     }
     for (const auto& sym : ctx_.symbols()) {
@@ -3183,6 +3207,19 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
                     "` is incompatible with the scrutinee's static "
                     "type — a value-type scrutinee can never match a "
                     "reference-typed type pattern (§19.3 / §19.5)");
+        }
+        // §19.3 / Appendix C.1 (v0.313, #5188): a bare value-primitive
+        // name (`long`) over a concrete value scrutinee of another type.
+        {
+            PrimitiveType pp = primitiveFromName(last);
+            if (pp != PrimitiveType::None && pp != PrimitiveType::String &&
+                pp != PrimitiveType::Object && scrutDecl &&
+                isValueScrutineeShapeForTypePattern(scrutDecl) &&
+                !(scrutDecl->kind == TypeRef::Kind::Primitive &&
+                  scrutDecl->primitive == pp))
+                ctx_.diagnostics().report(
+                    Severity::Error, np->span.begin,
+                    otherValueTypePatternMessage(last));
         }
         return;  // built-in type (authoritative table)
     }
@@ -12716,6 +12753,19 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
     return true;
 }
 
+// §19.3 (v0.313, #5188): see the declaration in ExprTypecheck_impl.hpp.
+TypeRef* ExprTC::caseScrutineeDeclaredType(const ast::Expr* scrut,
+                                           TypeRef* scrutTy) {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(scrut);
+        id && id->name != "this" && id->name != "base") {
+        if (Symbol* sym = lookupName(id->name))
+            if (dynamic_cast<LocalSymbol*>(sym) ||
+                dynamic_cast<ParameterSymbol*>(sym))
+                if (TypeRef* dt = declaredTypeOf(sym)) return dt;
+    }
+    return scrutTy;
+}
+
 // The resolved declared TypeRef of a local or parameter, or null for any other
 // symbol kind (issue #418). Locals carry an already-resolved declType; params
 // carry an ast::Type that must be looked up (or a context-supplied
@@ -22233,6 +22283,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(cs->scrutinee.get(), scrutTy);
+        // §19.3 (v0.313, #5188): the scrutinee's DECLARED type, for the
+        // different-value-type type-pattern reject.
+        TypeRef* scrutDecl5188 =
+            caseScrutineeDeclaredType(cs->scrutinee.get(), scrutTy);
         // fix #4139 (§19.6, v0.298): cache the shared exhaustiveness
         // verdict — "does this case's no-match fallthrough edge provably
         // never execute" — on the AST for the ownership pass's CaseStmt
@@ -22391,7 +22445,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // silently drop the arm — the mandatory `_` skipped, §19.6).
             if (auto* np =
                     dynamic_cast<const ast::NamedPattern*>(arm.pattern.get()))
-                checkTopLevelNamedPattern(np, scrutTy);
+                checkTopLevelNamedPattern(np, scrutTy, scrutDecl5188);
             // §19.3 (v0.311, #5188): primitive-keyword-led TypePattern
             // (`case c of string`, `case c of int`, …). The parser
             // (Parser_Exprs.cpp:~1546) routes the bare keyword through a
@@ -22419,6 +22473,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "static type — a value-type scrutinee can "
                                 "never match a reference-typed type pattern "
                                 "(§19.3 / §19.5)");
+                    }
+                    // §19.3 / Appendix C.1 (v0.313, #5188): a concrete value
+                    // scrutinee against a pattern naming a different value
+                    // type could never succeed.
+                    else if (valueTypeMismatchForCasePattern(scrutDecl5188,
+                                                             tpTy)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, tp->span.begin,
+                            otherValueTypePatternMessage(tpName));
                     }
                 }
             }
@@ -22545,6 +22608,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // one fires at the instantiation site for a BARE
                     // generic-parameter scrutinee; this one fires at admission
                     // on a concrete value-shaped scrutinee. Both stay live.
+                    // §19.3 / Appendix C.1 (v0.313, #5188): a typed binding
+                    // naming a value type other than the (concrete value)
+                    // scrutinee's own could never match.
+                    if (valueTypeMismatchForCasePattern(scrutDecl5188,
+                                                        bndTy))
+                        ctx_.diagnostics().report(
+                            Severity::Error, bp->span.begin,
+                            otherValueTypePatternMessage(
+                                bp->type->name && !bp->type->name->parts.empty()
+                                    ? bp->type->name->parts.back()
+                                    : std::string_view{}));
                     bool scrutIsValueShape =
                         isValueScrutineeShapeForTypePattern(scrutTy);
                     if (scrutIsValueShape) {

@@ -26,10 +26,13 @@
 // abort on an i32, so they remain a clean compile error.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& src) {
@@ -42,25 +45,36 @@ bool compileErrored(const std::string& src) {
 }
 }  // namespace
 
+// NOTE (v0.313, #5188): the two concrete value/value mismatch rows below
+// (bool, double over int) now pin the compile-time reject, not the runtime
+// `_` arm; the original #1473 runtime behavior is superseded by §19.3.
 // §19.3/§19.5 (#1473): the issue's concrete repro — an `int` scrutinee vs a
 // `var b: bool` binding can NEVER match, so the `_` arm is selected (0), not the
 // mismatched binding arm (1). Pre-fix this returned 1 (unsound).
-BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_bool_binding_no_match) {
-    BEZEL_EXPECT_EQ(run(
+BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_bool_binding_rejected_5188) {
+    // §19.3 / Appendix C.1 (v0.313, #5188) FLIP (was: never matches, `_` arm,
+    // exit 0): an `int` scrutinee vs `var b: bool` can never succeed and is now
+    // a compile error.
+    auto r = runAot(
         "module M; class App public static method Main(): int "
         "  var x: int := 5; "
         "  return (case x of var b: bool => 1, _ => 0); "
-        "end Main; end App;"), 0);
+        "end Main; end App;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "naming a different value type"));
 }
 
 // §19.3 (#1473): a `double`-typed binding over an `int` scrutinee likewise never
 // matches — falls through to `_`.
-BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_double_binding_no_match) {
-    BEZEL_EXPECT_EQ(run(
+BEZEL_TEST(case_typed_binding_value_scrutinee_1473, int_scrut_double_binding_rejected_5188) {
+    // §19.3 / Appendix C.1 (v0.313, #5188) FLIP (was: never matches, exit 0).
+    auto r = runAot(
         "module M; class App public static method Main(): int "
         "  var x: int := 5; "
         "  return (case x of var d: double => 1, _ => 0); "
-        "end Main; end App;"), 0);
+        "end Main; end App;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "naming a different value type"));
 }
 
 // Regression (#1473): the statically-satisfied case still matches — a `var n:

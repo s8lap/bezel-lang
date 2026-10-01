@@ -10,10 +10,13 @@
 // scrutinee — a pointer) remains a genuine runtime is-a (the §19.5 unbox case).
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 int run(const std::string& prog) {
@@ -33,15 +36,18 @@ BEZEL_TEST(case_record_typed_binding_801, record_same_type_matches) {
         "end Main; end C;"), 42);
 }
 
-// §9.6: a typed binding of a DIFFERENT record type over an unboxed record never
-// matches (records have no subtyping) — it falls through to the wildcard arm.
-BEZEL_TEST(case_record_typed_binding_801, record_different_type_falls_through) {
-    BEZEL_EXPECT_EQ(run(
+// §19.3 / Appendix C.1 (v0.313, #5188) FLIP (was: never matches, falls through
+// to the wildcard, exit 99): a typed binding of a DIFFERENT record type over an
+// unboxed record can never succeed and is now a compile error.
+BEZEL_TEST(case_record_typed_binding_801, record_different_type_rejected_5188) {
+    auto r = runAot(
         "module M; record Pt(x: int, y: int); record Qt(a: int); "
         "class C public static method Main(): int "
         "  var p := new Pt(40, 2); "
-        "  return (case p of var q: Qt => q.a, _ => 99); "  // 99
-        "end Main; end C;"), 99);
+        "  return (case p of var q: Qt => q.a, _ => 99); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "naming a different value type"));
 }
 
 // §10: a typed binding over an unboxed enum scrutinee (an i32 value) — static
