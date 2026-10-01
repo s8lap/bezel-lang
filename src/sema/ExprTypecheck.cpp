@@ -3141,8 +3141,10 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
         // form. The choice case branch above (returning early) ensures
         // the §35.5 carve-out holds: a payload-free case name is a CASE
         // pattern, not a type test, and the check never fires for it.
+        // §12.7 (v0.313, #5239): read the DECLARED type, so a type-narrowed
+        // Object/interface carrier stays a boxed reference operand.
         if (scrutTy &&
-            isValueScrutineeShapeForTypePattern(scrutTy) &&
+            isValueScrutineeShapeForTypePattern(scrutDecl) &&
             isReferenceTypePatternName(last, foundTs)) {
             ctx_.diagnostics().report(
                 Severity::Error, np->span.begin,
@@ -3205,8 +3207,10 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
     // primitive is not reference-typed and the check is silent on it).
     if (isBuiltinTypeName(last) || last == "string" || last == "Object" ||
         common::isBuiltinExceptionName(last)) {
+        // §12.7 (v0.313, #5239): read the DECLARED type, so a type-narrowed
+        // Object/interface carrier stays a boxed reference operand.
         if (scrutTy &&
-            isValueScrutineeShapeForTypePattern(scrutTy) &&
+            isValueScrutineeShapeForTypePattern(scrutDecl) &&
             isReferenceTypePatternName(last, /*ts=*/nullptr)) {
             ctx_.diagnostics().report(
                 Severity::Error, np->span.begin,
@@ -22554,7 +22558,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         (tp->type->name && !tp->type->name->parts.empty())
                             ? tp->type->name->parts.back()
                             : std::string_view{};
-                    if (isValueScrutineeShapeForTypePattern(scrutTy) &&
+                    // §12.7 (v0.313, #5239): the DECLARED type, not the
+                    // narrowed one.
+                    if (isValueScrutineeShapeForTypePattern(scrutDecl5188) &&
                         isReferenceTypePattern(tpTy, tpName)) {
                         ctx_.diagnostics().report(
                             Severity::Error, tp->span.begin,
@@ -22709,8 +22715,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 bp->type->name && !bp->type->name->parts.empty()
                                     ? bp->type->name->parts.back()
                                     : std::string_view{}));
+                    // §12.7 (v0.313, #5239): the DECLARED type, not the
+                    // narrowed one.
                     bool scrutIsValueShape =
-                        isValueScrutineeShapeForTypePattern(scrutTy);
+                        isValueScrutineeShapeForTypePattern(scrutDecl5188);
                     if (scrutIsValueShape) {
                         if (bndIsRefType)
                             ctx_.diagnostics().report(

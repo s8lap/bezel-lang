@@ -12233,7 +12233,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         (tp->type->name && !tp->type->name->parts.empty())
                             ? tp->type->name->parts.back()
                             : std::string_view{};
-                    if (isValueScrutineeShapeForTypePattern(scrutTy) &&
+                    // §12.7 (v0.313, #5239): the DECLARED type, not the
+                    // narrowed one.
+                    if (isValueScrutineeShapeForTypePattern(scrutDecl5188) &&
                         isReferenceTypePattern(tpTy, tpName)) {
                         ctx_.diagnostics().report(
                             Severity::Error, tp->span.begin,
@@ -12370,8 +12372,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 bp->type->name && !bp->type->name->parts.empty()
                                     ? bp->type->name->parts.back()
                                     : std::string_view{}));
+                    // §12.7 (v0.313, #5239): the DECLARED type, not the
+                    // narrowed one.
                     bool scrutIsValueShape =
-                        isValueScrutineeShapeForTypePattern(scrutTy);
+                        isValueScrutineeShapeForTypePattern(scrutDecl5188);
                     if (scrutIsValueShape) {
                         if (bndIsRefType)
                             ctx_.diagnostics().report(
