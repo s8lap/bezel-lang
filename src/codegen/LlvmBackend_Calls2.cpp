@@ -12674,6 +12674,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     }
                 if (!enclosingCls && currentSpecMethodSymbol_)
                     enclosingCls = currentSpecMethodSymbol_->parent;
+                // §22.12 / §14.1 (v0.313, #5226): inside a LAMBDA body
+                // `currentFn_` is the lambda's own function (never in
+                // methodFns_), so the lookups above miss; the method whose
+                // body encloses the lambda is `currentMethod_`.
+                if (!enclosingCls && currentMethod_)
+                    enclosingCls = currentMethod_->parent;
             }
             if (enclosingCls && enclosingCls != ms->parent) {
                 sema::TypeRef synth;
@@ -12864,6 +12870,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     }
                 if (!enclosingCls && currentSpecMethodSymbol_)
                     enclosingCls = currentSpecMethodSymbol_->parent;
+                // §22.12 / §14.1 (v0.313, #5226): inside a LAMBDA body
+                // `currentFn_` is the lambda's own function (never in
+                // methodFns_), so the lookups above miss; the method whose
+                // body encloses the lambda is `currentMethod_`.
+                if (!enclosingCls && currentMethod_)
+                    enclosingCls = currentMethod_->parent;
             }
             if (enclosingCls && enclosingCls != ms->parent) {
                 sema::TypeRef synth;
