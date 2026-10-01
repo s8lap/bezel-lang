@@ -36,6 +36,10 @@ void reportNestedInlineArrayError(SemaContext& ctx, SourceLocation loc) {
 // head can name a type parameter.
 std::string_view paramHead(const TypeRef* sub) {
     if (!sub) return {};
+    // fix #4698 (§2.2, v0.313): an alias-qualified built-in (`D.Stopwatch`,
+    // alias segment dropped) is never a type-parameter reference, even when a
+    // type parameter shares its bare name.
+    if (sub->astNode && sub->astNode->aliasQualifiedBuiltin) return {};
     if (sub->astNode && sub->astNode->name && sub->astNode->name->parts.size() == 1) {
         return sub->astNode->name->parts.front();
     }

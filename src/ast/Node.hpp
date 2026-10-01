@@ -1004,6 +1004,11 @@ struct Type : Node {
     // Named:
     std::unique_ptr<QualifiedName> name;
     std::vector<std::unique_ptr<Type>> genericArgs;
+    // fix #4698 (§2.2, v0.313): set by sema when the `Alias.` segment of an
+    // alias-qualified compiler-built-in (`Th.CancellationTokenSource`) was
+    // dropped from `name`. The type then always names the BUILT-IN: scope
+    // lookup (type parameter, module type, imported type) must not capture it.
+    bool aliasQualifiedBuiltin = false;
     // InlineArray (`[N]T` / `[N owned]T`):
     std::unique_ptr<Expr> arraySize;
     bool arrayOwned = false;
@@ -1099,6 +1104,13 @@ struct NullLiteralExpr : Expr {};
 struct IdentifierExpr : Expr {
     std::string_view name;
     std::vector<std::unique_ptr<Type>> typeArgs;
+    // fix #4698 (§2.2, v0.313): set by sema when this identifier is the
+    // synthesized head of an alias-qualified compiler-built-in
+    // (`D.Stopwatch.StartNew()` under `import System.Diagnostics as D;`, the
+    // `Alias.` segment dropped). The alias is a qualifier, not a rename, so the
+    // head always names the BUILT-IN: scope lookup (a same-named local,
+    // type parameter, module type or imported type) must not capture it.
+    bool aliasQualifiedBuiltin = false;
     // fix #4246 (§28.3 / §28.6, v0.298): set by the ownership pass on the
     // RECEIVER occurrence of an explicit `x.Dispose()` / `x?.Dispose()` /
     // `x!.Dispose()` call whose LOCAL is, at THIS exact program point (per

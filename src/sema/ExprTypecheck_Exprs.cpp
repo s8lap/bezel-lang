@@ -1630,6 +1630,9 @@ void ExprTC::normalizeAliasQualifiedBuiltinHead(
     auto bare = std::make_unique<ast::IdentifierExpr>();
     bare->span = inner->span;
     bare->name = inner->member;
+    // The qualifier is gone from the AST, so remember it: the head must keep
+    // naming the built-in, never a same-named local / type / import.
+    bare->aliasQualifiedBuiltin = true;
     const_cast<ast::MemberAccessExpr&>(ma).target = std::move(bare);
 }
 
@@ -1788,6 +1791,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     }
                 }
             }
+            return;
+        }
+        // fix #4698 (§2.2, v0.313): the head of an alias-qualified built-in
+        // (`D.Stopwatch.…`) names the built-in by qualifier, so no scope
+        // lookup (local, parameter, type parameter, module or imported type of
+        // the same bare name) may capture it. normalizeAliasQualifiedBuiltinHead
+        // admitted it only for a built-in whose home module is the aliased one.
+        if (id->aliasQualifiedBuiltin) {
+            ctx_.setExprSymbol(&e, builtinClassSym(id->name));
             return;
         }
         // §2.7 rule 1 (#2097): in VALUE position — a bare name that is NOT the
@@ -4697,9 +4709,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // with declaration==nullptr; we then verify the name matches one
                 // of the enclosing method or class generic params and that at
                 // least one `new` constraint item is listed for it.
+                // fix #4698 (§2.2, v0.313): an alias-qualified built-in
+                // (`new D.Stopwatch()`) also has a null declaration but is
+                // never a type parameter, whatever type parameter shares its
+                // bare name.
                 if (rt->kind == TypeRef::Kind::Named &&
                     rt->declaration == nullptr &&
                     ne->type && ne->type->name &&
+                    !ne->type->aliasQualifiedBuiltin &&
                     !ne->type->name->parts.empty()) {
                     std::string_view paramName = ne->type->name->parts.front();
                     // Determine whether paramName is a generic type parameter

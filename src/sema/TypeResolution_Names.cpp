@@ -2589,9 +2589,16 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 common::builtinTypeHomeModuleOf(cand) == modName) {
                 t.name->parts.erase(t.name->parts.begin());
                 first = t.name->parts.front();
+                // The qualifier is gone from the AST; remember it so this
+                // (and any re-resolution) bypasses scope lookup below.
+                const_cast<ast::Type&>(t).aliasQualifiedBuiltin = true;
             }
         }
     }
+    // fix #4698: an alias-qualified built-in names the built-in by qualifier;
+    // a type parameter, module type or imported type of the same bare name
+    // must not capture it (§2.2 "the import stays reachable by qualifier").
+    const bool qualifiedBuiltin = t.aliasQualifiedBuiltin;
     // Primitive check first.
     if (t.name->parts.size() == 1) {
         PrimitiveType prim = primitiveFromName(first);
@@ -2612,15 +2619,16 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         }
     }
     // Look up the first part.
-    Symbol* sym = lookupName(first, scope);
+    Symbol* sym = qualifiedBuiltin ? nullptr : lookupName(first, scope);
     if (!sym) {
         // Unknown — but a null lookup may also mean "name is in scope as
         // a generic-param marker" (we used nullptr to indicate that).
         // Distinguish by checking if the key exists.
         bool isGeneric = false;
-        for (Scope* s = scope; s; s = s->parent) {
-            if (s->names.count(first)) { isGeneric = true; break; }
-        }
+        if (!qualifiedBuiltin)
+            for (Scope* s = scope; s; s = s->parent) {
+                if (s->names.count(first)) { isGeneric = true; break; }
+            }
         if (isGeneric) {
             // Generic parameter — record as a Named with no declaration.
             // Sema slice 3+ will treat generic-param TypeRefs specially.
@@ -2743,7 +2751,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // re-derives the builtin arity and emits the matching `Named` ref.
         {
             std::size_t refArity = t.genericArgs.size();
-            if (refArity > 0) {
+            if (refArity > 0 && !qualifiedBuiltin) {
                 auto* tsymSym = dynamic_cast<TypeSymbol*>(sym);
                 bool symArityMatches = tsymSym &&
                                        tsymSym->genericParams.size() == refArity;
@@ -2798,7 +2806,8 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             // olution.cpp gate that excluded `Counter` at population —
             // here we mirror it so the diagnostic never fires for the
             // held rows even if some other path set the flag.
-            if (!ambiguousAlwaysAvailableNames_.empty() &&
+            if (!qualifiedBuiltin &&
+                !ambiguousAlwaysAvailableNames_.empty() &&
                 ambiguousAlwaysAvailableNames_.count(std::string(first)) &&
                 first != "Counter") {
                 auto impIt = ambiguousAlwaysAvailableNameImportingModule_

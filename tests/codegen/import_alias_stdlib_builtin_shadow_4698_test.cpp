@@ -51,3 +51,20 @@ BEZEL_TEST(import_alias_stdlib_builtin_shadow_4698, alias_static_call_ignores_lo
         "  Console.WriteLine(Stopwatch); "
         "end Main; end C;"), "True\n7");
 }
+
+// A type parameter named like the built-in (generic method `Go<Stopwatch>`)
+// must not capture `D.Stopwatch` in type position (`new D.Stopwatch()`,
+// annotation) or in expression position (`D.Stopwatch.StartNew()`).
+BEZEL_TEST(import_alias_stdlib_builtin_shadow_4698, alias_ignores_type_parameter_named_stopwatch) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; import System.Diagnostics as D; "
+        "class C "
+        "  public static method Go<Stopwatch>(x: Stopwatch) "
+        "    using var s := D.Stopwatch.StartNew(); "
+        "    Console.WriteLine(s.IsRunning); "
+        "    using var t: D.Stopwatch := new D.Stopwatch(); "
+        "    Console.WriteLine(t.IsRunning); "
+        "  end Go; "
+        "  public static method Main() Go<int>(1); end Main; "
+        "end C;"), "True\nFalse");
+}

@@ -19670,7 +19670,11 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
 static bool bareTypeParamRef(const TypeRef* t) {
     if (!t || t->kind != TypeRef::Kind::Named || t->declaration) return false;
     if (t->astNode)
-        return t->astNode->name && t->astNode->name->parts.size() == 1;
+        // fix #4698 (§2.2, v0.313): an alias-qualified built-in
+        // (`D.Stopwatch`, alias segment dropped) is single-part too, but never
+        // a type parameter, whatever parameter shares its bare name.
+        return t->astNode->name && t->astNode->name->parts.size() == 1 &&
+               !t->astNode->aliasQualifiedBuiltin;
     return !t->importedName.empty() && t->genericArgs.empty();
 }
 
@@ -19837,6 +19841,7 @@ TypeRef* ExprTC::substituteReturnType(
     if (declared->kind == TypeRef::Kind::Named && !declared->declaration &&
         declared->astNode && declared->astNode->name &&
         declared->astNode->name->parts.size() == 1 &&
+        !declared->astNode->aliasQualifiedBuiltin &&  // fix #4698
         declared->genericArgs.empty()) {
         // Only a bare param reference has no genericArgs and no declaration.
         // Check if this name is a solved type parameter.
@@ -19972,7 +19977,8 @@ static void collectBoundParamNames(
     std::unordered_set<std::string_view>& boundByArg) {
     if (!pt) return;
     if (pt->kind == ast::TypeKind::Named && pt->name &&
-        pt->name->parts.size() == 1 && paramNames.count(pt->name->parts[0]))
+        pt->name->parts.size() == 1 && !pt->aliasQualifiedBuiltin &&  // #4698
+        paramNames.count(pt->name->parts[0]))
         boundByArg.insert(pt->name->parts[0]);
     for (const auto& ga : pt->genericArgs)
         collectBoundParamNames(ga.get(), paramNames, boundByArg);
