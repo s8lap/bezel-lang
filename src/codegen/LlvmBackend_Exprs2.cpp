@@ -12920,6 +12920,26 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             const sema::TypeRef* scrutTy) {
     if (dynamic_cast<const ast::DiscardPattern*>(pat))
         return builder_.getInt1(true);
+    // fix #5232 (§19.3, v0.313): the scrutinee may be a TYPE PARAMETER (a bare
+    // Named TypeRef with no declaration), which §19.3 says is decided PER
+    // INSTANTIATION — the match verdict reads the SUBSTITUTED type argument,
+    // the same per-instantiation rule that #5195 gave `is` / `as`. Resolve
+    // scrutTy through the active monomorphization substitution so the pattern
+    // branches below can compare to the concrete substituted type. Without
+    // this resolution two silent-wrong-code shapes slipped through:
+    //   * `case v of int` over `v: T` at T=long returns unconditional true at
+    //     the TypePattern branch (the early-return primitive-vs-primitive check
+    //     gates on scrutTy being a concrete Primitive; the unresolved bare-T
+    //     misses that gate and falls through to `builder_.getInt1(true)`).
+    //   * `case v of Pt` over `v: T` at T=Pt misses `scrutTy->declaration ==
+    //     ts` (scrutTy->declaration is null for a bare-T) at the record/enum
+    //     NamedPattern branch, and falls through to the `_` arm (or worse, to
+    //     the #1847 backstop). Same shape for `case v of Color` over `v: T`.
+    // The unresolved template body (emittingGenericTemplateBody_) keeps an
+    // empty genericSubstSemaTy_ so resolveTypeParamRef is a no-op there; the
+    // dead-body backstop below already emits a well-formed never-match.
+    const sema::TypeRef* scrutTyResolved = resolveTypeParamRef(scrutTy);
+    (void)scrutTyResolved;
 
     // §35.5 (v0.200, #2045): a CHOICE scrutinee. The scrutinee's resolved
     // type is a choice (a value-typed sum lowered as `{ i32 tag, … }` per
@@ -13931,7 +13951,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     ts->kind != ast::TypeDeclKind::Enum) return nullptr;
                 if (scrut->getType()->isPointerTy())
                     return builder_.getInt1(false);
-                bool sameType = scrutTy && scrutTy->declaration == ts;
+                bool sameType = scrutTyResolved && scrutTyResolved->declaration == ts;
                 // fix #4082 (§19.5 / §3.6 rule 4 / §27.8, v0.294): a bare
                 // pattern resolved THROUGH A TYPE ALIAS that names a SPECIFIC
                 // generic instantiation (e.g. `type AliasBoxStr := Box<string>;`
@@ -14064,13 +14084,13 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // wrongly fired such an arm (a wrong value). When both the pattern and the
         // (non-nullable, non-Object) scrutinee are concrete primitives that
         // differ, return false; an Object/boxed scrutinee keeps the runtime path.
-        if (tp->type && scrutTy &&
-            scrutTy->kind == sema::TypeRef::Kind::Primitive &&
-            scrutTy->primitive != sema::PrimitiveType::Object) {
+        if (tp->type && scrutTyResolved &&
+            scrutTyResolved->kind == sema::TypeRef::Kind::Primitive &&
+            scrutTyResolved->primitive != sema::PrimitiveType::Object) {
             const sema::TypeRef* patTy = ctx_.resolvedType(*tp->type);
             if (patTy && patTy->kind == sema::TypeRef::Kind::Primitive &&
                 patTy->primitive != sema::PrimitiveType::Object &&
-                patTy->primitive != scrutTy->primitive)
+                patTy->primitive != scrutTyResolved->primitive)
                 return builder_.getInt1(false);
         }
         // §19.5 (#760): "A bare type pattern T matches only non-null values."
