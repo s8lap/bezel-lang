@@ -10451,16 +10451,23 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
         if (target == P::Decimal) {
             llvm::AllocaInst* outSlot = entryAlloca(decTy);
             if (src->getType()->isFloatingPointTy()) {
-                // double/float → decimal: bz_decimal_from_double (§5.2: explicit).
-                // Widen float to double first (the runtime takes double).
-                llvm::Value* dv = src;
-                if (!src->getType()->isDoubleTy())
-                    dv = builder_.CreateFPExt(src, llvm::Type::getDoubleTy(llvm_));
-                auto* fn = declareC("bz_decimal_from_double",
-                                   llvm::Type::getVoidTy(llvm_),
-                                   {llvm::Type::getDoubleTy(llvm_), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {dv, outSlot, getOVEVtable()});
-                emitPendingCheck();  // OverflowException from out-of-range double
+                if (src->getType()->isDoubleTy()) {
+                    // double → decimal: bz_decimal_from_double (§5.2: explicit).
+                    auto* fn = declareC("bz_decimal_from_double",
+                                       llvm::Type::getVoidTy(llvm_),
+                                       {llvm::Type::getDoubleTy(llvm_), ptrTy(), ptrTy()});
+                    builder_.CreateCall(fn, {src, outSlot, getOVEVtable()});
+                    emitPendingCheck();
+                } else {
+                    // float → decimal (§5.2 v0.311, fix #5190): use the dedicated
+                    // bz_decimal_from_float path which reads the float's shortest
+                    // round-trip form (not a double → shortest form).
+                    auto* fn = declareC("bz_decimal_from_float",
+                                       llvm::Type::getVoidTy(llvm_),
+                                       {llvm::Type::getFloatTy(llvm_), ptrTy(), ptrTy()});
+                    builder_.CreateCall(fn, {src, outSlot, getOVEVtable()});
+                    emitPendingCheck();
+                }
             } else if (src->getType()->isIntegerTy()) {
                 // int/long (and narrower integers) → decimal: widen to int32/int64
                 // then call the appropriate from_int.  This covers the explicit
