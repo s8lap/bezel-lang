@@ -13443,6 +13443,25 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     // inner enumerator's reclaim added here matches that existing, established
     // convention for this wrapper rather than introducing new asymmetric
     // gating not part of this fix's scope.
+    // fix #5203 (§29.2 / §28.2, v0.313): when srcTs is its own enumerator
+    // (structurallyIsEnumerator(srcTs) was true → enumTs == srcTs → the
+    // `structurallyIsEnumerator` arm fired at LlvmBackend_Assign.cpp ~L12980),
+    // the result of GetEnumerator(src) — slot 1 of the wrapper — is NOT
+    // necessarily a srcTs instance. A `GetEnumerator() { return _a.GetEnumerator();
+    // }` body (or any body that returns an inner enumerator different from
+    // `this`) puts a builtin Array enumerator (or any other class's instance)
+    // in slot 1, but `enumDisposeFn == srcDisposeFn == srcTs$Dispose` was
+    // resolved against the SOURCE class's layout. Calling it on a non-srcTs
+    // instance is a type confusion — `srcDispose` will read garbage offsets
+    // for the disposed flag and any owned field and SEGV inside DisposeCore.
+    // The wrap's structural `MoveNext`/`Current` paths and the slot-1 dispose
+    // were all baked assuming slot 1 IS the source. We must dispatch on
+    // `srcObj` (slot 2 — guaranteed to be the source class instance) whenever
+    // srcTs == enumTs. The two-class idiom (enumTs != srcTs) is unchanged —
+    // `enumDisposeFn(enumPtr)` is correct there because slot 1 is the
+    // distinct enumerator class instance.
+    bool srcIsOwnEnumerator = (srcTs == enumTs);
+
     llvm::Function* wrapDisposeFn = getOrCreate(prefix + "Dispose",
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         [&](llvm::Function* f) {
@@ -13451,8 +13470,22 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             llvm::Value* self = f->arg_begin();
             llvm::Value* enumF = b.CreateStructGEP(stTy, self, 1);
             llvm::Value* enumPtr = b.CreateLoad(ptrTy(), enumF);
+            // fix #5203: load srcObj BEFORE the dispatch so the srcIsOwnEnumerator
+            // branch can dispatch on the source instance, not on whatever the
+            // source's GetEnumerator() returned into slot 1.
+            llvm::Value* srcF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* srcObj = b.CreateLoad(ptrTy(), srcF);
             if (enumDisposeFn) {
-                b.CreateCall(enumDisposeFn->getFunctionType(), enumDisposeFn, {enumPtr});
+                if (srcIsOwnEnumerator) {
+                    // srcDisposeFn == enumDisposeFn here; dispatch on srcObj so the
+                    // Dispose layout assumption is satisfied regardless of what
+                    // GetEnumerator() returned.
+                    b.CreateCall(srcDisposeFn->getFunctionType(), srcDisposeFn,
+                                 {srcObj});
+                } else {
+                    b.CreateCall(enumDisposeFn->getFunctionType(), enumDisposeFn,
+                                 {enumPtr});
+                }
             }
             auto* freeFnCallee = module_->getOrInsertFunction(
                 "free", llvm::FunctionType::get(
@@ -13461,8 +13494,7 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
             // fix #2389: reclaim enumPtr's block unless it aliases the
             // retained source (slot 2) — see the block comment above.
-            llvm::Value* srcF = b.CreateStructGEP(stTy, self, 2);
-            llvm::Value* srcObj = b.CreateLoad(ptrTy(), srcF);
+            // (srcObj was loaded earlier; srcIsOwnEnumerator dispatched on it.)
             llvm::Value* aliasesSrc =
                 b.CreateICmpEQ(enumPtr, srcObj, "wrapdispose.enum_is_src");
             auto* freeEnumBB =
