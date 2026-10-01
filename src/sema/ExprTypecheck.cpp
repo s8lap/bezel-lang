@@ -890,6 +890,19 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         //     granted totality.
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
+        // §19.1 / §19.6 / §21.7 (v0.311, #5189 / #5167): "Wherever §19
+        // reads the scrutinee's nullability it reads the scrutinee's
+        // static type after §7.4 narrowing at the `case` (the null fact
+        // alone)." `admitsTotality` and the `caseArmsExhaustive` call
+        // below both read the declared bit only — for a §7.4-narrowed
+        // record scrutinee (a value-returning method whose body ends with
+        // `if r <> null then case r of R(var x) => return x; end case;`)
+        // the declared bit is `nullable=true`, the verdict is
+        // non-exhaustive on the null axis, and §21.7's grant is
+        // withheld. Normalize so the same post-§7.4 fact the CaseStmt
+        // visitStmt and CaseExpr sites read gets through here too —
+        // single helper, three callers, so the spellings cannot drift.
+        scrutTy = scrutineeTypeAfterNarrowing(cs->scrutinee.get(), scrutTy);
         bool admitsTotality = scrutTy && (
             // bool bullet (§4.1)
             (scrutTy->kind == TypeRef::Kind::Primitive &&
@@ -2285,6 +2298,13 @@ bool ExprTC::ancestorArmCoversDeterminedLeaf(
 // prove exhaustiveness statically." The diagnostic does not fail
 // compilation (DiagnosticEngine::hasErrors counts only errors).
 void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) {
+    // §19.1 / §19.6 (v0.311, #5189 / #5167): the §19.6 exhaustiveness
+    // verdict reads the scrutinee's nullability AFTER §7.4 narrowing at the
+    // `case` (the null fact alone), not the declared type. Normalize before
+    // the shared verdict below — same helper as stmtAlwaysExits and the
+    // CaseStmt visitStmt site, so the two spellings of `case` cannot drift
+    // on the narrowed-scrutinee verdict.
+    scrutTy = scrutineeTypeAfterNarrowing(ce.scrutinee.get(), scrutTy);
     // Expression-position `case`: emit the §19.6 non-exhaustiveness WARNING via
     // the shared verdict (the discarded return value carries the same fact).
     caseArmsExhaustive(ce.arms, ce.scrutinee.get(), scrutTy, ce.span.begin,
@@ -12978,6 +12998,37 @@ TypeRef* ExprTC::operandStaticTypeAt(const ast::Expr* e, TypeRef* declared) {
     return nonnull;
 }
 
+// §19.1 / §19.6 (v0.311, #5189 / #5167): the scrutinee type after §7.4's
+// null-fact narrowing at the `case`. Per §19.1 verbatim: "Wherever §19
+// reads the scrutinee's nullability — §19.3's pattern rules and §19.6's
+// exhaustiveness proofs — it reads the scrutinee's static type after §7.4
+// narrowing at the `case`, as §7.11 reads an operand's: a scrutinee §7.4
+// has narrowed non-null there is a non-nullable scrutinee." The case-
+// exhaustiveness verdict (`caseArmsExhaustive`) keys its nullable branches
+// on the declared bit only, and §19.6's exhaustiveness bullet closes its
+// value space without a `null` arm when the narrowed type is non-nullable.
+// `operandStaticTypeAt` is the analogous helper for the §6/§7 operator
+// operand path but is primitive-only (`declared->kind != Primitive`
+// returns early, :12811-12813). For a record / enum / choice scrutinee the
+// helper would be a no-op, so a §7.4-narrowed record/enum/choice was
+// keyed on the declared nullable bit and gave the WRONG verdict. This is
+// the kind-general sibling: every kind, not just Primitive. The fact read
+// is the null fact alone — a §12.7 type narrowing leaves the scrutinee's
+// declared type in place (§19.1 verbatim). Returns `declared` unchanged
+// for every scrutinee `isNarrowedNonNullRead` does not establish (an
+// un-narrowed nullable stays nullable; a non-nullable stays non-nullable),
+// so the helper is invisible to every verdict that does not already need
+// it.
+TypeRef* ExprTC::scrutineeTypeAfterNarrowing(const ast::Expr* scrutinee,
+                                             TypeRef* declared) {
+    if (!declared || !declared->nullable) return declared;
+    if (!isNarrowedNonNullRead(scrutinee)) return declared;
+    TypeRef* nonnull = ctx_.makeTypeRef();
+    *nonnull = *declared;
+    nonnull->nullable = false;
+    return nonnull;
+}
+
 // §19.3 / §16.6 / §7.11 (v0.286, #3298; slot reach v0.294, #3692): a
 // relational (`> x`) or range (`lo..hi`, `..<hi`, `lo..`, bare `..`) pattern
 // over a NULLABLE type — the arm scrutinee's, OR a destructuring slot's own
@@ -22377,8 +22428,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(cs->scrutinee.get(), scrutTy);
-        // §19.3 (v0.313, #5188): the scrutinee's DECLARED type, for the
-        // different-value-type type-pattern reject.
+        // §19.1 / §19.6 (v0.311, #5189 / #5167): the §19.6 exhaustiveness
+        // verdict (caseArmsExhaustive) reads the scrutinee's nullability
+        // AFTER §7.4 narrowing (the null fact alone), not the declared
+        // type. Normalize before passing downstream so the cached
+        // `noMatchEdgeStaticallyDead` (consumed by Ownership's CaseStmt
+        // arm-join, CFG's no-match-edge lowering, and codegen's totality
+        // trap) reflects the post-§7.4 fact. The CaseExpr site at
+        // `checkCaseExhaustiveness` and the stmt-position totality site at
+        // `stmtAlwaysExits` apply the SAME normalization — one helper,
+        // three callers, so the spellings of `case` cannot drift on the
+        // narrowed-scrutinee verdict.
+        TypeRef* exhaustScrutTy =
+            scrutineeTypeAfterNarrowing(cs->scrutinee.get(), scrutTy);
+        // §19.3 (v0.313, #5188/#5239): the scrutinee's DECLARED type, for
+        // the reference type-pattern reject (§12.7/#5239) and the
+        // different-value-type type-pattern reject (§19.3/#5188). KEEP the
+        // declared scrutTy for the §19.3 / §5.1 pattern-rule checks below —
+        // those read the declared nullable bit
+        // (`checkOrderingPatternsOverNullableScrutinee`) or the declared
+        // numeric width (`checkCasePatternConstantRanges`), neither of which
+        // should be rewritten by §7.4 narrowing: a pattern is matched against
+        // the scrutinee's DECLARED type, only the verdict is read against
+        // the narrowed type.
         TypeRef* scrutDecl5188 =
             caseScrutineeDeclaredType(cs->scrutinee.get(), scrutTy);
         // fix #4139 (§19.6, v0.298): cache the shared exhaustiveness
@@ -22392,7 +22464,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // since checkCasePatternConstantRanges runs it explicitly two lines
         // below regardless of this verdict. // per §19.6, v0.298, #4139
         const_cast<ast::CaseStmt*>(cs)->noMatchEdgeStaticallyDead =
-            caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
+            caseArmsExhaustive(cs->arms, cs->scrutinee.get(), exhaustScrutTy,
                                 s.span.begin, /*quiet=*/true);
         // §19.3 / §16.6 / §7.11 (v0.286, #3298; v0.310, #5143 ruling): the
         // statement-position form takes the same rule as the CaseExpr site —

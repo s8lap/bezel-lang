@@ -14192,7 +14192,31 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     (st->isPointerTy() != ct->isPointerTy() ||
                      st->isIntegerTy(1) != ct->isIntegerTy(1) ||
                      st->isFloatingPointTy() != ct->isFloatingPointTy());
-                if (incompatible) {
+                // §19.1 / §19.6 (v0.311, #5189 / #5167): "A `null` arm over
+                // a scrutinee that cannot hold `null` — non-nullable by its
+                // declared type (a type parameter only under a constraint
+                // that implies non-null, §14.2) or narrowed non-null — is
+                // admitted and never selected." A `null` literal
+                // ConstantPattern member over a NON-NULLABLE scrutinee is
+                // EXACTLY this case — the `null` alternative is admitted by
+                // §19.3, the non-nullable scrutinee cannot match it
+                // (§19.6's "never selected"), and the arm body still has to
+                // lower. Do NOT emit the §19 diagnostic for this
+                // combination: the sema verifier at `caseArmsExhaustive`
+                // (ExprTypecheck.cpp) already accepted the arm, and the
+                // §19.6 verdict admits the `null` alternative here. Skip
+                // the member silently (OR with false leaves `any`
+                // unchanged for the remaining `|` members) and continue.
+                // The diagnostic stays in place for the OTHER residual
+                // shapes (#2227's string-`"Red"`-over-`Color`, or any
+                // non-null incompatibility) — those are still §19 type
+                // errors.
+                bool nullOverNonNullable =
+                    incompatible &&
+                    c && dynamic_cast<const ast::NullLiteralExpr*>(c.get()) &&
+                    resolveTypeParamRef(scrutTy) &&
+                    !resolveTypeParamRef(scrutTy)->nullable;
+                if (incompatible && !nullOverNonNullable) {
                     if (!cp->constants.empty() && c.get() == cp->constants.front().get())
                         ctx_.diagnostics().report(
                             Severity::Error, c->span.begin,
@@ -14201,6 +14225,13 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             "constant must be comparable to the scrutinee");
                     // Skip this member — the OR-with-false leaves `any` unchanged
                     // for the remaining members.
+                    continue;
+                }
+                if (nullOverNonNullable) {
+                    // Admitted-but-never-selected (§19.6): the `null`
+                    // alternative contributes `false` to the `|`-list —
+                    // same shape as the diagnostic-skipped continue above,
+                    // but without the error. `any` is unchanged.
                     continue;
                 }
             }
@@ -14643,6 +14674,30 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     }
     // §19: NullPattern — matches null.
     if (dynamic_cast<const ast::NullPattern*>(pat)) {
+        // §19.6 nullable bullet / §19.1 (§19.1, v0.311, #5189 / #5167): "A
+        // `null` arm over a scrutinee that cannot hold `null` … is admitted
+        // and never selected." The sema verifier admits the arm at the
+        // §19.6 narrowing boundary (ExprTypecheck.cpp's `caseArmsExhaustive`
+        // reads the §7.4-narrowed scrutinee type), so the `null` arm can
+        // reach codegen over a NON-NULLABLE value scrutinee — `int`,
+        // `int`-narrowed-from-`int?`, etc. The unconditional
+        // ICmpEQ(scrut, ptr null) emits malformed IR on a non-pointer
+        // scrutinee (`Both operands to ICmp instruction are not of the
+        // same type! … icmp eq i32 %x, ptr null`). Lower the arm as
+        // constant `false` instead — the static answer a non-nullable
+        // scrutinee gives. §19.1's "the fact read is the null fact
+        // alone" is what makes the type-conditional shape the right
+        // gate: a `string?` (nullable) keeps the icmp path; a `string`
+        // (declared non-nullable) and a §7.4-narrowed-non-null `string?`
+        // (declared nullable, narrowed non-null) both fall to the
+        // constant-false path. A bare type-parameter `T` scrutinee
+        // substitutes to its ACTUAL instantiation at the call site
+        // (§3.6 rule 2) — `resolveTypeParamRef` reads the active
+        // substitution so a `T = string?` instantiation sees the icmp
+        // path while `T = string` (or any non-null concrete substitution)
+        // falls to constant-false.
+        const sema::TypeRef* rScrutTy = resolveTypeParamRef(scrutTy);
+        if (rScrutTy && !rScrutTy->nullable) return builder_.getInt1(false);
         return builder_.CreateICmpEQ(
             scrut, llvm::ConstantPointerNull::get(ptrTy()), "null.match");
     }

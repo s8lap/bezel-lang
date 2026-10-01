@@ -35,34 +35,45 @@ bool compileErrored(const std::string& src) {
 }
 }  // namespace
 
-// fix #2227 / §19.3 / §19.5: a `null` literal in a `|`-alternative over a
-// non-nullable int scrutinee is rejected with a §19 diagnostic (not an abort).
-BEZEL_TEST(case_pattern_null_alt_2227, int_scrutinee_null_alt_rejected) {
-    BEZEL_EXPECT_EQ(compileErrored(
+// fix #2227 / §19.3 / §19.5 / fix #5189 / §19.6 (v0.311): a `null` literal
+// in a `|`-alternative over a non-nullable int scrutinee is ADMITTED
+// silently and never selected (§19.6 "admitted and never selected" bullet
+// for non-nullable scrutinees). Pre-#5189 the codegen guard emitted a §19
+// diagnostic; v0.311 / #5189 reverses it — the `null` member contributes
+// `false` to the OR, the next literal matches, the arm selects.
+BEZEL_TEST(case_pattern_null_alt_2227, int_scrutinee_null_alt_admitted_spec_19_6) {
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var n := 5; "
         "  return (case n of null | 5 => 1, _ => 2); "
-        "end Main; end C;"), true);
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.diagnostics.hasErrors(), false);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
-// fix #2227 / §19.3: a `null` literal in a `|`-alternative over a non-nullable
-// float scrutinee is rejected.
-BEZEL_TEST(case_pattern_null_alt_2227, float_scrutinee_null_alt_rejected) {
-    BEZEL_EXPECT_EQ(compileErrored(
+// fix #2227 / §19.3 / fix #5189 / §19.6 (v0.311): same shape over float.
+// Note: f = 3.14, the alt-list `null | 1.0` does NOT match (1.0 != 3.14),
+// so `_` selects → 2. The non-matching exitCode distinguishes "the `null`
+// member is admitted silently" from "the alt-list matches".
+BEZEL_TEST(case_pattern_null_alt_2227, float_scrutinee_null_alt_admitted_spec_19_6) {
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var f := 3.14; "
         "  return (case f of null | 1.0 => 1, _ => 2); "
-        "end Main; end C;"), true);
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.diagnostics.hasErrors(), false);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);
 }
 
-// fix #2227 / §19.3: a `null` literal in a `|`-alternative over a non-nullable
-// bool scrutinee is rejected.
-BEZEL_TEST(case_pattern_null_alt_2227, bool_scrutinee_null_alt_rejected) {
-    BEZEL_EXPECT_EQ(compileErrored(
+// fix #2227 / §19.3 / fix #5189 / §19.6 (v0.311): same shape over bool.
+BEZEL_TEST(case_pattern_null_alt_2227, bool_scrutinee_null_alt_admitted_spec_19_6) {
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var b := true; "
         "  return (case b of null | true => 1, _ => 2); "
-        "end Main; end C;"), true);
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(r.diagnostics.hasErrors(), false);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // fix #2227 / §19.3: a string-literal ConstantPattern over an enum scrutinee

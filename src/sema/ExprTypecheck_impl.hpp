@@ -2712,6 +2712,19 @@ private:
     // case of its own.
     TypeRef* operandStaticTypeAt(const ast::Expr* e, TypeRef* declared);
 
+    // §19.1 / §19.6 (v0.311, #5189 / #5167): "Wherever §19 reads the
+    // scrutinee's nullability it reads the scrutinee's static type after §7.4
+    // narrowing at the `case` (the null fact alone)." Like
+    // `operandStaticTypeAt` but applies to every TypeRef kind — not just
+    // Primitive — because a §7.4-narrowed record / enum / choice scrutinee
+    // is non-nullable for §19.6's exhaustiveness verdict and §21.7's
+    // statement-`case` totality grant. Returns `declared` unchanged for
+    // every scrutinee `isNarrowedNonNullRead` does not establish, so the
+    // helper is invisible to a non-narrowed case (the declared nullable
+    // bit is what §19.6 already reads at an un-narrowed scrutinee).
+    TypeRef* scrutineeTypeAfterNarrowing(const ast::Expr* scrutinee,
+                                         TypeRef* declared);
+
     // §19.3 / §16.6 / §7.11 (v0.286, #3298; v0.310, #5143 ruling): reject a
     // relational or range pattern in `arms` when the scrutinee's static type
     // is nullable — EXCEPT when the scrutinee Expr is a §7.4-narrowed
