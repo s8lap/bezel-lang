@@ -8730,6 +8730,28 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                 // MethodSymbol; its accessor body has the same exposure and is
                 // filed separately rather than guessed at here.
                 if (!impl || !impl->parent) continue;
+                // fix #5214 (§12.1 / §14.1 / §2.8.3 rule 4, v0.313): a body
+                // declared on a class with NO type parameter anywhere on its
+                // chain reads no instantiation-dependent layout or static
+                // cell, so re-lowering it under this substitution yields the
+                // same code — the "non-generic declarers keep the shared
+                // slot" note above, now enforced before the identity peek.
+                // The slot keeps the declarer's exported function, so its
+                // identity is the same in every module;
+                // emitVirtualGenericDispatch's later-module-override guard
+                // compares exactly that identity (a generic importer
+                // subclass of a library class, `GenPlain<string>: GA`, must
+                // present `bz$GA$VB` in the slot, not a module-local copy).
+                {
+                    bool genericChain = false;
+                    for (const sema::TypeSymbol* t = impl->parent; t;
+                         t = baseClassOf(t))
+                        if (!t->genericParams.empty()) {
+                            genericChain = true;
+                            break;
+                        }
+                    if (!genericChain) continue;
+                }
                 unsigned slot =
                     kVirtualMethodsBase + static_cast<unsigned>(i);
                 if (slot >= nElems) continue;

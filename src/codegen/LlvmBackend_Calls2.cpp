@@ -16871,6 +16871,88 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     }
     if (!defaultImpl) return nullptr;  // no implementation found — bail safely
 
+    // fix #5214 (§11 / §12.1 / §14.2 / §2.8.3 rule 4, v0.313): the
+    // LATER-MODULE guard. The candidate scan above is closed-world: it sees
+    // the classes of the modules loaded into THIS compile. An executable
+    // loads every module of the program, so its scan is complete; a LIBRARY
+    // (`-c`, `!isMainModule_`) cannot see a class declared in a module
+    // compiled after it, and its default branch ran the library's body for
+    // such an instance even when that class overrides the method (MEASURED
+    // on e2aa55d0: 127 for 37 on the issue's repro) or inherits a known
+    // override (127 for 207; 127 for 307 through a two-module chain).
+    // Descriptors cannot tell those apart from a class that merely inherits
+    // the default, but the receiver's own vtable slot for the method can:
+    // every class's slot holds the function of its most-derived
+    // implementation, and for an implementation declared on a class chain
+    // with no type parameter that is the declarer's exported function — one
+    // symbol, the same address in every module (specializedVtableFor keeps
+    // it for a generic subclass too; buildVtable keys the slot by the
+    // parameter types' declared names, see methodSlotKey). So on the default
+    // path: a known descriptor → run the default; slot = the default's
+    // function → the class inherits the default, run it; slot = a known
+    // override's function → run that override's specialization; any other
+    // slot → an override this module cannot specialize (or a §12.1 widening
+    // adapter thunk, an internal per-module function), which aborts with a
+    // message rather than computing a wrong value. The later module's
+    // override at the library's type arguments is what a correct value
+    // needs, and the library never learns those arguments were used (see
+    // the handback design note); aborting is the sound half.
+    //
+    // CLASS parent: the slot identity is comparable only when the static
+    // type and the default's declarer have no type parameter on their chain
+    // (otherwise every slot holds a per-instantiation module-local copy),
+    // and matters only when some visible class is public and neither
+    // sealed, closed nor static (§12.4 / §11.7: only such a class can be
+    // subclassed by a later module). INTERFACE parent: there is no shared
+    // slot, so the guard is descriptor-only — every known implementer is
+    // matched by its descriptor, and a public interface's unknown
+    // implementer aborts; declined when a known implementer is generic (its
+    // per-instantiation descriptors cannot be enumerated, #1843).
+    bool slotGuard = false;
+    bool descGuard = false;
+    unsigned guardSlot = 0;
+    llvm::Constant* guardDefaultFn = nullptr;
+    if (!isMainModule_) {
+        auto chainNonGeneric = [&](const sema::TypeSymbol* c) {
+            for (const sema::TypeSymbol* t = c; t; t = baseClassOf(t))
+                if (!t->genericParams.empty()) return false;
+            return true;
+        };
+        auto extensible = [&](const sema::TypeSymbol* c) {
+            if (!c || c->visibility != ast::Visibility::Public) return false;
+            for (auto mod : c->modifiers)
+                if (mod == "sealed" || mod == "closed" || mod == "static")
+                    return false;
+            sema::MethodSymbol* impl = mostDerived(c);
+            if (impl)
+                for (auto mod : impl->modifiers)
+                    if (mod == "sealed") return false;  // `sealed override`
+            return true;
+        };
+        if (!ifaceParent) {
+            bool anyExtensible = extensible(staticType);
+            for (const sema::TypeSymbol* c : candidateClasses)
+                if (!anyExtensible && c != staticType &&
+                    isSubclassOf(c, staticType))
+                    anyExtensible = extensible(c);
+            auto slotIt = vtableSlot_.find(ms);
+            auto defFnIt = methodFns_.find(defaultImpl);
+            if (anyExtensible && slotIt != vtableSlot_.end() &&
+                defFnIt != methodFns_.end() && defFnIt->second &&
+                chainNonGeneric(staticType) && defaultImpl->parent &&
+                chainNonGeneric(defaultImpl->parent)) {
+                slotGuard = true;
+                guardSlot = slotIt->second;
+                guardDefaultFn = llvm::cast<llvm::Constant>(defFnIt->second);
+            }
+        } else if (staticType->visibility == ast::Visibility::Public &&
+                   !defaultGeneric) {
+            descGuard = true;
+            for (const Branch& b : branches)
+                if (!b.cls->genericParams.empty()) descGuard = false;
+        }
+    }
+
     // fix #5009 fix-forward 3 (§14.1 / §2.8.3 rule 4, v0.307): SIBLING GUARD of
     // emitInlineGenericMethod's constraint-route backstop. A constraint-route
     // body (ModuleLoader, `markConstraintRouteBody`) is proven only for the
@@ -17046,12 +17128,16 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // fix #5124: the unknown-class guard needs every default-running class's
     // descriptor; a generic one has per-instantiation descriptors (#1843)
     // this dispatch cannot enumerate, so fail closed at compile time.
-    if (anyConstraintRoute && defaultGeneric) return constraintRouteFail();
+    // fix #5214: unless the slot guard recognizes those classes by their
+    // vtable slot instead (see `slotGuard`).
+    if (anyConstraintRoute && defaultGeneric && !slotGuard)
+        return constraintRouteFail();
 
     // Common case: no subclass overrides differently — a direct call to the
     // single specialization is correct (the dynamic type always most-derives it).
     // fix #5124: not on the constraint route, whose default is guarded below.
-    if (brFns.empty() && !anyConstraintRoute) {
+    // fix #5214: nor where a later module's class may reach the call.
+    if (brFns.empty() && !anyConstraintRoute && !slotGuard && !descGuard) {
         if (args.size() != defFn->arg_size()) return nullptr;
         llvm::Value* r = builder_.CreateCall(defFn, args);
         emitPendingCheck();
@@ -17103,7 +17189,16 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // inherit it; any other descriptor aborts with a message, never a wrong
     // value. Every compare is emitted after all specializations were built, so
     // no bail below leaves a half-emitted dispatch.
-    if (anyConstraintRoute) {
+    //
+    // fix #5214: the later-module guard (see `slotGuard` / `descGuard`)
+    // takes the same shape. A known default-running class passes by its
+    // descriptor (which also covers a known class whose slot holds a §12.1
+    // widening thunk; a generic one has per-instantiation descriptors and
+    // passes by its slot); a class with an unknown descriptor passes by its
+    // slot holding the default's
+    // function, runs a known override's specialization when its slot holds
+    // that override's function, and aborts otherwise.
+    if (anyConstraintRoute || slotGuard || descGuard) {
         llvm::BasicBlock* okBB =
             llvm::BasicBlock::Create(llvm_, "vgen.known", currentFn_);
         for (llvm::Constant* dd : defaultDescs) {
@@ -17113,17 +17208,72 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                                   okBB, nextBB);
             builder_.SetInsertPoint(nextBB);
         }
+        if (slotGuard) {
+            llvm::Value* slotFn = builder_.CreateLoad(
+                ptrTy(),
+                builder_.CreateGEP(ptrTy(), vptr,
+                                   {builder_.getInt32(guardSlot)}),
+                "vgen.slot");
+            llvm::BasicBlock* nextBB =
+                llvm::BasicBlock::Create(llvm_, "vgen.next", currentFn_);
+            builder_.CreateCondBr(
+                builder_.CreateICmpEQ(slotFn, guardDefaultFn, "vgen.inh"),
+                okBB, nextBB);
+            builder_.SetInsertPoint(nextBB);
+            // A later module's class inheriting a KNOWN override (no
+            // override of its own) runs that override's specialization.
+            // Only an override declared on a non-generic chain has a shared
+            // slot identity; any other known override is matched by
+            // descriptor above or not at all.
+            std::unordered_set<const sema::MethodSymbol*> seenImpl;
+            for (std::size_t i = 0; i < branches.size(); ++i) {
+                const Branch& b = branches[i];
+                if (b.hasSubst || b.desc || !b.impl->parent ||
+                    !seenImpl.insert(b.impl).second)
+                    continue;
+                bool genericChain = false;
+                for (const sema::TypeSymbol* t = b.impl->parent; t;
+                     t = baseClassOf(t))
+                    if (!t->genericParams.empty()) genericChain = true;
+                auto fit = methodFns_.find(b.impl);
+                if (genericChain || fit == methodFns_.end() || !fit->second)
+                    continue;
+                llvm::BasicBlock* caseBB =
+                    llvm::BasicBlock::Create(llvm_, "vgen.slotcase", currentFn_);
+                llvm::BasicBlock* afterBB =
+                    llvm::BasicBlock::Create(llvm_, "vgen.next", currentFn_);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpEQ(
+                        slotFn, llvm::cast<llvm::Constant>(fit->second),
+                        "vgen.inhov"),
+                    caseBB, afterBB);
+                builder_.SetInsertPoint(caseBB);
+                llvm::Value* cr = builder_.CreateCall(brFns[i].second, args);
+                emitPendingCheck();
+                incoming.push_back({hasResult ? cr : nullptr,
+                                    builder_.GetInsertBlock()});
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(afterBB);
+            }
+        }
         auto* failFn = declareC("bz_debug_assert_fail",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(
             failFn,
             {lowerStringLiteralConst(
                 // a source-form literal: the quotes are stripped
-                "\"virtual call to imported generic method `" +
-                    std::string(ms->name) +
-                    "` reached a class this module does not know (declared "
-                    "in a module compiled after it); its override cannot be "
-                    "dispatched (#5124)\"",
+                (slotGuard || descGuard)
+                    ? "\"virtual call to generic method `" +
+                          std::string(ms->name) +
+                          "` from a library reached an override declared in "
+                          "a module compiled after it; that override's "
+                          "specialization cannot be dispatched from here "
+                          "(#5214)\""
+                    : "\"virtual call to imported generic method `" +
+                          std::string(ms->name) +
+                          "` reached a class this module does not know "
+                          "(declared in a module compiled after it); its "
+                          "override cannot be dispatched (#5124)\"",
                 false)});
         builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);

@@ -8561,6 +8561,24 @@ private:
                         default:                           key += "?";       break;
                     }
                     key += ".";
+                } else if (tr->kind == sema::TypeRef::Kind::Named &&
+                           tr->declaration &&
+                           !tr->declaration->name.empty()) {
+                    // fix #5214 (§12.1 / §2.8.3 rule 4, v0.313): an imported
+                    // parameter whose type is a USER type has `declaration`
+                    // set and no AST node, so `headName()` is empty and the
+                    // key read `?` — while the local-AST path (and the
+                    // exporting module's own layout) spell the type's name.
+                    // MEASURED on e2aa55d0: an importer's `override Take(s:
+                    // Sq)` keyed `Take#1#Sq.` against the imported base's
+                    // `Take#1#?`, took a FRESH slot, and the base slot kept
+                    // the base body (8 for 12); an imported override of an
+                    // imported virtual generic method (`SB.BDrv.VB(b: Box<T>)`
+                    // over `SA.GA.VB`) likewise lost the base slot in a third
+                    // module. Spell the declared name, as the AST path does
+                    // for an unqualified reference.
+                    key += std::string(tr->declaration->name);
+                    key += ".";
                 } else if (!tr->headName().empty()) {
                     for (auto part : tr->headName()) key += part;
                     key += ".";
