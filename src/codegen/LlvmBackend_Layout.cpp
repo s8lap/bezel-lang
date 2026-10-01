@@ -3693,6 +3693,20 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 return typesMatch ? builder_.CreateNot(hasVal)
                                  : builder_.getInt1(true);
             }
+            // fix #5222 (§12.7 "Value-typed operands", v0.313): `p as T` over
+            // a nullable value operand `p: T?` naming its own underlying type
+            // (or its own nullable form `as T?`) is the operand itself — the
+            // value wrapped as `T?`, null when `p` is null. A different value
+            // type is rejected by sema; the mismatch arm is the all-zero null.
+            if (te.op == "as") {
+                sema::TypeRef target = *rt;
+                target.nullable = false;
+                if (typesMatch || staticTypeIdentical(&underlying, &target))
+                    return obj;
+                sema::TypeRef nullableRt = target;
+                nullableRt.nullable = true;
+                return nullableValueNull(&nullableRt);
+            }
         }
         // fix #3120 (§12.7 / §8.6 / §17.4, v0.252): a CONCRETE non-nullable
         // VALUE-type operand (a primitive / record / enum / value-builtin /
@@ -3709,7 +3723,13 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         // operand keeps its pre-#3120 silent-drop and `reportDroppedTest`
         // still gates on the reference-location shape.
         if (operandTy && concreteValueTypeOperand(operandTy)) {
-            const bool sameTy = staticTypeIdentical(operandTy, rt);
+            // fix #5222: `as T?` names the operand's own nullable form, so
+            // compare against the non-nullable target for `as`.
+            sema::TypeRef rtNonNull = *rt;
+            rtNonNull.nullable = false;
+            const bool sameTy = te.op == "as"
+                ? staticTypeIdentical(operandTy, &rtNonNull)
+                : staticTypeIdentical(operandTy, rt);
             if (te.op == "is") return builder_.getInt1(sameTy);
             if (te.op == "is not") return builder_.getInt1(!sameTy);
             if (te.op == "as") {
