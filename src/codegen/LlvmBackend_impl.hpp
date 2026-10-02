@@ -8577,6 +8577,23 @@ private:
                     // over `SA.GA.VB`) likewise lost the base slot in a third
                     // module. Spell the declared name, as the AST path does
                     // for an unqualified reference.
+                    //
+                    // fix #5251 (§12.1 / §2.8.3 rule 4, v0.313): using only
+                    // `declaration->name` (e.g. "Item") means two distinct
+                    // modules each exporting a class named `Item` produce
+                    // IDENTICAL keys ("Take#1#Item.") for their respective
+                    // overloads, so the vtable assigns them the SAME slot.
+                    // Resolve by also including the declaring module name, per
+                    // §2.8.3 rule 4's program-wide type identity: spell
+                    // `moduleName.name.` so A5.Item and B5.Item produce
+                    // distinct keys "Take#1#A5.Item." and "Take#1#B5.Item.".
+                    // An override written as `override Take(x: A5.Item)` has
+                    // the same TypeRef and produces the same key, so it
+                    // correctly reuses the base's slot.
+                    if (!tr->declaration->moduleName.empty()) {
+                        key += tr->declaration->moduleName;
+                        key += ".";
+                    }
                     key += std::string(tr->declaration->name);
                     key += ".";
                 } else if (!tr->headName().empty()) {
