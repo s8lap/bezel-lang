@@ -2284,10 +2284,19 @@ void Emitter::registerOutVarStringRelease(const ast::IdentifierExpr& id,
         }
     }
     if (formalMod != "out") return;
-    if (!formalTy || formalTy->nullable ||
+    // fix #5253 (§22.3/§28.9, v0.313): widen from non-nullable `string` to nullable
+    // `string?` — bz_string_retain/release are null-safe, and the scope-end release
+    // registered here balances the callee's release of the old value.
+    if (!formalTy ||
         formalTy->kind != sema::TypeRef::Kind::Primitive ||
         formalTy->primitive != sema::PrimitiveType::String)
         return;
+    // fix #5253 (§22.3 / §28.9, v0.313): the callee's out-store
+    // (lowerStringRefParamStore) leaves this recipient's slot owning one
+    // reference whether or not it escapes, so a later `s := …` / `s ??= …`
+    // must keep it owning one — record it for stringLocalSlotOwnsRef, which
+    // admits a `string?` reassign target only when its slot owns its value.
+    outVarOwnedStringRecipients_.insert(static_cast<const void*>(&id));
     if (!outVarStringReleaseEligible(&id)) return;                 // gate 4
     // fix #3981 (§22.3/§22.4/§28.9, v0.294): inside a suspend-crossing body
     // (a sync/async iterator or an async method), this disposal can be
@@ -2428,10 +2437,19 @@ void Emitter::registerCtorOutVarStringRelease(
             formalTy = ctx_.resolvedType(*ctorDecl->params[pos].type);
     }
     if (formalMod != "out") return;
-    if (!formalTy || formalTy->nullable ||
+    // fix #5253 (§22.3/§28.9, v0.313): widen from non-nullable `string` to nullable
+    // `string?` — bz_string_retain/release are null-safe, and the scope-end release
+    // registered here balances the callee's release of the old value.
+    if (!formalTy ||
         formalTy->kind != sema::TypeRef::Kind::Primitive ||
         formalTy->primitive != sema::PrimitiveType::String)
         return;
+    // fix #5253 (§22.3 / §28.9, v0.313): the callee's out-store
+    // (lowerStringRefParamStore) leaves this recipient's slot owning one
+    // reference whether or not it escapes, so a later `s := …` / `s ??= …`
+    // must keep it owning one — record it for stringLocalSlotOwnsRef, which
+    // admits a `string?` reassign target only when its slot owns its value.
+    outVarOwnedStringRecipients_.insert(static_cast<const void*>(&id));
     if (!outVarStringReleaseEligible(&id)) return;                 // gate 4
     // fix #3981 (§22.3/§22.4/§28.9, v0.294): constructor-call sibling of the
     // wiring added to registerOutVarStringRelease above — see that function's
@@ -16603,7 +16621,11 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectStringReleaseEligible(*ci.stmts);
         stringReleaseEligibleFn_ = specFn;
-        retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #5253: the root lowerScopedBlock below drains the parameter's
+        // scope-end release (pendingChainOutDisposals_ is saved/cleared above).
+        retainAssignedStringParams(*ci.stmts, ms->params,
+                                   /*setterValueAnchor=*/nullptr,
+                                   /*armScopeEndRelease=*/!hasEnsuresClause(ms));
         // fix #2854 / #422 / §27.5 / §28.9 / §28.3 (v0.240): populate the
         // CLOSURE-release eligibility for THIS specialized function, mirroring
         // the non-specialized method-body prolog (LlvmBackend_Setup.cpp

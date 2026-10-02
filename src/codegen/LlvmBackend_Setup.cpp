@@ -10503,8 +10503,14 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // own an independent +1, or the assignment's drop-on-overwrite release
     // frees the CALLER's borrow (a use-after-free). Block bodies only — an
     // expression body has no assignment statement.
+    // fix #5253: this body's root lowerScopedBlock (below) drains the
+    // parameter's scope-end release, so arm it — unless an `ensures` clause
+    // could read the parameter after that release (§22.16's epilogue runs
+    // after the body's scope-end disposals).
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
-        retainAssignedStringParams(*ci.stmts, ms->params);
+        retainAssignedStringParams(*ci.stmts, ms->params,
+                                   /*setterValueAnchor=*/nullptr,
+                                   /*armScopeEndRelease=*/!hasEnsuresClause(ms));
     // fix #4174 follow-up: the closure twin of the retain just above — see
     // retainAssignedClosureParams' own comment. Paired with the
     // collectClosureReleaseEligible(*ci.stmts) / closureReleaseEligibleFn_ =
@@ -18051,6 +18057,22 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (v)
         armStringLocalRefcount(static_cast<const void*>(declNode), slot, v,
                                init);
+    // fix #5253 (§4.6 / §7.9 / §28.9, v0.313): a NO-INITIALIZER `var s:
+    // string;` / `var s: string?;` is a borrow candidate too (see
+    // collectStringReleaseEligible): its slot starts null — owning nothing —
+    // and every later `:=` / `??=` keeps it owning exactly one reference
+    // (lowerStringLocalReassign / the `??=` retain, both admitted through
+    // stringLocalSlotOwnsRef's stringBorrowAll_ arm). Arm the scope-end
+    // release of the FINAL value when the escape walk proved it non-escaping;
+    // there is nothing to retain at bind.
+    else if (!init && slot && slotTy->isPointerTy() && !disposeStack_.empty() &&
+             currentFn_ == stringReleaseEligibleFn_ &&
+             stringBorrowRetainEligible_.count(
+                 static_cast<const void*>(declNode))) {
+        Disposal d{slot, nullptr};
+        d.stringRelease = true;
+        disposeStack_.back().push_back(d);
+    }
     // fix #2900 / §28.9 / §28.3 (v0.240): an Object/interface-typed `var` local
     // whose initializer is a bare string-typed identifier is a string-aliased
     // slot — the Object slot must own its own +1 (the source `s` keeps its
@@ -25274,6 +25296,13 @@ bool Emitter::returnedStringLocalOwnsPlusOne(const ast::Expr* e) const {
     // producer branch needs the guard; an ESCAPING producer is in none of the
     // three eligibility sets, which is why the candidate set exists at all.
     if (!stringLocalCandidates_.count(declNode)) return false;
+    // fix #5253 (§4.6 / §28.9, v0.313): the producer twin of the borrow rule
+    // above. A NON-escaping producer local (stringReleaseEligible_) keeps its
+    // +1 and drops it at scope end, so a consumer that read it as a transfer
+    // (`var r := n ?? p;` — #5245 made `n ?? p` a walker safe-read, so `p`
+    // stays eligible) released it a second time: the issue's shape 5 SEGV.
+    // Only an ESCAPING producer local hands its +1 over.
+    if (stringReleaseEligible_.count(declNode)) return false;
     // A producer-initialized non-nullable string local transferred the
     // producer's +1 into its slot. (Borrow locals are exactly stringBorrowAll_;
     // a non-using string local whose initializer is a +1 producer is the
@@ -25435,12 +25464,34 @@ bool Emitter::stringLocalSlotOwnsRef(const ast::Expr& target) const {
     if (currentFn_ != stringReleaseEligibleFn_) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target);
     if (!id) return false;
-    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    // fix #5253 (§4.6 / §22.3 / §28.9, v0.313): a by-value `string` /
+    // `string?` PARAMETER that this body writes owns a +1 for its current
+    // value: retainAssignedStringParams retains every such parameter at bind —
+    // its candidacy now covers the nullable spelling, and "writes" covers
+    // both an assignment statement and a `ref`/`out` argument naming it. The
+    // assignment being lowered is itself one of those writes, so the
+    // parameter it targets was retained (same co-gate on the analyzed body).
+    if (isOwnedStringParamSlot(sym)) return true;  // see that function
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
     if (!loc || !loc->decl) return false;
     const void* declNode = static_cast<const void*>(loc->decl);
     return stringBorrowAll_.count(declNode) ||
-           stringLocalCandidates_.count(declNode);
+           stringLocalCandidates_.count(declNode) ||
+           outVarOwnedStringRecipients_.count(declNode);  // fix #5253
 }
+
+// fix #5253 (§22.3 / §28.9, v0.313): does `sym` name a by-value `string` /
+// `string?` parameter whose slot retainAssignedStringParams gave an
+// independent +1 in the body being lowered? Answered from the very set that
+// function filled (keyed on the body), so the drop-on-overwrite release this
+// licenses always finds the bind-time retain it pairs with.
+bool Emitter::isOwnedStringParamSlot(const sema::Symbol* sym) const {
+    if (!sym || currentFn_ != stringReleaseEligibleFn_) return false;
+    auto it = retainedStringParams_.find(currentFn_);
+    return it != retainedStringParams_.end() && it->second.count(sym);
+}
+
 
 bool Emitter::isNullableStringExprType(const ast::Expr& target) const {
     const sema::TypeRef* tt = ctx_.exprType(target);
@@ -25539,8 +25590,15 @@ bool Emitter::lowerStringRefParamStore(const ast::Expr& target,
         builder_.CreateStore(newVal, slotAddr);
         return true;
     }
-    if (const sema::TypeRef* tt = ctx_.exprType(target))
-        if (tt->nullable) return false;  // mirror local-reassign restriction
+    // fix #5253 (§22.3 / §28.9, v0.313): a `string?` target too, balanced
+    // exactly as the non-nullable one (retain and release are null-safe). The
+    // caller-side slots an `out` argument can name now own their value for the
+    // nullable spelling as well — a `string?` borrow local (#5245), a
+    // no-initializer local, an `out var` recipient (registerOutVarStringRelease
+    // admits `string?`), a by-value parameter (retainAssignedStringParams
+    // counts the `out` argument as a write) — so release-old drops a
+    // reference the caller's slot owned. A `ref` argument naming a by-value
+    // parameter is the same pre-existing gap for both spellings.
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strrp.old");
     if (!isPlusOneStringProducer(valueExpr))
         emitStringRetain(newVal);
@@ -25728,7 +25786,8 @@ void Emitter::armClosureLocalRefcount(const void* declNode,
 void Emitter::retainAssignedStringParams(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     const std::vector<sema::Symbol*>& params,
-    const ast::PropertyDecl* setterValueAnchor) {
+    const ast::PropertyDecl* setterValueAnchor,
+    bool armScopeEndRelease) {
     // 0. CO-GATE WITH THE RELEASE. Both drop-on-overwrite releases this retain
     //    pairs are gated on `currentFn_ == stringReleaseEligibleFn_`
     //    (LlvmBackend_Stmts.cpp — the `:=` call site, which is the ONLY caller
@@ -25747,7 +25806,17 @@ void Emitter::retainAssignedStringParams(
     //    what enforces it, and it is why the retain can be requested from the
     //    inline-constructor path without auditing that path's callers.
     if (currentFn_ != stringReleaseEligibleFn_) return;
-    // 1. Candidates: by-value, non-nullable `string` parameters with a slot.
+    // fix #5253: the set of parameters retained below, keyed on the LLVM
+    // function so stringLocalSlotOwnsRef's parameter arm agrees with it
+    // exactly. Insert-only: an INLINED accessor / constructor body reaches
+    // here with the enclosing function's currentFn_, and its parameter
+    // symbols are distinct from the enclosing body's, so a union is exact.
+    auto& retainedSet = retainedStringParams_[currentFn_];
+    // 1. Candidates: by-value `string` parameters with a slot. fix #5253
+    //    (§4.6 / §22.3 / §28.9, v0.313): `string?` too — a nullable
+    //    parameter's slot holds the caller's borrow exactly as a non-nullable
+    //    one does, and `p := c.Val` into it previously plain-stored a borrow of
+    //    a value the next `c.Set(...)` freed (the issue's shape 1 SEGV).
     std::unordered_set<const sema::Symbol*> candidates;
     for (sema::Symbol* s : params) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(s);
@@ -25757,7 +25826,9 @@ void Emitter::retainAssignedStringParams(
             ps->resolvedDeclType
                 ? ps->resolvedDeclType
                 : (ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr);
-        if (!isStringTypeRefNonNull(ty)) continue;
+        if (!ty || ty->kind != sema::TypeRef::Kind::Primitive ||
+            ty->primitive != sema::PrimitiveType::String)
+            continue;
         if (paramSlots_.find(s) == paramSlots_.end()) continue;
         candidates.insert(s);
     }
@@ -25831,6 +25902,20 @@ void Emitter::retainAssignedStringParams(
         }
     };
     for (auto& s : body) scan(s.get());
+    // 2b. fix #5253 (§22.3, v0.313): an `out` ARGUMENT naming the
+    //     parameter is a write too — the callee's lowerStringRefParamStore
+    //     loads the slot's old value and RELEASES it (#2321), so the slot must
+    //     hold a reference this frame owns or that release frees the caller's
+    //     string (measured: `Fill(out p, i)` on a by-value `string` / `string?`
+    //     parameter aborted with "refcount over-release (string)"). Not
+    //     descending into lambda bodies, same as the scan above.
+    {
+        std::vector<const ast::IdentifierExpr*> byRef;
+        collectByRefArgIdents(body, byRef);
+        for (const ast::IdentifierExpr* id : byRef)
+            if (sema::Symbol* sym = ctx_.exprSymbol(*id))
+                if (candidates.count(sym)) assigned.insert(sym);
+    }
 
     // 3. Mint the frame's own reference. Emitted in the prologue, where the
     //    builder still sits in the entry block right after bindParameters
@@ -25841,6 +25926,21 @@ void Emitter::retainAssignedStringParams(
         llvm::AllocaInst* slot = paramSlots_[const_cast<sema::Symbol*>(sym)];
         if (!slot) continue;
         emitStringRetain(builder_.CreateLoad(ptrTy(), slot, "str.parm"));
+        retainedSet.insert(sym);
+        // fix #5253 (§28.9, v0.313): the slot now owns exactly one reference
+        // (the retain above, kept balanced by every drop-on-overwrite write).
+        // When the parameter provably never escapes, release its FINAL value
+        // at scope end, exactly as armStringLocalRefcount does for a non-
+        // escaping borrow local — the walk is the same one, keyed on the
+        // parameter symbol. An escaping parameter keeps #2696's bounded
+        // per-call leak. Queued for the body's ROOT scope (lowerScopedBlock
+        // drains pendingChainOutDisposals_ there), so only a caller whose
+        // root lowerScopedBlock follows directly asks for it.
+        if (armScopeEndRelease && stringParamReleaseEligible(sym, body)) {
+            Disposal d{slot, nullptr};
+            d.stringRelease = true;
+            pendingChainOutDisposals_.push_back(d);
+        }
     }
     // 3b. fix #2712: the same +1 for an assigned-to implicit `value`. The type
     //     test runs here because the LocalSymbol sema built for it carries the
@@ -26194,6 +26294,11 @@ bool isSequenceEqualSpanNonRetainingArg(const ast::Expr* callee, size_t i,
 struct StringEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
+    // fix #5253 (§22.3 / §28.9, v0.313): when set, the tracked binding is this
+    // PARAMETER symbol (a ParameterSymbol has no LocalDecl to key on), and
+    // isTargetIdent matches an identifier resolving to it. Null for every
+    // LocalDecl-keyed walk, leaving them bit-identical.
+    const sema::Symbol* targetSym = nullptr;
     bool escaped = false;
     // FINDING [1] / §28.9 / §28.3: true while walking inside a lambda body. A
     // closure's heap env block captures (borrows) the target local and outlives
@@ -26442,6 +26547,7 @@ struct StringEscapeWalker {
             return false;
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         if (!id) return false;
+        if (targetSym) return ctx.exprSymbol(*id) == targetSym;  // fix #5253
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
         return loc && loc->decl &&
                static_cast<const void*>(loc->decl) == target;
@@ -27146,7 +27252,9 @@ struct StringEscapeWalker {
                             if (i < md->params.size() && md->params[i].type)
                                 fty = ctx.resolvedType(*md->params[i].type);
                     }
-                    if (fty && !fty->nullable &&
+                    // fix #5253 (§22.3 / §28.9, v0.313): a `string?` formal too —
+                    // lowerStringRefParamStore balances a nullable target the same way.
+                    if (fty &&
                         fty->kind == sema::TypeRef::Kind::Primitive &&
                         fty->primitive == sema::PrimitiveType::String)
                         safeArg = true;
@@ -27505,7 +27613,9 @@ struct StringEscapeWalker {
                             if (i < cd->params.size() && cd->params[i].type)
                                 fty = ctx.resolvedType(*cd->params[i].type);
                     }
-                    if (fty && !fty->nullable &&
+                    // fix #5253 (§22.3 / §28.9, v0.313): a `string?` formal too —
+                    // lowerStringRefParamStore balances a nullable target the same way.
+                    if (fty &&
                         fty->kind == sema::TypeRef::Kind::Primitive &&
                         fty->primitive == sema::PrimitiveType::String)
                         safeArg = true;
@@ -31679,6 +31789,27 @@ void Emitter::collectStringReleaseEligible(
                             static_cast<const void*>(s));
                     }
                 }
+            } else if (!v.init && !v.isUsing && v.type &&
+                       dynamic_cast<const ast::LocalDecl*>(s)) {
+                // fix #5253 (§4.6 / §7.9 / §28.9, v0.313): a NO-INITIALIZER
+                // `var s: string;` / `var s: string?;`. It was never a
+                // candidate, so a `string?` one took a plain store on every
+                // `:=` (lowerStringLocalReassign's nullable gate refused it)
+                // and dangled once the aliased field was stored over — the
+                // issue's shape 4 SEGV — while a `string` one was retained on
+                // every `:=` but never released (a per-iteration leak). Its
+                // slot is zero-initialized (lowerLocalDecl), so it is a borrow
+                // local whose bind retain is a no-op: classify it with the
+                // borrows — retain-new / release-old on every write, and a
+                // scope-end release when the walk below proves it never
+                // escapes.
+                const sema::TypeRef* lt = ctx_.resolvedType(*v.type);
+                if (lt && lt->kind == sema::TypeRef::Kind::Primitive &&
+                    lt->primitive == sema::PrimitiveType::String) {
+                    borrowCandidates.push_back(s);
+                    stringBorrowAll_.insert(static_cast<const void*>(s));
+                    stringLocalCandidates_.insert(static_cast<const void*>(s));
+                }
             }
         }
         // Recurse into nested blocks so locals declared inside if/while/for/
@@ -31794,6 +31925,25 @@ void Emitter::collectStringReleaseEligible(
             valueLikeChoiceStrReleaseEligible_.insert(
                 static_cast<const void*>(ld));
     }
+}
+
+
+// fix #5253 (§28.9, v0.313): StringEscapeWalker keyed on a PARAMETER symbol
+// (targetSym), with collectStringReleaseEligible's borrow-local opt-ins. A
+// `true` verdict means no alias of the parameter's value outlives the body
+// (not returned, captured, stored, or passed anywhere but a call-bounded
+// borrow position), so the slot's own +1 can be released at scope end.
+bool Emitter::stringParamReleaseEligible(
+    const sema::Symbol* sym,
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) const {
+    StringEscapeWalker w{ctx_, nullptr};
+    w.targetSym = sym;
+    w.stringReleaseMode = true;
+    w.scrutineeBorrowMode = true;
+    w.borrowRetainedAliases = &stringBorrowAll_;
+    w.objectStringBorrowAliases = &objectStringBorrowAll_;
+    for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+    return !w.escaped;
 }
 
 

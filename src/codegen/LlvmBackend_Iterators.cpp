@@ -382,10 +382,19 @@ namespace {
 struct OutVarSlotCollector {
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out;
     llvm::Type* fieldTy;
+    // fix #5253 (§22.3, v0.313): when set, ALSO collect every pre-declared
+    // `out` argument that is a bare identifier (§22.3: the callee definitely
+    // assigns it, writing the caller's own binding through the pointer). Null
+    // for the frame-slot reservation walks, which are unchanged.
+    std::vector<const ast::IdentifierExpr*>* byRefArgs = nullptr;
 
     void considerArgs(const std::vector<ast::CallArgument>& args) {
         for (auto& a : args) {
             if (!a.value) continue;
+            if (byRefArgs && a.modifier == "out")
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                    byRefArgs->push_back(id);
             // fix #3981: "out var" (registerOutVarStringRelease /
             // registerCtorOutVarStringRelease's `string` disposal) and
             // "out using var" (ensureOutVarSlots' / ensureCtorOutVarSlots'
@@ -540,6 +549,24 @@ void Emitter::collectOutVarSuspendLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
     OutVarSlotCollector c{out, ptrTy()};
+    for (auto& s : body) c.stmt(s.get());
+}
+
+
+// fix #5253 (§22.3, v0.313): every bare-identifier pre-declared `out`
+// argument in `body` (not descending into lambda bodies — OutVarSlotCollector's
+// own scope). retainAssignedStringParams counts such an argument naming a
+// by-value `string` / `string?` parameter as a WRITE of that parameter: the
+// callee's lowerStringRefParamStore releases the slot's old value, which must
+// therefore be a reference this frame owns. A `ref` argument is NOT counted:
+// a callee that only reads it would turn the retain into a per-call leak, and
+// the escape walk keeps `ref` an escape, so no release could pair it.
+void Emitter::collectByRefArgIdents(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<const ast::IdentifierExpr*>& out) {
+    std::vector<std::pair<const ast::Node*, llvm::Type*>> unused;
+    OutVarSlotCollector c{unused, ptrTy()};
+    c.byRefArgs = &out;
     for (auto& s : body) c.stmt(s.get());
 }
 

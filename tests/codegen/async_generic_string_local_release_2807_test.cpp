@@ -593,8 +593,8 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 
 // ---------------------------------------------------------------------
 // (E) / (J) the use-after-free direction — an ASSIGNED-TO `string` parameter.
-// Each still leaks the parameter slot's final value (#2696's documented trade)
-// and must NOT have freed the CALLER's reference. Removing the co-gated retain
+// (E) still leaks the parameter slot's final value (#2696's documented trade);
+// (J) no longer does (#5253). Neither may free the CALLER's reference. Removing the co-gated retain
 // turns both of these into heap-use-after-free (verified).
 // ---------------------------------------------------------------------
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
@@ -611,11 +611,17 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
     BEZEL_EXPECT_EQ(r.exitCode, 100);
 }
 
+// fix #5253 (§28.9, v0.313): the specialization's assigned parameter never
+// escapes, so its final value is now released at scope end, and #2696's
+// per-call leak is gone for (J). The run must therefore be clean under ASan
+// AND LSan: a leak OR a use-after-free fails it. (E), the async body, still
+// keeps the documented leak; the scope-end release is not armed there.
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            generic_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kGenericAssignedStringParam);
     if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);         // 953 B / 40 -> 390 B / 20
+    BEZEL_EXPECT_TRUE(r.ran);              // 953 B / 40 -> 390 B / 20 -> 0
+    BEZEL_EXPECT_EQ(r.exitCode, 100);
 }
 
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,

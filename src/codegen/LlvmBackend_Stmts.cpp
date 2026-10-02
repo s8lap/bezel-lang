@@ -1511,6 +1511,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                          stringLocalSlotOwnsRef(*as->target) &&
                          !isPlusOneStringProducer(as->value.get()))
                     emitStringRetain(rhs);
+                // fix #5253 (§22.3 / §28.9, v0.313): a `ref` / `out` string
+                // PARAMETER — the `??=` twin of lowerStringRefParamStore. The
+                // caller's slot this aliases owns one reference for whatever
+                // it holds and releases it (an `out var` recipient's scope-end
+                // release, a borrow local's), so a borrow stored here without
+                // a retain is released by the caller while its owner still
+                // holds it (`r := null; r ??= c.Val;` SEGVed once `c.Val` was
+                // overwritten). The slot is null here (no old value).
+                else if (rhs->getType()->isPointerTy() &&
+                         isStringExprType(*as->target) &&
+                         dynamic_cast<const ast::IdentifierExpr*>(
+                             as->target.get()) &&
+                         refParams_.count(ctx_.exprSymbol(*as->target)) &&
+                         !isPlusOneStringProducer(as->value.get()))
+                    emitStringRetain(rhs);
                 builder_.CreateStore(rhs, addr);
                 // §22.16's "throw exits check nothing": a store sequence that
                 // left the current block terminated (an unwind edge) must not

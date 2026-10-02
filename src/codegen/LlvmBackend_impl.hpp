@@ -13564,6 +13564,10 @@ private:
     void collectOutVarSuspendLocals(
         const ast::Expr* body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
+    // fix #5253: every bare-identifier pre-declared `out` argument in `body`.
+    void collectByRefArgIdents(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<const ast::IdentifierExpr*>& out);
 
     // §29.3 / §30.2 (#2132): inside a state-machine body (iterator or async), a
     // suspend-live local's alloca must be mapped to its reserved frame field via
@@ -16566,10 +16570,37 @@ private:
     // PropertyDecl and codegen binds into locals_ (not paramSlots_) — pass the
     // PropertyDecl after `locals_[pd]` has been bound; null for every non-
     // accessor caller.
+    //
+    // fix #5253 (§22.3 / §28.9, v0.313): the candidacy covers `string?` too,
+    // an `out` ARGUMENT naming the parameter counts as a write (the
+    // callee's lowerStringRefParamStore releases the slot's old value), and
+    // `armScopeEndRelease` additionally registers a root-scope release of the
+    // parameter's final value when stringParamReleaseEligible proves it never
+    // escapes. Only a plain method body / generic specialization passes true:
+    // the release is queued through pendingChainOutDisposals_, which only the
+    // body's own root lowerScopedBlock drains.
     void retainAssignedStringParams(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         const std::vector<sema::Symbol*>& params,
-        const ast::PropertyDecl* setterValueAnchor = nullptr);
+        const ast::PropertyDecl* setterValueAnchor = nullptr,
+        bool armScopeEndRelease = false);
+    // fix #5253: did retainAssignedStringParams give `sym`'s slot a +1 in
+    // the body being lowered?
+    bool isOwnedStringParamSlot(const sema::Symbol* sym) const;
+    // fix #5253: does `ms`'s declaration carry an `ensures` clause (§22.16)?
+    static bool hasEnsuresClause(const sema::MethodSymbol* ms) {
+        auto* md = ms ? dynamic_cast<const ast::MethodDecl*>(ms->decl) : nullptr;
+        if (!md) return true;  // unknown: conservatively "yes" (no release)
+        for (const auto& c : md->contractClauses)
+            if (c.kind == ast::ContractClause::Kind::Ensures) return true;
+        return false;
+    }
+    // fix #5253: the StringEscapeWalker verdict for a PARAMETER (keyed on its
+    // symbol rather than a LocalDecl), run over `body` with the same opt-ins
+    // collectStringReleaseEligible uses for a borrow local.
+    bool stringParamReleaseEligible(
+        const sema::Symbol* sym,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) const;
 
     // fix #4174 follow-up (review NEEDS-FIX) / §28.1: the closure twin of
     // retainAssignedStringParams — see that function's own comment for the
@@ -17193,6 +17224,18 @@ private:
     // (stringBorrowRetainEligible_) is additionally released at scope end; the
     // escaping ones leak their retained +1 (safe).
     std::unordered_set<const void*> stringBorrowAll_;
+    // fix #5253 (§22.3 / §28.9, v0.313): per LLVM function, the by-value
+    // `string` / `string?` parameters retainAssignedStringParams gave an
+    // independent +1 at bind (see isOwnedStringParamSlot).
+    std::unordered_map<const llvm::Function*,
+                       std::unordered_set<const sema::Symbol*>>
+        retainedStringParams_;
+    // fix #5253 (§22.3 / §28.9, v0.313): inline `out var` recipients (their
+    // introducing IdentifierExpr) at a `string` / `string?` `out` formal of a
+    // compiled callee, in a pinned body — registerOutVarStringRelease /
+    // registerCtorOutVarStringRelease record them before their escape gate.
+    // The callee's out-store leaves such a slot owning one reference.
+    std::unordered_set<const void*> outVarOwnedStringRecipients_;
     // fix #2817 / §4.6 / §28.9 (v0.240): EVERY `var` string LocalDecl node the
     // last collectStringReleaseEligible walk ADMITTED as a candidate — producer,
     // borrow, or value-like choice — whether or not it turned out to escape. It
