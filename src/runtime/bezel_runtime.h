@@ -579,10 +579,14 @@ int32_t bz_decimal_hash(const bz_decimal_t* a);
 void bz_decimal_from_int64(int64_t v, bz_decimal_t* out);
 void bz_decimal_from_int32(int32_t v, bz_decimal_t* out);
 
-// Conversions — from/to double (explicit only, per §5.2).
+// Conversions — from double (explicit only, per §5.2).
 // per fix #521: ove_vtable for out-of-range values.
+// per fix #5190 (v0.311): uses bz_double_to_string_r (shortest round-trip).
 void   bz_decimal_from_double(double v, bz_decimal_t* out, void* ove_vtable);
 double bz_decimal_to_double(const bz_decimal_t* a);
+
+// Conversion from float (explicit per §5.2, v0.311, fix #5190).
+void   bz_decimal_from_float(float v, bz_decimal_t* out, void* ove_vtable);
 
 // Conversions — to integer (explicit only, per §5.2).
 // §5.2: truncates toward zero; raises OverflowException (via ove_vtable) when

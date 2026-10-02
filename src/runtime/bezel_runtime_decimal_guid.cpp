@@ -523,33 +523,74 @@ extern "C" void bz_decimal_from_uint64(uint64_t v, bz_decimal_t* out) {
     dec_store(out, (__uint128_t)v, 0, /*neg=*/0, nullptr);
 }
 
-// Conversion from double (explicit per §5.2).
-// per fix #521 / §6.4: ove_vtable is stored in bz_exc on overflow; callers
-// call emitPendingCheck() after this function.
-// per fix #4845: %.15g + bz_decimal_parse_cstr can land on a scale > 28
-// (e.g. 1e-40 parses to scale 40, which §4.4 forbids).  Post-process the
-// parsed value so scale is always ≤ 28 with half-up rounding (consistent
-// with dec_store's existing rounding rule).
-extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
-                                        void* ove_vtable) {
-    // Use snprintf to get the decimal representation.
-    if (v != v || v > 1e29 || v < -1e29) {
-        // §6.4: OverflowException — value out of decimal range.
+// Conversion from float (explicit per §5.2, v0.311).
+// §5.2 (v0.311, fix #5190): read the float's shortest round-trip form, then parse.
+// Uses a stack-based search (1..9 significant digits) identical to the algorithm
+// in bz_float_to_string_r, but parses directly from the stack buffer.
+extern "C" void bz_decimal_from_float(float v, bz_decimal_t* out,
+                                       void* ove_vtable) {
+    if (v != v || v > 1e29f || v < -1e29f) {
         bz_set_exc(ove_vtable);
         return;
     }
     char buf[64];
-    snprintf(buf, sizeof(buf), "%.15g", v);
-    // ove_vtable also covers the (very unlikely) case where the string
-    // produced by snprintf overflows (e.g. 1e29 edge case).
+    int n = 0;
+    if (std::isnan(v) || std::isinf(v)) {
+        n = snprintf(buf, sizeof(buf), "%g", (double)v);
+    } else {
+        // Search 1..9 digits for the shortest that round-trips through strtof.
+        for (int prec = 1; prec <= 9; ++prec) {
+            n = snprintf(buf, sizeof(buf), "%.*e", prec - 1, (double)v);
+            float rt = strtof(buf, nullptr);
+            if (memcmp(&rt, &v, sizeof(float)) == 0) break;
+        }
+    }
     bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
-    if (bz_exc) return;  // let OverflowException / FormatException propagate
+    if (bz_exc) return;
 
-    // §5.2 (fix #4845): nearest-representable decimal value, scale ≤ 28.
-    // The %.15g + parser pipeline produces a (m, s) representation of the
-    // double's nearest-15-significant-digit value. For sub-scale-28 magnitudes
-    // (e.g. `decimal(1e-40)`), s > 28 — round the mantissa down to scale 28
-    // with half-up rounding (matches dec_store's rem >= 5 → m += 1 rule).
+    // §4.4: scale must be ≤ 28; round mantissa if necessary.
+    uint32_t s = dec_scale(out);
+    if (s > 28) {
+        __uint128_t m = dec_mantissa(out);
+        int neg = dec_sign(out);
+        uint32_t drop = s - 28;
+        for (uint32_t k = 0; k < drop; ++k) {
+            __uint128_t q = m / 10;
+            __uint128_t r = m - q * 10;
+            m = q;
+            if (r >= 5) m += 1;
+        }
+        dec_store(out, m, 28, neg, ove_vtable);
+    }
+}
+
+// Conversion from double (explicit per §5.2).
+// per fix #521 / §6.4: ove_vtable is stored in bz_exc on overflow.
+// per fix #4845: scale must be ≤ 28 after parse; round mantissa if necessary.
+// per fix #5190 / §5.2 v0.311: use the shortest round-trip form (1..17 digit search)
+// instead of the old snprintf("%.15g") approach. Stack-only — no heap allocation.
+extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
+                                        void* ove_vtable) {
+    if (v != v || v > 1e29 || v < -1e29) {
+        bz_set_exc(ove_vtable);
+        return;
+    }
+    char buf[64];
+    int n = 0;
+    if (std::isnan(v) || std::isinf(v)) {
+        n = snprintf(buf, sizeof(buf), "%g", v);
+    } else {
+        // Search 1..17 digits for the shortest that round-trips through strtod.
+        for (int prec = 1; prec <= 17; ++prec) {
+            n = snprintf(buf, sizeof(buf), "%.*e", prec - 1, v);
+            double rt = strtod(buf, nullptr);
+            if (memcmp(&rt, &v, sizeof(double)) == 0) break;
+        }
+    }
+    bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
+    if (bz_exc) return;
+
+    // §4.4: scale must be ≤ 28; round mantissa if necessary.
     uint32_t s = dec_scale(out);
     if (s > 28) {
         __uint128_t m = dec_mantissa(out);
