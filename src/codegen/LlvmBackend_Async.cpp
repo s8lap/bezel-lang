@@ -1416,6 +1416,74 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // captures (this + params)
         emitFrameCaptureStores(frame, st);
 
+        // fix-forward #5262-ff (§30.1 "Borrowed parameters, `this`, and
+        // captures are held until settlement" / §4.6 / §28.9, v0.313): retain
+        // every by-borrow `string`/`string?` formal INTO the async frame.
+        //
+        // §30.1 states the rule this implements verbatim: "An async method's
+        // plain (non-`owned`) parameters of class or interface type, its `this`
+        // receiver, and an `async` lambda's captures are borrows captured into
+        // the state-machine frame — held not for the duration of the
+        // synchronous call but until the task SETTLES."
+        //
+        // #5262's pin is a CALLER-side retain released on the call's
+        // normal-return edge. For an async callee that edge arrives at the
+        // FIRST SUSPENSION — the call returns its `Task` there (§30.1: the
+        // method "suspends and returns its `Task` to the caller"), while the
+        // body resumes later in `bz$async$…$Resume` on another frame. So the
+        // caller's +1 is gone before the resumed body reads the parameter, and
+        // a callee that stored over the aliased field in between has freed it.
+        // MEASURED (v1 review, r23-c28 d68dab26): `c.TwiceAsync(c.Val,
+        // "q"+i)` with an `await Task.Delay(0)` between the stores and the
+        // read SEGVs in `bz_string_to_utf8z` with frame #1
+        // `bz$async$M.C$TwiceAsync$Resume` on thread T3 via `domain_drain`.
+        //
+        // The retain is taken HERE, in the entry function, before the frame is
+        // driven even once, so it is live across every suspension; the
+        // matching release is at frame teardown (both terminal edges — the
+        // success edge in `emitAsyncComplete` and the fault boundary). The
+        // same `isStringPinFormalType` predicate the caller's pin uses
+        // applies, so the two agree on which arguments are pinned; a null
+        // `string?` retains and releases nothing (§28.9: `bz_string_retain`
+        // and `bz_string_release` are both no-ops on null).
+        //
+        // Deliberately NOT gated on whether the body assigns to the parameter:
+        // `retainAssignedStringParams` (Setup.cpp) mints a +1 per ACTIVATION
+        // for a parameter the body assigns to, which is a different quantity
+        // (it pairs with the drop-on-overwrite release, so it must scale with
+        // activations). This is the frame-lifetime half §30.1 asks for, and
+        // the two are additive — a surplus retain leaks, never over-releases.
+        for (sema::Symbol* sym : ms->params) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+            if (!ps || !ps->modifier.empty()) continue;
+            const sema::TypeRef* pty =
+                ps->resolvedDeclType
+                    ? ps->resolvedDeclType
+                    : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                    : nullptr);
+            if (!isStringPinFormalType(pty)) continue;
+            auto it = paramSlots_.find(sym);
+            if (it == paramSlots_.end() || !it->second) continue;
+            llvm::Value* v =
+                builder_.CreateLoad(ptrTy(), it->second, "async.pinparam");
+            emitStringRetain(v);
+            // Record the frame capture field holding this parameter, so
+            // emitAsyncStringParamRelease drops the SAME value at teardown.
+            // The capture list is `this` followed by the params, in the order
+            // emitFrameCaptureStores walked them, so the field index is
+            // captureStart + the parameter's position in that list.
+            for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+                if (frame.captures[ci].first != sym) continue;
+                asyncStringPinFields_.push_back(
+                    frame.captureStart + (unsigned)ci);
+                break;
+            }
+        }
+        // Publish the frame for the teardown release. Cleared at the end of
+        // this function alongside asyncOwnedParamFrame_, so a nested emission
+        // that completes its own frame cannot reach this one.
+        asyncStringPinFrame_ = asyncStringPinFields_.empty() ? nullptr : &frame;
+
         // §22.7 / §22.13 / §24 (#1502): run the entry-point static-init
         // prologue BEFORE driving the state machine. emitFunctionBody's async
         // routing returns before its own inline prologue site, so without this
@@ -1830,6 +1898,13 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // as the success edge (emitAsyncComplete) does. Runs BEFORE the frame
             // free below so it can still read/GEP through `self`.
             emitAsyncOwnedParamAutoDispose(self);
+            // fix-forward #5262-ff (§30.1 / §4.6 / §28.9, v0.313): the fault
+            // edge's half of the borrowed-string-parameter hold — §30.1 holds
+            // such a borrow "until the task settles", and a fault IS a
+            // settlement. Without this the +1 taken at frame entry leaks on
+            // every faulted task. Success and fault are mutually exclusive
+            // terminal states, so the pair is exactly-once.
+            emitAsyncStringParamRelease(self);
             // §30.5: the frame is dead on this terminal (fault) path — free it.
             // §30.13 (#439-followup): free the cross-suspend spill area first (if
             // any) — it is a side allocation pointed to from the frame.
@@ -1923,6 +1998,14 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // emitting async method (the fault-boundary handler null-guards it; §30.1).
         // #1521.
         asyncOwnedParamFrame_ = nullptr;
+        // fix-forward #5262-ff (§30.1 / §4.6 / §28.9, v0.313): the same
+        // discipline for the borrowed-string-parameter frame — cleared
+        // alongside asyncOwnedParamFrame_ so a nested async-lambda or lazy
+        // generic-specialization emission completing its OWN frame cannot
+        // release this frame's parameters, and so the field list cannot be
+        // read against a frame that is no longer being emitted.
+        asyncStringPinFrame_ = nullptr;
+        asyncStringPinFields_.clear();
     }
 }
 
@@ -5620,6 +5703,32 @@ void Emitter::emitAsyncOwnedParamAutoDispose(llvm::Value* self) {
     }
 }
 
+
+// fix-forward #5262-ff (§30.1 "Borrowed parameters, `this`, and captures are
+// held until settlement" / §4.6 / §28.9, v0.313): the terminal-edge half of the
+// borrowed-string-parameter hold. §30.1: the borrow is "held not for the
+// duration of the synchronous call but until the task SETTLES" — so the entry
+// function's +1 is dropped here, on whichever terminal edge fires.
+//
+// Runs on BOTH terminal edges (success in emitAsyncComplete, fault in the
+// async.fault boundary), which are mutually exclusive (§30.5) — so each task
+// drops each parameter exactly once. Each field is nulled after its release,
+// mirroring emitAsyncOwnedParamAutoDispose above, so a repeated call is a
+// no-op rather than an over-release. MUST run before `free(self)`, since it
+// reads through the frame pointer; both call sites satisfy that.
+void Emitter::emitAsyncStringParamRelease(llvm::Value* self) {
+    if (!asyncStringPinFrame_ || !self || !smStateStruct_) return;
+    for (unsigned fieldIdx : asyncStringPinFields_) {
+        llvm::Value* fptr =
+            builder_.CreateStructGEP(smStateStruct_, self, fieldIdx);
+        llvm::Value* v = builder_.CreateLoad(ptrTy(), fptr, "aspin.arg");
+        // null-safe by construction: §28.9's bz_string_release is a no-op on
+        // null, which is also what makes a `string?` formal safe to pin.
+        emitStringRelease(v);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), fptr);
+    }
+}
+
 // §30.1 / §30.9: complete the outer task. `value` is the lowered return value
 // (null for a `Task` with no value, or a fall-off completion). The result is
 // copied by the runtime (bz_task_complete malloc+memcpy's `result_size` bytes),
@@ -5679,6 +5788,12 @@ void Emitter::emitAsyncComplete(llvm::Value* value) {
     // nested async-lambda emission, suppressed across the call per the
     // save/restore in LlvmBackend_Exprs2.cpp).
     emitAsyncOwnedParamAutoDispose(self);
+    // fix-forward #5262-ff (§30.1 / §4.6 / §28.9, v0.313): the SUCCESS edge's
+    // half of the borrowed-string-parameter hold — §30.1 holds such a borrow
+    // "until the task settles", which is here. The fault edge's twin is in the
+    // async.fault boundary; the two terminal states are mutually exclusive
+    // (§30.5), so each parameter's entry +1 is dropped exactly once per task.
+    emitAsyncStringParamRelease(self);
     // §30.5 (minimal): the frame is dead once the task is completed on a terminal
     // path. In the synchronous / already-done cut the resume runs inline to
     // completion with no pending suspension, so freeing the frame here is safe and

@@ -15168,6 +15168,35 @@ private:
     // exclusive terminal states). No-op when asyncOwnedParamFrame_ is null.
     void emitAsyncOwnedParamAutoDispose(llvm::Value* self);
 
+    // fix-forward #5262-ff (§30.1 "Borrowed parameters, `this`, and captures
+    // are held until settlement" / §4.6 / §28.9, v0.313): the frame published
+    // by emitAsyncMethod for the borrowed-string-parameter half of that rule.
+    // A by-value `string`/`string?` formal owns no +1 of its own, so across a
+    // suspension the only thing keeping the value alive is the +1 the ENTRY
+    // function takes (see emitAsyncMethod). It must be dropped exactly once per
+    // task, on whichever terminal edge fires — success or fault, never both.
+    // Null outside emitAsyncMethod, and inside it only for the duration of the
+    // frame's own emission, so a nested async-lambda or lazy generic-
+    // specialization emission cannot release the OUTER frame's parameters.
+    const StateMachineFrame* asyncStringPinFrame_ = nullptr;
+
+    // fix-forward #5262-ff: the capture-field indices of the by-borrow
+    // `string`/`string?` formals of *asyncStringPinFrame_, in declaration
+    // order. Populated by the same loop in emitAsyncMethod that takes the
+    // entry retains, so the retain set and the release set cannot drift.
+    std::vector<unsigned> asyncStringPinFields_;
+
+    // fix-forward #5262-ff: drop the +1 this frame's entry function took on
+    // each borrowed string parameter, reading each value back through the
+    // frame `self` so the release targets the value that was retained (the
+    // body's own reassignment of the parameter slot is a different quantity —
+    // see retainAssignedStringParams). Nulls each field after releasing it,
+    // mirroring emitAsyncOwnedParamAutoDispose, so a second call on the same
+    // frame is a no-op rather than an over-release. Called from BOTH terminal
+    // edges, which are mutually exclusive (§30.5), so each task drops each
+    // parameter exactly once.
+    void emitAsyncStringParamRelease(llvm::Value* self);
+
     // Pass 2: emit a function's body.
     void emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn);
 

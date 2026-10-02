@@ -469,3 +469,72 @@ BEZEL_TEST(borrowed_string_arg_pin_5262,
     BEZEL_EXPECT_EQ(run(inlineCtorSrc(200)), wantPrinted(200));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SHAPE 6 — the ASYNC callee (fix-forward #5262-ff, row 2 of 3)
+//
+// #5262's pin is a CALLER-side retain released on the call's normal-return
+// edge. An async callee RETURNS at its first suspension (§30.1: the method
+// "suspends and returns its `Task` to the caller"), so that edge arrives long
+// before the body finishes — and the body then reads the parameter from a
+// different frame, with the borrow already freed by its own second store.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The await sits BETWEEN the two stores and the read, so the read of the
+// borrowed parameter happens AFTER a real suspension — which is the whole
+// point of the shape. `async Main` awaits each task in turn, so the
+// suspensions are sequential and stdout is deterministic (this shape does NOT
+// use TaskScope/Spawn, which would make the output order nondeterministic and
+// the exact-stdout assertion a flake).
+std::string asyncCalleeSrc(int iters) {
+    return "module M5262f; "
+           "public class C "
+           "  private _v: string; "
+           "  public constructor(v: string) _v := v; end constructor; "
+           "  public async method TwiceAsync(x: string, y: string): Task "
+           "    _v := x; "
+           "    _v := y; "
+           "    await Task.Delay(0); "
+           "    Console.WriteLine(x); "
+           "  end TwiceAsync; "
+           "  public property Val: string => _v; "
+           "end C; "
+           "public class Program "
+           "  public static async method Main(): Task "
+           "    using var c := new C(\"a1\"); "
+           "    for var i in 0.." "<" + std::to_string(iters) +
+           " do "
+           "      await c.TwiceAsync(c.Val, \"q\" + i.ToString()); "
+           "    end; "
+           "    Console.WriteLine(c.Val); "
+           "  end Main; "
+           "end Program;";
+}
+
+// 50 iterations, not 200: an async call per iteration is expensive under the
+// AOT harness (the v1 review measured the same reduction and recorded that
+// the failure is a FIRST-iteration SEGV, so the count does not weaken the
+// evidence). The amplification that matters is inside the single run.
+constexpr int kAsyncIters = 50;
+
+// (6a) FAIL-WITHOUT (MEASURED on the rebased r23-c28 9c640754,
+// `agent_check.sh --probe --asan`): `AddressSanitizer: SEGV`, READ in
+// `bz_string_to_utf8z`, frame #1 `bz$async$M.C$TwiceAsync$Resume`, thread T3
+// via `domain_drain` — i.e. the read happens on the RESUME, in a different
+// frame from the call, after the caller-side pin was already released.
+BEZEL_TEST(borrowed_string_arg_pin_5262,
+           async_callee_double_store_param_survives_spec_4_6_28_9) {
+    BEZEL_EXPECT_EQ(run(asyncCalleeSrc(kAsyncIters)),
+                    wantPrinted(kAsyncIters));
+}
+
+// (6b) The same 50 iterations under LeakSanitizer: the frame-entry retain
+// must balance at teardown, on BOTH terminal edges. A retain without its
+// release leaks one string per task; a double release drops the field's own
+// reference (the #4547 shape).
+BEZEL_TEST(borrowed_string_arg_pin_5262,
+           async_callee_pin_balanced_no_leak_spec_4_6_28_9) {
+    BEZEL_EXPECT_EQ(run(asyncCalleeSrc(kAsyncIters)),
+                    wantPrinted(kAsyncIters));
+}
+
+
