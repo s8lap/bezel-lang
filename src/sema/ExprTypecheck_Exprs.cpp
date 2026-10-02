@@ -11254,6 +11254,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // per §24: an event-handler lambda — give its single untyped param
         // the event payload type T. Consumed once (cleared) so nested lambdas
         // don't inherit it.
+        // fix #5266 (§14.1 v0.313): an annotated lambda parameter / return
+        // type that names a generic instantiation is an instantiation site.
+        for (const auto& lp : lam->params)
+            if (lp.type)
+                recordAnnotationInstantiationSites(
+                    ctx_.resolvedType(*lp.type), lp.type->span.begin);
+        if (lam->retType)
+            recordAnnotationInstantiationSites(
+                ctx_.resolvedType(*lam->retType), lam->retType->span.begin);
         TypeRef* eventParamType = pendingLambdaParamType_;
         pendingLambdaParamType_ = nullptr;
         // fix #829: the inferred positional parameter types from the lambda's

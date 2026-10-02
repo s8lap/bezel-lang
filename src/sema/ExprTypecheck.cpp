@@ -302,17 +302,27 @@ void ExprTC::recordDefaultTypeParamUse(const void* owner,
 // checkDeferredAsOperandInstantiations never saw them.  This helper records
 // a site for every class-level generic parameter that is substituted by a
 // value type at the given resolved type.
-// fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
-// instantiation sites — `var g: G<int>` and `class D : G<int>` — are
-// seen only as type annotations by Resolver (resolveTypesInBody / the
-// extends-clause walk).  recordDefaultObligationsForConstruction fires only
-// for `new` expressions, so these sites were never recorded and
-// checkDeferredAsOperandInstantiations never saw them.  This helper records
-// a site for every class-level generic parameter that is substituted by a
-// value type at the given resolved type.
 void ExprTC::recordAnnotationInstantiationSites(TypeRef* rt,
                                                SourceLocation loc) {
-    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration ||
+    if (!rt) return;
+    // fix #5266 (§14.1 "Instantiation and its site", v0.313): "as a type
+    // argument of another constructed type" and an inline-array element type
+    // are sites too, and a function type's parameter/return annotations are
+    // annotations.  Walk the children first, each at its own position.
+    auto childLoc = [&](const TypeRef* c) {
+        return (c && c->astNode) ? c->astNode->span.begin : loc;
+    };
+    for (TypeRef* c : rt->genericArgs)
+        if (c) recordAnnotationInstantiationSites(c, childLoc(c));
+    if (rt->arrayElement)
+        recordAnnotationInstantiationSites(rt->arrayElement,
+                                           childLoc(rt->arrayElement));
+    for (const auto& fp : rt->funcParams)
+        if (fp.type) recordAnnotationInstantiationSites(fp.type, childLoc(fp.type));
+    if (rt->funcReturn)
+        recordAnnotationInstantiationSites(rt->funcReturn,
+                                           childLoc(rt->funcReturn));
+    if (rt->kind != TypeRef::Kind::Named || !rt->declaration ||
         rt->declaration->kind != ast::TypeDeclKind::Class ||
         rt->genericArgs.empty()) {
         return;
@@ -348,6 +358,16 @@ void ExprTC::recordGenericInstantiationSite(const void* owner,
                                             TypeRef* arg, std::string argName,
                                             SourceLocation loc) {
     if (!owner || !arg || param.empty()) return;
+    // fix #5266 (§14.1 "Instantiation and its site", v0.313): every reference
+    // that forms an instantiation is its own site and the rule fires at every
+    // such site — `var g: G<int> := new G<int>();` is two sites, two
+    // diagnostics, each at its own position.  Only the SAME syntactic
+    // occurrence reached twice (same owner, parameter, type, line and column)
+    // is recorded once, so one site never reports twice.
+    for (const auto& e : genericInstantiationSites_)
+        if (e.owner == owner && e.param == param && e.argName == argName &&
+            e.loc.line == loc.line && e.loc.column == loc.column)
+            return;
     genericInstantiationSites_.push_back(
         {owner, std::string(param), arg, std::move(argName), loc});
 }
@@ -13996,6 +14016,17 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                 recordAnnotationInstantiationSites(br, loc);
             }
         }
+        // fix #5266 (§14.1 v0.313): primary-constructor / record positional
+        // fields and choice payload fields are annotation positions.
+        for (const auto& pf : td->positionalFields)
+            if (pf.type)
+                recordAnnotationInstantiationSites(
+                    ctx_.resolvedType(*pf.type), pf.type->span.begin);
+        for (const auto& cc : td->choiceCases)
+            for (const auto& pf : cc.payload)
+                if (pf.type)
+                    recordAnnotationInstantiationSites(
+                        ctx_.resolvedType(*pf.type), pf.type->span.begin);
         for (const auto& ec : td->enumConstants) {
             if (ec.value) visitExpr(*ec.value);
         }
@@ -16547,6 +16578,30 @@ static std::string nonClassElementName(const TypeRef* ta) {
 }
 
 void ExprTC::visitMember(const ast::Member& m) {
+    // fix #5266 (§12.7 v0.313, §3.6 rule 2): every annotation position that
+    // names a class-level generic instantiation is an instantiation site —
+    // fields, properties, parameters and return types, not only locals and
+    // extends clauses (#5210).
+    {
+        auto rec = [&](const std::unique_ptr<ast::Type>& t) {
+            if (t) recordAnnotationInstantiationSites(
+                ctx_.resolvedType(*t), t->span.begin);
+        };
+        auto recParams = [&](const std::vector<ast::Param>& ps) {
+            for (const auto& p : ps) rec(p.type);
+        };
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
+            rec(fd->type);
+        } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
+            rec(pd->type);
+            recParams(pd->indexerParams);
+        } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+            recParams(md->params);
+            rec(md->returnType);
+        } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
+            recParams(cd->params);
+        }
+    }
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         if (fd->initializer) {
             // Slice S29 (§22.8): a field initializer may not observe
