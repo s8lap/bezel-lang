@@ -8557,9 +8557,22 @@ private:
                         key += ".";
                         key += std::string(tr->declaration->name);
                         key += ".";
-                    } else if (!tr->headName().empty()) {
+                    } else if (tr && !tr->headName().empty()) {
                         for (auto part : tr->headName()) key += part;
                         key += ".";
+                    } else if (p.type && p.type->name && !p.type->name->parts.empty()) {
+                        // fix-forward #5251 follow-up: ctx_.resolvedType can
+                        // return nullptr (see SemaContext.hpp:122-125 — nullptr
+                        // when the type is not in the resolution cache), so the
+                        // `tr` arm must null-check before reading `headName()`.
+                        // On the unresolved fallback, spell the bare AST the way
+                        // the pre-#5251 path did (concatenated parts, then "."; or
+                        // "?" when there are no parts), so an unresolved param
+                        // keys exactly as before. (§12.1 / §2.8.3 rule 4, v0.313)
+                        for (auto part : p.type->name->parts) {
+                            key += std::string(part);
+                            key += ".";
+                        }
                     } else {
                         key += "?";
                     }
