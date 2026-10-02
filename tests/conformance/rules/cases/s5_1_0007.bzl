@@ -7,7 +7,7 @@
 //!   pair, direction reversed.
 //! cites: 5.1
 //! expect: reject
-//! diagnostic: only as listed
+//! diagnostic: conversion from `double` to `float`
 module Conf;
 
 public class Program

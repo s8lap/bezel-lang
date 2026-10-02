@@ -4064,6 +4064,11 @@ std::string ExprTC::primitiveNeverImplicitReason(const ast::Expr* fromExpr,
             return "between integers and `bool` is never implicit";
     }
     // "Between `decimal` and binary floats (`float`, `double`)."
+    // fix #4656 (§5.1 ll. 678-679, v0.313): `double → float` narrows and
+    // may lose precision; the spec's own wording from the table footnote.
+    if (from == P::Double && to == P::Float)
+        return "conversion from `double` to `float` may lose precision and is "
+               "not implicit";
     if ((from == P::Decimal && (to == P::Float || to == P::Double)) ||
         (to == P::Decimal && (from == P::Float || from == P::Double)))
         return "between `decimal` and binary floats (`float`, `double`) is "
@@ -5296,6 +5301,21 @@ void ExprTC::checkAssignable(
         if (from->nullable && !to->nullable) { reportNullable(); return; }
         if (from->declaration == to->declaration) return;
         if (isSubtype(from->declaration, to->declaration)) return;
+        // fix #4656 (§5.1, §5.2, v0.313): the spec lists only "class to base
+        // class, transitively, up to Object" as an implicit reference
+        // conversion. The OPPOSITE direction (base → derived = downcast) is NOT
+        // implicit and requires an explicit `T(x)` or `x as T` cast.  Only
+        // cases where the target IS a subtype of the source are downcasts;
+        // unrelated classes get the generic not-convertible message.
+        if (isSubtype(to->declaration, from->declaration)) {
+            std::string fromName(namedTypeSimpleName(from));
+            std::string toName(namedTypeSimpleName(to));
+            reportNotConvertible(
+                "a base-to-derived (downcast) conversion is not implicit: "
+                "use an explicit `" + toName + "(" + fromName + ")` or `" +
+                fromName + " as " + toName + "` per §5.2");
+            return;
+        }
         reportNotConvertible();
         return;
     }

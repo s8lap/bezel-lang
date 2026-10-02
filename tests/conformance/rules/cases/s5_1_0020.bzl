@@ -7,7 +7,7 @@
 //!   Twin of s5_1_0019: same pair, direction reversed.
 //! cites: 5.1
 //! expect: reject
-//! diagnostic: only as listed
+//! diagnostic: downcast
 module Conf;
 
 public class Animal
@@ -15,13 +15,13 @@ public class Animal
   end constructor;
 end Animal;
 
-public class Dog: Animal
+public class Cat: Animal
   public constructor()
   end constructor;
-end Dog;
+end Cat;
 
 public class Program
   public static method Convert(a: Animal)
-    var d: Dog := a;
+    var c: Cat := a;
   end Convert;
 end Program;
