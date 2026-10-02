@@ -13482,6 +13482,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // `out`/`owned` formals are excluded (they alias or transfer the caller's
     // slot); a generic formal `T` bound to string is #4980's store, not this.
     std::vector<llvm::Value*> stringPinArgs;
+    // SEAM-DEBT: #5262 local-callee gate on ms->decl: an imported callee has no MethodDecl, so its string arguments go unpinned (the #5262 gap)
     if (dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         const std::size_t pinOffset = isStaticMethod(ms) ? 0 : 1;
         for (std::size_t ai = pinOffset;
