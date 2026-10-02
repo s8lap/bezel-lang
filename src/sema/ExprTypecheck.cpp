@@ -292,6 +292,55 @@ void ExprTC::recordDefaultTypeParamUse(const void* owner,
     defaultTypeParamUses_.push_back({owner, std::string(param), loc});
 }
 
+// fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
+// instantiation sites — `var g: G<int>` and `class D : G<int>` — are
+// seen only as type annotations by Resolver (resolveTypesInBody / the
+// extends-clause walk).  recordDefaultObligationsForConstruction fires only
+// for `new` expressions, so these sites were never recorded and
+// checkDeferredAsOperandInstantiations never saw them.  This helper records
+// a site for every class-level generic parameter that is substituted by a
+// value type at the given resolved type.
+// fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
+// instantiation sites — `var g: G<int>` and `class D : G<int>` — are
+// seen only as type annotations by Resolver (resolveTypesInBody / the
+// extends-clause walk).  recordDefaultObligationsForConstruction fires only
+// for `new` expressions, so these sites were never recorded and
+// checkDeferredAsOperandInstantiations never saw them.  This helper records
+// a site for every class-level generic parameter that is substituted by a
+// value type at the given resolved type.
+void ExprTC::recordAnnotationInstantiationSites(TypeRef* rt,
+                                               SourceLocation loc) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration ||
+        rt->declaration->kind != ast::TypeDeclKind::Class ||
+        rt->genericArgs.empty()) {
+        return;
+    }
+    TypeSymbol* ts = rt->declaration;
+    if (ts->genericParams.empty()) return;
+    for (std::size_t i = 0; i < ts->genericParams.size(); ++i) {
+        Symbol* gp = ts->genericParams[i];
+        if (!gp || i >= rt->genericArgs.size()) continue;
+        TypeRef* arg = rt->genericArgs[i];
+        if (!arg || arg->kind == TypeRef::Kind::Error) continue;
+        if (arg->kind == TypeRef::Kind::Named && !arg->declaration) continue;
+        if (!isValueTypeArg(arg)) continue;
+        std::string argName;
+        if (arg->declaration) {
+            argName = std::string(arg->declaration->name);
+        } else if (arg->astNode && arg->astNode->name &&
+                   !arg->astNode->name->parts.empty()) {
+            argName = std::string(arg->astNode->name->parts.back());
+        } else {
+            argName = "the type argument";
+        }
+        if (arg->nullable) argName += "?";
+        // Use the TypeDecl as the owner key — matches what recordAsOperandTypeParamUse
+        // does for the type-level carrier (currentType_->decl, not currentType_).
+        recordGenericInstantiationSite(ts->decl, gp->name, arg,
+                                     std::move(argName), loc);
+    }
+}
+
 void ExprTC::recordGenericInstantiationSite(const void* owner,
                                             std::string_view param,
                                             TypeRef* arg, std::string argName,
@@ -13915,6 +13964,21 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                 default: break;
             }
         }
+        // fix #5210 residual (§12.7 v0.313, §3.6 rule 2): when the class's
+        // extends clause names a class-level generic instantiation, record the
+        // site so checkDeferredAsOperandInstantiations can join it against any
+        // `v as RefTarget` obligation in G's body.  tsym->baseTypeRefs carries
+        // the resolved TypeRef for each base (including generic args).
+        if (tsym) {
+            for (std::size_t bi = 0; bi < tsym->baseTypeRefs.size(); ++bi) {
+                TypeRef* br = tsym->baseTypeRefs[bi];
+                if (!br) continue;
+                SourceLocation loc;
+                if (bi < td->baseTypes.size() && td->baseTypes[bi])
+                    loc = td->baseTypes[bi]->span.begin;
+                recordAnnotationInstantiationSites(br, loc);
+            }
+        }
         for (const auto& ec : td->enumConstants) {
             if (ec.value) visitExpr(*ec.value);
         }
@@ -18216,6 +18280,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // Either may be null (plain `var x;` with no init).
             if (ld->type) {
                 lsym->declType = ctx_.resolvedType(*ld->type);
+                // fix #5210 residual (§12.7 v0.313, §3.6 rule 2): when the
+                // declared type is a class-level generic instantiation, record
+                // the site so checkDeferredAsOperandInstantiations can join it
+                // against any `v as RefTarget` obligation in the body.
+                if (lsym->declType) {
+                    recordAnnotationInstantiationSites(lsym->declType,
+                                                     ld->type->span.begin);
+                }
                 // §15.1 (#734): fold a local-`const` inline-array size now that
                 // the const is in scope (member/module consts were folded at
                 // type resolution; locals were not yet bound there).

@@ -1136,6 +1136,12 @@ private:
                                         std::string_view param, TypeRef* arg,
                                         std::string argName,
                                         SourceLocation loc);
+    // fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
+    // instantiation sites — `var g: G<int>` and `class D : G<int>` — are not
+    // recorded by recordDefaultObligationsForConstruction (only `new` calls
+    // it).  This records those sites directly for
+    // checkDeferredAsOperandInstantiations.
+    void recordAnnotationInstantiationSites(TypeRef* rt, SourceLocation loc);
     // §3.6 rule 2 join, run once at the end of the pass.
     void checkDeferredDefaultInstantiations();
 
