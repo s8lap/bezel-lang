@@ -1,6 +1,6 @@
 // fix #4876 / §4.3 (v0.307): a `decimal` literal whose mantissa exceeds the
-// 96-bit limit must round the dropped fractional digit half-up — matching the
-// runtime's `dec_store` overflow-reduction path (`rem >= 5 → m += 1`).
+// 96-bit limit must round the dropped fractional digit — originally half-up,
+// since #5174 / §4.4 (v0.310) to nearest with a tie to the even last digit.
 //
 // Pre-fix the parser silently truncated an over-precision literal's
 // fractional part: `39614081257132168796771975167.5m` (the literal form of the
@@ -11,8 +11,15 @@
 // representable value of its type … The same rule bounds decimal literals
 // against decimal's range") supports rounding over truncation.
 //
+// #5174 / §4.4 (v0.310) renames the two `half_up` rows to `ties_to_even` and
+// re-bases their spec citation on §4.4 + §6.4; their ORACLES ARE UNCHANGED,
+// because `…167.5` is not a tie — its retained last digit 7 is odd, so
+// ties-to-even rounds it up to `…168`, exactly as half-up did. The genuinely
+// even-midpoint rows (where the retained last digit is even and the tie must
+// round DOWN) are new, in `decimal_literal_scale_bound_ties_to_even_5174`.
+//
 // BUG PIN — the three EXACT-VALUE rows below all evaluate to
-// `39614081257132168796771975168\n` post-fix; pre-fix the fold and Parse rows
+// `39614081257132168796771975168\n`; pre-fix the fold and Parse rows
 // printed `39614081257132168796771975167\n` (the truncated form), failing.
 // The runtime row was already correct (control).
 //
@@ -30,11 +37,12 @@
 
 using bezel::test::runAotChecked;
 
-// §4.3 (v0.307) / #4876: the literal-fold path is the bug's primary surface.
-// A `const` decimal literal whose dropped frac digit is `5` must round up to
-// the nearest representable value, not silently truncate.
+// §4.4 (v0.310) / §6.4 / #4876 + #5174: the literal-fold path is the bug's
+// primary surface.  The dropped frac digit is `5` and nothing follows it, so
+// this is a true tie; the retained last digit 7 is odd, so ties-to-even rounds
+// it UP to the nearest representable value rather than truncating.
 BEZEL_TEST(decimal_literal_over_precision_round_4876,
-           decimal_literal_over_precision_rounds_half_up_spec_4_3) {
+           decimal_literal_over_precision_rounds_ties_to_even_spec_4_4_6_4) {
     BEZEL_EXPECT_EQ(runAotChecked(
         "module M; class C "
         "  public static method Main(): int "
@@ -63,11 +71,11 @@ BEZEL_TEST(decimal_literal_over_precision_round_4876,
         "39614081257132168796771975168\n");
 }
 
-// §4.3 (v0.307) / #4876: the same `dec_parse_src` backs both literal-fold and
-// runtime `decimal.Parse`. The post-fix Parse path must round half-up on the
-// same over-precision strings (consistent with the fold path).
+// §4.4 (v0.310) / §6.4 / #4876 + #5174: the same `dec_parse_src` backs both
+// literal-fold and runtime `decimal.Parse`.  The Parse path must round the same
+// over-precision string the same way as the fold path.
 BEZEL_TEST(decimal_literal_over_precision_round_4876,
-           decimal_parse_over_precision_rounds_half_up_spec_4_3_9_3) {
+           decimal_parse_over_precision_rounds_ties_to_even_spec_4_4_6_4_9_3) {
     BEZEL_EXPECT_EQ(runAotChecked(
         "module M; class C "
         "  public static method Main(): int "

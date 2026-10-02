@@ -217,6 +217,32 @@ static bool dec_store_rounded(bz_decimal_t* out, __uint128_t q, uint32_t s,
     }
 }
 
+// §4.4 (v0.310) / §6.4: the parse path's reduce-and-round.  Same shape as
+// dec_store_wide, but the magnitude already fits in 128 bits and the caller has
+// located the digits the 96-bit mantissa could not hold — `dropTop` is the most
+// significant of those, `sticky` says any lower one is nonzero.
+//
+// Pre-fix the parse path called dec_store, which reduces only a mantissa above
+// kMax96 and never a SCALE above 28, and rounds half-up (`rem >= 5 -> m += 1`).
+// So a 29-fractional-digit string was stored at a scale §4.4 does not admit
+// ("0 ≤ s ≤ 28"), and a tie rounded away from even.  §4.4: a literal or parsed
+// string "whose value is not in this set denote that value rounded as §6.4
+// rounds an inexact result"; §6.4: "rounded at the largest scale s ≤ 28 whose
+// rounded mantissa is at most 2^96 − 1 — to nearest, a tie to the even last
+// digit".
+static bool dec_store_parsed(bz_decimal_t* out, __uint128_t m, uint32_t s,
+                             int neg, uint32_t dropTop, bool sticky,
+                             void* ove_vtable) {
+    while (m > kMax96 || s > 28) {
+        if (s == 0) { bz_set_exc(ove_vtable); return false; }  // §6.4 overflow
+        if (dropTop != 0) sticky = true;
+        dropTop = (uint32_t)(m % 10);
+        m /= 10;
+        --s;
+    }
+    return dec_store_rounded(out, m, s, neg, dropTop, sticky, ove_vtable);
+}
+
 // Reduce a 192-bit magnitude at scale `s` to a <= 96-bit mantissa at scale
 // <= 28 by dropping digits (tracking dropTop/sticky), then round once.
 static bool dec_store_wide(bz_decimal_t* out, DecWide w, uint32_t s, int neg,
@@ -839,14 +865,15 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
     // fractional digit cannot be stored, the pre-fix code silently dropped it.
     // §4.3 ("A floating-point literal denotes the nearest representable value
     // of its type") and §5.2 ("decimal(x) for binary-float x yields the nearest
-    // representable decimal value") support rounding over truncation; the
-    // runtime's dec_store overflow-reduction path rounds half-up
-    // (`rem >= 5 → m += 1`), so a folded literal must agree.  Track the FIRST
-    // dropped fractional digit only: subsequent dropped digits cannot change
-    // the rounding direction (the first one decides).  After the loop, if that
-    // digit is >= 5, increment m by 1; dec_store handles overflow.
-    bool saw_dropped_frac = false;
-    uint32_t dropped_frac_digit = 0;
+    // representable decimal value") support rounding over truncation.  Track
+    // the FIRST dropped digit only — it is the rounding digit — and a sticky
+    // bit over every later one, which is what §6.4's "to nearest, a tie to the
+    // even last digit" needs to tell a true tie from "more than half".  The
+    // pair is handed to dec_store_parsed, which folds it into the same
+    // reduce-then-round-once path the arithmetic operations use.
+    uint32_t drop_top = 0;
+    bool drop_sticky = false;
+    bool saw_dropped = false;
     for (; i < src.len; ++i) {
         uint32_t c = dec_src_at(src, i);
         if (c == '.') {
@@ -927,16 +954,10 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
             ++dropped_int;
         } else {
             // #4876 / §4.3 (v0.307): the 96-bit mantissa is full and this
-            // digit is in the fractional part.  Track the FIRST such dropped
-            // digit's value so the post-loop half-up rounding (matching
-            // dec_store's `rem >= 5 → m += 1`) can round the stored mantissa
-            // to the nearest representable value at scale 0.  Subsequent
-            // dropped fractional digits cannot change the rounding direction:
-            // once the first dropped digit decides, only its value matters.
-            if (!saw_dropped_frac) {
-                saw_dropped_frac = true;
-                dropped_frac_digit = (uint32_t)(c - '0');
-            }
+            // digit is in the fractional part.  Record the FIRST such dropped
+            // digit — it is the rounding digit — and sticky every later one.
+            if (!saw_dropped) { saw_dropped = true; drop_top = (uint32_t)(c - '0'); }
+            else if (c != '0') drop_sticky = true;
         }
     }
     if (!any_digit) {
@@ -963,15 +984,16 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
         }
         sc -= dropped_int;
     }
-    // §4.3 (v0.307) / #4876: if a fractional digit was dropped because the
-    // mantissa was at the 96-bit limit, round the stored mantissa half-up to
-    // match dec_store's `rem >= 5 → m += 1` rule (§6.4).  dec_store handles
-    // overflow — a literal like `MaxValue.5m` correctly raises OverflowException
-    // because m would exceed kMax96 with sc=0 after the +1.
-    if (saw_dropped_frac && dropped_frac_digit >= 5) {
-        m += 1;
-    }
-    dec_store(out, m, sc, neg, ove_vtable);
+    // §4.4 (v0.310) / #5174: (m, sc) is exact for the digits that fit, and
+    // `drop_top` / `drop_sticky` describe the digits that did not.  Reduce
+    // until the scale is ≤ 28 AND the mantissa ≤ 2^96 − 1 — §6.4's "largest
+    // scale s ≤ 28 whose rounded mantissa is at most 2^96 − 1" — folding each
+    // newly dropped digit into the sticky bit, then round ONCE to nearest with
+    // a tie to the even last digit.  A value that cannot reach scale 0 within
+    // the mantissa bound is out of range and raises OverflowException (§6.4).
+    // No rounding happens before this point, so the rounding decision sees
+    // every digit of the input exactly once.
+    dec_store_parsed(out, m, sc, neg, drop_top, drop_sticky, ove_vtable);
 }
 
 // Parse from C string (null-terminated) — the LITERAL-grammar entry (§18.1).
