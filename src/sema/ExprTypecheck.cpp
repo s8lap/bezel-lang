@@ -20540,36 +20540,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // int(r))`, which scales rather than advances the code point.
                     // Fix: gate `allowCharWriteBack` to `+` and `-` (the stripped
                     // binOp values for `+=` and `-=`).
+                    // per §6.6/§3.5 (v0.309, #5150): a `char` RIGHT operand is
+                    // not arithmetic either (`c -= d` over `d: char` is
+                    // rejected; write `c := char(int(c) - int(d))`), so the
+                    // write-back stands aside only for an integer right
+                    // operand. `n mod= c` (an integer target, `char` right
+                    // operand) is likewise rejected through the shared gate.
                     const bool allowCharWriteBack =
                         tTy->primitive == P::Char &&
                         (binOp == "+" || binOp == "-") &&
-                        (isTrueInt(rTy->primitive) ||
-                         rTy->primitive == P::Char);
-                    // gate-fail fix-forward #5054/#3109 (§6.6/§6.1, v0.307):
-                    // `mod=` does not go through the shared §3.5 raw-binary
-                    // char gate at all in the RAW binary form — `mod`'s own
-                    // dedicated block (ExprTypecheck_Exprs.cpp, narrow
-                    // #3109) rejects ONLY `char mod char`, admitting
-                    // `<int> mod char` and `char mod <int>` via §5.1's
-                    // char->int widening (the canonical `s[0] mod 256` cast
-                    // pattern). #5054's `allowCharWriteBack` only stands the
-                    // gate aside for a `char` TARGET, so a non-char (true
-                    // int) TARGET against a `char` RHS under `mod=` still
-                    // hit this same gate unconditionally and was wrongly
-                    // rejected — unlike the raw-binary form it must desugar
-                    // to (§6.6: `n mod= c` is `n := n mod c`). A `char`
-                    // TARGET keeps its existing, unrelated behavior: it is
-                    // not part of this pair and stays governed by
-                    // `allowCharWriteBack` above (`c mod= 2`, `c mod= d`
-                    // both still rejected — narrow #3109's char-target
-                    // exclusion is untouched).
-                    const bool allowIntModCharRhs =
-                        binOp == "mod" && isTrueInt(tTy->primitive) &&
-                        rTy->primitive == P::Char;
+                        isTrueInt(rTy->primitive);
                     bool pairRejectedAsBinary =
                         reportBoolOperandExcludedFromArithmeticOrOrdering(
                             as->value->span.begin, binOp, tTy, rTy,
-                            allowCharWriteBack || allowIntModCharRhs);
+                            allowCharWriteBack);
                     if (!pairRejectedAsBinary && !integerKindPair) {
                         pairRejectedAsBinary =
                             reportNoImplicitConversionBetweenOperands(

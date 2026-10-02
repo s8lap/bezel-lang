@@ -639,7 +639,11 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_rhs_scalar_family_3
         "    var n: long := 5; var m: long? := 3; n += m; return int(n); "),
         8);
     BEZEL_EXPECT_EQ(runPlain(
-        "    var n: char := char(65); var m: char? := char(2); n += m; "
+        // fix #5150 (§6.6, v0.309): respelled the `char?` RHS as `int?` -- a
+        // `char` right operand of a `char` target is not arithmetic and is a
+        // compile error (pinned in char_compound_operand_rejected_5150); the
+        // narrowed-RHS-on-a-char-target shape is kept with an integer RHS.
+        "    var n: char := char(65); var m: int? := 2; n += m; "
         "    return int(n); "), 67);
     // float/double: not integer exit-status-safe, use the stdout route.
     BEZEL_EXPECT_EQ(runAotOut(decimalOut3924(

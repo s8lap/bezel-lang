@@ -1,3 +1,5 @@
+// NOTE (fix #5150, §3.5, v0.309): the "cast pattern" admissions described below
+// were FLIPPED to rejections -- see the `fix #5150` section further down.
 // Regression for #3109 narrow re-attempt (v0.256).
 //
 // The over-broad fix (de3cd71, reverted in ba9ea9b) rejected `char` on either
@@ -8,9 +10,12 @@
 // `char mod <int>` and `<int> mod char` remain admitted via §5.1's char→int
 // widening. The 2 #528 tests must continue to pass.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 using bezel::test::runAotOut;
 
@@ -28,6 +33,21 @@ bool compileErrored(const std::string& body) {
         std::string("module M; class C public static method Main(): int ") +
         body + " end Main; end C;").diagnostics.hasErrors();
 }
+
+// fix #5150 (§3.5/§6.1/§6.6, v0.309): `mod` is listed on the integer types and
+// `decimal` only and the operand lists name types BEFORE §5.1 conversion, so
+// a `char` operand on either side of `mod` (and `n mod= c`) is a compile
+// error. Asserts the location AND the diagnostic needle.
+void expectRejected(const std::string& body, const char* needle) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle));
+}
+
+constexpr const char* kModChar = "`mod` is not defined on `char` operands";
+constexpr const char* kCharOperand = "is not defined for `char` operands";
 
 }  // namespace
 
@@ -47,33 +67,54 @@ BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_mod_char_rejected_sym
         "  return int(d mod c);"));
 }
 
-// ── MUST-PASS: the 2 Wave 2 false-reject cases (re-pinned here as the
-//    canonical cast pattern). These are the *exact* bodies of the existing
-//    codegen_string_length_528 tests; they must remain admitted. ───────────
+// ── fix #5150 (§3.5, v0.309) FLIPPED: the v0.256 "cast pattern" `s[0] mod 256`
+//    admitted `char mod <int>` / `<int> mod char` via §5.1's char->int
+//    widening. §3.5's operand lists name types before §5.1 conversion and
+//    `mod` lists the integer types and `decimal`, so each is now a compile
+//    error; the arithmetic is `int(c) mod n`. Each reject row is paired with
+//    its `int(...)`-spelled accept control. ──────────────────────────────
 
-BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_mod_int_literal_japanese_cast) {
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_mod_int_literal_japanese_cast_rejected) {
+    expectRejected(
+        "var s := \"\xe6\x97\xa5\xe6\x9c\xac\"; return s[0] mod 256;", kModChar);
+}
+
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_mod_int_literal_emoji_cast_rejected) {
+    expectRejected(
+        "var s := \"\xf0\x9f\x98\x80\"; return s[0] mod 256;", kModChar);
+}
+
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_cast_mod_int_literal_japanese_admitted) {
     BEZEL_EXPECT_EQ(
-        run("var s := \"\xe6\x97\xa5\xe6\x9c\xac\"; return s[0] mod 256;"),
+        run("var s := \"\xe6\x97\xa5\xe6\x9c\xac\"; return int(s[0]) mod 256;"),
         26085 % 256);
 }
 
-BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_mod_int_literal_emoji_cast) {
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_cast_mod_int_literal_emoji_admitted) {
     BEZEL_EXPECT_EQ(
-        run("var s := \"\xf0\x9f\x98\x80\"; return s[0] mod 256;"),
+        run("var s := \"\xf0\x9f\x98\x80\"; return int(s[0]) mod 256;"),
         128512 % 256);
 }
 
-// ── Cast pattern controls (non-literal RHS) ────────────────────────────────
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_mod_int_variable_rejected) {
+    expectRejected(
+        "var c: char := char(26085); var n: int := 256; return c mod n;", kModChar);
+}
 
-BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_mod_int_variable_admitted) {
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_variable_mod_char_rejected) {
+    expectRejected(
+        "var n: int := 47; var c: char := char(10); return n mod c;", kModChar);
+}
+
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_cast_mod_variable_admitted) {
     BEZEL_EXPECT_EQ(
-        run("var c: char := char(26085); var n: int := 256; return c mod n;"),
+        run("var c: char := char(26085); var n: int := 256; return int(c) mod n;"),
         26085 % 256);
 }
 
-BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_variable_mod_char_admitted) {
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_variable_mod_int_cast_admitted) {
     BEZEL_EXPECT_EQ(
-        run("var n: int := 47; var c: char := char(10); return n mod c;"),
+        run("var n: int := 47; var c: char := char(10); return n mod int(c);"),
         47 % 10);
 }
 
@@ -117,23 +158,33 @@ BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, decimal_mod_decimal_still_
 
 // ── Compound `mod=` form is unchanged (control) ────────────────────────────
 
+// §6.6 (v0.309): `c mod= n` on a `char` target is a compile error (ground
+// moved from the #3109 binary rule to §6.6); strengthened with the location
+// and a needle (still rejected, not flipped).
 BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_compound_mod_assign_int_rejected) {
-    BEZEL_EXPECT_TRUE(compileErrored(
+    expectRejected(
         "  var c: char := 'a'; "
         "  c mod= 2; "
-        "  return int(c);"));
+        "  return int(c);", "`mod=` is not valid on `char`");
 }
 
 BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, char_compound_mod_assign_char_rejected) {
-    BEZEL_EXPECT_TRUE(compileErrored(
+    expectRejected(
         "  var c: char := 'a'; "
         "  var d: char := 'b'; "
         "  c mod= d; "
-        "  return int(c);"));
+        "  return int(c);", "`mod=` is not valid on `char`");
 }
 
-BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_compound_mod_assign_char_admitted) {
+// fix #5150 (§3.5/§6.6, v0.309) FLIPPED: `n mod= c` (integer target, `char`
+// right operand) desugars to `n := n mod c`, a `char` operand of `mod`.
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_compound_mod_assign_char_rejected) {
+    expectRejected(
+        "var c: char := char(10); var n: int := 47; n mod= c; return n;", kCharOperand);
+}
+
+BEZEL_TEST(binary_mod_char_char_rejected_3109_narrow, int_compound_mod_assign_int_cast_admitted) {
     BEZEL_EXPECT_EQ(
-        run("var c: char := char(10); var n: int := 47; n mod= c; return n;"),
+        run("var c: char := char(10); var n: int := 47; n mod= int(c); return n;"),
         47 % 10);
 }

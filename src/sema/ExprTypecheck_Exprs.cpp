@@ -7895,15 +7895,17 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                         "(§6.1)");
                     return;
                 }
-                // NAARROW #3109 (v0.256): reject ONLY `char mod char` (both
-                // sides char). The cast pattern `char mod <int>` (e.g. `s[0]
-                // mod 256` for exit codes) is admitted via §5.1 widening; the
-                // over-broad fix (de3cd71, reverted) broke those tests.
-                if (lp == PrimitiveType::Char && rp == PrimitiveType::Char) {
+                // per §3.5 (v0.309, #5150): `mod` is listed on the integer
+                // types and `decimal` only, and the operand lists name types
+                // before any §5.1 conversion, so a `char` operand on EITHER
+                // side is a compile error even though §5.1 would widen it
+                // (`s[0] mod 256`, `n mod c`, `c mod d`): write `int(c) mod n`.
+                // Supersedes narrow #3109's `char mod char`-only rejection.
+                if (lp == PrimitiveType::Char || rp == PrimitiveType::Char) {
                     ctx_.diagnostics().report(Severity::Error, be.span.begin,
-                        "`mod` is not defined on `char` operands (§6.1); a "
-                        "`char` remainder has neither a defined result type "
-                        "nor use — convert via `int(c) mod int(d)` (§5.2)");
+                        "`mod` is not defined on `char` operands (\xC2\xA7""3.5, "
+                        "\xC2\xA7""6.1): `char` is not an arithmetic operand; "
+                        "convert via `int(c) mod int(d)` (\xC2\xA7""5.2)");
                     return;
                 }
             }

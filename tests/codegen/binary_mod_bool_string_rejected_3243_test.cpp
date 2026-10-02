@@ -138,12 +138,14 @@ BEZEL_TEST(binary_mod_bool_string_rejected_3243,
 
 BEZEL_TEST(binary_mod_bool_string_rejected_3243,
            char_mod_int_literal_still_admitted) {
-    // The canonical cast pattern from #3109: `s[0] mod 256`. Must remain
-    // admitted via §5.1's char→int widening.
+    // fix #5150 (§3.5, v0.309): respelled `s[0] mod 256` as `int(s[0]) mod
+    // 256` -- `mod` lists integer types and `decimal` only, a `char` operand is
+    // a compile error before any §5.1 widening (the old spelling is pinned as
+    // a reject in binary_mod_char_char_rejected_3109_narrow).
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var s := \"\xe6\x97\xa5\xe6\x9c\xac\"; "
-        "  return s[0] mod 256; "
+        "  return int(s[0]) mod 256; "
         "end Main; end C;");
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 26085 % 256);
 }

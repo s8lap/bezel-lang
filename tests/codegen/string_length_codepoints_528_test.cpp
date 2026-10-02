@@ -106,18 +106,22 @@ BEZEL_TEST(codegen_string_length_528, cafe_index_3_is_e_acute) {
     BEZEL_EXPECT_EQ(runBody("var s := \"Caf\xc3\xa9\"; return s[3];"), 233);
 }
 
+// fix #5150 (§3.5, v0.309): respelled `s[0] mod 256` as `int(s[0]) mod 256` --
+// `mod` lists integer types and `decimal` only, so a `char` operand is a compile
+// error (the old spelling is pinned as a reject in
+// binary_mod_char_char_rejected_3109_narrow).
 // §4.6 / #528: "日本"[0] == U+65E5 == 26085.
 // Exit codes are 0-255, so check mod 256: 26085 mod 256 = 101.
 BEZEL_TEST(codegen_string_length_528, japanese_index_0_mod256) {
     BEZEL_EXPECT_EQ(
-        runBody("var s := \"\xe6\x97\xa5\xe6\x9c\xac\"; return s[0] mod 256;"),
+        runBody("var s := \"\xe6\x97\xa5\xe6\x9c\xac\"; return int(s[0]) mod 256;"),
         26085 % 256);
 }
 
 // §4.6 / #528: "😀"[0] == U+1F600 == 128512. mod 256 = 128.
 BEZEL_TEST(codegen_string_length_528, emoji_index_0_mod256) {
     BEZEL_EXPECT_EQ(
-        runBody("var s := \"\xf0\x9f\x98\x80\"; return s[0] mod 256;"),
+        runBody("var s := \"\xf0\x9f\x98\x80\"; return int(s[0]) mod 256;"),
         128512 % 256);
 }
 
