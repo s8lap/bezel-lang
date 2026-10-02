@@ -90,3 +90,39 @@ BEZEL_TEST(class_generic_as_operand_instantiation_5210,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
+// class-level generic instantiation — `var g: G<int>` with no `new` —
+// is seen only as a type annotation by Resolver, not by the `new`-expr
+// handler, so recordDefaultObligationsForConstruction never fires and
+// checkDeferredAsOperandInstantiations never sees the site.  The fix
+// records the site explicitly in visitStmt (LocalDecl) and visitTopDecl
+// (class extends clause) when the resolved type is a class-level generic
+// instantiation with a value-substituted argument.
+BEZEL_TEST(class_generic_as_operand_instantiation_5210,
+           annotation_only_var_decl_rejected_spec_12_7) {
+    BEZEL_EXPECT_TRUE(rejectedByOperandRule(
+        "module M; interface IS end IS; "
+        "class G<T> public method F(v: T): bool "
+        "  var o := v as IS; return o <> null; end F; end G; "
+        "class C public static method Main(): int "
+        "  var g: G<int>; "
+        "  return 0; end Main; end C;"));
+}
+
+// fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
+// class-level generic instantiation — `class D : G<int>` (extends with
+// a value-substituted generic) — is seen only as a type annotation by
+// Resolver, not by the `new`-expr handler, so the instantiation site
+// is not recorded.  The fix records the site in visitTopDecl when
+// processing a class's extends clause.
+BEZEL_TEST(class_generic_as_operand_instantiation_5210,
+           annotation_only_class_extends_rejected_spec_12_7) {
+    BEZEL_EXPECT_TRUE(rejectedByOperandRule(
+        "module M; interface IS end IS; "
+        "class G<T> public method F(v: T): bool "
+        "  var o := v as IS; return o <> null; end F; end G; "
+        "class D : G<int> end D; "
+        "class C public static method Main(): int "
+        "  return 0; end Main; end C;"));
+}
