@@ -28,6 +28,8 @@ namespace bezel::sema {
 // fwd decl — defined below (§12.9); reused by #5146's operand-side generic
 // instantiation join, which runs earlier in this file's layout.
 static bool isValueTypeArg(const TypeRef* t);
+static bool isFreeGenericTypeVarRef(
+    const TypeRef* t, const std::unordered_set<std::string_view>* freeNames);  // defined below; fix #5178
 
 // §5.1 (#738): does the compile-time integer constant `v` fit the range of a
 // narrower integer target type? Used to gate implicit literal/constant
@@ -5632,6 +5634,21 @@ void ExprTC::checkAssignable(
     // (the existing codegen path handles it correctly).
     if (from->kind == TypeRef::Kind::Function &&
         to->kind != TypeRef::Kind::Function) {
+        // fix #5178 (§14.5 phase 1, v0.313): "a function-typed *value*" is a
+        // self-determined argument and "a parameter type that is a bare type
+        // parameter `X` binds `X` to the argument's static type" — so a
+        // function VALUE against the callee's own still-free bare formal `U`
+        // is the binding itself, not a §5.1 conversion to reject. Only a
+        // plain value qualifies: a lambda literal and a method/property
+        // reference are phase 2 (§14.5 / §27.6) and keep the reject.
+        const bool phase2Arg = fromExpr &&
+            (dynamic_cast<const ast::LambdaExpr*>(fromExpr) ||
+             ((dynamic_cast<const ast::IdentifierExpr*>(fromExpr) ||
+               dynamic_cast<const ast::MemberAccessExpr*>(fromExpr)) &&
+              (dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*fromExpr)) ||
+               dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*fromExpr)))));
+        if (isFreeGenericTypeVarRef(to, freeTypeParamNames) && !phase2Arg)
+            return;
         reportNotConvertible();
         return;
     }
