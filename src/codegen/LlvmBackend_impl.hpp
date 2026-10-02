@@ -8518,12 +8518,50 @@ private:
         // parameter-type-spelling channel on ParameterSymbol — out of scope
         // for this fix per the audit's "land a family whole" rule.
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            // fix #5251 follow-up (§12.1 / §2.8.3 rule 4, v0.313): resolve
+            // each AST parameter type via `ctx_.resolvedType` to get the sema
+            // TypeRef, then spell Named types as `moduleName.name.` — the same
+            // identity the imported path uses. Previously this path spelled bare
+            // name parts (e.g. "Sq." for `Sq`), while the imported path spelled
+            // the resolved declaration's qualified identity (e.g. "SA.Sq."), so
+            // the two paths produced different keys for the same type and slot
+            // sharing broke across the local/imported boundary.
             for (const auto& p : md->params) {
                 key += "#";
-                if (p.type && p.type->name && !p.type->name->parts.empty()) {
-                    for (auto part : p.type->name->parts) {
-                        key += std::string(part);
+                if (p.type) {
+                    const sema::TypeRef* tr = ctx_.resolvedType(*p.type);
+                    if (tr && tr->kind == sema::TypeRef::Kind::Primitive) {
+                        switch (tr->primitive) {
+                            case sema::PrimitiveType::Bool:    key += "bool";    break;
+                            case sema::PrimitiveType::Char:    key += "char";    break;
+                            case sema::PrimitiveType::String:  key += "string";  break;
+                            case sema::PrimitiveType::Byte:    key += "byte";    break;
+                            case sema::PrimitiveType::SByte:   key += "sbyte";   break;
+                            case sema::PrimitiveType::Short:   key += "short";   break;
+                            case sema::PrimitiveType::UShort:  key += "ushort";  break;
+                            case sema::PrimitiveType::Int:     key += "int";     break;
+                            case sema::PrimitiveType::UInt:    key += "uint";    break;
+                            case sema::PrimitiveType::Long:    key += "long";    break;
+                            case sema::PrimitiveType::ULong:   key += "ulong";   break;
+                            case sema::PrimitiveType::Float:   key += "float";   break;
+                            case sema::PrimitiveType::Double:   key += "double";  break;
+                            case sema::PrimitiveType::Decimal: key += "decimal"; break;
+                            case sema::PrimitiveType::Object:  key += "Object";  break;
+                            default:                           key += "?";       break;
+                        }
                         key += ".";
+                    } else if (tr && tr->kind == sema::TypeRef::Kind::Named &&
+                               tr->declaration &&
+                               !tr->declaration->name.empty()) {
+                        key += std::string(tr->declaration->moduleName);
+                        key += ".";
+                        key += std::string(tr->declaration->name);
+                        key += ".";
+                    } else if (!tr->headName().empty()) {
+                        for (auto part : tr->headName()) key += part;
+                        key += ".";
+                    } else {
+                        key += "?";
                     }
                 } else {
                     key += "?";
@@ -8590,10 +8628,17 @@ private:
                     // An override written as `override Take(x: A5.Item)` has
                     // the same TypeRef and produces the same key, so it
                     // correctly reuses the base's slot.
-                    if (!tr->declaration->moduleName.empty()) {
-                        key += tr->declaration->moduleName;
-                        key += ".";
-                    }
+                    //
+                    // The `if (!moduleName.empty())` guard was wrong: a type
+                    // symbol's moduleName is ALWAYS set (populated in
+                    // SymbolCollection.cpp during type collection), so the bare
+                    // name path was NEVER taken for any user type — the bug was
+                    // NOT the missing qualifier but the guard itself blocking
+                    // the correct qualified spelling. Unconditionally spell the
+                    // qualifier so importer overrides and inherited overrides
+                    // both produce keys that match the base declaration's key.
+                    key += std::string(tr->declaration->moduleName);
+                    key += ".";
                     key += std::string(tr->declaration->name);
                     key += ".";
                 } else if (!tr->headName().empty()) {
