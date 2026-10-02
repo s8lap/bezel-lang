@@ -16861,7 +16861,33 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                     // an instantiation this scan cannot see aborts loudly on
                     // the default path (see `unboundGuard`).
                     unboundGenericCandidate = true;
-                    if (impl->parent != c || c->genericParams.empty())
+                    if (c->genericParams.empty()) {
+                        // fix #5256 (§12.1 / §14.1, v0.313): a NON-generic
+                        // class below an unpinned generic link
+                        // (`class Sub: EGO<int>`) has exactly one concrete
+                        // shape: its base clauses spell every ancestor
+                        // argument in concrete types. It runs its own
+                        // descriptor's branch, and the implementation's
+                        // declarer parameters (`X` of `EGO<X>`) come from
+                        // walking c's chain UP (computeAncestorGenericSubst).
+                        if (impl->parent && !impl->parent->genericParams.empty()) {
+                            sema::TypeRef synth;
+                            synth.kind = sema::TypeRef::Kind::Named;
+                            synth.declaration = const_cast<sema::TypeSymbol*>(c);
+                            std::unordered_map<std::string_view, llvm::Type*> ls;
+                            std::unordered_map<std::string_view,
+                                               const sema::TypeRef*> ss;
+                            if (!computeAncestorGenericSubst(
+                                    &synth, impl->parent, ls, ss))
+                                continue;  // reaches the abort guard
+                            b.substLlvm = std::move(ls);
+                            b.substSema = std::move(ss);
+                            b.hasSubst = true;
+                        }
+                        branches.push_back(std::move(b));
+                        continue;
+                    }
+                    if (impl->parent != c)
                         continue;  // reaches the abort guard, never silent
                     std::map<std::string, std::vector<const sema::TypeRef*>>
                         insts;
