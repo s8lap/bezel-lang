@@ -2007,6 +2007,21 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             // §9.4 / issue #654: bool.TryParse out-slot is i1 (Bool lowers to i1).
             else if (callPrimTy == P::Bool) slotTy = i1();
             else slotTy = i32();
+        } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            // fix #5263 (§22.4 / stdlib §2.3, v0.313): Convert.TryToDouble(out var d)
+            // was allocating a 4-byte i32 slot instead of 8-byte double, causing
+            // strtod's 8-byte write to overflow the slot (stack-buffer-overflow).
+            // Same pattern for Convert.TryToInt64 (8-byte i64 write to i32 slot).
+            if (ma->target) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                    if (id->name == "Convert") {
+                        if (ma->member == "TryToDouble")
+                            slotTy = llvm::Type::getDoubleTy(llvm_);
+                        else if (ma->member == "TryToInt64" || ma->member == "TryToLong")
+                            slotTy = i64();
+                    }
+                }
+            }
         } else if (loc && loc->declType) {
             // v0.171 (#1336): a BUILTIN collection Try's inline `out var x` has
             // no MethodDecl; sema typed the local `T?`/`V?` (the borrowing
