@@ -383,6 +383,9 @@ class SelfTestSuiteIsolationTest(_MarkerAssertions):
         # appears solely as a literal comm-name string in a non-match
         # assertion. Never spawns any script.
         "test_gate_builders_preflight.py": "source-only",
+        # Runs a COPY of gate_and_push.sh in a temp repo to pin the #5265
+        # untracked-file refusal; markers redirected via isolated_markers.
+        "test_untracked_guard.py": "isolated",
         # This file.
         "test_gate_markers.py": "isolated",
     }

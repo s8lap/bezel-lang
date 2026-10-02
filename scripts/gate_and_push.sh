@@ -178,9 +178,8 @@ echo "== gate_and_push: head = $(git rev-parse --short HEAD 2>/dev/null || echo 
 # only have caught it on the NEXT gate — after the bad state was public.
 #
 # CLAUDE.md already says the tree is frozen during a gate; this makes it
-# enforceable instead of remembered. Untracked files are fine (scratch, new test
-# sources not yet added); only TRACKED modifications block, because those are the
-# ones that make HEAD and the tested tree disagree.
+# enforceable instead of remembered. Tracked modifications block here; untracked
+# files in build inputs block below (#5265), other untracked files only WARN.
 _dirty="$(git diff --name-only HEAD 2>/dev/null)"
 if [ -n "$_dirty" ]; then
   echo "gate_and_push: REFUSING — tracked files differ from HEAD:" >&2
@@ -189,6 +188,16 @@ if [ -n "$_dirty" ]; then
   echo "  these first, or the verdict does not describe what would be pushed." >&2
   exit 65
 fi
+
+# #5265: untracked files under src/ tests/ scripts/ CMakeLists.txt cmake/ are
+# globbed into the build, so the gate would test a binary that is not HEAD
+# (gate B run 1 false FAIL). Refuse before any build starts; elsewhere WARN only.
+if ! _ug="$(scripts/untracked_guard.sh)"; then
+  echo "gate_and_push: REFUSING — untracked files in build inputs:" >&2
+  echo "$_ug" | sed 's/^/    /' >&2
+  exit 65
+fi
+[ -n "$_ug" ] && echo "$_ug" | sed 's/^/gate_and_push: /' >&2
 
 # Make scripts/ importable as the `gate` package so `python3 -m gate.serialize`
 # resolves from any cwd. Honor an operator's pre-set PYTHONPATH (e.g. a CI

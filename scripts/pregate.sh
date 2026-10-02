@@ -67,9 +67,14 @@ pf=PASS; pf_note=""
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   pf=FAIL; pf_note+="tracked changes uncommitted; "
 fi
-if [ -n "$(git ls-files --others --exclude-standard -- scripts/)" ]; then
-  pf=FAIL; pf_note+="untracked files under scripts/ (#3413); "
+# #3413/#5265: untracked files under src/ tests/ scripts/ CMakeLists.txt cmake/
+# are globbed into the gate binary -> FAIL; untracked files elsewhere -> WARN.
+if ug="$(scripts/untracked_guard.sh)"; then
+  [ -n "$ug" ] && pf_note+="untracked files outside build inputs (WARN, see untracked.log); "
+else
+  pf=FAIL; pf_note+="untracked build-input files: $(grep '^FAIL ' <<<"$ug" | cut -c6- | tr '\n' ' ')— quarantine, do not delete (#5265); "
 fi
+printf '%s\n' "$ug" > "$OUT/untracked.log"
 git fetch -q origin 2>/dev/null || pf_note+="(fetch failed, using cached $BASE) "
 if ! git merge-base --is-ancestor "$BASE" HEAD 2>/dev/null; then
   pf=FAIL; pf_note+="HEAD does not contain $BASE; "

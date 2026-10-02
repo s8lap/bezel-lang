@@ -24,3 +24,7 @@ __pycache__/
 
 # Local scheduler lock files (per-session)
 .claude/scheduled_tasks.lock
+
+# lit hand-run fallback writes these in-tree (lit.cfg.py test_exec_root); #5265
+/tests/lit/.lit_test_times.txt
+tests/lit/**/Output/
