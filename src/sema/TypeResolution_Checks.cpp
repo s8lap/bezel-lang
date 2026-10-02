@@ -4475,9 +4475,14 @@ std::string Resolver::owningElementBadDesc(const TypeRef* el) {
     case TypeRef::Kind::Primitive:
         // All primitives are rejected: value types, and `string` — a
         // runtime-managed reference (§28.9) with no disposal obligation.
-        return el->primitive == PrimitiveType::String
-                   ? "`string` (a runtime-managed reference type)"
-                   : "a primitive value type";
+        // fix #5250 (§3.4, v0.XXX): `Object` is the root class, not a
+        // primitive value type — it has a destructor and implements
+        // IDisposable, and satisfies `where T: class`.
+        if (el->primitive == PrimitiveType::String)
+            return "`string` (a runtime-managed reference type)";
+        if (el->primitive == PrimitiveType::Object)
+            return {};  // Object is a class — admitted
+        return "a primitive value type";
     case TypeRef::Kind::Function:
         return "a function value";
     case TypeRef::Kind::Unit:

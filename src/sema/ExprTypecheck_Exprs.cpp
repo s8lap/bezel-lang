@@ -5062,7 +5062,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 // OwningSet, OwningLinkedList, OwningDictionary, Array, Stack,
                                 // Queue, Set, LinkedList, Dictionary, EventSource,
                                 // AsyncEventSource, Shared, Weak.
-                                // Excluded: string (primitive), Object (primitive), int etc.
+                                // Excluded: string (runtime-managed reference, §28.9),
+                                // Object (§3.4: a class, but PrimitiveType in this impl),
+                                // int etc. (value primitives).
                                 // For simplicity: if the type arg is a Named builtin (no decl)
                                 // and is not a primitive, treat it as a class type.
                                 // The "T must be a class" guard's purpose is to exclude
@@ -5071,6 +5073,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 // obligation or are represented differently.
                                 // Builtin named types without a user decl are all class-like
                                 // (heap-allocated, runtime-managed, disposable).
+                                argIsClass = true;
+                            } else if (ta->kind == TypeRef::Kind::Primitive &&
+                                       ta->primitive == PrimitiveType::Object) {
+                                // fix #5250 (§3.4, v0.XXX): Object is the root class,
+                                // not a primitive value type — it has a destructor and
+                                // satisfies the `where T: class` constraint for Shared/Weak.
                                 argIsClass = true;
                             } else {
                                 // Produce a human-readable type name for the diagnostic.
