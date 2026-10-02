@@ -109,6 +109,7 @@
 // uses exclusively, and record_choice_call_result_param_alias_uaf_4254_test
 // .cpp for the sibling Record/Choice channel this fix sits beside.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -284,8 +285,13 @@ BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
 // job is to confirm the fix's boundary, not to re-measure #4254's own scope.
 // ===========================================================================
 BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
-           heap_array_string_factory_control_still_leaks_not_uaf) {
-    const char* prog =
+           heap_array_string_factory_static_plain_return_rejected_spec_28_3_row4) {
+    // Was `heap_array_string_factory_control_still_leaks_not_uaf`. The program
+    // (plain static `Wrap(): Array<string>`) is no longer legal: §28.3 row 4
+    // (v0.313, #5123) rejects it at the declaration. Spec-driven
+    // program-invalid flip, not an oracle weakening; the leak-vs-UAF boundary
+    // it controlled is kept by the legal leak control below.
+    auto r = bezel::test::runAot(
         "module M; "
         "class Helper "
         "  public static method Wrap(s: string): Array<string> "
@@ -294,14 +300,33 @@ BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
         "end Helper; "
         "class C "
         "  public static method Main(): int "
+        "    return Helper.Wrap(\"a\").Length; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "returns class/interface type `Array` without `owned`"));
+}
+
+// Legal leak control (measured: 799 allocations / 44085 bytes leaked at 200
+// iterations under LSan). An `owned Array<string>` factory result handed to a
+// BORROWING collection's Add is §15.4's documented hazard: the borrowing
+// collection never frees the fresh temporary, so it leaks (and is never a UAF).
+BEZEL_TEST(inline_array_string_call_result_param_alias_uaf_4265,
+           heap_array_string_owned_factory_into_borrowing_add_still_leaks_not_uaf) {
+    const char* prog =
+        "module M; "
+        "class Helper "
+        "  public static method Wrap(s: string): owned Array<string> "
+        "    return [s]; "
+        "  end Wrap; "
+        "end Helper; "
+        "class C "
+        "  public static method Main(): int "
         "    var i := 0; "
         "    while i < 200 do "
-        "      var outer: Array<string>; "
-        "      do "
-        "        var s := \"he\" + \"llo\" + i.ToString(); "
-        "        outer := Helper.Wrap(s); "
-        "      end; "
-        "      var n := outer[0].Length; "
+        "      var sink: Array<Array<string>> := []; "
+        "      sink.Add(Helper.Wrap(\"a\" + i.ToString())); "
         "      i += 1; "
         "    end; "
         "    return 0; "

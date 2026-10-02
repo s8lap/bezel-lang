@@ -238,7 +238,7 @@ BEZEL_TEST(take_current_array_backed_set_local_reclaim_3894,
         "    var xs: Set<Item> := [a, b]; "
         "    yield return xs; "
         "  end Gen; "
-        "  public static method TakeOne(): Set<Item> "
+        "  public static method TakeOne(): owned Set<Item> "
         "    using var source := C.Gen(); "
         "    using var en := source.GetOwningEnumerator(); "
         "    en.MoveNext(); "

@@ -201,7 +201,7 @@ BEZEL_TEST(set_literal_backing_reclaim_2142, set_literal_escape_via_return_no_do
     BEZEL_EXPECT_EQ(runValueOnly(
         "module M; "
         "class C "
-        "  public static method Make(): Set<int> "
+        "  public static method Make(): owned Set<int> "
         "    var s: Set<int> := [10, 20, 30]; "
         "    return s; "
         "  end Make; "

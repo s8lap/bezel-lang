@@ -182,7 +182,7 @@ BEZEL_TEST(dict_literal_534, empty_dict_literal_int_key_r39) {
 BEZEL_TEST(dict_literal_534, empty_dict_literal_return_r39) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public static method Make(): Dictionary<string, int> return []; end Make; "
+        "  public static method Make(): owned Dictionary<string, int> return []; end Make; "
         "  public static method Main(): int "
         "    using var d := Make(); return d.Count; "  // 0
         "  end Main; "

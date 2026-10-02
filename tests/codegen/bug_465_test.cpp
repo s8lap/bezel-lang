@@ -273,7 +273,7 @@ BEZEL_TEST(bug465_heap_array_literal, field_init_array_int_literal_465) {
 BEZEL_TEST(bug465_heap_array_literal, return_array_int_literal_465) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public static method Make(): Array<int> return [9, 8, 7]; end Make; "
+        "  public static method Make(): owned Array<int> return [9, 8, 7]; end Make; "
         "  public static method Main(): int "
         "    using var a := Make(); "
         "    return a[0] + a.Length; "   // 9 + 3 = 12

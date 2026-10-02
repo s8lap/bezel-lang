@@ -219,7 +219,7 @@ BEZEL_TEST(dict_literal_backing_reclaim_2143, dict_literal_escape_via_return_no_
     BEZEL_EXPECT_EQ(runValueOnly(
         "module M; "
         "class C "
-        "  public static method Make(): Dictionary<string, int> "
+        "  public static method Make(): owned Dictionary<string, int> "
         "    var d: Dictionary<string, int> := [\"a\": 1, \"b\": 2]; "
         "    return d; "
         "  end Make; "

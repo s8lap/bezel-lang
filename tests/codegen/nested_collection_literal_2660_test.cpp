@@ -59,6 +59,7 @@
 // per §15.4, §28.9, §28.11 (issue #2660, spec v0.237)
 
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -79,6 +80,15 @@ int runChecked(const std::string& prog) {
 // assertion, which is that the value is still correct — i.e. no UAF and no
 // double-free. runAot skips ASan entirely, so only a genuine crash flips `ran`.
 // (Same rationale, and same helper shape, as the #2142/#2143 escape controls.)
+
+// #5123 (§28.3 row 4, v0.313): a plain static return of a builtin collection
+// class is rejected at the declaration. True iff `prog` fails to compile with
+// exactly that diagnostic.
+bool rejectedWithRow4(const std::string& prog) {
+    auto r = runAot(prog);
+    return !r.ran && bezel::test::diagnosticMessageContains(
+        r, "returns class/interface type `Array` without `owned`");
+}
 int runValueOnly(const std::string& prog) {
     auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
@@ -316,8 +326,8 @@ BEZEL_TEST(nested_collection_literal_2660, add_after_construction_no_double_free
 // identical churn turned a widened gate into a hard ASan SEGV.)
 // Value: a[0] + a[2] + sink = 2 + 5 + (9 + 8) = 24.
 // per §15.4, §28.6 (issue #2660 self-pass)
-BEZEL_TEST(nested_collection_literal_2660, interior_alias_returned_no_uaf) {
-    BEZEL_EXPECT_EQ(runValueOnly(
+BEZEL_TEST(nested_collection_literal_2660, interior_alias_returned_static_rejected_spec_28_3_row4) {
+    BEZEL_EXPECT_TRUE(rejectedWithRow4(
         "module M; "
         "class C "
         "  public static method Leak(): Array<int> "
@@ -332,8 +342,7 @@ BEZEL_TEST(nested_collection_literal_2660, interior_alias_returned_no_uaf) {
         "    var sink := churn[\"p\"][0] + churn[\"q\"][1]; "
         "    return a[0] + a[2] + sink; "
         "  end Main; "
-        "end C;"),
-        24);
+        "end C;"));
 }
 
 // ── (c) DEPTH-3 interior alias returned — the shape that sent the first
@@ -348,8 +357,8 @@ BEZEL_TEST(nested_collection_literal_2660, interior_alias_returned_no_uaf) {
 // TYPE, which is depth-independent.
 // Value: got[0] + got[2] + sink = 2 + 5 + (9 + 8) = 24.
 // per §15.4, §28.6 (issue #2660 self-pass)
-BEZEL_TEST(nested_collection_literal_2660, depth_three_interior_alias_returned_no_uaf) {
-    BEZEL_EXPECT_EQ(runValueOnly(
+BEZEL_TEST(nested_collection_literal_2660, depth_three_interior_alias_returned_static_rejected_spec_28_3_row4) {
+    BEZEL_EXPECT_TRUE(rejectedWithRow4(
         "module M; "
         "class C "
         "  public static method Leak(): Array<int> "
@@ -364,8 +373,7 @@ BEZEL_TEST(nested_collection_literal_2660, depth_three_interior_alias_returned_n
         "    var sink := churn[\"p\"][0] + churn[\"q\"][1]; "
         "    return got[0] + got[2] + sink; "
         "  end Main; "
-        "end C;"),
-        24);
+        "end C;"));
 }
 
 // ── DEPTH-3 READ still works. The type-based gate must not over-deny: a
@@ -454,7 +462,7 @@ BEZEL_TEST(nested_collection_literal_2660, root_escapes_via_return_no_uaf) {
     BEZEL_EXPECT_EQ(runValueOnly(
         "module M; "
         "class C "
-        "  public static method Make(): Dictionary<string, Array<int>> "
+        "  public static method Make(): owned Dictionary<string, Array<int>> "
         "    var groups: Dictionary<string, Array<int>> := "
         "      [\"a\": [1, 2], \"b\": [3, 4]]; "
         "    return groups; "

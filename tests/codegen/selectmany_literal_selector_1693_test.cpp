@@ -147,7 +147,7 @@ BEZEL_TEST(selectmany_literal_selector_1693, block_body_typed_local_flattens_15_
 BEZEL_TEST(selectmany_literal_selector_1693, method_returning_array_selector_flattens) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public static method Pair(x: int): Array<int> "
+        "  public static method Pair(x: int): owned Array<int> "
         "    var r := new Array<int>(); r.Add(x); r.Add(x + 10); return r; "
         "  end Pair; "
         "  public static method Main(): int "

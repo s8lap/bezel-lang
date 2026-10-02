@@ -33,6 +33,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -271,20 +272,42 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
         std::string("30"));
 }
 
-// SortedSet RETURNED — the accept-side mirror of the rejected RETURN
-// coercion. Reuses the `Run` -> `Main` shape so the RETURN coercion is
-// the actual tested face (not a `new` shape that bypasses it).
+// SortedSet RETURNED through a plain STATIC return of a borrowed parameter.
+// Was `accept_sortedset_return_coercion_unaffected`; §28.3 row 4 (v0.313,
+// #5123) rejects a plain static return of a builtin collection class at the
+// declaration ("nothing names a responsible party"), so the program is
+// invalid — a spec-driven program-invalid flip, not an oracle weakening. The
+// RETURN-coercion face is kept by the legal `owned` form right below.
 BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
-           accept_sortedset_return_coercion_unaffected) {
-    BEZEL_EXPECT_EQ(out(std::string(PRELUDE) +
+           reject_sortedset_static_param_return_spec_28_3_row4) {
+    auto r = runAot(std::string(PRELUDE) +
             "class C "
             "  public static method Build(s: SortedSet<Cmp>): SortedSet<Cmp> "
             "    return s; "
             "  end Build; "
             "  public static method Main(): int "
+            "    return 0; "
+            "  end Main; "
+            "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "returns class/interface type `SortedSet` without `owned`"));
+}
+
+// SortedSet RETURNED — the accept-side mirror of the rejected RETURN
+// coercion, in the spec-legal shape: an `owned` static return of an owned
+// local (§28.3 row 1; K3.13 marker-free transfer).
+BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
+           accept_sortedset_owned_return_coercion_unaffected) {
+    BEZEL_EXPECT_EQ(out(std::string(PRELUDE) +
+            "class C "
+            "  public static method Build(): owned SortedSet<Cmp> "
             "    var s := new SortedSet<Cmp>(); "
             "    s.Add(new Cmp(5)); s.Add(new Cmp(3)); "
-            "    var t := Build(s); "
+            "    return s; "
+            "  end Build; "
+            "  public static method Main(): int "
+            "    using var t := Build(); "
             "    Console.WriteLine(t.Count); "
             "    return 0; "
             "  end Main; "

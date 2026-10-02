@@ -212,7 +212,7 @@ BEZEL_TEST(take_current_builtin_array_local_reclaim_3878,
         "    var xs: Array<int> := [1, 2, 3]; "
         "    yield return xs; "
         "  end Gen; "
-        "  public static method TakeOne(): Array<int> "
+        "  public static method TakeOne(): owned Array<int> "
         "    using var source := C.Gen(); "
         "    using var en := source.GetOwningEnumerator(); "
         "    en.MoveNext(); "

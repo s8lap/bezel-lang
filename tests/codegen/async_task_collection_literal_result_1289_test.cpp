@@ -140,7 +140,7 @@ BEZEL_TEST(async_task_collection_literal_result_1289, sync_return_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class C "
-        "  public static method Make(): Array<int> "
+        "  public static method Make(): owned Array<int> "
         "    return [3, 9, 3, 1, 5]; "
         "  end Make; "
         "  public static method Main(): int "

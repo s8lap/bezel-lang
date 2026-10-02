@@ -129,6 +129,11 @@ std::string factoryProg(const std::string& head, const std::string& ctor) {
            "end C;";
 }
 
+// §28.3 row 4 (v0.313, #5123): a plain static return of a builtin collection
+// class is rejected at the declaration, so the 8 borrowing-collection rows
+// below spell the factory's return `owned <head>` (the spec-legal producer
+// shape; the Make() signature is announced). The vacuity-lint assertions are
+// unchanged.
 // For factory bodies that aren't a single `new T(...)` expression —
 // `Stopwatch.StartNew()`, a built-in static factory — supply the full body
 // of the `Make` method as a single string and let this helper wire up the
@@ -159,7 +164,7 @@ std::string factoryProgBody(const std::string& head,
 
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            array_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("Array<int>",
+    auto r = parseAndCheckOwnership(factoryProg("owned Array<int>",
                                                 "new Array<int>(3)"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
@@ -168,7 +173,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
 
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            stack_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("Stack<int>",
+    auto r = parseAndCheckOwnership(factoryProg("owned Stack<int>",
                                                 "new Stack<int>()"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
@@ -177,7 +182,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
 
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            queue_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("Queue<int>",
+    auto r = parseAndCheckOwnership(factoryProg("owned Queue<int>",
                                                 "new Queue<int>()"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
@@ -186,7 +191,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
 
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            set_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("Set<int>",
+    auto r = parseAndCheckOwnership(factoryProg("owned Set<int>",
                                                 "new Set<int>()"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
@@ -195,7 +200,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
 
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            sorted_set_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("SortedSet<int>",
+    auto r = parseAndCheckOwnership(factoryProg("owned SortedSet<int>",
                                                 "new SortedSet<int>()"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
@@ -204,7 +209,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
 
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            dictionary_string_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("Dictionary<string, int>",
+    auto r = parseAndCheckOwnership(factoryProg("owned Dictionary<string, int>",
                                                 "new Dictionary<string, int>()"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
@@ -214,7 +219,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            sorted_dictionary_string_int_factory_call_no_vacuous_spec_28_9_28_10) {
     auto r = parseAndCheckOwnership(factoryProg(
-        "SortedDictionary<string, int>", "new SortedDictionary<string, int>()"));
+        "owned SortedDictionary<string, int>", "new SortedDictionary<string, int>()"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "x"));
@@ -222,7 +227,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
 
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            linked_list_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("LinkedList<int>",
+    auto r = parseAndCheckOwnership(factoryProg("owned LinkedList<int>",
                                                 "new LinkedList<int>()"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));

@@ -100,12 +100,15 @@ BEZEL_TEST(async_pattern_a_collection_literal_owned_4338,
 // §15.4: synchronous return of a collection-literal-initialized local is
 // unaffected — the fix is in producerState classification, not in any async-
 // specific path. Must still compile and run with exit 5.
+// §28.3 row 4 (v0.313, #5123): the static `Make` return is spelled
+// `owned Array<int>` (a plain static Array return is rejected at the
+// declaration); the sync-return-of-a-literal-local shape is otherwise intact.
 BEZEL_TEST(async_pattern_a_collection_literal_owned_4338,
            sync_return_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class C "
-        "  public static method Make(): Array<int> "
+        "  public static method Make(): owned Array<int> "
         "    var arr: Array<int> := [3, 9, 3, 1, 5]; "
         "    return arr; "
         "  end Make; "

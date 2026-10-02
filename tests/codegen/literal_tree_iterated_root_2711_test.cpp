@@ -59,6 +59,7 @@
 // per §15.4, §21.4, §28.9, §28.11 (issue #2711, spec v0.240)
 
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -82,6 +83,15 @@ int runChecked(const std::string& prog) {
 // runs 300 allocation-churn iterations between the point the tree's scope ends
 // and the point the escaped node is read, so a premature free is caught as a
 // corrupted value on this NON-sanitized oracle too, not only under ASan.
+
+// #5123 (§28.3 row 4, v0.313): a plain static return of a builtin collection
+// class is rejected at the declaration. True iff `prog` fails to compile with
+// exactly that diagnostic.
+bool rejectedWithRow4(const std::string& prog) {
+    auto r = runAot(prog);
+    return !r.ran && bezel::test::diagnosticMessageContains(
+        r, "returns class/interface type `Array` without `owned`");
+}
 int runValueOnly(const std::string& prog) {
     auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
@@ -248,8 +258,8 @@ BEZEL_TEST(literal_tree_iterated_root_2711, range_loop_variable_is_not_an_alias_
 // of the two controls that SEGV under an over-wide gate that admits the iterable
 // without tracking the loop variable. got = [7,8,9]: 3*10 + (7-6) = 31.
 // per §15.4, §28.6, §21.4 (issue #2711 self-pass)
-BEZEL_TEST(literal_tree_iterated_root_2711, alias_returned_no_uaf) {
-    BEZEL_EXPECT_EQ(runValueOnly(
+BEZEL_TEST(literal_tree_iterated_root_2711, alias_returned_static_rejected_spec_28_3_row4) {
+    BEZEL_EXPECT_TRUE(rejectedWithRow4(
         "module M; "
         "class C "
         "  public static method Get(): Array<int> "
@@ -270,16 +280,15 @@ BEZEL_TEST(literal_tree_iterated_root_2711, alias_returned_no_uaf) {
         "    end; "
         "    return got.Count * 10 + (got[0] - 6); "
         "  end Main; "
-        "end C;"),
-        31);
+        "end C;"));
 }
 
 // ── CONTROL (leaks by design). Bind the loop variable into an OUTER local that
 // outlives the loop, and return that. The second control that SEGVs under the
 // over-wide gate. Value 31.
 // per §15.4, §28.6, §21.4 (issue #2711 self-pass)
-BEZEL_TEST(literal_tree_iterated_root_2711, alias_bound_to_outer_local_no_uaf) {
-    BEZEL_EXPECT_EQ(runValueOnly(
+BEZEL_TEST(literal_tree_iterated_root_2711, alias_bound_to_outer_local_static_rejected_spec_28_3_row4) {
+    BEZEL_EXPECT_TRUE(rejectedWithRow4(
         "module M; "
         "class C "
         "  public static method Get(): Array<int> "
@@ -301,8 +310,7 @@ BEZEL_TEST(literal_tree_iterated_root_2711, alias_bound_to_outer_local_no_uaf) {
         "    end; "
         "    return got.Count * 10 + (got[0] - 6); "
         "  end Main; "
-        "end C;"),
-        31);
+        "end C;"));
 }
 
 // ── CONTROL (leaks by design), DEPTH 3. INDEX a loop-variable alias and return
@@ -312,8 +320,8 @@ BEZEL_TEST(literal_tree_iterated_root_2711, alias_bound_to_outer_local_no_uaf) {
 // it, and this control proves that gate composes with alias tracking rather than
 // being bypassed by it. Value 31.
 // per §15.4, §28.6, §21.4 (issue #2711 self-pass)
-BEZEL_TEST(literal_tree_iterated_root_2711, alias_indexed_depth3_returned_no_uaf) {
-    BEZEL_EXPECT_EQ(runValueOnly(
+BEZEL_TEST(literal_tree_iterated_root_2711, alias_indexed_depth3_returned_static_rejected_spec_28_3_row4) {
+    BEZEL_EXPECT_TRUE(rejectedWithRow4(
         "module M; "
         "class C "
         "  public static method Get(): Array<int> "
@@ -334,8 +342,7 @@ BEZEL_TEST(literal_tree_iterated_root_2711, alias_indexed_depth3_returned_no_uaf
         "    end; "
         "    return got.Count * 10 + (got[0] - 6); "
         "  end Main; "
-        "end C;"),
-        31);
+        "end C;"));
 }
 
 // ── CONTROL (leaks by design), DEPTH 3. The CHAINED read `deep[0][0]` returned
@@ -343,8 +350,8 @@ BEZEL_TEST(literal_tree_iterated_root_2711, alias_indexed_depth3_returned_no_uaf
 // re-pinned in the presence of an admitted iteration so the two gates cannot
 // mask each other. got = [1,2,3]: 3*10 + 1 = 31.
 // per §15.4, §28.6 (issue #2711 self-pass)
-BEZEL_TEST(literal_tree_iterated_root_2711, chained_depth3_returned_from_iterated_body_no_uaf) {
-    BEZEL_EXPECT_EQ(runValueOnly(
+BEZEL_TEST(literal_tree_iterated_root_2711, chained_depth3_returned_static_rejected_spec_28_3_row4) {
+    BEZEL_EXPECT_TRUE(rejectedWithRow4(
         "module M; "
         "class C "
         "  public static method Get(): Array<int> "
@@ -364,8 +371,7 @@ BEZEL_TEST(literal_tree_iterated_root_2711, chained_depth3_returned_from_iterate
         "    end; "
         "    return got.Count * 10 + got[0]; "
         "  end Main; "
-        "end C;"),
-        31);
+        "end C;"));
 }
 
 // ── CONTROL (leaks by design). Condition (a) — the ROOT itself escapes into a

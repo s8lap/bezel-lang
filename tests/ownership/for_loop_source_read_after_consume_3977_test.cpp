@@ -109,7 +109,7 @@ const char* kPrelude =
     "end Res; "
     "class Sink "
     "  public static method Take(owned r: Res): int return r.tag; end Take; "
-    "  public static method MakeRange(n: int): Array<int> "
+    "  public static method MakeRange(n: int): owned Array<int> "
     "    var a := new Array<int>(); a.Add(n); return a; "
     "  end MakeRange; "
     "end Sink; ";

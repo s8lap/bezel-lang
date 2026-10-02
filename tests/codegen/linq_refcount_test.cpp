@@ -695,7 +695,7 @@ BEZEL_TEST(linq_refcount, plain_var_two_toarray_string_leak_free_1003) {
 // Returns 3.
 const char* kReturnedToArrayLocal =
     "module M; class C "
-    "  public static method MakeArr(): Array<int> "
+    "  public static method MakeArr(): owned Array<int> "
     "    using var src := new Array<int>(); "
     "    src.Add(1); src.Add(2); src.Add(3); "
     "    var a := src.Where(lambda(n) => n > 0).ToArray(); "
