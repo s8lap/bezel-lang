@@ -129,3 +129,24 @@ BEZEL_TEST(codegen_convert_1356_stdlib_2_3, try_to_boolean_false_string) {
         "return 0;"
     )), 1);
 }
+
+// fix #5263 (§22.4 / stdlib §2.3, v0.313): Convert.TryToDouble with an
+// inline `out var` — the out-var slot was defaulted to i32 (4 bytes) instead
+// of double (8 bytes), so strtod wrote 8 bytes through a 4-byte slot:
+// stack-buffer-overflow (ASan).  Same pattern for Convert.TryToInt64.
+// The pre-declared form (out result: double) was always correct.
+BEZEL_TEST(codegen_convert_1356_stdlib_2_3, try_to_double_out_var_inline) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var ok := Convert.TryToDouble(\"3.14\", out var d); "
+        "if ok and d > 3.13 and d < 3.15 then return 1; end; "
+        "return 0;"
+    )), 1);
+}
+
+BEZEL_TEST(codegen_convert_1356_stdlib_2_3, try_to_int64_out_var_inline) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var ok := Convert.TryToInt64(\"9876543210\", out var n); "
+        "if ok and n = 9876543210L then return 1; end; "
+        "return 0;"
+    )), 1);
+}

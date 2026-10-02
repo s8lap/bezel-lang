@@ -9643,6 +9643,90 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             }
                         }
                     }
+                    // fix #5263 / #5271 (§22.4, v0.313: "Its type is inferred
+                    // from the method's `out` parameter declaration"): the
+                    // BUILTIN STATIC shape-(c) members (stdlib §1) likewise
+                    // have no MethodSymbol, so the recipient was left untyped.
+                    // That cost twice: sema typed nothing that read it
+                    // (`var s: string := d` was accepted), and codegen's
+                    // ensureOutVarSlots had no declared type to size the slot
+                    // from, so every member its name-matching ladder missed
+                    // fell to a 4-byte i32 alloca the lowering then wrote
+                    // 8/16 bytes through (Convert.TryToDouble/TryToInt64/
+                    // TryToDecimal, decimal.TryParse, DateTime/Guid.TryParse,
+                    // Math.DivRem(long…)). Type the recipient from the stdlib
+                    // signature; codegen sizes the slot from this declType.
+                    // Receiver must be the BUILTIN class symbol (a user type
+                    // that shadows `Convert` resolves to its own symbol and a
+                    // MethodSymbol, typed above) or a primitive keyword/alias.
+                    if (!lsym->declType) {
+                        auto* maB = dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get());
+                        auto* idB =
+                            (maB && maB->target)
+                                ? dynamic_cast<const ast::IdentifierExpr*>(
+                                      maB->target.get())
+                                : nullptr;
+                        if (idB && pos2 + 1 == ce->args.size()) {
+                            Symbol* rsB = ctx_.exprSymbol(*idB);
+                            auto* tsB = dynamic_cast<TypeSymbol*>(rsB);
+                            const bool builtinCls =
+                                tsB && tsB == builtinClassSym(idB->name);
+                            const PrimitiveType ptB =
+                                primitiveFromName(idB->name);
+                            const std::string_view cB = idB->name;
+                            const std::string_view mB = maB->member;
+                            const std::size_t nB = ce->args.size();
+                            auto prim = [&](PrimitiveType p) {
+                                lsym->declType = ctx_.primitiveTypeRef(p);
+                            };
+                            auto named = [&](std::string_view n) {
+                                auto* t = ctx_.makeTypeRef();
+                                t->kind = TypeRef::Kind::Named;
+                                t->declaration = builtinClassSym(n);
+                                lsym->declType = t;
+                            };
+                            if (builtinCls && cB == "Convert" && nB == 2) {
+                                // stdlib §2.3
+                                if (mB == "TryToInt32") prim(PrimitiveType::Int);
+                                else if (mB == "TryToInt64") prim(PrimitiveType::Long);
+                                else if (mB == "TryToDouble") prim(PrimitiveType::Double);
+                                else if (mB == "TryToDecimal") prim(PrimitiveType::Decimal);
+                                else if (mB == "TryToBoolean") prim(PrimitiveType::Bool);
+                            } else if (builtinCls && cB == "Math" &&
+                                       mB == "DivRem" && nB == 3) {
+                                // stdlib §2.2: DivRem(int, int, out int) /
+                                // DivRem(long, long, out long).
+                                bool anyLong = false;
+                                for (std::size_t k = 0; k < 2; ++k)
+                                    if (ce->args[k].value)
+                                        if (const TypeRef* at =
+                                                ctx_.exprType(*ce->args[k].value))
+                                            if (at->kind == TypeRef::Kind::Primitive &&
+                                                at->primitive == PrimitiveType::Long)
+                                                anyLong = true;
+                                prim(anyLong ? PrimitiveType::Long
+                                             : PrimitiveType::Int);
+                            } else if (builtinCls && mB == "TryParse" &&
+                                       nB == 2 &&
+                                       (cB == "DateTime" || cB == "DateOnly" ||
+                                        cB == "TimeOnly" || cB == "Guid")) {
+                                // stdlib §2.5 / §2.6
+                                named(cB);
+                            } else if (mB == "TryParse" &&
+                                       (!rsB || builtinCls) &&
+                                       ptB != PrimitiveType::None &&
+                                       ptB != PrimitiveType::String &&
+                                       ptB != PrimitiveType::Object &&
+                                       (nB == 2 ||
+                                        (nB == 3 && ptB == PrimitiveType::Int))) {
+                                // stdlib §9.1–§9.5: the primitive TryParse
+                                // family (`int.TryParse(s, radix, out …)` is
+                                // the one three-argument form).
+                                prim(ptB);
+                            }
+                        }
+                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }

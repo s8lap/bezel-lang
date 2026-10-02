@@ -2028,6 +2028,24 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                             slotTy = lowerTypeRef(ps->resolvedDeclType);
                 }
             }
+        } else if (loc && loc->declType) {
+            // fix #5263 / #5271 (§22.4, v0.313): checked BEFORE the
+            // callPrimTy name ladder below — the recipient's sema type IS the
+            // callee's `out` parameter type, for every builtin family alike:
+            // the primitive TryParse tower, Convert.TryTo* (stdlib §2.3),
+            // DateTime/DateOnly/TimeOnly/Guid.TryParse, Math.DivRem
+            // (ExprTypecheck_Exprs.cpp types them from the stdlib signature),
+            // and the #1336 collection Trys. The ladder is now only the
+            // fallback for a recipient sema left untyped; it had no arm for
+            // decimal (a 16-byte value written through the i32 default, #5271)
+            // and never reached a non-primitive receiver at all (#5263).
+            // v0.171 (#1336): a BUILTIN collection Try's inline `out var x` has
+            // no MethodDecl; sema typed the local `T?`/`V?` (the borrowing
+            // TryPop/TryDequeue/TryPeek/TryGetValue family). Lower that nullable
+            // type so the slot is the tagged `{i8,T}` struct for a value
+            // instantiation (a class instantiation stays a nullable pointer);
+            // the false-path null-store and value writeback then land correctly.
+            slotTy = lowerTypeRef(loc->declType);
         } else if (callPrimTy != sema::PrimitiveType::None) {
             using P = sema::PrimitiveType;
             // For TryParse, the out result is the same primitive type.
@@ -2037,14 +2055,6 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             // §9.4 / issue #654: bool.TryParse out-slot is i1 (Bool lowers to i1).
             else if (callPrimTy == P::Bool) slotTy = i1();
             else slotTy = i32();
-        } else if (loc && loc->declType) {
-            // v0.171 (#1336): a BUILTIN collection Try's inline `out var x` has
-            // no MethodDecl; sema typed the local `T?`/`V?` (the borrowing
-            // TryPop/TryDequeue/TryPeek/TryGetValue family). Lower that nullable
-            // type so the slot is the tagged `{i8,T}` struct for a value
-            // instantiation (a class instantiation stays a nullable pointer);
-            // the false-path null-store and value writeback then land correctly.
-            slotTy = lowerTypeRef(loc->declType);
         } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             // §3: collection instance calls (e.g. dict.TryGetValue).
             // Infer out-param type from the collection's generic args.
