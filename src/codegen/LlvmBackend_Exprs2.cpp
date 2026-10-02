@@ -8157,6 +8157,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     allUnbound = false;
                     break;
                 }
+                // fix #5242 (§14.1, v0.313): a builtin class (e.g. Stopwatch)
+                // HAS a declaration (builtinClassSym), but the builtin type IS
+                // concrete — the declaration is for the reserved-name lookup,
+                // not a user type. Without this, `new Box<Stopwatch>` treats
+                // Stopwatch as unbound, skips the substitution, and recordStruct
+                // uses {i32} instead of {ptr}, causing an ASan heap-buffer-overflow.
+                if (isBuiltinTypeRefName(arg->astNode->name->parts.back())) {
+                    allUnbound = false;
+                    break;
+                }
             }
             // Resolve generic args WITH the outer substitution active so
             // that `new Pair<T>` inside a `Pair<string>` method correctly
