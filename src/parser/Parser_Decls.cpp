@@ -2236,6 +2236,10 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
             // expressions.  We detect the statement cases (assignment and
             // increment) after parsing the leading expression/LHS, mirroring
             // the logic in parseStatement()'s expression-led path.  per §13.6
+            // fix #5252: capture the statement's start so the synthesized
+            // assignment / increment carries a real span (§23.3) — later
+            // diagnostics on it otherwise report 0:0 (the issue #135 class).
+            const SourceLocation stmtStart = current_.location;
             auto lhs = parseExpression();
             const bool isAssignOp =
                 current_.kind == TokenKind::Punctuator &&
@@ -2256,6 +2260,7 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
                 auto a = std::make_unique<ast::AssignmentStmt>();
                 a->target = std::move(lhs);
                 a->op = current_.text;
+                a->span.begin = stmtStart;
                 advance(); // past assignment operator
                 a->value = parseExpression();
                 if (!consumePunctuator(";")) {
@@ -2271,6 +2276,7 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
                 auto inc = std::make_unique<ast::IncrementStmt>();
                 inc->target = std::move(lhs);
                 inc->op = current_.text;
+                inc->span.begin = stmtStart;
                 advance();
                 if (!consumePunctuator(";")) {
                     diagnostics_.report(Severity::Error, current_.location,

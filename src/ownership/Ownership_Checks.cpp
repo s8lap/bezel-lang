@@ -9714,7 +9714,8 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
         if (const auto* rid =
                 dynamic_cast<const ast::IdentifierExpr*>(
                     lookThroughForceUnwrap(as.value.get()))) {
-            if (const LocalOwnership* rst = lookupState(rid->name))
+            // fix #5252: resolve by symbol, not by name (shadowing).
+            if (const LocalOwnership* rst = lookupStateFor(*rid))
                 if (rst->state == OwnershipState::Owned) return false;
         }
         // fix #4989 (§28.3 consume table K3.1 / §28.5 / §28.8.1 / §17.8,
@@ -9735,7 +9736,7 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             if (core != as.value.get()) {
                 if (const auto* cid =
                         dynamic_cast<const ast::IdentifierExpr*>(core)) {
-                    if (const LocalOwnership* cst = lookupState(cid->name))
+                    if (const LocalOwnership* cst = lookupStateFor(*cid))
                         if (cst->state == OwnershipState::Owned &&
                             ownedArgSourceIsBorrow(*as.value))
                             return false;
@@ -11820,6 +11821,14 @@ LocalOwnership* MethodOwnership::lookupState(std::string_view name) {
         if (sym->name == name) return &st;
     }
     return nullptr;
+}
+
+LocalOwnership* MethodOwnership::lookupStateFor(const ast::IdentifierExpr& id) {
+    if (sema::Symbol* sym = ctx_.exprSymbol(id)) {
+        auto it = states_.find(sym);
+        if (it != states_.end()) return &it->second;
+    }
+    return lookupState(id.name);
 }
 
 // fix #4246 (§28.3 / §28.6, v0.298): see IdentifierExpr::disposeReclaims-
@@ -14433,7 +14442,8 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // A tracked local: only the Borrowed state is the owned-sink hazard. Owned
     // (the legal transfer) and the error-producing states (MovedFrom/Disposed/
     // Uninitialized — diagnosed by their own checks) are NOT flagged here.
-    if (auto* st = lookupState(id->name)) {
+    // fix #5252: resolve by symbol, not by name (shadowing).
+    if (auto* st = lookupStateFor(*id)) {
         if (st->state != OwnershipState::Borrowed) return false;
         // fix #4042 (§21.1 / §28.3, stdlib §5 / §4.4 / §9.6): a bare local
         // bound DIRECTLY to a builtin owned-materializer call (`ToArray`,

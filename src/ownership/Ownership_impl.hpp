@@ -4279,6 +4279,15 @@ private:
 
     LocalOwnership* lookupState(std::string_view name);
 
+    // fix #5252 (§28.3, v0.313): the state of the binding `id` actually
+    // resolves to (sema's exprSymbol), falling back to the by-name
+    // `lookupState` only when that symbol is untracked. `lookupState` scans
+    // the unordered `states_` for the FIRST symbol with a matching name, so
+    // once an inner block declares a same-named local (`do var value := 5;
+    // end;`) it can answer with the shadowing local's state instead of the
+    // outer binding's.
+    LocalOwnership* lookupStateFor(const ast::IdentifierExpr& id);
+
     void markDisposedByName(std::string_view name, SourceLocation loc);
 
     // fix #4246 (§28.3 / §28.6, v0.298): stamp `id` (an explicit
