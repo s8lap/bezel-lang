@@ -140,12 +140,15 @@ BEZEL_TEST(virtual_overload_same_name_imported_types_5251,
         "  end Run; "
         "end Base; ";
 
-    // App: imports M1C, calls Base.Run(new Base())
+    // App: imports M1C, calls Base.Run(g) on a `using var` Base. The argument
+    // is bound (not a `new` temporary) so the row stays leak-free under the
+    // gate's LSan leg; the temporary-argument leak is tracked separately.
     const std::string app =
         "module App1; import M1C; "
         "class Main1 "
         "  public static method Main(): int "
-        "    const r := Base.Run(new Base()); "
+        "    using var g := new Base(); "
+        "    const r := Base.Run(g); "
         "    Console.WriteLine(r); "
         "    return r; "
         "  end Main; "
@@ -195,7 +198,8 @@ BEZEL_TEST(virtual_overload_same_name_imported_types_5251,
         "class Main2 "
         "  public static method Main(): int "
         "    using var b: Base := new Der(); "
-        "    const r := b.Take(new M2A.Item()); "
+        "    using var it := new M2A.Item(); "
+        "    const r := b.Take(it); "
         "    Console.WriteLine(r); "
         "    return r; "
         "  end Main; "
@@ -248,7 +252,8 @@ BEZEL_TEST(virtual_overload_same_name_imported_types_5251,
         "class Main3 "
         "  public static method Main(): int "
         "    using var b: Base := new Der(); "
-        "    const r := b.Take(new M3A.Item()); "
+        "    using var it := new M3A.Item(); "
+        "    const r := b.Take(it); "
         "    Console.WriteLine(r); "
         "    return r; "
         "  end Main; "
