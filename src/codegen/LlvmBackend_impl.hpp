@@ -20614,6 +20614,36 @@ private:
         return !isBuiltinTypeRefName(t->headName());
     }
 
+    // fix #5242 / fix #3143 (§14.1, v0.313): THE one "is this generic argument
+    // a still-unbound template parameter?" predicate behind the `allUnbound`
+    // erasure decision. A generic record/choice/class instantiation whose args
+    // are ALL unbound (`new Box<T>` inside the template body of `Make<T>`) is
+    // laid out as the ERASED template struct, everything else is specialized.
+    // lowerNew (LlvmBackend_Exprs2.cpp) and lowerTypeRef's generic-record and
+    // generic-choice branches (LlvmBackend_Layout.cpp) MUST answer the same way
+    // for the same TypeRef (#3143: a value built as `%record.Box` stored through
+    // a `%record.Box$spec0` signature, or vice versa, fails IR verification), so
+    // all three call this rather than open-coding the test.
+    //
+    // An unbound parameter is a single-part, declaration-less Named ref with no
+    // generic args of its own (#787: `Array<int>` is concrete) that the active
+    // substitution does not bind. A BUILTIN class (`Stopwatch`,
+    // `StringBuilder`, `CancellationTokenSource`) has that same shape — it has
+    // NO `TypeSymbol` declaration — so before #5242 `Box<Stopwatch>` was
+    // classified unbound at every site, erased to the T→i32 placeholder
+    // layout, and its 8-byte builtin pointer was stored into / read from a
+    // 4-byte slot (ASan stack/heap-buffer-overflow). `isBuiltinTypeRefName` is
+    // the same reserved-name exclusion `isBareTypeParamRef` applies.
+    bool isUnboundTemplateArg(const sema::TypeRef* arg) const {
+        if (!arg || arg->kind != sema::TypeRef::Kind::Named ||
+            arg->declaration || !arg->astNode || !arg->astNode->name ||
+            arg->astNode->name->parts.size() != 1 ||
+            !arg->genericArgs.empty() ||
+            genericSubst_.count(arg->headName()))
+            return false;
+        return !isBuiltinTypeRefName(arg->headName());
+    }
+
     // issues D3 / D8 / §8.3: build C-ABI trampolines over an ARBITRARY
     // hashable value type's hash / equality for the generic dict/set
     // runtime variant. Generalizes buildRecord*Trampoline from records to

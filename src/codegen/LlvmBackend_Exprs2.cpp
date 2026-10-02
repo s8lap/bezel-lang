@@ -8149,11 +8149,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // struct, and truncated the 8-byte Array pointer into a 4-byte
                 // field (SIGSEGV on field access via the specialized {ptr} view).
                 // A type carrying its own generic args is concrete, not unbound.
-                if (!arg || arg->kind != sema::TypeRef::Kind::Named ||
-                    arg->declaration || !arg->astNode || !arg->astNode->name ||
-                    arg->astNode->name->parts.size() != 1 ||
-                    !arg->genericArgs.empty() ||
-                    genericSubst_.count(arg->headName())) {
+                // fix #5242 (§14.1, v0.313): a builtin class (`Stopwatch`) has
+                // the same declaration-less single-part shape and is concrete
+                // too. isUnboundTemplateArg is the ONE predicate shared with
+                // lowerTypeRef's generic-record/choice branches.
+                if (!isUnboundTemplateArg(arg)) {
                     allUnbound = false;
                     break;
                 }

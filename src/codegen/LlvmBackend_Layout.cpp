@@ -1282,23 +1282,15 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                     // unbound placeholder; the caller (declareFunctions, template
                     // body) is building the unspecialized template and must use the
                     // same base struct as the template body.
+                    // An unbound type param: Named kind, no declaration,
+                    // single-part name, no generic args of its own (#787), NOT
+                    // bound in the current outer subst, and NOT a builtin class
+                    // name (#5242: `Box<Stopwatch>` is concrete). The predicate
+                    // is shared with lowerNew (LlvmBackend_Exprs2.cpp) via
+                    // isUnboundTemplateArg so the two cannot disagree (#3143).
                     bool allUnbound = true;
                     for (const auto& arg : rt->genericArgs) {
-                        if (!arg) { allUnbound = false; break; }
-                        // An unbound type param: Named kind, no declaration,
-                        // single-part name, NOT bound in the current outer subst.
-                        // issue #787: a builtin collection (`Array<int>`) is also
-                        // Named/declaration-less/single-part ("Array"); it carries
-                        // its own generic args, so it is a concrete type, NOT an
-                        // unbound parameter (a bare `T` has no generic args). Kept
-                        // in sync with the mirror check in LlvmBackend_Exprs.cpp
-                        // (lowerNew record construction).
-                        if (arg->kind != sema::TypeRef::Kind::Named ||
-                            arg->declaration ||
-                            !arg->astNode || !arg->astNode->name ||
-                            arg->astNode->name->parts.size() != 1 ||
-                            !arg->genericArgs.empty() ||
-                            genericSubst_.count(arg->headName())) {
+                        if (!isUnboundTemplateArg(arg)) {
                             allUnbound = false;
                             break;
                         }
@@ -1377,15 +1369,11 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                         : sema::genericParamNames(rt->declaration);
                 if (!cGpNames.empty() &&
                     cGpNames.size() == rt->genericArgs.size()) {
+                    // fix #5242 (§14.1, v0.313): the shared predicate (see the
+                    // record branch above).
                     bool allUnbound = true;
                     for (const auto& arg : rt->genericArgs) {
-                        if (!arg) { allUnbound = false; break; }
-                        if (arg->kind != sema::TypeRef::Kind::Named ||
-                            arg->declaration ||
-                            !arg->astNode || !arg->astNode->name ||
-                            arg->astNode->name->parts.size() != 1 ||
-                            !arg->genericArgs.empty() ||
-                            genericSubst_.count(arg->headName())) {
+                        if (!isUnboundTemplateArg(arg)) {
                             allUnbound = false;
                             break;
                         }
