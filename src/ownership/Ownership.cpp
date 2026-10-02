@@ -12701,6 +12701,12 @@ void MethodOwnership::collectReassignedOwnedLocals(
 // recursive control-flow arms).
 void MethodOwnership::collectReassignedOwnedLocalsStmt(const ast::Stmt& s) {
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // fix #5278: record EVERY assigned local (any op / RHS).
+        if (as->target)
+            if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get()))
+                if (sema::Symbol* asym = ctx_.exprSymbol(*aid))
+                    assignedLocals_.insert(asym);
         if (as->op == ":=" && as->target && as->value) {
             if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     as->target.get())) {

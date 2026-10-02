@@ -14220,6 +14220,29 @@ bool MethodOwnership::getterBodyIsDrainAliasOverReceiverSourced(
     return false;
 }
 
+// fix #5278 (§15.4, §28.3, K3.13): see the header. A local whose declaration
+// is `var x: <heap collection> := [...]` and which is never assigned to again
+// holds exactly the fresh literal production, so returning it through an
+// `owned` return type is the marker-free transfer of an owned named binding.
+// A reassigned local (`kept := row`) may hold a borrow and is NOT admitted.
+bool MethodOwnership::isUnassignedHeapCollectionLiteralLocal(
+        const ast::Expr& e) {
+    const ast::Expr* p = &e;
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(p))
+        if (un->op == "move" && un->operand) p = un->operand.get();
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(p);
+    if (!id) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || !ls->decl) return false;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->initializer) return false;
+    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(ld->initializer.get()))
+        return false;
+    if (assignedLocals_.count(sym)) return false;
+    return isLocalHeapCollectionTyped(sym);
+}
+
 // §28.8 owned-sink check (issue #395). See the header for the full contract.
 // fix #4042 / #4057: see the header comment. Extracted from
 // `ownedArgSourceIsBorrow`'s original inline check so `handleOwnedField
@@ -14684,6 +14707,7 @@ bool MethodOwnership::checkOwnedReturnBorrowSource(const ast::Expr& e) {
     // local/parameter, a catch-bound exception (§31.1), a Borrowed-state local,
     // or a non-`owned` field is REJECTED; an owned local or an owned producer is
     // accepted (ownedArgSourceIsBorrow returns false).
+    if (isUnassignedHeapCollectionLiteralLocal(e)) return false;  // #5278
     if (!ownedArgSourceIsBorrow(e)) return false;
     report(
         Severity::Error, un->span.begin,
@@ -14806,6 +14830,7 @@ void MethodOwnership::checkOwnedReturnDirectBorrow(const ast::Expr& e) {
             }
         }
     }
+    if (isUnassignedHeapCollectionLiteralLocal(e)) return;  // #5278
     if (!ownedArgSourceIsBorrow(e)) return;
     report(
         Severity::Error, e.span.begin,

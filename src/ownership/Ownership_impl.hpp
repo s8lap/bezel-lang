@@ -888,6 +888,10 @@ private:
     // cleared/rebuilt per lambda the way `states_` is: this is a per-METHOD
     // static fact, independent of which lambda is currently being walked.
     std::unordered_set<sema::Symbol*> reassignedOwnedLocals_;
+    // fix #5278 (§15.4 / §28.3 K3.13): every local assigned to (any `op`, any
+    // RHS) by this method's statement scan — feeds
+    // `isUnassignedHeapCollectionLiteralLocal`.
+    std::unordered_set<sema::Symbol*> assignedLocals_;
     // §28.3 (#1900): locals whose slot DEFINITELY holds a fresh value at the
     // current program point — i.e. the LAST state-changing operation on the local
     // was an UNCONDITIONAL reassignment (`x := new T()` at straight-line scope,
@@ -4452,6 +4456,16 @@ private:
     // `ownedArgSourceIsBorrow`'s own header comment for why that must stay
     // true). // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057
     bool isMaterializerCarveOutBorrow(std::string_view name);
+
+    // fix #5278 (§15.4, §28.3 Producers table, K3.13): true when `e` (after
+    // peeling a leading `move` / bare `!`) is a bare read of a LOCAL declared
+    // `var x: <heap collection> := [ ... ]` and never assigned afterwards. A
+    // reference-typed collection literal is "a fresh owned production"
+    // (§15.4) — the local is an owned local — but `producerState` cannot see
+    // that (the literal is untyped, its type comes from the declaration), so
+    // the local stays Borrowed-classified. The `owned`-return checks consult
+    // this to admit the marker-free transfer (K3.13) of such a local.
+    bool isUnassignedHeapCollectionLiteralLocal(const ast::Expr& e);
 
     // §28.3 (issue #398): true when `e` is a read of an `owned` field — either
     // an explicit member access `obj.f` whose member resolves to an owned
