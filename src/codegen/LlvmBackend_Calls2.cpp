@@ -13513,10 +13513,29 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     const std::vector<llvm::Value*> stringPinArgs =
         emitBorrowedStringArgPins(args, &argExprs, ms->params,
                                   isStaticMethod(ms) ? 0 : 1);
+    // fix-forward #5262-ff (§4.6 / §28.3 "Exception-path discharge" / §28.9,
+    // v0.313): the EXCEPTION-edge release for these pins. #5262 dropped the
+    // vector on the normal-return edge only, so a callee that THREW leaked one
+    // string pair per throwing call — MEASURED (v1 review, r23-c28 d68dab26):
+    // a `Twice` that stores twice then throws, 200 iterations, gives
+    // `caught=200` and exit 0 (no UAF — the safe direction) but
+    // `LeakSanitizer: 7290 byte(s) leaked in 400 allocation(s)`, exactly one
+    // string pair per throwing call. §28.3's Exception-path discharge is the
+    // rule that leak violates: "Exceptions therefore do not produce leaks."
+    //
+    // Installed ON TOP of whatever closure cleanup the block above left in
+    // `unwindTarget_`, so the order on a propagating edge is pins first, then
+    // the closure temporaries, then the enclosing catch/propagate boundary —
+    // matching the ctor arm's chain. `unwindTarget_` is restored to
+    // `savedClArgUnwind` immediately after the call either way.
+    if (!stringPinArgs.empty())
+        unwindTarget_ = stringPinArgUnwindCleanup(stringPinArgs);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
                                          call.span.begin, thisReceiver);
     unwindTarget_ = savedClArgUnwind;
     if (!diverged_) {
+        // fix-forward #5262-ff: the throw edge no longer leaks these — the
+        // cleanup above drops the same vector on the propagating path.
         releaseBorrowedStringArgPins(stringPinArgs);
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
         // fix #1073 release site (1/2) — the NORMAL-return edge. Straight-line

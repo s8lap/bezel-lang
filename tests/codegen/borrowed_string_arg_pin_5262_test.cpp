@@ -537,4 +537,137 @@ BEZEL_TEST(borrowed_string_arg_pin_5262,
                     wantPrinted(kAsyncIters));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SHAPE 7 — the THROWING-CALL edge (fix-forward #5262-ff, row 3 of 3)
+//
+// #5262 released the pin on the NORMAL-return edge only, so a callee that
+// threw leaked the +1. §28.3's Exception-path discharge is the rule that leak
+// violates: "the compiler treats every owned local and owned parameter as if
+// it were wrapped in an implicit try/finally … Exceptions therefore do not
+// produce leaks."
+// ═══════════════════════════════════════════════════════════════════════════
+
+// IMPORTANT — WHAT IS AND IS NOT PINNED HERE, and why the argument list is
+// exactly one borrowed value.
+//
+// The v1 review attributed the METHOD-call leak
+// (`LeakSanitizer: 7290 byte(s) leaked in 400 allocation(s)`, 200 throwing
+// calls of `c.Twice(c.Val, "q" + i.ToString())`) to the #5262 pin. MEASURED
+// attribution on this lane says otherwise, with four discriminating probes
+// (`agent_check.sh --probe --asan`, 200 throwing iterations each):
+//
+//   c.Val only, no producer   `Boom1(c.Val)`                  -> CLEAN, exit 0
+//   "q"+i only, no borrow      `Boom1("q" + i.ToString())`    -> 7290 B / 400 allocs
+//   the review's shape         `Twice(c.Val, "q" + i...)`      -> 7290 B / 400 allocs
+//   the review's shape, no store  `Twice` that only throws     -> 7290 B / 400 allocs
+//
+// The method-call leak is the SECOND argument — a #429 +1 PRODUCER string
+// whose release is also normal-return-only — and it tracks the producer
+// count, not the pin. A callee that only throws, with no field store at all,
+// leaks the identical 7290 B / 400 allocs, which a pin-only argument cannot
+// explain; a pin-only argument is clean, which a producer-only argument
+// cannot explain either.
+//
+// The pin DOES leak on the throwing edge, but only where it is genuinely
+// unobservable by the naive probe: LeakSanitizer reports unreachable blocks,
+// and while the receiver field still points at the pinned value the block
+// stays reachable, masking the dropped +1. Row (7a) is built to orphan it
+// (see its comment), and there the leak is real and the unwind-edge release
+// closes it — MEASURED 26865 B / 398 allocs without, clean with.
+//
+// The producer-argument leak is a SEPARATE, pre-existing #429 issue, not
+// #5262's, and is not pinned here (doing so would freeze a defect unrelated
+// to the pin this file is about). It is reported to the coordinator
+// separately.
+//
+// The callee stores over the aliased field twice — the shape that makes the
+// borrow a UAF on the normal edge — and then throws, so this row also keeps
+// the pin's reason for existing in play on the path that unwinds.
+std::string throwingCtorSrc(int iters) {
+    return "module M5262g; "
+           "public class Holder "
+           "  public _v: string; "
+           "  public constructor(v: string) _v := v; end constructor; "
+           "end Holder; "
+           "public class Box "
+           "  public constructor(h: Holder, v: string) "
+           "    h._v := v; "
+           "    h._v := v + \"x\"; "
+           "    throw new InvalidOperationException(\"boom\"); "
+           "  end constructor; "
+           "end Box; "
+           "public class Program "
+           "  public static method Main(): int "
+           "    using var h := new Holder(\"a1\"); "
+           "    var caught := 0; "
+           "    for var i in 0.." "<" + std::to_string(iters) +
+           " do "
+           "      try "
+           "        using var b := new Box(h, h._v); "
+           "      catch "
+           "        InvalidOperationException => do caught := caught + 1; end, "
+           "      end try; "
+           "    end; "
+           "    Console.WriteLine($\"caught={caught}\"); "
+           "    return 0; "
+           "  end Main; "
+           "end Program;";
+}
+
+// (7a) 200 throwing constructions. Every one must be caught, so
+// `caught=200` and exit 0 is the pass; a heap-use-after-free or an
+// over-release on the unwind edge is a HALT. The assertion is on stdout
+// because a leak is invisible to an exit code — the leak half is carried by
+// runAotChecked's LeakSanitizer, so an unbalanced pin fails this row through
+// the harness rather than through the compared string.
+//
+// WHY THE SECOND STORE IS `v + "x"` AND NOT A LITERAL — this is what makes
+// the row FAIL-WITHOUT rather than merely green. The pin's +1 on `h._v` is
+// invisible to LeakSanitizer while the field still references the value: LSan
+// reports UNREACHABLE blocks, and a string the field still points at is
+// reachable, so a dropped +1 on it is masked. The first version of this row
+// stored a literal for the second value and passed with AND without the
+// unwind-edge release — a vacuous pin. `v + "x"` is a FRESH runtime string,
+// so displacing the field with it orphans the pinned value: the pin's +1 is
+// then the only thing keeping the block allocated, and a dropped release shows
+// up. MEASURED, 200 iterations: without the unwind-edge release,
+// `SUMMARY: AddressSanitizer: 26865 byte(s) leaked in 398 allocation(s)`;
+// with it, clean and exit 0. (398, not 400: the first iteration's value is
+// still reachable from the field when the process tears down.)
+BEZEL_TEST(borrowed_string_arg_pin_5262,
+           throwing_ctor_pin_does_not_leak_spec_4_6_28_9) {
+    BEZEL_EXPECT_EQ(run(throwingCtorSrc(200)), "caught=200\n");
+}
+
+// (7b) Control for (7a), and the row that makes (7a) attributable: the SAME
+// throwing constructor with NO borrowed argument at all — the callee builds
+// its own value. If (7a) ever fails, this row's continued greenness is what
+// says the failure is the borrow pin and not the throw/construct path.
+BEZEL_TEST(borrowed_string_arg_pin_5262,
+           control_throwing_ctor_without_borrowed_arg_spec_4_6_28_9) {
+    BEZEL_EXPECT_EQ(
+        run("module M5262h; "
+            "public class Box "
+            "  public constructor() "
+            "    throw new InvalidOperationException(\"boom\"); "
+            "  end constructor; "
+            "end Box; "
+            "public class Program "
+            "  public static method Main(): int "
+            "    var caught := 0; "
+            "    for var i in 0..<200 do "
+            "      try "
+            "        using var b := new Box(); "
+            "      catch "
+            "        InvalidOperationException => do caught := caught + 1; end, "
+            "      end try; "
+            "    end; "
+            "    Console.WriteLine($\"caught={caught}\"); "
+            "    return 0; "
+            "  end Main; "
+            "end Program;"),
+        "caught=200\n");
+}
+
+
 

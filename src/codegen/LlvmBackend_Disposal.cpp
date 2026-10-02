@@ -2604,6 +2604,41 @@ llvm::BasicBlock* Emitter::closureArgUnwindCleanup(
 }
 
 
+// fix-forward #5262-ff (§4.6 / §28.3 "Exception-path discharge" / §28.9,
+// v0.313): the EXCEPTION-edge half of #5262's borrowed-string-argument pin.
+// The pin mints a +1 per admissible argument and the call site released it on
+// the NORMAL-return edge only, so a callee that THREW leaked exactly one
+// string pair per throwing call. #5262 documented that as "the safe direction"
+// — a leak, not a use-after-free — but it is a real per-throw leak, and
+// §28.3's Exception-path discharge is precisely the rule it violates: "the
+// compiler treats every owned local and owned parameter as if it were wrapped
+// in an implicit try/finally … Exceptions therefore do not produce leaks."
+//
+// This is `closureArgUnwindCleanup`'s exact twin with `emitStringRelease` in
+// place of `emitClosureRelease`, and inherits its exactly-once argument
+// verbatim: the block is installed as `unwindTarget_` ONLY across the call,
+// its only predecessors are that call's unwind edges (each a `CreateCondBr`
+// whose other side is the pending-check continuation carrying the normal-path
+// release), and an exception edge never rejoins that continuation. Capturing
+// `unwindBB()` BEFORE the caller overrides `unwindTarget_` preserves the
+// enclosing catch/propagate boundary. A nested `try` inside an inlined callee
+// body saves and restores `unwindTarget_` around its own catch dispatch, so a
+// HANDLED throw resumes on the normal edge and still reaches the post-call
+// release exactly once.
+llvm::BasicBlock* Emitter::stringPinArgUnwindCleanup(
+    const std::vector<llvm::Value*>& pins) {
+    auto* savedInsert = builder_.GetInsertBlock();
+    llvm::BasicBlock* enclosingUnwind = unwindBB();
+    auto* cleanupBB =
+        llvm::BasicBlock::Create(llvm_, "strpin.throw.cleanup", currentFn_);
+    builder_.SetInsertPoint(cleanupBB);
+    for (llvm::Value* pv : pins) emitStringRelease(pv);  // null-safe (§28.9)
+    builder_.CreateBr(enclosingUnwind);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    return cleanupBB;
+}
+
+
 void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // §28.2 / §28.4: dispatch the object's PUBLIC, idempotent Dispose through
     // its vtable (slot 2, CG35-itable) — which runs the destructor body, owned-field

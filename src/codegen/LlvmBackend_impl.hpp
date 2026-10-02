@@ -11548,6 +11548,16 @@ private:
     llvm::BasicBlock* closureArgUnwindCleanup(
         const std::vector<llvm::Value*>& closures);
 
+    // fix-forward #5262-ff (§4.6 / §28.3 "Exception-path discharge" / §28.9,
+    // v0.313): the exception-edge release for #5262's borrowed-string-argument
+    // pin. `closureArgUnwindCleanup`'s exact twin — it drops each pinned
+    // argument's +1 with `emitStringRelease` and then continues to the
+    // enclosing unwind, and inherits that function's exactly-once argument.
+    // Installed as `unwindTarget_` only across the call, so a throwing callee
+    // does not leak the pin the normal-return edge would have dropped.
+    llvm::BasicBlock* stringPinArgUnwindCleanup(
+        const std::vector<llvm::Value*>& pins);
+
     // §28.2 / §28.4: dispatch an object's PUBLIC idempotent Dispose through its
     // vtable (slot 1) — runs the destructor + owned fields + base chain at most
     // once. Does NOT free the block. `obj` must be non-null. Used as the dispatch

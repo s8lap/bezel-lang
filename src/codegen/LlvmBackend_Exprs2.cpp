@@ -9836,15 +9836,34 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         unwindTarget_ = closureArgUnwindCleanup(ctorClosureArgs);
                     builder_.CreateCall(it->second, args);
                     unwindTarget_ = savedClArgUnwind;
+                    // fix-forward #5262-ff (§4.6 / §28.3 "Exception-path
+                    // discharge" / §28.9, v0.313): the SAME treatment for the
+                    // string pins, installed across the PENDING CHECK — which
+                    // is where a compiled callee's throw is actually detected.
+                    //
+                    // The span matters and is the whole fix. A compiled callee
+                    // does not unwind into this frame's IR: it returns with
+                    // `bz$exc` set, and `emitNewPendingCheck` below is the edge
+                    // that notices. So a cleanup installed only around the
+                    // `CreateCall` (as the #2305 closure cleanup above is, for
+                    // its own reasons) has no predecessor from the ctor's own
+                    // throw, and the pin would still leak. `stringPinArgUnwind-
+                    // Cleanup` captures `unwindBB()` here, with the enclosing
+                    // boundary already restored, so it chains to the real
+                    // catch/propagate target and not to the closure block.
+                    if (!ctorStringPins.empty())
+                        unwindTarget_ = stringPinArgUnwindCleanup(ctorStringPins);
                     // §22.9 / §28.3 (FINDING [4]): the called ctor disposed its
                     // assigned owned fields + base subobject on its own unwind
                     // path (without freeing `this`); reclaim the instance block
                     // here on the throw edge.
                     emitNewPendingCheck(obj);
+                    unwindTarget_ = savedClArgUnwind;
                     // fix #5262: normal-edge release of the string pins.
-                    // Only when the ctor returned (the throw edge leaked them,
-                    // which is the safe direction the #429 producer release
-                    // above also takes).
+                    // fix-forward #5262-ff: the throw edge no longer leaks
+                    // them — `stringPinArgUnwindCleanup` above drops the same
+                    // vector on the propagating path, per §28.3's
+                    // Exception-path discharge.
                     if (!diverged_) {
                         releaseBorrowedStringArgPins(ctorStringPins);
                     }
@@ -9991,7 +10010,22 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             paramSlots_[cs->params[pi]] = slot;
                         }
                     }
+                    // fix-forward #5262-ff (§4.6 / §28.3 "Exception-path
+                    // discharge" / §28.9, v0.313): the inline arm's EXCEPTION
+                    // edge. `inlineCtorBody` installs its own `unwindTarget_`
+                    // (the §22.9 ctor.inline.cleanup block, which disposes the
+                    // assigned owned fields + base subobject, frees `obj`, and
+                    // branches to the ENCLOSING unwind). Installing the pin
+                    // cleanup first means the inlined body's throw edges reach
+                    // it before the instance cleanup — the same order as the
+                    // call arm's chained cleanups. `savedUnwindTarget` was
+                    // captured even earlier, so the restore below leaves the
+                    // enclosing frame's target untouched.
+                    llvm::BasicBlock* savedInlinePinUnwind = unwindTarget_;
+                    if (!ctorStringPins.empty())
+                        unwindTarget_ = stringPinArgUnwindCleanup(ctorStringPins);
                     inlineCtorBody(cs, obj);
+                    unwindTarget_ = savedInlinePinUnwind;
                     unwindTarget_ = savedUnwindTarget;
                     unwindScopeDepth_ = savedUnwindDepth;
                     currentThis_ = savedThis;
