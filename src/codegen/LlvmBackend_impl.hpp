@@ -16966,6 +16966,9 @@ private:
     // dangles this slot (no UAF). Returns true when handled (caller must NOT also
     // store); false when `target` is not a string local slot. `slotAddr`/`elemTy`
     // are the lvalue address/type the caller already computed.
+    // fix #5245: see the definitions in LlvmBackend_Setup.cpp.
+    bool stringLocalSlotOwnsRef(const ast::Expr& target) const;
+    bool isNullableStringExprType(const ast::Expr& target) const;
     bool lowerStringLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
                                   llvm::Type* elemTy, llvm::Value* newVal,
                                   const ast::Expr* valueExpr);

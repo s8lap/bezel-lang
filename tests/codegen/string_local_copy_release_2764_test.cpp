@@ -60,9 +60,11 @@
 // oracle that moves and the plain assertions pin that the fix froze nothing
 // early.
 //
-// ⚠ DELIBERATE EXCLUSIONS — cases (J), (L), (M). The relaxation fires only for
+// ⚠ DELIBERATE EXCLUSIONS — cases (J), (M) (case (L), the `string?` target,
+// left this list under #5245: `string?` is now admitted to `stringBorrowAll_`
+// and asserted clean). The relaxation fires only for
 // a copy target that armStringLocalRefcount actually RETAINS (membership in
-// `stringBorrowAll_`). A `string?`-declared target and a `using var` target are
+// `stringBorrowAll_`). A `using var` target is
 // excluded from the borrow-candidate set by construction, and an alias STORED
 // into a class field escapes on its own account. Each keeps the pre-existing
 // bounded leak, which is the safe direction — relaxing for them would free the
@@ -453,8 +455,9 @@ const char* kConstCopyTarget =
     "  end Main; "
     "end C;";
 
-// (L) a `string?`-declared copy target — excluded from the borrow-candidate set
-// (which is non-nullable-only), so it gets no retain.
+// (L) a `string?`-declared copy target — admitted to the borrow-candidate set
+// since #5245 (it used to be excluded: non-nullable-only), so it is retained at
+// bind and released at scope end.
 const char* kNullableCopyTarget =
     "module M; class C "
     "  public static method Main(): int "
@@ -719,11 +722,16 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
 
+// fix #5245 (§4.6 / §28.9, v0.313): case (L) LEFT the exclusion list. A
+// `string?` borrow target is now admitted to `stringBorrowAll_` (retained at
+// bind, released at scope end), so this program is clean; it used to report the
+// bounded leak this row pinned (and a `string?` borrow of a field dangled).
 BEZEL_TEST(codegen_string_local_copy_release_2764,
-           nullable_copy_target_is_deliberately_excluded_spec_7) {
+           nullable_copy_target_is_released_spec_28_9) {
     JitResult r = runAotChecked(kNullableCopyTarget);
     if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
 
 BEZEL_TEST(codegen_string_local_copy_release_2764,

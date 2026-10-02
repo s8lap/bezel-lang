@@ -25253,8 +25253,15 @@ bool Emitter::returnedStringLocalOwnsPlusOne(const ast::Expr* e) const {
     auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
     if (!loc || !loc->decl) return false;
     const void* declNode = static_cast<const void*>(loc->decl);
-    // A borrow local was retained at bind (owns a +1).
-    if (stringBorrowAll_.count(declNode)) return true;
+    // A borrow local was retained at bind (owns a +1) — but only an ESCAPING
+    // one hands that +1 over: a non-escaping borrow local is in
+    // stringBorrowRetainEligible_ and is released at scope end, so a consumer
+    // that treated the read as a transfer (`n ?? s`, `s ?? d`) would drop the
+    // reference twice. Such a read must mint its own retain.
+    // fix #5245 (§4.6 / §28.9, v0.313): `string?` borrow locals now take part,
+    // and `s ?? d` is a walker safe-read of a nullable borrow local.
+    if (stringBorrowAll_.count(declNode))
+        return !stringBorrowRetainEligible_.count(declNode);
     // fix #2817 / §27.5 / §28.9 (v0.240): the decl must belong to the body being
     // lowered. The fn token alone does not establish that any more: #2817 pins it
     // to a LAMBDA body, and a lambda body can NAME an enclosing local (a §27.5
@@ -25418,6 +25425,29 @@ bool Emitter::lowerStringFieldStore(const ast::Expr& target,
 }
 
 
+// fix #5245 (§4.6 / §28.9, v0.313): is `target` a bare identifier naming a
+// `var` string local of the body being lowered whose slot owns a +1 for its
+// current value — a +1 producer-initialized local (transferred) or a borrow-
+// initialized one (retained at bind, armStringLocalRefcount)? Gated on the
+// analyzed function exactly as armStringLocalRefcount is, so it is true only
+// where the bind-time +1 was actually minted.
+bool Emitter::stringLocalSlotOwnsRef(const ast::Expr& target) const {
+    if (currentFn_ != stringReleaseEligibleFn_) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target);
+    if (!id) return false;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc || !loc->decl) return false;
+    const void* declNode = static_cast<const void*>(loc->decl);
+    return stringBorrowAll_.count(declNode) ||
+           stringLocalCandidates_.count(declNode);
+}
+
+bool Emitter::isNullableStringExprType(const ast::Expr& target) const {
+    const sema::TypeRef* tt = ctx_.exprType(target);
+    return tt && tt->nullable;
+}
+
+
 // #429 / §4.6 / §28.9: reassign a string LOCAL/parameter slot with retain-new /
 // release-old, keeping the slot's independent +1 across the overwrite. Without
 // this, `x := h.Name` would make `x` alias the field's heap string WITHOUT a +1,
@@ -25440,13 +25470,16 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     if (!localSlot(target)) return false;          // not a local/param
     if (!elemTy || !elemTy->isPointerTy()) return false;  // not a `ptr` slot
     if (!isStringExprType(target)) return false;   // not string-typed
-    // A nullable string? target lowers to a `ptr` too; retain/release are
-    // null-safe, so including it is sound — but we keep scope to the same
-    // non-nullable string surface the bind-time arming uses, to avoid surprising
-    // interactions. A string? local is left as a plain store (it just leaks, as
-    // before — safe). Detect nullability via the resolved target type.
-    if (const sema::TypeRef* tt = ctx_.exprType(target))
-        if (tt->nullable) return false;
+    // fix #5245 (§4.6 / §28.9, v0.313): a nullable `string?` target lowers to a
+    // `ptr` too; retain/release are null-safe. It is admitted ONLY when the slot
+    // provably owns a +1 — a `var` local the collectStringReleaseEligible walk
+    // classified (producer: transferred, borrow: retained at bind) — so the
+    // release-old below never drops a reference this frame does not hold. A
+    // `string?` PARAMETER, the setter `value`, a for-in / pattern binding or an
+    // un-pinned body's local takes no bind-time +1 (retainAssignedStringParams
+    // covers the non-nullable parameter only), so those keep the plain store.
+    if (isNullableStringExprType(target) && !stringLocalSlotOwnsRef(target))
+        return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strl.old");
     if (!isPlusOneStringProducer(valueExpr))
         emitStringRetain(newVal);
@@ -31629,8 +31662,15 @@ void Emitter::collectStringReleaseEligible(
                     const sema::TypeRef* lt = nullptr;
                     if (v.type) lt = ctx_.resolvedType(*v.type);
                     if (!lt) lt = ctx_.exprType(*v.init);
-                    if (lt && !lt->nullable &&
-                        lt->kind == sema::TypeRef::Kind::Primitive &&
+                    // fix #5245 (§4.6 / §28.9, v0.313): a `string?` borrow
+                    // local is admitted too. It used to be left alone, so it
+                    // took NO +1 and dangled when the aliased field was stored
+                    // over (`var s: string? := c.Val; c.Set(..); use(s)`).
+                    // bz_string_retain/release are null-safe (a null slot or a
+                    // literal sentinel is a no-op), and the reassign twin
+                    // lowerStringLocalReassign admits the nullable target in
+                    // the SAME change, so the scope-end release stays balanced.
+                    if (lt && lt->kind == sema::TypeRef::Kind::Primitive &&
                         lt->primitive == sema::PrimitiveType::String) {
                         borrowCandidates.push_back(s);
                         stringBorrowAll_.insert(static_cast<const void*>(s));

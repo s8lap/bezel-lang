@@ -1500,6 +1500,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 else if (isTypeParamStringFieldLvalue(*as->target) &&
                          rhs->getType()->isPointerTy())
                     emitStringRetain(rhs);
+                // fix #5245 (§4.6 / §28.9 / §6.6, v0.313): a `string?` LOCAL
+                // that owns a +1 for its value (a classified producer/borrow
+                // local, see stringLocalSlotOwnsRef) takes an independent +1
+                // for the value `??=` stores into it — it is released at scope
+                // end and by a later reassign, so a borrow stored without a
+                // retain would dangle when its owner is overwritten. The slot
+                // is null here (no old value). A +1 producer transfers.
+                else if (rhs->getType()->isPointerTy() &&
+                         stringLocalSlotOwnsRef(*as->target) &&
+                         !isPlusOneStringProducer(as->value.get()))
+                    emitStringRetain(rhs);
                 builder_.CreateStore(rhs, addr);
                 // §22.16's "throw exits check nothing": a store sequence that
                 // left the current block terminated (an unwind edge) must not
