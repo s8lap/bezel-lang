@@ -1225,7 +1225,15 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // through the ACTIVE substitution BEFORE the name-keyed builtin
             // classification — otherwise `Box<int>` frees an int as a Stopwatch.
             rt = resolveTypeParamRef(rt);
-            if (rt) {
+            // fix #5270 (§28.4 / §28.5, v0.313): only an `owned` field is
+            // disposed with its container. A plain field of a vtableless
+            // builtin type (`public v: Stopwatch;`, the §28.3 back-reference
+            // idiom, or a generic `v: T` instantiated at one) is a BORROW whose
+            // owner disposes it; releasing it here was a double free. Every
+            // sibling arm (isOwnedReferenceField, taskFamilyTypeFromField
+            // #2260, isOwnedFfiBufferField, isOwnedSharedWeakField) already
+            // gates on the modifier; this arm alone did not.
+            if (rt && hasOwnedModifier(fs)) {
                 if (auto n = builtinTypeName(rt); !n.empty()) {
                     if (classifyVtablelessBuiltinRelease(n) !=
                         VtablelessBuiltinReleaseArm::None) {
