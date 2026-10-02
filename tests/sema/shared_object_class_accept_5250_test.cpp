@@ -1,4 +1,4 @@
-// fix #5250 (§3.4, v0.XXX): `Object` is a class — the root class of the
+// fix #5250 (§3.4, v0.313): `Object` is a class — the root class of the
 // type system per spec §3.4 ("Object has no lowercase keyword alias…Object
 // is a class, named Object or, qualified, System.Object"), not a primitive
 // value type. Two code paths misclassified it as a non-class.
@@ -17,9 +17,9 @@
 //   and add `PrimitiveType::Object` to the "admitted" check.
 //
 // Spec citations:
-//   §3.4 (v0.XXX): "Object is a class" — the root class, no lowercase alias
-//   §14.2 (v0.XXX): where T: class — non-nullable reference types only
-//   §14.4 (v0.XXX): class-only restriction on owning generics
+//   §3.4 (v0.313): "Object is a class" — the root class, no lowercase alias
+//   §14.2 (v0.313): where T: class — non-nullable reference types only
+//   §14.4 (v0.313): class-only restriction on owning generics
 //   stdlib §2.16: public class Shared<T>: IDisposable where T: class
 //
 // Regression: shared_object_class_accept_5250

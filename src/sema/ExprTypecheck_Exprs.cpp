@@ -5076,7 +5076,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 argIsClass = true;
                             } else if (ta->kind == TypeRef::Kind::Primitive &&
                                        ta->primitive == PrimitiveType::Object) {
-                                // fix #5250 (§3.4, v0.XXX): Object is the root class,
+                                // fix #5250 (§3.4, v0.313): Object is the root class,
                                 // not a primitive value type — it has a destructor and
                                 // satisfies the `where T: class` constraint for Shared/Weak.
                                 argIsClass = true;
