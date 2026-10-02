@@ -17177,8 +17177,16 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         if (implMd && implMd->genericParams.size() ==
                           staticMd->genericParams.size() &&
             !implMd->genericParams.empty()) {
-            std::unordered_map<std::string_view, llvm::Type*> rk;
-            std::unordered_map<std::string_view, const sema::TypeRef*> rks;
+            // fix #5256 (§12.1 / §14.1, v0.313): start from the CURRENT
+            // bindings so the candidate's CLASS parameters (`X` of
+            // `EGO<X>`, installed by the branch) survive into the body;
+            // rebuilding from the method parameters alone dropped them and
+            // compiled the override against the erased X -> i32 layout (a
+            // string/double field read printed garbage).
+            std::unordered_map<std::string_view, llvm::Type*> rk =
+                genericSubst_;
+            std::unordered_map<std::string_view, const sema::TypeRef*> rks =
+                genericSubstSemaTy_;
             for (std::size_t gi = 0; gi < staticMd->genericParams.size(); ++gi) {
                 std::string_view from = staticMd->genericParams[gi].name;
                 std::string_view to = implMd->genericParams[gi].name;
