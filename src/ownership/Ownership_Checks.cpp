@@ -6570,6 +6570,19 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                 returnedExprMayBorrow(rhs) &&
                 methodReturnsOnlyReceiverSourcedBorrows(*md))
                 return borrowSourceForExpr(*ma->target);
+            // fix #5254 (§28.3, v0.313): an interface-dispatched call whose
+            // resolved callee is an abstract method (no body) cannot be proven
+            // receiver-sourced by methodReturnsOnlyReceiverSourcedBorrows (it
+            // returns false for every body-less method).  The interface signature
+            // does not expose what any implementation returns, so conservatively
+            // apply the §28.3 returns table: a class/interface-typed non-owned
+            // return MAY be receiver-sourced (source 1, `this`).  If the return
+            // type is borrowable, treat the call result as a borrow of the
+            // receiver's source, exactly as the concrete-method arm above does.
+            if (!isAsync && !md->returnOwned && ma && ma->target &&
+                md->bodyKind == ast::MethodBodyKind::Abstract &&
+                returnedExprMayBorrow(rhs))
+                return borrowSourceForExpr(*ma->target);
         }
     }
     // Shape 1 — a re-borrow rooted at an Owned local. Per §28.3 producers:
