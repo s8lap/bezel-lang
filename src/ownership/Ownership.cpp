@@ -15234,6 +15234,15 @@ static std::string_view staticReturnTypeRejected(
         return head;  // rejected — spell `owned <head>`
     }
 
+    // (A') PLAIN BUILTIN COLLECTION return (declaration-less `Array<T>` etc.).
+    // §28.3 row 4 (v0.313, #5123): a trivial-dispose class such as `Array<T>`
+    // carries the free obligation (K1.6), so an unmarked static return names no
+    // responsible party — rejected at the declaration, spell `owned <head>`.
+    if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        returnType.name->parts.size() == 1 &&
+        common::isPlainBuiltinCollectionHead(head))
+        return head;
+
     // (B) BARE-TYPE-PARAMETER return. A bare type parameter resolves to a
     // null-declaration Named TypeRef; the head must name a method-level or
     // enclosing-type generic parameter (the name-set test that distinguishes

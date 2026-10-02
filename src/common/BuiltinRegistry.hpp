@@ -42,6 +42,13 @@ bool isOwningCollectionHead(std::string_view head);
 // CancellationTokenSource) whose non-`owned` return is an owned producer.
 bool isOwningTypeHead(std::string_view head);
 
+// The plain (non-`owning`) builtin concrete collection class heads that carry
+// no `ast::TypeDecl` (declaration-less `TypeRef`s) — `Array`, `Dictionary`,
+// `Set`, `Stack`, `Queue`, `LinkedList`, `SortedDictionary`, `SortedSet`. Each
+// is a class type (§3.1), so §28.3 row 4's static-return rejection applies to
+// an unmarked return of one (#5123, v0.313).
+bool isPlainBuiltinCollectionHead(std::string_view head);
+
 // The Task-family type heads — `Task` and `OwningTask` (§28.3 "Task-family
 // calls produce owned frames", v0.190, SB-01). A pre-substitution, name-keyed
 // test used by the ownership pass to recognize a `Task`/`Task<T>` return whose

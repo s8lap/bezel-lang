@@ -31,6 +31,12 @@ constexpr std::array<std::string_view, 6> kOwningCollectionHeads = {
     "OwningStack", "OwningQueue",      "OwningLinkedList",
 };
 
+// §28.3 row 4 (v0.313, #5123): the plain builtin collection classes.
+constexpr std::array<std::string_view, 8> kPlainBuiltinCollectionHeads = {
+    "Array", "Dictionary", "Set", "Stack", "Queue", "LinkedList",
+    "SortedDictionary", "SortedSet",
+};
+
 // §28.3 / §5.11: the owning collections plus the owning wrappers.
 // §28.6 / §28.3 (v0.221, #1787 ruling; #2369): all FOUR owning iterable-
 // interface heads (`IOwningEnumerable`, `IOwningEnumerator`,
@@ -878,6 +884,10 @@ bool isOwningPrefixedName(std::string_view head) {
 bool isOwningCollectionHead(std::string_view head) {
     return contains(kOwningCollectionHeads, head);
 }  // per §28.6 / §5.11 (#1008 Part C) — element-owning collection heads
+
+bool isPlainBuiltinCollectionHead(std::string_view head) {
+    return contains(kPlainBuiltinCollectionHeads, head);
+}  // per §28.3 row 4 (v0.313) — plain builtin collection class heads
 
 bool isOwningTypeHead(std::string_view head) {
     return contains(kOwningTypeHeads, head);
