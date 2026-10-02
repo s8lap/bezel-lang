@@ -107,6 +107,16 @@ BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_3_5e_28_odd_tie_round_up_spe
     BEZEL_EXPECT_EQ(assertDecimalEq("decimal(3.5e-28)", "0.0000000000000000000000000004"), 42);
 }
 
+// fix-forward #5190 ff: restore the pinned v0.311 row deleted by 93c07c53.
+// The 2.4e-28 input pins the same 2e-28 result as the 2.5e-28 tie row above, but
+// reaches it as a *truncation* (dropped digit 4, strictly below half) rather than
+// as a tie. #5190's fix set shortens 2.4e-28 to 2e-28 while the §6.4 rounding
+// rules retain 2e-28 (ties-to-even at drop 1); restoring the row keeps that
+// input pinned so no future change can drop it unnoticed.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_4e_28_double_shortest_spec_5_2_v0_311) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(2.4e-28)", "0.0000000000000000000000000002"), 42);
+}
+
 // ---------------------------------------------------------------------------
 // §4.4 / §6.4: the rounding direction comes from the MOST significant dropped
 // digit. Every row above reduces by exactly one digit, where the first digit
