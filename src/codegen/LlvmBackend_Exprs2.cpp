@@ -9784,33 +9784,47 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     }
                 }
 
+                // fix #5262 / fix-forward #5262-ff (§4.6 / §28.9, v0.313): the
+                // CONSTRUCTOR member of #5244's borrowed-string-argument pin. A
+                // by-value `string`/`string?` constructor parameter owns no +1
+                // either, so `new Box(h, h._v, "q" + i)` — the constructor body
+                // stores over the field the argument aliases, twice — left the
+                // parameter dangling (MEASURED: SEGV in bz_string_to_utf8z,
+                // frame `bz$M.Box$ctor`, on r23-c28 d68dab26). Same pin as the
+                // method-call path, so the two shapes cannot drift apart.
+                //
+                // `ctorArgExprs` is parallel to `args[1..]` (args[0] is the
+                // instance); the helper wants both indexed with the receiver in
+                // place, so splice a leading nullptr through.
+                //
+                // fix-forward #5262-ff: the pin is HOISTED ABOVE the
+                // call/inline branch, so it covers BOTH arms. #5262 emitted it
+                // only inside the `!needsInlineForLayout` arm, and that left the
+                // INLINE arm (a generic class with an ACTIVE substitution, where
+                // `needsInlineForLayout = !genericSubst_.empty()` routes the body
+                // to `inlineCtorBody` in the CALLER's frame) a live use-after-
+                // free: with the body inlined there is no call edge to hang the
+                // pin off, but the hazard is IDENTICAL — the inlined body still
+                // stores over the aliased field twice, and the borrowed parameter
+                // (which owns no +1 of its own) is freed by the second store's
+                // release-old. MEASURED (v1 review, r23-c28 d68dab26):
+                // `new Box<string>(h, h._v, "q" + i)`, 200 iterations, SEGV on
+                // unknown address 0x10 in `bz_string_to_utf8z`
+                // (bezel_runtime_strings.cpp:1250), frame #1 `main`, printing
+                // only `a1` before dying. The `isStringPinFormalType` test is
+                // unchanged — only the CALL SITE differs (a call edge vs an
+                // inlined body), and the retain must span the body either way.
+                std::vector<const ast::Expr*> ctorArgExprsAligned;
+                ctorArgExprsAligned.reserve(args.size());
+                ctorArgExprsAligned.push_back(nullptr);  // args[0] = obj
+                ctorArgExprsAligned.insert(ctorArgExprsAligned.end(),
+                                           ctorArgExprs.begin(),
+                                           ctorArgExprs.end());
+                const std::vector<llvm::Value*> ctorStringPins =
+                    emitBorrowedStringArgPins(args, &ctorArgExprsAligned,
+                                              cs->params, /*argOffset=*/1);
+
                 if (!typesMismatch && !needsInlineForLayout) {
-                    // fix #5262 (§4.6 / §28.9, v0.313): the CONSTRUCTOR member
-                    // of #5244's borrowed-string-argument pin. A by-value
-                    // `string`/`string?` constructor parameter owns no +1
-                    // either, so `new Box(h, h._v, "q" + i)` — the constructor
-                    // body stores over the field the argument aliases, twice —
-                    // left the parameter dangling (MEASURED: SEGV in
-                    // bz_string_to_utf8z, frame `bz$M.Box$ctor`, on r23-c28
-                    // d68dab26). Same pin as the method-call path, so the two
-                    // shapes cannot drift apart.
-                    //
-                    // `ctorArgExprs` is parallel to `args[1..]` (args[0] is the
-                    // instance); the helper wants both indexed with the
-                    // receiver in place, so splice a leading nullptr through.
-                    // Only the
-                    // CALL path is pinned — the inline path
-                    // (`needsInlineForLayout`) runs the body in this frame with
-                    // no call edge, and is out of scope here.
-                    std::vector<const ast::Expr*> ctorArgExprsAligned;
-                    ctorArgExprsAligned.reserve(args.size());
-                    ctorArgExprsAligned.push_back(nullptr);  // args[0] = obj
-                    ctorArgExprsAligned.insert(ctorArgExprsAligned.end(),
-                                               ctorArgExprs.begin(),
-                                               ctorArgExprs.end());
-                    const std::vector<llvm::Value*> ctorStringPins =
-                        emitBorrowedStringArgPins(args, &ctorArgExprsAligned,
-                                                  cs->params, /*argOffset=*/1);
                     // fix #2305: install the unwind-edge cleanup so a
                     // propagating constructor (the ctor body throws, or its
                     // argument-eval threw and the new-arg-unwind cleanup
@@ -9984,6 +9998,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     locals_ = std::move(savedLocals);
                     paramSlots_ = std::move(savedParams);
                     refParams_ = std::move(savedRefParams);
+                    // fix-forward #5262-ff (§4.6 / §28.9, v0.313): the inline
+                    // arm's NORMAL-edge release of the hoisted
+                    // `ctorStringPins`, exactly as the call arm releases the
+                    // same vector below its own `emitNewPendingCheck`. The
+                    // inlined body ran in THIS frame, so the borrow it held
+                    // ends here; `diverged_` means the body branched to the
+                    // unwind chain and this edge is unreachable (the
+                    // exception-edge half is fix-forward #5262-ff's third
+                    // change, installed around `inlineCtorBody` itself — this
+                    // block is the normal-return twin and the two are mutually
+                    // exclusive by construction).
+                    if (!diverged_) {
+                        releaseBorrowedStringArgPins(ctorStringPins);
+                    }
                 }
                 // fix #2319 / §22.3: flush the copy-OUT half of every
                 // accessor-mediated `ref`/`out` argument. Skipped on the

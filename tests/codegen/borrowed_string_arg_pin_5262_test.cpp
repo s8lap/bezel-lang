@@ -412,3 +412,60 @@ BEZEL_TEST(borrowed_string_arg_pin_5262,
            nullable_pin_200_iters_balanced_no_leak_spec_4_6_28_9) {
     BEZEL_EXPECT_EQ(run(nullableSrc(200)), wantPrinted(200));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHAPE 5 — the INLINE constructor (fix-forward #5262-ff, row 1 of 3)
+//
+// #5262's pin sat ONLY in lowerNew's `!needsInlineForLayout` arm. But
+// `needsInlineForLayout = !genericSubst_.empty()`, so a GENERIC class with
+// an ACTIVE substitution routes its constructor body to `inlineCtorBody` —
+// in the CALLER's frame, with no call edge. The hazard is identical (the
+// inlined body still stores over the aliased field twice, and the borrowed
+// parameter owns no +1), so the missing call edge bought nothing.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// `new Box<string>(...)` binds a real substitution, so the ctor body is
+// inlined into `main`. Same double-store-then-read body as shape 1.
+std::string inlineCtorSrc(int iters) {
+    return "module M5262e; "
+           "public class Holder "
+           "  public _v: string; "
+           "  public constructor(v: string) _v := v; end constructor; "
+           "end Holder; "
+           "public class Box<T> "
+           "  public constructor(h: Holder, v: string, y: string) "
+           "    h._v := v; h._v := y; Console.WriteLine(v); "
+           "  end constructor; "
+           "end Box; "
+           "public class Program "
+           "  public static method Main(): int "
+           "    using var h := new Holder(\"a1\"); "
+           "    for var i in 0.." "<" + std::to_string(iters) +
+           " do "
+           "      using var b := new Box<string>(h, h._v, \"q\" + i.ToString()); "
+           "    end; "
+           "    Console.WriteLine(h._v); "
+           "    return 0; "
+           "  end Main; "
+           "end Program;";
+}
+
+// (5a) FAIL-WITHOUT (MEASURED on the rebased r23-c28 9c640754, `agent_check.sh
+// --probe --asan`): `AddressSanitizer: SEGV on unknown address 0x10`, READ in
+// `bz_string_to_utf8z` (bezel_runtime_strings.cpp:1250), frame #1 `main`,
+// printing only `a1` before dying. The first iteration of 200 already dies —
+// a UAF is not a slow burn.
+BEZEL_TEST(borrowed_string_arg_pin_5262,
+           inline_ctor_double_store_param_survives_spec_4_6_28_9) {
+    BEZEL_EXPECT_EQ(run(inlineCtorSrc(50)), wantPrinted(50));
+}
+
+// (5b) 200 iterations under LeakSanitizer: the inline arm's pin must balance
+// exactly, exactly as the call arm's. A retain without its release here would
+// leak one string per construction; an over-release would drop the field's own
+// reference (the #4547 shape).
+BEZEL_TEST(borrowed_string_arg_pin_5262,
+           inline_ctor_pin_200_iters_balanced_no_leak_spec_4_6_28_9) {
+    BEZEL_EXPECT_EQ(run(inlineCtorSrc(200)), wantPrinted(200));
+}
+
