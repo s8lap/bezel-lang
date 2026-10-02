@@ -21817,11 +21817,63 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // §3.4: `int.MaxValue`, `double.NaN`, `char.MaxValue`, etc. — static
     // properties on primitive keyword aliases. The target is an identifier
     // that names a primitive type; there's no TypeSymbol in scope for it.
+    //
+    // fix #5186 (§8.1 / §3.4, v0.311; stdlib §2.13): the §3.4 reserved
+    // primitive keyword names can also appear in the QUALIFIED chain-head
+    // form (`System.Object.member`, `System.Type.member` — §8.1's
+    // declaration that `Object`'s module is `System`). The chain head is
+    // recognised by trying `id2` first (bare keyword) and, when it doesn't
+    // match, checking whether the target is a `MemberAccessExpr` whose own
+    // target is the bare `System` identifier and whose member is `Object`
+    // / `Type`. The IdentifierExpr visitor left `System` WITHOUT an
+    // exprSymbol / exprType in that shape (the "unresolved identifier"
+    // path is suppressed by `maTargetHintMember_` matching — see
+    // ExprTypecheck_Exprs.cpp's IdentifierExpr arm), so the dispatch
+    // re-derives the keyword name from the inner MemberAccessExpr's
+    // `member` field. `Object` and `Type` are the only two §3.4 keyword
+    // names whose module is `System`; every other primitive keyword
+    // (`int`, `string`, `bool`, …) has no qualified form and the
+    // ordinary §2.7 module resolution path is correct (a user module
+    // named `System` would shadow the prefix — §2.7 rule 1 — and this
+    // branch would never fire).
+    //
+    // SCOPE. This branch ONLY fires for the STATIC primitive-typed
+    // surface (§3.4: `int.MaxValue`, `Object.ReferenceEquals`, …). An
+    // instance-side call on a primitive-typed local (`var o: Object :=
+    // 42L; return o.ToString().Length;` — the universal §8.1 ToString
+    // method reached through a `Object`-typed local) MUST NOT route
+    // through this body, which only knows the static surface; that
+    // path takes the ordinary member-lookup branch further down and
+    // dispatches through the universal member / `lowerObjectToString`
+    // paths. The qualified-chain-head form is gated on the inner
+    // `System.<Object|Type>` shape; the bare-keyword arm is gated on
+    // `id2` matching a §3.4 keyword name; BOTH paths intentionally
+    // ignore `ctx_.exprType(*ma.target)` (a primitive-typed receiver
+    // WITHOUT the bare keyword / chain-head shape) — that shape is the
+    // instance-call gate and is rejected here.
     if (!targetType && ma.target) {
-        if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
-            PrimitiveType pt = primitiveFromName(id2->name);
-            if (pt != PrimitiveType::None) {
-                const auto& mbr = ma.member;
+        PrimitiveType pt = PrimitiveType::None;
+        const ast::IdentifierExpr* id2 = nullptr;
+        // (a) bare-keyword head: `int.X`, `bool.Y`, `Object.X`, …
+        if ((id2 = dynamic_cast<const ast::IdentifierExpr*>(
+                 ma.target.get()))) {
+            pt = primitiveFromName(id2->name);
+        } else {
+            // (b) qualified chain head: `System.Object.X`, `System.Type.X`.
+            if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(
+                    ma.target.get())) {
+                if (auto* sysId = dynamic_cast<const ast::IdentifierExpr*>(
+                        inner->target.get())) {
+                    if (sysId->name == "System" &&
+                        (inner->member == "Object" ||
+                         inner->member == "Type")) {
+                        pt = primitiveFromName(inner->member);
+                    }
+                }
+            }
+        }
+        if (pt != PrimitiveType::None) {
+            const auto& mbr = ma.member;
                 // §27.6 (v0.184, #1758): a primitive-intrinsic static METHOD used
                 // as a bare method reference — NOT the direct callee of a call —
                 // is a function value `(paramTypes) -> returnType`, not its scalar
@@ -22153,9 +22205,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // NOT reach this path — they take the general path with
                 // the `knownCompleteUserType` gate, which IS suppressed
                 // for permissive receivers.
+                //
+                // fix #5186 (§8.1, v0.311): the `id2` here may be NULL —
+                // the body is reached through a chain-head path
+                // (`System.Object.X` / `System.Type.X`) whose target
+                // identifier was suppressed by `maTargetHintMember_` and
+                // therefore carries no exprSymbol. Render the diagnostic
+                // with the qualified spelling so the message names the
+                // actual receiver the user wrote, not the synthetic
+                // `System` identifier the visitor left without one.
+                std::string recvName;
+                if (id2) {
+                    recvName = std::string(id2->name);
+                } else if (auto* inner =
+                               dynamic_cast<const ast::MemberAccessExpr*>(
+                                   ma.target.get())) {
+                    if (auto* sysId =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                inner->target.get())) {
+                        if (sysId->name == "System" &&
+                            (inner->member == "Object" ||
+                             inner->member == "Type")) {
+                            recvName = "System." +
+                                       std::string(inner->member);
+                        }
+                    }
+                }
+                if (recvName.empty()) recvName = "<primitive>";
                 ctx_.diagnostics().report(
                     Severity::Error, ma.span.begin,
-                    "type '" + std::string(id2->name) +
+                    "type '" + recvName +
                         "' has no static method or property '" +
                         std::string(mbr) + "' (§3.4)");
                 return;
@@ -22167,13 +22246,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // (issue #491).
                 ctx_.diagnostics().report(
                     Severity::Error, ma.span.begin,
-                    "type '" + std::string(id2->name) +
+                    "type '" + recvName +
                         "' has no static method or property '" +
                         std::string(mbr) + "' (§3.4)");
                 return;
             }
         }
-    }
     // stdlib §3.2: the Encoding singletons. `Encoding.Utf8` (and Utf16/Utf32/
     // Ascii) are `public static readonly property ...: Encoding`. The target is
     // the auto-imported `Encoding` builtin class (a synthetic TypeSymbol with a

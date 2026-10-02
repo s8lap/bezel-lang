@@ -2618,6 +2618,41 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             return;
         }
     }
+    // fix #5186 (§8.1 / §3.4, v0.311; stdlib §2.13): the qualified chain
+    // head for the two §3.4-reserved primitive types whose module is
+    // `System` (`System.Object`, `System.Type`). The bare-name primitive
+    // check above only handles single-part spellings; the qualified form
+    // is the §8.1 declaration that `Object`'s module is `System`, so a
+    // `var o: System.Object := …` must type to the same Primitive as a
+    // bare `var o: Object := …`. No `import System;` is needed (the
+    // prefix is a §2.7 rule 1 pseudo-module for the two keyword names,
+    // not a real user module). The lookup is gated on the EXACT
+    // (prefix, member) pair — `System.<other>` would never reach this
+    // block, and a user module named `System` would have shadowed the
+    // prefix at the §2.7 rule 1 lookup site anyway.
+    //
+    // The full block is symmetric with the bare-name arm above: a single
+    // primitive-kind TypeRef, the generic-args visit, the no-generic-
+    // args guard. The qualified spelling participates in §3.4's
+    // identical-type rule with the bare spelling: a `Shared<Object>` /
+    // `Shared<System.Object>` parameter must accept both forms.
+    if (t.name->parts.size() == 2 && first == "System" &&
+        (t.name->parts[1] == "Object" || t.name->parts[1] == "Type")) {
+        PrimitiveType prim = primitiveFromName(t.name->parts[1]);
+        if (prim != PrimitiveType::None) {
+            ref.kind = TypeRef::Kind::Primitive;
+            ref.primitive = prim;
+            for (const auto& ga : t.genericArgs) {
+                if (ga) resolveType(*ga, scope);
+            }
+            if (!t.genericArgs.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t.span.begin,
+                    "primitive type cannot take generic arguments");
+            }
+            return;
+        }
+    }
     // Look up the first part.
     Symbol* sym = qualifiedBuiltin ? nullptr : lookupName(first, scope);
     if (!sym) {

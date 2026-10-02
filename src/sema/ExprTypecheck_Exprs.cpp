@@ -2709,6 +2709,30 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     ctx_.diagnostics().report(
                         Severity::Error, id->span.begin, why);
                 }
+            } else if (id->name == "System" &&
+                       &e == maTargetHint_ &&
+                       (maTargetHintMember_ == "Object" ||
+                        maTargetHintMember_ == "Type")) {
+                // fix #5186 (§8.1 / §3.4, v0.311; stdlib §2.13): the bare
+                // `System` prefix of the chain head for `Object` / `Type`.
+                // The prefix is NOT a real identifier in any user module —
+                // it is the dotted form of the §3.4 reserved names (§8.1
+                // declares `Object`'s module is `System`). The MemberAccess
+                // pass that follows will recognize the stamp left here via
+                // a parallel exprType / exprSymbol absent marker and route
+                // `System.Object` / `System.Type` to the primitive
+                // dispatch (tryLowerPrimitiveStaticCall). Suppress the
+                // generic "unresolved identifier `System`" diagnostic so
+                // the chain head resolves cleanly; a `System` not followed
+                // by one of those two members (`System.Foo.member`) does
+                // NOT match the hint and the ordinary diagnostic fires
+                // (the hint is name-specific).
+                //
+                // The empty-string-out `return` keeps the function path
+                // tidy: the identifier is left with no exprSymbol so
+                // resolveMemberAccess sees the chain-head stamp and
+                // produces the primitive dispatch result rather than the
+                // "unresolved" failure path.
             } else {
                 ctx_.diagnostics().report(
                     Severity::Error, id->span.begin,
@@ -9014,8 +9038,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // (`T.Member(...)`) without resolving bare `T` anywhere else.
         const ast::Expr* savedHint = maTargetHint_;
         maTargetHint_ = ma->target.get();
+        // fix #5186 (§8.1 / §3.4, v0.311; stdlib §2.13): thread the OUTER
+        // member name through to the IdentifierExpr handler so a chain-head
+        // `System` (`System.Object.member` / `System.Type.member`) is
+        // recognized — the bare `System` identifier would otherwise be
+        // rejected as "unresolved identifier `System`" by the same handler
+        // that the §11.8 hint above covers. Saved/restored in parallel with
+        // `maTargetHint_` so a target visit never inherits a stale outer
+        // member name from a sibling member-access arm.
+        std::string_view savedMemberHint = maTargetHintMember_;
+        maTargetHintMember_ = ma->member;
         if (ma->target) visitExpr(*ma->target);
         maTargetHint_ = savedHint;
+        maTargetHintMember_ = savedMemberHint;
     } else if (auto* nm =
                    dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (nm->target) visitExpr(*nm->target);

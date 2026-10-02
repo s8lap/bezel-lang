@@ -427,6 +427,19 @@ private:
     // identifier". A bare `T` in any other expression position keeps today's
     // error. Saved/restored around each target visit.
     const ast::Expr* maTargetHint_ = nullptr;
+    // fix #5186 (§8.1 / §3.4, v0.311; stdlib §2.13): while visiting a
+    // MemberAccessExpr's TARGET child, the MEMBER name the OUTER access is
+    // asking about (`System.Object.member`, `System.Type.member`). Read by
+    // the IdentifierExpr handler to recognize `System` (the dotted prefix
+    // of the §3.4 reserved chain head) when the outer member is one of the
+    // two §3.4-reserved primitive names; without it, a bare `System` in any
+    // other expression position is correctly rejected as unresolved. A
+    // `System` identifier used as the target of a chain head for a member
+    // name OTHER than `Object` / `Type` (`System.Foo.member`) does NOT
+    // match the hint and the ordinary "unresolved identifier `System`"
+    // diagnostic still fires — the hint is name-specific. Empty outside a
+    // chain-head-target visit. Saved/restored around each target visit.
+    std::string_view maTargetHintMember_;
     // §27.6 (v0.184): while visiting a CallExpr's *callee* child, this points at
     // that callee node. resolveMemberAccess consults it to tell a primitive-
     // intrinsic static member that is the DIRECT callee of a call (`int.Parse(s)`

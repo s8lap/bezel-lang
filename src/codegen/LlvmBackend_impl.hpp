@@ -7474,8 +7474,13 @@ private:
                 // top-level nullable form is reified to its underlying type
                 // (§17.10), so this surface is unreachable in the top-
                 // level position; inside `<…>` it can appear.
-                std::string rp = std::string(common::primitiveBuiltinSpelling(
-                    static_cast<int>(rt->primitive)));
+                std::string rp;
+                if (rt->primitive == sema::PrimitiveType::Object) {
+                    rp = "System.Object";
+                } else {
+                    rp = std::string(common::primitiveBuiltinSpelling(
+                        static_cast<int>(rt->primitive)));
+                }
                 if (rt->nullable) rp += "?";
                 return rp;
             }

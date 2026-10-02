@@ -1240,7 +1240,15 @@ struct BuiltinClassModulePath {
     std::string_view name;
     std::string_view modulePath;
 };
-constexpr std::array<BuiltinClassModulePath, 85> kBuiltinClassModulePaths = {{
+constexpr std::array<BuiltinClassModulePath, 87> kBuiltinClassModulePaths = {{
+    // fix #5186 (spec §8.1, v0.311; stdlib §2.13): `Object` and `Type` are the
+    // §2.3 Row 1 core types whose module is `System`. The `Object` row is the
+    // type-argument rendering (§2.13 rule 3 / `spec85TypeRefQualifiedName`'s
+    // `K::Primitive` arm) — the bare `Object` head would otherwise render as
+    // just `Object`, not `System.Object`; the `Type` row is the
+    // `typeof(...).FullName` rendering under stdlib §2.13 rule 1.
+    {"Object", "System"},
+    {"Type", "System"},
     // stdlib §2 (System) — the §2.5/§2.6 temporal/identity value types are
     // value-shaped (§3.1) but their BOX thunk (`valueBuiltinBoxToStringThunk`)
     // is in the §8.5 default path, so they belong here too.

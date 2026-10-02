@@ -465,8 +465,38 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
     if (!ma || !ma->target) return nullptr;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!id) return nullptr;
-    sema::PrimitiveType pt = sema::primitiveFromName(id->name);
+    // fix #5186 (spec §8.1, v0.311; stdlib §2.13): the qualified form
+    // `System.<Primitive>(...)` of a §3.4-reserved primitive type. The
+    // qualified chain-head's exprType is stamped by
+    // `ExprTypecheck_Calls::resolveMemberAccess` as the same Primitive
+    // the bare name resolves to, so the dispatch below (and every per-
+    // member handler keyed on `pt`) sees the same `PrimitiveType` value
+    // it sees for the bare `Object` head. A user declaration named
+    // `System` shadows the prefix per §2.7 rule 1; in that case the
+    // sema chain-head stamp does NOT fire (it consults
+    // `!lookupName("System")`), and this path falls through to the
+    // user-static redirect in lowerCall.
+    sema::PrimitiveType pt = sema::PrimitiveType::None;
+    if (id) {
+        pt = sema::primitiveFromName(id->name);
+    } else if (auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(
+                   ma->target.get())) {
+        if (auto* sysId = dynamic_cast<const ast::IdentifierExpr*>(
+                inner->target.get())) {
+            if (sysId->name == "System") {
+                pt = sema::primitiveFromName(inner->member);
+                if (pt == sema::PrimitiveType::Object) {
+                    // The qualified form is reserved for `Object` (§8.1).
+                    // `System.int` / `System.string` are not §3.4 keyword
+                    // aliases and resolve to NOTHING here — those would be
+                    // ordinary identifiers, not primitives.
+                } else {
+                    pt = sema::PrimitiveType::None;
+                }
+            }
+        }
+    }
+    if (!id && pt == sema::PrimitiveType::None) return nullptr;
     // §11.8 (v0.176, #807): `T.Parse(...)` / `T.Zero()` / … — a static
     // interface member called through a constrained TYPE PARAMETER, at a
     // specialization where T is a PRIMITIVE (the compiler-provided §2.19

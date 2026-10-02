@@ -1203,8 +1203,11 @@ llvm::Value* Emitter::emitPrimitiveToString(llvm::Value* val,
     // value as a truncated i32. This covers both interpolation and Console.WriteLine.
     if (prim == P::Object) {
         if (llvm::Value* r = lowerObjectToString(val)) return r;
-        // Fallback (should not be reached for a well-typed Object): type name.
-        return lowerStringLiteral("\"Object\"", false);
+        // Fallback (should not be reached for a well-typed Object): type
+        // name. fix #5186 (spec §8.1, v0.311): the §8.5 name-only default
+        // for a class renders the qualified name — `"System.Object"` —
+        // not the bare identifier.
+        return lowerStringLiteral("\"System.Object\"", false);
     }
 
     // §4.4 / fix #521: decimal.ToString() → call bz_decimal_to_string.

@@ -862,7 +862,16 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
 // deliberately does not name them) stay OUT — they render lowercase or
 // not at all, respectively.
 BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
-    static constexpr std::array<std::string_view, 82> kSnapshot = {
+    static constexpr std::array<std::string_view, 84> kSnapshot = {
+        // fix #5186 (spec §8.1, v0.311; stdlib §2.13): the §3.4 reserved
+        // keyword primitives whose module is `System`. These two rows
+        // mirror the chain-head resolution the table enables
+        // (`System.Object`, `System.Type`); without them `var o:
+        // System.Object := …` (a §2.13 rule 1 / §8.1 spelling) would
+        // reach `resolveMemberAccess`'s chain-head stamp and the
+        // primitive-typed read would find no `builtinClassModulePathOf`
+        // entry to render the qualified `System.Object` argument name.
+        "Object", "Type",
         // §2 System — §2.5/§2.6 value-builtins whose box thunk renders the
         // type-name literal (fix #3119 (a)).
         "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
