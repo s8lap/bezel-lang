@@ -35,7 +35,7 @@
 #         PropertySymbol::decl is never set at all, so these answer the same
 #         silent "no" across a module boundary.
 20   src/codegen/LlvmBackend_Assign.cpp
-31   src/codegen/LlvmBackend_Calls2.cpp
+30   src/codegen/LlvmBackend_Calls2.cpp
 4    src/codegen/LlvmBackend_Disposal.cpp
 7    src/codegen/LlvmBackend_Exprs.cpp
 11   src/codegen/LlvmBackend_Exprs2.cpp

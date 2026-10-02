@@ -13497,49 +13497,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             call.callee.get()))
         if (rma->target)
             pendingIfaceRecvTy_ = ctx_.exprType(*rma->target);
-    // fix #5244 (§4.6 / §28.9, v0.313): CALLER-SIDE PIN for a borrowed
-    // by-value `string` argument. A by-value `string` parameter owns no +1 of
-    // its own (retainAssignedStringParams only mints one for a parameter the
-    // body ASSIGNS to), so when the argument is the receiver field's own value
-    // (`c.Twice(c.Val, ...)`, a getter lend) and the callee stores over that
-    // field twice, lowerStringFieldStore's release-old of the second store
-    // drops the SOLE reference and the parameter dangles. Retain every
-    // non-producer `string` argument before the call and release it after, on
-    // the normal-return edge only (an unwind leaks the +1 — the safe
-    // direction, the same one the #429 producer release below takes). A +1
-    // producer argument already holds its own reference (released below), and
-    // a literal is a sentinel the retain ignores, so both are skipped. `ref`/
-    // `out`/`owned` formals are excluded (they alias or transfer the caller's
-    // slot); a generic formal `T` bound to string is #4980's store, not this.
-    std::vector<llvm::Value*> stringPinArgs;
-    // SEAM-DEBT: #5262 local-callee gate on ms->decl: an imported callee has no MethodDecl, so its string arguments go unpinned (the #5262 gap)
-    if (dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        const std::size_t pinOffset = isStaticMethod(ms) ? 0 : 1;
-        for (std::size_t ai = pinOffset;
-             ai < args.size() && ai < argExprs.size(); ++ai) {
-            const std::size_t pj = ai - pinOffset;
-            if (!argExprs[ai] || pj >= ms->params.size()) continue;
-            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[pj]);
-            if (!ps || !ps->modifier.empty()) continue;
-            const sema::TypeRef* pty =
-                ps->resolvedDeclType
-                    ? ps->resolvedDeclType
-                    : (ps->declType ? ctx_.resolvedType(*ps->declType)
-                                    : nullptr);
-            if (!isStringTypeRefNonNull(pty)) continue;
-            if (!args[ai] || !args[ai]->getType()->isPointerTy()) continue;
-            if (isPlusOneStringProducer(argExprs[ai])) continue;
-            if (dynamic_cast<const ast::StringLiteralExpr*>(argExprs[ai]))
-                continue;
-            emitStringRetain(args[ai]);
-            stringPinArgs.push_back(args[ai]);
-        }
-    }
+    // fix #5244 / #5262 (§4.6 / §28.9, v0.313): CALLER-SIDE PIN for a
+    // borrowed by-value `string` / `string?` argument. See
+    // emitBorrowedStringArgPins for the full rationale. #5262 measured the
+    // three shapes #5244 scoped out and all three SEGV'd on the staging tip
+    // d68dab26: an IMPORTED callee (whose MethodSymbol carries no
+    // ast::MethodDecl, so #5244's `ms->decl` gate skipped it), a `string?`
+    // formal (`isStringTypeRefNonNull` excluded the nullable form), and a
+    // CONSTRUCTOR argument (a different call shape entirely — pinned at its
+    // own `new` site, LlvmBackend_Exprs2.cpp). The first two close here: the
+    // pin reads the callee's parameter SYMBOLS, which an imported method has,
+    // and admits the nullable string formal. The `ms->decl` gate is gone,
+    // which also drops one class-3 imported-symbol read (the SEAM-DEBT marker
+    // 74e4c24b added is no longer describing live behaviour).
+    const std::vector<llvm::Value*> stringPinArgs =
+        emitBorrowedStringArgPins(args, &argExprs, ms->params,
+                                  isStaticMethod(ms) ? 0 : 1);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
                                          call.span.begin, thisReceiver);
     unwindTarget_ = savedClArgUnwind;
     if (!diverged_) {
-        for (llvm::Value* pv : stringPinArgs) emitStringRelease(pv);
+        releaseBorrowedStringArgPins(stringPinArgs);
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
         // fix #1073 release site (1/2) — the NORMAL-return edge. Straight-line
         // code in the pending check's `cont` block, with no branch between the

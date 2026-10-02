@@ -4567,6 +4567,79 @@ private:
         builder_.CreateCall(fn, {s});
     }
 
+    // fix #5244 / #5262 (§4.6 / §28.9, v0.313): is `pty` a `string` or
+    // `string?` FORMAL — i.e. a by-value string parameter a #5262 pin
+    // applies to?
+    // #5244 shipped the `!rt->nullable` half only; #5262 widens it to the
+    // nullable form because bz_string_retain/bz_string_release are both
+    // no-ops on null (bezel_runtime_refcounting.cpp:117, :125), so pinning a
+    // `string?` argument is exactly as safe as pinning a `string` one — a
+    // null argument retains and releases nothing.
+    static bool isStringPinFormalType(const sema::TypeRef* pty) {
+        return pty && pty->kind == sema::TypeRef::Kind::Primitive &&
+               pty->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #5244 / #5262 (§4.6 / §28.9, v0.313): the CALLER-SIDE PIN, shared by
+    // every call shape that can hand a borrowed by-value string to a callee
+    // (#5244's user-method call; #5262's constructor, imported-callee and
+    // `string?`-formal members). `formals` is the callee's parameter SYMBOL
+    // list (sema::Symbol*, read as ParameterSymbol) — symbol-side on purpose,
+    // so an IMPORTED callee (which has no ast::MethodDecl, §2.5) is covered by
+    // the same predicate rather than skipped by an AST-presence gate. `args` /
+    // `argExprs` are parallel, both indexed with the receiver at `argOffset`
+    // (1 for an instance callee, 0 for a static one).
+    //
+    // A by-value `string`/`string?` parameter owns no +1 of its own
+    // (retainAssignedStringParams only mints one for a parameter the body
+    // ASSIGNS to), so when the argument is the receiver field's own value
+    // (`c.Twice(c.Val, ...)`, a getter lend) and the callee stores over that
+    // field twice, lowerStringFieldStore's release-old of the second store
+    // drops the SOLE reference and the parameter dangles. Retain every
+    // admissible argument now; the caller releases the returned vector on the
+    // normal-return edge (an unwind leaks the +1 — the safe direction, the
+    // same one the #429 producer release takes).
+    //
+    // Excluded: a non-empty modifier (`ref`/`out`/`owned` alias or transfer
+    // the caller's slot, not a by-value borrow), a +1 producer argument
+    // (already holds its own reference, released by the #429 block), and a
+    // string LITERAL (an rc sentinel the retain ignores, so pinning it would
+    // be a no-op retain plus a real no-op release — harmless, but it also
+    // cannot dangle). A generic formal `T` bound to string is #4980's
+    // retain-only store, not this.
+    std::vector<llvm::Value*> emitBorrowedStringArgPins(
+        const std::vector<llvm::Value*>& args,
+        const std::vector<const ast::Expr*>* argExprs,
+        const std::vector<sema::Symbol*>& formals, std::size_t argOffset) {
+        std::vector<llvm::Value*> pinned;
+        if (!argExprs) return pinned;
+        for (std::size_t fi = 0; fi < formals.size(); ++fi) {
+            const std::size_t ai = fi + argOffset;
+            if (ai >= args.size() || ai >= argExprs->size()) break;
+            auto* ps = dynamic_cast<const sema::ParameterSymbol*>(formals[fi]);
+            if (!ps || !ps->modifier.empty()) continue;
+            const sema::TypeRef* pty =
+                ps->resolvedDeclType
+                    ? ps->resolvedDeclType
+                    : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                    : nullptr);
+            if (!isStringPinFormalType(pty)) continue;
+            if (!args[ai] || !args[ai]->getType()->isPointerTy()) continue;
+            if (isPlusOneStringProducer((*argExprs)[ai])) continue;
+            if (dynamic_cast<const ast::StringLiteralExpr*>((*argExprs)[ai]))
+                continue;
+            emitStringRetain(args[ai]);
+            pinned.push_back(args[ai]);
+        }
+        return pinned;
+    }
+
+    // fix #5244 / #5262: release a `emitBorrowedStringArgPins` vector on the
+    // call's NORMAL-return edge.
+    void releaseBorrowedStringArgPins(const std::vector<llvm::Value*>& pins) {
+        for (llvm::Value* pv : pins) emitStringRelease(pv);
+    }
+
     // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544) / #4475 (§28.2): the
     // closure-cell heap layout —
     //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24),

@@ -9785,6 +9785,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
 
                 if (!typesMismatch && !needsInlineForLayout) {
+                    // fix #5262 (§4.6 / §28.9, v0.313): the CONSTRUCTOR member
+                    // of #5244's borrowed-string-argument pin. A by-value
+                    // `string`/`string?` constructor parameter owns no +1
+                    // either, so `new Box(h, h._v, "q" + i)` — the constructor
+                    // body stores over the field the argument aliases, twice —
+                    // left the parameter dangling (MEASURED: SEGV in
+                    // bz_string_to_utf8z, frame `bz$M.Box$ctor`, on r23-c28
+                    // d68dab26). Same pin as the method-call path, so the two
+                    // shapes cannot drift apart.
+                    //
+                    // `ctorArgExprs` is parallel to `args[1..]` (args[0] is the
+                    // instance); the helper wants both indexed with the
+                    // receiver in place, so splice a leading nullptr through.
+                    // Only the
+                    // CALL path is pinned — the inline path
+                    // (`needsInlineForLayout`) runs the body in this frame with
+                    // no call edge, and is out of scope here.
+                    std::vector<const ast::Expr*> ctorArgExprsAligned;
+                    ctorArgExprsAligned.reserve(args.size());
+                    ctorArgExprsAligned.push_back(nullptr);  // args[0] = obj
+                    ctorArgExprsAligned.insert(ctorArgExprsAligned.end(),
+                                               ctorArgExprs.begin(),
+                                               ctorArgExprs.end());
+                    const std::vector<llvm::Value*> ctorStringPins =
+                        emitBorrowedStringArgPins(args, &ctorArgExprsAligned,
+                                                  cs->params, /*argOffset=*/1);
                     // fix #2305: install the unwind-edge cleanup so a
                     // propagating constructor (the ctor body throws, or its
                     // argument-eval threw and the new-arg-unwind cleanup
@@ -9801,6 +9827,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // path (without freeing `this`); reclaim the instance block
                     // here on the throw edge.
                     emitNewPendingCheck(obj);
+                    // fix #5262: normal-edge release of the string pins.
+                    // Only when the ctor returned (the throw edge leaked them,
+                    // which is the safe direction the #429 producer release
+                    // above also takes).
+                    if (!diverged_) {
+                        releaseBorrowedStringArgPins(ctorStringPins);
+                    }
                     // fix #2305: normal-edge release. Only when the ctor
                     // returned (the throw edge already dropped these via the
                     // unwind cleanup above).
