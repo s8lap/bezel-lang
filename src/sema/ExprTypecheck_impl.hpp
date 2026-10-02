@@ -18,6 +18,7 @@
 #include "common/BuiltinRegistry.hpp"  // common::BuiltinFormals (fix #3424 / #3425)
 
 #include <cerrno>
+#include <cmath>      // std::isfinite — fix #5194 (§4.3, v0.312)
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -42,6 +43,35 @@ namespace bezel::sema {
 // test now lives there as the single shared definition.
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
+
+// fix #5194 (§4.3/§5.2, v0.312): parse a `float` literal text to its correctly-
+// rounded IEEE-754 value.  A `float` literal must be rounded once, to nearest
+// with ties to even (not double-rounded through a `double` intermediate).
+// `strtof` does exactly this.  Returns {value, overflow}; overflow is true when
+// the correctly-rounded value is not finite (magnitude ≥ float.MaxValue + ½ ulp).
+// The `double` overload is provided for callers that need a double result.
+struct FloatLiteralResult {
+    float       value;
+    bool        overflow;
+};
+struct DoubleLiteralResult {
+    double      value;
+    bool        overflow;
+};
+inline FloatLiteralResult parseFloatLiteralText(const char* text, size_t) {
+    char* end = nullptr;
+    errno = 0;
+    float v = std::strtof(text, &end);
+    bool overflow = (end == text) || errno == ERANGE || !std::isfinite(v);
+    return {v, overflow};
+}
+inline DoubleLiteralResult parseDoubleLiteralText(const char* text, size_t) {
+    char* end = nullptr;
+    errno = 0;
+    double v = std::strtod(text, &end);
+    bool overflow = (end == text) || errno == ERANGE || !std::isfinite(v);
+    return {v, overflow};
+}
 
 // per §15.4 (#1174 / #1866): a collection literal's admissible TARGET types are
 // a CLOSED list of CONCRETE collections (inline array, `Array`/`OwningArray`,

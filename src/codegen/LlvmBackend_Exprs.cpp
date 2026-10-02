@@ -242,8 +242,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 continue;
             digits.push_back(c);
         }
-        double v = digits.empty() ? 0.0 : std::strtod(digits.c_str(),
-                                                      nullptr);
+        // fix #5194 (§4.3, v0.312): use strtof for float (single rounding) and
+        // strtod for double.  Double-rounding through strtod+fpcast is wrong.
+        if (ty->isFloatTy()) {
+            float v = digits.empty() ? 0.0f
+                                     : std::strtof(digits.c_str(), nullptr);
+            return llvm::ConstantFP::get(ty, v);
+        }
+        double v = digits.empty() ? 0.0 : std::strtod(digits.c_str(), nullptr);
         return llvm::ConstantFP::get(ty, v);
     }
     // CG27a (§4.6): string and verbatim-string literals → global bz_string.

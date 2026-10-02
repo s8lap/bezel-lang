@@ -148,11 +148,9 @@ std::optional<std::int64_t> parseImportedConstIntText(std::string_view text) {
 
 // fix #4843 (§5.2 / §17.14, v0.307): an IMPORTED `float` / `double`
 // const's textual value. Same shape as `binaryFloatLiteralValue` in
-// ExprTypecheck_Calls.cpp (strtod on the digits-only carrier, then a
-// single-precision truncation for a `float` target) — nullopt on a
-// non-finite value (an out-of-range literal is already a §4.3 formation
-// error in the producer, so the caller's nullopt arm is the same
-// fall-back the integer parse already takes).
+// ExprTypecheck_Calls.cpp — nullopt on a non-finite value (an out-of-range
+// literal is already a §4.3 formation error in the producer, so the caller's
+// nullopt arm is the same fall-back the integer parse already takes).
 std::optional<double> parseImportedConstFloatText(std::string_view text,
                                                   bool isFloat) {
     if (text.empty()) return std::nullopt;
@@ -164,17 +162,26 @@ std::optional<double> parseImportedConstFloatText(std::string_view text,
     if (!((c0 >= '0' && c0 <= '9') || c0 == '+' || c0 == '-' || c0 == '.'))
         return std::nullopt;
     // Strip the `_` separators the textual channel admits (Appendix A.1's
-    // grouping character) — `strtod` does not consume them.
+    // grouping character) — strtof/strtod do not consume them.
     std::string digits;
     digits.reserve(text.size());
     for (char c : text) {
         if (c == '_') continue;
         digits.push_back(c);
     }
+    // fix #5194 (§4.3, v0.312): use strtof for float (single rounding, ties to
+    // even) and strtod for double.  The double-rounding (strtod+fpcast) was
+    // silently producing a different value than what the producer folded to.
+    if (isFloat) {
+        char* end = nullptr;
+        float v = std::strtof(digits.c_str(), &end);
+        if (end == digits.c_str()) return std::nullopt;
+        if (!std::isfinite(v)) return std::nullopt;
+        return static_cast<double>(v);
+    }
     char* end = nullptr;
     double v = std::strtod(digits.c_str(), &end);
     if (end == digits.c_str()) return std::nullopt;
-    if (isFloat) v = static_cast<double>(static_cast<float>(v));
     if (!std::isfinite(v)) return std::nullopt;
     return v;
 }

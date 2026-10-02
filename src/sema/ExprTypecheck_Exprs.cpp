@@ -6,6 +6,7 @@
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
+#include <cstdlib>   // std::strtof — fix #5194 (§4.3, v0.312)
 #include <algorithm>  // std::find — for static-method detection via modifiers
 #include <unordered_set>
 
@@ -2867,9 +2868,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     "(magnitude exceeds `decimal.MaxValue`) (\xC2\xA7""4.3)");
             }
         } else {
-            // Float/Double: parse the magnitude exactly as codegen does (strip
-            // underscores and the f/F/d/D suffix, then strtod). The value
-            // materialized for `float` is `(float)v`, so check the overflow
+            // Float/Double: parse the magnitude with the correctly-rounded
+            // parser (§4.3, v0.312).  For `float` use strtof (single rounding,
+            // ties to even); for `double` use strtod.  The overflow check is
             // against the target type's own largest finite value.
             std::string digits;
             for (char c : fl->text) {
@@ -2878,10 +2879,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 digits.push_back(c);
             }
             if (!digits.empty()) {
-                double v = std::strtod(digits.c_str(), nullptr);
-                bool overflow = (pt == PrimitiveType::Float)
-                                    ? std::isinf(static_cast<float>(v))
-                                    : std::isinf(v);
+                bool overflow = false;
+                if (pt == PrimitiveType::Float) {
+                    auto r = parseFloatLiteralText(digits.c_str(), digits.size());
+                    overflow = r.overflow;
+                } else {
+                    auto r = parseDoubleLiteralText(digits.c_str(), digits.size());
+                    overflow = r.overflow;
+                }
                 if (overflow) {
                     ctx_.diagnostics().report(
                         Severity::Error, fl->span.begin,

@@ -380,19 +380,23 @@ __int128 truncatedDecimal(const FoldDecimal& dec) {
     return neg ? -(__int128)whole : (__int128)whole;
 }
 
-// A `float`/`double` literal's value. A `float` literal is materialised as
-// `(float)strtod(digits)` by codegen and is rounded the same way here. nullopt
-// when the literal is non-finite — an out-of-range literal is already a §4.3
-// formation error, and a second diagnostic at the conversion would only
-// cascade.
+// A `float`/`double` literal's value. A `float` literal must be rounded once,
+// to nearest with ties to even (§4.3, v0.312); use strtof directly.  A `double`
+// literal uses strtod.  nullopt when the literal is non-finite — an out-of-range
+// literal is already a §4.3 formation error, and a second diagnostic at the
+// conversion would only cascade.
 std::optional<double> binaryFloatLiteralValue(std::string_view text,
                                               bool isFloat) {
     const std::string digits = floatLiteralDigitsForFold(text, false);
     if (digits.empty()) return std::nullopt;
-    double v = std::strtod(digits.c_str(), nullptr);
-    if (isFloat) v = (double)(float)v;
-    if (!std::isfinite(v)) return std::nullopt;
-    return v;
+    if (isFloat) {
+        auto r = parseFloatLiteralText(digits.c_str(), digits.size());
+        if (r.overflow) return std::nullopt;
+        return static_cast<double>(r.value);
+    }
+    auto r = parseDoubleLiteralText(digits.c_str(), digits.size());
+    if (r.overflow) return std::nullopt;
+    return r.value;
 }
 
 // fix #4801: the folded operand's value as the diagnostic prints it — the
