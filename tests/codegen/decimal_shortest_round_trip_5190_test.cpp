@@ -12,8 +12,7 @@
 //     decimal(2.5e-28)       → 0.0000000000000000000000000002  (tie at scale 28 → even digit)
 //
 // Issue: #5190 (OPEN, spec-ahead-of-impl)
-// Branch: a24-5190 / WT: /mnt/fast/worktrees/a24-wt-5190
-// Base commit: e2aa55d0
+// Branch: a24-5190-rb / WT: /mnt/fast/worktrees/a24-wt-5190
 
 #include <cstdio>
 #include <string>
@@ -80,69 +79,69 @@ BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_1_5_double_shortest_spec_5_2
 }
 
 // decimal(2.5e-28) — SPEC ROW (§5.2 v0.311 line 768, §4.4 ties-to-even).
-// Shortest round-trip of 2.5e-28 is "2.5e-28" → parses to mantissa 25 scale 29.
-// Reducing scale 29→28: dropped digit is 5, no further digits → exact tie.
-// Ties-to-even: mantissa 25 has last digit 5 (odd) → round UP to 26 → 26e-28 = 2.6e-27.
-// Wait: that's wrong. Let me re-trace:
-//   mantissa 25, scale 29 → "2.5e-28" = 2.5 × 10^-28 = 2.5e-28
-//   Scale 28 target: 2.5e-28 = X × 10^-28 = X × 10^-28 → X = 2.5 → not integer
-//   Scale 28 tie: 2 vs 3 at scale 28
-//     2e-28 = 0.000...0002  (mantissa 2, scale 28)
-//     3e-28 = 0.000...0003  (mantissa 3, scale 28)
-//   2.5e-28 is EXACTLY between them → tie, ties-to-even picks EVEN mantissa = 2.
-//   So decimal(2.5e-28) = 2e-28 = 0.000...0002 ✓ per spec.
+// Shortest round-trip of 2.5e-28 is "2.5e-28" → parses to mantissa 25, scale 29.
+// Reducing scale 29→28 drops the single digit 5, so the dropped portion is
+// exactly half: 2.5e-28 lies midway between 2e-28 and 3e-28, and §6.4's tie to
+// the even last digit takes it to 2e-28.
 BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_5e_28_spec_5_2_4_4_ties_to_even) {
     // §5.2 v0.311 line 768: "decimal(2.5e-28) is 0.0000000000000000000000000002,
     //  the form's tie at scale 28 going to the even digit"
     BEZEL_EXPECT_EQ(assertDecimalEq("decimal(2.5e-28)", "0.0000000000000000000000000002"), 42);
 }
 
-// decimal(2.6e-28) — NON-TIE: dropped digit is 6 (> 5) → round UP.
-// Shortest round-trip "2.6e-28" → 26e-28 (mantissa 26, scale 28) = 2.6e-28 exactly.
+// decimal(2.6e-28) — NOT A TIE: the dropped digit is 6, strictly above half, so
+// the result is 3e-28 regardless of the kept parity. Shortest round-trip
+// "2.6e-28" → mantissa 26, scale 29. Pairs with the two tie rows to show the
+// rule is "above half rounds up", not "dropped digit ≥ 5 rounds up".
 BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_6e_28_non_tie_round_up_spec_5_2_4_4) {
-    // Dropped digit 6 > 5: always round up → mantissa 26 → 0.000...0003
     BEZEL_EXPECT_EQ(assertDecimalEq("decimal(2.6e-28)", "0.0000000000000000000000000003"), 42);
 }
 
-// decimal(3.5e-28) — ODD-TIE: dropped digit is 5, all subsequent digits are 0,
-// mantissa's last digit is 5 (odd) → ties-to-even rounds UP to 6.
-// Shortest round-trip "3.5e-28" → 35e-28 (mantissa 35, scale 28).
-// Reducing scale 28→27: dropped digit 5, tie, mantissa 35 last digit 5 (odd) → +1 → 36.
-// Result: 36e-28 = 3.6e-27 = 0.000...0004? No:
-//   35e-28 = 3.5 × 10^-28
-//   Scale 28: 35e-28 = X × 10^-28 → X = 35
-//   3.5e-28 tie between 3e-28 and 4e-28 (mantissa 3 vs 4 at scale 28).
-//   Mantissa 35 → last digit 5 (odd) → round up to 36e-28.
-//   36e-28 = 0.000...0004 at scale 28 (wait: 36e-28 = 3.6 × 10^-27 ≠ 4 × 10^-28)
-// Actually: 36e-28 with scale 28 = 36 × 10^-28 = 3.6 × 10^-27.
-// But the string "0.000...0004" at scale 28 = 4 × 10^-28 = 4e-28.
-// Let me re-trace:
-//   2.5e-28 = 25e-29 (mantissa 25, scale 29) → round to scale 28: tie 2e-28 vs 3e-28.
-//   2.5e-28 is exactly in between → ties-to-even → 2e-28 (mantissa 2, even) → 0.000...0002
-//   2.6e-28 = 26e-29 (mantissa 26, scale 29) → reduce to scale 28: 26e-29 = 2.6 × 10^-28.
-//   At scale 28: 2.6e-28 is NOT exactly representable; 2.6 is between 2e-28 and 3e-28.
-//   2.6e-28 is closer to 3e-28 (distance 0.4e-28) than 2e-28 (distance 0.6e-28) → rounds to 3.
-//   So decimal(2.6e-28) = 3e-28 = 0.000...0003. ✓
-//   3.5e-28 = 35e-29 (mantissa 35, scale 29) → reduce to scale 28: 35e-29 = 3.5 × 10^-28.
-//   At scale 28: 3.5e-28 is exactly between 3e-28 and 4e-28 (mantissa 3 vs 4).
-//   Mantissa 35 → last digit 5 (odd) → round up to 36e-28 = 3.6 × 10^-27 = 0.000...0004 at scale 27? No!
-//   36e-28 at scale 28 = 36 × 10^-28 = 3.6 × 10^-27.
-//   Wait: 0.000...0004 at scale 28 = 4 × 10^-28 = 4e-28.
-//   Let me redo:
-//   - 2.5e-28: mantissa 25, scale 29. Reduce 1 digit (k=0): q=2, r=5. first_drop_eq_5=true.
-//     m=2 after loop. any_nonzero_dropped=false. first_drop_eq_5 && m%2==1 → 2%2==0 (even), so NO round-up.
-//     Result: mantissa 2, scale 28 = 0.000...0002 ✓
-//   - 2.6e-28: mantissa 26, scale 29. Reduce 1 digit: q=2, r=6. first_drop_eq_5=false.
-//     any_nonzero_dropped=true. Round up → m=3. Result: mantissa 3, scale 28 = 0.000...0003 ✓
-//   - 3.5e-28: mantissa 35, scale 29. Reduce 1 digit: q=3, r=5. first_drop_eq_5=true, m=3.
-//     any_nonzero_dropped=false. first_drop_eq_5 && m%2==1 → 3%2==1 (odd) → round up → m=4.
-//     Result: mantissa 4, scale 28 = 0.000...0004 ✓
+// decimal(3.5e-28) — ODD TIE: the same exact-half tie as 2.5e-28, but here the
+// kept mantissa is odd, so §6.4's tie to the even last digit rounds UP.
+// Shortest round-trip "3.5e-28" → mantissa 35, scale 29; dropping the single
+// digit 5 leaves 3, which is odd → 4e-28. Paired with the 2.5e-28 row above it
+// pins the direction of the tie: same dropped digit, opposite kept parity,
+// opposite result.
 BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_3_5e_28_odd_tie_round_up_spec_5_2_4_4) {
-    // §4.4 / §6.4 ties-to-even: 3.5e-28 tie at scale 28, mantissa 35 last digit 5 (odd)
-    // → round to even 6, so 36e-28 = 3.6e-27 = 0.000...0004? NO:
-    // Re-trace: 3.5e-28 = 35e-29. Reduce scale 29→28: q=3, r=5. Tie. m=3 (odd).
-    // Round UP → m=4. 4e-28 = 0.000...0004. ✓
     BEZEL_EXPECT_EQ(assertDecimalEq("decimal(3.5e-28)", "0.0000000000000000000000000004"), 42);
+}
+
+// ---------------------------------------------------------------------------
+// §4.4 / §6.4: the rounding direction comes from the MOST significant dropped
+// digit. Every row above reduces by exactly one digit, where the first digit
+// peeled is also the deciding one, so they cannot distinguish a peel that reads
+// the direction off the LEAST significant dropped digit. These rows reduce by
+// two or three and do.
+// ---------------------------------------------------------------------------
+
+// decimal(1.46e-28) — drop=2, most significant dropped digit is 4 (< 5) →
+// truncate. 146e-30 = 14.6e-29 → 1e-28. Reading the direction off the least
+// significant dropped digit (6 > 5) wrongly rounded up to 2e-28.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_1_46e_28_drop2_truncates_spec_4_4) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(1.46e-28)", "0.0000000000000000000000000001"), 42);
+}
+
+// decimal(2.55e-28) — drop=2, deciding digit 5 with a non-zero digit below it
+// (5) → strictly above half → round up. 255e-30 → 3e-28. Reading the direction
+// off the least significant dropped digit (5, tie) wrongly truncated to 2e-28.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_55e_28_drop2_above_half_spec_4_4) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(2.55e-28)", "0.0000000000000000000000000003"), 42);
+}
+
+// decimal(5.55e-29) — drop=3, deciding digit 5 with non-zero digits below
+// (5, 5) → above half → round up to 1e-28. Reading the direction off the least
+// significant dropped digit (5) and stopping there wrongly truncated to 0.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_5_55e_29_drop3_above_half_spec_4_4) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(5.55e-29)", "0.0000000000000000000000000001"), 42);
+}
+
+// decimal(1.2345e-29) — drop=5, deciding digit 1 (< 5) → truncate to 0.
+// Guards the peel for a multi-digit reduction that must not accumulate the
+// dropped portion into a value (10^5 does not threaten __uint128_t, but the
+// subnormal 1e-324 reaches drop=296, which would).
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_1_2345e_29_drop5_truncates_spec_4_4) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(1.2345e-29)", "0"), 42);
 }
 
 // decimal(-0.1) — negative double
@@ -203,8 +202,45 @@ BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_neg_inf_overflow_spec_5_2_v0
         "return 2; ")), 42);
 }
 
+// decimal(x) for a runtime x at 2^96 — §4.4: decimal.MaxValue is 2^96 − 1, so a
+// value at or above 2^96 does not fit at scale 0 and is out of range. §5.2: an
+// out-of-range binary float raises OverflowException. The operand is a runtime
+// double (not a constant), so this exercises the runtime entry; the constant
+// form is a compile error at the conversion site per §17.14.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_2_pow_96_overflow_spec_4_4_5_2_v0_311) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var v := 7.9228162514264338e28; "   // rounds to 2^96
+        "try "
+        "  var d := decimal(v); "
+        "  return 1; "
+        "catch OverflowException => return 42; "
+        "end; "
+        "return 2; ")), 42);
+}
+
+// decimal(1.0000000000000002) — §5.2's shortest round-trip rule: the value one
+// ulp above 1.0 needs 17 significant digits to round-trip, and that is what
+// decimal(x) reads (%.15g could not distinguish it from 1.0).
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_1_0000000000000002_double_shortest_spec_5_2_v0_311) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(1.0000000000000002)", "1.0000000000000002"), 42);
+}
+
+// decimal(5e-29) — §5.2's own subnormal-range example: 5e-29 = 0.5e-28 is an
+// exact tie at scale 28 and ties-to-even takes it to 0 (§6.4: "a nonzero result
+// that rounds to zero is zero"). Fix-forward: reading the tie off the peeled
+// digit and rounding half-up gave 1e-28.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_5e_29_tie_to_even_zero_spec_4_4) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(5e-29)", "0"), 42);
+}
+
 // decimal(3.14159) — double that is not exactly representable
 BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_pi_double_shortest_spec_5_2_v0_311) {
     // double pi ≈ 3.141592653589793; shortest round-trip is "3.141592653589793"
     BEZEL_EXPECT_EQ(assertDecimalEq("decimal(3.14159)", "3.14159"), 42);
+}
+
+// decimal(3.141592653589793) — the issue's own row: the full 16-digit shortest
+// round-trip of pi, which %.15g truncated to 3.14159265358979.
+BEZEL_TEST(codegen_5190_shortest_roundtrip, decimal_pi_full_double_shortest_spec_5_2_v0_311) {
+    BEZEL_EXPECT_EQ(assertDecimalEq("decimal(3.141592653589793)", "3.141592653589793"), 42);
 }

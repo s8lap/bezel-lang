@@ -523,6 +523,53 @@ extern "C" void bz_decimal_from_uint64(uint64_t v, bz_decimal_t* out) {
     dec_store(out, (__uint128_t)v, 0, /*neg=*/0, nullptr);
 }
 
+// Reduce a parsed (mantissa, scale) to scale ≤ 28, rounding once. per fix #4845
+// (scale must be ≤ 28) and per fix #5190's ties-to-even correction.
+// §4.4: a value outside decimal's set denotes "that value rounded as §6.4 rounds
+// an inexact result"; §6.4: rounded "at the largest scale s ≤ 28 … to nearest, a
+// tie to the even last digit". The dropped portion is the low `drop` digits of the
+// mantissa, so the decision compares that WHOLE portion against 5 × 10^(drop-1):
+// the MOST significant dropped digit sets the direction, and only when it is
+// exactly 5 do the digits below it matter (breaking the tie). Taking the
+// direction from the first digit peeled instead — which is the LEAST significant
+// dropped digit — inverts it whenever drop > 1: decimal(1.46e-28) became 2e-28
+// instead of 1e-28. The peel runs least-significant-first, so the deciding digit
+// is the one peeled LAST; digits below it only break a 5 tie. Nothing is
+// accumulated into a dropped-portion value, so a subnormal's large `drop`
+// (1e-324 → 296) cannot overflow __uint128_t.
+static void dec_reduce_scale_28(bz_decimal_t* out, void* ove_vtable) {
+    uint32_t s = dec_scale(out);
+    if (s <= 28) return;
+    __uint128_t m = dec_mantissa(out);
+    int neg = dec_sign(out);
+    const uint32_t drop = s - 28;
+    __uint128_t q = m;         // kept portion, reduced in place
+    uint32_t top = 0;         // most significant dropped digit
+    bool below_nonzero = false;
+    for (uint32_t k = 0; k < drop; ++k) {
+        __uint128_t next = q / 10;
+        const uint32_t d = (uint32_t)(q - next * 10);
+        q = next;
+        if (k + 1 < drop) {
+            if (d != 0) below_nonzero = true;   // strictly below the deciding digit
+        } else {
+            top = d;                             // last peeled == most significant
+        }
+    }
+    bool round_up;
+    if (top > 5) {
+        round_up = true;
+    } else if (top < 5) {
+        round_up = false;
+    } else {
+        // top == 5: the dropped portion is above half if any digit below it is
+        // non-zero, else it is an exact tie → to the even last digit.
+        round_up = below_nonzero || ((uint64_t)(q & 1) == 1);
+    }
+    if (round_up) q += 1;
+    dec_store(out, q, 28, neg, ove_vtable);
+}
+
 // Conversion from float (explicit per §5.2, v0.311).
 // §5.2 (v0.311, fix #5190): read the float's shortest round-trip form, then parse.
 // Uses a stack-based search (1..9 significant digits) identical to the algorithm
@@ -548,39 +595,7 @@ extern "C" void bz_decimal_from_float(float v, bz_decimal_t* out,
     bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
     if (bz_exc) return;
 
-    // §4.4: scale must be ≤ 28; round mantissa if necessary.
-    // §6.4 / §5.2 v0.311: ties-to-even (banker's rounding):
-    //   the entire dropped portion is compared to 5 × 10^(drop-1):
-    //     > half → round up   < half → truncate   == half → ties-to-even
-    uint32_t s = dec_scale(out);
-    if (s > 28) {
-        __uint128_t m = dec_mantissa(out);
-        int neg = dec_sign(out);
-        uint32_t drop = s - 28;
-        // Scan the dropped digits; stop as soon as the rounding direction is known.
-        // first_gt_5: first dropped digit > 5  → must round up.
-        // first_lt_5: first dropped digit < 5  → must truncate.
-        // first_eq_5: first dropped digit = 5; all subsequent dropped = 0 → tie.
-        bool first_gt_5 = false, first_lt_5 = false, first_eq_5 = false;
-        for (uint32_t k = 0; k < drop; ++k) {
-            __uint128_t q = m / 10;
-            __uint128_t r = m - q * 10;
-            if (first_gt_5 || first_lt_5) {
-                // direction already determined; nothing more to do
-            } else if (r > 5) {
-                first_gt_5 = true;
-            } else if (r < 5) {
-                first_lt_5 = true;
-            } else {  // r == 5
-                if (k == 0) first_eq_5 = true;
-                // if any later dropped digit is non-zero, direction was already set
-            }
-            m = q;
-        }
-        bool round_up = first_gt_5 || (first_eq_5 && !first_lt_5 && (uint64_t)(m & 1) == 1);
-        if (round_up) m += 1;
-        dec_store(out, m, 28, neg, ove_vtable);
-    }
+    dec_reduce_scale_28(out, ove_vtable);
 }
 
 // Conversion from double (explicit per §5.2).
@@ -609,39 +624,7 @@ extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
     bz_decimal_parse_cstr(buf, out, ove_vtable, nullptr);
     if (bz_exc) return;
 
-    // §4.4: scale must be ≤ 28; round mantissa if necessary.
-    // §6.4 / §5.2 v0.311: ties-to-even (banker's rounding):
-    //   the entire dropped portion is compared to 5 × 10^(drop-1):
-    //     > half → round up   < half → truncate   == half → ties-to-even
-    uint32_t s = dec_scale(out);
-    if (s > 28) {
-        __uint128_t m = dec_mantissa(out);
-        int neg = dec_sign(out);
-        uint32_t drop = s - 28;
-        // Scan the dropped digits; stop as soon as the rounding direction is known.
-        // first_gt_5: first dropped digit > 5  → must round up.
-        // first_lt_5: first dropped digit < 5  → must truncate.
-        // first_eq_5: first dropped digit = 5; all subsequent dropped = 0 → tie.
-        bool first_gt_5 = false, first_lt_5 = false, first_eq_5 = false;
-        for (uint32_t k = 0; k < drop; ++k) {
-            __uint128_t q = m / 10;
-            __uint128_t r = m - q * 10;
-            if (first_gt_5 || first_lt_5) {
-                // direction already determined; nothing more to do
-            } else if (r > 5) {
-                first_gt_5 = true;
-            } else if (r < 5) {
-                first_lt_5 = true;
-            } else {  // r == 5
-                if (k == 0) first_eq_5 = true;
-                // if any later dropped digit is non-zero, direction was already set
-            }
-            m = q;
-        }
-        bool round_up = first_gt_5 || (first_eq_5 && !first_lt_5 && (uint64_t)(m & 1) == 1);
-        if (round_up) m += 1;
-        dec_store(out, m, 28, neg, ove_vtable);
-    }
+    dec_reduce_scale_28(out, ove_vtable);
 }
 
 // Conversion to double (explicit per §5.2).
