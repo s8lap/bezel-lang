@@ -1219,6 +1219,12 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             } else {
                 rt = ctx_.importedMemberType(fs);
             }
+            // fix #5249 / §14.1 (v0.313): a class type parameter shadows a
+            // same-named builtin in the class body, so a field typed by the
+            // parameter (`class Box<Stopwatch> v: Stopwatch`) must be resolved
+            // through the ACTIVE substitution BEFORE the name-keyed builtin
+            // classification — otherwise `Box<int>` frees an int as a Stopwatch.
+            rt = resolveTypeParamRef(rt);
             if (rt) {
                 if (auto n = builtinTypeName(rt); !n.empty()) {
                     if (classifyVtablelessBuiltinRelease(n) !=
