@@ -588,6 +588,18 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             }
         }
     }
+    // fix #5252 (§23.3 / §28.3, v0.313): a `set(owned)` accessor's implicit
+    // `value` "takes owned T" (§23.3) — an `owned` parameter of the setter
+    // body — so it enters Owned exactly as an `owned` ParameterSymbol does
+    // above. Sema records it as a LocalSymbol anchored on the PropertyDecl,
+    // which is the obligation origin.
+    if (ownedAccessorValue_) {
+        LocalOwnership lo;
+        lo.state = OwnershipState::Owned;
+        lo.implicitDischarge = false;
+        lo.obligationOrigin = ownedAccessorValue_->decl;
+        entry.locals[ownedAccessorValue_] = lo;
+    }
     // §29.8 (#2154/#2217): a linear owning iterator whose body consists solely
     // of direct `yield return <owned-param>` statements has a precise runtime
     // ownership boundary at each yield state. Record those states so the clone
@@ -723,6 +735,18 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             reassignedDropCovered_.insert(sym);
     for (const auto& [sym, st] : endState) {
         if (st.state == OwnershipState::Owned && !st.implicitDischarge) {
+            // fix #5252 (§23.3 / §28.3, v0.313): a `set(owned)` accessor's
+            // `value` that reaches the setter's normal exit still Owned (on
+            // every path, or on some) is §28.3 *Auto-drop (affine)*'s
+            // undischarged `owned` parameter. Its end-of-setter disposal is
+            // #5212's codegen, which reads no flag from here, so no verdict is
+            // issued: neither the must-use warning (it would name a disposal
+            // codegen does not yet emit) nor the discharge error (the method
+            // form of a conditional transfer into an `owned` field is admitted
+            // with only that warning — measured — so erroring here would make
+            // the setter stricter than the method). This fix adds only the
+            // §28.3 borrow-escape verdicts the full pass reaches mid-body.
+            if (sym == ownedAccessorValue_) continue;
             // §28.3 / §28.11 (#1466): a PRE-DECLARED nullable out-owned recipient
             // (`var item: T? := null; coll.TryX(out item);`) that reaches a
             // normal-exit scope end still Owned is given an AUTO-DROP — a
@@ -15355,6 +15379,50 @@ static std::vector<ast::GenericParam> extensionTypeParams(
     return out;
 }
 
+// fix #5252 (§23.3 / §28.3, v0.313): run the full ownership pass over a
+// block-bodied `set(owned)` accessor, with its implicit `value` (renamable via
+// `set(owned x)`) seeded as an `owned` parameter. Sema records `value` as a
+// LocalSymbol whose decl is the PropertyDecl (ExprTypecheck's visitMember
+// PropertyDecl arm); it is NOT re-recorded here — the ownership pass alone
+// classifies it as owned (MethodOwnership::setOwnedAccessorValue). The last
+// such symbol allocated is the one the body's identifiers resolve to (a later
+// typecheck of the same accessor rebinds every `exprSymbol` to its own fresh
+// symbol). An indexer's own parameters ride along as the body's other
+// (borrow) parameters.
+static void runOwnedSetterBody(const ast::PropertyDecl& pd,
+                               const ast::PropertyAccessor& acc,
+                               sema::SemaContext& ctx,
+                               const ast::TypeDecl* enclosingType) {
+    const std::string_view vname = acc.setterParamName.empty()
+        ? std::string_view("value")
+        : acc.setterParamName;
+    sema::Symbol* valueSym = nullptr;
+    const std::vector<sema::Symbol*>* idxParams = nullptr;
+    for (const auto& up : ctx.symbols()) {
+        sema::Symbol* s = up.get();
+        if (!s || s->decl != &pd) continue;
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s)) {
+            if (ls->name == vname) valueSym = ls;
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(s)) {
+            if (ps->isIndexer) idxParams = &ps->indexerParams;
+        }
+    }
+    if (!valueSym) return;
+    std::vector<sema::Symbol*> params;
+    if (idxParams) params = *idxParams;
+    params.push_back(valueSym);
+    bool isStatic = false;
+    for (std::string_view mod : pd.modifiers)
+        if (mod == "static") isStatic = true;
+    MethodOwnership mo(ctx);
+    mo.setOwnedAccessorValue(valueSym);
+    mo.run(acc.stmts, &params, /*isAsync=*/false, /*isDestructor=*/false,
+           /*returnType=*/nullptr, /*returnOwned=*/false, isStatic,
+           /*genericCtx=*/nullptr,
+           /*isGenericBody=*/enclosingType &&
+               !enclosingType->genericParams.empty());
+}
+
 // fix #4011 / §7.9: forward-declared so checkMember's NestedTypeMember arm
 // (below) can run the same no-ctor screen checkTopDecl runs for a top-level
 // type — defined after checkOwnedFieldDA, further down this file.
@@ -15658,6 +15726,24 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                         *acc.exprBody);
                 else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
                     mo.checkLambdaBodyEscapes(acc.stmts);
+                // fix #5252 (§23.3 / §28.3, v0.313): a `set(owned)` accessor
+                // body runs the FULL ownership pass with its implicit `value`
+                // as an `owned` parameter. §23.3: the setter "takes owned T";
+                // §28.3's field-store rule makes an `owned` parameter
+                // scope-bound, so `_x := value` / `_x := value.Self()` into a
+                // non-`owned` field must be rejected exactly as in a method
+                // with an `owned` parameter (#5225) — they were admitted
+                // because no accessor body was ever analysed. Scoped to
+                // `set(owned)`: a plain setter's `value` is a borrow parameter
+                // whose field store §28.3 admits (parameter-sourced), and a
+                // getter has no parameter of its own, so neither is affected
+                // by this rule; bringing them under the full pass is a
+                // separate blast. Both setter spellings (`=> stmt;` and
+                // `=> do … end;`) parse as a Block body (Parser_Decls.cpp).
+                if (acc.isSet && acc.setterParamMod == "owned" &&
+                    acc.bodyKind == ast::PropertyAccessorBodyKind::Block) {
+                    runOwnedSetterBody(*pd, acc, ctx, enclosingType);
+                }
                 if (acc.isSet) continue;  // §28.6 getter-fresh-owned: getters only
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                     acc.exprBody) {

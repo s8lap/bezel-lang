@@ -407,6 +407,27 @@ public:
         enclosingCtor_ = cs;
     }
 
+    // fix #5252 (§23.3 / §28.3, v0.313): the implicit `value` parameter of a
+    // `set(owned)` accessor whose body is being analysed (null for every
+    // other body). Sema records it as a `LocalSymbol` anchored on the
+    // PropertyDecl (codegen and the indexer typing paths depend on that
+    // shape), but §23.3 makes it an `owned` parameter ("takes owned T"), so
+    // the ownership pass seeds it Owned and classifies it exactly as an
+    // `owned` ParameterSymbol: see `isOwnedParamSymbol`. Set by
+    // `checkMember`'s PropertyDecl arm before `run`.
+    void setOwnedAccessorValue(sema::Symbol* sym) {
+        ownedAccessorValue_ = sym;
+    }
+    // fix #5252: does an owned borrow SOURCE (already classified owned by
+    // `ownedLocalBorrowSource`) name a parameter rather than a local? True for
+    // a ParameterSymbol and for the `set(owned)` accessor's `value`; selects
+    // the parameter wording of the §28.3 escape diagnostics.
+    bool isOwnedParamSymbol(const sema::Symbol* sym) const {
+        if (!sym) return false;
+        if (sym == ownedAccessorValue_) return true;
+        return dynamic_cast<const sema::ParameterSymbol*>(sym) != nullptr;
+    }
+
     // §28.3 / §5.11 (#1007): apply ONLY the borrow-returned-through-owning-type
     // check to an expression-bodied method `M(): T => exprBody` (which the full
     // block dataflow above is not run on). Seeds the parameters so a borrowed
@@ -4283,6 +4304,8 @@ private:
     // moved-from state tracking rather than re-classifying the expression.
     // fix #3751: see setEnclosingCtor above.
     const sema::ConstructorSymbol* enclosingCtor_ = nullptr;
+    // fix #5252: see setOwnedAccessorValue above.
+    sema::Symbol* ownedAccessorValue_ = nullptr;
 
     bool isNamedOwnedBinding(const ast::Expr& e);
 

@@ -10148,8 +10148,9 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
     // source. Only the `Dest::Field` / `Dest::OutParam` legs can see one (the
     // source query above asked `LocalOnly` for every other destination), and a
     // catch borrow is never a parameter, so the §31.1 legs are untouched.
-    const bool srcIsOwnedParam =
-        dynamic_cast<sema::ParameterSymbol*>(src) != nullptr;
+    // fix #5252: a `set(owned)` accessor's `value` is an `owned` parameter
+    // too (§23.3), though sema records it as a LocalSymbol.
+    const bool srcIsOwnedParam = isOwnedParamSymbol(src);
     if (isCatchBorrow(src)) {
         if (dest == Dest::OuterLocal && outerLocalIsClosureCapture) {
             report(
@@ -10722,7 +10723,7 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
             recvRoot ? std::string(recvRoot->name) : std::string("it");
         // fix #3746: an `owned` PARAMETER source gets the clause that is true
         // of it; the owned-local text below is unchanged.
-        if (dynamic_cast<sema::ParameterSymbol*>(src)) {
+        if (isOwnedParamSymbol(src)) {  // fix #5252: incl. set(owned) `value`
             report(
                 Severity::Error, a.value->span.begin,
                 std::string("borrow of `") + std::string(src->name) +
@@ -11086,7 +11087,7 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
         recvRoot ? std::string(recvRoot->name) : std::string("it");
     // fix #3746: an `owned` PARAMETER source gets the clause that is true of
     // it; the owned-local text below is unchanged.
-    if (dynamic_cast<sema::ParameterSymbol*>(src)) {
+    if (isOwnedParamSymbol(src)) {  // fix #5252: incl. set(owned) `value`
         report(
             Severity::Error, as.value->span.begin,
             std::string("borrow of `") + std::string(src->name) +
@@ -16824,6 +16825,8 @@ bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const 
 // `states_` as Owned — for the transfer classification — so `isOwnedTrackedLocal`
 // alone cannot draw this line; the modifier can.) // per §28.3, §22.3, v0.286
 bool MethodOwnership::symbolIsOwnedObligation(const sema::Symbol* sym) const {
+    // fix #5252 (§23.3, v0.313): a `set(owned)` accessor's `value`.
+    if (sym && sym == ownedAccessorValue_) return true;
     if (const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym))
         return ps->modifier == "owned";
     if (const auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym))
