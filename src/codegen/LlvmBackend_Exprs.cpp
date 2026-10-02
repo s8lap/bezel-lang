@@ -297,6 +297,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // up here so the lambda can capture by reference and reset to nullptr
         // at the top of each iteration.
         llvm::Value* inlineBoxMint = nullptr;
+        // fix #5277 (§18.5 / §28.9, v0.313): set by the nullable-REFERENCE arm
+        // below when the hole is a `string?` slot READ (a local, parameter,
+        // field or auto-property) rendered by identity. Its rendering is the
+        // PHI(slot value, "null" literal), a new Value* distinct from `srcEv`,
+        // so the `pv != srcEv` rule took it for a fresh render and released
+        // it, dropping the reference the slot owns (the slot's own scope-end /
+        // drop-on-overwrite release then aborted with "refcount over-release
+        // (string)"; a field's string was freed while reachable). It is a
+        // BORROW exactly as the non-nullable `string` hole is (the
+        // `pv == srcEv` case), and the "null" arm is a sentinel literal, so the
+        // PHI is released only when the hole is a +1 producer. Reset per part.
+        bool nullableStringSlotBorrow = false;
         auto appendPart = [&](llvm::Value* pv, llvm::Value* srcEv,
                               const ast::Expr* srcExpr) {
             llvm::Value* prev = acc;
@@ -326,7 +338,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // `isUserMethodObjectStringReturnCall` recognizes the same method
             // shape `tryLowerConsoleCall` recognizes, so both consumption
             // positions close the leak in lockstep.
-            if (pv != srcEv ||
+            if ((pv != srcEv && !nullableStringSlotBorrow) ||
                 (srcExpr && isPlusOneStringProducer(srcExpr)))
                 emitStringRelease(pv);
             if (srcExpr && isUserMethodObjectStringReturnCall(srcExpr)) {
@@ -461,6 +473,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
             llvm::Value* ev = nullptr;  // #1030: lowered part expr (borrow check)
+            nullableStringSlotBorrow = false;  // #5277
             if (!part.literal.empty()) {
                 // Literal part: process escape sequences (e.g. \n → newline,
                 // \t → tab) that were stored as raw chars by splitInterpolation.
@@ -834,6 +847,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     llvm::Value* liveStr =
                         tryOpaqueSlotBuiltinRender(ev, &liveTy, part.expr.get());
                     if (!liveStr) liveStr = emitValueToString(ev, &liveTy);
+                    // fix #5277 (§18.5 / §28.9, v0.313): a `string?` slot read
+                    // renders its live arm by identity (`liveStr == ev`), so
+                    // the PHI below borrows the slot's reference — see
+                    // `nullableStringSlotBorrow` above appendPart.
+                    if (liveStr == ev &&
+                        isNullableStringSlotRead(part.expr.get()))
+                        nullableStringSlotBorrow = true;
                     auto* liveEnd = builder_.GetInsertBlock();
                     builder_.CreateBr(endBB);
                     builder_.SetInsertPoint(nullBB);
