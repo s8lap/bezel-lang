@@ -2341,6 +2341,29 @@ unsigned Emitter::disposedFlagIndex(const sema::TypeSymbol* t) {
 }
 
 
+// fix: give a record with NO fields a non-empty LLVM struct body (§28.9, v0.313).
+// A zero-field record still has identity and is still a first-class value type,
+// but `setBody({})` yields `type {}` — zero bytes, zero alignment. Every
+// `alloca` of such a record is then a zero-byte stack object, and every
+// `ptrtoint (gep <record>, null, 1)` — the byte size used for the closure
+// capture cell in `boxLocalSlot` — is 0, so the cell is `calloc(1, 0)`. Neither
+// has an addressable byte, and the capture's store into the cell is then out of
+// bounds; under `bezelc --sanitize=address` the zero-byte store is reported
+// (`AddressSanitizer:DEADLYSIGNAL`). A single unnamed `i8` padding field gives
+// the record a 1-byte footprint and makes `ptrtoint (gep ..., null, 1)` 1,
+// fixing all three capture-cell sites by construction.
+//
+// The padding is appended AFTER the real fields, so `fieldIndex_` (assigned over
+// `storage` above, before this call) is unaffected — a zero-field record has no
+// field GEPs to misalign in the first place. Records that declare any field keep
+// their exact previous layout.
+static std::vector<llvm::Type*>
+withRecordFootprint(llvm::LLVMContext& ctx,
+                    const std::vector<llvm::Type*>& fieldTys) {
+    if (!fieldTys.empty()) return fieldTys;
+    return {llvm::Type::getInt8Ty(ctx)};
+}
+
 llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
     // §9.1 / §9.2: storage = non-static FieldSymbols (positional + body
     // fields) and body auto-properties (PropertySymbol), in declaration order.
@@ -2386,7 +2409,7 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
         std::string specName = std::string("record.") + std::string(t->name)
             + "$spec" + std::to_string(specMap.size());
         auto* specSt = llvm::StructType::create(llvm_, specName);
-        specSt->setBody(specFieldTys);
+        specSt->setBody(withRecordFootprint(llvm_, specFieldTys));
         specMap[specFieldTys] = specSt;
         unsigned sidx = 0;
         for (const sema::Symbol* m : storage) fieldIndex_[m] = sidx++;
@@ -2404,7 +2427,7 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
         fieldTys.push_back(storageType(m));
         fieldIndex_[m] = idx++;
     }
-    st->setBody(fieldTys);
+    st->setBody(withRecordFootprint(llvm_, fieldTys));
     return st;
 }
 
