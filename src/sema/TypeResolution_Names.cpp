@@ -2964,6 +2964,68 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             std::string(first.substr(6)) +
                             "<\xE2\x80\xA6>` for value elements.");
                     }
+                    // fix #4796 (§14.2, v0.307): the owning-collection
+                    // families (OwningArray, OwningSet, OwningStack,
+                    // OwningQueue, OwningLinkedList, OwningDictionary per
+                    // `owningCollectionOwnedSlot` above) declare
+                    // `where T: class` in stdlib §4.2, and §14.2's
+                    // `where T: class` row admits ONLY non-nullable
+                    // reference types — "non-nullable" being the
+                    // load-bearing word the class-only restriction above
+                    // did not enforce: a *nullable* element wrapper
+                    // (`Foo?`) leaves the underlying class a value the
+                    // slot cannot own (the slot's reference is valid,
+                    // but the contained `null` has no disposal
+                    // obligation the slot tracks; an iterator that
+                    // copies the slot out, or a `Clear()` cascade that
+                    // calls `Dispose` on the slot, would either
+                    //   (a) treat null as a live reference and deref
+                    //       it on Dispose, UAFing; or
+                    //   (b) silently skip the null, which §28.11 does
+                    //       not permit on `OwningArray`/`OwningSet`/etc.
+                    //       — null skipping is the `OwningBuffer<T?>` /
+                    //       array-form contract, not this family's.)
+                    // The OwningBuffer<T> / Span<T> / ReadOnlySpan<T>
+                    // family (§4.14, #4679) is a different recorder
+                    // (`owningBufferSpanMoveOnlySites_`) and admits
+                    // nullable elements; OwningTask<T> and the
+                    // IOwning* interfaces (#4305) are a different
+                    // recorder too — neither share this branch, so
+                    // neither is affected. §14.4's verbatim example
+                    // `OwningTask<Lock?>` is admissible by design
+                    // because the `?` is the task RESULT's nullability
+                    // (Pattern B), NOT T substitution — `T = Lock`
+                    // (non-nullable), matches `where T: class`.
+                    // Inline array `[N owned]T?` (§15.1.1) is a
+                    // separate construct with its own null-state
+                    // semantics and is also unaffected.
+                    //
+                    // Scope: only the "first attempt at this slot"
+                    // (declaration-site) arm the `badDesc`-based
+                    // check above sits inside. The Pass-2 sweep
+                    // (`checkOwningElementInstantiations`, #2713) is
+                    // out of scope per the brief — a deferred-binding
+                    // nullable element (e.g. `OwningArray<T>` in a
+                    // generic context where T is bound to `Foo?`) would
+                    // still need its own pass-2 arm; that residual is
+                    // tracked as #4820.
+                    if (el->nullable) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("`") + std::string(first) +
+                            "` requires a non-nullable element type "
+                            "(\xC2\xA7""14.2 `where T: class` admits "
+                            "non-nullable reference types only; "
+                            "\xC2\xA7""14.4, v0.307, #4796) "
+                            "\xE2\x80\x94 a nullable element has no "
+                            "disposal obligation the slot can track "
+                            "and cannot be owned in an owning "
+                            "collection. Use `" +
+                            // v0.168 (#1372): strip the 6-char `Owning`
+                            // prefix to name the borrowing counterpart.
+                            std::string(first.substr(6)) +
+                            "<\xE2\x80\xA6>` for nullable elements.");
+                    }
                 }
                 // §14.2/§14.4 (fix #4305, SHARPENED by send-back review): a
                 // null-declaration builtin generic (this whole

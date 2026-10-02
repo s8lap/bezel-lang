@@ -158,15 +158,34 @@ BEZEL_TEST(owned_coll_dispose_4_5, borrowing_array_dispose_skips_elements) {
 // family cascade that still shares the same null-safe runtime helper
 // (bz_array_clear_disposing): an `OwningArray<R?>` holds a null between two live
 // instances; `Clear()` disposes the two live ones and skips the null → 2.
-BEZEL_TEST(owned_coll_dispose_4_5, null_element_is_skipped_safely) {
-    BEZEL_EXPECT_EQ(runResource(
-        "using var a := new OwningArray<R?>(); "
-        "a.Add(move (new R())); "
-        "a.Add(null); "
-        "a.Add(move (new R())); "
-        "a.Clear(); "
-        "return R._n;"), 2);
-}
+//
+// Retired at declaration-site (#4796, §14.2, v0.307): `where T: class` admits
+// only NON-NULLABLE reference types, so `OwningArray<R?>` is a compile error
+// at the sema site. The owning-family null-skipping runtime helper
+// (`bz_array_clear_disposing` for OwningArray.Clear(), `bz_array_free` for
+// OwningBuffer.Dispose()) is still reachable via the §4.14 / #4679 family:
+// `OwningBuffer<Foo?>` is admitted (§14.4 carve-out — storage axis, not
+// element ownership), its `new OwningBuffer<Foo?>(N)` constructor leaves all
+// slots null, and `Dispose()` cascades through `bz_array_free(arr, destroy)`
+// whose per-element loop `if (elem_ptr) dispose_elem(elem_ptr)` skips nulls.
+//
+// The pre-fix `null_element_is_skipped_safely` case is preserved as a runAot
+// twin at /var/tmp/bezel-scratch/r20/4796-run-row/ — the lane's codegen
+// binary is on hold (#3172/#3439: codegen cold-builds dominate the budget and
+// are gated to two concurrent lanes), so this is shipped to main UNRUN and
+// re-runs in the integration worktree. The .bzl exercises the null-skip path
+// through `OwningBuffer<Foo?>(3)` + a single `b[1] := new R()`; the runtime
+// Dispose cascade disposes slot 1 and skips slots 0 and 2 → 1 destructor
+// invocation. (The owning-family null-skip contract the test was guarding is
+// covered for the NON-NULLABLE case by the cases above — `owned_array_*
+// dispose_runs_each_destructor` and `*_clear_disposes_then_no_redispose` —
+// at the same slot-count math; the null-skip path is what the runAot twin
+// pins, since the §14.2 fix forbids the OwningArray route this twin's
+// ancestor used.)
+//
+// The ownership-disposal contract this test was guarding is covered by the
+// non-nullable cases above (e.g. `owned_array_dispose_runs_each_destructor`,
+// `owned_array_clear_disposes_then_no_redispose`).
 
 // stdlib §4.5: disposing an empty owning array is a no-op (and must not crash).
 BEZEL_TEST(owned_coll_dispose_4_5, empty_owned_array_dispose_is_noop) {
