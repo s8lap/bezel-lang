@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Every commit in a range must end with exactly ONE trailer, and it must be
-the one CLAUDE.md mandates.
+the Co-Authored-By line CLAUDE.md mandates, naming the model that wrote it.
 
 CLAUDE.md: "End every commit message with exactly one trailer line and nothing
 else -- no `Signed-off-by`, no second trailer."
@@ -13,6 +13,12 @@ rule that is re-violated by every fresh agent is not enforceable by prose -- the
 same lesson `check_deprecated_jit_oracle.py` records: "A prose ratchet is not a
 ratchet."
 
+The model name is not pinned (it was "Claude Opus 5" verbatim until 2026-10-04):
+an exact string went stale with every model release and made every Sonnet
+lane's commit claim Opus authorship. The checked invariants are the ones the
+rule exists for: one trailer, last line, Co-Authored-By to a Claude model at
+the noreply address.
+
 Usage:
     check_commit_trailers.py [--range origin/main..HEAD] [--self-test]
 Exit 0 clean, 1 on a violation.
@@ -22,7 +28,10 @@ import re
 import subprocess
 import sys
 
-WANT = "Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+# e.g. "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+WANT_RE = re.compile(r"^Co-Authored-By: Claude [A-Z][a-z]+ \d+(\.\d+)*"
+                     r"( \([^()]*\))? <noreply@anthropic\.com>$")
+EXAMPLE = "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 TRAILER_RE = re.compile(r"^(Co-Authored-By|Signed-off-by|Claude-Session|Reviewed-by|"
                         r"Acked-by|Tested-by|Reported-by):", re.I)
 
@@ -37,19 +46,32 @@ def violations(msg):
     elif len(found) > 1:
         out.append("%d trailers, expected exactly 1: %s"
                    % (len(found), " | ".join(found)))
-    elif found[0].strip() != WANT:
-        out.append("wrong trailer: %r" % found[0].strip())
-    if found and lines[-1].strip() != WANT:
+    elif not WANT_RE.match(found[0].strip()):
+        out.append("wrong trailer: %r (want e.g. %r)" % (found[0].strip(), EXAMPLE))
+    if found and not WANT_RE.match(lines[-1].strip()):
         out.append("the mandated trailer is not the LAST line")
     return out
 
 
 def self_test():
+    WANT = EXAMPLE
     cases = [
         ("subject\n\nbody\n\n" + WANT, []),
-        ("subject\n\nbody\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>",
+        ("subject\n\nbody\n\nCo-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+         []),
+        ("subject\n\nbody\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>", []),
+        ("subject\n\nbody\n\nCo-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>", []),
+        ("subject\n\nbody\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <me@example.com>",
+         ["wrong trailer"]),
+        ("subject\n\nbody\n\nCo-Authored-By: MiniMax-M3 <noreply@anthropic.com>",
+         ["wrong trailer"]),
+        ("subject\n\nbody\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+         ["wrong trailer"]),
+        ("subject\n\nbody\n\nSigned-off-by: Claude Opus 5.5 <noreply@anthropic.com>",
          ["wrong trailer"]),
         ("subject\n\nbody\n\n" + WANT + "\nClaude-Session: https://x", ["2 trailers"]),
+        ("subject\n\nbody\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n" + WANT,
+         ["2 trailers"]),
         ("subject\n\nbody", ["no trailer at all"]),
         ("subject\n\n" + WANT + "\n\ntrailing prose", ["not the LAST line"]),
     ]

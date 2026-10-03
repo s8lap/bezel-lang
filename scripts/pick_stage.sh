@@ -16,7 +16,7 @@
 # re-author as the integrator (--reset-author), and print one line per pick.
 # New: after each pick the commit MUST end with exactly the one mandated
 # trailer, checked by scripts/check_commit_trailers.py (the single source of
-# the WANT string). A violation stops the run with exit 3 and leaves the commit
+# the trailer rule). A violation stops the run with exit 3 and leaves the commit
 # in place for a human to amend — it is never silently rewritten.
 #
 # Usage:

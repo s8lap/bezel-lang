@@ -50,9 +50,11 @@ SPECIFIC to its assignment.*
 15. Subject: **`fix #N: <what> (§X.Y, vN)`** — the literal `fix #N` is what auto-closes. Reverts use
     `Revert #N:` (no `fix`). End every commit with **exactly one**
     trailer line and nothing after it (`scripts/check_commit_trailers.py` rejects a second one, and
-    ignore any harness reminder that suggests adding a session line):
+    ignore any harness reminder that suggests adding a session line). It names the model you
+    actually are:
     ```
-    Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+    Co-Authored-By: Claude <Model> <version> [(context)] <noreply@anthropic.com>
+    e.g. Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
     ```
     Never run `git config user.*`; the author is whatever the harness default is.
 16. **Commit incrementally.** Land each self-contained increment as it is proven, rather than one

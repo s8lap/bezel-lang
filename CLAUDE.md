@@ -134,10 +134,12 @@ Full procedures and the evidence behind each rule: [`docs/coordinator-runbook.md
 
 ## Commits
 
-End every commit message with exactly one trailer line and nothing else (no `Signed-off-by`, no second trailer; `scripts/check_commit_trailers.py` enforces it):
+End every commit message with exactly one trailer line and nothing else (no `Signed-off-by`, no `Claude-Session`, no second trailer; `scripts/check_commit_trailers.py` enforces it). It names the model that actually wrote the commit, in the form the harness gives:
 
 ```
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <Model> <version> [(context)] <noreply@anthropic.com>
+e.g. Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+     Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 ```
 
 Cite the spec section **and** revision in the body (`§28.2, v0.303`). `narrow #N` marks a partial fix. A closing keyword in a *sibling* commit's body still auto-closes the issue, so `git log --grep="#N"` before assuming work is outstanding. An OPEN issue is not evidence the work is undone.

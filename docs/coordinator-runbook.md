@@ -863,10 +863,12 @@ Sonnet fix regresses more than it fixes, revert it and re-dispatch as Opus.
 ### Commits
 
 End every commit message with exactly one trailer line and nothing else — no
-`Signed-off-by`, no second trailer:
+`Signed-off-by`, no second trailer — naming the model that wrote the commit
+(`scripts/check_commit_trailers.py` checks the form, not a fixed model):
 
 ```
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude <Model> <version> [(context)] <noreply@anthropic.com>
+e.g. Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ```
 
 Cite the spec section **and** revision in the body (`§28.2, v0.303`); the gate
