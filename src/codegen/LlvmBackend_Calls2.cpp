@@ -12522,6 +12522,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         registerFfiExprTemp(tmpSlot, argIsRawBytes);
                     }
                 }
+                // fix #5268 / §28.3 (v0.313): the IMPORTED-callee twin of
+                // buildOrderedArgs' #1019 registration — see the helper.
+                if (!byRef && a.modifier != "owned" && formalMod != "owned")
+                    registerImportedBorrowedFreshClassTempArg(*a.value, v);
                 ordered[pi] = v;
                 orderedExprs[pi] = a.value.get();
             }
@@ -19380,5 +19384,47 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
 }
 
+
+
+// fix #5268 / §28.3 *Unbound owned temporaries* (v0.313): the IMPORTED-callee
+// twin of buildOrderedArgs' #1019 registration. The imported method / ctor
+// argument arms build their own argument lists (#1221: no reconstructed
+// ast::MethodDecl), and registered only FFI buffers, so a fresh owned class
+// temporary (`b.Take(new A.Item())`, `new A.Holder(new A.Item())`) bound to a
+// BORROW parameter was never disposed (16 B/object; the single-module twin was
+// clean). Same predicate and gates as the local arm: a fresh producer (`new` /
+// `move` / owned operator / owned-returning call) of a class static type,
+// non-null; registered for scope-end dispose on BOTH edges via vtable Dispose.
+// The caller excludes ref/out/`owned` formals (an `owned` formal consumes it).
+void Emitter::registerImportedBorrowedFreshClassTempArg(
+    const ast::Expr& argExpr, llvm::Value* v) {
+    if (disposeStack_.empty() || !v || !v->getType()->isPointerTy() ||
+        llvm::isa<llvm::ConstantPointerNull>(v))
+        return;
+    const ast::Expr* av = &argExpr;
+    bool freshTemp = false;
+    if (dynamic_cast<const ast::NewExpr*>(av)) {
+        freshTemp = true;
+    } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(av)) {
+        freshTemp = un->op == "move";
+    } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(av)) {
+        if (auto* osym = ctx_.exprSymbol(*be))
+            if (auto* oms = dynamic_cast<sema::MethodSymbol*>(osym))
+                freshTemp = oms->isOperator &&
+                            sema::methodReturnsOwned(*oms, ctx_);
+    } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(av)) {
+        freshTemp = common::calleeReturnsOwned(*ce, ctx_);
+    }
+    if (!freshTemp) return;
+    const sema::TypeRef* at = ctx_.exprType(*av);
+    if (!at || at->kind != sema::TypeRef::Kind::Named || !at->declaration ||
+        at->declaration->kind != ast::TypeDeclKind::Class)
+        return;
+    llvm::AllocaInst* tslot = entryAlloca(v->getType());
+    builder_.CreateStore(v, tslot);
+    Disposal d{tslot, nullptr};
+    d.dynamicDispose = true;
+    disposeStack_.back().push_back(d);
+}
 
 }  // namespace bezel::codegen

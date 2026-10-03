@@ -19793,6 +19793,15 @@ private:
     // temporary (no double-free / use-after-free).
     bool isFreshOwnedClassProducer(const ast::Expr* e) const;
 
+    // fix #5268 / §28.3 *Unbound owned temporaries* (v0.313): the hand-rolled
+    // IMPORTED-callee argument arms (method call, constructor) cannot run
+    // buildOrderedArgs, so they register the #1019 borrow-parameter disposal
+    // of a fresh owned class temporary (`new C()`, `move x`, owned operator /
+    // call result) through this one helper. `v` is the lowered argument; the
+    // caller has already excluded ref/out/`owned` formals.
+    void registerImportedBorrowedFreshClassTempArg(const ast::Expr& argExpr,
+                                                   llvm::Value* v);
+
     // CG6/CG9: a call whose callee resolves to a known method → direct
     // LLVM call with lowered positional arguments. An instance method
     // (CG9) takes the receiver as an implicit leading `this` argument:

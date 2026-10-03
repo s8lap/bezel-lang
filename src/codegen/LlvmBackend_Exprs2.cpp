@@ -9293,6 +9293,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         builder_.CreateStore(v, tmpSlot);
                         registerFfiExprTemp(tmpSlot, argIsRawBytes);
                     }
+                    // fix #5268 / §28.3 (v0.313): a fresh owned class temporary
+                    // bound to a BORROW formal (`new A.Holder(new A.Item())`).
+                    registerImportedBorrowedFreshClassTempArg(
+                        *ne.args[ai].value, v);
                 }
                 // §5.1: widen an int argument to a wider numeric parameter, as
                 // the in-module ctor-call path does, so the ABI matches.
@@ -9522,6 +9526,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             }
                         }
                     }
+                    // fix #5268 / §28.3 (v0.313): a fresh owned class temporary
+                    // bound to a BORROW formal (named-argument arm).
+                    if (a.modifier != "owned" && formalMod != "owned")
+                        registerImportedBorrowedFreshClassTempArg(*a.value, v);
                     ordered[fi] = v;
                 }
                 // Materialize every unfilled formal's §22.5 default.
