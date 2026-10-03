@@ -20195,6 +20195,35 @@ private:
     // Returns an empty string_view if the TypeRef is not a builtin named type.
     static std::string_view builtinTypeName(const sema::TypeRef* rt);
 
+    // fix #5272 + #5272-ff (§2.3 / §2.7 / §3.4, v0.313): THE chokepoint guard
+    // for every builtin dispatch keyed on a receiver's identifier TEXT.  True
+    // when `recv` is a dotted-access receiver that sema resolved to a
+    // USER-declared type — a `TypeSymbol` carrying a real `ast::TypeDecl`
+    // in-module, or a populated `moduleName` when imported — i.e. NOT the
+    // synthetic `builtinClassSym`, which is shaped `decl == nullptr &&
+    // moduleName.empty()` (the #2997 discriminator `builtinTypeName` above
+    // documents).  False when sema stamped nothing on the receiver, so a
+    // receiver that previously reached a builtin arm never loses it.
+    //
+    // §2.3 (v0.313): of the always-available names, only §3.4's reserved row —
+    // the PascalCase aliases of the primitive value types, plus `String` —
+    // cannot be shadowed; "every other always-available name may be shadowed
+    // by local declarations under the normal name-resolution rules", which
+    // §2.7 supplies: the current-module declaration wins the bare name and the
+    // auto-imported one stays reachable by its qualified name
+    // (`System.Convert.ToInt32`).  `Math`, `Environment`, `DateTime`,
+    // `TimeSpan`, `IntPtr`, `UIntPtr`, `Guid` and `CancellationToken` are in
+    // neither reserved set, so a user class may take those spellings and MUST
+    // win — including for a static PROPERTY read, not only a static call.
+    //
+    // Every site that matches `id->name == "<Builtin>"` (or `cls == "<Builtin>"`)
+    // must be gated on `!` of this.  Two chokepoints existed and both are
+    // gated: the static-CALL ladder in LlvmBackend_Calls.cpp's
+    // `tryLowerBuiltinClassCall`, and the static-PROPERTY-read ladder in
+    // LlvmBackend_Exprs.cpp's `lowerExpr`.  See the definition in
+    // LlvmBackend_Exprs2.cpp for the measured pre-fix evidence.
+    bool receiverIsUserType(const ast::Expr& recv);
+
     // fix #2991 (spec §11.3 / §28.3 / §28.9, v0.240): the head SPELLING a `new`
     // expression writes, returned only when the type it actually constructs is
     // a BUILT-IN — and `{}` (no match, ever) when it constructs a USER type.

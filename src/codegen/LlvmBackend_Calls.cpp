@@ -10660,26 +10660,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // 1.4142135623730951 (the builtin arm) and the user's method never ran, so
     // the whole text-keyed family is wrong, not just Convert.
     //
-    // §2.3: of the always-available names, only §3.4's reserved row (the
-    // PascalCase primitive aliases and `String`) cannot be shadowed — "every
-    // other always-available name may be shadowed by local declarations under
-    // the normal name-resolution rules", which §2.7 gives: the current-module
-    // declaration wins the bare name and the auto-imported one stays reachable
-    // by its qualified name (`System.Convert.ToInt32`). `Convert` is in neither
-    // reserved set, so a user class may take the spelling and MUST win. These
-    // arms may therefore be reached only by a receiver sema resolved to the
-    // synthetic builtin class symbol. `builtinClassSym` is shaped
-    // `decl == nullptr && moduleName.empty()` (the #2997 discriminator
-    // `builtinTypeName` above documents): a user's TypeSymbol carries a real
-    // ast::TypeDecl in-module, or a populated moduleName when imported. When
-    // sema stamps nothing on the receiver the symbol is null and `cls` stands —
-    // the pre-existing behaviour, so an unresolved receiver never loses a builtin
-    // arm it used to reach.
-    if (!cls.empty()) {
-        if (auto* tsym = dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target))) {
-            if (tsym->decl || !tsym->moduleName.empty()) cls = {};
-        }
-    }
+    // #5272-ff promoted the discriminator into the shared
+    // `receiverIsUserType` helper (defined in LlvmBackend_Exprs2.cpp, with the
+    // full rule and the measured evidence) because the same text-keyed defect
+    // had a SECOND chokepoint — the static-PROPERTY-read arms in
+    // LlvmBackend_Exprs.cpp's `lowerExpr`, which this guard never reached and
+    // which silently answered a user `DateTime.Now` with the builtin's clock.
+    // One helper, both ladders: a future text-keyed arm that forgets the guard
+    // is one call away from the shared rule instead of re-deriving it.
+    if (!cls.empty() && receiverIsUserType(*ma->target)) cls = {};
     const auto& m = ma->member;
 
     // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString / WString / RawBytes

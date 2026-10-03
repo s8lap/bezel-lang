@@ -3584,7 +3584,34 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (ma->target) {
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (id->name == "Math") {
+                // fix #5272-ff (§2.3 / §2.7 / §3.4, v0.313): this is the SECOND
+                // text-keyed chokepoint for the #4691 family, the static-PROPERTY
+                // read, and it is the twin of `tryLowerBuiltinClassCall`'s
+                // static-CALL ladder that #5272 gated. Every arm below used to
+                // match on the receiver's identifier TEXT alone, so a user
+                // class that takes a builtin's spelling — which §2.3 explicitly
+                // permits, only §3.4's reserved row cannot be shadowed — was
+                // answered with the BUILTIN's value and the user's own
+                // PropertySymbol was discarded. MEASURED pre-fix at 23d1c7ad
+                // (`agent_check --probe --asan`, one user class per probe, the
+                // user's declared value on the right): `Math.Pi` 3.25 ->
+                // 3.141592653589793, `Math.Tau` 6.5 -> 6.283185307179586,
+                // `Environment.ProcessorCount` 555 -> 20, `DateTime.Now` 111
+                // -> 639265989418842169 (a tick count), `DateTime.MaxValue` 222
+                // -> 3155378975999999999, `TimeSpan.Zero` 333 -> 00:00:00,
+                // `IntPtr.Zero` 444 -> 0, `Guid.Empty` 777 -> the all-zero
+                // Guid, `CancellationToken.None` 888 -> the builtin's token.
+                // None crashed and none warned: every row is a SILENT wrong
+                // answer, which is why the guard belongs at the chokepoint.
+                //
+                // `receiverIsUserType` is the SAME helper #5272's call ladder
+                // uses (defined in LlvmBackend_Exprs2.cpp with the #2997
+                // discriminator and the full rule), so the two ladders cannot
+                // drift apart. The `int`/`long`/`double` arms further down are
+                // deliberately NOT gated: §3.4 reserves those spellings, so no
+                // user class can carry them.
+                const bool userRecv = receiverIsUserType(*ma->target);
+                if (!userRecv && id->name == "Math") {
                     // §2.2 (v0.285): the spec constants are `Pi` and `Tau`.
                     // fix #3559: `E` was removed with the transcendental block
                     // at v0.284 and the legacy `PI` spelling with it (G1,
@@ -3593,7 +3620,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
                     if (ma->member == "Tau") return llvm::ConstantFP::get(dbl, 6.28318530717958647692);
                 }
-                if (id->name == "Environment") {
+                if (!userRecv && id->name == "Environment") {
                     // §2.3: Environment static properties.
                     if (ma->member == "NewLine") {
                         // Platform newline: "\n" on Unix, "\r\n" on Windows.
@@ -3669,7 +3696,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // §2.5: DateTime static properties accessed as property reads
                 // (without parentheses): DateTime.Now, DateTime.UtcNow, etc.
                 // Also handles TimeSpan.Zero and TimeSpan.FromX() zero args.
-                if (id->name == "DateTime") {
+                if (!userRecv && id->name == "DateTime") {
                     const auto& mbr = ma->member;
                     if (mbr == "Now") {
                         auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
@@ -3691,7 +3718,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     if (mbr == "MaxValue")
                         return builder_.getInt64(3155378975999999999LL);
                 }
-                if (id->name == "TimeSpan") {
+                if (!userRecv && id->name == "TimeSpan") {
                     const auto& mbr = ma->member;
                     if (mbr == "Zero")
                         return builder_.getInt64(0LL);
@@ -3702,7 +3729,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // §32.7 / stdlib §10 (#1512): IntPtr.Zero / UIntPtr.Zero — the
                 // null pointer (integer 0). IntPtr/UIntPtr lower to a
                 // pointer-sized integer (i64 host), so the null value is i64 0.
-                if ((id->name == "IntPtr" || id->name == "UIntPtr") &&
+                if (!userRecv && (id->name == "IntPtr" || id->name == "UIntPtr") &&
                     ma->member == "Zero")
                     return builder_.getInt64(0LL);
                 if (id->name == "int") {
@@ -4031,11 +4058,23 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
             // CancellationToken.None (static property, target is type-name identifier).
             if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
-                if (id2->name == "CancellationToken" && ma->member == "None") {
+                // fix #5272-ff (§2.3 / §2.7, v0.313): the same text-keyed trap as
+                // the `userRecv` ladder above, in this second block's scope — a
+                // user `class Guid` / `class CancellationToken` declares a real
+                // §2.3-legal `static property Empty` / `None` and used to get the
+                // builtin's all-zero Guid / token instead. MEASURED pre-fix:
+                // `Guid.Empty` 777 -> 00000000-0000-0000-0000-000000000000,
+                // `CancellationToken.None` 888 -> System.Threading.CancellationToken.
+                // The `Decimal`/`decimal` arms below are NOT gated: §3.4 reserves
+                // that spelling (`class Decimal` is rejected outright), so no user
+                // class can carry it.
+                const bool userRecv2 = receiverIsUserType(*ma->target);
+                if (!userRecv2 && id2->name == "CancellationToken" &&
+                    ma->member == "None") {
                     return llvm::ConstantPointerNull::get(ptrTy());
                 }
                 // stdlib §2.6: Guid.Empty — the all-zero Guid (static readonly property).
-                if (id2->name == "Guid" && ma->member == "Empty") {
+                if (!userRecv2 && id2->name == "Guid" && ma->member == "Empty") {
                     return llvm::ConstantAggregateZero::get(guidStructType());
                 }
                 // stdlib §9.3 / fix #521: Decimal static constants.

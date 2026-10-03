@@ -403,6 +403,34 @@ struct TypeSymbol : Symbol {
     std::vector<ast::CallArgument> importedPrimaryBaseCtorArgs;
 };
 
+// fix #5272 + #5272-ff (§2.3 / §2.7 / §3.4, v0.313): THE discriminator for
+// "does this receiver name a built-in, or did a user declaration take the
+// spelling?".  A `builtinClassSym` is shaped `decl == nullptr &&
+// moduleName.empty()` — the #2997 rule codegen's `builtinTypeName` documents —
+// so a user's `TypeSymbol` is its exact complement: a real `ast::TypeDecl`
+// in-module, or a populated `moduleName` when imported.
+//
+// §2.3 (v0.313, *Always-available names*): of the always-available names, only
+// §3.4's reserved row — the PascalCase aliases of the primitive value types,
+// plus `String` — cannot be shadowed; "every other always-available name may be
+// shadowed by local declarations under the normal name-resolution rules",
+// which §2.7 (*Name resolution for dotted names*) supplies: the
+// current-module declaration wins the bare name, and the auto-imported one
+// stays reachable by its qualified name (`System.Convert.ToInt32`).
+//
+// EVERY layer that dispatches on a receiver's identifier TEXT — sema's static
+// member TYPING and codegen's static CALL and static PROPERTY lowering — must
+// gate on this. The defect it prevents is #4691's family, and it is a SILENT
+// wrong answer: a user `class DateTime` declaring `static property Now` was
+// typed and lowered as the builtin's clock, with no diagnostic. A null `s` is
+// NOT a user type: when sema stamped nothing, the pre-existing behaviour stands
+// and no builtin arm that used to be reached is lost.
+inline bool isUserDeclaredTypeSym(const Symbol* s) {
+    const auto* ts = dynamic_cast<const TypeSymbol*>(s);
+    if (!ts) return false;
+    return ts->decl != nullptr || !ts->moduleName.empty();
+}
+
 // §11.7 / §12.5 / §19.6 (v0.242, #3052): the class-shape modifier predicates,
 // stated once so the whole `abstract`-keyed rule family reaches `closed`.
 //

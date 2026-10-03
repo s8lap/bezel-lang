@@ -22274,7 +22274,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // clobbering the adjacent pending-task field → SIGSEGV on resume. Typing it
     // as CancellationToken (a ptr-lowered builtin record) gives the frame slot
     // the correct ptr width so the local round-trips. Mirrors Encoding.Utf8.
-    if (ma.target) {
+    if (ma.target && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
         if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if (cid->name == "CancellationToken" && ma.member == "None") {
                 auto* ctTy = ctx_.makeTypeRef();
@@ -22552,7 +22552,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // it lowers to a pointer-sized integer (i64) and a downstream
     // `handle = IntPtr.Zero` types as `bool` (both operands Named IntPtr, no
     // declaration → no record-equality error). Codegen emits the i64 0.
-    if (ma.target) {
+    if (ma.target && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
         if (auto* pid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
             if ((pid->name == "IntPtr" || pid->name == "UIntPtr") &&
                 ma.member == "Zero") {
@@ -22664,7 +22664,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // same shape §2.5 already declares on `DateTime.UtcNow: DateTime` /
     // `TimeSpan.Zero: TimeSpan`, so codegen's `DateTime` / `TimeSpan`
     // builders receive a typeref they already accept.
-    if (ma.target) {
+    if (ma.target && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
         if (auto* did = dynamic_cast<const ast::IdentifierExpr*>(
                 ma.target.get())) {
             if (did->name == "DateTime") {
@@ -23891,7 +23891,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
             // §2.5: DateTime static properties accessed as DateTime.Now, etc.
             // These appear as MemberAccess on the "DateTime" identifier.
-            if (auto* did = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            if (auto* idtmp = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma.target.get());
+                idtmp && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+                const auto* did = idtmp;
                 if (did->name == "DateTime") {
                     auto* dt = ctx_.makeTypeRef();
                     dt->kind = TypeRef::Kind::Named;
@@ -23979,7 +23982,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
             // stdlib §2.6: Guid.Empty — static readonly property on the Guid type name.
-            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            if (auto* idtmp = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma.target.get());
+                idtmp && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+                const auto* tid = idtmp;
                 if (tid->name == "Guid" && ma.member == "Empty") {
                     auto* gTy = ctx_.makeTypeRef();
                     gTy->kind = TypeRef::Kind::Named;
@@ -24046,7 +24052,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // CancellationToken builtin type name used as an identifier expression.
             // The target's exprType is null (an identifier-as-type-name, not a
             // value expression), so we look at the exprSymbol instead.
-            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+            if (auto* idtmp = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma.target.get());
+                idtmp && !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target))) {
+                const auto* tid = idtmp;
                 if (tid->name == "CancellationToken" && ma.member == "None") {
                     auto* ctTy = ctx_.makeTypeRef();
                     ctTy->kind = TypeRef::Kind::Named;

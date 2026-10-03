@@ -15476,4 +15476,67 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
 }
 
 
+// fix #5272 (the static-CALL chokepoint) and #5272-ff (the static-PROPERTY
+// chokepoint) — §2.3 / §2.7 / §3.4, v0.313.
+//
+// Codegen's builtin dispatch is keyed on the receiver identifier's SPELLING
+// (`id->name`, or the `cls` string derived from it), not on what sema resolved
+// that identifier to.  A user class that takes a builtin's spelling — which §2.3
+// explicitly permits, since only §3.4's reserved row cannot be shadowed — was
+// therefore answered with the BUILTIN's member, and the user's own
+// `MethodSymbol`/`PropertySymbol` was silently discarded.  This is the
+// #4691 family, and it had TWO chokepoints:
+//
+//   * LlvmBackend_Calls.cpp `tryLowerBuiltinClassCall` — the ~24 `cls ==
+//     "<Builtin>"` static-call arms (Convert, Math, Guid, DateTime, File, Path,
+//     Debug, Stopwatch, Environment, CString, WString, RawBytes, Task, Random,
+//     BitConverter, DateOnly, TimeOnly, Directory, TimeSpan, …);
+//   * LlvmBackend_Exprs.cpp `lowerExpr` — the static-PROPERTY-read arms
+//     (Math.Pi/Tau, Environment.*, DateTime.Now/UtcNow/Today/MinValue/MaxValue,
+//     TimeSpan.Zero, IntPtr.Zero/UIntPtr.Zero, Guid.Empty,
+//     CancellationToken.None), which fix #5272 did NOT reach.
+//
+// MEASURED PRE-FIX (staging @ 23d1c7ad, `agent_check --probe --asan`, one user
+// class per probe, the USER's declared value in the right column):
+//
+//     user class            member        user's value   printed (the builtin)
+//     Math                  Pi            3.25            3.141592653589793
+//     Math                  Tau           6.5             6.283185307179586
+//     Environment           ProcessorCount 555             20
+//     DateTime              Now           111             639265989418842169
+//     DateTime              MaxValue      222             3155378975999999999
+//     TimeSpan              Zero          333             00:00:00
+//     IntPtr                Zero          444             0
+//     Guid                  Empty         777             00000000-0000-...
+//     CancellationToken     None          888             System.Threading...
+//
+// Not one of these crashes and not one warns: every row is a SILENT wrong
+// answer, which is why the guard has to sit at the chokepoint and why the
+// regression rows assert the USER's bytes rather than "did not crash".
+//
+// The discriminator is the EXISTING #2997 one `builtinTypeName` documents — a
+// `builtinClassSym` is shaped `decl == nullptr && moduleName.empty()`, so a
+// user's `TypeSymbol` (a real `ast::TypeDecl` in-module, or a populated
+// `moduleName` when imported) is its exact complement.  Nothing is invented
+// here.  Both chokepoints call THIS function, so the two ladders cannot drift
+// apart again: a future text-keyed arm that forgets the guard is one call away
+// from the shared rule.
+//
+// Sema stamps the receiver `IdentifierExpr`'s `exprSymbol` uniformly for a
+// dotted head and a value position (ExprTypecheck_Exprs.cpp), so ONE predicate
+// serves the call form and the property form.  When sema stamps nothing the
+// symbol is null, this returns false, and the receiver keeps the pre-existing
+// behaviour — no arm that used to be reached is lost.
+//
+// The rule itself lives in `sema::isUserDeclaredTypeSym` (sema/Symbol.hpp) so
+// SEMA's own text-keyed static-member TYPING gates on the identical predicate:
+// a receiver sema types as a built-in must be the same receiver codegen lowers
+// as a built-in, or the two layers disagree about what a user class shadowing
+// a built-in means — sema would type the user's property as the builtin's and
+// codegen would lower the user's, and one of the two is wrong by construction.
+bool Emitter::receiverIsUserType(const ast::Expr& recv) {
+    return sema::isUserDeclaredTypeSym(ctx_.exprSymbol(recv));
+}
+
+
 }  // namespace bezel::codegen
