@@ -8789,12 +8789,33 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     // field's pointer and then SEGV inside the disposer (§28.4/§28.5), so the
     // corruption surfaces nowhere near the accessor.
     //
-    // The QUESTION IS THE SAME PROPERTY (c) asks, not an enumeration of accessor
-    // shapes: `instanceLayoutDiffersFromErasedTemplate(impl->parent)`, asked
-    // about the class that DECLARES the accessor — the class whose `classStruct`
-    // that body GEPs. False for a non-generic declarer, for `T = int`, and for
-    // every generic class whose storage sequence does not move; all of those keep
-    // the shared slot with no behaviour change.
+    // fix #4984 (§14.1 / §23 / §2.8.3 rule 4, v0.307; #4966 sibling):
+    // #4966 (cb405b15) closed the (c) twin by removing the
+    // `instanceLayoutDiffersFromErasedTemplate` gate from the VIRTUAL METHOD
+    // slot loop. The same predicate here had the same blind spot: B<T> has no
+    // instance fields, every LLVM struct layout agrees, the predicate is
+    // therefore false, but the accessor's body still reads `B<T>._c` — a STATIC
+    // field whose global name is `bz$M.B$_c` (placeholder) and is re-emitted
+    // under the active substitution at `bz$M.B$T$_c` — and the ERASED body
+    // GEPs the per-instantiation cell for `T -> i32` rather than the cell for
+    // the receiver's actual T. Measured on a `class D<T>: B<T>` overriding a
+    // virtual `property Val: int` whose setter writes `B<T>._c := value + 1`,
+    // at T = int: the vtable's erased accessor wrote `bz$M.B$_c` (the
+    // placeholder cell) while `B<int>._c` reads `bz$M.B$int$_c` (a different
+    // cell) and printed 0 instead of the expected 21. The defect is not in
+    // the LAYOUT — it is in the BODY. Layout-equal does not mean body-equal.
+    //
+    // The predicate is removed. Every inherited virtual-property / indexer
+    // accessor slot of the GENERIC class that still holds the ERASED template
+    // accessor is now re-lowered under the active substitution. The
+    // signature-ABI guard below (`specFn->getFunctionType() != canon->getFunctionType()`)
+    // stays — a specialization whose signature MOVES under the substitution
+    // (`virtual property Item: T`) cannot go in the fixed-ABI slot, and the
+    // indirect call at the receiver's static property type would mistype it.
+    // Non-generic declarers and storage-equal generics keep the shared slot
+    // because `declareVtables` lowers against the SAME concrete type, so the
+    // `sharedInitPeek->getAggregateElement(slot) != installedCanon` check
+    // above already gates them out.
     //
     // Collection is deliberately SIDE-EFFECT-FREE (map lookups and the pure
     // layout predicate only): every body emission must happen AFTER the vtable
@@ -8845,8 +8866,13 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                 if (sharedInitPeek->getAggregateElement(slot) !=
                     llvm::cast<llvm::Constant>(installedCanon))
                     continue;
-                if (!instanceLayoutDiffersFromErasedTemplate(impl->parent))
-                    continue;
+                // fix #4984 (§14.1 / §23 / §2.8.3 rule 4, v0.307): removed the
+                // `instanceLayoutDiffersFromErasedTemplate(impl->parent)`
+                // predicate. See the block comment above for the rationale —
+                // the layout predicate has the same blind spot #4966 closed
+                // for (c): the accessor's body can depend on `T` (e.g. via a
+                // per-instantiation static `B<T>._c`) without the instance
+                // layout moving.
                 accessorSlotsToSpec.push_back({slot, impl, vs.isSet});
             }
         }
