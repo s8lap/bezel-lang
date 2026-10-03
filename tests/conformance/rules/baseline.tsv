@@ -255,7 +255,7 @@ s7_11_0007	pass
 s7_11_0008	pass	
 s7_11_0009	pass	
 s7_11_0010	pass	
-s8_1_0001	fail	divergence
+s8_1_0001	pass	
 s8_1_0002	pass	
 s8_2_0001	fail	divergence
 s8_2_0002	pass	
