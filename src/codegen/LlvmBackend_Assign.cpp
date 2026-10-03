@@ -14266,6 +14266,14 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                         tk == ast::TypeDeclKind::Interface) {
                         builder_.CreateStore(
                             llvm::ConstantPointerNull::get(ptrTy()), scratch);
+                        // fix #5292 / §28.3 *Unbound owned temporaries* rule 1,
+                        // §30.1 (v0.313): the null above and the post-call /
+                        // unwind disposal can sit on opposite sides of a
+                        // suspension (a LATER argument that awaits), so the
+                        // scratch must live in the state-machine frame; an
+                        // entry alloca is uninitialised stack after resume.
+                        if (smStateStruct_)
+                            asyncHandlerSpillSlots_.push_back(scratch);
                         discardOwnedOutSlots_.push_back(scratch);
                         // #1833 (a) / §22.4 / §28.3 / §17.13: the normal-path
                         // disposal above (`discardOwnedOutSlots_` loop in
@@ -14521,6 +14529,12 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 // through the alloca, mirroring a `using var` local's slot).
                 llvm::AllocaInst* slot = entryAlloca(coll->getType());
                 builder_.CreateStore(coll, slot);
+                // fix #5292 / §28.3 *Unbound owned temporaries* rule 1, §30.1
+                // (v0.313): the borrow-parameter literal temporary is disposed
+                // at scope end, possibly after a LATER argument's suspension,
+                // so its disposal slot must live in the async frame.
+                if (smStateStruct_ && params[idx].modifier != "owned")
+                    asyncHandlerSpillSlots_.push_back(slot);
                 v = coll;
                 bool ownedParam = (params[idx].modifier == "owned");
                 if (!ownedParam && !disposeStack_.empty())
@@ -14927,6 +14941,15 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 !disposeStack_.empty()) {
                 llvm::AllocaInst* eslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, eslot);
+                // fix #5292 / §28.3 *Unbound owned temporaries* rule 1, §30.1
+                // (v0.313): the wrapper is disposed at the end of the full
+                // expression, which in a state-machine body can be AFTER a
+                // suspension (a LATER argument that awaits: `b.Sum(arr, await
+                // P())`), on the resumed `...$Resume` invocation where an entry
+                // alloca is uninitialised stack. Promote the slot into the
+                // frame, as #5286 did for the #1019 arm below / #2754 for the
+                // FFI temp.
+                if (smStateStruct_) asyncHandlerSpillSlots_.push_back(eslot);
                 Disposal d{eslot, nullptr};
                 d.iterEnumDispose = true;  // slot-1 Dispose: free wrapper frame
                                             // (owning cases also free drained
