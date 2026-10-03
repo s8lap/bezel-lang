@@ -20097,6 +20097,36 @@ private:
         const ast::Expr& target, llvm::Type*& outTy,
         std::vector<AccessorRefArg>& sink);
 
+    // fix #5289 (§17.13 "the discard `_`" / §22.6 "out _", v0.313) — the
+    // BUILTIN-intrinsic twin of buildOrderedArgs' #1301 discard arm. An `out _`
+    // argument has a null `value` BY DESIGN (Node.hpp `CallArgument::value`:
+    // "null when isDiscard"), so every builtin `Try*` site that guarded on
+    // `call.args[N].value` bailed and the call degraded to a zero (false)
+    // value (#1315 recurring). For a discard this allocates a throwaway,
+    // zero-initialised scratch slot of `discardTy` — the builtin's own `out`
+    // parameter type (stdlib §2.3 / §2.5 / §2.6 / §4 / §9; for the nullable
+    // out shapes the `T?` slot form) — sets `outTy` to it and returns its
+    // address; the written value is never read back. For any other argument it
+    // is exactly resolveOutAddrWithBracket(*a.value, ...).
+    llvm::Value* resolveBuiltinOutArg(
+        const ast::CallArgument& a, llvm::Type* discardTy, llvm::Type*& outTy,
+        std::vector<AccessorRefArg>& sink);
+    // The `T?` out-slot type of a builtin collection `Try*` (the tagged
+    // `{i8,T}` struct for a value instantiation, a nullable pointer for a
+    // class one) — what ensureOutVarSlots gives an `out var` recipient (#1336).
+    llvm::Type* tryOutNullableSlotTy(const sema::TypeRef* elem);
+    // fix #5289 (§22.6 "out _", §28.3 "Unbound owned temporaries"): against an
+    // `out owned T` formal the discarded value is an unbound owned temporary
+    // disposed at the end of the full statement. A builtin `Try*` that wrote an
+    // owned class/interface value into its discard scratch slot (a `ptr` slot;
+    // null when the call returned false) disposes it here, null-guarded, on
+    // the normal-return edge. No-op for any other element type.
+    void disposeDiscardedOwnedOut(llvm::Value* scratch,
+                                  const sema::TypeRef* elem);
+    // Same for `Weak<T>.TryUpgrade(out using var s)` discarded: the upgraded
+    // Shared<T> handle written into the scratch slot is released (null-guarded).
+    void releaseDiscardedSharedOut(llvm::Value* scratch);
+
     // #1955 / §28.3: null the caller's slot for a call ARGUMENT that transferred
     // a bare owned LOCAL / owned PARAMETER's ownership to an owned recipient at a
     // lowering site OUTSIDE buildOrderedArgs — an owning-collection element-

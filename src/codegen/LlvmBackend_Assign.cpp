@@ -13747,6 +13747,78 @@ llvm::Value* Emitter::resolveOutAddrWithBracket(
 }
 
 
+// fix #5289 (§17.13, §22.6, v0.313): see the declaration in
+// LlvmBackend_impl.hpp. The slot is zero-initialised so a builtin that writes
+// only on its success path leaves a defined value; it is never read back.
+llvm::Value* Emitter::resolveBuiltinOutArg(
+    const ast::CallArgument& a, llvm::Type* discardTy, llvm::Type*& outTy,
+    std::vector<AccessorRefArg>& sink) {
+    if (!a.value) {
+        outTy = discardTy ? discardTy : i32();
+        llvm::AllocaInst* scratch = entryAlloca(outTy);
+        // Zero-init in the ENTRY block, right after the alloca (never at the
+        // current insertion point: a site may already have emitted its branch
+        // terminator before it resolves the out argument — TryRead*), so it
+        // dominates every path and a never-written slot reads null/0.
+        {
+            llvm::IRBuilder<> eb(scratch->getParent(),
+                                 scratch->getNextNode()
+                                     ? scratch->getNextNode()->getIterator()
+                                     : scratch->getParent()->end());
+            eb.CreateStore(llvm::Constant::getNullValue(scratch->getAllocatedType()),
+                           scratch);
+        }
+        return scratch;
+    }
+    return resolveOutAddrWithBracket(*a.value, outTy, sink);
+}
+
+llvm::Type* Emitter::tryOutNullableSlotTy(const sema::TypeRef* elem) {
+    if (!elem) return ptrTy();
+    sema::TypeRef nn = *elem;
+    nn.nullable = true;
+    llvm::Type* t = lowerTypeRef(&nn);
+    return t ? t : ptrTy();
+}
+
+void Emitter::releaseDiscardedSharedOut(llvm::Value* scratch) {
+    llvm::Value* h = builder_.CreateLoad(ptrTy(), scratch, "outdisc.sh");
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        h, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* relBB = llvm::BasicBlock::Create(llvm_, "outdisc.shrel", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "outdisc.shcont", currentFn_);
+    builder_.CreateCondBr(isNull, contBB, relBB);
+    builder_.SetInsertPoint(relBB);
+    builder_.CreateCall(declareC("bz_shared_release",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                        {h});
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), scratch);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+void Emitter::disposeDiscardedOwnedOut(llvm::Value* scratch,
+                                       const sema::TypeRef* elem) {
+    if (!scratch || !elem || elem->kind != sema::TypeRef::Kind::Named ||
+        !elem->declaration)
+        return;
+    const ast::TypeDeclKind tk = elem->declaration->kind;
+    if (tk != ast::TypeDeclKind::Class && tk != ast::TypeDeclKind::Interface)
+        return;
+    llvm::Value* obj = builder_.CreateLoad(ptrTy(), scratch, "outdisc.obj");
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        obj, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* dispBB =
+        llvm::BasicBlock::Create(llvm_, "outdisc.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "outdisc.cont", currentFn_);
+    builder_.CreateCondBr(isNull, contBB, dispBB);
+    builder_.SetInsertPoint(dispBB);
+    emitDisposeAndReclaim(obj);
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), scratch);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
 // fix #3777 (§22.5 "Optional parameters and named arguments" / §22.8 step 1 /
 // §12.8, v0.286): the ONE materialization of an omitted §22.5 default for a
 // LOCALLY declared formal list. Extracted verbatim from `buildOrderedArgs`,

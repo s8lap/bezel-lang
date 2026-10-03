@@ -597,7 +597,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return loadCodePoint(s, builder_.getInt64(0));
     }
     if (pt == P::Char && m == "TryParse" && call.args.size() == 2 &&
-        call.args[0].value && call.args[1].value) {
+        call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
         // fix #2938 / §22.3: §22.3-admitted accessor targets (property /
@@ -605,8 +605,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // flushes at the normal-return exit below.
         llvm::Type* et = nullptr;
         std::vector<AccessorRefArg> outArgs;
-        llvm::Value* outAddr = resolveOutAddrWithBracket(
-            *call.args[1].value, et, outArgs);
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[1], lowerPrimitive(P::Char), et, outArgs);
         if (!outAddr) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
@@ -651,14 +651,14 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // stdlib §9.3 / §2.19: decimal.TryParse(s, out result): bool — routes to
     // bz_decimal_try_parse (no exception on failure; out gets 0 per §9.3).
     if (pt == P::Decimal && m == "TryParse" && call.args.size() == 2 &&
-        call.args[0].value && call.args[1].value) {
+        call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
         // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
         std::vector<AccessorRefArg> outArgs;
-        llvm::Value* outAddr = resolveOutAddrWithBracket(
-            *call.args[1].value, et, outArgs);
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[1], lowerPrimitive(P::Decimal), et, outArgs);
         if (!outAddr) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
@@ -1113,7 +1113,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // parse value (e.g. 1.5 for "1.5abc"). Per §9.3: "TryParse returns false
     // in every case where Parse would raise"; the out param gets the default.
     if (m == "TryParse" && call.args.size() == 2 &&
-        call.args[0].value && call.args[1].value &&
+        call.args[0].value && (call.args[1].value || call.args[1].isDiscard) &&
         (pt == P::Double || pt == P::Float)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
@@ -1121,8 +1121,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
         std::vector<AccessorRefArg> outArgs;
-        llvm::Value* outAddr = resolveOutAddrWithBracket(
-            *call.args[1].value, et, outArgs);
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[1], lowerPrimitive(pt), et, outArgs);
         if (!outAddr) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
@@ -1181,7 +1181,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // tower member; each narrower width range-checks the strtoll result the
     // same way int always did (#1134). ulong parses via strtoull (full width).
     if (m == "TryParse" && call.args.size() == 2 &&
-        call.args[0].value && call.args[1].value &&
+        call.args[0].value && (call.args[1].value || call.args[1].isDiscard) &&
         (pt == P::Int || pt == P::Long || pt == P::UInt || pt == P::ULong ||
          pt == P::Short || pt == P::UShort || pt == P::Byte ||
          pt == P::SByte)) {
@@ -1197,8 +1197,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // mediated; the write-back flushes at the normal-return exit below.
         llvm::Type* et = nullptr;
         std::vector<AccessorRefArg> outArgs;
-        llvm::Value* outAddr = resolveOutAddrWithBracket(
-            *call.args[1].value, et, outArgs);
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[1], lowerPrimitive(pt), et, outArgs);
         if (!outAddr) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
@@ -1277,15 +1277,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // Accepts "true"/"false" case-insensitively; everything else → false, ok=false.
     // Unlike Convert.ToBoolean, "1" is NOT accepted (only the two canonical words).
     if (pt == P::Bool && m == "TryParse" && call.args.size() == 2 &&
-        call.args[0].value && call.args[1].value) {
+        call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
         // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
         std::vector<AccessorRefArg> outArgs;
-        llvm::Value* outAddr = resolveOutAddrWithBracket(
-            *call.args[1].value, et, outArgs);
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[1], lowerPrimitive(P::Bool), et, outArgs);
         if (!outAddr) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;

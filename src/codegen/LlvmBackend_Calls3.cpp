@@ -3594,12 +3594,16 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // param), returning true; on empty return false and leave the out param
     // unchanged. Before this fix it fell through → malformed IR (bug16).
     if ((m == "TryPopFirst" || m == "TryPopLast") &&
-        call.args.size() == 1 && call.args[0].value) {
+        call.args.size() == 1 &&
+        (call.args[0].value || call.args[0].isDiscard)) {
         // fix #2938 / §22.3: see TryPop in Calls.cpp.
         llvm::Type* outTy = nullptr;
         std::vector<AccessorRefArg> outArgs;
-        llvm::Value* outAddr = resolveOutAddrWithBracket(
-            *call.args[0].value, outTy, outArgs);
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[0],
+            tryOutNullableSlotTy(recvTy && !recvTy->genericArgs.empty()
+                                     ? recvTy->genericArgs[0] : nullptr),
+            outTy, outArgs);
         if (!outAddr) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
@@ -3631,6 +3635,12 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         auto* phi = builder_.CreatePHI(i1(), 2, "lltrypop.r");
         phi->addIncoming(builder_.getTrue(), foundBB);
         phi->addIncoming(builder_.getFalse(), preBB);
+        // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
+        // unbound owned temporary — dispose it (null-guarded) after the call.
+        if (call.args[0].isDiscard)
+            disposeDiscardedOwnedOut(
+                    outAddr, recvTy && !recvTy->genericArgs.empty()
+                                 ? recvTy->genericArgs[0] : nullptr);
         return phi;
     }
     // --- RemoveFirst() ---
@@ -5023,7 +5033,8 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                     if (isRead) {
                         // TryRead*(out value: T): bool
                         // out parameter is call.args[0]
-                        if (call.args.empty() || !call.args[0].value) {
+                        if (call.args.empty() ||
+                            !(call.args[0].value || call.args[0].isDiscard)) {
                             builder_.SetInsertPoint(okBB);
                             builder_.CreateBr(endBB);
                             builder_.SetInsertPoint(failBB);
@@ -5040,8 +5051,14 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                         // merge block.
                         llvm::Type* outTy = nullptr;
                         std::vector<AccessorRefArg> outArgs;
-                        llvm::Value* outAddr = resolveOutAddrWithBracket(
-                            *call.args[0].value, outTy, outArgs);
+                        // fix #5289 (§17.13 / §22.6): `out _` → scratch of T.
+                        llvm::Value* outAddr = resolveBuiltinOutArg(
+                            call.args[0],
+                            isFloat ? (byteWidth == 4
+                                           ? llvm::Type::getFloatTy(llvm_)
+                                           : llvm::Type::getDoubleTy(llvm_))
+                                    : static_cast<llvm::Type*>(intTy),
+                            outTy, outArgs);
                         if (!outAddr) {
                             emitAccessorRefArgWriteBacks(outArgs,
                                                          /*emit=*/false);
@@ -5250,7 +5267,7 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             //     to inner type, then build {i8=1, innerVal} and store.
             //   - pointer outEty (class/string): store rawItem directly.
             if (mname == "TryReceive" && call.args.size() == 1 &&
-                call.args[0].value) {
+                (call.args[0].value || call.args[0].isDiscard)) {
                 // The out argument's address. // fix #2938 / §22.3
                 // Pre-fix the fallback was a temp slot — a null lvalueAddr
                 // silently dropped the write. resolveOutAddrWithBracket falls
@@ -5258,8 +5275,14 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 // caller's property/indexer on normal return.
                 llvm::Type* outEty = nullptr;
                 std::vector<AccessorRefArg> outArgs;
-                llvm::Value* outSlot = resolveOutAddrWithBracket(
-                    *call.args[0].value, outEty, outArgs);
+                // fix #5289 (§17.13 / §22.6): an `out _` discard gets a scratch
+                // `T?` slot, then disposes a received owned class value.
+                const sema::TypeRef* chElem =
+                    !recvTy->genericArgs.empty() ? recvTy->genericArgs[0]
+                                                  : nullptr;
+                llvm::Value* outSlot = resolveBuiltinOutArg(
+                    call.args[0], tryOutNullableSlotTy(chElem), outEty,
+                    outArgs);
                 if (!outSlot) {
                     // The previous fallback path was a scratch slot; with the
                     // bracket, no fallback is needed — the slot is always
@@ -5336,7 +5359,11 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 builder_.SetInsertPoint(contBB);
                 // fix #2938 / §22.3: flush any bracket on the normal-return edge.
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
-                return builder_.CreateICmpNE(ok, builder_.getInt32(0), "ch.try.r");
+                llvm::Value* tryRecvOk =
+                    builder_.CreateICmpNE(ok, builder_.getInt32(0), "ch.try.r");
+                if (call.args[0].isDiscard)
+                    disposeDiscardedOwnedOut(outSlot, chElem);
+                return tryRecvOk;
             }
 
             // Count → int64.

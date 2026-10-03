@@ -6602,15 +6602,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // #1476 — same missing-handler root cause (no codegen dispatch existed
         // for either method on a class-typed OwningSet receiver).
         if (m == "TryTake" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value &&
+            call.args[0].value &&
+            (call.args[1].value || call.args[1].isDiscard) &&
             isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
             llvm::Value* query = lowerExpr(*call.args[0].value);
             if (!query) return nullptr;
             // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[1].value, outTy, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], ptrTy(), outTy, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -6665,6 +6666,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi2 = builder_.CreatePHI(i1(), 2, "tt.r");
             phi2->addIncoming(builder_.getTrue(), foundEnd);
             phi2->addIncoming(builder_.getFalse(), condBB);
+            // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
+            // unbound owned temporary — dispose it (null-guarded) after the call.
+            if (call.args[1].isDiscard)
+                disposeDiscardedOwnedOut(
+                    outAddr, recvTy && !recvTy->genericArgs.empty()
+                                 ? recvTy->genericArgs[0] : nullptr);
             return phi2;
         }
         // per §4.5: .Insert(index, item) — insert at index, shifting up. For an
@@ -6972,12 +6979,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // an Owned* collection). TryPeek never removes. Modeled on Pop/Dequeue +
         // the TryGetValue out-write; bz_array_len/get/remove_at already exist.
         if ((m == "TryPop" || m == "TryDequeue" || m == "TryPeek") &&
-            call.args.size() == 1 && call.args[0].value) {
+            call.args.size() == 1 &&
+            (call.args[0].value || call.args[0].isDiscard)) {
             // fix #2938 / §22.3: see TryGetValue above.
+            // fix #5289 (§17.13 / §22.6): an `out _` discard gets a scratch
+            // `T?` slot (the tagged struct for a value instantiation).
             llvm::Type* outTy = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[0].value, outTy, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[0],
+                tryOutNullableSlotTy(recvTy && !recvTy->genericArgs.empty()
+                                         ? recvTy->genericArgs[0] : nullptr),
+                outTy, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -7109,12 +7122,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // handler and the result was a non-i1 value used as a branch condition →
         // malformed IR (bug16). Modeled on TryPop + the PopFirst/PopLast pop.
         if ((m == "TryPopFirst" || m == "TryPopLast") &&
-            call.args.size() == 1 && call.args[0].value) {
+            call.args.size() == 1 &&
+            (call.args[0].value || call.args[0].isDiscard)) {
             // fix #2938 / §22.3: see TryPop above.
             llvm::Type* outTy = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[0].value, outTy, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[0],
+                tryOutNullableSlotTy(recvTy && !recvTy->genericArgs.empty()
+                                         ? recvTy->genericArgs[0] : nullptr),
+                outTy, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -7160,6 +7177,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "trypopfl.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
+            // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
+            // unbound owned temporary — dispose it (null-guarded) after the call.
+            if (call.args[0].isDiscard)
+                disposeDiscardedOwnedOut(
+                    outAddr, recvTy && !recvTy->genericArgs.empty()
+                                 ? recvTy->genericArgs[0] : nullptr);
             return phi;
         }
         // .Clear()
@@ -8622,14 +8645,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // through to no handler → bz_dict_try_get was never emitted and the
         // result was a wrong/always-false bool (#831, bug15).
         if (m == "TryPopValue" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value &&
+            (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[1].value, outTy, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], valTy ? lowerTypeRef(valTy) : ptrTy(), outTy,
+                outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -8694,6 +8719,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             // fix #2938 / §22.3: flush any bracket on the normal-return edge.
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+            if (call.args[1].isDiscard)  // fix #5289 (§22.6, §28.3)
+                disposeDiscardedOwnedOut(outAddr, valTy);
             return found;
         }
         // .TryGetValue(k, out v): bool
@@ -10271,12 +10298,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             if (btn653 == "Weak") {
                 if (mname == "TryUpgrade" && call.args.size() == 1 &&
-                    call.args[0].value) {
+                    (call.args[0].value || call.args[0].isDiscard)) {
                     // fix #2938 / §22.3: see TryGetValue above.
+                    // fix #5289 (§22.6): `out _` gets a scratch handle slot.
                     llvm::Type* slotTy = nullptr;
                     std::vector<AccessorRefArg> outArgs;
-                    llvm::Value* outAddr = resolveOutAddrWithBracket(
-                        *call.args[0].value, slotTy, outArgs);
+                    llvm::Value* outAddr = resolveBuiltinOutArg(
+                        call.args[0], ptrTy(), slotTy, outArgs);
                     if (!outAddr) {
                         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                         return builder_.getFalse();
@@ -10287,6 +10315,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                                          "weak.tryupgrade");
                     // fix #2938 / §22.3: flush any bracket on the normal-return edge.
                     emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+                    if (call.args[0].isDiscard)  // fix #5289 (§28.3)
+                        releaseDiscardedSharedOut(outAddr);
                     return builder_.CreateICmpNE(r, builder_.getInt32(0),
                                                  "weak.upgraded");
                 }
@@ -10978,7 +11008,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // int.TryParse strtoll-with-endptr + range-check + whitespace-reject
         // (#1238 / #1227 / §9.1).
         if (m == "TryToInt32" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
@@ -10986,8 +11016,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // fix #2938 / §22.3: see TryGetValue in tryLowerBuiltinClassCall.
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[1].value, et, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], lowerPrimitive(sema::PrimitiveType::Int), et, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -11029,15 +11059,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         // per stdlib §2.3 / #1356: Convert.TryToInt64(value: string, out result: long): bool.
         if (m == "TryToInt64" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et64 = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr64 = resolveOutAddrWithBracket(
-                *call.args[1].value, et64, outArgs);
+            llvm::Value* outAddr64 = resolveBuiltinOutArg(
+                call.args[1], lowerPrimitive(sema::PrimitiveType::Long), et64, outArgs);
             if (!outAddr64) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -11067,15 +11097,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         // per stdlib §2.3 / #1356: Convert.TryToDouble(value: string, out result: double): bool.
         if (m == "TryToDouble" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* etd = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddrd = resolveOutAddrWithBracket(
-                *call.args[1].value, etd, outArgs);
+            llvm::Value* outAddrd = resolveBuiltinOutArg(
+                call.args[1], lowerPrimitive(sema::PrimitiveType::Double), etd, outArgs);
             if (!outAddrd) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -11112,7 +11142,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         // per stdlib §2.3 / #1356: Convert.TryToDecimal(value: string, out result: decimal): bool.
         if (m == "TryToDecimal" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::StructType* dst = decimalStructType();
@@ -11127,8 +11157,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // gating changes — so the assignment runs unconditionally.
             llvm::Type* etdec = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddrdec = resolveOutAddrWithBracket(
-                *call.args[1].value, etdec, outArgs);
+            llvm::Value* outAddrdec = resolveBuiltinOutArg(
+                call.args[1], lowerPrimitive(sema::PrimitiveType::Decimal), etdec, outArgs);
             if (!outAddrdec) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -11143,7 +11173,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         // per stdlib §2.3 / #1356: Convert.TryToBoolean(value: string, out result: bool): bool.
         if (m == "TryToBoolean" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
@@ -11173,8 +11203,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // assignment runs unconditionally.
             llvm::Type* etb = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddrb = resolveOutAddrWithBracket(
-                *call.args[1].value, etb, outArgs);
+            llvm::Value* outAddrb = resolveBuiltinOutArg(
+                call.args[1], lowerPrimitive(sema::PrimitiveType::Bool), etb, outArgs);
             if (!outAddrb) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 // (return nullptr would skip the ok computation below; the
@@ -12169,7 +12199,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Not `pure` (§22.15): a pure member declares no `out`.
         if (m == "DivRem" && call.args.size() == 3 &&
             call.args[0].value && call.args[1].value &&
-            call.args[2].value) {
+            (call.args[2].value || call.args[2].isDiscard)) {
             llvm::Value* a = lowerExpr(*call.args[0].value);
             llvm::Value* b = lowerExpr(*call.args[1].value);
             if (!a || !b) return nullptr;
@@ -12223,8 +12253,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // `out remainder` — same pattern as Convert.TryToInt32 (#2938).
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[2].value, et, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[2], remainder->getType(), et, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -13013,7 +13043,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
 
         // Decimal.TryParse(s: string, out result: decimal): bool
         if (m == "TryParse" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::AllocaInst* slot = makeDecSlot();
@@ -13028,8 +13058,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // bracket flushes below.
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[1].value, et, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], dst, et, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -13107,15 +13137,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Boolean.TryParse(s: string, out result: bool): bool
         // Accepts "true"/"false" case-insensitively; everything else → false.
         if (m == "TryParse" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[1].value, et, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], lowerPrimitive(sema::PrimitiveType::Bool), et, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -13229,15 +13259,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
 
         // Guid.TryParse(s: string, out result: Guid): bool
         if (m == "TryParse" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             const ast::Expr* parseArg = call.args[0].value.get();
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[1].value, et, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], guidStructType(), et, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -13348,14 +13378,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         // per §2.5 / #648: DateTime.TryParse(s: string, out result: DateTime): bool
         if (m == "TryParse" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+            call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddr = resolveOutAddrWithBracket(
-                *call.args[1].value, et, outArgs);
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], i64(), et, outArgs);
             if (!outAddr) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -14276,7 +14306,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateTrunc(builder_.CreateSDiv(ticks, tpd), i32(), "do.dn");
         }
         // DateOnly.TryParse(s: string, out result: DateOnly): bool
-        if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+        if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             auto* ticksSlot = entryAlloca(i64());
@@ -14288,8 +14318,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // below.
             llvm::Type* etdo = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddrdo = resolveOutAddrWithBracket(
-                *call.args[1].value, etdo, outArgs);
+            llvm::Value* outAddrdo = resolveBuiltinOutArg(
+                call.args[1], i32(), etdo, outArgs);
             if (!outAddrdo) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -14373,7 +14403,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateLoad(i32(), msSlot, "to.parsed");
         }
         // TimeOnly.TryParse(s: string, out result: TimeOnly): bool
-        if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+        if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             auto* msSlot = entryAlloca(i32());
@@ -14382,8 +14412,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // fix #2938 / §22.3: see Convert.TryToDecimal above.
             llvm::Type* etto = nullptr;
             std::vector<AccessorRefArg> outArgs;
-            llvm::Value* outAddrto = resolveOutAddrWithBracket(
-                *call.args[1].value, etto, outArgs);
+            llvm::Value* outAddrto = resolveBuiltinOutArg(
+                call.args[1], i32(), etto, outArgs);
             if (!outAddrto) {
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
@@ -14474,7 +14504,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     // bz_weak_try_upgrade(weak_handle, &out_slot) → int (1=success).
                     // The out-slot was pre-created in ensureOutVarSlots.
                     if (mname == "TryUpgrade" && call.args.size() == 1 &&
-                        call.args[0].value) {
+                        (call.args[0].value || call.args[0].isDiscard)) {
                         // fix #2938 / §22.3: a property or indexer slot target
                         // is admitted by §22.3 and resolves through the §22.3
                         // copy-in/copy-out bracket; `lvalueAddr` alone declines,
@@ -14483,8 +14513,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         // for the normal-return write-back flush below.
                         llvm::Type* slotTy = nullptr;
                         std::vector<AccessorRefArg> outArgs;
-                        llvm::Value* outAddr = resolveOutAddrWithBracket(
-                            *call.args[0].value, slotTy, outArgs);
+                        llvm::Value* outAddr = resolveBuiltinOutArg(
+                            call.args[0], ptrTy(), slotTy, outArgs);
                         if (!outAddr) {
                             emitAccessorRefArgWriteBacks(outArgs,
                                                          /*emit=*/false);
@@ -14497,6 +14527,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         // fix #2938 / §22.3: flush any bracket on the
                         // normal-return edge.
                         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+                        if (call.args[0].isDiscard)  // fix #5289 (§28.3)
+                            releaseDiscardedSharedOut(outAddr);
                         return builder_.CreateICmpNE(r, builder_.getInt32(0),
                                                      "weak.upgraded");
                     }
