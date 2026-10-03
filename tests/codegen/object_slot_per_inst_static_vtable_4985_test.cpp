@@ -203,6 +203,19 @@ end Program;
 // Two distinct B<int> instances must hash identically because the body's
 // per-inst static IS the source of the hash — pinning that the override is
 // reached, not the default.
+//
+// The receivers are typed `Object`, NOT `D<int>`. That is load-bearing, and it
+// is what makes this row a FAIL-WITHOUT pin rather than a vacuous pass. With
+// a statically-typed `var d1 := new D<int>()` receiver the call site knows the
+// exact override and devirtualizes to a direct call, so it never reads the
+// vtable slot and passes on pre-fix code too — MEASURED on the R26 lane
+// 4985-cherry re-derivation: the `D<int>`-typed and `B<int>`-typed variants
+// both printed "101\n101\n" with the (e) gate re-inserted, i.e. they passed
+// against the UNFIXED compiler. Widening to `Object` puts the call back
+// through the vtable's FIXED Object slot 5, and the same program then prints
+// "1\n1\n" pre-fix (the erased template body GEP'd the untouched placeholder
+// cell `bz$M.B$_c`, so `B<T>._c + 1` read 0 + 1) against "101\n101\n"
+// post-fix (the per-inst thunk reads `bz$M.B$int$_c`).
 BEZEL_TEST(object_slot_per_inst_static_vtable_4985,
            gethashcode_override_reaches_per_inst_cell) {
     expectBoth(R"BZL(
@@ -219,8 +232,10 @@ public class Program
     var d1 := new D<int>();
     var d2 := new D<int>();
     B<int>._c := 100;
-    Console.WriteLine(d1.GetHashCode());
-    Console.WriteLine(d2.GetHashCode());
+    var o1: Object := d1;
+    var o2: Object := d2;
+    Console.WriteLine(o1.GetHashCode());
+    Console.WriteLine(o2.GetHashCode());
     return 0;
   end Main;
 end Program;
