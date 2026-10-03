@@ -2727,6 +2727,7 @@ private:
     // symbols are bound), and the #1188 out-argument invalidation already
     // cleared the recipient — this re-establishes it on the matching branch.
     bool narrowFromOutPostcond(const ast::Expr* cond, bool forTrueBranch);
+    bool narrowFromBuiltinShapeA(const ast::CallExpr* ce, bool forTrueBranch);
 
     // The resolved declared TypeRef of a local or parameter symbol, or null for
     // any other symbol kind (or when the type is unresolved). Used by

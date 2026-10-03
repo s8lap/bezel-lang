@@ -13965,7 +13965,7 @@ bool ExprTC::narrowFromOutPostcond(const ast::Expr* cond, bool forTrueBranch) {
     auto* ce = dynamic_cast<const ast::CallExpr*>(cond);
     if (!ce || !ce->callee) return false;
     auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce->callee));
-    if (!ms) return false;
+    if (!ms) return narrowFromBuiltinShapeA(ce, forTrueBranch);
     bool any = false;
     for (std::size_t j = 0;
          j < ms->params.size() && j < ce->args.size(); ++j) {
@@ -13990,6 +13990,75 @@ bool ExprTC::narrowFromOutPostcond(const ast::Expr* cond, bool forTrueBranch) {
         any = true;
     }
     return any;
+}
+
+// §22.4 / §7.11 (stdlib §1, v0.313; fix #5312): the BUILTIN shape-(a) Try
+// members have no MethodSymbol (no declaration to carry the clause), yet stdlib
+// §1 makes the `when true` postcondition normative for "every shape-(a) member"
+// (the table's (a) row names them). The caller-side narrowing is therefore
+// applied here by receiver type + member name, from the stdlib listing:
+//   Stack/OwningStack  TryPop/TryPeek (out at 0); Queue/OwningQueue
+//   TryDequeue/TryPeek (0); OwningArray/OwningLinkedList TryPopFirst/TryPopLast
+//   (0); Channel TryReceive (0); Dictionary/SortedDictionary/OwningDictionary
+//   TryGetValue(key, out) (1); OwningDictionary TryPopValue(key, out) (1);
+//   OwningSet TryPop(query, out) (1). (`OwningSlotMap`, the other shape-(a)
+//   holder, is not yet a type in this compiler.) `IParsable<T>.TryParse` is a
+//   synthesized MethodSymbol and takes the declared-clause path above. Only a
+//   BUILTIN receiver counts (`!declaration`, as at the out-var typing site): a
+//   user type of the same name has a MethodSymbol and a clause only if it
+//   declares one (§22.4: "an undeclared method keeps requiring the explicit
+//   `!`").
+bool ExprTC::narrowFromBuiltinShapeA(const ast::CallExpr* ce,
+                                     bool forTrueBranch) {
+    if (!forTrueBranch) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+    if (!ma || !ma->target) return false;
+    const TypeRef* rt = ctx_.exprType(*ma->target);
+    if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration ||
+        !rt->astNode)
+        return false;
+    const std::string_view cn = rt->headName();
+    const std::string_view mn = ma->member;
+    int outPos = -1;
+    auto isOneOf = [&](std::initializer_list<std::string_view> l,
+                       std::string_view x) {
+        for (auto v : l)
+            if (v == x) return true;
+        return false;
+    };
+    if (isOneOf({"Stack", "OwningStack"}, cn) &&
+        isOneOf({"TryPop", "TryPeek"}, mn))
+        outPos = 0;
+    else if (isOneOf({"Queue", "OwningQueue"}, cn) &&
+             isOneOf({"TryDequeue", "TryPeek"}, mn))
+        outPos = 0;
+    else if (isOneOf({"OwningArray", "OwningLinkedList"}, cn) &&
+             isOneOf({"TryPopFirst", "TryPopLast"}, mn))
+        outPos = 0;
+    else if (cn == "Channel" && mn == "TryReceive")
+        outPos = 0;
+    else if (isOneOf({"Dictionary", "SortedDictionary", "OwningDictionary"},
+                     cn) &&
+             mn == "TryGetValue")
+        outPos = 1;
+    else if (cn == "OwningDictionary" && mn == "TryPopValue")
+        outPos = 1;
+    else if (cn == "OwningSet" && mn == "TryPop")
+        outPos = 1;
+    if (outPos < 0 || ce->args.size() != static_cast<std::size_t>(outPos) + 1)
+        return false;
+    const auto& a = ce->args[outPos];
+    if (!(a.modifier == "out" || a.modifier == "out var" ||
+          a.modifier == "out using var" || a.modifier == "out owned var") ||
+        !a.value)
+        return false;
+    Symbol* recip = ctx_.exprSymbol(*a.value);
+    if (!recip) return false;
+    if (!dynamic_cast<LocalSymbol*>(recip) &&
+        !dynamic_cast<ParameterSymbol*>(recip))
+        return false;
+    nullNarrowed_.insert(recip);
+    return true;
 }
 
 // §22.4 (v0.183, #1585): callee-side postcondition check at a return point.
