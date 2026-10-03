@@ -10644,6 +10644,42 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (tsym == ctx_.builtinClassSym("Task")) cls = "Task";
         }
     }
+    // fix #5272 (§2.3 / §2.7 / §3.4 v0.313, stdlib §2.3): the ~24 static-call
+    // arms below are keyed on the receiver's IDENTIFIER TEXT, so a user class
+    // that takes a builtin's spelling silently lowered the BUILTIN member
+    // instead of the user's own — the #4691 family, reached here with a
+    // memory-safety consequence: a user `class Convert` with a static
+    // `TryToDouble(s: string, out r: int)` lowered the builtin `strtod` arm,
+    // which wrote a `double` (8 bytes) through the 4-byte `int` out-slot the
+    // USER signature declared (§22.4 — the inline `out r` slot is typed from the
+    // method's own `out` parameter declaration), an ASan stack-buffer-overflow,
+    // WRITE of size 8. Sema had resolved the callee to the user's
+    // `MethodSymbol` all along; only codegen discarded it. Measured the same
+    // shadowing with no memory fault on a user `class Math` whose static
+    // `Sqrt(d: double): double` returned 7.0 — `Math.Sqrt(2.0)` printed
+    // 1.4142135623730951 (the builtin arm) and the user's method never ran, so
+    // the whole text-keyed family is wrong, not just Convert.
+    //
+    // §2.3: of the always-available names, only §3.4's reserved row (the
+    // PascalCase primitive aliases and `String`) cannot be shadowed — "every
+    // other always-available name may be shadowed by local declarations under
+    // the normal name-resolution rules", which §2.7 gives: the current-module
+    // declaration wins the bare name and the auto-imported one stays reachable
+    // by its qualified name (`System.Convert.ToInt32`). `Convert` is in neither
+    // reserved set, so a user class may take the spelling and MUST win. These
+    // arms may therefore be reached only by a receiver sema resolved to the
+    // synthetic builtin class symbol. `builtinClassSym` is shaped
+    // `decl == nullptr && moduleName.empty()` (the #2997 discriminator
+    // `builtinTypeName` above documents): a user's TypeSymbol carries a real
+    // ast::TypeDecl in-module, or a populated moduleName when imported. When
+    // sema stamps nothing on the receiver the symbol is null and `cls` stands —
+    // the pre-existing behaviour, so an unresolved receiver never loses a builtin
+    // arm it used to reach.
+    if (!cls.empty()) {
+        if (auto* tsym = dynamic_cast<sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target))) {
+            if (tsym->decl || !tsym->moduleName.empty()) cls = {};
+        }
+    }
     const auto& m = ma->member;
 
     // stdlib §10.1/§10.2/§10.3 / §32.6 / fix #977: CString / WString / RawBytes
