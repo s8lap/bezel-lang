@@ -168,8 +168,12 @@ codegen_string_index_arg_release_2717.named_local_index_with_object_element_is_n
 codegen_generic_indexer_asT_bang_4914.asT_bang_indexer_getter_leaks_but_no_memory_error_spec_17_4_17_8  # status:trade spec §17.4/§17.8: the `(k as T)!` generic indexer-getter element is not released (#2717 residual; replaces the 00af1a60-dropped bare_generic_element_via_this row). tests/codegen/generic_indexer_asT_bang_4914_test.cpp:107
 codegen_string_local_copy_release_2764.alias_stored_into_class_field_still_leaks_spec_28_9  # status:trade spec §28.9: an alias stored into a class field still leaks. tests/codegen/string_local_copy_release_2764_test.cpp:692
 codegen_string_local_copy_release_2764.using_var_copy_target_is_deliberately_excluded_spec_28_10  # status:trade spec §28.10: a `using var` copy target is deliberately excluded. tests/codegen/string_local_copy_release_2764_test.cpp:740
-dict_shadow_class_string_key_guard_3897.shadow_dict_indexer_aliasing_getter_not_armed_spec_23_4  # status:trade spec §23.4: a shadowed-dict indexer aliasing getter is not armed by the guard. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:235
-dict_shadow_class_string_key_guard_3897.shadow_dict_generic_method_aliasing_return_not_armed_spec_28_9  # status:trade spec §28.9: a shadowed-dict generic method aliasing its return is not armed. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:253
+dict_shadow_class_string_key_guard_3897.shadow_dict_indexer_aliasing_getter_not_armed_spec_23_4  # status:trade spec §23.4: a shadowed-dict indexer aliasing getter is not armed by the guard. tests/codegen/dict_shadow_class_string_key_guard_3897_test.cpp:269
+# The former sibling entry `...shadow_dict_generic_method_aliasing_return_not_armed_spec_28_9`
+# (spec §28.9, the #1430 generic-method escape exclusion) was REMOVED at #5300/#5301: that
+# exclusion was narrowed to bare-type-parameter returns, the row no longer leaks, and it is
+# renamed `..._aliasing_return_clean_after_5300_spec_28_9` asserting the clean outcome. The
+# indexer-getter row above still pins its #2746-item-3 residual and keeps its exemption.
 
 # ── pattern (c): expectLeakNotCrash(prog) — 4 rows, 1 file ─────────────────
 using_var_discard_vtableless_builtin_4224.shared_using_var_discard_looped_leaks_not_crashes  # status:trade #4224: a discarded `using var Shared<T>` builtin outside emitVtablelessBuiltinRelease's coverage leaks (not crashes) under repetition. tests/codegen/using_var_discard_vtableless_builtin_wild_jump_4224_test.cpp:180

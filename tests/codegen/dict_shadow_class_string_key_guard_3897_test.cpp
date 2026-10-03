@@ -61,13 +61,21 @@
 // Case (B) exercises `dictMethodStrKeySafe` (the walkCallArgs arm) via a
 // GENERIC method `ContainsKey<U>(k: U): U => k;` on the shadowing class. A
 // generic method's `sema::MethodSymbol` has non-empty `genericParams`, which
-// `walkCallArgs`'s existing `ms`-gated #1430 general relaxation deliberately
-// excludes (`if (ms && (... || !ms->genericParams.empty() || ...)) ms =
-// nullptr;`) — so, unlike an ORDINARY (non-generic) resolved method (already
-// covered, soundly, by #1430 regardless of this fix), this shape isolates
+// `walkCallArgs`'s `ms`-gated #1430 general relaxation excluded WHOLESALE
+// (`if (ms && (... || !ms->genericParams.empty() || ...)) ms = nullptr;`)
+// — so, unlike an ORDINARY (non-generic) resolved method (already covered,
+// soundly, by #1430 regardless of this fix), this shape isolated
 // `dictMethodStrKeySafe`'s OWN structural-name-only relaxation as the sole
 // path that could mark the argument safe, exactly mirroring case (A)'s
 // isolation of `dictStrKeySafe`.
+//
+// #5300/#5301 (§28.3 *Bare-type-parameter returns*) narrowed that exclusion
+// from WHOLESALE to "generic AND NOT a bare-type-parameter return"
+// (`!ms->genericParams.empty() && !methodReturnsBareTypeParam(ctx, ms)`), and
+// `U` here is exactly such a return. So the argument is now admitted as a
+// borrow source by the general #1430 relaxation, the local's scope-end
+// release arms, and case (B) no longer leaks — the sanctioned flip recorded
+// at its own row below.
 //
 // Case (C) is a NEGATIVE control: a shadowing class whose indexer element is
 // `int` (cannot alias the `string` key) is unaffected by this fix either way
@@ -87,9 +95,11 @@
 //
 // FAIL-WITHOUT / PASS-WITH (this file, filter
 // `dict_shadow_class_string_key_guard_3897`, bezel_tests_codegen):
-//   PASS-WITH (this commit): checked rows for (A)/(B) report a leak and
-//   EXPLICITLY not a memory error; (C)'s checked row reports clean (no
-//   report at all); all three value rows return the documented constant.
+//   PASS-WITH (this commit): (A)'s checked row reports a leak and EXPLICITLY
+//   not a memory error; (B)'s checked row reports CLEAN (200 calls, no
+//   report at all — see its own comment for the flip and the FORWARD-LOOKING
+//   note that sanctioned it); (C)'s checked row reports clean; all three
+//   value rows return the documented constant.
 //   FAIL-WITHOUT (LlvmBackend_impl.hpp / LlvmBackend_Calls.cpp /
 //   LlvmBackend_Setup.cpp reverted to this branch's pre-fix HEAD,
 //   bezel_tests_codegen RELINKED via `--area codegen` before rerunning — not
@@ -117,6 +127,16 @@ namespace {
 // limitation is ever tightened, these rows FLIP from leak-assertion to
 // clean-assertion. That flip is EXPECTED, not a regression: update the
 // rows, do not revert the tightening.
+//
+// CASE B HAS NOW FLIPPED — at #5300/#5301 (the §28.3 bare-type-parameter
+// return copy at a runtime-managed substitution tightened walkCallArgs'
+// generic-method exclusion, so a plain parameter of a bare-type-parameter
+// RETURN is now admitted as a borrow SOURCE and the local's scope-end
+// release arms). The case-B row is renamed
+// `..._aliasing_return_clean_after_5300_spec_28_9` and now asserts the
+// CLEAN outcome — the flip this comment predicted, taken as sanctioned.
+// CASE A still pins its #2746-item-3 residual and is deliberately left
+// asserting the leak: the aliasing-GETTER exclusion was NOT tightened.
 // absent — mirrors string_index_arg_release_2717_test.cpp /
 // dict_call_arg_key_local_release_3886_test.cpp.
 bool wasSkipped(const JitResult& r) {
@@ -176,6 +196,18 @@ const char* kShadowDictIndexerAliasingGetter =
 // empty()` exclusion), isolating dictMethodStrKeySafe's structural-name-only
 // relaxation as the only thing that could mark `s` safe. Returns 4, same as
 // (A) — the shapes are deliberately parallel.
+//
+// AMPLIFIED 10x20 = 200 CALLS (fix-forward at #5300/#5301). When this
+// program is asserted CLEAN, LSan has to see 200 rounds of the accounting
+// before the "no leak" verdict means anything; at the original 20 it would
+// pass on a much smaller sample of the same balance. The OUTER repeat loop
+// (rather than widening the inner range) is what keeps the pinned constant
+// at 4: the last assignment is still `i = 20`, so `last` is still "y-20".
+// The balance under the tightened walker is exactly closed at 200 calls:
+// 200 calls mint 200 result +1, 199 are discharged by the plain store into
+// `last` overwriting the previous value, and the 200th by `last`'s own
+// scope-end release; 200 `s` locals each carry a +1 that their scope-end
+// release now discharges (the leak this file used to pin).
 // =====================================================================
 const char* kShadowDictGenericMethodAliasingReturn =
     "module M; class Dictionary<T> "
@@ -185,11 +217,13 @@ const char* kShadowDictGenericMethodAliasingReturn =
     "  public static method Main(): int "
     "    using var e := new Dictionary<string>(); "
     "    var last: string? := null; "
-    "    for var i in 1..20 do "
-    "      var s := $\"y-{i}\"; "
-    "      last := e.ContainsKey(s); "     // plain store: raw alias, no retain
-    "      var churn := $\"churn-churn-churn-{i}-{i}-{i}\"; "
-    "      if churn.Length < 0 then return 99; end; "
+    "    for var round in 1..10 do "
+    "      for var i in 1..20 do "
+    "        var s := $\"y-{i}\"; "
+    "        last := e.ContainsKey(s); "   // plain store: raw alias, no retain
+    "        var churn := $\"churn-churn-churn-{round}-{i}-{i}\"; "
+    "        if churn.Length < 0 then return 99; end; "
+    "      end; "
     "    end; "
     "    return last!.Length; "            // 4
     "  end Main; "
@@ -246,11 +280,39 @@ BEZEL_TEST(dict_shadow_class_string_key_guard_3897,
 // (B)
 // ---------------------------------------------------------------------
 BEZEL_TEST(dict_shadow_class_string_key_guard_3897,
-           shadow_dict_generic_method_aliasing_return_not_armed_spec_28_9) {
-    // The load-bearing gate: pre-fix this is `heap-use-after-free` in main.
+           shadow_dict_generic_method_aliasing_return_clean_after_5300_spec_28_9) {
+    // BEHAVIOR FLIP, sanctioned by this file's own FORWARD-LOOKING comment
+    // above (fix-forward for #5300/#5301, §28.3 *Bare-type-parameter
+    // returns* / §28.9, v0.313).
+    //
+    // WAS: `expectLeakButNoMemoryError(r)` — this row ASSERTED the residual
+    // leak, "detected memory leaks" had to be PRESENT. The comment named the
+    // pinned limitation precisely: "the general #1430 generic-method escape
+    // exclusion for case B", and said a tightening of it flips the row and
+    // the row is to be updated rather than the tightening reverted.
+    //
+    // NOW: the tightening landed. `ContainsKey<U>(k: U): U` declares a bare
+    // type-parameter return keyed PRE-substitution, and at `U = string` §28.3's
+    // callee-side rule 1 makes the return path a COPY — the call site mints
+    // the result's own +1 (LlvmBackend_Calls2.cpp's lowerCallDispatch) while
+    // the argument, a PLAIN parameter, is a borrow SOURCE (§28.3 clause 4:
+    // "`owned` parameters are never sources", so a plain one is). walkCallArgs
+    // no longer nulls `ms` for this callee, so `s`'s scope-end release arms
+    // and the per-call leak is gone. The row now asserts the CLEAN outcome,
+    // amplified to 200 calls (see the program's comment), and KEEPS the
+    // memory-error half of the old helper: arming a release is only safe if
+    // it does not free something still read, so heap-use-after-free,
+    // double-free and SEGV must all be absent. "no leak" alone would pass on
+    // a program that simply stopped running.
     JitResult r = runAotChecked(kShadowDictGenericMethodAliasingReturn);
     if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);
+    const std::string t = sanitizerText(r);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);          // the aliasing return still survives
+    BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("heap-use-after-free") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("double-free") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("SEGV") == std::string::npos);
 }
 
 BEZEL_TEST(dict_shadow_class_string_key_guard_3897,
