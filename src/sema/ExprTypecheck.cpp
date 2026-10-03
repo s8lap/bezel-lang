@@ -13344,6 +13344,12 @@ void ExprTC::bindNestedDestructuringNames(
             // now keyed on the SUBSTITUTED slot type per the rule the
             // four caller loops already follow.
             checkOrderingPatternOverNullableType(fieldTy, s.pattern.get());
+            // §19.3 (v0.313, #5235 fix-forward): the "has an ordering at all"
+            // half of the same rule, on the same key — the SLOT's declared
+            // type. `record Q(A: Object)` + `Q(> 5)` is the same §19.3
+            // violation as `case o of > 5`, and without this call it reached
+            // codegen and emitted `icmp sgt ptr %obj, i32 5`.
+            checkOrderingPatternOverUnorderedType(fieldTy, s.pattern.get());
             if (!s.nakedBinding.empty()) {
                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                 lsym->name = s.nakedBinding;
@@ -13495,36 +13501,56 @@ void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
     // relop arm over the same Object scrutinee is the same error restated,
     // and repeating it per arm would bury the one that matters.
     for (const ast::CaseArm& arm : arms) {
-        // Iterative walk, mirroring checkOrderingPatternOverNullableType
-        // above: A.7 admits relationals and ranges as `|`-joined alternative
-        // members, so `> 5 | < 1` parses as an AltPattern WRAPPING the two
-        // RelOpPatterns and a single-node dynamic_cast sees none of them. The
-        // gate walks no tree otherwise, and the arm reaches codegen to emit
-        // `icmp sgt ptr %obj, i32 5` — the same malformed IR this gate exists
-        // to prevent (#5235). Members go back on the QUEUE rather than being
-        // tested once: A.7's `Pattern` production does not itself include
-        // AltPattern, so an alternation cannot nest today (`> 5 | (< 1 | = 3)`
-        // is a §17.1 precedence parse error), but the walk costs one `push`
-        // and keeps this gate structurally identical to the nullable sibling
-        // instead of encoding "a member is never an alternation" as a second
-        // assumption that a future A.7 amendment would silently break.
-        std::vector<const ast::Pattern*> queue{arm.pattern.get()};
-        while (!queue.empty()) {
-            const ast::Pattern* q = queue.back();
-            queue.pop_back();
-            if (!q) continue;
-            if (dynamic_cast<const ast::RelOpPattern*>(q) ||
-                dynamic_cast<const ast::RangePattern*>(q)) {
-                ctx_.diagnostics().report(
-                    Severity::Error, q->span.begin,
-                    "a relational or range pattern cannot be used with an "
-                    "Object scrutinee (\xC2\xA7""19.3) — Object has no defined "
-                    "ordering");
-                return;
-            }
-            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
-                for (const auto& m : ap->members) queue.push_back(m.get());
+        checkOrderingPatternOverUnorderedType(scrutTy, arm.pattern.get());
+        return;
+    }
+}
+
+// §19.3 (v0.313, #5235 fix-forward): the "has an ordering at all" half of the
+// gate above, keyed on a SLOT's own declared type. §19.3 spells the same rule
+// for a slot's right-hand side that it spells for an arm head — "Each slot's
+// right-hand side is a full pattern … a range, a relational, …", matched
+// "under the ordering of the scrutinee's type", where a slot's scrutinee is
+// the slot's declared type. `record Q(A: Object)` + `case o of Q(> 5)` is
+// therefore the same §19.3 violation as `case o of > 5`, and pre-fix it
+// emitted the identical `icmp sgt ptr %16, i32 5` (MEASURED on this branch's
+// parent: verifyModule failed with "Both operands to ICmp instruction are not
+// of the same type!"). `checkOrderingPatternOverUnorderedScrutinee` walks arms
+// only, and never visits a `DestructuringPattern`, so the slot spelling
+// reached codegen — the same class of hole the nullable sibling closed for
+// `Object?` at #3692.
+//
+// The walk body is deliberately identical to the nullable sibling's and to the
+// arm-level loop above: A.7 admits relationals and ranges as `|`-joined
+// alternative members, so `> 5 | < 1` parses as an AltPattern WRAPPING the two
+// RelOpPatterns and a single-node dynamic_cast sees neither. Members go back
+// on the QUEUE rather than being tested once: A.7's `Pattern` production does
+// not itself include AltPattern, so an alternation cannot nest today
+// (`> 5 | (< 1 | = 3)` is a §17.1 precedence parse error), but the walk costs
+// one `push` and keeps this gate structurally identical to the nullable
+// sibling instead of encoding "a member is never an alternation" as a second
+// assumption a future A.7 amendment would silently break.
+void ExprTC::checkOrderingPatternOverUnorderedType(
+        const TypeRef* ty, const ast::Pattern* pat) {
+    if (!ty || ty->kind != TypeRef::Kind::Primitive ||
+        ty->primitive != PrimitiveType::Object || !pat)
+        return;
+    std::vector<const ast::Pattern*> queue{pat};
+    while (!queue.empty()) {
+        const ast::Pattern* q = queue.back();
+        queue.pop_back();
+        if (!q) continue;
+        if (dynamic_cast<const ast::RelOpPattern*>(q) ||
+            dynamic_cast<const ast::RangePattern*>(q)) {
+            ctx_.diagnostics().report(
+                Severity::Error, q->span.begin,
+                "a relational or range pattern cannot be used with an "
+                "Object scrutinee (\xC2\xA7""19.3) — Object has no defined "
+                "ordering");
+            return;
         }
+        if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+            for (const auto& m : ap->members) queue.push_back(m.get());
     }
 }
 
@@ -23240,6 +23266,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // an ordering sub-pattern is admitted here.
                             checkOrderingPatternOverNullableType(
                                 fieldTy, sp.pattern.get());
+                            // §19.3 (v0.313, #5235 fix-forward): ordering
+                            // half on the SLOT's declared type — see the
+                            // header comment on
+                            // checkOrderingPatternOverUnorderedType.
+                            checkOrderingPatternOverUnorderedType(
+                                fieldTy, sp.pattern.get());
                             if (!sp.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = sp.nakedBinding;
@@ -23579,6 +23611,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // the choice-case call site above for the rationale.
                     checkOrderingPatternOverNullableType(fieldTy,
                                                          sp.pattern.get());
+                    // §19.3 (v0.313, #5235 fix-forward): ordering half on the
+                    // SLOT's declared type — see the header comment on
+                    // checkOrderingPatternOverUnorderedType.
+                    checkOrderingPatternOverUnorderedType(fieldTy,
+                                                          sp.pattern.get());
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
                         // Use the PositionalPattern's address (stable since

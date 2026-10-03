@@ -12763,6 +12763,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             // an ordering sub-pattern is admitted here.
                             checkOrderingPatternOverNullableType(
                                 fieldTy, sp.pattern.get());
+                            // §19.3 (v0.313, #5235 fix-forward): ordering
+                            // half on the SLOT's declared type — see the
+                            // header comment on
+                            // checkOrderingPatternOverUnorderedType.
+                            checkOrderingPatternOverUnorderedType(
+                                fieldTy, sp.pattern.get());
                             if (!sp.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = sp.nakedBinding;
@@ -13128,6 +13134,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // the choice-case call site above for the rationale.
                     checkOrderingPatternOverNullableType(fieldTy,
                                                          sp.pattern.get());
+                    // §19.3 (v0.313, #5235 fix-forward): ordering half on the
+                    // SLOT's declared type — see the header comment on
+                    // checkOrderingPatternOverUnorderedType.
+                    checkOrderingPatternOverUnorderedType(fieldTy,
+                                                          sp.pattern.get());
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();

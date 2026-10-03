@@ -2797,6 +2797,27 @@ private:
     void checkOrderingPatternsOverUnorderedScrutinee(
         const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms);
 
+    // §19.3 (v0.313, #5235 fix-forward): the single-pattern half of
+    // `checkOrderingPatternsOverUnorderedScrutinee`, factored out for the
+    // reason `checkOrderingPatternOverNullableType` below was (#3692): a
+    // destructuring SLOT's sub-pattern is matched against the SLOT's own
+    // declared type, which need not be the arm scrutinee's type, so the
+    // "has an ordering at all" half of the same §19.3 requirement must be
+    // keyed on `ty` — the slot type — at the same five slot-resolution sites
+    // the nullable sibling already serves.
+    //
+    // MEASURED: with the arm-level gate alone, `record Q(A: Object)` +
+    // `case o of Q(> 5)` (an Object scrutinee, relational in the SLOT) still
+    // emitted `icmp sgt ptr %16, i32 5` — the verbatim defect #5235 exists to
+    // eliminate, reached by a different spelling. §19.3: "Each slot's
+    // right-hand side is a full pattern … a range, a relational, …", compared
+    // under the ordering of the slot's type; `Object` has none, exactly as at
+    // the arm. Same narrow scope: `PrimitiveType::Object` only, so an ordered
+    // slot type (`record Q(A: int)` + `Q(> 5)`) is untouched, and the
+    // user-declared-operator question stays #5269's open spec-question.
+    void checkOrderingPatternOverUnorderedType(const TypeRef* ty,
+                                               const ast::Pattern* pat);
+
     // §19.3 (v0.294, #3692): the single-pattern walk `
     // checkOrderingPatternsOverNullableScrutinee` runs per arm — factored out
     // so a destructuring SLOT's sub-pattern can be checked against ITS OWN

@@ -240,6 +240,77 @@ BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
     BEZEL_EXPECT_EQ(1, r.exitCode);
 }
 
+// §19.3 (v0.313, #5235 fix-forward): the DESTRUCTURING-SLOT spelling. §19.3
+// states the same rule for a slot's right-hand side that it states for an arm
+// head — "Each slot's right-hand side is a full pattern … a range, a
+// relational, …" — and a slot's scrutinee is the SLOT's own declared type.
+// `record Q(A: Object)` + `case o of Q(> 5)` is therefore the same §19.3
+// violation as `case o of > 5`, reached by a different spelling.
+//
+// MEASURED on this branch's parent: it compiled through sema and reached
+// codegen, which emitted `icmp sgt ptr %16, i32 5` and failed verifyModule
+// with "Both operands to ICmp instruction are not of the same type!" — the
+// verbatim defect #5235 exists to eliminate. The arm-level walk descends
+// `AltPattern::members` and never visits a `DestructuringPattern`, so the slot
+// was unreachable to it; the nullable sibling (`Object?`) already covered this
+// site (#3692), which is the asymmetry this row pins shut.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           destructuring_slot_relop_over_object_rejected) {
+    auto r = runAot(
+        "module M; "
+        "record Q(A: Object) end Q; "
+        "class P "
+        "  public static method Main(): int "
+        "    var o: Object := null; "
+        "    return (case o of Q(> 5) => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}
+
+// The same slot with the `|`-ALTERNATION spelling. A.7 admits relationals and
+// ranges as `|`-joined alternative members in a PositionalPattern too, so
+// `Q(> 5 | < 1)` is the two-relational arm spelling inside the slot; pre-fix
+// it emitted the malformed compare TWICE. Pinned separately because the slot
+// walk is a different code path from the arm walk and an alternation inside it
+// must be descended the same way.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           destructuring_slot_alt_relop_over_object_rejected) {
+    auto r = runAot(
+        "module M; "
+        "record Q(A: Object) end Q; "
+        "class P "
+        "  public static method Main(): int "
+        "    var o: Object := null; "
+        "    return (case o of Q(> 5 | < 1) => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}
+
+// CONTROL — the slot gate keys on the SLOT's DECLARED type, exactly as the
+// nullable sibling's slot gate does, so widening the check from the arm to the
+// slot must not fire on an ordered slot type. `record Q(A: int)` + `Q(> 5)`
+// takes the identical AST shape as the reject row above and differs only in
+// the slot's declared type; it must still compile and still return 1 (Q(7),
+// and 7 > 5). If this row ever flips, the slot check has over-reached.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           destructuring_slot_int_relop_over_ordered_rejected_accepts) {
+    auto r = runAot(
+        "module M; "
+        "record Q(A: int) end Q; "
+        "class P "
+        "  public static method Main(): int "
+        "    var q := new Q(7); "
+        "    return (case q of Q(> 5) => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(1, r.exitCode);
+}
+
 // NARROW-SCOPE GUARD. Whether a user type that DECLARES comparison operators
 // counts as having "the ordering of the scrutinee's type" (§19.3) is the open
 // spec-question in #5269 (owner-ruled, NOT this lane's to decide). This fix
