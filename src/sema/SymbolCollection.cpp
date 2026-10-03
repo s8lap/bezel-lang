@@ -66,14 +66,15 @@ std::string moduleDottedName(const ModuleSymbol* mod) {
 // unreserved identifier either. §3.4's reserved-name rule rests on the
 // keyword/PascalCase dual form, and `Object` has no lowercase keyword alias
 // (spec §3.4: "there is no `object` spelling"), so this predicate is the wrong
-// home for it. Its reservation is a separate, narrower rule: §8.1 (v0.311,
-// unchanged at v0.313)
-// bans a user module-level, zero-arity type declaration named `Object` — a
-// class, record, enum, interface, choice or type alias, at any visibility in
-// any user module — and permits every other declaration of the name (a generic
-// `Object<T>` under §2.2 arity keying; a nested type or type parameter, which
-// shadow the root under §2.7). That check is emitted at the two sites that see
-// the whole declaration shape: collectTypeDecl (guarded on
+// home for it. Its reservation is a separate, narrower rule — §8.1 (v0.311,
+// unchanged at v0.313): "User code cannot redeclare or replace `Object`. The
+// ban is on a user module-level type declaration — a class, record, enum,
+// interface, choice or type alias — named `Object` with no type parameters,
+// in any user module and at any visibility." §8.1 permits every other
+// declaration of the name (a generic `Object<T>` is a different name, §2.2
+// arity keying; a nested type or type parameter shadows the root under §2.7).
+// That check is emitted at the two sites that see the whole declaration shape:
+// collectTypeDecl (guarded on
 // `enclosingTypePath.empty() && genericParams.empty()`) and collectTopDecl's
 // TypeAlias branch. A method-local `Object` is §21.10's error, a separate rule.
 //
@@ -466,13 +467,17 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
             "declared as a user type — it names a built-in primitive value type "
             "through its lowercase keyword alias; choose a different name");
     }
-    // fix #5187 (spec §8.1, v0.311): the ban on a user module-level non-
-    // generic type declaration named `Object`. A generic `Object<T>`,
-    // a nested type, and a type parameter named `Object` are ordinary
-    // declarations that shadow the root; only the bare, top-level, zero-
-    // arity `Object` is reserved — the same `Object` the stdlib §2.3
-    // Row 1 core type table keys on and stdlib §2.13 rule 1 renders
-    // `"System.Object"` for. The diagnostic message includes the word
+    // fix #5187 (spec §8.1, v0.311, unchanged at v0.313): the ban on a user
+    // module-level non-generic type declaration named `Object` — "User code
+    // cannot redeclare or replace `Object`. The ban is on a user module-level
+    // type declaration — a class, record, enum, interface, choice or type
+    // alias — named `Object` with no type parameters, in any user module and
+    // at any visibility." A generic `Object<T>`, a nested type, and a type
+    // parameter named `Object` are ordinary declarations that shadow the
+    // root (§8.1's own carve-outs; §2.2 arity keying and §2.7); only the bare,
+    // top-level, zero-arity `Object` is reserved — the same `Object` the
+    // stdlib §2.3 Row 1 core type table keys on and stdlib §2.13 rule 1
+    // renders `"System.Object"` for. The diagnostic message includes the word
     // `redeclare` to keep the §8.1 corpus case's (`s8_1_0001`,
     // baseline.tsv:256) needle functional when the banked divergence is
     // retired. The symbol is still registered so later passes have a
@@ -606,16 +611,23 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
     if (auto* alias = dynamic_cast<const ast::TypeAlias*>(&decl)) {
         auto* sym = ctx.makeSymbol<TypeAliasSymbol>();
         sym->name = alias->name;
-        // fix #5187 (spec §8.1, v0.311): a top-level type alias named
-        // `Object` is the same reserved-name violation as a top-level
-        // class/record/enum/interface named `Object` — a type alias is a
-        // top-level type declaration per §27.8, so the §8.1 ban applies.
+        // fix #5187 (spec §8.1, v0.311, unchanged at v0.313): a top-level
+        // type alias named `Object` is the same reserved-name violation as
+        // a top-level class/record/enum/interface/choice named `Object`.
+        // §8.1 is the authority and names the alias form itself in its own
+        // terms: "User code cannot redeclare or replace `Object`. The ban is
+        // on a user module-level type declaration — a class, record, enum,
+        // interface, choice or type alias — named `Object` with no type
+        // parameters, in any user module and at any visibility." The alias
+        // is a top-level declaration by §27.8 ("Type aliases may be declared
+        // at module level. A module-level alias is always **module-internal**"),
+        // so it lands inside §8.1's ban with no separate rule required.
         // The symbol is still registered so later passes have a well-formed
         // type to resolve against; the diagnostic makes the program a
         // compile error. Generic type-parameter aliases (e.g.
-        // `type Object<T> := List<T>;`) are outside the ban per the issue's
-        // scope rule (a generic is an ordinary declaration that shadows the
-        // root, like `public class Object<T>`).
+        // `type Object<T> := List<T>;`) are outside the ban per §8.1's own
+        // carve-out ("a generic `Object<T>` is a different name", §2.2), the
+        // same rule that exempts `public class Object<T>`.
         if (alias->name == "Object" && alias->genericParams.empty()) {
             ctx.diagnostics().report(
                 Severity::Error, alias->span.begin,

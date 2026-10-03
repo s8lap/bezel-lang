@@ -1,19 +1,26 @@
-// Regression tests for issue #5187 (spec §8.1, v0.311).
+// Regression tests for issue #5187 (spec §8.1, v0.311, unchanged at
+// v0.313).
 //
 // AUTHORITY:
 //
-//   §8.1 *Definition* — "`Object` is the universal base type … user code
-//   cannot redeclare or replace `Object`." The ban scope is the bare
-//   module-level, zero-arity `Object`: a generic `Object<T>` (a §11.6
-//   generic instantiation shadows the root under §2.7), a nested
-//   `Object` (a §13.2 nested type shadows the root under §2.7), and a
-//   type-parameter named `Object` (a §11.8 type parameter shadows the
-//   root under §2.7) all remain ordinary declarations per the issue's
-//   scope rule.
+//   §8.1 *Definition* — "`Object` is the universal root." The ban, in
+//   the same section's own words: "User code cannot redeclare or
+//   replace `Object`. The ban is on a user module-level type declaration
+//   — a class, record, enum, interface, choice or type alias — named
+//   `Object` with no type parameters, in any user module and at any
+//   visibility." The ban scope is therefore the bare module-level,
+//   zero-arity `Object`. §8.1's next sentence permits every other
+//   declaration of the name: "a generic `Object<T>` is a different name
+//   (§2.2); a nested type or a type parameter named `Object` shadows the
+//   root under §2.7 …" — so a generic instantiation, a nested `Object`
+//   (§11.6) and a type-parameter named `Object` all remain ordinary
+//   declarations.
 //
-//   §27.8 *Type aliases* — "A type alias is a top-level type
-//   declaration," so the §8.1 ban applies identically to a module-level
-//   `type Object := int;`.
+//   §27.8 *Type aliases* — "Type aliases may be declared at module
+//   level. A module-level alias is always **module-internal**", so a
+//   module-level `type Object := int;` is a module-level type
+//   declaration and falls under §8.1's ban, which names "type alias"
+//   among its six banned declaration kinds.
 //
 // The diagnostic message includes the word `redeclare` to keep the §8.1
 // corpus case's (`s8_1_0001`, baseline.tsv:256) needle functional when
@@ -60,8 +67,9 @@ BEZEL_TEST(object_module_level_ban_5187, public_class_object_rejected) {
 }
 
 // §27.8 + §8.1: a module-level type alias named `Object` is also
-// rejected (a type alias is a top-level type declaration, so the §8.1
-// ban applies identically to the alias form).
+// rejected. §8.1's ban names "type alias" among the declaration kinds
+// it covers, and §27.8 makes a module-level alias a module-level
+// declaration, so the ban applies to the alias form identically.
 BEZEL_TEST(object_module_level_ban_5187, type_alias_object_rejected) {
     BEZEL_EXPECT_TRUE(diagContains(
         "module M; "
