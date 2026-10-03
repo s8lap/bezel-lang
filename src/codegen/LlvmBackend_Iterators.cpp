@@ -379,6 +379,9 @@ namespace {
 // declared `out owned` / bare `out` (isOutOwnedArgPosition) forms, which bind
 // an ALREADY-EXISTING LocalDecl's own slot — collectSuspendLocals already
 // frame-backs that slot for the same reason it frame-backs any other local.
+// fix #5275 (§22.3 / §28.9, v0.313): RefArgSite (the `ref`-argument site record
+// the two new collectors below produce) is declared in LlvmBackend_impl.hpp, next
+// to the two Emitter members that pass it across translation units.
 struct OutVarSlotCollector {
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out;
     llvm::Type* fieldTy;
@@ -387,14 +390,70 @@ struct OutVarSlotCollector {
     // assigns it, writing the caller's own binding through the pointer). Null
     // for the frame-slot reservation walks, which are unchanged.
     std::vector<const ast::IdentifierExpr*>* byRefArgs = nullptr;
+    // fix #5275 (§22.3, v0.313): the `ref`-argument twin of `byRefArgs` above,
+    // carrying the callee and positional index so the caller-side analysis can
+    // consult the CALLEE's body (see RefArgSite). Null everywhere else.
+    std::vector<RefArgSite>* refArgSites = nullptr;
+    // fix #5275 (§22.3 / §28.9, v0.313): WRITE-PROFILE mode. With `scanCtx` and
+    // `writeTarget` both set, this collector no longer gathers recipients — it
+    // profiles the ONE tracked `ref`/`out` formal `writeTarget` over `stmts`,
+    // answering three questions Emitter::refFormalWriteVerdict needs:
+    //   * `targetAssigned` — is it an assignment target anywhere? (that store is
+    //     lowerStringRefParamStore, whose release-old DISCHARGES the caller's
+    //     slot value — §22.3's "true alias" plus §28.9's exactly-once rule);
+    //   * `targetOnward` — is it passed as a `ref`/`out` argument itself? (the
+    //     same discharge happens one level down, so counting it keeps a
+    //     ref-forwarding chain from terminating early at a read-only leaf);
+    //   * `targetCaptured` — is it REFERENCED inside a lambda body? (the
+    //     capture-store's own comment, LlvmBackend_Exprs2.cpp: "A captured
+    //     ref/out param … stays at semaTy = nullptr: it borrows the caller's
+    //     storage and the envdtor releases nothing" — so the envdtor releases
+    //     nothing AND the capture store retains nothing: the closure ALIASES
+    //     the caller's slot value without owning it. This is the one channel
+    //     that makes a scope-end release of the slot unsafe, and the only
+    //     reason the release gate is narrower than the retain gate. §27.5 is
+    //     the closure/capture-cell rule but states no retain/refcount detail,
+    //     so the code comment is the citation for the refcount half.)
+    // `lambdaDepth` is the in-lambda marker that separates a CAPTURE (an
+    // escape) from an ordinary use.
+    const sema::SemaContext* scanCtx = nullptr;
+    const sema::Symbol* writeTarget = nullptr;
+    bool targetAssigned = false;
+    bool targetOnward = false;
+    bool targetCaptured = false;
+    int lambdaDepth = 0;
 
-    void considerArgs(const std::vector<ast::CallArgument>& args) {
-        for (auto& a : args) {
+    // fix #5275: is `e` the bare identifier naming the tracked formal?
+    bool isWriteTarget(const ast::Expr* e) const {
+        if (!writeTarget || !scanCtx) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        return id && scanCtx->exprSymbol(*id) == writeTarget;
+    }
+
+    void considerArgs(const std::vector<ast::CallArgument>& args,
+                      const ast::Expr* callee = nullptr) {
+        for (size_t i = 0; i < args.size(); ++i) {
+            const ast::CallArgument& a = args[i];
             if (!a.value) continue;
             if (byRefArgs && a.modifier == "out")
                 if (auto* id =
                         dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
                     byRefArgs->push_back(id);
+            // fix #5275: the `ref` twin. §22.3 "The caller writes `ref` at the
+            // call site", so `a.modifier == "ref"` is the whole spelling test;
+            // the callee/index pair is recorded so the caller-side analysis can
+            // consult the callee's body for a write to the formal. The
+            // `targetOnward` test is deliberately independent of the modifier
+            // being `ref`: an onward `out` argument discharges the slot just
+            // the same, and a ref-forwarding chain through either modifier must
+            // not terminate at this level.
+            if (isWriteTarget(a.value.get()) &&
+                (a.modifier == "ref" || a.modifier == "out"))
+                targetOnward = true;
+            if (refArgSites && a.modifier == "ref")
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                    refArgSites->push_back({id, callee, i});
             // fix #3981: "out var" (registerOutVarStringRelease /
             // registerCtorOutVarStringRelease's `string` disposal) and
             // "out using var" (ensureOutVarSlots' / ensureCtorOutVarSlots'
@@ -419,22 +478,44 @@ struct OutVarSlotCollector {
     // before descending into each argument value.
     void expr(const ast::Expr* e) {
         if (!e) return;
+        // fix #5275 (§27.5 / §28.9, v0.313): a reference to the tracked `ref`
+        // formal from INSIDE a lambda body is a CAPTURE — the capture-store
+        // gives a captured `ref`/`out` param semaTy = nullptr (see its own
+        // comment in LlvmBackend_Exprs2.cpp), so the envdtor releases nothing
+        // and the store retains nothing; the closure aliases the caller's slot
+        // value without owning a reference of its own. Every other use of the
+        // identifier (an ordinary read, a field/member path's root) is one of
+        // the channels that DOES mint its own +1.
+        if (lambdaDepth > 0 && isWriteTarget(e)) targetCaptured = true;
         // A lambda body compiles as its own function with its own suspend/
         // frame domain (if any) — its out-var call sites are that frame's
         // business, not this one's. Do not descend.
-        if (dynamic_cast<const ast::LambdaExpr*>(e)) return;
+        if (auto* le = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            // fix #5275: EXCEPT in write-profile mode, where descending is the
+            // whole point (a capture of the tracked formal is exactly what
+            // `targetCaptured` measures). The lambda's OWN parameters shadow any
+            // same-named outer binding and resolve to a different symbol, so
+            // `isWriteTarget` correctly excludes them; nothing else in the
+            // profile changes meaning inside a lambda, so `lambdaDepth` gates
+            // only the capture flag.
+            if (!writeTarget) return;
+            ++lambdaDepth;
+            for (auto& st : le->stmts) stmt(st.get());
+            expr(le->exprBody.get());
+            --lambdaDepth;
+            return; }
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
             expr(m->target.get()); return; }
         if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
             expr(m->target.get()); return; }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
             expr(c->callee.get());
-            considerArgs(c->args);
+            considerArgs(c->args, c->callee.get());
             for (auto& a : c->args) expr(a.value.get());
             return; }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             expr(c->callee.get());
-            considerArgs(c->args);
+            considerArgs(c->args, c->callee.get());
             for (auto& a : c->args) expr(a.value.get());
             return; }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
@@ -458,7 +539,7 @@ struct OutVarSlotCollector {
             expr(r->lo.get()); expr(r->hi.get()); expr(r->step.get());
             return; }
         if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
-            considerArgs(n->args);
+            considerArgs(n->args, /*callee=*/nullptr);
             for (auto& a : n->args) expr(a.value.get());
             return; }
         if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
@@ -496,6 +577,16 @@ struct OutVarSlotCollector {
         if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
             expr(ts->value.get()); return; }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // fix #5275 (§22.3 / §28.9, v0.313): a store to the tracked `ref`
+            // formal. A BARE-IDENTIFIER target is the shape that reaches
+            // lowerStringRefParamStore, whose release-old discharges whatever
+            // the CALLER's slot held; a member/index target does not (a
+            // `ref`-parameter may not be a receiver store, §9.4, and a
+            // field/index chain is copied in and out per §22.3's accessor
+            // bracket), so only the bare form counts.
+            if (dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
+                isWriteTarget(as->target.get()))
+                targetAssigned = true;
             expr(as->target.get()); expr(as->value.get()); return; }
         if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
             expr(inc->target.get()); return; }
@@ -558,9 +649,18 @@ void Emitter::collectOutVarSuspendLocals(
 // own scope). retainAssignedStringParams counts such an argument naming a
 // by-value `string` / `string?` parameter as a WRITE of that parameter: the
 // callee's lowerStringRefParamStore releases the slot's old value, which must
-// therefore be a reference this frame owns. A `ref` argument is NOT counted:
-// a callee that only reads it would turn the retain into a per-call leak, and
-// the escape walk keeps `ref` an escape, so no release could pair it.
+// therefore be a reference this frame owns.
+//
+// fix #5275 (§22.3 / §28.9, v0.313): a `ref` argument is counted only when the
+// CALLEE'S OWN BODY shows the callee can write through that formal (see
+// collectRefArgSites below and Emitter::refFormalWriteVerdict). The reason for
+// the split, unchanged from #5253: `ref` has no "the callee definitely assigns
+// it" guarantee, so a `ref` callee that only READS the formal discharges
+// nothing — retaining for it unconditionally is a per-call leak, and the escape
+// walk keeps `ref` an escape, so no release could pair the retain. What DOES
+// discharge the caller's slot value is the callee's own `r := …` (which routes
+// through lowerStringRefParamStore, §22.3's "true alias" plus §28.9's
+// exactly-once rule), and that is decidable at the call site.
 void Emitter::collectByRefArgIdents(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<const ast::IdentifierExpr*>& out) {
@@ -568,6 +668,55 @@ void Emitter::collectByRefArgIdents(
     OutVarSlotCollector c{unused, ptrTy()};
     c.byRefArgs = &out;
     for (auto& s : body) c.stmt(s.get());
+}
+
+
+// fix #5275 (§22.3 / §28.9, v0.313): the `ref`-argument twin of
+// collectByRefArgIdents — every bare-identifier `ref` argument in `body`, with
+// the callee expression and POSITIONAL index each was passed at. Callers
+// resolve the callee themselves (refFormalWriteVerdict does, and it must apply
+// walkCallArgs' own admission test to that resolution, which this collector has
+// no business duplicating). Same scope: no descent into lambda bodies.
+void Emitter::collectRefArgSites(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<RefArgSite>& out) {
+    std::vector<std::pair<const ast::Node*, llvm::Type*>> unused;
+    OutVarSlotCollector c{unused, ptrTy()};
+    c.refArgSites = &out;
+    for (auto& s : body) c.stmt(s.get());
+}
+
+
+// fix #5275 (§22.3 / §28.9, v0.313): profile the tracked `ref`/`out` formal
+// `sym` over the CALLEE's own `body`, answering the three questions
+// refFormalWriteVerdict turns into a verdict: is it assigned (a store that
+// discharges the caller's slot), is it passed onward `ref`/`out` (the same
+// discharge one level down), and is it captured by a lambda (the one channel
+// that aliases the caller's value without minting a +1 of its own). The
+// callee's expression body is walked too — an expression body can still carry
+// an onward `ref` argument at an argument position.
+void profileRefFormalWrites(const sema::SemaContext& ctx,
+                                     const sema::Symbol* sym,
+                                     const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                                     const ast::Expr* exprBody,
+                                     bool& assigned, bool& onward, bool& captured) {
+    std::vector<std::pair<const ast::Node*, llvm::Type*>> unused;
+    // `fieldTy` is null here and MUST stay unread on this path: it is read by
+    // exactly one line of the collector — the `out var` / `out using var`
+    // frame-reservation push in considerArgs — and write-profile mode never
+    // takes it (it reads neither `out`/`out using var` modifier, and
+    // `refArgSites` / `byRefArgs` are both null). A free function has no
+    // `ptrTy()` to offer, and the alternative — making this an Emitter member
+    // just to reach it — is what the declaration comment in
+    // LlvmBackend_impl.hpp rules out.
+    OutVarSlotCollector c{unused, /*fieldTy=*/nullptr};
+    c.scanCtx = &ctx;
+    c.writeTarget = sym;
+    for (auto& s : body) c.stmt(s.get());
+    c.expr(exprBody);
+    assigned = c.targetAssigned;
+    onward = c.targetOnward;
+    captured = c.targetCaptured;
 }
 
 

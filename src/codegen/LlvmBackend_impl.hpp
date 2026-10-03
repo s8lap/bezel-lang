@@ -53,6 +53,64 @@
 
 namespace bezel::codegen {
 
+// fix #5275 (§22.3 / §28.9, v0.313): one bare-identifier `ref` ARGUMENT site
+// in a body — the argument, the callee expression it is passed to, and its
+// POSITIONAL index. Declared in this shared header (not beside
+// OutVarSlotCollector) because the Emitter member that produces it,
+// collectRefArgSites, and the member that consumes it,
+// retainAssignedStringParams, live in different translation units.
+// The callee and index are what let the caller-side analysis ask the CALLEE's
+// own body whether that formal is a `string` one it can WRITE THROUGH, rather
+// than treating every `ref` argument as a write (which #5253 measured to be
+// wrong for a read-only `ref` callee: a per-call leak, since the escape walk
+// keeps `ref` an escape and no release could pair the retain).
+struct RefArgSite {
+    const ast::IdentifierExpr* id = nullptr;
+    const ast::Expr* callee = nullptr;
+    size_t index = 0;
+};
+
+// fix #5275 (§22.3 / §28.9, v0.313): the caller's write-analysis verdict for a
+// `ref` argument's formal. `NoWrite` is the safe default and covers every shape
+// the callee cannot be statically proven to write through (an imported or
+// generic callee, a non-`string` formal, a `ref` callee that only reads).
+enum class RefFormalVerdict {
+    // The callee provably never discharges the caller's slot value: today's
+    // behavior, unchanged — no bind-time retain, `ref` stays an escape.
+    NoWrite,
+    // The callee can discharge the caller's slot value, so the slot must own a
+    // reference for it (retainAssignedStringParams mints one) — but the callee
+    // may also ALIAS that value beyond the call (a closure capture, which by the
+    // capture-store's own comment neither retains at the capture store nor
+    // releases in the envdtor), so no
+    // scope-end release is armed. The retained +1 then leaks per call, which is
+    // the safe direction: a retain can never create an over-release.
+    WriteAliased,
+    // The callee can discharge the caller's slot value and provably cannot alias
+    // it beyond the call, so the slot owns a reference for the whole body: the
+    // bind-time retain AND a scope-end release of the final value.
+    WriteOwned,
+};
+
+// fix #5275 (§22.3 / §28.9, v0.313): profile the tracked `ref`/`out` formal
+// `sym` over the CALLEE's own body + expression body, reporting whether it is
+// ASSIGNED (a store that discharges the caller's slot value), passed onward
+// `ref`/`out` (the same discharge one level down), and CAPTURED by a lambda (the
+// one channel that aliases the caller's value without minting a +1 of its own).
+// The `exprBody` arm is walked because an expression body can still carry an
+// onward `ref` argument at an argument position.
+//
+// A NAMESPACE-SCOPE function rather than an Emitter member: one of its two
+// consumers is refFormalWriteVerdict's caller StringEscapeWalker — a file-local
+// struct holding only a `const sema::SemaContext&` and no Emitter — and reaching
+// a private member from there would need a friendship the walker cannot be named
+// from this header.
+void profileRefFormalWrites(
+    const sema::SemaContext& ctx, const sema::Symbol* sym,
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    const ast::Expr* exprBody,
+    bool& assigned, bool& onward, bool& captured);
+
 // fix #2717 / §23.4 / §28.9 (v0.240): can an indexer whose ELEMENT type is `t`
 // yield a value that IS the `string` index argument passed to it?
 //
@@ -13601,6 +13659,38 @@ private:
     void collectByRefArgIdents(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<const ast::IdentifierExpr*>& out);
+
+    // fix #5275 (§22.3 / §28.9, v0.313): the `ref`-argument twin of
+    // collectByRefArgIdents — every bare-identifier `ref` argument in `body`,
+    // with the callee expression and POSITIONAL index each was passed at. The
+    // callee is NOT resolved here: refFormalWriteVerdict applies walkCallArgs'
+    // own admission test to that resolution, and duplicating it in a collector
+    // that has no other business knowing it is exactly the drift CLAUDE.md
+    // rule 6 forbids. Same scope: no descent into lambda bodies.
+    void collectRefArgSites(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        std::vector<RefArgSite>& out);
+
+    // fix #5275 (§22.3 / §28.9, v0.313): the caller's verdict on a `ref`
+    // argument's formal — can the callee at `callee` DISCHARGE the value the
+    // caller's slot holds, and does it provably leave no alias of that value
+    // behind? — is `refFormalWriteVerdict`, a FILE-LOCAL function in
+    // LlvmBackend_Setup.cpp next to the callee-admission filter it shares with
+    // StringEscapeWalker::walkCallArgs, and is deliberately NOT an Emitter
+    // member: its second consumer is that walker, which holds only a
+    // `const sema::SemaContext&` and no Emitter. The verdict enum
+    // (RefFormalVerdict) is at the top of this header because both the producer
+    // and both consumers name it.
+    //
+    // Admitted callees are exactly walkCallArgs' #1430 set: a resolved
+    // user/imported MethodSymbol that is not an operator, not an extension, not
+    // generic — plus, for the body walk, a locally-compiled one (an IMPORTED
+    // callee has no `ms->decl` AST here, so nothing can be proven about its
+    // body and it falls to NoWrite, which is today's behavior). The formal must
+    // be `ref` (NOT `out` — #5253's arm already covers that modifier, and
+    // §22.3's "the callee must assign every `out` parameter" makes a body walk
+    // redundant there) and of `string` / `string?` type, the exact surface
+    // lowerStringRefParamStore balances.
 
     // §29.3 / §30.2 (#2132): inside a state-machine body (iterator or async), a
     // suspend-live local's alloca must be mapped to its reserved frame field via

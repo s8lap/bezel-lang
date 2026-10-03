@@ -25800,6 +25800,125 @@ void Emitter::armClosureLocalRefcount(const void* declNode,
 }
 
 
+
+// fix #5275 (§22.3 / §28.9, v0.313): the call-side `ref`-write analysis —
+// refFormalWriteVerdict below plus the callee-admission filter it shares with
+// StringEscapeWalker::walkCallArgs, placed here so both are visible to the two
+// consumers (retainAssignedStringParams' step 2c, and walkCallArgs' `ref` arm).
+
+
+// fix #5275 (§22.3 / §28.9, v0.313): the #1430 `ms` admission test, extracted
+// so walkCallArgs below and refFormalWriteVerdict (which asks the same question
+// of the same callee) cannot drift apart — a second copy of this filter is
+// exactly the risk CLAUDE.md rule 6 names. A MethodSymbol that fails ANY clause
+// is null, meaning "no compiled body here to hold the discipline", which is the
+// conservative direction both callers want.
+static const sema::MethodSymbol* plainBorrowAnalysisCallee(
+        const sema::SemaContext& ctx, const ast::Expr* callee) {
+    if (!callee) return nullptr;
+    auto* ms = dynamic_cast<const sema::MethodSymbol*>(
+        ctx.exprSymbol(*callee));
+    if (ms && (ms->isOperator || ms->extensionDecl ||
+               !ms->genericParams.empty() ||
+               (ms->decl == nullptr && !ctx.isImported(ms))))
+        return nullptr;
+    return ms;
+}
+
+
+// fix #5275 (§22.3 / §28.9, v0.313): the caller's verdict on a `ref` argument's
+// formal. See the declaration in LlvmBackend_impl.hpp for the verdict's three
+// cases and why the `out` modifier is excluded (its own #5253 arm already counts
+// it, unconditionally and without a body walk — §22.3's "the callee must assign
+// every `out` parameter on every normal-completion path" makes the walk
+// redundant there, and reusing the arm would change #5253's proven rows).
+//
+// WHAT IS BEING PROVEN. §22.3: "A `ref` argument naming a mutable local or
+// writable field is a true alias: callee writes are visible through the caller's
+// location immediately." So when the callee WRITES the formal, the store is an
+// ordinary assignment to the caller's slot, and lowerStringRefParamStore's
+// load-old / retain-or-transfer-new / store-new / release-old balance applies to
+// it — its release-old DROPS the reference the caller's slot was holding. That
+// slot holds the CALLER's reference unless the caller's own frame gave it one:
+// §28.3's marker economy ("An unmarked read of a class-typed binding never
+// consumes") plus §15.3's `Parameter passing` bullet (an ordinary V is by value
+// (copy)) make a by-value `string` parameter a BORROW carrying the caller's own
+// reference rather than one of the callee frame's own, so a callee that writes it
+// through the alias frees a reference the intermediate frame never owned. The
+// issue's own repro measured that as
+// `bezel: fatal: refcount over-release (string)` — exit 134, 100 iterations, one
+// store per call. A `ref` callee that only READS the formal discharges nothing,
+// which is why this cannot be decided by the modifier alone (the reason #5253
+// left `ref` out of its `out`-style arm, and the reason the read-only `ref`
+// guard row in tests/codegen/string_optional_residual_5253_test.cpp must keep
+// passing unchanged).
+//
+// WHY THE CAPTURE VERDICT IS `WriteAliased` AND NOT `WriteOwned`. Every OTHER
+// channel by which the callee could alias the caller's value past the call
+// mints a reference of its own — the #1430 soundness argument, unchanged: a
+// `string`-typed FIELD STORE retains (lowerStringFieldStore's emitStringRetain),
+// a RETURN of the parameter mints (the #429 return balance; a ParameterSymbol is
+// not a LocalSymbol, so returnedStringLocalOwnsPlusOne cannot answer true
+// and the return falls to its retain path), a CLOSURE CAPTURE of a by-value
+// `string` parameter retains (#2689, every capture), and an onward plain-argument
+// pass repeats the rule one level down. A captured `ref`/`out` parameter is the
+// single exception, and it is explicit in the capture-store's own comment:
+// "A captured ref/out param … stays at semaTy = nullptr: it borrows the caller's
+// storage and the envdtor releases nothing" — so the capture neither retains nor
+// releases, leaving a live alias of the caller's slot value. Arming a scope-end
+// release of the slot for such a callee would free a string the closure still
+// reads. Hence the retain WITHOUT the release: the slot holds a reference the
+// callee's write can discharge, and the retained +1 leaks when the call does not
+// write — leak-over-UAF, the safe direction this analysis always prefers.
+static RefFormalVerdict refFormalWriteVerdict(const sema::SemaContext& ctx,
+                                              const ast::Expr* callee,
+                                              size_t index) {
+    const sema::MethodSymbol* ms = plainBorrowAnalysisCallee(ctx, callee);
+    if (!ms || index >= ms->params.size()) return RefFormalVerdict::NoWrite;
+    auto* ps = dynamic_cast<const sema::ParameterSymbol*>(ms->params[index]);
+    if (!ps || ps->modifier != "ref") return RefFormalVerdict::NoWrite;
+    // The exact surface lowerStringRefParamStore balances: it bails unless the
+    // target reads as `string`, and its `ref`/`out` predicate is refParams_
+    // membership, which only a by-ref formal has. A bare type parameter the
+    // active substitution binds to `string` (#4965) is deliberately NOT admitted
+    // here: `isTypeParamBoundToString` makes that store retain-only (it cannot
+    // prove the aliased slot owns a +1), so no release-old — and therefore no
+    // discharge — ever happens on that path.
+    const sema::TypeRef* fty = ps->resolvedDeclType;
+    if (!fty && ms->decl) {
+        // SEAM-ACCESSOR: symbol-side ps->resolvedDeclType is read first, the
+        // AST cast is only the local-path fallback when it was not populated.
+        // Same pattern as the #3304 arm's own fallback in walkCallArgs. #3152
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+            if (index < md->params.size() && md->params[index].type)
+                fty = ctx.resolvedType(*md->params[index].type);
+    }
+    if (!fty || fty->kind != sema::TypeRef::Kind::Primitive ||
+        fty->primitive != sema::PrimitiveType::String)
+        return RefFormalVerdict::NoWrite;
+    // A body walk needs the AST. An IMPORTED callee (ms->decl == nullptr) passes
+    // plainBorrowAnalysisCallee's filter when ctx knows it, but has no body here
+    // — nothing can be proven about its writes, so NoWrite, which is exactly the
+    // pre-#5275 behavior for it.
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return RefFormalVerdict::NoWrite;
+    // Abstract / interface body — §22.3's `ref` callee is a true alias of
+    // whatever the runtime override does, and that override is not this body.
+    if (md->bodyKind == ast::MethodBodyKind::Abstract)
+        return RefFormalVerdict::NoWrite;
+    bool assigned = false, onward = false, captured = false;
+    profileRefFormalWrites(ctx, ps, md->stmts, md->exprBody.get(),
+                                    assigned, onward, captured);
+    // `onward` is folded in as a discharge trigger for the same reason the
+    // collector records it: a ref-forwarding chain (`W1(ref p) { W2(ref p) }`)
+    // discharges the caller's slot one level down, so a verdict that stopped at
+    // the first non-assigning link would miss the write entirely and leave the
+    // over-release in place at the bottom of the chain.
+    if (!assigned && !onward) return RefFormalVerdict::NoWrite;
+    return captured ? RefFormalVerdict::WriteAliased
+                    : RefFormalVerdict::WriteOwned;
+}
+
 // fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): a non-nullable `string` PARAMETER
 // that this body ASSIGNS TO is retained at bind, so its slot owns an
 // INDEPENDENT +1 — exactly the treatment armStringLocalRefcount (above) gives a
@@ -25997,6 +26116,46 @@ void Emitter::retainAssignedStringParams(
         for (const ast::IdentifierExpr* id : byRef)
             if (sema::Symbol* sym = ctx_.exprSymbol(*id))
                 if (candidates.count(sym)) assigned.insert(sym);
+    }
+    // 2c. fix #5275 (§22.3 / §28.9, v0.313): the `ref` twin of 2b. §22.3's
+    //     "`ref` argument naming a mutable local … is a true alias: callee
+    //     writes are visible through the caller's location immediately" means a
+    //     WRITING `ref` callee discharges this slot's value through the very
+    //     same lowerStringRefParamStore, so a by-value `string` / `string?`
+    //     parameter passed `ref` needs the identical +1. Measured (the issue's
+    //     own repro, `scripts/agent_check.sh --probe --asan` on r23-c28 tip
+    //     28644650): `W(ref p, i)` where `W` does `r := "m" + i.ToString();`
+    //     aborted with `bezel: fatal: refcount over-release (string)`, exit
+    //     134. §28.3's marker economy is why the slot has nothing to discharge
+    //     until this retain: an unmarked read of a class-typed binding is a
+    //     borrow, so a by-value `string` parameter holds the CALLER's reference,
+    //     and the reference the callee frees is one this frame never owned.
+    //
+    //     WHY `ref` NEEDS A BODY WALK AND `out` DOES NOT (2b above keeps its
+    //     unconditional count). §22.3 gives `out` a guarantee `ref` does not:
+    //     "The callee must assign every `out` parameter on every
+    //     normal-completion (return) path", so an `out` argument is a write
+    //     whatever the body says, and #5253's rows (and the read-only `ref`
+    //     guard row beside them, which must keep passing) hold under that
+    //     asymmetry. For `ref`, "the callee MAY reassign it" is the whole
+    //     content of the rule — so a `ref` argument to a callee that only
+    //     READS the formal discharges nothing, and retaining for it
+    //     unconditionally would be a per-call leak with no release to pair it
+    //     (the escape walk keeps `ref` an escape). refFormalWriteVerdict
+    //     consults the callee's OWN body for exactly that, and both non-NoWrite
+    //     verdicts mint the retain: the WriteAliased one keeps the +1 without a
+    //     scope-end release, which is a bounded per-call leak (the safe
+    //     direction) rather than the over-release this closes.
+    {
+        std::vector<RefArgSite> refSites;
+        collectRefArgSites(body, refSites);
+        for (const RefArgSite& site : refSites)
+            if (sema::Symbol* sym = ctx_.exprSymbol(*site.id))
+                if (candidates.count(sym) &&
+                    refFormalWriteVerdict(ctx_, site.callee,
+                                          site.index) !=
+                        RefFormalVerdict::NoWrite)
+                    assigned.insert(sym);
     }
 
     // 3. Mint the frame's own reference. Emitted in the prologue, where the
@@ -26804,11 +26963,11 @@ struct StringEscapeWalker {
         const sema::MethodSymbol* ms = nullptr;
         const sema::ExternDeclSymbol* xd = nullptr;
         if (callee) {
-            ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*callee));
-            if (ms && (ms->isOperator || ms->extensionDecl ||
-                       !ms->genericParams.empty() ||
-                       (ms->decl == nullptr && !ctx.isImported(ms))))
-                ms = nullptr;  // not a plain compiled method — no relaxation
+            // fix #5275: routed through plainBorrowAnalysisCallee, the ONE
+            // spelling of the #1430 admission test — refFormalWriteVerdict
+            // applies the identical filter to the same callee expression, and a
+            // second copy here is the drift CLAUDE.md rule 6 names.
+            ms = plainBorrowAnalysisCallee(ctx, callee);
             // fix #2222 residue (FFI+concat scope-end release gap): when the
             // callee is NOT a compiled MethodSymbol, fall through to the FFI
             // form (`extern`/`extern "c"`/`extern block`). An FFI callee with
@@ -27342,6 +27501,40 @@ struct StringEscapeWalker {
                         safeArg = true;
                 }
             }
+            // fix #5275 (§22.3 / §28.9, v0.313): the `ref` sibling of the #3304
+            // arm above, and the answer to the objection that arm records
+            // against `ref` ("a `ref` callee reads the caller's slot via a
+            // hidden reference and may alias the value through field store /
+            // return / capture without minting its own +1 … so releasing the
+            // local at scope end would dangle any such alias").
+            //
+            // That objection is answered, not assumed away, and the answer is
+            // per-callee. A `ref` argument to a callee that only READS the
+            // formal is EXACTLY the plain-argument case the #1430 relaxation
+            // above already admits: field store retains, return mints, an onward
+            // plain pass repeats the rule — the same three channels, the same
+            // compiled-callee premise, the same stringReleaseMode gate. It is
+            // admitted here only for the WriteOwned verdict, i.e. a callee that
+            // WRITES the formal (refFormalWriteVerdict) and provably leaves no
+            // alias of the value behind. A callee that captures the formal in a
+            // closure is WriteAliased and stays an ESCAPE: the capture-store
+            // gives a captured `ref`/`out` param semaTy = nullptr (see its own
+            // comment in LlvmBackend_Exprs2.cpp), so the capture store retains
+            // nothing and the envdtor releases nothing, and a scope-end release
+            // of the caller's slot would dangle the closure's cell.
+            //
+            // The write itself is what makes the release SAFE rather than
+            // merely tolerable: the slot ends the body holding the value the
+            // callee stored (an owned +1 by lowerStringRefParamStore's balance),
+            // or — when the callee's store was on a path not taken — the
+            // caller's own bind-time retain, which is the reference the callee
+            // could only have aliased through one of the minting channels.
+            if (!safeArg && stringReleaseMode &&
+                a.modifier == "ref" && a.name.empty() && !a.isDiscard &&
+                isTargetIdent(a.value.get()) &&
+                refFormalWriteVerdict(ctx, callee, i) ==
+                    RefFormalVerdict::WriteOwned)
+                safeArg = true;
             // fix #3886: the KEY position is always index 0 (see the
             // detection comment above `dictMethodStrKeySafe`'s computation) —
             // gated on the SAME plain-argument-shape check every other arm
