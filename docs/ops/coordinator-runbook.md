@@ -11,7 +11,8 @@ disagreement is a defect to fix in whichever file is stale.
 
 **Who reads this:** coordinators (orchestrators) before running a gate, a
 dual-coordinator run, or a pool. Lanes read `CLAUDE.md` and
-`docs/ops/lane-contract.md`. They do not need this file unless a rule's reason
+`docs/ops/lane-contract.md`; a peer coordinator reads `CLAUDE.md` and
+`docs/ops/peer-contract.md`. They do not need this file unless a rule's reason
 matters to their task.
 
 **Pre-gate in one command:** `scripts/pregate.sh [--filters "…"]` runs every
@@ -369,8 +370,9 @@ a lost gate cycle or a corrected memory file during those runs.
 
 ⚠ **None of this was written down until 2026-09-24.** The protocol lived entirely
 in one coordinator's private memory directory, which lane agents never read and
-which the two coordinators had already collided on. If you are the second session
-and this section is all you have, it is enough to start.
+which the two coordinators had already collided on. If you are the second session,
+start from `docs/ops/peer-contract.md`: it is this section's rules as a work loop.
+This section keeps their reasons.
 
 ### One gate owner, declared, with an explicit verdict
 
