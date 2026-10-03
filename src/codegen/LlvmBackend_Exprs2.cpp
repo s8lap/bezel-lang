@@ -10680,14 +10680,17 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
             if (lowerPrimitive(target)->isFloatingPointTy()) {
                 llvm::AllocaInst* srcSlot = entryAlloca(decTy);
                 builder_.CreateStore(src, srcSlot);
+                llvm::Type* dstTy = lowerPrimitive(target);
+                // §5.2 v0.313: round ONCE to the target; a float target must not
+                // go through double (double rounding, #5307).
+                if (!dstTy->isDoubleTy()) {
+                    auto* ffn = declareC("bz_decimal_to_float", dstTy, {ptrTy()});
+                    return builder_.CreateCall(ffn, {srcSlot}, "dec.toflt");
+                }
                 auto* fn = declareC("bz_decimal_to_double",
                                    llvm::Type::getDoubleTy(llvm_),
                                    {ptrTy()});
-                llvm::Value* dv = builder_.CreateCall(fn, {srcSlot}, "dec.todbl");
-                llvm::Type* dstTy = lowerPrimitive(target);
-                if (dstTy->isDoubleTy()) return dv;
-                // Narrow to float if target is float.
-                return builder_.CreateFPTrunc(dv, dstTy);
+                return builder_.CreateCall(fn, {srcSlot}, "dec.todbl");
             }
         }
     }

@@ -584,6 +584,8 @@ void bz_decimal_from_int32(int32_t v, bz_decimal_t* out);
 // per fix #5190 (v0.311): uses bz_double_to_string_r (shortest round-trip).
 void   bz_decimal_from_double(double v, bz_decimal_t* out, void* ove_vtable);
 double bz_decimal_to_double(const bz_decimal_t* a);
+// per fix #5307 (§5.2 v0.313): single-rounding decimal -> float (strtof).
+float  bz_decimal_to_float(const bz_decimal_t* a);
 
 // Conversion from float (explicit per §5.2, v0.311, fix #5190).
 void   bz_decimal_from_float(float v, bz_decimal_t* out, void* ove_vtable);

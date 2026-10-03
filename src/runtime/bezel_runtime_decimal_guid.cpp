@@ -653,12 +653,9 @@ extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
     dec_reduce_scale_28(out, ove_vtable);
 }
 
-// Conversion to double (explicit per §5.2: "round to the nearest representable
-// binary value"). fix #5298: the exact decimal value is spelled as
-// "<mantissa digits>e-<scale>" and handed to strtod, which rounds it ONCE
-// (correctly, ties to even); the old mantissa-as-double / 10^scale division
-// rounded twice. Stack-only (|mantissa| < 2^96 has at most 29 digits).
-extern "C" double bz_decimal_to_double(const bz_decimal_t* a) {
+// Spells the exact decimal value |a| as "<mantissa digits>e-<scale>" so strtod /
+// strtof can round it ONCE. Stack-only (|mantissa| < 2^96 has at most 29 digits).
+static void dec_spell_for_strto(const bz_decimal_t* a, char (&buf)[64]) {
     __uint128_t m = dec_mantissa(a);
     uint32_t s = dec_scale(a);
     char digits[40];
@@ -668,11 +665,31 @@ extern "C" double bz_decimal_to_double(const bz_decimal_t* a) {
         digits[n++] = (char)('0' + (int)(m % 10));
         m /= 10;
     }
-    char buf[64];
     int len = 0;
     while (n > 0) buf[len++] = digits[--n];
-    len += snprintf(buf + len, sizeof(buf) - (size_t)len, "e-%u", (unsigned)s);
+    snprintf(buf + len, sizeof(buf) - (size_t)len, "e-%u", (unsigned)s);
+}
+
+// Conversion to double (explicit per §5.2: "round to the nearest representable
+// binary value"). fix #5298: the exact decimal value is spelled as
+// "<mantissa digits>e-<scale>" and handed to strtod, which rounds it ONCE
+// (correctly, ties to even); the old mantissa-as-double / 10^scale division
+// rounded twice.
+extern "C" double bz_decimal_to_double(const bz_decimal_t* a) {
+    char buf[64];
+    dec_spell_for_strto(a, buf);
     double result = strtod(buf, nullptr);
+    return dec_sign(a) ? -result : result;
+}
+
+// Conversion to float (explicit per §5.2 v0.313: `float(m)` rounds to the
+// nearest representable binary value). fix #5307: strtof on the same spelling
+// rounds once; decimal -> double -> float rounded twice. Never overflows:
+// |decimal| < 2^96 is far below float's finite range.
+extern "C" float bz_decimal_to_float(const bz_decimal_t* a) {
+    char buf[64];
+    dec_spell_for_strto(a, buf);
+    float result = strtof(buf, nullptr);
     return dec_sign(a) ? -result : result;
 }
 
