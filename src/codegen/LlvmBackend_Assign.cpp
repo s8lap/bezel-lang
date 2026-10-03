@@ -5235,22 +5235,114 @@ bool Emitter::isInliningComputedGetter(sema::Symbol* sym) const {
 // call for this same property. Reusing it means a property that is BOTH
 // recursive and virtual keeps ONE accessor body — the recursive read compiles
 // to a call of the very function its own vtable slot names.
+//
+// fix #5319 follow-up (llane 5319-ff) — §14.1 "Generic declarations" / §23.2
+// "Expression-bodied read-only properties", v0.313. A GENERIC owner is the
+// case where "call the memoised accessor" is NOT the same function twice.
+//
+// `ensurePropertyAccessorFn` memoises on (property, isSet,
+// `accessorSpecTagNow()`), and tag 0 is by construction "the shared/erased
+// template" — the body every pre-#2928 caller asks for, built against the
+// erased `T -> i32` layout. An ordinary read site has NO specialization tag
+// installed, so the direct call this function used to make resolved to tag 0
+// for EVERY owner, generic or not.
+//
+// For a non-generic owner that is correct and unchanged: there is exactly one
+// layout, so there is exactly one accessor. For a generic owner it is an ABI
+// mismatch, and a self/mutual read is what makes it observable. §23.2 admits
+// `class Box<T>` with
+//
+//     property Rec: T => (if _next = null then _v else _next!.Rec);
+//
+// which terminates at RUN time (each hop consumes one link). Codegen, however,
+// now compiles the body ONCE and calls it: the FIRST instantiation read built
+// that body against the ERASED layout and memoised it under tag 0, and the
+// SECOND instantiation's read was handed the very same function. `T` is 4 bytes
+// in `Box<int>` and 8 in `Box<long>`, so `_v` and `_next` sit at different
+// offsets; the int-compiled accessor then recursed on a long receiver, read
+// `_next` at the int offset, never found the null base, and walked off the end
+// of the object. MEASURED at this branch's pre-fix-forward state: bezelc exits
+// 139 (SIGSEGV) for the int+long shape, and the int+string / int+bool shapes
+// abort in LLVM IR verification ("PHI node operands are not the same type") —
+// one instantiation's body having its recursive call wired against another's
+// return type.
+//
+// The vtable and itable faces never had this bug precisely because they do NOT
+// reach `ensurePropertyAccessorFn` directly: `buildSpecializedAccessorFn`
+// (LlvmBackend_Setup.cpp) mints the per-(class, substitution) tag
+// `accessorSpecTagFor`, snapshots the live substitution under it, and only then
+// calls the same builder — so the two instantiations memoise under two
+// different keys and each body is lowered against its own layout. This
+// function now takes that same vehicle for a generic owner, which is what
+// "the same tag the vtable and itable faces use" means: a recursive read
+// compiles to a call of the very function that instantiation's own accessor
+// key names.
+//
+// RESOLUTION, AND THE REFUSAL. `buildSpecializedAccessorFn` mints no tag when
+// `genericSubst_` is empty, and a substitution that does not name the OWNER's
+// own type parameters is no resolution at all — it is some enclosing context's
+// unrelated binding, and building the body under it would be the same
+// wrong-layout accessor under a different key. So the gate asks the question
+// the builder cannot: does the live substitution bind every type parameter
+// `cls` declares? If yes, the instantiation is resolved and the specialized
+// path runs. If not, this function does NOT inline (that is the unbounded
+// recursion it exists to stop) and does NOT call tag-0 (that is the ABI
+// mismatch above) — it reports and lets the build fail cleanly, which is
+// strictly better than the pre-#5319 outcome for the same program (a compiler
+// SIGSEGV) and strictly better than the intermediate one (a green build whose
+// program segfaults).
 llvm::Value* Emitter::callComputedGetterFn(sema::PropertySymbol* ps,
                                            llvm::Value* recv,
                                            const ast::Expr* at) {
     if (!ps || !ps->parent) return nullptr;
     const sema::TypeSymbol* cls = ps->parent;
-    llvm::Function* fn =
-        ensurePropertyAccessorFn(cls, ps, /*isSet=*/false);
+    llvm::Function* fn = nullptr;
+    if (cls->genericParams.empty()) {
+        // Non-generic owner: one layout, one accessor, tag 0 is the only key
+        // that can exist. Unchanged from the original #5319 fix.
+        fn = ensurePropertyAccessorFn(cls, ps, /*isSet=*/false);
+    } else {
+        // Generic owner (§14.1): only a substitution that binds THIS owner's
+        // parameters identifies the instantiation, and only then may the
+        // per-instantiation accessor be built.
+        const std::vector<std::string_view> gpNames =
+            sema::genericParamNames(cls);
+        bool resolved = !gpNames.empty();
+        for (std::string_view n : gpNames) {
+            auto lit = genericSubst_.find(n);
+            if (lit == genericSubst_.end() || !lit->second ||
+                genericSubstSemaTy_.find(n) == genericSubstSemaTy_.end()) {
+                resolved = false;
+                break;
+            }
+        }
+        if (resolved) {
+            // Minted per-(class, substitution) and memoised separately from —
+            // and never displacing — the tag-0 template, exactly as the
+            // vtable/itable faces do it.
+            fn = buildSpecializedAccessorFn(cls, ps, /*isSet=*/false);
+        } else {
+            ctx_.diagnostics().report(
+                Severity::Error, at ? at->span.begin : SourceLocation{},
+                "internal: recursive computed property '" +
+                    std::string(ps->name) + "' on generic class '" +
+                    std::string(cls->name) +
+                    "' has no resolvable instantiation at this read site — "
+                    "#5319");
+        }
+    }
     if (!fn) {
         // No accessor could be materialised (an abstract or body-less
-        // declaration). Inlining the body anyway is precisely the unbounded
-        // recursion this path exists to stop, so report and let the build fail
-        // cleanly rather than recurse or crash.
-        ctx_.diagnostics().report(
-            Severity::Error, at ? at->span.begin : SourceLocation{},
-            "internal: recursive computed property '" + std::string(ps->name) +
-            "' has no materializable getter accessor to call — #5319");
+        // declaration, or the unresolved-generic refusal above). Inlining the
+        // body anyway is precisely the unbounded recursion this path exists to
+        // stop, so report and let the build fail cleanly rather than recurse or
+        // crash.
+        if (cls->genericParams.empty())
+            ctx_.diagnostics().report(
+                Severity::Error, at ? at->span.begin : SourceLocation{},
+                "internal: recursive computed property '" +
+                    std::string(ps->name) +
+                    "' has no materializable getter accessor to call — #5319");
         return nullptr;
     }
     // §22.12: a static property's accessor takes no receiver, matching the
