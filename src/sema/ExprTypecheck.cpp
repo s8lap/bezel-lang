@@ -14153,6 +14153,31 @@ void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
             collectNarrowings(be->right.get(), /*forTrueBranch=*/false);
         }
     }
+    // fix #5331 (§7.4, v0.313): "`not` swaps the fact sets" — a `not`-composed
+    // test narrows the branch the negation makes true, by recursing into the
+    // operand with `forTrueBranch` flipped. This is what makes
+    // `if not (b <> null) then return; end;` narrow `b` on the surviving path,
+    // and `if not p.Get(out var y) then return; end;` narrow `y` (§22.4's
+    // `when true` postcondition, "composing through boolean operators and early
+    // exits like any other fact").
+    //
+    // The flip is deliberately NOT unconditional. §7.4 continues: "The
+    // `not`-swap applies to **null facts**; a *type-classification* fact is
+    // established only by the `is`/`is not` operators and typed patterns
+    // directly, never by `not`-composition — `not (x is T)` has the same truth
+    // value as `x is not T` but narrows neither branch." A `TypeTestExpr`
+    // operand is therefore declined here: recursing would hand
+    // narrowFromTypeTest a flipped flag and establish exactly the
+    // classification fact §7.4 withholds. The parser desugars the NULLABILITY
+    // spellings `x is null` / `x is not null` to `x = null` / `x <> null`
+    // (Parser_Exprs.cpp §17.4) — plain BinaryExprs, so `not (x is not null)`
+    // still swaps its null fact, which is what §7.4 asks for.
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(cond)) {
+        if (ue->op == "not" && ue->operand &&
+            !dynamic_cast<const ast::TypeTestExpr*>(ue->operand.get())) {
+            collectNarrowings(ue->operand.get(), !forTrueBranch);
+        }
+    }
 }
 
 void ExprTC::visitTopDecl(const ast::TopDecl& d) {
@@ -21903,6 +21928,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto whileEntryNull = nullNarrowed_;
         auto whileEntryNarrowings = narrowings_;
         auto whileEntryField = fieldNarrowed_;  // §7.4 #2116
+        // fix #5331 (§7.4, v0.313): a null test in a `while` condition
+        // narrows that arm's body — "The knowledge is established by: a null
+        // test … in an `if`/`elif` condition …, a `while` condition, or a
+        // `when` guard". The entry snapshots above are taken BEFORE this call
+        // on purpose: the condition's fact is true only when the body runs, so
+        // it must not be part of the entry state the
+        // intersectNarrowingSetsAfterLoop join below restores at the
+        // after-loop point (a zero-iteration loop establishes nothing). The
+        // fact is in effect for the body walk and for every break/continue edge
+        // snapshot taken inside it, which is exactly the region the condition
+        // controls.
+        collectNarrowings(ws->condition.get(), /*forTrueBranch=*/true);
         loopEdgeNarrowing_.emplace_back();
         {
             // per §21.6 / §21.1 (#5314): the loop body is a block scope, like
