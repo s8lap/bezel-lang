@@ -653,26 +653,26 @@ extern "C" void bz_decimal_from_double(double v, bz_decimal_t* out,
     dec_reduce_scale_28(out, ove_vtable);
 }
 
-// Conversion to double (explicit per §5.2).
+// Conversion to double (explicit per §5.2: "round to the nearest representable
+// binary value"). fix #5298: the exact decimal value is spelled as
+// "<mantissa digits>e-<scale>" and handed to strtod, which rounds it ONCE
+// (correctly, ties to even); the old mantissa-as-double / 10^scale division
+// rounded twice. Stack-only (|mantissa| < 2^96 has at most 29 digits).
 extern "C" double bz_decimal_to_double(const bz_decimal_t* a) {
     __uint128_t m = dec_mantissa(a);
     uint32_t s = dec_scale(a);
-    double result = 0.0;
-    // Convert mantissa to double then divide by 10^scale.
-    // Split m into hi64 and lo64 to avoid precision loss.
-    uint64_t m_hi = (uint64_t)(m >> 64);
-    uint64_t m_lo = (uint64_t)(m);
-    result = (double)m_hi * 18446744073709551616.0 + (double)m_lo;
-    if (s > 0) {
-        static const double pow10d[29] = {
-            1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
-            1000000000, 10000000000.0, 100000000000.0, 1000000000000.0,
-            10000000000000.0, 100000000000000.0, 1000000000000000.0,
-            10000000000000000.0, 100000000000000000.0, 1000000000000000000.0,
-            10000000000000000000.0, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28
-        };
-        result /= pow10d[s];
+    char digits[40];
+    int n = 0;
+    if (m == 0) digits[n++] = '0';
+    while (m != 0) {
+        digits[n++] = (char)('0' + (int)(m % 10));
+        m /= 10;
     }
+    char buf[64];
+    int len = 0;
+    while (n > 0) buf[len++] = digits[--n];
+    len += snprintf(buf + len, sizeof(buf) - (size_t)len, "e-%u", (unsigned)s);
+    double result = strtod(buf, nullptr);
     return dec_sign(a) ? -result : result;
 }
 
