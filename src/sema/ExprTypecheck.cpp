@@ -20652,7 +20652,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     const bool allowCharWriteBack =
                         tTy->primitive == P::Char &&
                         (binOp == "+" || binOp == "-") &&
-                        isTrueInt(rTy->primitive);
+                        isTrueInt(rTy->primitive) &&
+                        // §6.6 "Nullable targets and operands": a read-
+                        // modify-write compound is a compile error when
+                        // "the static type of its left-hand side, or of its
+                        // right operand, is a nullable type" — either
+                        // position. #5287 admits only the §6.6 right-operand
+                        // LIST, spelled non-nullable (`byte`/`sbyte`/
+                        // `short`/`ushort`), so an un-narrowed `byte?`
+                        // operand or `char?` target keeps the pre-#5287
+                        // rejection: the desugared `int(c) + byte?` has no
+                        // meaning over a nullable operand (§7.11). §6.6
+                        // reads the static type "as §7.4 reads it", so a
+                        // `byte?` that §7.4 has narrowed non-null IS a
+                        // non-nullable operand and takes the admitted path.
+                        // Measured at ccd0be14: `var b: byte? := null; c +=
+                        // b;` and `var c: char? := null; c += b;` both
+                        // reject with §7.11's nullable wording, before and
+                        // after this fix.
+                        !tTy->nullable && !rTy->nullable;
                     bool pairRejectedAsBinary =
                         reportBoolOperandExcludedFromArithmeticOrOrdering(
                             as->value->span.begin, binOp, tTy, rTy,
@@ -20780,11 +20798,34 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             }
                         }
                     } else
+                    // fix #5287 (§6.6, v0.313): `allowCharWriteBack` stands
+                    // the #2155 pair test aside for a `char` target's code-
+                    // point advance. §6.6 types that right operand "as in
+                    // `int op e` under §6.2 — `sbyte`, `byte`, `short`,
+                    // `ushort`, `int` or `long`", so the operand pair is
+                    // `int op <small int>`, which §6.2 promotes and admits —
+                    // NOT the literal `char op byte` pair the generic test
+                    // reads off the declared types. `byte`/`sbyte`/`short`/
+                    // `ushort` never widen to `char` under §5.1 (a code
+                    // point is not a widened byte), so the "no conversion
+                    // either way" test fired and rejected `c += b` for all
+                    // four, while the §6.2-desugared `int(c) + int(b)` is a
+                    // plain `int` add whose §5.2 code-point write-back the
+                    // surrounding branch already schedules. Only the
+                    // non-constant `uint`/`ulong` operand remains an error,
+                    // and the dedicated §6.6 branch above reports it with its
+                    // own wording. The predicate is `allowCharWriteBack`
+                    // itself (`char` target, `+`/`-`, non-nullable integer
+                    // right operand), so a `char` right operand, a nullable
+                    // operand in either position, a bitwise/shift form, a
+                    // `*=`/`/=`/`mod=` scale, and every non-char target keep
+                    // the #2155 rejection.
                     if (integerWriteBack &&
                         !primitiveWidens(tTy->primitive,
                                          rTy->primitive) &&
                         !primitiveWidens(rTy->primitive,
                                          tTy->primitive) &&
+                        !allowCharWriteBack &&
                         !isLitDerived(as->value.get()))
                         reportInadmissiblePair();
                     if (!rEqualsT && !rConvertsToT && !integerWriteBack) {
