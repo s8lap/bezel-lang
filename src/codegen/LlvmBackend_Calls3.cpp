@@ -5171,6 +5171,100 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 //     Dispose()                 → bz_channel_sender_release(tx, cce_vtable) → void
 //   Domain.Spawn(entry, arg?)   → bz_domain_spawn(fn, arg, dfe_vtable) → OwningTask<R>
 // ---------------------------------------------------------------------------
+// #5305 / §30.14 (v0.313) / §30.15: the channel ITEM-WORD codec.
+//
+// `bz_channel_send` takes one ptr-sized `void*` per item and the receive side
+// hands that same word back. A scalar value type rides the word directly
+// (`zext`+`inttoptr` for an integer narrower than 64 bits, `inttoptr` for an
+// i64, `bitcast`+`inttoptr` of a float/double's bits). An AGGREGATE value type
+// — a sendable record or choice (§30.14 v0.313's value-type bullet names the
+// two; the choice's own sendability rule is §35.12 v0.313), per
+// `sema::isAggregateChannelElement` — has no such encoding: the pre-#5305
+// `CreateBitCast(record, i64)` is not a legal LLVM instruction ("Invalid
+// bitcast"), so `Channel<Record>` aborted the compiler at IR verification.
+//
+// The aggregate word is a POINTER to a fresh heap cell holding a copy of the
+// value — §30.14's value-type bullet verbatim ("A sendable value crosses as a
+// copy"). The three Send sites encode through `encodeChannelItemWord` and the
+// two decode sites (TryReceive, and the `await ch.Receive()` result) decode
+// through `decodeChannelItemWord`; the cell is released by the decoder, and by
+// the channel's `dispose_elem` for an item still buffered when the channel is
+// disposed or the send is refused (§30.15's undelivered-items rule).
+llvm::Value* Emitter::encodeChannelItemWord(llvm::Value* item,
+                                            const std::string& prefix) {
+    if (!item) return nullptr;
+    llvm::Type* ity = item->getType();
+    // #5305: the aggregate case, checked BEFORE the float/double bitcast arm
+    // below (which is where the pre-fix malformed `bitcast %record.P to i64`
+    // came from). `isAggregateValueTy` keeps the boxing decision on the LLVM
+    // value actually being sent, so it cannot disagree with the decode side,
+    // which sees the same `lowerTypeRef` lowering of the same T.
+    if (ity->isAggregateType()) {
+        auto* allocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+        // The DataLayout's ALLOC size, not `Type::getPrimitiveSizeInBits()`:
+        // for a STRUCT that intrinsic reports the size of the FIRST ELEMENT
+        // alone (8 bits for `{i32, i32}`), which under-allocated every cell to
+        // one byte and made the store below a heap-buffer-overflow.
+        uint64_t cellBytes = module_->getDataLayout().getTypeAllocSize(ity);
+        llvm::Value* cell = builder_.CreateCall(
+            allocFn, {builder_.getInt64(1), builder_.getInt64(cellBytes)},
+            prefix + ".cell");
+        builder_.CreateStore(item, cell);
+        return cell;
+    }
+    if (ity->isIntegerTy() && !ity->isIntegerTy(64)) {
+        // Zero-extend to i64 then inttoptr.
+        llvm::Value* ext = builder_.CreateZExt(item, i64(), prefix + ".ext");
+        return builder_.CreateIntToPtr(ext, ptrTy(), prefix + ".cast");
+    }
+    if (ity->isIntegerTy(64))
+        return builder_.CreateIntToPtr(item, ptrTy(), prefix + ".cast");
+    if (!ity->isPointerTy()) {
+        // double/float: bitcast to i64 then inttoptr.
+        llvm::Value* bits = builder_.CreateBitCast(item, i64(), prefix + ".bits");
+        return builder_.CreateIntToPtr(bits, ptrTy(), prefix + ".cast");
+    }
+    return item;
+}
+
+// #5305 / §30.14 (v0.313) / §30.15: the decode twin of encodeChannelItemWord.
+//
+// `rawPtr` is the item word the runtime handed back, already a `void*`-typed
+// value; `valTy` is the LLVM type of the element T. A scalar is decoded out of
+// the word exactly as `encodeChannelItemWord` encoded it (the long-standing
+// fix-#667 / §30.15 rule). An aggregate is loaded out of the cell the word
+// points at, and the cell is released — the receiver is the item's owner from
+// the moment the runtime hands it over (§30.15: `Send` consumes the value in
+// the sending domain; `TryReceive` produces it in the receiving domain).
+llvm::Value* Emitter::decodeChannelItemWord(llvm::Value* rawPtr,
+                                            llvm::Type* valTy,
+                                            const std::string& prefix) {
+    if (!rawPtr) return nullptr;
+    // #5305: the aggregate decode — the pre-fix fallback stored the raw i64 and
+    // then asked `CreateIntCast` to coerce it to the record struct, which is
+    // "Trunc only produces integer" at IR verification.
+    if (valTy->isAggregateType()) {
+        llvm::Value* v = builder_.CreateLoad(valTy, rawPtr, prefix + ".val");
+        builder_.CreateCall(declareC("free", llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy()}),
+                            {rawPtr});
+        return v;
+    }
+    llvm::Value* asI64 =
+        builder_.CreatePtrToInt(rawPtr, i64(), prefix + ".i64");
+    if (valTy->isDoubleTy())
+        return builder_.CreateBitCast(asI64, valTy, prefix + ".dbl");
+    if (valTy->isFloatTy()) {
+        llvm::Value* t32 = builder_.CreateTrunc(asI64, i32(), prefix + ".f32b");
+        return builder_.CreateBitCast(t32, valTy, prefix + ".flt");
+    }
+    if (valTy->isIntegerTy(64))
+        return asI64;
+    if (valTy->isIntegerTy())
+        return builder_.CreateTrunc(asI64, valTy, prefix + ".int");
+    return asI64;
+}
+
 llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -5224,22 +5318,14 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
-                // Value types (int/bool/etc.) need to be widened to ptr-size.
-                // We store them as bit-cast void* (uint64 reinterpretation).
-                // For ptr-typed items (class, string) just pass as-is.
-                llvm::Value* itemArg = item;
-                if (item->getType()->isIntegerTy() &&
-                    !item->getType()->isIntegerTy(64)) {
-                    // Zero-extend to i64 then inttoptr.
-                    llvm::Value* ext = builder_.CreateZExt(item, i64(), "send.ext");
-                    itemArg = builder_.CreateIntToPtr(ext, ptrTy(), "send.cast");
-                } else if (item->getType()->isIntegerTy(64)) {
-                    itemArg = builder_.CreateIntToPtr(item, ptrTy(), "send.cast");
-                } else if (!item->getType()->isPointerTy()) {
-                    // double/float: bitcast to i64 then inttoptr.
-                    llvm::Value* bits = builder_.CreateBitCast(item, i64(), "send.bits");
-                    itemArg = builder_.CreateIntToPtr(bits, ptrTy(), "send.cast");
-                }
+                // #5305 / §30.15: the item WORD — the single encoding shared by
+                // all three Send sites and both decode sites. Scalar value types
+                // ride the ptr-size word directly; an aggregate (record/choice)
+                // rides it as a pointer to a fresh cell. (This arm is not
+                // reachable from Bezel source — sema rejects `Channel<T>.Send`,
+                // §6.9 / #640 — but it decodes through the SAME helper so the
+                // two cannot drift.)
+                llvm::Value* itemArg = encodeChannelItemWord(item, "send");
                 auto* fn = declareC("bz_channel_send",
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
@@ -5320,35 +5406,23 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                     llvm::Type* innerTy = stTy->getNumElements() > 1
                                          ? stTy->getElementType(1)
                                          : i32();
-                    llvm::Value* asI64 = builder_.CreatePtrToInt(
-                        rawItem, i64(), "tr.i64");
-                    llvm::Value* decoded;
-                    if (innerTy->isDoubleTy()) {
-                        decoded = builder_.CreateBitCast(asI64, innerTy, "tr.dbl");
-                    } else if (innerTy->isFloatTy()) {
-                        llvm::Value* t32 = builder_.CreateTrunc(asI64, i32(), "tr.f32b");
-                        decoded = builder_.CreateBitCast(t32, innerTy, "tr.flt");
-                    } else if (innerTy->isIntegerTy(64)) {
-                        decoded = asI64;
-                    } else if (innerTy->isIntegerTy()) {
-                        decoded = builder_.CreateTrunc(asI64, innerTy, "tr.int");
-                    } else {
-                        // Fallback for unexpected inner types (e.g. record struct):
-                        // store as i64 and let the struct initialiser zero the rest.
-                        decoded = asI64;
-                    }
+                    // #5305 / §30.15: the decode twin of the Send item word
+                    // (decodeChannelItemWord). For a scalar inner type this is
+                    // the unchanged fix-#667 rule (ptrtoint + trunc/bitcast into
+                    // the word). For an AGGREGATE inner type — a record's
+                    // `{i8 hasValue, %record.P}` slot, the pre-fix
+                    // "Trunc only produces integer" `tr.coerce` — the word is
+                    // the cell the Send allocated, the record is loaded out of
+                    // it, and the cell is released here: the receiver owns the
+                    // item from this point (§30.15).
+                    llvm::Value* decoded =
+                        decodeChannelItemWord(rawItem, innerTy, "tr");
                     // Build the nullable struct {i8=1, decoded}.
                     llvm::Value* nv = llvm::UndefValue::get(stTy);
                     nv = builder_.CreateInsertValue(
                         nv,
                         llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u},
                         "tr.hv");
-                    // Coerce decoded to the exact inner slot type (handles the rare
-                    // case where the truncation produced a slightly wrong width).
-                    if (decoded->getType() != stTy->getElementType(1))
-                        decoded = builder_.CreateIntCast(
-                            decoded, stTy->getElementType(1),
-                            /*isSigned=*/false, "tr.coerce");
                     nv = builder_.CreateInsertValue(nv, decoded, {1u}, "tr.nv");
                     builder_.CreateStore(nv, outSlot);
                 } else {
@@ -5463,17 +5537,11 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
-                llvm::Value* itemArg = item;
-                if (item->getType()->isIntegerTy() &&
-                    !item->getType()->isIntegerTy(64)) {
-                    llvm::Value* ext = builder_.CreateZExt(item, i64());
-                    itemArg = builder_.CreateIntToPtr(ext, ptrTy());
-                } else if (item->getType()->isIntegerTy(64)) {
-                    itemArg = builder_.CreateIntToPtr(item, ptrTy());
-                } else if (!item->getType()->isPointerTy()) {
-                    llvm::Value* bits = builder_.CreateBitCast(item, i64());
-                    itemArg = builder_.CreateIntToPtr(bits, ptrTy());
-                }
+                // #5305 / §30.15: shared item-word encoding (see
+                // encodeChannelItemWord) — an aggregate record/choice element
+                // crosses as a pointer to a fresh cell instead of the pre-fix
+                // illegal `bitcast %record.P to i64`.
+                llvm::Value* itemArg = encodeChannelItemWord(item, "send");
                 auto* fn = declareC("bz_channel_sender_send",
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
@@ -5494,17 +5562,10 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
-                llvm::Value* itemArg = item;
-                if (item->getType()->isIntegerTy() &&
-                    !item->getType()->isIntegerTy(64)) {
-                    llvm::Value* ext = builder_.CreateZExt(item, i64());
-                    itemArg = builder_.CreateIntToPtr(ext, ptrTy());
-                } else if (item->getType()->isIntegerTy(64)) {
-                    itemArg = builder_.CreateIntToPtr(item, ptrTy());
-                } else if (!item->getType()->isPointerTy()) {
-                    llvm::Value* bits = builder_.CreateBitCast(item, i64());
-                    itemArg = builder_.CreateIntToPtr(bits, ptrTy());
-                }
+                // #5305 / §30.15: the SAME item-word encoding as the sync Send
+                // above (encodeChannelItemWord) — SendAsync hands the identical
+                // word to the identical runtime entry point.
+                llvm::Value* itemArg = encodeChannelItemWord(item, "sendasync");
                 auto* fn = declareC("bz_channel_sender_send_async", ptrTy(),
                                     {ptrTy(), ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {tx, itemArg, getCCEVtable()},

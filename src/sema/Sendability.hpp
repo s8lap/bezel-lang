@@ -48,6 +48,31 @@ inline bool isSendableType(const TypeRef* rt, SemaContext& ctx) {
     return isSendableType(rt, ctx, ip);
 }
 
+// #5305 / §30.14 (v0.313) / §30.15: the AGGREGATE channel-element set.
+//
+// A `Channel<T>` item rides one ptr-sized word (§30.15's `void*` cell). A
+// scalar value type (primitive, enum, `double`, `char`) rides it directly; an
+// AGGREGATE value type — a sendable record, or a choice (the two kinds §30.14's
+// value-type bullet names; the choice's own sendability rule is §35.12, v0.313)
+// — has no such ≤64-bit encoding, so the compiler carries it as a POINTER to
+// a fresh heap cell holding a copy of the value (§30.14's value-type bullet,
+// "A sendable value crosses as a copy"). The set is declared HERE, once, so
+// that every site which must agree on it by construction does. All three are
+// codegen, and all three are keyed on the same predicate rather than on the
+// lowered LLVM type, so the ENCODER and each DECODER cannot drift:
+//
+//   - the item-word codec `encodeChannelItemWord` / `decodeChannelItemWord`
+//     (LlvmBackend_Calls3.cpp) — `Send`, `SendAsync`, `TryReceive`;
+//   - `channelReceiveHasAggregateElement` (LlvmBackend_Async.cpp) — the
+//     `await ch.Receive()` result;
+//   - `channelDrainHasAggregateElement` (LlvmBackend_Async.cpp) — the
+//     `await for … in ch.ReceiveAll()` loop variable.
+//
+// Deliberately NOT keyed on the lowered LLVM type (which would also catch the
+// `Span`/`Range`/`Guid` struct builtins): those carry borrows and are not
+// sendable (§30.14), so they are not legal `Channel<T>` elements.
+bool isAggregateChannelElement(const TypeRef* rt);
+
 // §14.2 (v0.201 sharpened §3.6 rule 4, #2059): given a type that has just
 // FAILED the §30.14 sendability check, walk its structure to identify the
 // FIRST structural reason for failure and return a component-path fragment

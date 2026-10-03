@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "sema/Sendability.hpp"  // #5305: isAggregateChannelElement — §30.14 aggregate channel element
 
 namespace bezel::codegen {
 
@@ -10630,8 +10631,31 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     llvm::Value* curSlotPtr =
         builder_.CreateGEP(ptrTy(), vt2, {builder_.getInt32(3)});
     llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
-    llvm::Value* curVal =
-        builder_.CreateCall(currentTy, curFnPtr, {enumObj2}, "afor.cur");
+    // #5305 / §30.15 (v0.313) / stdlib §6.9: on a `Channel<T>.ReceiveAll()`
+    // drain whose element T is an AGGREGATE value type, slot 3 is the
+    // borrowing `bz_chrecvall_current`, which returns the channel's item WORD
+    // verbatim — and for an aggregate that word is the CELL the Send allocated
+    // (encodeChannelItemWord), not the value's bytes. The `currentTy` call
+    // above reinterprets the returned pointer AS `elemTy` and would store the
+    // cell ADDRESS into the loop variable: valid IR, silently wrong values
+    // (MEASURED pre-unbox: a `record P(X,Y)` drain printed the cell address as
+    // `X,Y`). §30.15 requires the drain to yield "each item with `Receive`'s
+    // transfer semantics", so the word is read at its true `void*` type and
+    // unboxed. The cell is released here — for the value-T (borrowing)
+    // variant `bz_chrecvall_dispose` frees `current_yielded` only when
+    // `is_owning`, and this path is `is_owning == 0`, so the decoder's release
+    // is the ONLY one and the slot's stale copy is never dereferenced again.
+    // Every other async enumerable is untouched: the by-value slot-3 call is
+    // exactly what they produce.
+    llvm::Value* curVal = nullptr;
+    if (channelDrainHasAggregateElement(fs.iterable.get())) {
+        auto* cellTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        llvm::Value* cell =
+            builder_.CreateCall(cellTy, curFnPtr, {enumObj2}, "afor.boxed.ptr");
+        curVal = decodeChannelItemWord(cell, elemTy, "afor.boxed");
+    } else {
+        curVal = builder_.CreateCall(currentTy, curFnPtr, {enumObj2}, "afor.cur");
+    }
     emitPendingCheck();  // TakeCurrent may raise IOE on OwnedAsync path (#1349)
     builder_.CreateStore(curVal, varSlot);
 

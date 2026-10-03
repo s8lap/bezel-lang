@@ -14415,7 +14415,34 @@ private:
                                   bool freeOnFault = false,
                                   const std::function<void()>& onFault = {},
                                   bool deferToScopeOnly = false,
-                                  bool drainChainOnTake = false);
+                                  bool drainChainOnTake = false,
+                                  // #5305 / §30.14 (v0.313) / §30.15: the awaited
+                                  // result is a channel item WORD holding a cell
+                                  // pointer to an aggregate element's copy, so
+                                  // read the word as a pointer and unbox it (see
+                                  // decodeChannelItemWord) rather than loading
+                                  // `resultTy` bytes out of the result buffer.
+                                  bool resultBoxed = false);
+
+    // #5305 / §30.14 (v0.313) / §30.15: is `e` a `Channel<T>.Receive()` call on
+    // an AGGREGATE-element channel? Defined in LlvmBackend_Async.cpp beside
+    // lowerAwait, its only caller.
+    bool channelReceiveHasAggregateElement(const ast::Expr* e);
+
+    // #5305 / §30.14 (v0.313) / §30.15: the `await for … in ch.ReceiveAll()`
+    // twin of channelReceiveHasAggregateElement — the drain yields an
+    // AGGREGATE element through the same item WORD, so the loop variable must
+    // be unboxed the same way. See the definition in LlvmBackend_Async.cpp.
+    bool channelDrainHasAggregateElement(const ast::Expr* e);
+
+    // #5305 / §30.14 (v0.313) / §30.15: the channel ITEM-WORD codec — one
+    // encode and one decode shared by all three Send sites, the TryReceive
+    // decode, and the `await ch.Receive()` result decode, so no two can drift.
+    // See the definition comments in LlvmBackend_Calls3.cpp.
+    llvm::Value* encodeChannelItemWord(llvm::Value* item,
+                                       const std::string& prefix);
+    llvm::Value* decodeChannelItemWord(llvm::Value* rawPtr, llvm::Type* valTy,
+                                       const std::string& prefix);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope

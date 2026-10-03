@@ -3,6 +3,7 @@
 
 #include "common/OwnershipFacts.hpp"  // #2098: bindClauseNeedsAtomDisposal (§17.15/K8.5)
 #include "sema/EnumValues.hpp"  // enumDeclaredValues — §5.4 checked cast (#3044)
+#include "sema/Sendability.hpp"  // #5305: isAggregateChannelElement — §30.14 aggregate channel element
 
 // This translation unit continues the definitions of Emitter's expression-lowering
 // member functions begun in LlvmBackend_Exprs.cpp.  It was split off mechanically
@@ -7443,6 +7444,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // (per §30.15 / §28.11 v0.135: class elements are owned, the
                 // runtime disposes them when the channel is closed/drained).
                 llvm::Value* dispArg = elementDisposerArg(chElemTy, /*owningFamily=*/true);
+                // #5305 / §30.15: an AGGREGATE element (a sendable record or a
+                // choice, §30.14 v0.313; choice sendability is §35.12 v0.313)
+                // is not a bare value in the channel's item deque — the
+                // Send encoding puts it in a fresh heap cell (encodeChannelItemWord),
+                // so the cell IS a heap object the channel owns while it sits
+                // buffered. §30.15's undelivered-items rule ("undelivered items
+                // disposed at the channel's disposal", and the same for a send
+                // refused because the channel is closed or full) therefore has a
+                // disposer for this element type: plain `free` of the cell. The
+                // received-and-decoded cell is released by the decoder instead,
+                // so the two obligations never overlap.
+                if (sema::isAggregateChannelElement(chElemTy))
+                    dispArg = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy()});
                 // v0.174 (#809) / §6.9: bounded ctor `new Channel<T>(capacity)`.
                 // capacity >= 1, else ArgumentException (a catchable guard, per
                 // §6.9). The nullary ctor passes capacity 0 (= unbounded).

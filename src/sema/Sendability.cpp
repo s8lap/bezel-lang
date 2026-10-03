@@ -1025,4 +1025,14 @@ std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
     return {};
 }
 
+// #5305 / §30.14 (v0.313) / §30.15: the aggregate channel-element set — see
+// the declaration in Sendability.hpp for why it lives here and why it is
+// keyed on the DECLARATION kind rather than the lowered LLVM type.
+bool isAggregateChannelElement(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration)
+        return false;
+    const ast::TypeDeclKind k = rt->declaration->kind;
+    return k == ast::TypeDeclKind::Record || k == ast::TypeDeclKind::Choice;
+}
+
 }  // namespace bezel::sema

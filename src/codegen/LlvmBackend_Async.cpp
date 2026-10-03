@@ -3,6 +3,7 @@
 #include <set>
 
 #include "common/AwaitScan.hpp"
+#include "sema/Sendability.hpp"  // #5305: isAggregateChannelElement — §30.14 aggregate channel element
 
 namespace bezel::codegen {
 
@@ -4734,6 +4735,59 @@ void Emitter::emitAsyncIterComplete(bool hasValue) {
 }
 
 
+// #5305 / §30.14 (v0.313) / §30.15: is `e` an `await`-able
+// `Channel<T>.Receive()` whose element T is an AGGREGATE value type (a
+// sendable record or a choice, §30.14 v0.313; the choice's own sendability
+// rule is §35.12 v0.313)?
+//
+// True exactly when the awaited result must be unboxed from the cell the Send
+// encoded (see encodeChannelItemWord): the runtime completes the Receive task
+// with the ONE ptr-sized item word, and for an aggregate that word is a cell
+// pointer rather than the value's bytes. The shape test mirrors
+// `isChannelReceiveInitializer` (LlvmBackend_Setup.cpp) — the same
+// `MemberAccessExpr(Receive)` on a builtin `Channel` receiver, asked of the
+// awaited EXPRESSION rather than of a LocalDecl's initializer. Every other
+// `Task<T>` producer stores the value itself, so the by-value read stays right
+// for all of them.
+bool Emitter::channelReceiveHasAggregateElement(const ast::Expr* e) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee || !call->args.empty()) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target || ma->member != "Receive") return false;
+    auto* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        builtinTypeName(recvTy) != "Channel" || recvTy->genericArgs.empty())
+        return false;
+    return sema::isAggregateChannelElement(recvTy->genericArgs[0]);
+}
+
+
+// #5305 / §30.14 (v0.313) / §30.15: is `e` a `Channel<T>.ReceiveAll()` call on
+// an AGGREGATE-ELEMENT channel — the `await for` drain form stdlib §6.9
+// documents ("await for var item in inbox.ReceiveAll() do … end;")?
+//
+// True exactly when the enumerator's yielded element must be unboxed from the
+// cell the Send encoded (see encodeChannelItemWord). §30.15 requires the
+// drain to yield "each item with `Receive`'s transfer semantics" for
+// `IAsyncEnumerable<T>` (the value-typed form), so this is NOT a deferred
+// case: without the unbox the drain stores the cell ADDRESS into the loop
+// variable — valid IR, silently wrong values. The shape test mirrors
+// `channelReceiveHasAggregateElement` above, asked of the `await for`
+// iterable; every other vtable-backed async enumerable produces its element
+// BY VALUE through slot 3 and must keep reading it that way.
+bool Emitter::channelDrainHasAggregateElement(const ast::Expr* e) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee || !call->args.empty()) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target || ma->member != "ReceiveAll") return false;
+    auto* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        builtinTypeName(recvTy) != "Channel" || recvTy->genericArgs.empty())
+        return false;
+    return sema::isAggregateChannelElement(recvTy->genericArgs[0]);
+}
+
+
 llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     // Defensive: `await` outside an async state machine is rejected by sema; if
     // we somehow reach here without the async frame live, produce nothing.
@@ -4936,9 +4990,20 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
                 if (ue == &un) deferToScopeOnly = true;
             });
     }
+    // #5305 / §30.14 (v0.313) / §30.15: an AGGREGATE channel element arrives
+    // through `await ch.Receive()` as the cell POINTER the Send encoded, not as
+    // the value's own bytes — `Task<T>`'s result buffer holds the one ptr-sized
+    // word `bz_channel_send` wrote (see encodeChannelItemWord). Without this the
+    // by-value `await.result` load read the CELL ADDRESS as the record's bytes:
+    // valid IR, silently wrong value. Only the channel-Receive shape can carry
+    // that word (every other Task<T> producer stores the value itself), so the
+    // test is on the awaited operand, exactly like isChannelReceiveInitializer
+    // above matches the LocalDecl form.
+    bool resultBoxed = channelReceiveHasAggregateElement(un.operand.get());
     return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
                             markSpentAfter, deferTaskFree, freeOnFault,
-                            /*onFault=*/{}, deferToScopeOnly, drainChainOnTake);
+                            /*onFault=*/{}, deferToScopeOnly, drainChainOnTake,
+                            resultBoxed);
 }
 
 
@@ -4958,7 +5023,8 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        bool freeOnFault,
                                        const std::function<void()>& onFault,
                                        bool deferToScopeOnly,
-                                       bool drainChainOnTake) {
+                                       bool drainChainOnTake,
+                                       bool resultBoxed) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -5214,7 +5280,19 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
     } else {
         llvm::Value* resPtr =
             builder_.CreateCall(awaitFn, {awaitedTask}, "await.result.ptr");
-        result = builder_.CreateLoad(resultTy, resPtr, "await.result");
+        if (resultBoxed) {
+            // #5305 / §30.15: the awaited result is the channel item WORD — a
+            // pointer to the cell holding a COPY of an aggregate element
+            // (record/choice). Load the value out of the cell and release the
+            // cell here, where the receiver takes ownership (§30.15: the
+            // `Receive` result is owned by the receiving domain). The scalar
+            // path below is unchanged.
+            llvm::Value* cell =
+                builder_.CreateLoad(ptrTy(), resPtr, "await.boxed.ptr");
+            result = decodeChannelItemWord(cell, resultTy, "await.boxed");
+        } else {
+            result = builder_.CreateLoad(resultTy, resPtr, "await.result");
+        }
         // The result is loaded BY VALUE into the await site before the task is
         // freed below, so the value (and the task's freed result buffer) do not
         // alias afterwards.
