@@ -12455,6 +12455,48 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         v = emitAccessorRefArgCopyIn(
                             *a.value, /*paramTy=*/nullptr,
                             /*isOut=*/formalMod == "out", accessorRefArgs);
+                } else if (auto* argLit =
+                               dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                   a.value.get());
+                           argLit && formalTy) {
+                    // fix #5309 / §15.4, §28.3 *Unbound owned temporaries*
+                    // (v0.313): the IMPORTED-callee twin of buildOrderedArgs'
+                    // collection-literal arm. `lowerExpr` returns null for a
+                    // CollectionLiteralExpr (not a general expression value),
+                    // so this arm abandoned the whole call and the #3079
+                    // guard dropped the enclosing statement with exit 0.
+                    // Materialize the literal at the formal's resolved type
+                    // (an imported formal is a sema::TypeRef, §2.8.3), then
+                    // dispose the temp per the parameter's mode: an `owned`
+                    // formal takes ownership; a borrow formal borrows it, so
+                    // the temp is disposed once at scope exit.
+                    v = materializeCollectionLiteralForArg(argLit, formalTy);
+                    if (v) {
+                        llvm::AllocaInst* litSlot = entryAlloca(v->getType());
+                        builder_.CreateStore(v, litSlot);
+                        if (smStateStruct_ && formalMod != "owned")
+                            asyncHandlerSpillSlots_.push_back(litSlot);
+                        if (formalMod != "owned" && !disposeStack_.empty())
+                            disposeStack_.back().push_back(
+                                buildCollectionTempDisposal(litSlot, formalTy));
+                    } else {
+                        // §15.4: the literal has no concrete target at this
+                        // imported formal (e.g. a collection INTERFACE such as
+                        // `IEnumerable<T>`). Sema has no literal-target check
+                        // on the imported-callee channel, so say so loudly
+                        // here rather than letting the null `v` abandon the
+                        // call and the #3079/#2961 guards drop the statement
+                        // silently with exit 0 (the same-module twin is
+                        // rejected by sema's §15.4 gate).
+                        ctx_.diagnostics().report(
+                            Severity::Error, a.value->span.begin,
+                            "a collection literal `[...]` cannot target the "
+                            "imported parameter type here — §15.4 admits only "
+                            "a concrete collection target (an inline array, "
+                            "`Array<T>`/`OwningArray<T>`, `Set`, `Stack`, "
+                            "`Queue`, `LinkedList`, `Dictionary`); construct "
+                            "one of those and pass it (§15.4)");
+                    }
                 } else {
                     v = lowerExpr(*a.value);
                 }
