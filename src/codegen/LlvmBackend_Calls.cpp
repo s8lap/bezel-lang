@@ -10910,6 +10910,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     builder_.CreateAnd(advCd, nulCd), "cvtd.vfmt");
                 emitGuardThrow(builder_.CreateNot(validCd, "cvtd.fmtbad"),
                                "FormatException");
+                // stdlib §2.3 / §9.2 (v0.313, #5198): out-of-range -> OverflowException.
+                emitGuardThrow(emitFloatParseOverflow(data, dvCd),
+                               "OverflowException");
                 return dvCd;
             }
             // per stdlib §2.3 / #1356: Convert.ToDecimal(s: string): decimal
@@ -11093,7 +11096,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 endChTd, llvm::ConstantInt::get(i8td, 0), "tryd.nul");
             llvm::Value* okTd = builder_.CreateAnd(
                 builder_.CreateNot(fcWsTd),
-                builder_.CreateAnd(advTd, atNulTd), "tryd.ok");
+                builder_.CreateAnd(advTd, atNulTd), "tryd.fmtok");
+            // stdlib §2.3 / §9.2 (v0.313, #5198): out-of-range -> false.
+            okTd = builder_.CreateAnd(
+                okTd,
+                builder_.CreateNot(emitFloatParseOverflow(strData, dvTd)),
+                "tryd.ok");
             llvm::Value* selTd = builder_.CreateSelect(
                 okTd, dvTd,
                 llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), 0.0), "tryd.sel");

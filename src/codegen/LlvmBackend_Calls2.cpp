@@ -1127,9 +1127,14 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
         }
-        // strtod(data, &endptr)
-        auto* strtodFn = declareC("strtod",
-            llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
+        // strtod / strtof(data, &endptr). float uses the correctly rounded
+        // strtof, never (float)strtod (§4.3 v0.312 rounds a float literal once;
+        // #5198 / stdlib §9.2 v0.313).
+        const bool isF = (pt == P::Float);
+        auto* fpTyT = isF ? llvm::Type::getFloatTy(llvm_)
+                          : llvm::Type::getDoubleTy(llvm_);
+        auto* strtodFn = declareC(isF ? "strtof" : "strtod",
+            fpTyT, {ptrTy(), ptrTy()});
         auto* endSlotD = entryAlloca(ptrTy());
         llvm::Value* valD = builder_.CreateCall(
             strtodFn, {strData, endSlotD}, "tryp.d");
@@ -1144,22 +1149,22 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* endChD = builder_.CreateLoad(i8TyD, endPtrD, "tryp.end");
         llvm::Value* atNulD = builder_.CreateICmpEQ(
             endChD, llvm::ConstantInt::get(i8TyD, 0), "tryp.nul");
-        llvm::Value* okD = builder_.CreateAnd(
+        llvm::Value* fmtOkD = builder_.CreateAnd(
             builder_.CreateNot(fcWsD),
-            builder_.CreateAnd(advD, atNulD), "tryp.ok");
+            builder_.CreateAnd(advD, atNulD), "tryp.fmtok");
+        // stdlib §9.2 (v0.313, #5198): a finite spelling that rounds to a
+        // non-finite value is out of range -> false (before the out store, so a
+        // nullable `out T?` slot reads null).
+        llvm::Value* okD = builder_.CreateAnd(
+            fmtOkD,
+            builder_.CreateNot(emitFloatParseOverflow(strData, valD)),
+            "tryp.ok");
         // Store 0.0 on failure, parsed value on success (§9.3: out = default on false).
-        auto* dblTy = llvm::Type::getDoubleTy(llvm_);
-        llvm::Value* zeroD = llvm::ConstantFP::get(dblTy, 0.0);
+        llvm::Value* zeroD = llvm::ConstantFP::get(fpTyT, 0.0);
         llvm::Value* selD = builder_.CreateSelect(okD, valD, zeroD, "tryp.sel");
         // §11.8 / §2.19 (#1470): nullable-companion aware store (generic
         // IParsable<double>/<float> dispatch into a `out T?`); bare otherwise.
-        if (pt == P::Float) {
-            auto* fltTy = llvm::Type::getFloatTy(llvm_);
-            storeTryParseOut(outAddr, et,
-                             builder_.CreateFPTrunc(selD, fltTy), okD);
-        } else {
-            storeTryParseOut(outAddr, et, selD, okD);
-        }
+        storeTryParseOut(outAddr, et, selD, okD);
         // fix #2938 / §22.3: flush any bracket on the normal-return edge.
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return okD;
@@ -1587,8 +1592,13 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 // input.  Reject empty, non-numeric leading chars, trailing
                 // garbage, and leading whitespace → FormatException (per the
                 // strict-fault model in §9.3 which applies to all §9 Parse).
-                auto* strtodFnP = declareC("strtod",
-                    llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
+                // float: the correctly rounded strtof, never (float)strtod
+                // (§4.3 v0.312; #5198).
+                const bool isFP = (pt == P::Float);
+                auto* fpTyP = isFP ? llvm::Type::getFloatTy(llvm_)
+                                   : llvm::Type::getDoubleTy(llvm_);
+                auto* strtodFnP = declareC(isFP ? "strtof" : "strtod",
+                    fpTyP, {ptrTy(), ptrTy()});
                 auto* endSlotF = entryAlloca(ptrTy());
                 llvm::Value* dVal = builder_.CreateCall(
                     strtodFnP, {data, endSlotF}, "parse.dv");
@@ -1606,8 +1616,10 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                     builder_.CreateAnd(advF, atNulF), "parse.vfmtF");
                 emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
                                "FormatException");
-                if (pt == P::Float)
-                    dVal = builder_.CreateFPTrunc(dVal, llvm::Type::getFloatTy(llvm_));
+                // stdlib §9.2 (v0.313, #5198): a finite spelling whose rounding
+                // is not finite raises OverflowException.
+                emitGuardThrow(emitFloatParseOverflow(data, dVal),
+                               "OverflowException");
                 return dVal;
             }
         }

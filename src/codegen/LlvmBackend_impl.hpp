@@ -5997,6 +5997,36 @@ private:
             builder_.CreateStore(raw, outAddr);
         }
     }
+    // stdlib §9.2 / §2.3 (v0.313, #5198): i1 true iff a binary-float parse of the
+    // C string `data` yielded a non-finite `val` (double or float) although the
+    // input spells a finite number (first char after an optional sign is a digit
+    // or '.'). Such an input is out of range: Parse / Convert.ToDouble raise
+    // OverflowException, TryParse / TryToDouble return false. An "inf" / "nan"
+    // spelling is excluded (their acceptance is #4890's); underflow is in range,
+    // so errno == ERANGE is deliberately not consulted.
+    llvm::Value* emitFloatParseOverflow(llvm::Value* data, llvm::Value* val) {
+        auto* i8 = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* c0 = builder_.CreateLoad(i8, data, "fpo.c0");
+        llvm::Value* signed_ = builder_.CreateOr(
+            builder_.CreateICmpEQ(c0, llvm::ConstantInt::get(i8, '+')),
+            builder_.CreateICmpEQ(c0, llvm::ConstantInt::get(i8, '-')), "fpo.sg");
+        llvm::Value* off = builder_.CreateZExt(signed_, i64(), "fpo.off");
+        llvm::Value* cp = builder_.CreateGEP(i8, data, {off}, "fpo.cp");
+        llvm::Value* c = builder_.CreateLoad(i8, cp, "fpo.c");
+        llvm::Value* isDigit = builder_.CreateICmpULT(
+            builder_.CreateSub(c, llvm::ConstantInt::get(i8, '0')),
+            llvm::ConstantInt::get(i8, 10), "fpo.dig");
+        llvm::Value* spellsFinite = builder_.CreateOr(
+            isDigit, builder_.CreateICmpEQ(c, llvm::ConstantInt::get(i8, '.')),
+            "fpo.fin");
+        llvm::Type* ty = val->getType();
+        llvm::Value* isInf = builder_.CreateOr(
+            builder_.CreateFCmpOEQ(val, llvm::ConstantFP::getInfinity(ty, false)),
+            builder_.CreateFCmpOEQ(val, llvm::ConstantFP::getInfinity(ty, true)),
+            "fpo.inf");
+        return builder_.CreateAnd(spellsFinite, isInf, "fpo.ovf");
+    }
+
     // §11.8 / stdlib §2.19 (#1470): store a TryParse out-result. The per-type
     // CONCRETE member's out is a BARE value (stdlib §9.1: `out result: int`), so
     // a direct `int.TryParse(s, out var b)` slot is a plain scalar and the bare
