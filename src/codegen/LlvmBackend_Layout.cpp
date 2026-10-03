@@ -6834,6 +6834,48 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             }
         }
     }
+    // fix #5316 (§14.1 / §27.6 / §12, v0.313): a property declared on a
+    // generic BASE reached through a DERIVED receiver — `a.v` with `a: DI`
+    // where `DI : Holder<int>`, or `this.v` inside such a class's own method
+    // (sema gives `this` no exprType, `isThisOrBaseExpr`) — matches neither the
+    // direct-receiver gate above (`recvTy->declaration == ps->parent`) nor, for
+    // `this`, any receiver type at all, so NO substitution was installed and
+    // the thunk's signature and body lowered against the erased `T -> i32`
+    // placeholder: `DS : Holder<string>` formed `this.v` and read `""` for
+    // `"z"`. Walk the base chain exactly as the inline read path does
+    // (#3346/#3348, LlvmBackend_Exprs.cpp) and the implicit-`this` field path
+    // does for the enclosing class (#989/#3347, implicitFieldAddr).
+    if (ma && ma->target && ps->parent && !ps->parent->genericParams.empty()) {
+        const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+        sema::TypeRef synth;
+        if (!recvTy && isThisOrBaseExpr(*ma->target)) {
+            const sema::TypeSymbol* enclosingCls = nullptr;
+            if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent)
+                enclosingCls = currentSpecMethodSymbol_->parent;
+            if (!enclosingCls && currentFn_) {
+                for (const auto& [sym, fn] : methodFns_)
+                    if (fn == currentFn_ && sym->parent) {
+                        enclosingCls = sym->parent;
+                        break;
+                    }
+            }
+            if (enclosingCls) {
+                synth.kind = sema::TypeRef::Kind::Named;
+                synth.declaration = const_cast<sema::TypeSymbol*>(enclosingCls);
+                recvTy = &synth;
+            }
+        }
+        if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+            recvTy->declaration && recvTy->declaration != ps->parent) {
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(recvTy, ps->parent, ancSubst,
+                                            ancSema)) {
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+            }
+        }
+    }
 
     // fix #5306: the per-instantiation memo lookup, under the substitution
     // just installed (see the note at the top of this function). The
