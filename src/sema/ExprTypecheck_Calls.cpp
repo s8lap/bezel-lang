@@ -14775,6 +14775,61 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
             pt = substituteMemberType(pt, recvTarget, recvParent);
         if (!explicitSubst.empty())
             pt = substituteReturnType(pt, explicitSubst);  // narrow #4915
+        // fix #5328 (§15.4, v0.313): the §15.4 collection-literal TARGET
+        // check, imported twin of `checkArgsAgainstParams`'s gate. §15.4:
+        // "A collection literal has no standalone type. It is well-typed only
+        // in a context that provides the target type: a type annotation, or
+        // the parameter type of a method call", and the targets that admit
+        // one are a CLOSED list. The same-module path has run that gate since
+        // #1174 (interface) / #2914 (the general closed list); the IMPORTED
+        // path did not, so `checkAssignable` below was the only check this
+        // argument ever got — and it no-ops on a null `from` (an untargeted
+        // literal has no exprType). Measured on r23-c28 599c6f53: the
+        // character-identical program rejected its own-module twin from sema
+        // with the §15.4 text and, across the boundary, was left to codegen's
+        // `lowerCallDispatch` imported-argument arm, which reported a
+        // DIFFERENT string ("cannot target the imported parameter type here")
+        // for the same location — and that string lists an inline array as
+        // admissible while the very arm emitting it had no inline-array path
+        // to admit one.
+        //
+        // The fix is the SAME predicate on the SAME resolved formal type, so
+        // the two legs report the same rule, at the same location, in the
+        // same words (§2.6's cross-module twin of a local rule; the property
+        // #3141 pins). What §15.4 admits stays admitted here: an inline array
+        // `[N]T` and `Set<T>` are both on the list, so `Inl([1, 2, 3])` at a
+        // `[3]int` formal and `St([1, 2, 2])` at a `Set<int>` formal are NOT
+        // rejected by this gate — this lane fixes the SEMAD side only, and
+        // what codegen then does with an admitted inline array / a duplicate
+        // Set element is the separate codegen arm of #5328.
+        //
+        // SCOPE — why the interface predicate alone, and not the local arm's
+        // full #3031 `isCollectionLiteralAdmissibleTarget` gate: that predicate
+        // identifies a BUILTIN collection head through `t->astNode` /
+        // `t->headName()`, and an imported formal's TypeRef carries its name on
+        // `importedName` with a null `astNode` (the #2648 point-1 blind spot
+        // this issue's item 4 also names). MEASURED on this base: extending
+        // the gate to the imported channel false-rejected BOTH §15.4-admitted
+        // targets with the generic out-of-list diagnostic —
+        //   `b.St([1, 2, 2])` at `St(s: Set<int>)` -> "cannot target the type
+        //    `Set<int>` — §15.4 admits only a concrete collection target"
+        //   `b.Inl([1, 2, 3])` at `Inl(a: [3]int)` -> same, the inline array
+        //    losing to the null-`astNode` name lookup exactly as `Set` does.
+        // Carrying that predicate across the boundary means teaching it the
+        // imported-name spelling FIRST; that is the codegen arm's prerequisite
+        // for admitting `[N]T` and deduplicating a `Set` element, not this
+        // lane's. `isCollectionLiteralInterfaceTarget` needs no such repair —
+        // it matches a builtin interface by simple name through
+        // `callsNamedTypeSimpleName`, which reads `importedName` — so it is
+        // correct on an imported formal as it stands, which is what makes it
+        // the right predicate to carry over now.
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(a.value.get()) &&
+            isCollectionLiteralInterfaceTarget(pt)) {
+            reportCollectionLiteralInterfaceTarget(
+                ctx_.diagnostics(), a.value->span.begin,
+                callsNamedTypeSimpleName(pt));
+            continue;
+        }
         checkAssignable(ctx_.exprType(*a.value), pt,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(ai + 1),
