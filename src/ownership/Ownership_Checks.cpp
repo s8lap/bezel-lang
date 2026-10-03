@@ -14597,6 +14597,36 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // it fell through to "not a borrow" — letting an `owned` sink dispose a value
     // the real owner also disposes (a double-free). Flag it as a borrow when the
     // bound field is a reference type (a record field is always non-owning, §9.7).
+    // fix #5279 (§28.11 "an element borrow", §28.3 *Borrow lifetime rules*,
+    // v0.313): a for-in iteration variable over a BORROWING collection is "a
+    // default-iteration variable" -- an element borrow of the collection, whose
+    // owner (the collection) disposes the element. It is not in `states_`
+    // (only an OWNING-iterable variable is seeded Owned by seedOwnedIterVar,
+    // and that case was classified by the tracked-local arm above), so it fell
+    // through to the not-a-borrow tail and `return row;` through an `owned`
+    // return -- or any other owned sink -- was accepted and leaked/double-freed.
+    // Value-typed elements are excluded by the borrowable-type gate.
+    // per §28.11, §28.3
+    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        if (loc->decl && dynamic_cast<const ast::ForStmt*>(loc->decl)) {
+            const sema::TypeRef* et = ctx_.exprType(*id);
+            if (isBorrowableType(et)) return true;
+            // A declaration-less builtin collection element (`Array<int>` in
+            // `Array<Array<int>>`) is a class instance too (§28.3 row 4,
+            // v0.313), which isBorrowableType leaves unclassified.
+            if (et && et->kind == sema::TypeRef::Kind::Named &&
+                !et->declaration) {
+                std::string_view head;
+                if (et->astNode && et->astNode->name &&
+                    !et->astNode->name->parts.empty())
+                    head = et->headName();
+                else
+                    head = et->importedName;
+                if (common::isPlainBuiltinCollectionHead(head)) return true;
+            }
+            return false;
+        }
+    }
     if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
         if (loc->decl &&
             dynamic_cast<const ast::BindingPattern*>(loc->decl)) {
