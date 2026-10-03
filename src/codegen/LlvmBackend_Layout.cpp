@@ -6754,11 +6754,19 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     // property's return type / generic substitution were already baked into
     // the compiled thunk on first emission) and go straight to building a
     // fresh closure cell with the current receiver.
+    //
+    // fix #5306 (§14.1 / §27.6 / §27.7.1, v0.313): "this property" means this
+    // property AT THIS INSTANTIATION. The cache lookup therefore runs AFTER
+    // the receiver's §14.1 substitution is installed below, and keys on it
+    // (see PropertyThunkKey in LlvmBackend_impl.hpp): a thunk compiled for
+    // `Holder<int>` (signature `i32 (ptr)`, body GEPs typed against
+    // `class.Holder$spec0`) is never handed to a `Holder<string>` reference,
+    // whose field types and offsets differ. Keyed by the symbol alone (the
+    // pre-#5306 memo), the first instantiation's thunk served every later one
+    // and returned a silently wrong value.
     // §27.7.1 (#1544): classify the equality kind once and thread it into
     // buildPropertyClosureCell on both paths (mirrors makeMethodThunk).
     FnValKind pkind = closureKindForProperty(ps, receiverVal);
-    if (auto cit = propertyThunks_.find(ps); cit != propertyThunks_.end())
-        return buildPropertyClosureCell(cit->second, receiverVal, pkind);
     auto savedSubst = genericSubst_;
     auto savedSemaTy = genericSubstSemaTy_;
 
@@ -6806,14 +6814,45 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                     for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
                         newSubst[gpNames[gi]] =
                             lowerTypeRef(recvTy->genericArgs[gi]);
-                        newSema[gpNames[gi]] =
-                            resolveTypeParamRef(recvTy->genericArgs[gi]);
+                        // fix-forward #5306 (§14.1, v0.313): compose the SEMA
+                        // argument through the still-active OUTER map, as the
+                        // method-call site does (#2192, LlvmBackend_Calls2.cpp).
+                        // `resolveTypeParamRef` resolved only a BARE `U`; a
+                        // nested `Holder<Box<U>>` inside `Read<U>` at `U = int`
+                        // kept `Box<U>`, so the memo key below encoded the
+                        // enclosing method's parameter instead of the owner's
+                        // instantiation `Holder<Box<int>>`, and the reference
+                        // formed there never equalled `hi.v` formed in `Main`
+                        // (§27.7.1). The LLVM half already composed, since
+                        // lowerTypeRef reads the outer `genericSubst_`.
+                        newSema[gpNames[gi]] = substituteTypeRefLocal(
+                            recvTy->genericArgs[gi], genericSubstSemaTy_);
                     }
                     genericSubst_ = std::move(newSubst);
                     genericSubstSemaTy_ = std::move(newSema);
                 }
             }
         }
+    }
+
+    // fix #5306: the per-instantiation memo lookup, under the substitution
+    // just installed (see the note at the top of this function). The
+    // receiver's LLVM type is part of the key because the body's `this`
+    // reconstruction below branches on it (#2501). The substitution half is
+    // the OWNER's instantiation only (fix-forward #5306, propertyThunkSubstKey):
+    // when the block above did not run — `this.v` (`this` carries no
+    // exprType) or a bare-name `v` (no MemberAccessExpr) inside a specialized
+    // generic METHOD — the live map also binds the method's own parameters,
+    // which must not split one property at one instantiation per method
+    // instantiation and per site.
+    PropertyThunkKey thunkKey{ps, receiverVal ? receiverVal->getType() : nullptr,
+                              {}, {}};
+    propertyThunkSubstKey(ps, std::get<2>(thunkKey), std::get<3>(thunkKey));
+    if (auto cit = propertyThunks_.find(thunkKey);
+        cit != propertyThunks_.end()) {
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        return buildPropertyClosureCell(cit->second, receiverVal, pkind);
     }
 
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
@@ -6852,11 +6891,12 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     // those fields are NOT redundant with this guard; this guard covers
     // the per-body set the hand-rolled block missed.
     //
-    // WHY IT MATTERS HERE. `propertyThunks_[ps]` is memoized per
-    // `sema::PropertySymbol*` (not per receiver — §27.7.1, "property
-    // references follow the method-reference rule" / #1544), so the
-    // body built here is the cached thunk's body for the LIFETIME of the
-    // module. A `new T<Res>` (or any other emitter that reaches a
+    // WHY IT MATTERS HERE. `propertyThunks_` is memoized per (property,
+    // receiver shape, §14.1 substitution) — fix #5306 added the last two;
+    // it is still NOT per receiver VALUE or per call site (§27.7.1,
+    // "property references follow the method-reference rule" / #1544), so
+    // the body built here is the cached thunk's body for every later
+    // reference at the same instantiation, for the LIFETIME of the module. A `new T<Res>` (or any other emitter that reaches a
     // destructor's body) anywhere in the surrounding caller's emission
     // window leaks THAT caller's `emittingDisposerBody_` into the thunk
     // body. The first caller's surrounding context is frozen module-wide
@@ -6916,9 +6956,10 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     // PropertySymbol carries no `parent` — SymbolCollection.cpp "patched by
     // slice 2" never patches it for properties, only `MethodSymbol::
     // extensionDecl` gets the analogous method-side wiring). The thunk body
-    // is built ONCE and cached per `ps` (propertyThunks_), so this shape is
-    // fixed at first emission — the same per-symbol-not-per-instantiation
-    // caching methodThunks_ already accepts.
+    // is built ONCE per (`ps`, receiver LLVM type, substitution) and cached
+    // (propertyThunks_, fix #5306) — the receiver's LLVM type is a key
+    // component precisely because this shape is baked into the body, the
+    // same reason methodThunks_ keys on the instantiated signature (#2766).
     //   - CLASS/INTERFACE receiver (or no receiver at all — a static
     //     property; `thisVal` then has no real use since a static getter
     //     body never reads `this`): unchanged pointer load.
@@ -7147,8 +7188,84 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     // §27.7.1 (v0.180, #1544): cache the thunk so subsequent references to
     // this property (e.g. a repeated `b.Count` read as a function value)
     // reuse the SAME fn pointer — mirrors makeMethodThunk's methodThunks_.
-    propertyThunks_[ps] = thunk;
+    // fix #5306: under the per-instantiation key computed above, never `ps`
+    // alone.
+    propertyThunks_[thunkKey] = thunk;
     return buildPropertyClosureCell(thunk, receiverVal, pkind);
+}
+
+// fix #5306 (§14.1 / §27.6 / §27.7.1, v0.313): the substitution half of a
+// property thunk's memo key — see PropertyThunkKey in LlvmBackend_impl.hpp.
+// Each entry pairs an LLVM type with `typeRefIdentityKey`'s recursive
+// structural encoding of the sema type (#1947: erased LLVM types alone
+// conflate `Box<A>` with `Box<B>`, both `ptr`, whose bodies can differ). A
+// property whose owner declares no type parameters gets the EMPTY key:
+// nothing in its thunk depends on a substitution, and splitting it by the
+// caller's unrelated one would give two references to the same property on
+// the same receiver different fn pointers (#1544's §27.7.1 equality).
+//
+// fix-forward #5306 (review R-1): the key is the OWNER's instantiation and
+// nothing else — one entry per `sema::genericParamNames(ps->parent)` name, in
+// declaration order, each the owner parameter's binding in the live map.
+//
+// WHY NOT THE WHOLE LIVE MAP (the first #5306 form). When makePropertyThunk's
+// §14.1 install block runs it REPLACES the live map with exactly the owner's
+// bindings, so both forms agree there. It does not run for `this.v` (`this`
+// carries no exprType) nor for a bare-name `v` (no MemberAccessExpr), and
+// inside a specialized generic METHOD the live map then also binds the
+// method's own parameters: `this.v` inside `RefAt<U>` of `Holder<T>` keyed on
+// {T, U}, so one property at one instantiation got a thunk per `U` and per
+// site, and `hi.RefAt<int>(1) = hi.RefAt<string>("u")` (and `= hi.v`) was
+// False — §27.7.1's "guaranteed equal" broken, and with it event `-=`
+// unsubscription. A thunk's signature and body depend only on the owner's
+// bindings (a getter body is class-scope code and cannot name a method's
+// `U`), so those bindings are the whole of what the key must carry.
+//
+// UNBOUND OWNER PARAMETER. When some owner parameter has no binding in the
+// live map — a reference from a DERIVED class's own body (`class D<X> :
+// Holder<X>` forming `this.v`, #5316's family) or from the erased template —
+// the owner's instantiation cannot be identified by name. The key then falls
+// back to the first #5306 form, the whole live map in NAME order
+// (`genericSubst_` is unordered, and an iteration-order-dependent key would
+// vary run to run), behind a sentinel entry no owner-only key can produce
+// (`typeRefIdentityKey` never yields a string starting with `!`), so the two
+// forms can never collide and every such shape partitions its references
+// exactly as before this fix-forward.
+void Emitter::propertyThunkSubstKey(const sema::PropertySymbol* ps,
+                                    std::vector<llvm::Type*>& llvmKey,
+                                    std::vector<std::string>& idKey) {
+    llvmKey.clear();
+    idKey.clear();
+    if (!ps || !ps->parent) return;
+    const std::vector<std::string_view> gpNames =
+        sema::genericParamNames(ps->parent);
+    if (gpNames.empty()) return;  // non-generic owner: the EMPTY key
+    auto pushEntry = [&](std::string_view name, llvm::Type* ty) {
+        llvmKey.push_back(ty);
+        auto sit = genericSubstSemaTy_.find(name);
+        idKey.push_back(sit != genericSubstSemaTy_.end() && sit->second
+                            ? typeRefIdentityKey(sit->second)
+                            : std::string());
+    };
+    // The owner's instantiation, in declaration order.
+    bool allBound = true;
+    for (std::string_view name : gpNames) {
+        auto lit = genericSubst_.find(name);
+        if (lit == genericSubst_.end()) { allBound = false; break; }
+        pushEntry(name, lit->second);
+    }
+    if (allBound) return;
+    // Fallback: the whole live map, name-sorted, behind the sentinel.
+    llvmKey.clear();
+    idKey.clear();
+    llvmKey.push_back(nullptr);
+    idKey.push_back("!owner-unbound");
+    std::vector<std::string_view> names;
+    names.reserve(genericSubst_.size());
+    for (const auto& [name, ty] : genericSubst_) names.push_back(name);
+    std::sort(names.begin(), names.end());
+    for (std::string_view name : names)
+        pushEntry(name, genericSubst_.find(name)->second);
 }
 
 // §27.7.1 (#1544): classify the equality kind of a property-reference function

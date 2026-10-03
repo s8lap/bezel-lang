@@ -1590,7 +1590,38 @@ private:
     // the general `=`/`<>` operator (bz_closure_value_equals) even though
     // "property references follow the method-reference rule" (§27.7.1
     // fourth bullet).
-    std::unordered_map<sema::PropertySymbol*, llvm::Function*> propertyThunks_;
+    // fix #5306 (§14.1 / §27.6 / §27.7.1, v0.313): keyed by the INSTANTIATION
+    // too, not the symbol alone. One PropertySymbol of a generic class serves
+    // every instantiation, but the thunk does not: its SIGNATURE (`T -> i32`
+    // at `Holder<int>`, `T -> ptr` at `Holder<string>`) and its BODY (the
+    // `class.Holder$specN` struct every field GEP is typed against, so even an
+    // `int`-typed sibling property's byte offset moves) are both lowered under
+    // the receiver's §14.1 substitution. Keying by symbol froze the FIRST
+    // instantiation's thunk for every later one — a silent wrong value. The key
+    // is (symbol, receiver LLVM type, substitution) where the substitution is
+    // `propertyThunkSubstKey`'s (LLVM type, `typeRefIdentityKey`) pairs for
+    // the OWNER's type parameters in declaration order — the identity half is
+    // the same recursive encoding buildSpecializedMethodFn (#1947) keys
+    // per-instantiation bodies on. Two references at the SAME instantiation
+    // still share one thunk, so §27.7.1's "property references follow the
+    // method-reference rule" (#1544) is preserved — including a `this.v` or
+    // bare-name `v` formed inside a specialized generic METHOD of the owner,
+    // whose live map also binds the method's own parameters (fix-forward
+    // #5306, review R-1: keying on the whole live map split those per method
+    // instantiation and per site).
+    using PropertyThunkKey =
+        std::tuple<sema::PropertySymbol*, llvm::Type*,
+                   std::vector<llvm::Type*>, std::vector<std::string>>;
+    std::map<PropertyThunkKey, llvm::Function*> propertyThunks_;
+    // fix #5306: the substitution half of PropertyThunkKey for `ps` under the
+    // LIVE `genericSubst_` / `genericSubstSemaTy_`: the owner's parameters'
+    // bindings only. Empty for a property whose owner is not generic (its
+    // thunk cannot depend on any substitution, and a caller's unrelated
+    // substitution must not split its §27.7.1 identity). See the definition
+    // for the unbound-owner-parameter fallback.
+    void propertyThunkSubstKey(const sema::PropertySymbol* ps,
+                               std::vector<llvm::Type*>& llvmKey,
+                               std::vector<std::string>& idKey);
     // CG10: emitted LLVM function for each (non-static) constructor symbol.
     std::unordered_map<sema::ConstructorSymbol*, llvm::Function*> ctorFns_;
     // CG47 / fix #582 / §22.13: one entry per static-initialisation unit that

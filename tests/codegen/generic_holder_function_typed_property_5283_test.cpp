@@ -283,24 +283,27 @@ BEZEL_TEST(generic_holder_function_typed_property_5283,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n"));
 }
 
-// Control (NOT a fail-without row), and the one that most directly guards the
-// blast radius of the #5283 fix: the SAME `Holder<T>` generic read in
-// function-value position at TWO instantiations in one program. `makePropertyThunk`
-// memoises its thunk per `sema::PropertySymbol*` — NOT per instantiation
-// (`propertyThunks_`; see its own comment there), so a program that instantiates
-// one generic property at two different type arguments is exactly the shape where
-// a substitution-sensitive signature could be baked from the first emission and
-// reused by the second. Both orders are exercised: function-typed first, then
-// `string`; and the reverse pairing below.
+// The row that guards the blast radius of the #5283 fix: the SAME `Holder<T>`
+// property referenced in function-value position at TWO instantiations of
+// DIFFERENT LLVM shapes, in both orders. `makePropertyThunk` memoizes its
+// thunk (`propertyThunks_`), and #5283's hoist made the thunk's signature
+// substitution-dependent, so a memo keyed by the symbol alone freezes the
+// first instantiation's thunk for the second (#5306, fixed with the memo now
+// keyed per instantiation).
 //
-// MEASURED: this holds because defect 2's carve-out means a function-typed
-// substitution never reaches the thunk at all (it takes the ordinary value-read
-// path), so the only thunk ever cached is the `string` one — consistent in both
-// orderings. If a future change routes a function-typed substitution back
-// through the thunk, this row is what will catch the shared-signature bug.
+// fix #5306 (review F-1): the previous version of this row was VACUOUS — its
+// function-typed instantiation was read at the call site, where defect 2's
+// carve-out makes `hf.v` an ordinary value read, so only ONE thunk was ever
+// emitted (`grep -c 'define internal.*pthunk'` = 1 for both programs). Here the
+// function-typed instantiation reaches the thunk through `Read<U>`, whose
+// receiver is `Holder<U>` (a §27.6 getter reference at `U = () -> int`, a
+// `ptr (ptr)` thunk), paired with `Holder<int>`'s `i32 (ptr)` thunk.
+// MEASURED (`BEZEL_DUMP_IR=1` on bezelc, post-fix): 3 `pthunk` definitions in
+// each program (`i32` for `hi.v`, `ptr` for `Read<() -> int>`, and the erased
+// `Read` template's `i32`). Fails on ef32951c and on r23-c28 (see the commit).
 BEZEL_TEST(generic_holder_function_typed_property_5283,
            two_instantiations_of_one_generic_property) {
-    // Function-typed instantiation FIRST, then a reference-type one.
+    // Function-typed instantiation's thunk FIRST, then the `int` one.
     JitResult r = runAot(
         "module M;\n"
         "class Holder<T>\n"
@@ -310,24 +313,27 @@ BEZEL_TEST(generic_holder_function_typed_property_5283,
         "  end constructor;\n"
         "end Holder;\n"
         "class Program\n"
+        "  public static method Read<U>(h: Holder<U>): U\n"
+        "    var g: () -> U := h.v;\n"
+        "    return g();\n"
+        "  end Read;\n"
         "  public static method Main(): int\n"
         "    var hf := new Holder<() -> int>(lambda () => 7);\n"
-        "    var gf: () -> int := hf.v;\n"
-        "    var b := gf();\n"
-        "    var hs := new Holder<string>(\"z\");\n"
-        "    var gs: () -> string := hs.v;\n"
-        "    var c := gs();\n"
+        "    var f := Read<() -> int>(hf);\n"
+        "    var b := f();\n"
+        "    var hi := new Holder<int>(3);\n"
+        "    var gi: () -> int := hi.v;\n"
+        "    var a := gi();\n"
         "    Console.WriteLine(b.ToString());\n"
-        "    Console.WriteLine(c);\n"
+        "    Console.WriteLine(a.ToString());\n"
         "    return 0;\n"
         "  end Main;\n"
         "end Program;\n");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\nz\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n3\n"));
 
-    // The reverse pairing: a value-type instantiation (which DOES take the
-    // thunk path) alongside the function-typed one.
+    // The reverse order: the `int` thunk first, then the function-typed one.
     JitResult r2 = runAot(
         "module M;\n"
         "class Holder<T>\n"
@@ -337,13 +343,17 @@ BEZEL_TEST(generic_holder_function_typed_property_5283,
         "  end constructor;\n"
         "end Holder;\n"
         "class Program\n"
+        "  public static method Read<U>(h: Holder<U>): U\n"
+        "    var g: () -> U := h.v;\n"
+        "    return g();\n"
+        "  end Read;\n"
         "  public static method Main(): int\n"
         "    var hi := new Holder<int>(3);\n"
         "    var gi: () -> int := hi.v;\n"
         "    var a := gi();\n"
         "    var hf := new Holder<() -> int>(lambda () => 7);\n"
-        "    var gf: () -> int := hf.v;\n"
-        "    var b := gf();\n"
+        "    var f := Read<() -> int>(hf);\n"
+        "    var b := f();\n"
         "    Console.WriteLine(a.ToString());\n"
         "    Console.WriteLine(b.ToString());\n"
         "    return 0;\n"
