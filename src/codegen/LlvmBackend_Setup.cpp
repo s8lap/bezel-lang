@@ -8905,7 +8905,25 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     // override statically and emits a direct call, so it never reads this slot
     // and was already correct. The test file pins both arms.)
     //
-    // THE QUESTION IS (c)'s PROPERTY, asked about the class that DECLARES the
+    // fix #4985: drop the `instanceLayoutDiffersFromErasedTemplate(user->parent)`
+    // gate. The blind spot this predicate has on (c) and (d) — layout-equal
+    // does not mean body-equal — is the same blind spot here. The thunk
+    // forwards to `methodFns_[user]` — the ERASED template body — non-virtually,
+    // and that body reads per-instantiation statics (`B<T>._c`) by their
+    // substitution-specific global name. A generic class with no instance
+    // fields has the predicate false on every specialization, so the thunk
+    // stayed pinned to the erased body and observed the placeholder cell.
+    // Measured on `class D<T>: B<T>` overriding `ToString(): string` to
+    // `$"<D{B<T>._c}>"` at T = int: every print was `<D0>` pre-fix because the
+    // erased thunk GEP'd `bz$M.B$_c` (the placeholder), `<D10>`/`<D20>`
+    // post-fix because the per-inst thunk reads `bz$M.B$int$_c`. Sibling to
+    // #4966 (cb405b15) for (c) and #4984 (8a00c084) for (d); same predicate,
+    // same gate, same defect, three sites. The signature-ABI guard below
+    // (`concFnTy != mit->second->getFunctionType()`) stays — a specialization
+    // whose signature MOVES under the substitution cannot be forwarded to from
+    // the thunk's fixed-argument call site.
+    //
+    // (THE QUESTION IS (c)'s PROPERTY, asked about the class that DECLARES the
     // user override — `instanceLayoutDiffersFromErasedTemplate(user->parent)` —
     // because that is the class whose `classStruct` the forwarded-to body GEPs.
     // False for a non-generic declarer, at `T = int`, and for every generic
@@ -8914,7 +8932,7 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     // reaches here at all: its thunk is the §8.5/§8.3 compiler-generated default
     // (§8.5's "the type's qualified name"; §8.3's "Reference equality" and
     // "Identity-based" hash), which reads no field and
-    // therefore has no layout to be wrong about.
+    // therefore has no layout to be wrong about.)
     //
     // Collection is deliberately SIDE-EFFECT-FREE (map lookups and pure
     // predicates), for #2906's reason: nothing may emit a body before the
@@ -8949,8 +8967,13 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     return;
                 auto mit = methodFns_.find(user);
                 if (mit == methodFns_.end() || !mit->second) return;
-                if (!instanceLayoutDiffersFromErasedTemplate(user->parent))
-                    return;
+                // fix #4985 (§8.5 / §8.3 / §14.1 / §2.8.3 rule 4, v0.307):
+                // removed the `instanceLayoutDiffersFromErasedTemplate` gate.
+                // See the block comment above for the rationale — the layout
+                // predicate has the same blind spot #4966 closed for (c) and
+                // #4984 closed for (d): the thunk's forwarded-to body can
+                // depend on `T` (e.g. via a per-instantiation static
+                // `B<T>._c`) without the instance layout moving.
                 // The thunk calls the user body with the slot's own fixed
                 // arguments, so a specialization whose SIGNATURE moves under the
                 // substitution cannot be forwarded to. Refuse — keeping today's
