@@ -479,7 +479,12 @@ BEZEL_TEST(sema_shared_event_capture_free_4920,
 }
 
 // pe_free: capture-free lambda literal on Subscribe. Sema admits
-// (capture-free); codegen rejects with #2457 (no claim).
+// (capture-free, by #4920); codegen rejected on f321f94e / l24b with the
+// #2457 backstop. Lifted to RUN-with-stdout by #4972, which extended
+// codegen's sharedEventHandlerAdmissible predicate to admit a capture-free
+// LambdaExpr of exactly `(T) -> ()` (mirroring stdlib §6.5 v0.307 / spec
+// §28.14 v0.307, which admit both a static method reference AND a
+// non-capturing lambda on every subscribe position of the pair).
 BEZEL_TEST(sema_shared_event_capture_free_4920,
            subscribe_capture_free_lambda_control_spec_6_5_28_14) {
     auto r = runAot(
@@ -496,9 +501,12 @@ BEZEL_TEST(sema_shared_event_capture_free_4920,
         "    return 0; "
         "  end Main; "
         "end C4920pef;");
-    // CONTROL: same intermediate state as p9_static_ctl above.
-    BEZEL_EXPECT_TRUE(rejectedWithNeedle(r,
-        "produced no value, and no dispatch arm emitted any code"));
+    // FLIPPED by #4972: was the CONTROL #2457 row (codegen rejected with
+    // "produced no value, and no dispatch arm emitted any code"); now
+    // asserts the spec-stated behaviour — the handler runs, prints 9,
+    // and exits 0.
+    BEZEL_EXPECT_TRUE(r.ran && r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "9\n" || r.stdoutText == "9\r\n");
 }
 
 // pe_free_via_add: capture-free lambda held in a local, passed to Add.
@@ -566,8 +574,18 @@ BEZEL_TEST(sema_shared_event_capture_free_4920,
 }
 
 // pe_free_pe: capture-free lambda literal via +=. Desugars to .Add per
-// spec §17.2. Sema admits (capture-free); codegen rejects with #2457.
-// CONTROL — flips to RUN-with-stdout when L24b widens.
+// spec §17.2. Sema admits (capture-free, by #4920); codegen rejected on
+// f321f94e/l24b (the #4901 codegen narrow: tryLowerEventCompound's `+=`
+// gate admitted only a static method reference, with its own diagnostic
+// text — the explicit spurious reject tracked as #4972). Lifted to
+// RUN-with-stdout by #4972, which extended codegen's
+// sharedEventHandlerAdmissible predicate to admit a capture-free
+// LambdaExpr (mirroring stdlib §6.5 v0.307 / spec §28.14 v0.307, which
+// admit both forms) AND replaced the `+=` route's bespoke handler-
+// lowering with the shared helper used by the `.Subscribe`/`.Add`/
+// `.Remove` call arms (`lowerEventHandlerClosure` — sets the synthesized
+// return to Unit; same consume-guard for cellFreeEligible_ captures on
+// `using var` receivers).
 BEZEL_TEST(sema_shared_event_capture_free_4920,
            plus_equal_capture_free_lambda_control_spec_6_5_17_2_28_14) {
     auto r = runAot(
@@ -583,12 +601,10 @@ BEZEL_TEST(sema_shared_event_capture_free_4920,
         "    return 0; "
         "  end Main; "
         "end C4920pefp;");
-    // CONTROL: sema admits (capture-free). Under #4901 v3 codegen's `+=`
-    // gate rejects it (it lowers only a static `(T) -> ()` method reference;
-    // lambda handlers on the pair are #4972), with its own text rather than
-    // #2457. Flips to RUN-with-stdout="9" when #4972 lands.
-    BEZEL_EXPECT_TRUE(rejectedWithNeedle(r,
-        "`+=` on a `SharedEventSource<T>` is lowered only for a static"));
-    BEZEL_EXPECT_TRUE(diagnosticAbsent(r,
-        "produced no value, and no dispatch arm emitted any code"));
+    // FLIPPED by #4972: was the CONTROL `+=`-gate diagnostic row on
+    // f321f94e/l24b ("`+=` on a `SharedEventSource<T>` is lowered only
+    // for a static..." with no #2457 text); now asserts the spec-stated
+    // behaviour — the lambda handler runs, prints 9, and exits 0.
+    BEZEL_EXPECT_TRUE(r.ran && r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "9\n" || r.stdoutText == "9\r\n");
 }

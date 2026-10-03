@@ -845,12 +845,15 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
 // distinguishes the gate.
 // -----------------------------------------------------------------------
 
-// A capture-free lambda literal via `+=`: §6.5 admits it, but lowering a
-// lambda handler on the shared pair is not implemented yet (#4972) — a
-// spurious reject by design, pinned so the flip to a RUN row is visible.
+// A capture-free lambda literal via `+=`: §6.5 admits it. Before fix #4972
+// the codegen `+=` gate admitted ONLY a static, non-overloaded method ref
+// of exactly `(T) -> ()` and rejected a lambda literal with its own text;
+// that gate has been lifted to also admit a capture-free lambda of that
+// signature. Spec-stated behaviour: the handler runs, prints `9`, and
+// exits 0.
 BEZEL_TEST(codegen_shared_event_call_lowering_4901,
-           plus_eq_capture_free_lambda_rejected_by_codegen_gate) {
-    BEZEL_EXPECT_TRUE(rejectedWith(
+           plus_eq_capture_free_lambda_lowered_lift_4972) {
+    auto r = runAot(
         "module M; "
         "import System.Threading; "
         "class Bus "
@@ -862,17 +865,18 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
         "    Bus.Feed.Raise(9); "
         "    return 0; "
         "  end Main; "
-        "end C;",
-        {"`+=` on a `SharedEventSource<T>` is lowered only for a static, "
-         "non-overloaded method reference whose signature is exactly "
-         "`(T) -> ()`",
-         "(#4972)"}));
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran && r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "9\n" || r.stdoutText == "9\r\n");
 }
 
 // p06 via `+=`: an overload GROUP whose first member is `On(int)`. Sema's
 // `+=` assignability check passes (measured: with `On(string)` declared first
 // it rejects instead), but which overload codegen would bind is not what sema
-// checked, so the gate rejects every overload group.
+// checked, so the gate rejects every overload group. The diagnostic's lead-in
+// phrase is unchanged; only the post-semicolon segment was reworded by #4972
+// (the lift to capture-free lambda handlers dropped the now-stale "(#4972)"
+// continuation).
 BEZEL_TEST(codegen_shared_event_call_lowering_4901,
            plus_eq_overloaded_static_group_rejected_by_codegen_gate) {
     BEZEL_EXPECT_TRUE(rejectedWith(
@@ -895,5 +899,5 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
         {"`+=` on a `SharedEventSource<T>` is lowered only for a static, "
          "non-overloaded method reference whose signature is exactly "
          "`(T) -> ()`",
-         "(#4972)"}));
+         "this handler is not one"}));
 }

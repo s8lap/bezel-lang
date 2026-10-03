@@ -144,15 +144,11 @@ BEZEL_TEST(shared_event_source_handler_signature_4898,
 }
 
 // ---------------------------------------------------------------------------
-// CONTROL — capture-free lambda on SharedEventSource.Subscribe passes the
-// SEMANTIC shape check (#4898 + #4920), but codegen does NOT yet lower a
-// non-static lambda on the shared pair (tracked as #4972). Pre-fix the
-// handler slot was also missing, so a non-capturing-lambda literal went
-// further than this row — codegen still rejected (#2457), but the
-// diagnostic text was identical. Post-fix, this row is the load-bearing
-// pin that a capture-free lambda with the correct `(T) -> ()` shape now
-// reaches the same codegen state as a static method ref (a #4972 widening
-// would let this row run).
+// fix #4972 (stdlib §6.5 v0.307, spec §28.14 v0.307): capture-free lambda
+// on SharedEventSource.Subscribe. Was a CONTROL pinning the codegen gap
+// (the handler slot check #4898 + capture-freedom admission #4920 passed,
+// then codegen rejected with #2457); #4972 lifts the codegen gap and the
+// handler now runs, printing its payload.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(shared_event_source_handler_signature_4898,
            shared_eventsource_subscribe_capture_free_lambda_control_spec_6_5) {
@@ -162,16 +158,16 @@ BEZEL_TEST(shared_event_source_handler_signature_4898,
         "  public static method Main(): int "
         "    using var src := new SharedEventSource<int>(); "
         "    src.Subscribe(lambda(x: int) => Console.WriteLine($\"v:{x}\")); "
+        "    src.Raise(9); "
         "    return 0; "
         "  end Main; "
         "end C;");
-    // Capture-free lambda passes #4920 (no capture) and #4898 (shape OK),
-    // then hits #4972's codegen gap — the same backstop diagnostic #2457
-    // a static method ref would have hit pre-#4901. If this row ever flips
-    // to RUN, the codegen widening landed and #4972 closed.
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(hasDiag(r,
-        "produced no value, and no dispatch arm emitted any code"));
+    // FLIPPED by #4972: was the CONTROL #2457 reject row on b640eb0d/l24b
+    // (codegen rejected with "produced no value, and no dispatch arm
+    // emitted any code"); now asserts the spec-stated behaviour — the
+    // lambda handler runs, prints "v:9", and exits 0.
+    BEZEL_EXPECT_TRUE(r.ran && r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "v:9\n" || r.stdoutText == "v:9\r\n");
 }
 
 // ---------------------------------------------------------------------------

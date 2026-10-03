@@ -8613,11 +8613,13 @@ bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
         // lambda. Codegen lowers only what it has measured sound,
         // so apply the SAME gate the `.Subscribe`/`.Add` call arms use
         // (sharedEventHandlerAdmissible, LlvmBackend_Calls2.cpp): a static,
-        // non-overloaded method reference of exactly `(T) -> ()`. Unlike those
+        // non-overloaded method reference of exactly `(T) -> ()` OR a
+        // capture-free lambda of exactly `(T) -> ()` (lifted from static-
+        // method-ref-only to "capture-free static OR capture-free lambda",
+        // mirroring stdlib §6.5 / spec §28.14, fix #4972). Unlike those
         // arms there is no #2457 backstop behind this statement, so reject
-        // here. Lowering a capture-free lambda on this pair is #4972 (a
-        // spurious reject today). `-=` (Remove, "call-bounded: compares only")
-        // is not a subscribe position and is left as it was; its per-call
+        // here. `-=` (Remove, "call-bounded: compares only") is not a
+        // subscribe position and is left as it was; its per-call
         // closure-record leak is #4970.
         if (as.op == "+=" && isSharedEventSourceTypeName(tgtTy) &&
             !sharedEventHandlerAdmissible(
@@ -8631,29 +8633,37 @@ bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
                 Severity::Error, as.value->span.begin,
                 "`+=` on a `SharedEventSource<T>` is lowered only for a "
                 "static, non-overloaded method reference whose signature is "
-                "exactly `(T) -> ()` for the source's payload type `T` "
-                "(stdlib §6.5); this handler is not one — a lambda handler on "
-                "this pair is not yet lowered (#4972), and an overloaded, "
-                "`owned`-formal or mistyped method group is rejected");
+                "exactly `(T) -> ()` for the source's payload type `T`, or "
+                "for a capture-free lambda of that signature (stdlib §6.5); "
+                "this handler is not one — an overload group, an `owned`-"
+                "formal, a mistyped parameter, or a non-capture-free "
+                "handler is rejected (a handler held in a local or field "
+                "is rejected by #4920's admission-erase)");
             return true;
         }
         src = lowerExpr(*as.target);
         if (!src) return true;  // error path; avoid bad fallthrough
     }
     // Lower the handler to a closure, hinting the expected (payload)->() type
-    // so an untyped lambda param resolves the payload type.
-    const sema::TypeRef* saved = expectedFunctionType_;
-    sema::TypeRef handlerTy;
-    handlerTy.kind = sema::TypeRef::Kind::Function;
-    if (payloadTy) {
-        sema::TypeRef::FuncParam p;
-        p.type = const_cast<sema::TypeRef*>(payloadTy);
-        handlerTy.funcParams.push_back(p);
-    }
-    expectedFunctionType_ = &handlerTy;
-    llvm::Value* closure = lowerExpr(*as.value);
-    expectedFunctionType_ = saved;
+    // so an untyped lambda param resolves the payload type. fix #4972:
+    // reuse the shared helper used by the `.Subscribe`/`.Add`/`.Remove`
+    // call arms (LlvmBackend_Calls2.cpp) so the handler lowering is
+    // identical — that helper ALSO sets the synthesized return type to
+    // Unit (a block-bodied handler would otherwise default to i32 by
+    // lowerLambda's logic, defining the closure as `i32(env)` against a
+    // `void(env)` callee signature — an indirect-call type mismatch).
+    llvm::Value* closure =
+        lowerEventHandlerClosure(as.value.get(), payloadTy);
     if (!closure) return true;  // handled (error path); avoid bad fallthrough
+    // fix #4972: lowerEventHandlerClosure -> lowerLambda populated
+    // lastLambdaCapturedCells_ for any cellFreeEligible_ captures IFF the
+    // handler is a lambda LITERAL — same consume guard as the call arms
+    // (a method-reference handler would leave the vector stale/empty
+    // from whatever lambda last ran elsewhere in this function; the guard
+    // is the AST shape, not the gate's verdict). For a capture-free
+    // lambda on a non-using-var receiver the consume is a harmless no-op.
+    if (dynamic_cast<const ast::LambdaExpr*>(as.value.get()))
+        consumeLastLambdaCapturedCells();
     if (as.op == "+=") {
         auto* addFn = declareC("bz_event_add", i64(), {ptrTy(), ptrTy()});
         builder_.CreateCall(addFn, {src, closure});

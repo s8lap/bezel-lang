@@ -4517,7 +4517,39 @@ bool sharedEventHandlerAdmissible(
         llvm::function_ref<bool(std::string_view)> isBuiltinName,
         bool honourSelectedOverload) {
     if (!handler || !payload) return false;
-    // (1) capture-free: a static method reference.
+    // (1a) Capture-free LAMBDA LITERAL — fix #4972 (stdlib §6.5 v0.307,
+    // spec §28.14 v0.307). Mirrors sema's `ExprTC::isCaptureFreeEntry`
+    // arm (b): isCaptureFreeEntry admits ONLY a literal LambdaExpr whose
+    // body has no captures — a `var h := lambda ...; Feed.Add(h)` spelling
+    // is rejected because the local indirection erases the capture-free
+    // admission (the IdentifierExpr arm of isCaptureFreeEntry returns false
+    // for a LocalSymbol that holds a closure, exactly as for one that holds
+    // a capturing closure; the local's lambda is opaque to the structural
+    // check). So by the time a LambdaExpr reaches this codegen gate, sema
+    // #4920 has already rejected both the capturing and the
+    // local-indirection forms, and a LambdaExpr that survived is a
+    // capture-free LITERAL. Lifts the codegen gate from static-method-ref-
+    // only to "a capture-free static method ref OR a capture-free lambda"
+    // (stdlib §6.5 / spec §28.14 admit both). The shape checks mirror the
+    // static arm below: one formal, no async, payload-matching formal type
+    // when ascription is present, unit return when ascription is present.
+    // An inferred-parameter lambda is left to `lowerEventHandlerClosure`
+    // to resolve via the synthesized (payload) -> () expected type.
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(handler)) {
+        if (lam->isAsync) return false;
+        if (lam->params.size() != 1) return false;
+        if (lam->params[0].type) {
+            const sema::TypeRef* pt =
+                ctx.resolvedType(*lam->params[0].type);
+            if (!pt || !sharedEventTypeEq(pt, payload)) return false;
+        }
+        if (lam->retType) {
+            const sema::TypeRef* rt = ctx.resolvedType(*lam->retType);
+            if (!rt || rt->kind != sema::TypeRef::Kind::Unit) return false;
+        }
+        return true;
+    }
+    // (1b) capture-free: a static method reference.
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(handler);
     if (!ma && !dynamic_cast<const ast::IdentifierExpr*>(handler)) return false;
     if (ma) {
@@ -4854,16 +4886,19 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
     // reference. Sema enforces the capture half (#4920); it does NOT check
     // the handler against `(T) -> ()`, because the pair has no sema member
     // surface. So this arm claims the call ONLY when the handler is a STATIC
-    // method reference of exactly the handler type `(T) -> ()`
-    // (sharedEventHandlerAdmissible, keyed on the resolved MethodSymbol).
-    // An instance method reference captures its receiver (§28.14: a method
-    // reference's "capture is the receiver") and a local/field/conditional/
-    // call-result handler may hold a capturing closure (both now also
-    // rejected by #4920, so this is defence in depth). An ill-typed static
-    // (overload group, wrong arity, `owned` formal, wrong type) would be
-    // lowered unchecked — measured SEGV / garbage / heap-use-after-free — and
-    // a lambda literal is not lowered on this pair yet (#4972). All of those
-    // fall through to the SAME #2457 backstop as before.
+    // non-overloaded method reference of exactly the handler type `(T) -> ()`
+    // OR a capture-free LAMBDA of exactly that handler type — both ruled by
+    // the same sharedEventHandlerAdmissible predicate (above). An instance
+    // method reference captures its receiver (§28.14: a method reference's
+    // "capture is the receiver") and a local/field/conditional/call-result
+    // handler may hold a capturing closure (both now also rejected by #4920,
+    // so this is defence in depth). An ill-typed handler (overload group,
+    // wrong arity, `owned` formal, wrong type) would be lowered unchecked —
+    // measured SEGV / garbage / heap-use-after-free. All of those fall
+    // through to the SAME #2457 backstop as before. fix #4972 lifts the
+    // lambda-literal case from "not yet lowered" to "admitted": the same
+    // signature checks the static arm does, applied to the lambda's
+    // declared formal type and return type.
     const sema::TypeRef* sharedPayload =
         (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                  : nullptr;
@@ -4882,8 +4917,19 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         llvm::Value* closure =
             lowerEventHandlerClosure(call.args[0].value.get(), payload);
         if (!closure) return std::optional<llvm::Value*>(nullptr);
-        // No lastLambdaCapturedCells_ consume (cf. the IEvent<T> arm above):
-        // the handler is never a lambda literal here.
+        // fix #4972: sharedEventHandlerAdmissible now also admits a
+        // capture-free lambda literal here (lifted from static-method-ref-
+        // only); lowerEventHandlerClosure -> lowerLambda populated
+        // lastLambdaCapturedCells_ for any cellFreeEligible_ captures IFF
+        // the argument is a lambda LITERAL. Mirror the IEvent<T> arm's
+        // consume guard so this never consumes an unrelated lambda's
+        // cells. Method-reference arguments do not go through lowerLambda
+        // and would leave the vector stale/empty from whatever lambda
+        // last ran elsewhere in this function — the guard is the same.
+        // For a capture-free lambda on a non-using-var receiver the
+        // consume is a harmless no-op.
+        if (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+            consumeLastLambdaCapturedCells();
         auto* subFn =
             declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
         return std::optional<llvm::Value*>(
@@ -4932,14 +4978,16 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
     // when codegen can prove the call
     // well-formed; anything else falls through to the pre-existing #2457
     // "not implemented" backstop rather than silently accepting it:
-    //   * Subscribe / Add — sharedEventHandlerAdmissible (static, exactly
-    //     `(T) -> ()`).
+    //   * Subscribe / Add — sharedEventHandlerAdmissible (a static
+    //     non-overloaded method ref of exactly `(T) -> ()` OR a capture-free
+    //     lambda of exactly `(T) -> ()`; fix #4972 lifts the second half).
     //   * Remove — the SAME gate. §6.5 exempts Remove from capture-freedom
     //     ("call-bounded: compares only"), but a lambda-literal argument is a
     //     fresh closure that can never compare equal to a subscribed handler,
-    //     and a capturing one leaks its environment; until lambda handlers
-    //     are lowered on this pair (#4972), Remove takes what Subscribe/Add
-    //     take. (Even a static Remove leaks its closure record, #4970.)
+    //     and a capturing one leaks its environment; the same admission
+    //     gate as Subscribe/Add (the lift to lambdas #4972 made is harmless
+    //     — Remove simply never matches the registered closure). (Even a
+    //     static Remove leaks its closure record, #4970.)
     //   * Raise — sharedEventRaiseAdmissible (one argument of type exactly T,
     //     or none for a unit payload). Unchecked, `Raise("s")` on an int
     //     feed, `Raise()` on a class feed and `Raise(1, 2)` all compiled.
