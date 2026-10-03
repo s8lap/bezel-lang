@@ -7191,14 +7191,15 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
     // leaked the nullable producer arm's minted string (#1952). We detect that
     // exact STRING shape below and record `string?`.
     //
-    // SCOPED TO `string` (recorded). Only the `string` value-arm shape is
-    // overridden. A VALUE-type null-arm result (`int?`, `bool?`, record?, enum?)
-    // keeps the pre-#1952 fold UNCHANGED — its lowerCaseExpr Path A/B handling
-    // depends on the folded (`Object?`) type, and re-typing it via the general
-    // nullable-form rule regressed the value-nullable result (#573,
-    // codegen_cg28_573). typeConditional applies the nullable-form rule for ALL
-    // types because the if-expression lowering path differs; the case/when path
-    // is brought into line only for `string`, which is the leak #1952 concerns.
+    // SCOPED TO `string` (recorded). Only the `string` / `string?` value-arm
+    // shape is overridden. A VALUE-type null-arm result (`int?`, `bool?`,
+    // record?, enum?) keeps the pre-#1952 fold UNCHANGED — its lowerCaseExpr
+    // Path A/B handling depends on the folded (`Object?`) type, and re-typing it
+    // via the general nullable-form rule regressed the value-nullable result
+    // (#573, codegen_cg28_573). typeConditional applies the nullable-form rule
+    // for ALL types because the if-expression lowering path differs; the
+    // case/when path is brought into line only for the `string` family, which
+    // is the leak #1952 concerns and, in its nullable form, #5310.
     bool sawNullArm = false;
     bool haveNonNullValueArm = false;
     bool allNonNullValueArmsString = true;
@@ -7215,8 +7216,20 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
         if (!at) continue;  // diverging (bottom) arm — no constraint
         if (!isNullLit) {
             haveNonNullValueArm = true;
+            // fix #5310 (§20, §19.2, §28.3, §28.9, v0.313): the arm may be a
+            // NULLABLE `string?` too. §20's null-arm rule target-types the bare
+            // `null` to "the nullable form of the other branches' common type",
+            // and for a `string?` arm that form is `string?` — which is exactly
+            // the type this branch records below. The `!at->nullable` conjunct
+            // sent a `string?` arm down the general fold, where its `Object?`
+            // placeholder met the `null` arm's placeholder and the result was
+            // recorded as `Object?` (#5310). Both codegen sides key on a
+            // string-typed result — the per-arm retain in `lowerCaseExpr` and
+            // `isStringResultArmMeet`'s StringEscapeWalker relaxation — so on
+            // the `Object?` typing they both DECLINED and the `string?` arm's
+            // reference leaked, once per evaluation.
             if (!(at->kind == TypeRef::Kind::Primitive &&
-                  at->primitive == PrimitiveType::String && !at->nullable))
+                  at->primitive == PrimitiveType::String))
                 allNonNullValueArmsString = false;
         }
         // Fold every arm — INCLUDING a `null` arm's `Object?` placeholder — so
