@@ -413,9 +413,31 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // primitive/enum/record cases), or emit the literal "null".  This mirrors
     // the interpolation path in LlvmBackend_Exprs.cpp (~line 127) and the
     // emitValueToString path in LlvmBackend_String.cpp (~line 1904).
-    if (argTy && isNullableValueTy(argTy) && arg->getType()->isStructTy()) {
-        llvm::Value* hasVal = nullablePrimHasValue(arg);           // i1
-        llvm::Value* innerVal = nullablePrimValue(arg);             // T
+    //
+    // fix #5109 (§5.1 / §14.1, v0.307): a bare generic type parameter `T`
+    // (Named with no declaration) that is NOT nullable in sema, but whose LLVM
+    // lowered value IS a nullable-value carrier struct {i8 hasValue; T}. This
+    // happens when the result of `??` on `T?` with a `T` default is passed
+    // directly to Console.WriteLine in the UNSPECIALIZED TEMPLATE body (where
+    // T is unresolved): lowerCoalesce returns the bare payload T (not the
+    // nullable struct), but the sema type of the coalesce expression is the bare
+    // T Named type (nullable=0, declaration=null). The nullable-value branch
+    // below only fires when isNullableValueTy(argTy) is true, which requires
+    // nullable=1 on the sema type — so it misses this shape entirely.
+    // Detect structurally: a 2-element struct whose first element is the hasValue
+    // tag and whose second element is NOT a pointer (not a nullable reference).
+    bool isStructurallyNullableValue = false;
+    if (arg && arg->getType()->isStructTy()) {
+        auto* st = llvm::cast<llvm::StructType>(arg->getType());
+        if (st->getNumElements() == 2 &&
+            st->getElementType(0) == nullablePrimHasValTy() &&
+            !st->getElementType(1)->isPointerTy()) {
+            isStructurallyNullableValue = true;
+        }
+    }
+    if ((argTy && isNullableValueTy(argTy)) || isStructurallyNullableValue) {
+        llvm::Value* hasVal = nullablePrimHasValue(arg);             // i1
+        llvm::Value* innerVal = nullablePrimValue(arg);              // T
         auto* valBB  = llvm::BasicBlock::Create(llvm_, "wln.nv.val",  currentFn_);
         auto* nullBB = llvm::BasicBlock::Create(llvm_, "wln.nv.null", currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "wln.nv.end",  currentFn_);
