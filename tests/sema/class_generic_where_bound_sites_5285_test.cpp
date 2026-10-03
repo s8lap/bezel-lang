@@ -93,6 +93,16 @@ BEZEL_TEST(class_generic_where_bound_sites_5285, method_where_bound_rejected_onc
         "class H public method M<U>(u: U) where U: G<int> end M; end H;"), 1);
 }
 
+// A `where` bound on an EXTENSION block is a site on the same footing: A.3
+// places GenericConstraints on extension blocks too, so §14.1's "a `where`
+// bound" reaches them without qualification.
+BEZEL_TEST(class_generic_where_bound_sites_5285, extension_declaration_where_bound_rejected) {
+    BEZEL_EXPECT_EQ(operandErrors(
+        "class Bag<T> public v: int; public constructor() v := 0; end; end Bag; "
+        "extension Bag<T> where T: G<int> "
+        "  public method Extra(): int return 1; end Extra; end;"), 1);
+}
+
 // The other §14.2 joins fire at a `where` bound too, not only the as-OPERAND
 // one — the site recording is shared, so each join is pinned here.
 BEZEL_TEST(class_generic_where_bound_sites_5285, class_where_bound_default_join_rejected_once) {
