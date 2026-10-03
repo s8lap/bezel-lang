@@ -71,26 +71,9 @@ staging (*runbook, Dual-coordinator runs*).
    Set its model explicitly, by your brief's model policy.
    *Your* reading of the handback is not a review. A producer's handback describes its own work.
    The review re-measures that work with independent instruments, and it is the evidence the
-   integrator picks on. The reviewer brief requires the reviewer to:
-   - run FAIL-WITHOUT **per row** on the base (a 4/4 aggregate hides a vacuous row), and run it
-     again with the fix;
-   - **run** every accept row whose program the base rejected, and check its output, not only its
-     exit code (a silent zero-fill exits 0);
-   - do the behaviour-flip grep (every test named in the commit, every test in the touched files,
-     every renamed diagnostic needle in gtest and lit) and run `scripts/pregate_stale_needles.py`;
-   - treat **deleted or rewritten existing rows as REJECT**, whatever the fix's merit;
-   - check any soundness probe against the base first: a probe that also fails on the base is a
-     pre-existing gap to file, not a rejection;
-   - for a conflict resolution claimed as a UNION, read `git diff <base>..<sha> -- src/` and
-     confirm both sides survive;
-   - run the full `--area` of every touched area, plus the ASan leg when allocation, layout or
-     disposal is touched (`NATIVE SANITIZER: 0 check(s) skipped`, and zero
-     `LeakSanitizer: detected` lines);
-   - for corpus rows, run `python3 scripts/gate_rule_corpus_baseline.py --strict`
-     (`corpus.py --strict` is not a valid invocation);
-   - **not edit the branch**, and return one verdict: ACCEPT, ACCEPT-W-NOTES, ACCEPT-HOLD
-     (correct, but waits for a sibling commit) or REJECT, labelling each claim MEASURED, QUOTED
-     or HYPOTHESIS.
+   integrator picks on. The reviewer brief names the branch, SHA(s), base, worktree and issue,
+   and tells the reviewer to read [`review-contract.md`](review-contract.md) fully first. That
+   file holds every check a review runs and its verdicts; do not restate them in the brief.
 6. **REJECT** goes back to a producer with the reviewer's findings, and the fix is reviewed
    again afterwards. When your brief limits your model tier, a refuted fix or a HALT with
    evidence goes to the integrator with MEASURED evidence instead: CLAUDE.md sends the

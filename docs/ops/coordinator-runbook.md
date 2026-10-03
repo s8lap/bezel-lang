@@ -862,6 +862,89 @@ cause, has a suspect root cause, follows a *refuted* partial fix, or is **any
 gate-failure fix-forward** (always Opus). Judge difficulty, not topic. If a
 Sonnet fix regresses more than it fixes, revert it and re-dispatch as Opus.
 
+### Review and dispatch: where the contract rules came from
+
+*Added 2026-10-04. Until then these rules lived only in coordinators' memory files and in
+per-run briefs. `review-contract.md`, `peer-contract.md` and CLAUDE.md's *Pools* bullets state
+them; this section keeps the incident behind each one, so a rule that looks fussy can be judged
+by what it cost. Dates are from the coordinators' notes at the time.*
+
+**The review is a separate agent, never the producer's own handback.** Cycle 25 (2026-09-25
+02:35): a peer offered #4859 (`ceacb92b`) for pick on the strength of the producer's handback.
+The integrator refused it: a handback describes the producer's own work, including its own
+judgement that five divergences were "pre-existing". Those had to be re-measured at the base by
+someone with no stake in them. That is why review-contract check 7 exists.
+
+**A freed producer slot goes to its reviewer first.** Cycle 25: a producer handed back #4770
+(`2dde041d`, a §30.6/§5.1 ordering change on async return), and its freed slot went to a new
+producer instead of the waiting reviewer. A fix with no reviewer in flight is one step from
+being picked unreviewed, and it was exactly the kind of change that needed one.
+
+**FAIL-WITHOUT per row.** R25, 2026-10-01: a reviewer ACCEPTed #5217 with "4/4 gtest PASS" on
+the fixed tree and "0 gtest FAIL" on the base. Rows that pass on the buggy base do not pin the
+bug. The aggregate hid it, and the integrator rejected the review.
+
+**Run the accept rows the base rejected.** Cycle 25: two rows of
+`ctor_chain_self_reference_4791_test.cpp` (`9c00771a`, #4791) asserted that invalid programs are
+accepted and run. Row 1 printed `hello/0` (a silent zero-fill) and row 5 crashed with SIGSEGV.
+The base had rejected both. The gtest rows passed because they checked only that the program
+was accepted.
+
+**Deleted rows are a REJECT.** Cycle 25: #4770 (`bd4a3a1a`) deleted
+`async_forgotten_await_777_test.cpp`, with 8 rows including 5 that ran accepted programs. The
+reviewer flagged the coverage loss and still said ACCEPT. Deleting regression rows weakens the
+oracle whatever the fix's merit, so a review that reports deleted rows is a REJECT.
+
+**Check a probe against the base first.** Cycle 25, #4791: a reviewer's soundness probe found
+a silent accept and would have rejected the fix mechanically. The reviewer checked the base, the
+gap was already there (the same root as #4824), and the fix was correct. It became ACCEPT-HOLD
+until its codegen half landed. A pre-existing gap is an issue to file, not a rejection.
+
+**Read the diff of a UNION resolution.** R22: a lane resolved #5082's cherry-pick conflict and
+called it a UNION (`268a6c4e`). The diff showed it had taken the incoming side and dropped
+#5045's `ParameterSymbol` branch. The reviewer had run the tests and a grep, and neither shows a
+dropped branch. R21 cycle 26 (#4973): `--theirs` on a shared test file silently drops the other
+commit's rows.
+
+**Grep the leak log even when the rows pass.** R25 gate C, run 1 (staging `3758eb31`): the new
+#5251 module rows each leaked 16 B through an imported-class temporary (#5268). They passed
+every lane and reviewer ASan check, because only the gate's sharded verdict turns a leak report
+in a *passing* test into a failure. That cost one gate cycle (~27 min) with the 02:00 deadline
+approaching.
+
+**`corpus.py --strict` is not the strict check.** R26: the #4972 producer and its reviewer
+both ran `corpus.py` lint/check and missed three UNBANKED rows. `corpus.py` exits 0 on an
+unknown subcommand. The real check is `scripts/gate_rule_corpus_baseline.py --strict`.
+
+**The five-source pre-dispatch check.** R23, 2026-09-28: #4924 was dispatched with a three-source
+check. Its fix (`b2ee727d`) had landed 207 commits earlier citing §22.3, not the issue number,
+and the issue was CLOSED. The lane exited with no SHA, the fourth no-op of that run. R25: the
+a24-4957 lane HALTed because #4994's fix (`b8f7b434`, the out-var recipient slot in chain-call
+codegen) had already fixed #4957's symptom. A grep on the mechanism (`out var recipient`,
+`emitChainCall`) would have caught it; the `#4957` grep could not.
+
+**Claims and worktree paths.** R23, 2026-09-29: two lanes in one pool were dispatched into the
+same worktree, and the second switched the branch under the first mid-build. Earlier runs had
+the same collision across pools. `claims.tsv` is the one record both pools check. R26
+(#4984/#4985): a brief built its worktree path from the branch name, and the real worktree had
+another name. The lane measured the mismatch and asked for authorisation, and the permission
+classifier, which authorises by the literal path, denied the rebase. So the path is always copied from `git worktree list`.
+
+**Reuse worktrees.** 2026-09-27: the NVMe was at 27% of its rated write endurance after 35.8 TB,
+writing ~0.8 TB a day during runs. Moving five-plus old worktrees onto a new base caused
+simultaneous cold builds of ~3.6 GB each. Each pool keeps a fixed set and reuses it, adding a
+worktree only to fill a free slot.
+
+**Corpus rows are banked centrally.** 2026-09-23: two lanes each banked their own row in
+`tests/conformance/rules/baseline.tsv`. One lane's three commits then all conflicted on the same
+hunk at pick, although the changes were independent. The integrator banks corpus rows, like the batch-level ratchets.
+
+**Stop every process before handing back.** R26 (5272-ff2): a producer's follow-up left a
+`setsid nohup` child running after its own shell exited. The child was reparented to init, so
+nothing could kill it by session. The reviewer then launched its own sweep of the same half, so
+two ran at once, and the kill was refused as not verifiably this session's. Hence `kill -0` on every PID before handback,
+including detached children.
+
 ### Commits
 
 End every commit message with exactly one trailer line and nothing else — no
