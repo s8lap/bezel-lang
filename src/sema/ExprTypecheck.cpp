@@ -22172,7 +22172,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto tryEntryField = fieldNarrowed_;
         auto tryEntryNull = nullNarrowed_;
         const std::uint64_t tryDropEpoch0 = fieldFactDropEpoch_;
-        for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
+        {
+            // per §21.6 / §21.1 (#5334, the #5314 residual): the PROTECTED
+            // BLOCK of a `try` is a statement block (A.6 TryStmt), sibling to
+            // the `finally` block and to each catch arm body. A local declared
+            // in it is visible only until the matching `end try`. Pre-fix it
+            // registered in the ENCLOSING scope, so a read after the `end try`
+            // resolved to the leaked local — the issue's own repro compiled
+            // and the run read garbage out of a stale slot. Mirror the
+            // `forScope` / `doScope` / #5314 branch bodies.
+            Scope bodyScope;
+            bodyScope.parent = currentScope_;
+            Scope* const saveScope = currentScope_;
+            currentScope_ = &bodyScope;
+            for (const auto& bs : trys->body) if (bs) visitStmt(*bs);
+            currentScope_ = saveScope;
+        }
         auto afterBodyField = fieldNarrowed_;
         auto tryJoinField = afterBodyField;
         auto afterBodyNull = nullNarrowed_;
@@ -22363,7 +22378,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         int savedFinallyLoopBoundary = finallyLoopBoundary_;
         finallyLoopBoundary_ = loopDepth_;
         ++finallyDepth_;
-        for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
+        {
+            // per §21.6 / §21.1 (#5334): the FINALLY BLOCK is the third child
+            // block of the `try` (A.6 FinallyClause), sibling to the protected
+            // block and each catch arm body; its locals end with the matching
+            // `end try`. §31.2 gives the runtime reason: the finally runs on
+            // every exit edge of the protected block, so a name declared in
+            // that block may never have been initialized when the finally
+            // reads it.
+            Scope finScope;
+            finScope.parent = currentScope_;
+            Scope* const saveFinScope = currentScope_;
+            currentScope_ = &finScope;
+            for (const auto& bs : trys->finallyBody) if (bs) visitStmt(*bs);
+            currentScope_ = saveFinScope;
+        }
         --finallyDepth_;
         finallyLoopBoundary_ = savedFinallyLoopBoundary;
         // §7.4 (v0.214, #2116 pre-gate review): after-try state. The paths
