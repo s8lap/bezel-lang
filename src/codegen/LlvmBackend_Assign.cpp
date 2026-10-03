@@ -10171,7 +10171,8 @@ llvm::Type* Emitter::owningDrainElemType(const sema::TypeRef* iOwnEnumTy) {
 // exception check turns into the raise.
 void Emitter::emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
                                              llvm::StructType* stTy,
-                                             unsigned pendIdx) {
+                                             unsigned pendIdx,
+                                             unsigned advIdx) {
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
     auto* okBB = llvm::BasicBlock::Create(llvm_, "tc.ok", tcFn);
     auto* ioeBB = llvm::BasicBlock::Create(llvm_, "tc.ioe", tcFn);
@@ -10179,10 +10180,14 @@ void Emitter::emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
     llvm::Value* self = &*tcFn->arg_begin();
     llvm::Value* pendF = b.CreateStructGEP(stTy, self, pendIdx);
     llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "odtc.pend");
+    // fix #4796 (§29.1, v0.313; §14.4 admits `OwningArray<R?>`): the IOE guard
+    // keys on an explicit `advanced` flag, NOT on `pending == null` — a null
+    // ELEMENT is a legitimately yielded value, and the pre-fix null-sentinel
+    // made every null element look "already taken".
+    llvm::Value* advF = b.CreateStructGEP(stTy, self, advIdx);
+    llvm::Value* adv = b.CreateLoad(b.getInt8Ty(), advF, "odtc.adv");
     b.CreateCondBr(
-        b.CreateICmpEQ(pend, llvm::ConstantPointerNull::get(ptrTy()),
-                       "odtc.pend.null"),
-        ioeBB, okBB);
+        b.CreateICmpEQ(adv, b.getInt8(0), "odtc.notadv"), ioeBB, okBB);
 
     b.SetInsertPoint(ioeBB);
     auto* callocTy = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
@@ -10204,6 +10209,7 @@ void Emitter::emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
     // MoveNext / Dispose sees an empty pending (§29.1 single consumption).
     b.SetInsertPoint(okBB);
     b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+    b.CreateStore(b.getInt8(0), advF);
     b.CreateRet(pend);
 }
 
@@ -10226,15 +10232,16 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
     std::string prefix =
         std::string("bz$ownarrenum$") + (lifo ? "lifo$" : "") + elemName + "$";
 
-    // Wrapper struct: { ptr vtable, ptr arr, ptr pending }. Three pointer
-    // fields (vtable + arr + pending); the wrapper holds a borrow of the
+    // Wrapper struct: { ptr vtable, ptr arr, ptr pending, i8 advanced }. The
+    // `advanced` flag (#4796) says a yielded value is pending, independent of
+    // its nullness; the wrapper holds a borrow of the
     // array (does NOT own it) and an owned class pointer in `pending` that
     // the Dispose path must release if non-null (§29.1 abandonment rule).
     std::string stName = "ownarrenum." + elemName;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy) {
         stTy = llvm::StructType::create(llvm_,
-            {ptrTy(), ptrTy(), ptrTy()}, stName);
+            {ptrTy(), ptrTy(), ptrTy(), llvm::Type::getInt8Ty(llvm_)}, stName);
     }
 
     // The disposer for `pending` — for an owning collection, the element type
@@ -10374,6 +10381,10 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         // matching bz_array_drain_next's "false ⇒ no write" contract.
         llvm::Value* popped = builder_.CreateLoad(ptrTy(), outSlot, "oaem.popped");
         builder_.CreateStore(popped, builder_.CreateStructGEP(stTy, self, 2));
+        // fix #4796: `advanced` records "a value is pending" independent of
+        // its nullness (a null element is a yielded value, §14.4 / §29.1).
+        builder_.CreateStore(builder_.CreateZExt(ok, builder_.getInt8Ty()),
+                             builder_.CreateStructGEP(stTy, self, 3));
         builder_.CreateRet(ok);
         currentFn_ = savedCurrentFn;
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
@@ -10394,7 +10405,7 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "TakeCurrent",
             module_.get());
-        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2);
+        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2, /*advIdx=*/3);
     }
 
     // --- Slot 4 (GetOwningEnumerator): a FRESH enumerator over the same
@@ -10523,8 +10534,8 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
     // Element-name key (the scheme ensureLinkedListEnumMachinery uses) so the
     // Dispose / MoveNext / TakeCurrent / vtable are created once per element
     // type. The struct name is distinct from the borrowing wrap's
-    // ("llenum.<elem>") because the LAYOUT differs — 3 fields with a `pending`
-    // slot, not 4 with a node cursor pair.
+    // ("llenum.<elem>") because the LAYOUT differs — {vtable, list, pending,
+    // i8 advanced} (#4796), not 4 pointers with a node cursor pair.
     std::string elemName = elemLlvm->isIntegerTy()
         ? ("i" + std::to_string(elemLlvm->getIntegerBitWidth()))
         : (elemLlvm->isPointerTy() ? "ptr" : "f");
@@ -10533,7 +10544,7 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy)
         stTy = llvm::StructType::create(llvm_,
-            {ptrTy(), ptrTy(), ptrTy()}, stName);
+            {ptrTy(), ptrTy(), ptrTy(), llvm::Type::getInt8Ty(llvm_)}, stName);
     auto* voidTy = llvm::Type::getVoidTy(llvm_);
 
     // --- Dispose(self) — dispose pending (if any), free the frame. ---
@@ -10631,6 +10642,10 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
         llvm::Value* popped =
             builder_.CreateLoad(ptrTy(), outSlot, "ollm.popped");
         builder_.CreateStore(popped, builder_.CreateStructGEP(stTy, self, 2));
+        // fix #4796: `advanced` records "a value is pending" independent of
+        // its nullness (a null element is a yielded value, §14.4 / §29.1).
+        builder_.CreateStore(builder_.CreateZExt(ok, builder_.getInt8Ty()),
+                             builder_.CreateStructGEP(stTy, self, 3));
         builder_.CreateRet(ok);
         currentFn_ = savedCurrentFn;
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
@@ -10644,7 +10659,7 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "TakeCurrent",
             module_.get());
-        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2);
+        emitOwningDrainTakeCurrentBody(tcFn, stTy, /*pendIdx=*/2, /*advIdx=*/3);
     }
 
     // --- Slot 4 (GetOwningEnumerator): a FRESH frame over the same borrowed

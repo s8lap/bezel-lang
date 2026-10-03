@@ -10940,15 +10940,18 @@ private:
     // fix #4750 / #4772 (§29.1, v0.307): the slot-3 `TakeCurrent` body BOTH
     // builtin draining frames install (`wrapArrayAsIOwningEnumerator` and
     // `wrapLinkedListAsIOwningEnumerator`, whose layouts share `pending` at
-    // field `pendIdx`). A null `pending` — a take before the first advance,
-    // after exhaustion, or a second take without an intervening advance —
-    // raises `InvalidOperationException` (signalled through `bz_exc_addr`,
+    // field `pendIdx`, with an i8 `advanced` flag at `advIdx` — #4796: the
+    // guard must not key on a null `pending`, a null element is a yielded
+    // value under §14.4). A take with `advanced == 0` — before the first
+    // advance, after exhaustion, or a second take without an intervening
+    // advance — raises `InvalidOperationException` (signalled through `bz_exc_addr`,
     // exactly as the iterator-method TakeCurrent in LlvmBackend_Iterators.cpp
     // does per #1349); otherwise the slot is nulled and the value returned.
     // `tcFn` must be a fresh, body-less `ptr (ptr)` function.
     void emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
                                         llvm::StructType* stTy,
-                                        unsigned pendIdx);
+                                        unsigned pendIdx,
+                                        unsigned advIdx);
 
     // fix #3461 (§29.1 / §29.2 / §29.11; stdlib §4.7 / §4.13, v0.283): the
     // LinkedList sibling of wrapArrayAsIOwningEnumerator — the DRAINING
