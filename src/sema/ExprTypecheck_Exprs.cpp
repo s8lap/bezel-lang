@@ -9617,13 +9617,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         const std::string_view mn =
                                             maCallee->member;
                                         const TypeRef* elemT = nullptr;
+                                        // fix #5295 (stdlib §6.9 / §1 shape (a), v0.313):
+                                        // `Channel<T>.TryReceive(out item: T?)` is a
+                                        // shape-(a) member too; left untyped, codegen's
+                                        // ensureOutVarSlots sized the slot with the i32
+                                        // default and the lowering wrote the 8-byte
+                                        // `T?` through it (stack-buffer-overflow).
                                         bool posElem =
-                                            (cn == "Stack" || cn == "Queue" ||
-                                             cn == "OwningStack" ||
-                                             cn == "OwningQueue") &&
-                                            (mn == "TryPop" ||
-                                             mn == "TryDequeue" ||
-                                             mn == "TryPeek");
+                                            ((cn == "Stack" || cn == "Queue" ||
+                                              cn == "OwningStack" ||
+                                              cn == "OwningQueue") &&
+                                             (mn == "TryPop" ||
+                                              mn == "TryDequeue" ||
+                                              mn == "TryPeek")) ||
+                                            (cn == "Channel" &&
+                                             mn == "TryReceive");
                                         bool valElem =
                                             (cn == "Dictionary" ||
                                              cn == "SortedDictionary" ||
