@@ -10567,6 +10567,116 @@ llvm::Value* Emitter::lowerPrimCastScalar(sema::PrimitiveType targetPt,
 }
 
 
+// fix #5337 / §5.2 (v0.313): `decimal` → integer, the ONE implementation of
+// this conversion's runtime semantics — "Floating-point to integer truncates
+// toward zero; `NaN`, `±Infinity`, and out-of-range values raise
+// `OverflowException`", and a `decimal` has neither non-finite value
+// (§4.4), so the bound check is the whole story. `decValue` is a BARE
+// `%bz.decimal` struct, not a nullable wrapper: the §5.3 lifted path unwraps
+// first and keeps the call behind the null flag, so a null operand never
+// reaches here. `target` must be an integer primitive.
+//
+// Shared by the explicit `T(x)` conversion (lowerConversion, Case B) and the
+// §5.3 lifted cast `T?(x)` (LlvmBackend_Exprs.cpp's NullCondCallExpr branch).
+// Before this helper existed the lifted path handed the 16-byte struct to
+// lowerPrimCastScalar, which classifies a struct as neither integer nor
+// floating point, fell into its int→int arm and emitted
+// `sext %bz.decimal %nv.val to i32` — an IR-verification abort ("SExt only
+// operates on integer"). That is the same struct-as-scalar defect #5330 fixed
+// for `float?`/`double?` with `sitofp`; this is its integer-target half.
+//
+// §5.3 admits `T?(x)` "exactly when the corresponding non-nullable conversion
+// `T(v)` is admitted ... a present value `v` converts by `T(v)` under that
+// conversion's own semantics, including its runtime checks", so the lifted
+// path must reach these same guards — an out-of-range present value raises
+// `OverflowException` there, exactly as `T(v)` does.
+llvm::Value* Emitter::lowerDecimalToInteger(sema::PrimitiveType target,
+                                             llvm::Value* decValue) {
+    using P = sema::PrimitiveType;
+    llvm::Type* decTy = decimalStructType();
+    llvm::Type* dstTy = lowerPrimitive(target);
+    llvm::AllocaInst* srcSlot = entryAlloca(decTy);
+    builder_.CreateStore(decValue, srcSlot);
+
+    // OverflowException vtable; null when the builtin is not materialized.
+    llvm::Value* oveVt = llvm::ConstantPointerNull::get(ptrTy());
+    auto vit = builtinVtable_.find("OverflowException");
+    if (vit != builtinVtable_.end()) oveVt = vit->second;
+
+    if (dstTy->getIntegerBitWidth() <= 32) {
+        // Target fits in int32 (byte, sbyte, short, ushort, int, char).
+        // §5.2, fix #872: pass the OverflowException vtable so that a
+        // decimal exceeding int64 range (e.g. 1e19) raises OverflowException
+        // here; a decimal in int64 range but out of int32 range is caught by
+        // the IR range-check below.  The vtable path is the same one used by
+        // the int64-target branch and works in the JIT harness in practice.
+        auto* fn64 = declareC("bz_decimal_to_int64", i64(), {ptrTy(), ptrTy()});
+        llvm::Value* v64 =
+            builder_.CreateCall(fn64, {srcSlot, oveVt}, "dec.toi64v");
+        emitPendingCheck();  // §5.2, #872: raises if decimal > int64 range
+        // §5.2 (fix #4802, v0.307): uint target uses UINT32_MAX as the
+        // upper bound instead of INT32_MAX.
+        //
+        // Before #4802, every 32-bit-or-smaller target was range-checked
+        // against the signed int32 upper bound INT32_MAX — for a `uint`
+        // target this wrongly rejected every value in (INT32_MAX, UINT32_MAX],
+        // throwing away half of uint's domain.  The fix narrows the
+        // condition to `target == P::UInt` (not the broader
+        // `dstUns && dstTy == i32`): `char` shares the i32 / unsigned
+        // shape but has its OWN contract (code-point range [0, 0x10FFFF]
+        // excluding surrogates — §5.2 char semantics) which is enforced
+        // elsewhere; widening the upper bound for char too would change
+        // char's behaviour rather than fix it, and is out of scope for
+        // #4802.  The sibling ulong arm (≥32-bit) was already fixed by
+        // #4785 via a dedicated `bz_decimal_to_uint64` helper — this is
+        // the same defect shape at the 32-bit-or-smaller codegen dispatch.
+        //
+        // For the other unsigned narrower targets (ushort, byte) the
+        // existing trunc + roundtrip check (ZExt then compare back to
+        // the i32 value) already correctly bounds at USHRT_MAX /
+        // UINT8_MAX; the wider signed-range upper bound above the roundtrip
+        // is harmless (the roundtrip catches anything outside the narrower
+        // range), so we leave it unchanged.
+        bool dstUns = isUnsignedPrim(target);
+        int64_t hiBound = (target == P::UInt)
+                              ? (int64_t)(uint64_t)UINT32_MAX
+                              : (int64_t)INT32_MAX;
+        llvm::Value* lo = builder_.CreateICmpSLT(
+            v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MIN), "dec.ilo");
+        llvm::Value* hi = builder_.CreateICmpSGT(
+            v64, llvm::ConstantInt::get(i64(), hiBound), "dec.ihi");
+        emitGuardThrow(builder_.CreateOr(lo, hi), "OverflowException");
+        llvm::Value* v32 = builder_.CreateTrunc(v64, i32(), "dec.toi32");
+        if (dstTy == i32()) return v32;
+        // Further narrowing (e.g. to i8/i16): check sub-range and trunc.
+        llvm::Value* trunc = builder_.CreateTrunc(v32, dstTy);
+        llvm::Value* back = dstUns ? builder_.CreateZExt(trunc, i32())
+                                   : builder_.CreateSExt(trunc, i32());
+        emitGuardThrow(builder_.CreateICmpNE(back, v32), "OverflowException");
+        return trunc;
+    }
+
+    // int64 or uint64 target.
+    // #4785 / §5.2 (v0.307): ulong targets must route through
+    // bz_decimal_to_uint64 (uint64 semantics: rejects negatives
+    // and values > uint64.MaxValue) — the signed helper
+    // bz_decimal_to_int64 silently rejects the whole range
+    // (int64.MaxValue, uint64.MaxValue], which is exactly half
+    // of `ulong`'s domain.  The long-target arm is unchanged.
+    if (target == P::ULong) {
+        auto* fn = declareC("bz_decimal_to_uint64", i64(), {ptrTy(), ptrTy()});
+        llvm::Value* v64 =
+            builder_.CreateCall(fn, {srcSlot, oveVt}, "dec.tou64");
+        emitPendingCheck();
+        return v64;
+    }
+    auto* fn = declareC("bz_decimal_to_int64", i64(), {ptrTy(), ptrTy()});
+    llvm::Value* v64 = builder_.CreateCall(fn, {srcSlot, oveVt}, "dec.toi64");
+    emitPendingCheck();
+    return v64;
+}
+
+
 llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
                              const ast::CallExpr& call) {
     using P = sema::PrimitiveType;
@@ -10698,88 +10808,13 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
         // above uses. Case C below is the float/double half of the same fix.
         if (src->getType() == decTy) {
             if (lowerPrimitive(target)->isIntegerTy()) {
-                llvm::AllocaInst* srcSlot = entryAlloca(decTy);
-                builder_.CreateStore(src, srcSlot);
-                if (lowerPrimitive(target)->getIntegerBitWidth() <= 32) {
-                    // Target fits in int32 (byte, sbyte, short, ushort, int, char).
-                    // §5.2, fix #872: pass the OverflowException vtable so that a
-                    // decimal exceeding int64 range (e.g. 1e19) raises OverflowException
-                    // here; a decimal in int64 range but out of int32 range is caught by
-                    // the IR range-check below.  The vtable path is the same one used by
-                    // the int64-target branch and works in the JIT harness in practice.
-                    auto* fn64 = declareC("bz_decimal_to_int64", i64(),
-                                         {ptrTy(), ptrTy()});
-                    llvm::Value* v64 = builder_.CreateCall(
-                        fn64, {srcSlot, getOVEVtable()},
-                        "dec.toi64v");
-                    emitPendingCheck();  // §5.2, #872: raises if decimal > int64 range
-                    // §5.2 (fix #4802, v0.307): uint target uses UINT32_MAX as the
-                    // upper bound instead of INT32_MAX.
-                    //
-                    // Before #4802, every 32-bit-or-smaller target was range-checked
-                    // against the signed int32 upper bound INT32_MAX — for a `uint`
-                    // target this wrongly rejected every value in (INT32_MAX, UINT32_MAX],
-                    // throwing away half of uint's domain.  The fix narrows the
-                    // condition to `target == P::UInt` (not the broader
-                    // `dstUns && dstTy == i32`): `char` shares the i32 / unsigned
-                    // shape but has its OWN contract (code-point range [0, 0x10FFFF]
-                    // excluding surrogates — §5.2 char semantics) which is enforced
-                    // elsewhere; widening the upper bound for char too would change
-                    // char's behaviour rather than fix it, and is out of scope for
-                    // #4802.  The sibling ulong arm (≥32-bit) was already fixed by
-                    // #4785 via a dedicated `bz_decimal_to_uint64` helper — this is
-                    // the same defect shape at the 32-bit-or-smaller codegen dispatch.
-                    //
-                    // For the other unsigned narrower targets (ushort, byte) the
-                    // existing trunc + roundtrip check (ZExt then compare back to
-                    // the i32 value) already correctly bounds at USHRT_MAX /
-                    // UINT8_MAX; the wider signed-range upper bound above the roundtrip
-                    // is harmless (the roundtrip catches anything outside the narrower
-                    // range), so we leave it unchanged.
-                    llvm::Type* dstTy = lowerPrimitive(target);
-                    bool dstUns = isUnsignedPrim(target);
-                    int64_t hiBound = (target == P::UInt)
-                        ? (int64_t)(uint64_t)UINT32_MAX
-                        : (int64_t)INT32_MAX;
-                    llvm::Value* lo = builder_.CreateICmpSLT(
-                        v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MIN),
-                        "dec.ilo");
-                    llvm::Value* hi = builder_.CreateICmpSGT(
-                        v64, llvm::ConstantInt::get(i64(), hiBound),
-                        "dec.ihi");
-                    emitGuardThrow(builder_.CreateOr(lo, hi), "OverflowException");
-                    llvm::Value* v32 = builder_.CreateTrunc(v64, i32(), "dec.toi32");
-                    if (dstTy == i32()) return v32;
-                    // Further narrowing (e.g. to i8/i16): check sub-range and trunc.
-                    llvm::Value* trunc = builder_.CreateTrunc(v32, dstTy);
-                    llvm::Value* back = dstUns
-                        ? builder_.CreateZExt(trunc, i32())
-                        : builder_.CreateSExt(trunc, i32());
-                    emitGuardThrow(builder_.CreateICmpNE(back, v32), "OverflowException");
-                    return trunc;
-                } else {
-                    // int64 or uint64 target.
-                    // #4785 / §5.2 (v0.307): ulong targets must route through
-                    // bz_decimal_to_uint64 (uint64 semantics: rejects negatives
-                    // and values > uint64.MaxValue) — the signed helper
-                    // bz_decimal_to_int64 silently rejects the whole range
-                    // (int64.MaxValue, uint64.MaxValue], which is exactly half
-                    // of `ulong`'s domain.  The long-target arm is unchanged.
-                    if (target == P::ULong) {
-                        auto* fn = declareC("bz_decimal_to_uint64", i64(),
-                                           {ptrTy(), ptrTy()});
-                        llvm::Value* v64 = builder_.CreateCall(
-                            fn, {srcSlot, getOVEVtable()}, "dec.tou64");
-                        emitPendingCheck();
-                        return v64;
-                    }
-                    auto* fn = declareC("bz_decimal_to_int64", i64(),
-                                       {ptrTy(), ptrTy()});
-                    llvm::Value* v64 = builder_.CreateCall(fn, {srcSlot, getOVEVtable()},
-                                                           "dec.toi64");
-                    emitPendingCheck();
-                    return v64;
-                }
+                // fix #5337: the decimal→integer runtime semantics (truncate
+                // toward zero, OverflowException out of range — §5.2) now live
+                // in lowerDecimalToInteger, shared with the §5.3 lifted cast
+                // `T?(x)`. The two paths must agree: §5.3 converts a present
+                // value "by `T(v)` under that conversion's own semantics",
+                // so `int?(d)` and `int(d)` raise on the same inputs.
+                return lowerDecimalToInteger(target, src);
             }
             // Case C: decimal → double/float. §5.2: "double(m)" — bz_decimal_to_double.
             if (lowerPrimitive(target)->isFloatingPointTy()) {

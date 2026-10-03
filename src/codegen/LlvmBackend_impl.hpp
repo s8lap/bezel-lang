@@ -20283,6 +20283,23 @@ private:
                                      llvm::Value* payload,
                                      bool srcUns);
 
+    // fix #5337 / §5.2 (v0.313): `decimal` → integer — the ONE implementation
+    // of this conversion's runtime semantics (truncate toward zero;
+    // OverflowException when the truncated value is out of the target's range).
+    // `decValue` is a BARE `%bz.decimal` struct, not a nullable wrapper: the
+    // §5.3 lifted cast `T?(x)` unwraps first and keeps the call behind the
+    // null flag, so a null operand never reaches here. `target` must be an
+    // integer primitive.
+    //
+    // Shared by the explicit `T(x)` conversion (lowerConversion's Case B) and
+    // the §5.3 lifted cast `T?(x)` (LlvmBackend_Exprs.cpp's NullCondCallExpr
+    // branch), which §5.3 requires to agree: a present value "converts by
+    // `T(v)` under that conversion's own semantics, including its runtime
+    // checks". Emits the runtime call AND its OverflowException guards, so the
+    // builder may be left in a different basic block than it started in.
+    llvm::Value* lowerDecimalToInteger(sema::PrimitiveType target,
+                                       llvm::Value* decValue);
+
     // §5.1: apply an implicit numeric widening to coerce a lowered value to
     // a target LLVM type when the pair is a §5.1-admitted widening — int →
     // float / double, float → double (FPExt), or integer widening. Returns

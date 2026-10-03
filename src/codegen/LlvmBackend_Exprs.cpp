@@ -2622,8 +2622,77 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // ONCE (a `float` target must not go through `double`).
                         // The call sits behind the null flag, so a null source
                         // stays null (§5.3) and its payload is never converted.
-                        if (payload->getType() == decimalStructType() &&
-                            ncdDstTy->isFloatingPointTy()) {
+                        //
+                        // fix #5337: the same struct-as-scalar defect with an
+                        // INTEGER target — lowerPrimCastScalar's int->int arm
+                        // emitted `sext %bz.decimal %nv.val to i32` ("SExt only
+                        // operates on integer"), and the unsigned targets took
+                        // its signed-widening guard first, which built an even
+                        // earlier `icmp slt %bz.decimal %nv.val, i1 false`
+                        // ("Both operands to ICmp instruction are not of the
+                        // same type!"). The integer case routes through
+                        // lowerDecimalToInteger — the SAME §5.2 conversion the
+                        // non-nullable `int(d)` / `long(d)` explicit cast uses,
+                        // so §5.3's "a present value `v` converts by `T(v)` under
+                        // that conversion's own semantics, including its runtime
+                        // checks" holds literally: `int?(d)` truncates toward
+                        // zero and raises OverflowException on exactly the
+                        // inputs `int(d)` does.
+                        //
+                        // `bool` is deliberately NOT routed here. §4.2 does not
+                        // make `bool` an integer type, and sema rejects the
+                        // non-nullable form outright ("conversion between a
+                        // numeric type and `bool` is not permitted", §5.1/§5.2)
+                        // — so `bool?(d)` should never reach codegen at all. It
+                        // does today (a sema admission gap, tracked separately);
+                        // lowerPrimCastScalar still handles it, and this lane does
+                        // not implement a conversion the spec forbids.
+                        const bool decPayload =
+                            payload->getType() == decimalStructType();
+                        const bool decToInt =
+                            decPayload && targetPt != P::Bool &&
+                            ncdDstTy->isIntegerTy();
+                        if (decToInt) {
+                            if (auto* hc = llvm::dyn_cast<llvm::ConstantInt>(hasV)) {
+                                // Non-nullable source: hasV is a constant, so no
+                                // branch is emitted (a PHI with a non-predecessor
+                                // incoming block fails verification). A
+                                // non-nullable source is never the null case, so
+                                // the conversion always runs.
+                                converted = hc->isZero()
+                                    ? static_cast<llvm::Value*>(
+                                          llvm::ConstantInt::get(ncdDstTy, 0))
+                                    : lowerDecimalToInteger(targetPt, payload);
+                            } else {
+                                auto* convBB = llvm::BasicBlock::Create(
+                                    llvm_, "ncd.conv", currentFn_);
+                                auto* nullBB = llvm::BasicBlock::Create(
+                                    llvm_, "ncd.null", currentFn_);
+                                auto* endBB = llvm::BasicBlock::Create(
+                                    llvm_, "ncd.end", currentFn_);
+                                builder_.CreateCondBr(hasV, convBB, nullBB);
+                                builder_.SetInsertPoint(convBB);
+                                // The whole conversion goes inside convBB: its
+                                // §5.2 OverflowException guards branch, so the
+                                // value is defined in whatever block the helper
+                                // leaves the builder in, not necessarily convBB.
+                                llvm::Value* cv =
+                                    lowerDecimalToInteger(targetPt, payload);
+                                auto* convEnd = builder_.GetInsertBlock();
+                                builder_.CreateBr(endBB);
+                                builder_.SetInsertPoint(nullBB);
+                                builder_.CreateBr(endBB);
+                                builder_.SetInsertPoint(endBB);
+                                auto* phi = builder_.CreatePHI(ncdDstTy, 2);
+                                phi->addIncoming(cv, convEnd);
+                                // A null source stays null (§5.3); the payload is
+                                // never converted, so this arm is unobservable
+                                // and only needs to be a well-typed value.
+                                phi->addIncoming(
+                                    llvm::ConstantInt::get(ncdDstTy, 0), nullBB);
+                                converted = phi;
+                            }
+                        } else if (decPayload && ncdDstTy->isFloatingPointTy()) {
                             llvm::AllocaInst* slot = entryAlloca(payload->getType());
                             builder_.CreateStore(payload, slot);
                             const bool toDouble = ncdDstTy->isDoubleTy();
