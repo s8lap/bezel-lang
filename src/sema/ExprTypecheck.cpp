@@ -13465,6 +13465,47 @@ void ExprTC::checkOrderingPatternsOverNullableScrutinee(
         checkOrderingPatternOverNullableType(scrutTy, arm.pattern.get());
 }
 
+// §19.3 / §16.6 (v0.313, #5235): reject a relational or range pattern whose
+// scrutinee's type defines NO ordering. §19.3 compares the scrutinee against
+// the right-hand operand "under the ordering of the scrutinee's type"; the
+// spec defines an ordering for the primitive value types and, per §4.6, an
+// ordinal ordering for `string`. `Object` (§3 builtin, lowers to a heap
+// pointer) has none, so `case o of > 5 => …` over an `Object` scrutinee has
+// no meaning — codegen used to emit `icmp sgt ptr %obj, i32 5` and the module
+// failed `verifyModule` with "Both operands to ICmp instruction are not of
+// the same type!". Rejecting at sema turns that internal error into a
+// diagnostic that names §19.3 and the offending scrutinee type.
+//
+// Narrow scope, deliberately: only `Object` is gated here. A user type that
+// DECLARES comparison operators may legitimately have "the ordering of the
+// scrutinee's type" — whether it does is the open spec-question in #5269
+// (owner-ruled), so those scrutinees keep today's behavior here. §7.4
+// narrowing does not reopen the gate: `Object` is a reference type, so the
+// nullable-scrutinee checker above still rejects a narrowed `Object?`
+// independently, and this one reads the scrutinee's static type either way.
+//
+// Shared by the CaseExpr and CaseStmt sites — the two spellings of `case`
+// take the same rule and the same diagnostic.
+void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms) {
+    if (!scrutTy || scrutTy->kind != TypeRef::Kind::Primitive ||
+        scrutTy->primitive != PrimitiveType::Object)
+        return;
+    // One diagnostic per `case`, at the first offending pattern: a second
+    // relop arm over the same Object scrutinee is the same error restated,
+    // and repeating it per arm would bury the one that matters.
+    for (const ast::CaseArm& arm : arms) {
+        if (dynamic_cast<const ast::RelOpPattern*>(arm.pattern.get()) ||
+            dynamic_cast<const ast::RangePattern*>(arm.pattern.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, arm.pattern->span.begin,
+                "a relational or range pattern cannot be used with an Object "
+                "scrutinee (\xC2\xA7""19.3) — Object has no defined ordering");
+            return;
+        }
+    }
+}
+
 // §7.4 (issue #418): refresh `nullNarrowed_` for `sym := value`. A non-null
 // value proves the variable non-null from here; a nullable value (including a
 // bare `null` literal, typed nullable) clears any prior knowledge.
@@ -22624,6 +22665,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // non-null read of a nullable scrutinee.
         checkOrderingPatternsOverNullableScrutinee(
             scrutTy, cs->arms, cs->scrutinee.get());
+        // §19.3 / §16.6 (v0.313, #5235): the statement-position form takes the
+        // same "the scrutinee's type has an ordering" rule as the CaseExpr
+        // site — one shared checker, so the two spellings of `case` cannot
+        // drift apart. Pre-fix this form reached codegen unchecked and emitted
+        // `icmp sgt ptr %obj, i32 5` (MEASURED malformed IR, #5235).
+        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, cs->arms);
         // §5.1 / §19 (#1153): reject an out-of-range integer pattern literal
         // (statement-position `case` is exempt from exhaustiveness but not from
         // the literal-range gate — codegen would otherwise truncate it).

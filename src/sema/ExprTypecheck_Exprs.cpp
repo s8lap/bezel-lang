@@ -12179,20 +12179,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // §19.3 (v0.313, #5235): a relational or range pattern requires a
         // scrutinee with a defined ordering. Object has no ordering, so
         // reject RelOpPattern and RangePattern over an Object scrutinee.
-        if (scrutTy && scrutTy->kind == TypeRef::Kind::Primitive &&
-            scrutTy->primitive == PrimitiveType::Object) {
-            for (const auto& arm : ce->arms) {
-                if (dynamic_cast<const ast::RelOpPattern*>(arm.pattern.get()) ||
-                    dynamic_cast<const ast::RangePattern*>(arm.pattern.get())) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, arm.pattern->span.begin,
-                        "a relational or range pattern cannot be used with an "
-                        "Object scrutinee (\xC2\xA7""19.3) — Object has no "
-                        "defined ordering");
-                    break;
-                }
-            }
-        }
+        // Shared with the CaseStmt site — one rule, two spellings of `case`.
+        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, ce->arms);
         // §10.6 (#772): "Inside a `case` whose scrutinee is an enum, the enum
         // prefix may be omitted." This holds throughout the construct, INCLUDING
         // arm bodies (`Red => Green`), not only patterns. Inject the scrutinee

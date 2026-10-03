@@ -11,6 +11,7 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeNotRuntime;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
@@ -108,4 +109,127 @@ BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
         "  end Main; "
         "end P;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §19.3 / §16.6 (v0.313, #5235): the STATEMENT-position form (`case … of …
+// end case;`, A.6 CaseStmt) is the OTHER spelling of the same construct. It
+// has its own visit site (ExprTypecheck.cpp) and, with the expression-position
+// gate alone, still reached codegen and emitted `icmp sgt ptr %obj, i32 5`
+// (MEASURED against bezelc -c on this branch's parent). Same rule, same
+// diagnostic — the two spellings must not drift.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           relop_over_object_stmt_rejected) {
+    auto r = runAot(
+        "module M; class P public static method Main(): int "
+        "  var o: Object := null; "
+        "  case o of "
+        "    > 5 => return 1;, "
+        "    _ => return 2; "
+        "  end case; "
+        "  return 0; "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}
+
+// §19.3 / §16.6 (v0.313, #5235): range pattern, statement-position form. The
+// stmt-position range arm emits TWO malformed compares pre-fix (`icmp sge ptr
+// …, i32 1` and `icmp sle ptr …, i32 10`).
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           range_over_object_stmt_rejected) {
+    auto r = runAot(
+        "module M; class P public static method Main(): int "
+        "  var o: Object := null; "
+        "  case o of "
+        "    1..10 => return 1;, "
+        "    _ => return 2; "
+        "  end case; "
+        "  return 0; "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}
+
+// CONTROLS — the three ordered scrutinee types the issue names must keep
+// compiling. §19.3's rule is about the scrutinee's type HAVING an ordering,
+// not about relational patterns as such: `int` is ordered natively, `decimal`
+// is ordered, and `string` is ordered by the §4.6 ordinal intrinsics (the
+// #5173 route). If any of these rows ever flip to rejected, this fix has
+// over-reached.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           control_relop_over_int_compiles) {
+    auto r = runAot(
+        "module M; class P "
+        "  public static method Main(): int "
+        "    var x: int := 7; "
+        "    return (case x of > 5 => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(1, r.exitCode);
+}
+
+// `decimal` is the third ordered type the issue names. RELATIONAL, not
+// range: §16.3 admits a range pattern only over the integer types and `char`
+// ("Range<T> restricts T to the integer types and char"), so a decimal RANGE
+// is rejected for an unrelated, correct reason and would prove nothing about
+// this fix. The relational form is the one §19.3 orders decimal for.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           control_relop_over_decimal_compiles) {
+    auto r = runAot(
+        "module M; class P "
+        "  public static method Main(): int "
+        "    var d: decimal := 7.5m; "
+        "    return (case d of > 5m => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(1, r.exitCode);
+}
+
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           control_relop_over_string_compiles) {
+    auto r = runAot(
+        "module M; class P "
+        "  public static method Main(): int "
+        "    var s: string := \"b\"; "
+        "    return (case s of > \"a\" => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(1, r.exitCode);
+}
+
+// NARROW-SCOPE GUARD. Whether a user type that DECLARES comparison operators
+// counts as having "the ordering of the scrutinee's type" (§19.3) is the open
+// spec-question in #5269 (owner-ruled, NOT this lane's to decide). This fix
+// gates PrimitiveType::Object only, so it must not change what happens to
+// such a scrutinee. This row pins that boundary from BOTH sides: the program
+// is still rejected (MEASURED on this branch — codegen emits
+// `icmp slt %record.V %9, %10` and `verifyModule` fails), and it is NOT
+// rejected by the new §19.3 gate. The first assertion is what makes the row
+// non-vacuous; the second is the actual scope claim.
+//
+// `failedAtCompileTimeNotRuntime`, not `...WithRealLocation`: this program's
+// rejection is an IR-verification failure raised by the backend, which carries
+// no source location, so the location-based helper cannot see it.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           user_declared_ordering_not_gated_5269) {
+    auto r = runAot(
+        "module M; "
+        "record V(X: int) "
+        "  public static method operator <(a: V, b: V): bool => a.X < b.X; "
+        "  public static method operator >(a: V, b: V): bool => a.X > b.X; "
+        "  public static method operator <=(a: V, b: V): bool => a.X <= b.X; "
+        "  public static method operator >=(a: V, b: V): bool => a.X >= b.X; "
+        "end V; "
+        "class P "
+        "  public static method Main(): int "
+        "    var a := new V(1); "
+        "    var b := new V(9); "
+        "    return (case a of < b => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
+    BEZEL_EXPECT_FALSE(hasObjectOrderingDiag(r));
 }

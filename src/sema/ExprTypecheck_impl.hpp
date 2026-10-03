@@ -2785,6 +2785,18 @@ private:
         const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms,
         const ast::Expr* scrutinee = nullptr);
 
+    // §19.3 / §16.6 (v0.313, #5235): reject a relational or range pattern
+    // whose scrutinee type defines NO ordering — currently `Object`, which
+    // lowers to a heap pointer and admitted `icmp sgt ptr %obj, i32 5`
+    // (malformed IR, `verifyModule` failure). The sibling nullable-scrutinee
+    // rule above is the NULLABILITY half of the same §19.3 requirement; this
+    // is the "has an ordering at all" half. Shared by the CaseExpr and
+    // CaseStmt sites so the two spellings cannot drift. Narrow by design: a
+    // user type that DECLARES comparison operators is left alone pending the
+    // #5269 ruling.
+    void checkOrderingPatternsOverUnorderedScrutinee(
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms);
+
     // §19.3 (v0.294, #3692): the single-pattern walk `
     // checkOrderingPatternsOverNullableScrutinee` runs per arm — factored out
     // so a destructuring SLOT's sub-pattern can be checked against ITS OWN
