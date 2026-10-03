@@ -6952,6 +6952,67 @@ private:
     // are not arrow getters).
     const ast::Expr* computedGetterOf(sema::Symbol* sym);
 
+    // fix #5319 (§23.2 "Expression-bodied read-only properties", v0.313): the
+    // chain of computed-property symbols whose EXPRESSION body is being
+    // INLINED into the expression currently being lowered, outermost first.
+    //
+    // WHY THIS EXISTS. A §23.2 getter body is inlined at each read site, and
+    // §23.2 imposes NO restriction on which expressions the body may read — a
+    // body that reads the SAME property on another instance (`=> _child.Rec`
+    // for a linked structure) is an ordinary, legal, and run-time-terminating
+    // program. But the inlining is what recurses: the read site lowers the
+    // body, the body contains the read, and the read site lowers the body
+    // again — with no bound. Pre-fix this exhausted the compiler's own stack
+    // (measured: SIGSEGV, exit 139, `lowerExprInner -> lowerExpr ->
+    // lowerConditional -> lowerExprInner -> …`).
+    //
+    // WHY A SYMBOL-CHAIN AND NOT A DEPTH COUNTER. A depth bound would change
+    // the lowering of every DEEP-but-acyclic getter chain (a legal program
+    // whose property A's body reads B's, whose reads C's, …), silently
+    // switching the innermost N levels from inlined to called. Keying on the
+    // CHAIN OF SYMBOLS fires only on a genuine self- or mutual read, so for
+    // every non-recursive program the push/pop is a no-op and `lowerExpr` runs
+    // byte-identically — the smallest blast radius available for this fix.
+    std::vector<sema::PropertySymbol*> computedGetterInlining_;
+
+    // fix #5319: is `sym`'s expression-bodied getter already being inlined
+    // higher up this expression? A read that answers true is a self/mutual
+    // read, and must be lowered as a CALL (see `callComputedGetterFn`) rather
+    // than inlined a second time.
+    bool isInliningComputedGetter(sema::Symbol* sym) const;
+
+    // fix #5319: RAII marker for "this property's arrow getter is being
+    // inlined here". Construct immediately before the `lowerExpr(*getter)`
+    // that performs the inline, so every path out of that inline — including
+    // an early `return nullptr` — pops the chain. Deliberately NOT a
+    // NestedBodyScope: the inline stays in the CALLER's function (no
+    // function boundary is crossed), and this guard owns only the chain.
+    struct ComputedGetterInlineScope {
+        ComputedGetterInlineScope(Emitter& e, sema::PropertySymbol* ps)
+            : e_(e) { e_.computedGetterInlining_.push_back(ps); }
+        ~ComputedGetterInlineScope() { e_.computedGetterInlining_.pop_back(); }
+        ComputedGetterInlineScope(const ComputedGetterInlineScope&) = delete;
+        ComputedGetterInlineScope& operator=(const ComputedGetterInlineScope&) =
+            delete;
+        Emitter& e_;
+    };
+
+    // fix #5319: lower a self/mutual read of an expression-bodied property as
+    // a CALL to its standalone getter (`T get(ptr this)`, or no argument for a
+    // static property per §22.12) instead of inlining the body again. The
+    // function is `ensurePropertyAccessorFn`'s — the same memoized accessor
+    // the vtable/itable and exported faces use — so a property that is BOTH
+    // recursive and virtual shares one body rather than growing a second.
+    //
+    // `recv` is the already-spilled receiver POINTER (null for a static
+    // property). Reports a diagnostic and returns a typed null if no accessor
+    // can be materialised: the alternative — inlining anyway — is exactly the
+    // unbounded recursion this replaces, so a clean build failure is the
+    // correct failure mode, never a crash.
+    llvm::Value* callComputedGetterFn(sema::PropertySymbol* ps,
+                                      llvm::Value* recv,
+                                      const ast::Expr* at);
+
     // §22.9: return the block-form getter accessor (get => do...end;) if the
     // property has one, else null.  Arrow-expression getters are handled by
     // computedGetterOf above.

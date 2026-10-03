@@ -5200,6 +5200,68 @@ const ast::Expr* Emitter::computedGetterOf(sema::Symbol* sym) {
 }
 
 
+// fix #5319 (§23.2 "Expression-bodied read-only properties", v0.313): see
+// `computedGetterInlining_`'s declaration for why the chain exists and why it
+// is keyed on the symbol rather than on a depth.
+bool Emitter::isInliningComputedGetter(sema::Symbol* sym) const {
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+    if (!ps) return false;
+    return std::find(computedGetterInlining_.begin(),
+                     computedGetterInlining_.end(), ps) !=
+           computedGetterInlining_.end();
+}
+
+
+// fix #5319 (§23.2, v0.313): the self/mutual-read fallback — lower the read as
+// a CALL to the property's standalone getter rather than inlining its body a
+// second time.
+//
+// WHY CALL RATHER THAN A DEPTH-BOUNDED INLINE. §23.2 places no restriction on
+// the expressions a getter body may read, so a body that reads the same
+// property on another instance is legal and terminates at RUN time (the
+// issue's repro bottoms out on a `null` child). The non-termination was never
+// in the program — it was in the compiler's unbounded inlining of the body at
+// each read site. Cutting the inline at a fixed depth would replace a crash
+// with an arbitrary constant that silently changes the shape of every deep
+// but acyclic getter chain; keying on the chain of SYMBOLS (see
+// `computedGetterInlining_`) fires only on a genuine self/mutual read, so this
+// call is emitted exactly when the program is actually recursive and never
+// otherwise.
+//
+// WHY `ensurePropertyAccessorFn` RATHER THAN A NEW EMITTER. It already
+// materialises `T get(ptr this)` for an arrow-bodied property, memoised on
+// (property, isSet, specialization tag) with the full #2702/#2694 nested-body
+// state isolation, and it is what the vtable/itable and exported faces already
+// call for this same property. Reusing it means a property that is BOTH
+// recursive and virtual keeps ONE accessor body — the recursive read compiles
+// to a call of the very function its own vtable slot names.
+llvm::Value* Emitter::callComputedGetterFn(sema::PropertySymbol* ps,
+                                           llvm::Value* recv,
+                                           const ast::Expr* at) {
+    if (!ps || !ps->parent) return nullptr;
+    const sema::TypeSymbol* cls = ps->parent;
+    llvm::Function* fn =
+        ensurePropertyAccessorFn(cls, ps, /*isSet=*/false);
+    if (!fn) {
+        // No accessor could be materialised (an abstract or body-less
+        // declaration). Inlining the body anyway is precisely the unbounded
+        // recursion this path exists to stop, so report and let the build fail
+        // cleanly rather than recurse or crash.
+        ctx_.diagnostics().report(
+            Severity::Error, at ? at->span.begin : SourceLocation{},
+            "internal: recursive computed property '" + std::string(ps->name) +
+            "' has no materializable getter accessor to call — #5319");
+        return nullptr;
+    }
+    // §22.12: a static property's accessor takes no receiver, matching the
+    // signature `ensurePropertyAccessorFn` builds for it (fix #2885).
+    if (isStaticProperty(ps))
+        return builder_.CreateCall(fn->getFunctionType(), fn, {});
+    if (!recv) return nullptr;
+    return builder_.CreateCall(fn->getFunctionType(), fn, {recv});
+}
+
+
 const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
     auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
     if (!ps || ps->isIndexer) return nullptr;

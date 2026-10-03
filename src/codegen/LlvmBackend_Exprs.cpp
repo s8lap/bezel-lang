@@ -3071,7 +3071,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         }
                         llvm::Value* ncSavedThis = currentThis_;
                         currentThis_ = obj;
-                        ncRaw = lowerExpr(*ncGetter);
+                        // fix #5319 (§23.2, v0.313): the `?.` spelling of the
+                        // self/mutual-read guard. The block-form twin a few
+                        // lines below already CALLS `ensurePropertyBlockGetter`
+                        // rather than inlining; this is the same decision for
+                        // the arrow form, and it is emitted inside the
+                        // already-emitted non-null access block, so the call's
+                        // receiver is the null-checked `obj`.
+                        if (isInliningComputedGetter(ncPropSym)) {
+                            ncRaw = callComputedGetterFn(ncPropSym, obj, &e);
+                            emitPendingCheck();  // §31.1/§31.2
+                        } else {
+                            ComputedGetterInlineScope inlineScope(*this,
+                                                                  ncPropSym);
+                            ncRaw = lowerExpr(*ncGetter);
+                        }
                         // §23.2/§23.3 (#1168/#2761): wrap/box the body result to
                         // the property's DECLARED type (not the §7.5-lifted
                         // nullable result) — a `T?`-declared body yielding bare
@@ -6343,10 +6357,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             [](const auto& m){ return m == "static"; });
             if (isStaticProp) {
                 // Static property: no 'this', just evaluate the getter body.
+                // fix #5319 (§23.2, v0.313): the self/mutual-read guard, static
+                // spelling — a static property whose body reads itself lowered
+                // to unbounded inlining exactly as the instance spelling did.
+                // The accessor takes no receiver (§22.12, fix #2885).
+                llvm::Value* staticRaw;
+                if (isInliningComputedGetter(propSym)) {
+                    staticRaw = callComputedGetterFn(propSym, nullptr, ma);
+                    emitPendingCheck();  // §31.1/§31.2 (FINDING [4])
+                } else {
+                    ComputedGetterInlineScope inlineScope(*this, propSym);
+                    staticRaw = lowerExpr(*getter);
+                }
                 // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
                 // declared `T?` optional, same as the instance paths below.
                 llvm::Value* sv = wrapNullableGetterResult(
-                    ctx_.exprType(*ma), lowerExpr(*getter));
+                    ctx_.exprType(*ma), staticRaw);
                 // fix #2761 (§8.6 "Boxing", v0.240): and box it when the
                 // property's declared type is Object/an interface — the static
                 // spelling of the instance-path box below; see there.
@@ -6554,7 +6580,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                  propSym->parent->kind == ast::TypeDeclKind::Choice)
                     ? propSym->parent
                     : nullptr;
-            llvm::Value* v = lowerExpr(*getter);
+            // fix #5319 (§23.2, v0.313): a self/mutual read — this property's
+            // own arrow body is already being inlined higher up this
+            // expression — is lowered as a CALL to its standalone getter
+            // instead of inlining that body a second time (which pre-fix
+            // recursed without bound and took the compiler down with SIGSEGV).
+            // The `v` / wrap / box sequence below is UNCHANGED and applies to
+            // the call's result identically: the accessor's return type IS the
+            // property's declared type, which is exactly what an inlined body
+            // yields after the two wraps — and both wraps are no-ops on a
+            // value already in that representation.
+            llvm::Value* v;
+            if (isInliningComputedGetter(propSym)) {
+                v = callComputedGetterFn(propSym, obj, ma);
+                emitPendingCheck();  // §31.1/§31.2 (FINDING [4])
+            } else {
+                ComputedGetterInlineScope inlineScope(*this, propSym);
+                v = lowerExpr(*getter);
+            }
             // §23.2/§23.3 (#1168): a `T?`-declared expression-bodied property
             // whose body yields the bare inner `T` must wrap the result to the
             // declared `{i8 hasValue; T}` optional, just as a method/lambda
@@ -7225,11 +7268,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // CG33b: a bare computed-property read evaluates its getter
         // against the current `this`.
         if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e))) {
+            // fix #5319 (§23.2, v0.313): the bare-`this` spelling of the
+            // self/mutual-read guard — the receiver is `currentThis_` here, so
+            // the fallback is the same standalone-getter call as the qualified
+            // `obj.P` site above.
+            auto* barePropSym =
+                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e));
+            llvm::Value* raw;
+            if (isInliningComputedGetter(barePropSym)) {
+                raw = callComputedGetterFn(barePropSym, currentThis_, &e);
+                emitPendingCheck();  // §31.1/§31.2 (FINDING [4])
+            } else {
+                ComputedGetterInlineScope inlineScope(*this, barePropSym);
+                raw = lowerExpr(*getter);
+            }
             // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
             // property's declared `T?` optional (see the qualified `obj.P`
             // read above for the rationale).
-            llvm::Value* bv =
-                wrapNullableGetterResult(ctx_.exprType(e), lowerExpr(*getter));
+            llvm::Value* bv = wrapNullableGetterResult(ctx_.exprType(e), raw);
             // fix #2761 (§8.6 "Boxing", v0.240): the BARE (`implicit this`)
             // spelling of the same read — `var o := O;` inside the declaring
             // class was silently unboxed too. See the qualified path above.
@@ -7702,7 +7758,20 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
                 if (const ast::Expr* getter = computedGetterOf(impl)) {
                     llvm::Value* saved = currentThis_;
                     currentThis_ = obj;
-                    llvm::Value* v = lowerExpr(*getter);
+                    // fix #5319 (§23.2, v0.313): the record-devirtualised
+                    // spelling of the self/mutual-read guard. Same decision as
+                    // the direct site — CALL the materialised accessor instead
+                    // of inlining a getter that would re-enter itself. The
+                    // block-form twin immediately below already does exactly
+                    // this, which is why only the arrow form needed the guard.
+                    llvm::Value* v;
+                    if (isInliningComputedGetter(impl)) {
+                        v = callComputedGetterFn(impl, obj, &e);
+                        emitPendingCheck();  // §31.1/§31.2
+                    } else {
+                        ComputedGetterInlineScope inlineScope(*this, impl);
+                        v = lowerExpr(*getter);
+                    }
                     // fix #2761 (§8.6 "Boxing" / §14.2, v0.240): the
                     // record-devirtualised spelling of the inline
                     // expression-getter read. `ctx_.exprType(e)` is the
