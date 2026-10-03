@@ -2607,8 +2607,65 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // returns the payload unchanged.
                         bool srcUns = (srcPt != P::None) ? isUnsignedPrim(srcPt)
                                                          : false;
-                        llvm::Value* converted =
-                            lowerPrimCastScalar(targetPt, srcPt, payload, srcUns);
+                        llvm::Value* converted = nullptr;
+                        llvm::Type* ncdDstTy = lowerPrimitive(targetPt);
+                        // fix #5330 / §5.2, §5.3 (v0.313): a `decimal` payload is
+                        // the 16-byte struct, not a scalar, so lowerPrimCastScalar
+                        // reached its int->FP arm and emitted
+                        // `sitofp %bz.decimal ... to float`, which the IR
+                        // verifier rejects ("SIToFP source must be integer or
+                        // integer vector"). §5.3: "`T?(x)` is admitted exactly
+                        // when the corresponding non-nullable conversion `T(v)`
+                        // is admitted" — so `float?`/`double?` of a `decimal?`
+                        // converts through the SAME runtime helpers `float(m)` /
+                        // `double(m)` use (§5.2, #5298 / #5307), each rounding
+                        // ONCE (a `float` target must not go through `double`).
+                        // The call sits behind the null flag, so a null source
+                        // stays null (§5.3) and its payload is never converted.
+                        if (payload->getType() == decimalStructType() &&
+                            ncdDstTy->isFloatingPointTy()) {
+                            llvm::AllocaInst* slot = entryAlloca(payload->getType());
+                            builder_.CreateStore(payload, slot);
+                            const bool toDouble = ncdDstTy->isDoubleTy();
+                            auto* dfn = declareC(
+                                toDouble ? "bz_decimal_to_double"
+                                         : "bz_decimal_to_float",
+                                ncdDstTy, {ptrTy()});
+                            const char* dtag = toDouble ? "ncd.todbl" : "ncd.toflt";
+                            if (auto* hc = llvm::dyn_cast<llvm::ConstantInt>(hasV)) {
+                                // Non-nullable source: hasV is a constant, so
+                                // no branch is emitted (a PHI with a non-
+                                // predecessor incoming block fails verification).
+                                converted = hc->isZero()
+                                    ? static_cast<llvm::Value*>(
+                                          llvm::ConstantFP::get(ncdDstTy, 0.0))
+                                    : builder_.CreateCall(dfn, {slot}, dtag);
+                            } else {
+                                auto* convBB = llvm::BasicBlock::Create(
+                                    llvm_, "ncd.conv", currentFn_);
+                                auto* nullBB = llvm::BasicBlock::Create(
+                                    llvm_, "ncd.null", currentFn_);
+                                auto* endBB = llvm::BasicBlock::Create(
+                                    llvm_, "ncd.end", currentFn_);
+                                builder_.CreateCondBr(hasV, convBB, nullBB);
+                                builder_.SetInsertPoint(convBB);
+                                llvm::Value* cv =
+                                    builder_.CreateCall(dfn, {slot}, dtag);
+                                auto* convEnd = builder_.GetInsertBlock();
+                                builder_.CreateBr(endBB);
+                                builder_.SetInsertPoint(nullBB);
+                                builder_.CreateBr(endBB);
+                                builder_.SetInsertPoint(endBB);
+                                auto* phi = builder_.CreatePHI(ncdDstTy, 2);
+                                phi->addIncoming(cv, convEnd);
+                                phi->addIncoming(
+                                    llvm::ConstantFP::get(ncdDstTy, 0.0), nullBB);
+                                converted = phi;
+                            }
+                        } else {
+                            converted =
+                                lowerPrimCastScalar(targetPt, srcPt, payload, srcUns);
+                        }
                         if (!converted) return nullptr;
                         // Re-wrap as {i8 hasValue, targetScalar} nullable struct.
                         // Per §5.3: null stays null (hasV=0); value is re-wrapped

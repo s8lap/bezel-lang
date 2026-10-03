@@ -10591,7 +10591,18 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
 
         // Case B: decimal → int (any integer target). §5.2: truncate toward zero;
         // OverflowException when the truncated value is out of the target's range.
-        if (srcPrim == P::Decimal && src->getType() == decTy) {
+        //
+        // fix #5330: the gate is the LLVM SHAPE of the lowered operand, not the
+        // sema primitive. Inside a generic TEMPLATE body instantiated at
+        // `T = decimal` (`G<T>(x: T): float { return float(x); }`), the operand
+        // types as the type PARAMETER, so `srcPrim` above stayed `P::None`,
+        // the decimal block was skipped, and the scalar int->FP path emitted
+        // `sitofp %bz.decimal ... to float` — an IR-verification abort
+        // ("SIToFP source must be integer or integer vector"). `decTy` IS
+        // `decimalStructType()`, so a shape match is exactly "this value is a
+        // decimal"; the same robust-shape fallback the §5.3 nullable unwrap
+        // above uses. Case C below is the float/double half of the same fix.
+        if (src->getType() == decTy) {
             if (lowerPrimitive(target)->isIntegerTy()) {
                 llvm::AllocaInst* srcSlot = entryAlloca(decTy);
                 builder_.CreateStore(src, srcSlot);
