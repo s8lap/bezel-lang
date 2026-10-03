@@ -15018,6 +15018,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             if (isClassInstance) {
                 llvm::AllocaInst* tslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, tslot);
+                // fix #5286 / §28.3 *Unbound owned temporaries* + *Deferred-
+                // activation callees*, §30.1 (v0.313): in a state-machine body
+                // the temporary's disposal can run AFTER a suspension — `s :=
+                // s + await b.TakeA(new Item())` disposes it once the awaited
+                // task has settled, on the RESUMED invocation; `b.Two(new
+                // Item(), await P())` likewise (and the #993 unwind-only entry
+                // when P faults). The slot must therefore live in the frame:
+                // an entry alloca of the suspended invocation is uninitialised
+                // stack after resume (a garbage Dispose). Same promotion as
+                // registerFfiExprTemp (#2754) and the awaited-task temp.
+                if (smStateStruct_) asyncHandlerSpillSlots_.push_back(tslot);
                 Disposal d{tslot, nullptr};
                 if (params[idx].modifier == "owned") {
                     // #993: an `owned` parameter takes ownership on the normal
