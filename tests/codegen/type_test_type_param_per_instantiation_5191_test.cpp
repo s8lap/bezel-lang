@@ -85,3 +85,25 @@ BEZEL_TEST(type_test_type_param_per_instantiation_5191, generic_carrier_is_long_
         "  end Main; "
         "end P;"), 1);
 }
+
+// §12.7 (v0.313) nullable substitution: `p is T` with a concrete value-typed
+// operand `p: int` at `T = int?`. Where a type parameter stands on either side
+// and both sides are value types at an instantiation, the test is decided per
+// instantiation — `true` when the substituted types are identical, "a nullable
+// substitution of the target counting as its underlying type". `int?` counts as
+// `int`, the operand's own type, so the answer is true (expect 1). Paired with
+// bare_type_param_pattern_B_long_fallback (same body at T=long → 3), this row
+// discriminates: the test is not unconditionally true.
+BEZEL_TEST(type_test_type_param_per_instantiation_5191, nullable_substitution_p_is_T_at_int_nullable_true) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "class B<T> "
+        "  public static method K(p: int): int "
+        "    if p is T then return 1; end; "
+        "    return 3; "
+        "  end K; "
+        "end B; "
+        "public static class P "
+        "  public static method Main(): int => B<int?>.K(5); "
+        "end P;"), 1);
+}
