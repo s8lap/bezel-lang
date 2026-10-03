@@ -6759,8 +6759,68 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     FnValKind pkind = closureKindForProperty(ps, receiverVal);
     if (auto cit = propertyThunks_.find(ps); cit != propertyThunks_.end())
         return buildPropertyClosureCell(cit->second, receiverVal, pkind);
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+
+    // fix #5283 (§14.1 / §27.6, v0.313): install the receiver's generic
+    // substitution BEFORE the thunk's result type is lowered — the thunk's
+    // SIGNATURE (`thunkFnTy` below) and its BODY must agree, and both are
+    // computed from this same `genericSubst_`. Previously this block ran
+    // ~130 lines BELOW the `retTy` computation, so at `retTy` time
+    // `genericSubst_` was still the CALLER's (empty in the reported repro's
+    // non-generic `Main`) and `lowerType(pd->type)` on the property's declared
+    // `T` missed the substitution lookup in `lowerTypeRef` (LlvmBackend_Layout
+    // .cpp's no-declaration-Named arm), falling through to the bare-param
+    // placeholder `i32()`. The body, emitted with the substitution correctly
+    // installed, then loaded the real `class.Holder$spec0` field — a `ptr` at
+    // `T = () -> int` (a function value is a closure-cell pointer, §27.6) —
+    // and emitted `ret ptr %3` from a function declared `i32 (ptr)`:
+    // "Function return type does not match operand type of return inst!"
+    // (issue #5283). Any non-`i32`-shaped `T` reached this: `T = String`,
+    // `T = bool`, `T = () -> int`, any class type.
+    //
+    // The block is hoisted verbatim (it reads only `ma` / `ps->parent` /
+    // `ctx_`, never `thisVal` / `currentThis_` / the builder), and the
+    // matching save moved with it so the restore at the end of this function
+    // still sees the CALLER's maps. The receiver-shape block below
+    // (#2501/#2281) is unaffected: it reads `receiverVal->getType()`, never
+    // `genericSubst_`.
+    //
+    // §14.1: for a generic class receiver, set up the generic substitution so a
+    // getter body that reads a `T`-typed field uses the right struct layout.
+    // (Mirror the computed-getter read path in LlvmBackend_Exprs.cpp.)
+    if (ma && ma->target && ps->parent) {
+        if (sema::TypeRef* recvTy = ctx_.exprType(*ma->target)) {
+            if (recvTy->kind == sema::TypeRef::Kind::Named &&
+                recvTy->declaration == ps->parent && !recvTy->genericArgs.empty()) {
+                // fix #3143 (§14.1 / §2.5, v0.254): parameter names through the
+                // one both-sources walk (and the `parent->decl` pre-guard
+                // dropped with it), mirroring the read path in
+                // LlvmBackend_Exprs.cpp this block is the mirror of.
+                const std::vector<std::string_view> gpNames =
+                    sema::genericParamNames(ps->parent);
+                if (!gpNames.empty() &&
+                    gpNames.size() == recvTy->genericArgs.size()) {
+                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+                    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+                    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                        newSubst[gpNames[gi]] =
+                            lowerTypeRef(recvTy->genericArgs[gi]);
+                        newSema[gpNames[gi]] =
+                            resolveTypeParamRef(recvTy->genericArgs[gi]);
+                    }
+                    genericSubst_ = std::move(newSubst);
+                    genericSubstSemaTy_ = std::move(newSema);
+                }
+            }
+        }
+    }
+
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    // Result type = the property's value type.
+    // Result type = the property's value type. With the §14.1 substitution
+    // installed above (#5283), a `T`-typed property resolves to its
+    // CONCRETE type — `ptr` for `T = () -> int` — so the thunk signature
+    // matches the body emitted further down.
     llvm::Type* retTy = nullptr;
     if (pd && pd->type) retTy = lowerType(pd->type.get());
     else if (sema::TypeRef* tr = ctx_.importedMemberType(ps)) retTy = lowerTypeRef(tr);
@@ -6829,8 +6889,10 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     llvm::Value* savedCaught = currentCaughtExc_;
     std::size_t savedUnwindDepth = unwindScopeDepth_;
     bool savedDiverged = diverged_;
-    auto savedSubst = genericSubst_;
-    auto savedSemaTy = genericSubstSemaTy_;
+    // savedSubst / savedSemaTy captured at the top of this function (#5283
+    // moved the §14.1 substitution install — and its save — above the `retTy`
+    // computation so the thunk's signature is lowered under the substitution
+    // its body is emitted under).
 
     currentFn_ = thunk;
     currentThis_ = nullptr;
@@ -6885,36 +6947,6 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
         thisVal = builder_.CreateLoad(recvLlvmTy, envArg);
     }
     currentThis_ = thisVal;
-
-    // §14.1: for a generic class receiver, set up the generic substitution so a
-    // getter body that reads a `T`-typed field uses the right struct layout.
-    // (Mirror the computed-getter read path in LlvmBackend_Exprs.cpp.)
-    if (ma && ma->target && ps->parent) {
-        if (sema::TypeRef* recvTy = ctx_.exprType(*ma->target)) {
-            if (recvTy->kind == sema::TypeRef::Kind::Named &&
-                recvTy->declaration == ps->parent && !recvTy->genericArgs.empty()) {
-                // fix #3143 (§14.1 / §2.5, v0.254): parameter names through the
-                // one both-sources walk (and the `parent->decl` pre-guard
-                // dropped with it), mirroring the read path in
-                // LlvmBackend_Exprs.cpp this block is the mirror of.
-                const std::vector<std::string_view> gpNames =
-                    sema::genericParamNames(ps->parent);
-                if (!gpNames.empty() &&
-                    gpNames.size() == recvTy->genericArgs.size()) {
-                    std::unordered_map<std::string_view, llvm::Type*> newSubst;
-                    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-                    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
-                        newSubst[gpNames[gi]] =
-                            lowerTypeRef(recvTy->genericArgs[gi]);
-                        newSema[gpNames[gi]] =
-                            resolveTypeParamRef(recvTy->genericArgs[gi]);
-                    }
-                    genericSubst_ = std::move(newSubst);
-                    genericSubstSemaTy_ = std::move(newSema);
-                }
-            }
-        }
-    }
 
     // Compute the getter result. Virtual/interface properties dispatch through
     // the receiver's vtable/itable; otherwise evaluate the concrete getter.

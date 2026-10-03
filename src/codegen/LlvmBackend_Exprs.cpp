@@ -6190,16 +6190,64 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // (static SIGSEGV / instance garbage). Discriminate on the
                 // declared type from the PropertyDecl (or the imported member
                 // type for a cross-module property, which has no AST decl).
+                //
+                // fix #5283 (§14.1 / §27.6 / §23.1, v0.313): at a GENERIC
+                // instantiation the DECLARED type is not the last word — a `T`-typed
+                // property of `Holder<T>` read as `h.v` on a
+                // `Holder<() -> int>` has SUBSTITUTED type `() -> int`, i.e. a
+                // function type, and the #1187 rationale applies verbatim: the
+                // getter already yields the stored closure cell, so the read is an
+                // ordinary value read. Reading only the declared type saw the bare
+                // `T` (not `ast::TypeKind::Function`), took the thunk path, and
+                // built a `() -> (() -> int)` getter closure where a `(…) -> T`
+                // slot was bound — so the call passed no user args at the wrong
+                // arity and the program returned garbage (measured: exit 32, where
+                // the identical NON-generic program returns 7).
+                //
+                // So: resolve the declared type, and when it is a bare type
+                // parameter of the property's owning generic, resolve that
+                // parameter against the RECEIVER's type arguments at this
+                // instantiation. A substitution that is itself a function type
+                // takes the ordinary read path, exactly as the non-generic
+                // spelling does.
+                const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
                 bool declaredFunc = false;
                 if (const auto* pd =
                         dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-                    declaredFunc =
-                        pd->type && pd->type->kind == ast::TypeKind::Function;
+                    if (pd->type && pd->type->kind == ast::TypeKind::Function) {
+                        declaredFunc = true;
+                    } else if (pd->type && ps->parent && ma && ma->target) {
+                        // fix #5283: a bare `T` declared type resolves through the
+                        // receiver's own type arguments (§14.1 monomorphization —
+                        // the same one both-sources walk makePropertyThunk's
+                        // §14.1 block performs, and the same one
+                        // genericParamNames orders).
+                        const sema::TypeRef* declTy = ctx_.resolvedType(*pd->type);
+                        const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                        if (isBareTypeParamRef(declTy) && recvTy &&
+                            recvTy->kind == sema::TypeRef::Kind::Named &&
+                            recvTy->declaration == ps->parent &&
+                            !recvTy->genericArgs.empty()) {
+                            const std::vector<std::string_view> gpNames =
+                                sema::genericParamNames(ps->parent);
+                            auto pit = std::find(gpNames.begin(), gpNames.end(),
+                                                 declTy->headName());
+                            if (pit != gpNames.end()) {
+                                std::size_t idx =
+                                    static_cast<std::size_t>(
+                                        std::distance(gpNames.begin(), pit));
+                                if (idx < recvTy->genericArgs.size() &&
+                                    recvTy->genericArgs[idx])
+                                    declaredFunc = recvTy->genericArgs[idx]
+                                                      ->kind ==
+                                                  sema::TypeRef::Kind::Function;
+                            }
+                        }
+                    }
                 } else if (sema::TypeRef* tr = ctx_.importedMemberType(ps)) {
                     declaredFunc = tr->kind == sema::TypeRef::Kind::Function;
                 }
                 if (!ps->isIndexer && !declaredFunc) {
-                    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
                     llvm::Value* recv =
                         (ma && ma->target) ? lowerExpr(*ma->target) : currentThis_;
                     if (llvm::Value* th = makePropertyThunk(ps, recv, ma))
