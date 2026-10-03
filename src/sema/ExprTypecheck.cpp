@@ -21704,8 +21704,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         nullNarrowed_ = entryNullNarrowed;
         fieldNarrowed_ = fieldCondState;
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
-        for (const auto& bs : ifs->ifBranch.body) {
-            if (bs) visitStmt(*bs);
+        {
+            // per §21.6 / §21.1 (#5314): the branch body is a block; a local
+            // declared in it is not visible after the matching `end`.
+            Scope bodyScope;
+            bodyScope.parent = currentScope_;
+            Scope* const saveScope = currentScope_;
+            currentScope_ = &bodyScope;
+            for (const auto& bs : ifs->ifBranch.body) {
+                if (bs) visitStmt(*bs);
+            }
+            currentScope_ = saveScope;
         }
         if (!bodyAlwaysExits(ifs->ifBranch.body)) {
             fallThroughExits.push_back(nullNarrowed_);
@@ -21757,7 +21766,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 collectNarrowings(ifs->elifBranches[j].condition.get(),
                                   /*forTrueBranch=*/false);
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/true);
-            for (const auto& bs : el.body) if (bs) visitStmt(*bs);
+            {
+                Scope bodyScope;  // per §21.6 / §21.1 (#5314): block scope
+                bodyScope.parent = currentScope_;
+                Scope* const saveScope = currentScope_;
+                currentScope_ = &bodyScope;
+                for (const auto& bs : el.body) if (bs) visitStmt(*bs);
+                currentScope_ = saveScope;
+            }
             if (!bodyAlwaysExits(el.body)) {
                 fallThroughExits.push_back(nullNarrowed_);
                 fieldExits.push_back(fieldNarrowed_);
@@ -21771,7 +21787,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/false);
         for (const auto& el : ifs->elifBranches)
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/false);
-        for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
+        {
+            Scope bodyScope;  // per §21.6 / §21.1 (#5314): block scope
+            bodyScope.parent = currentScope_;
+            Scope* const saveScope = currentScope_;
+            currentScope_ = &bodyScope;
+            for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
+            currentScope_ = saveScope;
+        }
         // The else path falls through unless an explicit else body always exits.
         if (!ifs->hasElse || !bodyAlwaysExits(ifs->elseBody)) {
             fallThroughExits.push_back(nullNarrowed_);
@@ -21823,7 +21846,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto whileEntryNarrowings = narrowings_;
         auto whileEntryField = fieldNarrowed_;  // §7.4 #2116
         loopEdgeNarrowing_.emplace_back();
-        for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
+        {
+            // per §21.6 / §21.1 (#5314): the loop body is a block scope, like
+            // the `for` body's `forScope` below.
+            Scope bodyScope;
+            bodyScope.parent = currentScope_;
+            Scope* const saveScope = currentScope_;
+            currentScope_ = &bodyScope;
+            for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
+            currentScope_ = saveScope;
+        }
         intersectNarrowingSetsAfterLoop(whileEntryNull, whileEntryNarrowings,
                                         whileEntryField,
                                         loopEdgeNarrowing_.back());
@@ -23835,9 +23867,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                           /*forTrueBranch=*/true);
                     }
                 }
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
-                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                {
+                    // per §21.6 / §21.1 (#5314): an arm body is a block; its
+                    // locals end with the arm (the binding/destructuring arms
+                    // above already run under their own armScope).
+                    Scope bodyScope;
+                    bodyScope.parent = currentScope_;
+                    Scope* const saveScope = currentScope_;
+                    currentScope_ = &bodyScope;
+                    if (arm.guard) visitExpr(*arm.guard);
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                    currentScope_ = saveScope;
+                }
                 intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
                                            armEntryField);  // §7.4 #2258
             }
