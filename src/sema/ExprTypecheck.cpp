@@ -14199,6 +14199,17 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                 if (pf.type)
                     recordAnnotationInstantiationSites(
                         ctx_.resolvedType(*pf.type), pf.type->span.begin);
+        // fix #5285 (§14.1 "Instantiation and its site", v0.313): a
+        // constructed type in "a `where` bound" is an instantiation site, and
+        // §14.2's constraint checks fire "at every such site".  The bound's
+        // TypeRef is resolved by `Resolver::resolveTypeDecl`'s
+        // `genericConstraints` walk, so it is available here.
+        for (const auto& gc : td->genericConstraints)
+            for (const auto& item : gc.items)
+                if (item.typeArg)
+                    recordAnnotationInstantiationSites(
+                        ctx_.resolvedType(*item.typeArg),
+                        item.typeArg->span.begin);
         for (const auto& ec : td->enumConstants) {
             if (ec.value) visitExpr(*ec.value);
         }
@@ -15089,6 +15100,23 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
         // typechecked above.
         checkConstructorChainCycles(tsym);
         currentType_ = save;
+    } else if (auto* alias = dynamic_cast<const ast::TypeAlias*>(&d)) {
+        // fix #5285 (§14.1 "Instantiation and its site", v0.313): a
+        // constructed type "in a type alias (§27.8)" is an instantiation site,
+        // and §14.2's constraint checks fire "at every such site".  A generic
+        // alias's own `where` bounds are sites on the same footing.  The
+        // Resolver resolves `aliasedType` and each `ConstraintItem::typeArg`
+        // (`Resolver::resolveTopDecl`'s TypeAlias arm), so both are available.
+        if (alias->aliasedType)
+            recordAnnotationInstantiationSites(
+                ctx_.resolvedType(*alias->aliasedType),
+                alias->aliasedType->span.begin);
+        for (const auto& gc : alias->genericConstraints)
+            for (const auto& item : gc.items)
+                if (item.typeArg)
+                    recordAnnotationInstantiationSites(
+                        ctx_.resolvedType(*item.typeArg),
+                        item.typeArg->span.begin);
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         // §26.1: inside an extension block, `this` is the receiver. For an
         // extension on a user class/record/enum, point currentType_ at the
@@ -15103,6 +15131,15 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                 if (rt->kind == TypeRef::Kind::Named)
                     targetSym = rt->declaration;
         }
+        // fix #5285 (§14.1 "Instantiation and its site", v0.313): an
+        // extension block's `where` bound is a site on the same footing as a
+        // type declaration's (A.3 places GenericConstraints on both).
+        for (const auto& gc : ext->genericConstraints)
+            for (const auto& item : gc.items)
+                if (item.typeArg)
+                    recordAnnotationInstantiationSites(
+                        ctx_.resolvedType(*item.typeArg),
+                        item.typeArg->span.begin);
         // Find the ExtensionSymbol for this decl so paramSymbolsOf can locate
         // the extension methods' parameters (they live on the ExtensionSymbol,
         // not on the extended type).
@@ -16762,6 +16799,13 @@ void ExprTC::visitMember(const ast::Member& m) {
         auto recParams = [&](const std::vector<ast::Param>& ps) {
             for (const auto& p : ps) rec(p.type);
         };
+        // fix #5285 (§14.1 v0.313): "a `where` bound" is a site on any
+        // declaration that carries one, not only a type declaration.
+        auto recConstraints = [&](const std::vector<ast::GenericConstraint>& gcs) {
+            for (const auto& gc : gcs)
+                for (const auto& item : gc.items)
+                    rec(item.typeArg);
+        };
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
             rec(fd->type);
         } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
@@ -16770,6 +16814,7 @@ void ExprTC::visitMember(const ast::Member& m) {
         } else if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
             recParams(md->params);
             rec(md->returnType);
+            recConstraints(md->genericConstraints);
         } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
             recParams(cd->params);
         }
