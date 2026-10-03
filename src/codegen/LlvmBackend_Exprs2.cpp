@@ -363,19 +363,23 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // the mint WITHOUT recognition still double-retains a producer arm (the leak
     // — #1948).
     //
-    // NON-NULLABLE ONLY (fix #1952 rework): the per-arm mint is confined to a
-    // non-nullable `string` result. A `string?` `??` (both operands nullable) is
-    // NOT normalized here — minting +1 for a borrow arm of a `string?` `??`
-    // leaked when the result flowed through the un-refcounted nullable return
-    // path (`return a ?? b` over `string?` borrows; #2196). The non-nullable
-    // `??` result is discharged by the non-nullable consumers (return / bind),
-    // so its borrow-arm mint is always balanced.
+    // NULLABLE-INCLUSIVE (fix #5290, §7.7 / §28.3 / §28.9, v0.313): the
+    // #1952 rework confined the per-arm mint to a non-nullable `string`
+    // result because a `string?` result then flowed through the un-refcounted
+    // nullable return path (#2196). #2196 refcounted that path and #2200
+    // extended the arm mint to `string?` case/if results, but not here: a
+    // `string?` `??` stayed un-normalized, so its result was +1 when a
+    // producer arm was taken and a +0 borrow otherwise, which no consumer can
+    // discharge (an interpolation hole `{(Fresh(i) ?? p)}` leaked or
+    // over-released by arm; a bind retained on top of a producer arm and
+    // leaked). Normalizing the `string?` result too makes it the same single
+    // +1 producer isPlusOneStringProducer now reports; retain is null-safe.
     const sema::TypeRef* coalResTy = ctx_.exprType(bin);
-    bool coalNonNullString =
-        coalResTy && !coalResTy->nullable &&
+    bool coalStringResult =
+        coalResTy &&
         coalResTy->kind == sema::TypeRef::Kind::Primitive &&
         coalResTy->primitive == sema::PrimitiveType::String;
-    if (coalNonNullString && l->getType()->isPointerTy() && bin.left &&
+    if (coalStringResult && l->getType()->isPointerTy() && bin.left &&
         !isPlusOneStringProducer(bin.left.get()) &&
         !returnedStringLocalOwnsPlusOne(bin.left.get()))
         emitStringRetain(l);
@@ -390,7 +394,7 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
     // flows to endBB), before the branch. Skipped when the RHS is itself a +1
     // producer / owning local (it already carries its single reference) or when
     // it diverged (never reaches endBB).
-    if (coalNonNullString && !rhsDiverged && r->getType()->isPointerTy() &&
+    if (coalStringResult && !rhsDiverged && r->getType()->isPointerTy() &&
         bin.right && !isPlusOneStringProducer(bin.right.get()) &&
         !returnedStringLocalOwnsPlusOne(bin.right.get()))
         emitStringRetain(r);

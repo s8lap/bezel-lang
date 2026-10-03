@@ -23979,50 +23979,31 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // (a producer arm transfers, a borrow arm is retained) and the non-nullable
     // consumer (return / bind) discharges it once.
     //
-    // fix #1952 (rework) — the NULLABLE sibling, guarded. A `string?` result is
-    // recognized as a producer ONLY when every arm is ALREADY +1-or-null WITHOUT
-    // a per-arm borrow retain — a +1 producer, a `null` literal, a string
-    // literal (an immortal sentinel), or a diverging `throw` arm. In that case
-    // the merged result is uniformly {+1 | null | sentinel}, so a `string?`
-    // producer local bound to it (`var s: string? := (case … => "a"+"b", _ =>
-    // null)`) is released soundly at scope end (a null/sentinel release is a
-    // no-op, the producer's +1 is freed) — closing #1952 WITHOUT the nullable
-    // per-arm mint that leaked when the result flowed through the un-refcounted
-    // nullable return path (#2196: a returned `string?` arm-meet with a BORROW
-    // arm). A `string?` arm-meet WITH a borrow arm fails the guard and stays on
-    // the old (borrow, unreleased) path — safe, unchanged from before #1952, and
-    // regression-free vs the un-refcounted nullable return.
-    auto armReleasableNullable = [this](const ast::Expr* a) -> bool {
-        if (!a) return true;                                   // no value arm
-        if (dynamic_cast<const ast::NullLiteralExpr*>(a)) return true;
-        if (dynamic_cast<const ast::StringLiteralExpr*>(a)) return true;
-        if (dynamic_cast<const ast::ThrowExpr*>(a)) return true;  // diverges
-        return isPlusOneStringProducer(a);
-    };
+    // fix #1952 (rework) guarded the NULLABLE sibling: a `string?` result was
+    // recognized only when every arm was ALREADY +1-or-null without a per-arm
+    // retain, because the nullable return path was not refcounted (#2196).
+    // fix #5290 (§18.5 / §28.3 / §28.9, v0.313): #2200 then made
+    // lowerCaseExpr / lowerConditional normalize EVERY arm of a `string?`
+    // result to +1 too (a borrow arm is retained, bz_string_retain is
+    // null-safe), so the guard no longer matched what the lowering returns: a
+    // `string?` arm-meet WITH a borrow arm carried +1 that every consumer
+    // took for a borrow (a bind retained on top of it and leaked, #5302; a
+    // `string?` interpolation hole leaked it, #5290). The result is a +1
+    // producer for the nullable spelling exactly as for the non-nullable one.
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(init)) {
         const sema::TypeRef* rt = ctx_.exprType(*ce);
-        if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
-            rt->primitive != sema::PrimitiveType::String)
-            return false;
-        if (!rt->nullable) return true;   // non-nullable: arm normalization mints
-        for (const auto& arm : ce->arms)
-            if (!armReleasableNullable(arm.exprBody.get())) return false;
-        return true;
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
     }
     // fix #1948 / §20 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9: an
     // if-expression `(if c then v1 else v2)` whose result is an owned `string` —
     // §28.3's row makes it the arm-meet of the branches "identically to the `a ??
-    // b` row" (v0.184). Non-nullable: a +1 producer (lowerConditional normalizes
-    // each branch). Nullable (#1952 rework): the SAME guard as the case/when
-    // above — recognized only when every branch is +1-or-null/sentinel/throw.
+    // b` row" (v0.184). lowerConditional normalizes each branch to +1, for a
+    // `string?` result as well (#2200; see the case/when arm above, #5290).
     if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(init)) {
         const sema::TypeRef* rt = ctx_.exprType(*cond);
-        if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
-            rt->primitive != sema::PrimitiveType::String)
-            return false;
-        if (!rt->nullable) return true;
-        return armReleasableNullable(cond->thenValue.get()) &&
-               armReleasableNullable(cond->elseValue.get());
+        return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::String;
     }
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(init)) {
         // fix #1948 / §7.7 / §28.3 (producers arm-meet, v0.184; v0.220) / §28.9:
@@ -24031,13 +24012,17 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         // = owned (exactly one of the two owned values is produced at runtime and
         // is discharged once)". lowerCoalesce normalizes each arm to +1 (a
         // producer arm transfers; the LHS / a borrow arm is retained), so the
-        // consumer TRANSFERS the single reference. Confined to NON-NULLABLE
-        // (#1952 rework): a `string?` `??` is NOT recognized — its borrow-arm
-        // mint leaked through the un-refcounted nullable return path (#2196).
+        // consumer TRANSFERS the single reference. fix #5290 (§7.7 / §28.3 /
+        // §28.9, v0.313): a `string?` result too. The #1952 rework confined
+        // both halves to the non-nullable result because the nullable return
+        // path was not refcounted (#2196, since fixed); the un-normalized
+        // `string?` `??` then yielded a PATH-DEPENDENT reference (+1 when a
+        // producer arm was taken, +0 for a borrow arm) that no consumer could
+        // discharge: `{(Fresh(i) ?? p)}` leaked or over-released depending on
+        // the arm. lowerCoalesce now normalizes the `string?` result as well.
         if (bin->op == "??") {
             auto* rt = ctx_.exprType(*init);
-            return rt && !rt->nullable &&
-                   rt->kind == sema::TypeRef::Kind::Primitive &&
+            return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                    rt->primitive == sema::PrimitiveType::String;
         }
         if (bin->op != "+") return false;
@@ -24915,14 +24900,84 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // don't statically know, so they are conservatively left for the borrow
     // path; no leak there, no double-release either). Indexers and non-string
     // properties are excluded by the type/symbol gate below.
+    // The inlined getter body of a non-indexer property read, the SAME body
+    // lowerPropertyRead / the `?.` read lower in place (#2304 / #2704); null
+    // when there is none to inspect (an imported or auto property).
+    auto inlinedGetterBody =
+        [](const sema::PropertySymbol* ps) -> const ast::Expr* {
+        // Inline the predicate that computedGetterOf keys on
+        // (isPlusOneStringProducer is `const`, but computedGetterOf
+        // is not — duplicating the small constant-time check here
+        // keeps this const-correct without widening the API):
+        // an expression-bodied property, OR a block-getter with an
+        // expression body.
+        // SEAM-ACCESSOR: documented in the #2304 comment above -- "an
+        // imported string-returning property ... correctly
+        // return false here" (conservative borrow path). #3152
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        const ast::Expr* getter = nullptr;
+        if (pd && !pd->isIndexer) {
+            if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+                getter = pd->exprBody.get();
+            else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                for (const auto& acc : pd->accessors) {
+                    if (!acc.isSet &&
+                        acc.bodyKind ==
+                            ast::PropertyAccessorBodyKind::Expression) {
+                        getter = acc.exprBody.get();
+                        break;
+                    }
+                    // fix #2704 / §23.3 / §28.9: the
+                    // STATEMENT-BODIED block-getter twin — a body
+                    // that is exactly one `return <producer>;`
+                    // hands the caller the producer's single +1
+                    // reference unchanged (the getter's return
+                    // contract is +0, currentReturnTypeNode_ stays
+                    // null per #2694, so emitReturn does not mint
+                    // — the producer's +1 flows straight through
+                    // to the read site at LlvmBackend_Exprs.cpp
+                    // ~5455, the blockGetterOf path). Pre-fix this
+                    // arm never fired: `computedGetterOf` returns
+                    // null for a statement body, the read site
+                    // handed the call result back as a borrow, and
+                    // every read leaked (LSan: 771 B / 40 alloc
+                    // over 20 reads — the issue's repro). Inline
+                    // the predicate here because `blockGetterOf`
+                    // is non-const and this recognizer is `const`
+                    // — the single-statement gate is deliberately
+                    // narrow: a body with intermediate locals or
+                    // branches can still produce a borrow at any
+                    // single point we don't statically know, so it
+                    // is conservatively left for the borrow path
+                    // (no leak there, no double-release either —
+                    // the getter returns a borrow and the caller
+                    // handles it as one). Lockstep with #2694's
+                    // +0 read-face contract: a borrow-bodied
+                    // getter classifies as false here and the
+                    // call site retains at bind / releases at
+                    // scope end as today.
+                    if (!acc.isSet &&
+                        acc.bodyKind ==
+                            ast::PropertyAccessorBodyKind::Block &&
+                        acc.stmts.size() == 1) {
+                        auto* rs = dynamic_cast<const ast::ReturnStmt*>(
+                            acc.stmts[0].get());
+                        if (rs && rs->value)
+                            getter = rs->value.get();
+                        break;
+                    }
+                }
+            }
+        }
+        return getter;
+    };
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
         sema::Symbol* sym = ctx_.exprSymbol(*ma);
         if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
             if (!ps->isIndexer) {
                 const sema::TypeRef* ty = ctx_.exprType(*init);
                 if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
-                    ty->primitive == sema::PrimitiveType::String &&
-                    !ty->nullable) {
+                    ty->primitive == sema::PrimitiveType::String) {
                     // fix #4952 (§4.6 / §28.3 / §28.9, v0.307): a
                     // DYNAMICALLY DISPATCHED property read — `ps` (the
                     // symbol this MemberAccessExpr resolved to) has a
@@ -25024,73 +25079,45 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             if (recordImpl) ps = recordImpl;
                         }
                     }
-                    if (dynamicSlot) return true;
-                    // Inline the predicate that computedGetterOf keys on
-                    // (isPlusOneStringProducer is `const`, but computedGetterOf
-                    // is not — duplicating the small constant-time check here
-                    // keeps this const-correct without widening the API):
-                    // an expression-bodied property, OR a block-getter with an
-                    // expression body.
-                    // SEAM-ACCESSOR: documented 12 lines above -- "an
-                    // imported string-returning property ... correctly
-                    // return false here" (conservative borrow path). #3152
-                    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                    const ast::Expr* getter = nullptr;
-                    if (pd && !pd->isIndexer) {
-                        if (pd->bodyKind == ast::PropertyBodyKind::Expression)
-                            getter = pd->exprBody.get();
-                        else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
-                            for (const auto& acc : pd->accessors) {
-                                if (!acc.isSet &&
-                                    acc.bodyKind ==
-                                        ast::PropertyAccessorBodyKind::Expression) {
-                                    getter = acc.exprBody.get();
-                                    break;
-                                }
-                                // fix #2704 / §23.3 / §28.9: the
-                                // STATEMENT-BODIED block-getter twin — a body
-                                // that is exactly one `return <producer>;`
-                                // hands the caller the producer's single +1
-                                // reference unchanged (the getter's return
-                                // contract is +0, currentReturnTypeNode_ stays
-                                // null per #2694, so emitReturn does not mint
-                                // — the producer's +1 flows straight through
-                                // to the read site at LlvmBackend_Exprs.cpp
-                                // ~5455, the blockGetterOf path). Pre-fix this
-                                // arm never fired: `computedGetterOf` returns
-                                // null for a statement body, the read site
-                                // handed the call result back as a borrow, and
-                                // every read leaked (LSan: 771 B / 40 alloc
-                                // over 20 reads — the issue's repro). Inline
-                                // the predicate here because `blockGetterOf`
-                                // is non-const and this recognizer is `const`
-                                // — the single-statement gate is deliberately
-                                // narrow: a body with intermediate locals or
-                                // branches can still produce a borrow at any
-                                // single point we don't statically know, so it
-                                // is conservatively left for the borrow path
-                                // (no leak there, no double-release either —
-                                // the getter returns a borrow and the caller
-                                // handles it as one). Lockstep with #2694's
-                                // +0 read-face contract: a borrow-bodied
-                                // getter classifies as false here and the
-                                // call site retains at bind / releases at
-                                // scope end as today.
-                                if (!acc.isSet &&
-                                    acc.bodyKind ==
-                                        ast::PropertyAccessorBodyKind::Block &&
-                                    acc.stmts.size() == 1) {
-                                    auto* rs = dynamic_cast<const ast::ReturnStmt*>(
-                                        acc.stmts[0].get());
-                                    if (rs && rs->value)
-                                        getter = rs->value.get();
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    // fix #5290 (§18.5 / §28.9, v0.313): the dynamic-slot
+                    // fast path relies on ensureVirtualStringGetterOwnershipThunk
+                    // normalizing every override to +1, and that thunk is
+                    // installed for a NON-nullable `string` getter only. A
+                    // `string?` dynamic read keeps the borrow classification
+                    // (its override's ownership is not known here). A
+                    // `string?` read of an INLINED getter body is classified
+                    // by that body below, exactly like the `string` one:
+                    // lowerPropertyRead hands back the body's own value, so a
+                    // fresh body (`=> "w" + …`) is a +1 the consumer must
+                    // discharge and a slot body (`=> _f`) stays a borrow.
+                    if (dynamicSlot) return !ty->nullable;
+                    const ast::Expr* getter = inlinedGetterBody(ps);
                     if (getter && isPlusOneStringProducer(getter)) return true;
                 }
+            }
+        }
+    }
+    // fix #5290 / #5291 (§7.5 / §18.5 / §28.9, v0.313): the null-conditional
+    // twin, `q?.W`. Its lowering (lowerExprInner's NullCondMemberExpr property
+    // arm) inlines a NON-virtual computed / block getter in the non-null arm
+    // and joins it with null, so the result carries exactly what that body
+    // carries: +1 for a producer body, a borrow for a slot body (`?.` over an
+    // auto-property is a plain storage read, a borrow). Mirrors that arm's
+    // gate (non-indexer, no vtable / itable slot, an inlinable getter); a
+    // virtual `?.` read keeps the borrow classification.
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(init)) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*nm));
+        if (ps && !ps->isIndexer && !propGetSlot_.count(ps) &&
+            !ifacePropertyGetIndex_.count(ps)) {
+            // SEAM-ACCESSOR: an imported property has no PropertyDecl, so
+            // inlinedGetterBody answers null and the read stays a borrow. #3152
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            const sema::TypeRef* pty =
+                pd && pd->type ? ctx_.resolvedType(*pd->type) : nullptr;
+            if (pty && pty->kind == sema::TypeRef::Kind::Primitive &&
+                pty->primitive == sema::PrimitiveType::String) {
+                const ast::Expr* getter = inlinedGetterBody(ps);
+                if (getter && isPlusOneStringProducer(getter)) return true;
             }
         }
     }
@@ -25326,8 +25353,14 @@ bool Emitter::returnedStringLocalOwnsPlusOne(const ast::Expr* e) const {
         const sema::TypeRef* lt = nullptr;
         if (view.type) lt = ctx_.resolvedType(*view.type);
         if (!lt) lt = ctx_.exprType(*view.init);
-        return lt && !lt->nullable &&
-               lt->kind == sema::TypeRef::Kind::Primitive &&
+        // fix #5290 (§28.3 / §28.9, v0.313): a `string?` producer local too.
+        // Its producer's +1 lives in the slot exactly as for `string` (the
+        // nullable value path is refcounted since #2196), so an escaping one
+        // hands it over on `return r;`. Excluding it made the return mint a
+        // second reference that nobody released (`var r: string? := "x" + s;
+        // return r;` leaked one string per call on r23-c28), and the #5290
+        // fix-forward widened the producer set (`var r := n ?? p;`).
+        return lt && lt->kind == sema::TypeRef::Kind::Primitive &&
                lt->primitive == sema::PrimitiveType::String;
     }
     return false;

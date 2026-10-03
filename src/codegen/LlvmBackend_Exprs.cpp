@@ -3466,6 +3466,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (stringLength) {
             llvm::Value* len64 = loadStringLen(obj);
             val = builder_.CreateTrunc(len64, i32(), "str.len.i32");
+            // fix #5290 (§7.5 / §28.9, v0.313): the `?.` twin of the `.Length`
+            // #429 release above. A +1 producer receiver (`(p ?? q)?.Length`,
+            // `(if c then f() else s)?.Length`, `k.W?.Length`) has no named
+            // owner and no scope-end release, so discharge it here, after the
+            // length read. Only the non-null edge holds a reference.
+            if (isPlusOneStringProducer(nm->target.get()))
+                emitStringRelease(obj);
         } else {
             llvm::Value* addr = builder_.CreateStructGEP(st, obj, memIdx);
             val = builder_.CreateLoad(memTy, addr);
