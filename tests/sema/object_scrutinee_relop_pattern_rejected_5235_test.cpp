@@ -344,3 +344,51 @@ BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
     BEZEL_EXPECT_FALSE(hasObjectOrderingDiag(r));
 }
+
+// NON-VACUOUS ARM-LEVEL PIN (#5235-ff2-rv regression). The destructuring-slot
+// fix-forward (#5235-ff2, this branch) refactored the arm-level walk to call
+// the new per-pattern helper, but left the loop's `return` unconditional —
+// arm[1+] was no longer visited, and a relational in the second arm walked
+// straight through to codegen as malformed `icmp sgt ptr %obj, i32 5`. The
+// 17 existing rows all put the offending pattern in arm[0], so a clean arm
+// followed by an offending arm is exactly the shape no existing row covers.
+//
+// EXPR spelling. The first arm (`null => 1`) is a fully valid pattern that
+// cannot itself trip the gate, so the assertion is satisfied only if the
+// walk actually descends into the SECOND arm. `failedAtCompileTimeWithRealLocation`
+// + `hasObjectOrderingDiag` together pin BOTH "rejected at sema" AND "the
+// §19.3 needle, not some other failure" — a silent wrong answer cannot pass.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           second_arm_relop_over_object_rejected) {
+    auto r = runAot(
+        "module M; class P "
+        "  public static method Main(): int "
+        "    var o: Object := null; "
+        "    return (case o of null => 1, > 5 => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}
+
+// NON-VACUOUS ARM-LEVEL PIN (#5235-ff2-rv regression) — statement-position
+// `case`. The statement spelling takes a different entry point
+// (`visitStmt` rather than the expr `case`) but routes through the same
+// `checkOrderingPatternsOverUnorderedScrutinee` gate. Pre-fix, the same
+// unconditional `return` after arm[0] left the statement spelling open too;
+// MEASURED on the rejected branch: `%2 = icmp sgt ptr %1, i32 5`. Same
+// "clean first arm, offending second arm" shape.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           second_arm_relop_over_object_rejected_stmt) {
+    auto r = runAot(
+        "module M; class P "
+        "  public static method Main(): int "
+        "    var o: Object := null; "
+        "    var r: int := 0; "
+        "    case o of null => r := 1, > 5 => r := 2 end; "
+        "    return r; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}

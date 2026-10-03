@@ -2815,7 +2815,15 @@ private:
     // the arm. Same narrow scope: `PrimitiveType::Object` only, so an ordered
     // slot type (`record Q(A: int)` + `Q(> 5)`) is untouched, and the
     // user-declared-operator question stays #5269's open spec-question.
-    void checkOrderingPatternOverUnorderedType(const TypeRef* ty,
+    // Returns true iff this call issued a §19.3 diagnostic for the pattern
+    // (or any alternation member descended into). The arm-level caller in
+    // `ExprTypecheck.cpp` walks each arm and stops on the first true return,
+    // preserving "one diagnostic per `case`, at the first offending pattern"
+    // while ensuring a relational in arm[1+] still diagnoses
+    // (#5235-ff2-rv regression: the previous caller returned unconditionally
+    // after arm[0], letting malformed IR through). Slot callers ignore the
+    // return value — a slot has no "next pattern" to walk.
+    bool checkOrderingPatternOverUnorderedType(const TypeRef* ty,
                                                const ast::Pattern* pat);
 
     // §19.3 (v0.294, #3692): the single-pattern walk `

@@ -13499,10 +13499,16 @@ void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
         return;
     // One diagnostic per `case`, at the first offending pattern: a second
     // relop arm over the same Object scrutinee is the same error restated,
-    // and repeating it per arm would bury the one that matters.
+    // and repeating it per arm would bury the one that matters. The walk
+    // returns true once it has reported a diagnostic; false otherwise (clean
+    // walk, or the scrutinee's type was not Object — the early-out below).
+    // A relational pattern in arm[1+] must NOT skip this gate: an earlier
+    // revision returned unconditionally after arm[0] and let the malformed
+    // IR through (#5235-ff2-rv). The behaviour-preserving change is to stop
+    // at the first arm that DIAGNOSES, not at the first arm that exists.
     for (const ast::CaseArm& arm : arms) {
-        checkOrderingPatternOverUnorderedType(scrutTy, arm.pattern.get());
-        return;
+        if (checkOrderingPatternOverUnorderedType(scrutTy, arm.pattern.get()))
+            return;
     }
 }
 
@@ -13530,29 +13536,37 @@ void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
 // one `push` and keeps this gate structurally identical to the nullable
 // sibling instead of encoding "a member is never an alternation" as a second
 // assumption a future A.7 amendment would silently break.
-void ExprTC::checkOrderingPatternOverUnorderedType(
-        const TypeRef* ty, const ast::Pattern* pat) {
-    if (!ty || ty->kind != TypeRef::Kind::Primitive ||
-        ty->primitive != PrimitiveType::Object || !pat)
-        return;
-    std::vector<const ast::Pattern*> queue{pat};
-    while (!queue.empty()) {
-        const ast::Pattern* q = queue.back();
-        queue.pop_back();
-        if (!q) continue;
-        if (dynamic_cast<const ast::RelOpPattern*>(q) ||
-            dynamic_cast<const ast::RangePattern*>(q)) {
-            ctx_.diagnostics().report(
-                Severity::Error, q->span.begin,
-                "a relational or range pattern cannot be used with an "
-                "Object scrutinee (\xC2\xA7""19.3) — Object has no defined "
-                "ordering");
-            return;
+// Returns true if a diagnostic was reported for the given pattern (or any
+    // alternation member it descends into). Returning true lets the caller
+    // stop at the first offending arm of a `case` and emit one diagnostic per
+    // case, preserving the behaviour the original arm-level walk had at
+    // #5235's parent. Returning false lets the caller keep walking arms; the
+    // #5235-ff2-rv regression returned unconditionally after arm[0] and let
+    // a relational in arm[1+] reach codegen as malformed IR.
+    bool ExprTC::checkOrderingPatternOverUnorderedType(
+            const TypeRef* ty, const ast::Pattern* pat) {
+        if (!ty || ty->kind != TypeRef::Kind::Primitive ||
+            ty->primitive != PrimitiveType::Object || !pat)
+            return false;
+        std::vector<const ast::Pattern*> queue{pat};
+        while (!queue.empty()) {
+            const ast::Pattern* q = queue.back();
+            queue.pop_back();
+            if (!q) continue;
+            if (dynamic_cast<const ast::RelOpPattern*>(q) ||
+                dynamic_cast<const ast::RangePattern*>(q)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, q->span.begin,
+                    "a relational or range pattern cannot be used with an "
+                    "Object scrutinee (\xC2\xA7""19.3) — Object has no defined "
+                    "ordering");
+                return true;
+            }
+            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+                for (const auto& m : ap->members) queue.push_back(m.get());
         }
-        if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
-            for (const auto& m : ap->members) queue.push_back(m.get());
+        return false;
     }
-}
 
 // §7.4 (issue #418): refresh `nullNarrowed_` for `sym := value`. A non-null
 // value proves the variable non-null from here; a nullable value (including a
