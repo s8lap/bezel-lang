@@ -414,28 +414,40 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // the interpolation path in LlvmBackend_Exprs.cpp (~line 127) and the
     // emitValueToString path in LlvmBackend_String.cpp (~line 1904).
     //
-    // fix #5109 (§5.1 / §14.1, v0.307): a bare generic type parameter `T`
-    // (Named with no declaration) that is NOT nullable in sema, but whose LLVM
-    // lowered value IS a nullable-value carrier struct {i8 hasValue; T}. This
-    // happens when the result of `??` on `T?` with a `T` default is passed
-    // directly to Console.WriteLine in the UNSPECIALIZED TEMPLATE body (where
-    // T is unresolved): lowerCoalesce returns the bare payload T (not the
-    // nullable struct), but the sema type of the coalesce expression is the bare
-    // T Named type (nullable=0, declaration=null). The nullable-value branch
-    // below only fires when isNullableValueTy(argTy) is true, which requires
-    // nullable=1 on the sema type — so it misses this shape entirely.
-    // Detect structurally: a 2-element struct whose first element is the hasValue
-    // tag and whose second element is NOT a pointer (not a nullable reference).
-    bool isStructurallyNullableValue = false;
-    if (arg && arg->getType()->isStructTy()) {
-        auto* st = llvm::cast<llvm::StructType>(arg->getType());
-        if (st->getNumElements() == 2 &&
-            st->getElementType(0) == nullablePrimHasValTy() &&
-            !st->getElementType(1)->isPointerTy()) {
-            isStructurallyNullableValue = true;
-        }
-    }
-    if ((argTy && isNullableValueTy(argTy)) || isStructurallyNullableValue) {
+    // fix #5240 (§3.6 rule 2, v0.313): the branch is keyed on the SEMANTIC type
+    // of the argument, never on the shape of its lowered LLVM value. A generic
+    // body's `Console.WriteLine(q)` over a `q: T?` reaches this call with the
+    // carrier `{i8 hasValue; T}` (per §3.6 rule 2 the body is lowered once, on
+    // the weakest assumption its constraints establish, and the substitution of
+    // `T` is applied when the instantiation is judged — so the value is a
+    // carrier while the recorded type of `q` can still be the UNSUBSTITUTED
+    // `T`). Two `argTy` shapes denote that carrier:
+    //   • `isNullableValueTy(argTy)` — `nullable=1` on a primitive/enum/
+    //     record/choice/value-builtin (the non-generic `int?`, `bool?`,
+    //     `E?`, `R?` cases, §7.2);
+    //   • `isBareTypeParamRef(argTy)` — a bare type parameter `T` (Named,
+    //     no declaration, no generic arguments, not a reserved builtin name),
+    //     i.e. the generic-body shape.
+    //
+    // The earlier cut detected the carrier STRUCTURALLY — "a 2-element struct
+    // whose element 0 is the `i8` hasValue tag and whose element 1 is not a
+    // pointer" — as an OR-disjunct. That shape is not exclusive to a nullable
+    // carrier: `lowerPrimitive` maps `byte`/`sbyte` to `i8`, so an ordinary
+    // non-nullable `record R(b: byte, n: int)` lowers to exactly `{i8, i32}`
+    // and was routed into the unwrap arm. There `nullablePrimValue` extracted
+    // element 1 while `*argTy` still named the RECORD, so `emitValueToString`
+    // was handed a bare `i32` under a record TypeRef and `Console.WriteLine(r)`
+    // printed `99` instead of `R(b: 7, n: 99)` — a silent miscompile: wrong
+    // value, exit status 0, no diagnostic (`bool` lowers to `i1`, not `i8`,
+    // which is why no existing row caught it).
+    //
+    // Keying on `argTy` also keeps `*argTy` below reachable: `argTy` is
+    // `ctx_.exprType(...)`, an `unordered_map::find` that returns nullptr for
+    // an unrecorded expression, and the structural disjunct above did not
+    // require it non-null. The `argTy &&` conjunct is what makes the
+    // dereference safe again, as it was before that cut.
+    if (argTy && (isNullableValueTy(argTy) || isBareTypeParamRef(argTy)) &&
+        arg->getType()->isStructTy()) {
         llvm::Value* hasVal = nullablePrimHasValue(arg);             // i1
         llvm::Value* innerVal = nullablePrimValue(arg);              // T
         auto* valBB  = llvm::BasicBlock::Create(llvm_, "wln.nv.val",  currentFn_);
