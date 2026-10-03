@@ -289,4 +289,38 @@ end Program;
     BEZEL_EXPECT_EQ(out, std::string("B=6\nA=6\n"));
 }
 
+// §29.2 / stdlib §4 (v0.313), #5308 headline repro.
+BEZEL_TEST(imported_ienumerable_param_5308, array_headline_repro_prints_a6) {
+    auto r = run5309(
+        "    using var arr := new Array<int>(3);\n"
+        "    arr.Add(1); arr.Add(2); arr.Add(3);\n"
+        "    Console.WriteLine(\"A=\" + b.SumE(arr).ToString());\n");
+    EXPECT_RUN_5309(r, "A=6\n");
+}
+
+BEZEL_TEST(imported_ienumerable_param_5308, array_loop_200) {
+    auto r = run5309(
+        "    using var arr := new Array<int>(3);\n"
+        "    arr.Add(1); arr.Add(2); arr.Add(3);\n" +
+        loop200("enumArr", "b.SumE(arr)"));
+    EXPECT_RUN_5309(r, "enumArr=1200\n");
+}
+
+BEZEL_TEST(imported_ienumerable_param_5308, linkedlist_loop_200) {
+    auto r = run5309(
+        "    using var ll := new LinkedList<int>();\n"
+        "    ll.AddLast(1); ll.AddLast(2); ll.AddLast(3);\n" +
+        loop200("enumLL", "b.SumE(ll)"));
+    EXPECT_RUN_5309(r, "enumLL=1200\n");
+}
+
+// An imported generic `CountG<T>(xs: IEnumerable<T>)` handed an Array.
+BEZEL_TEST(imported_ienumerable_param_5308, generic_callee_array_loop_200) {
+    auto r = run5309(
+        "    using var arr := new Array<int>(3);\n"
+        "    arr.Add(1); arr.Add(2); arr.Add(3);\n" +
+        loop200("gen", "XL5309.Base.CountG<int>(arr)"));
+    EXPECT_RUN_5309(r, "gen=600\n");
+}
+
 }  // namespace bezel::module

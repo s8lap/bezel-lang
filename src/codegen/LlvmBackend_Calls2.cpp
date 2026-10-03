@@ -12623,6 +12623,36 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         }
                     }
                 }
+                // fix #5308 / §29.2, stdlib §4 (v0.313): the IMPORTED-callee
+                // twin of buildOrderedArgs' pure-`IEnumerable<T>` argument
+                // wrap. This arm never wrapped, so an `Array<T>` / List /
+                // LinkedList / lazy pipeline handed to an imported
+                // `IEnumerable<T>` formal arrived as a raw collection pointer
+                // and the callee's for-in dispatched through its (absent)
+                // vtable — a jump to a null pc. Same wrap, same lazy-pipeline
+                // ownership, same scope-end disposal of the wrapper frame
+                // (`wrapMade`) as the local-callee arm (#2298/#1069/#1923).
+                if (!byRef && formalTy && v->getType()->isPointerTy()) {
+                    bool lazyArgWrapped =
+                        formalTy->kind == sema::TypeRef::Kind::Named &&
+                        !formalTy->declaration &&
+                        formalTy->headName() == "IEnumerable" &&
+                        isLazyEnumerableType(ctx_.exprType(*a.value));
+                    bool wrapMade = false;
+                    v = wrapAsIEnumerableForTarget(
+                        v, formalTy, a.value.get(),
+                        /*ownLazyPipeline=*/lazyArgWrapped, &wrapMade);
+                    if (wrapMade && v && v->getType()->isPointerTy() &&
+                        !disposeStack_.empty()) {
+                        llvm::AllocaInst* eslot = entryAlloca(v->getType());
+                        builder_.CreateStore(v, eslot);
+                        if (smStateStruct_)
+                            asyncHandlerSpillSlots_.push_back(eslot);
+                        Disposal d{eslot, nullptr};
+                        d.iterEnumDispose = true;
+                        disposeStack_.back().push_back(d);
+                    }
+                }
                 // fix #2809 / §28.3 *Unbound owned temporaries* + §32.6
                 // (v0.240): the IMPORTED-callee twin of the registration
                 // buildOrderedArgs does (LlvmBackend_Assign.cpp). This arm

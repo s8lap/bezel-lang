@@ -8799,9 +8799,13 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // §29.2 wrapper frame at all, and every ownership-CLAIM site downstream is
     // only correct while it agrees. #3355 widened it by hand and #3392 was the
     // claim predicate that did not follow. Both now read one classifier.
+    // fix #5308 (§29.2, §2.8.3, v0.313): an IMPORTED callee's formal is rebuilt
+    // from metadata with no `astNode`; `headName()` already falls back to the
+    // metadata `importedName`, so the head test alone is the gate (the old
+    // `astNode && name && parts` conjunct made every imported `IEnumerable<T>`
+    // formal decline the wrap and receive a raw collection pointer).
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
-          !targetTy->declaration && targetTy->astNode &&
-          targetTy->astNode->name && !targetTy->astNode->name->parts.empty() &&
+          !targetTy->declaration && !targetTy->headName().empty() &&
           common::isSyncIterFormatEnumerableHead(targetTy->headName())))
         return v;
     sema::TypeRef* actualTy = ctx_.exprType(*srcExpr);
