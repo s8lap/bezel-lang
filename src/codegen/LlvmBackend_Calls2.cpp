@@ -19422,6 +19422,11 @@ void Emitter::registerImportedBorrowedFreshClassTempArg(
         return;
     llvm::AllocaInst* tslot = entryAlloca(v->getType());
     builder_.CreateStore(v, tslot);
+    // fix #5286 / §28.3 *Deferred-activation callees*, §30.1 (v0.313): as in
+    // the local arm, a suspension between this store and the disposal (`s :=
+    // s + await b.TakeA(new A.Item())`, or a later awaited argument) reads the
+    // slot on the RESUMED invocation, so it must live in the frame.
+    if (smStateStruct_) asyncHandlerSpillSlots_.push_back(tslot);
     Disposal d{tslot, nullptr};
     d.dynamicDispose = true;
     disposeStack_.back().push_back(d);

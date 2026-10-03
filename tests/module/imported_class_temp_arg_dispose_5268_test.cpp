@@ -15,7 +15,9 @@
 #include <sys/wait.h>
 #include <vector>
 
+#include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 #include "support/unique_stem.hpp"
 
@@ -209,6 +211,169 @@ end Program;
     BEZEL_EXPECT_TRUE(driver.compileFile(src.path, exe.path, {}).success);
     int status = std::system(exe.path.c_str());
     BEZEL_EXPECT_EQ(WIFEXITED(status) ? WEXITSTATUS(status) : -1, 20);
+}
+
+// ===========================================================================
+// fix-forward (#5286, §28.3 *Deferred-activation callees*, §30.1, v0.313):
+// inside an ASYNC body, a suspension between the temporary's store and its
+// disposal. The disposal runs on the resumed invocation of `...$Resume`, so
+// the helper's slot must be frame-spilled exactly like the local arm's
+// (tests/codegen/async_fresh_temp_arg_frame_spill_5286_test.cpp). Without it,
+// the #5268 helper SEGVs in `Main$Resume`. The importer is built with
+// `--sanitize=address` and run under the ambient (leak-detecting) ASan, 200
+// iterations. Main returns 42 only when n, s and h all match; a sanitizer
+// report exits nonzero with another code.
+// ===========================================================================
+namespace {
+
+const char* kAsyncLib5268 = R"BZL(module AsyncLib5268;
+public class Item
+  public static n: int := 0;
+  public constructor() end constructor;
+  destructor Item.n := Item.n + 1; end destructor;
+  public method V(): int return 1; end V;
+end Item;
+public class Base
+  public static hits: int := 0;
+  public constructor() end constructor;
+  public static method Hit() Base.hits := Base.hits + 1; end Hit;
+  public async method TakeA(x: Item): Task<int>
+    const before := Item.n;
+    await Task.Delay(1);
+    return 10 * (Item.n - before) + x.V();
+  end TakeA;
+  public async method TakeNoSusp(x: Item): Task<int>
+    return x.V();
+  end TakeNoSusp;
+  public async method ThrowA(x: Item): Task<int>
+    await Task.Delay(1);
+    if x.V() = 1 then throw new InvalidOperationException("x"); end;
+    return 0;
+  end ThrowA;
+  public method Two(x: Item, y: int): int return x.V() + y; end Two;
+  public static async method One(): Task<int>
+    await Task.Delay(1);
+    return 1;
+  end One;
+  public static async method Boom(): Task<int>
+    await Task.Delay(1);
+    throw new InvalidOperationException("b");
+  end Boom;
+end Base;
+)BZL";
+
+// -2 = the library did not build (row skips); -1 = the app did not build or
+// did not exit normally.
+int runAsync5268(const std::string& body, int wantS, int wantH) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = unique_stem("bz5268a_");
+    TempFile5268 aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile5268 aObj((dir / (stem + "_a.o")).string());
+    writeSource5268(aSrc.path, kAsyncLib5268);
+    if (!compileToObj5268(aSrc.path, aObj.path)) return -2;
+    if (!std::ifstream(aObj.path).good()) return -2;
+
+    std::string app =
+        "module AppA5268;\nimport AsyncLib5268;\n"
+        "public class Program\n"
+        "  public static async method Main(): Task<int>\n"
+        "    var s := 0;\n"
+        "    for var i in 0..<200 do\n"
+        "      using var b := new AsyncLib5268.Base();\n"
+        "      " + body + "\n"
+        "    end;\n"
+        "    if AsyncLib5268.Item.n = 200 and s = " + std::to_string(wantS) +
+        " and AsyncLib5268.Base.hits = " + std::to_string(wantH) +
+        " then return 42; end;\n"
+        "    return 7;\n"
+        "  end Main;\n"
+        "end Program;\n";
+    TempFile5268 bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile5268 bExe((dir / stem).string());
+    writeSource5268(bSrc.path, app);
+    bezel::Driver driver;
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    codegen::CodegenOptions opts;
+    opts.sanitizeAddress = true;
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps,
+                                         opts).success)
+        return -1;
+    int status = std::system(bExe.path.c_str());
+    return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+}
+
+}  // namespace
+
+// Imported async borrow callee, fresh temporary, real suspension (the review's
+// probe (d)).
+BEZEL_TEST(imported_class_temp_arg_dispose_5268,
+           async_awaited_imported_borrow_callee_fresh_temp_loop_200) {
+    int r = runAsync5268(
+        "s := s + await b.TakeA(new AsyncLib5268.Item());", 200, 0);
+    BEZEL_EXPECT_TRUE(r != -2);
+    BEZEL_EXPECT_EQ(r, 42);
+}
+
+// The imported task faults after its suspension. The unwind edge of the
+// resumed invocation disposes the temporary.
+BEZEL_TEST(imported_class_temp_arg_dispose_5268,
+           async_imported_callee_faults_after_suspend_loop_200) {
+    int r = runAsync5268(
+        "try\n"
+        "        s := s + await b.ThrowA(new AsyncLib5268.Item());\n"
+        "      catch\n"
+        "        InvalidOperationException => AsyncLib5268.Base.Hit(),\n"
+        "      end try;", 0, 200);
+    BEZEL_EXPECT_TRUE(r != -2);
+    BEZEL_EXPECT_EQ(r, 42);
+}
+
+// A SYNC imported borrow callee whose later argument awaits.
+BEZEL_TEST(imported_class_temp_arg_dispose_5268,
+           async_body_imported_sync_callee_later_arg_awaits_loop_200) {
+    int r = runAsync5268(
+        "s := s + b.Two(new AsyncLib5268.Item(), "
+        "await AsyncLib5268.Base.One()) - 1;", 200, 0);
+    BEZEL_EXPECT_TRUE(r != -2);
+    BEZEL_EXPECT_EQ(r, 42);
+}
+
+// The same, with the later awaited argument faulting.
+BEZEL_TEST(imported_class_temp_arg_dispose_5268,
+           async_body_imported_sync_callee_later_arg_faults_loop_200) {
+    int r = runAsync5268(
+        "try\n"
+        "        s := s + b.Two(new AsyncLib5268.Item(), "
+        "await AsyncLib5268.Base.Boom());\n"
+        "      catch\n"
+        "        InvalidOperationException => AsyncLib5268.Base.Hit(),\n"
+        "      end try;", 0, 200);
+    BEZEL_EXPECT_TRUE(r != -2);
+    BEZEL_EXPECT_EQ(r, 42);
+}
+
+// Control: the imported async callee never suspends (clean both ways).
+BEZEL_TEST(imported_class_temp_arg_dispose_5268,
+           async_control_imported_callee_without_suspension_loop_200) {
+    int r = runAsync5268(
+        "s := s + await b.TakeNoSusp(new AsyncLib5268.Item());", 200, 0);
+    BEZEL_EXPECT_TRUE(r != -2);
+    BEZEL_EXPECT_EQ(r, 42);
+}
+
+// Control: a bound `using var` argument, not a temporary (clean both ways).
+BEZEL_TEST(imported_class_temp_arg_dispose_5268,
+           async_control_imported_callee_bound_local_loop_200) {
+    int r = runAsync5268(
+        "using var it := new AsyncLib5268.Item();\n"
+        "      s := s + await b.TakeA(it);", 200, 0);
+    BEZEL_EXPECT_TRUE(r != -2);
+    BEZEL_EXPECT_EQ(r, 42);
 }
 
 }  // namespace bezel::module
