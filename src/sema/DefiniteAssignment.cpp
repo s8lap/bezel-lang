@@ -397,11 +397,15 @@ bool caseArmIsUnguardedCatchAll(const ast::CaseArm& arm) {
 // read that previously passed regresses — soundness is unaffected there because
 // no reachable path observes the result. `entry` is used only for the
 // degenerate no-branch case.
-std::unordered_set<std::string_view> joinLiveBranches(
-    const std::vector<std::unordered_set<std::string_view>>& outs,
-    const std::vector<bool>& terminated,
-    const std::unordered_set<std::string_view>& entry) {
-    std::unordered_set<std::string_view> result;
+//
+// fix #5335: templated on the set's element type. It joins BOTH the local
+// tracker (keyed by declaration identity since #5335) and the field trackers
+// (still keyed by name); the join logic is identical for the two, so one
+// template serves both rather than duplicating the algorithm.
+template <class Set>
+Set joinLiveBranches(const std::vector<Set>& outs,
+                     const std::vector<bool>& terminated, const Set& entry) {
+    Set result;
     bool any = false;
     for (std::size_t i = 0; i < outs.size(); ++i) {
         if (i < terminated.size() && terminated[i]) continue;  // diverging arm
@@ -409,7 +413,7 @@ std::unordered_set<std::string_view> joinLiveBranches(
             result = outs[i];
             any = true;
         } else {
-            std::unordered_set<std::string_view> tmp;
+            Set tmp;
             for (auto n : result)
                 if (outs[i].count(n)) tmp.insert(n);
             result = std::move(tmp);
@@ -420,7 +424,7 @@ std::unordered_set<std::string_view> joinLiveBranches(
     // All branches diverge → unreachable join; preserve prior full intersection.
     result = outs.front();
     for (std::size_t i = 1; i < outs.size(); ++i) {
-        std::unordered_set<std::string_view> tmp;
+        Set tmp;
         for (auto n : result)
             if (outs[i].count(n)) tmp.insert(n);
         result = std::move(tmp);
@@ -484,6 +488,29 @@ bool hasOutParam(const std::vector<ast::Param>& params);
 class MethodDA {
 public:
     explicit MethodDA(SemaContext& ctx) : ctx_(ctx) {}
+
+    // fix #5335 (§7.9 / §21.1 / §21.6, v0.313): the DA key of a local read or
+    // write. Sema mints ONE `LocalSymbol` per local declaration and resolves
+    // every reference to the scope-correct one; each such symbol's `decl`
+    // field points at the AST node that introduced the local (`LocalDecl`,
+    // `LocalConstDecl`, `ForStmt`, or the `IdentifierExpr` of an inline
+    // `out var`). That node is a unique, stable identity for the DECLARATION,
+    // and — crucially — it is available at BOTH ends: directly at the
+    // declaration site (which already holds the node) and at a read/write
+    // site by following `exprSymbol` to the symbol's `decl`. So the two sides
+    // agree without any extra table, and two same-named locals in different
+    // blocks get different keys.
+    //
+    // Returns nullptr when sema resolved no local for this occurrence (an
+    // unresolved reference, or a parameter — a parameter is not a local and is
+    // not DA-tracked); the caller then falls back to `nameKey`.
+    static const ast::Node* localDeclNode(const SemaContext& ctx,
+                                          const ast::Expr& e) {
+        Symbol* s = ctx.exprSymbol(e);
+        if (!s) return nullptr;
+        auto* ls = dynamic_cast<LocalSymbol*>(s);
+        return ls ? ls->decl : nullptr;
+    }
 
     // Run the walker. `params` lists the method's parameters. By-value
     // and `ref` params are definitely-assigned on entry (the caller
@@ -617,7 +644,12 @@ public:
             if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
                 p.modifier.rfind("out var", 0) != 0) {
                 outParams_.insert(p.name);
-                declared_.insert(p.name);
+                // fix #5335: an `out` PARAMETER has no LocalSymbol (an
+                // `ast::Param` is not a Node and sema mints no local for it),
+                // so it keys by the name-interned fallback — matching the
+                // read/write sites, which fall back the same way whenever
+                // `resolvedLocal` yields null for a parameter reference.
+                declared_.insert(nameKey(p.name));
             }
         }
         // §22.7 rule 1, chaining position: the `base(...)`/`this(...)` call is
@@ -850,7 +882,12 @@ public:
             if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
                 p.modifier.rfind("out var", 0) != 0) {
                 outParams_.insert(p.name);
-                declared_.insert(p.name);
+                // fix #5335: an `out` PARAMETER has no LocalSymbol (an
+                // `ast::Param` is not a Node and sema mints no local for it),
+                // so it keys by the name-interned fallback — matching the
+                // read/write sites, which fall back the same way whenever
+                // `resolvedLocal` yields null for a parameter reference.
+                declared_.insert(nameKey(p.name));
             }
         }
         std::size_t startIdx = 0;
@@ -902,12 +939,55 @@ public:
 
 private:
     SemaContext& ctx_;
-    // declared_ records every local introduced in this method (by name).
-    // assigned_ records those that are also known-assigned at the
-    // current point. A read of a name in declared_ but not assigned_
-    // is a diagnostic.
-    std::unordered_set<std::string_view> declared_;
-    std::unordered_set<std::string_view> assigned_;
+    // fix #5335 (§7.9 / §21.1 / §21.6, v0.313): `declared_` / `assigned_` are
+    // keyed by a DECLARATION IDENTITY, not by a name. A block local that
+    // shadows an outer local is a DIFFERENT variable (§21.6: "Locals declared
+    // in a block are visible only until the matching `end`"; §21.1: a local's
+    // scope is "the innermost enclosing statement block"), so a write to the
+    // inner one must not mark the outer one assigned. The key is the AST node
+    // that INTRODUCED the local (see `localDeclNode`): unique per declaration,
+    // and reachable from both the declaration site and any read/write of that
+    // local. Two same-named locals in different blocks therefore get different
+    // keys, and a write to the inner one no longer discharges the outer one's
+    // §7.9 obligation.
+    //
+    // A name-keyed entry remains for the sites where sema resolved no local at
+    // all (an unresolved reference, an `out` parameter seeded from a `Param`
+    // that carries no LocalSymbol). Those are interned through `nameKey`,
+    // which yields a stable, separately-allocated token that can never alias
+    // an AST node — the two come from distinct allocations.
+    using DaKey = const void*;
+    using DaSet = std::unordered_set<DaKey>;
+    // fix #5335: the fallback key for a site where sema resolved no local — an
+    // `out` PARAMETER (`ast::Param` carries no symbol, and §22.3's obligation is
+    // on the parameter, not on a block local) or an unresolved reference.
+    // Interned to a stable, separately-allocated token so it can never alias an
+    // AST node: the two come from distinct allocations, and the tokens outlive
+    // every copy of `declared_`/`assigned_` because this MethodDA owns them.
+    DaKey nameKey(std::string_view n) {
+        auto it = nameKeys_.find(n);
+        if (it != nameKeys_.end()) return it->second;
+        // `new std::string` (not a string_view into the source buffer) so the
+        // token address is stable for the walk regardless of buffer lifetime.
+        auto* tok = new std::string(n);
+        nameTokenStore_.emplace_back(tok);
+        DaKey k = static_cast<DaKey>(tok);
+        nameKeys_.emplace(n, k);
+        return k;
+    }
+    // The key for a declaration site: the introducing AST node when the
+    // declaration has one, else the name-keyed fallback. `node` may be null
+    // (a declaration form sema anchors no LocalSymbol on).
+    DaKey declKey(const ast::Node* node, std::string_view n) {
+        return node ? static_cast<DaKey>(node) : nameKey(n);
+    }
+    std::unordered_map<std::string_view, DaKey> nameKeys_;
+    std::vector<std::unique_ptr<std::string>> nameTokenStore_;
+    // `declared_` records every local introduced in this method. `assigned_`
+    // records those also known-assigned at the current point. A read of a
+    // local in declared_ but not assigned_ is a diagnostic.
+    DaSet declared_;
+    DaSet assigned_;
     // out-parameter names that must be assigned on every exit path (§22.3).
     std::unordered_set<std::string_view> outParams_;
     // #1226 / §29.11: lazy LINQ bound vars that are definitely consumed at
@@ -1048,16 +1128,14 @@ private:
     // only on the true continuation; `A or Call(out var x)` only on the false
     // continuation.
     struct CondState {
-        std::unordered_set<std::string_view> afterTrue;
-        std::unordered_set<std::string_view> afterFalse;
+        DaSet afterTrue;
+        DaSet afterFalse;
     };
 
     // Set intersection helper (a local is definitely assigned only where it is
     // assigned on *every* incoming path).
-    static std::unordered_set<std::string_view> intersectSets(
-        const std::unordered_set<std::string_view>& a,
-        const std::unordered_set<std::string_view>& b) {
-        std::unordered_set<std::string_view> r;
+    static DaSet intersectSets(const DaSet& a, const DaSet& b) {
+        DaSet r;
         for (auto n : a)
             if (b.count(n)) r.insert(n);
         return r;
@@ -1207,9 +1285,21 @@ private:
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
             if (ld->initializer) visitExpr(*ld->initializer);
             if (!ld->name.empty()) {
-                declared_.insert(ld->name);
+                // fix #5335 (§7.9 / §21.1 / §21.6, v0.313): key this
+                // declaration by the AST node that introduces it, NOT by its
+                // name. Two `var t` in nested blocks are two different
+                // variables (§21.6: a block local is visible only until the
+                // matching `end`), so the inner one's initializer must not
+                // mark the outer one assigned — the read of the outer `t`
+                // after the block is still a §7.9 error. Sema anchors this
+                // declaration's LocalSymbol on `ld` itself
+                // (ExprTypecheck.cpp:18519 `lsym->decl = ld`), and resolves
+                // every read/write of it back to that same node, so the
+                // declaration and use sites agree on the key.
+                DaKey k = declKey(ld, ld->name);
+                declared_.insert(k);
                 if (ld->initializer) {
-                    assigned_.insert(ld->name);
+                    assigned_.insert(k);
                 } else if (ld->type) {
                     // §7.9 (v0.299, #4419): a local of DEFAULTABLE type
                     // (§17.11 "defaultable" glossary entry) declared without an
@@ -1232,7 +1322,7 @@ private:
                     // types, so `[N]T` is admitted iff `T` is defaultable.
                     if (auto* rt = ctx_.resolvedType(*ld->type)) {
                         if (!typeHasNoDefault(rt, ctx_))
-                            assigned_.insert(ld->name);
+                            assigned_.insert(k);
                     }
                 }
             }
@@ -1241,8 +1331,13 @@ private:
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
             if (lc->value) visitExpr(*lc->value);
             if (!lc->name.empty()) {
-                declared_.insert(lc->name);
-                assigned_.insert(lc->name);  // const requires initializer
+                // fix #5335: keyed by the introducing node, as in the
+                // LocalDecl arm above — a block-local `const` shadows an
+                // outer same-named local rather than assigning it
+                // (§21.1 / §21.6, v0.313).
+                DaKey k = declKey(lc, lc->name);
+                declared_.insert(k);
+                assigned_.insert(k);  // const requires initializer
             }
             return;
         }
@@ -1318,8 +1413,18 @@ private:
             // targets (member/index) read their root path first.
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     as->target.get())) {
-                if (declared_.count(id->name)) {
-                    assigned_.insert(id->name);
+                // fix #5335 (§7.9 / §21.1 / §21.6, v0.313): this WRITE must
+                // mark the local sema resolved the target to — the one the
+                // write actually names, per §2.7 rule 1's lexical resolution
+                // — not "whatever local happens to share this name". Writing
+                // to a block-local `t` that shadows an unassigned outer `t`
+                // is an assignment of the INNER variable (§21.6), so the outer
+                // one keeps its §7.9 obligation and the read after the block is
+                // rejected. Falls back to the name key when sema resolved no
+                // local (an `out` parameter, or an unresolved reference).
+                DaKey k = declKey(localDeclNode(ctx_, *id), id->name);
+                if (declared_.count(k)) {
+                    assigned_.insert(k);
                 }
                 // Bare ident that's NOT a declared local — could be a
                 // field-on-this or a typo. Sema slice 3d's silent fall-
@@ -1396,7 +1501,7 @@ private:
             for (const auto& bs : ifs->ifBranch.body) {
                 if (bs) visitStmt(*bs);
             }
-            std::vector<std::unordered_set<std::string_view>> branchOuts;
+            std::vector<DaSet> branchOuts;
             branchOuts.push_back(std::move(assigned_));
             std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
             consumedLazyOuts.push_back(std::move(consumedLazy_));
@@ -1551,8 +1656,13 @@ private:
             bool entryTerminated = terminated_;
             terminated_ = false;
             if (!fs->varName.empty()) {
-                declared_.insert(fs->varName);
-                assigned_.insert(fs->varName);
+                // fix #5335: the loop variable is anchored on the ForStmt
+                // itself (ExprTypecheck.cpp:21943 `lsym->decl = fs`), so key
+                // it by that node — a `for var i` that shadows an outer `i`
+                // is a different variable (§21.1 / §21.6, v0.313).
+                DaKey k = declKey(fs, fs->varName);
+                declared_.insert(k);
+                assigned_.insert(k);
             }
             ++inLoopDepth_;
             for (const auto& bs : fs->body) {
@@ -1591,7 +1701,7 @@ private:
             }
             // Try-body may abort at any point → join with entry for
             // the post-try set; catch arms each start from entry.
-            std::vector<std::unordered_set<std::string_view>> outs;
+            std::vector<DaSet> outs;
             outs.push_back(std::move(assigned_));
             std::vector<std::unordered_set<std::string_view>> consumedLazyOuts;
             consumedLazyOuts.push_back(std::move(consumedLazy_));
@@ -1690,7 +1800,7 @@ private:
             // mutually exclusive (like if/else), so each resets to `roEntry` and
             // the post-case set is the UNION over live arms (joinUnionLive).
             auto roEntry = readonlyMaybeAssigned_;
-            std::vector<std::unordered_set<std::string_view>> armOuts;
+            std::vector<DaSet> armOuts;
             std::vector<std::unordered_set<std::string_view>> armConsumedLazyOuts;
             std::vector<std::unordered_set<std::string_view>> armFieldOuts;
             std::vector<std::unordered_set<std::string_view>> armRoOuts;
@@ -2158,9 +2268,20 @@ private:
                 // A plain `out x` / `out owned x` targets a pre-declared local
                 // (already in `declared_`) and is just marked assigned
                 // (§22.3 / #747).
+                //
+                // fix #5335 (§7.9 / §21.1 / §21.6, v0.313): key by the local
+                // the argument resolved to. Sema anchors the inline `out var`
+                // local on this very IdentifierExpr
+                // (ExprTypecheck_Exprs.cpp:9530 `lsym->decl = id`) before it
+                // visits the node, so this site and a later read of the same
+                // out var agree on the key, and an `out var t` that shadows an
+                // outer unassigned `t` no longer discharges the outer one's
+                // §7.9 obligation. Falls back to the name key for a plain
+                // `out x` targeting an `out` PARAMETER (no LocalSymbol).
+                DaKey k = declKey(localDeclNode(ctx_, *id), id->name);
                 if (a.modifier == "out var" && inlineOutVarNeedsDA(*id))
-                    declared_.insert(id->name);
-                assigned_.insert(id->name);
+                    declared_.insert(k);
+                assigned_.insert(k);
                 return;  // pure write — not a read
             }
         }
@@ -2196,7 +2317,12 @@ private:
                 // "out var" as a param modifier; the check is belt-and-
                 // suspenders).
                 outParams_.insert(p.name);
-                declared_.insert(p.name);
+                // fix #5335: an `out` PARAMETER has no LocalSymbol (an
+                // `ast::Param` is not a Node and sema mints no local for it),
+                // so it keys by the name-interned fallback — matching the
+                // read/write sites, which fall back the same way whenever
+                // `resolvedLocal` yields null for a parameter reference.
+                declared_.insert(nameKey(p.name));
                 // Intentionally NOT inserted into assigned_ — starts unassigned.
             }
         }
@@ -2207,7 +2333,7 @@ private:
     // source location to attach the diagnostic (null → no location).
     void checkOutParams(const SourceLocation* loc) {
         for (auto name : outParams_) {
-            if (!assigned_.count(name)) {
+            if (!assigned_.count(nameKey(name))) {
                 SourceLocation sl;
                 if (loc) sl = *loc;
                 ctx_.diagnostics().report(
@@ -2322,9 +2448,17 @@ private:
 
     void checkRead(const ast::IdentifierExpr& id) {
         if (id.name == "this" || id.name == "base") return;
+        // fix #5335 (§7.9 / §2.7 rule 1, v0.313): consult the SAME key the
+        // declaration and write sites used — the introducing node of the local
+        // this read resolves to. Name keying conflated a read of the OUTER
+        // `t` with the block-local `t` that shadowed it (§21.1 / §21.6), so a
+        // nested declaration's initializer made the outer read look assigned.
+        // Falls back to the name key when sema resolved no local here, which
+        // keeps the #5314 by-name behaviour for the cases it preserved.
+        DaKey k = declKey(localDeclNode(ctx_, id), id.name);
         // Only flag locals declared in this method that haven't been
         // assigned. Fields, params, and outer scopes pass silently.
-        if (declared_.count(id.name) && !assigned_.count(id.name)) {
+        if (declared_.count(k) && !assigned_.count(k)) {
             // fix #5314 (§7.9 / §2.7 rule 1, v0.313): `declared_`/`assigned_`
             // are keyed by NAME, so a nested-block local that shadows a
             // PARAMETER (or a field) leaves the name in `declared_` yet drops
