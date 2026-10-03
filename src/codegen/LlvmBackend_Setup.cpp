@@ -21044,11 +21044,18 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // Detection: NewExpr type name OR inferred exprType name "Channel".
     {
         bool isCh = false;
+        // #5313 / §30.15 / stdlib §6.9 (v0.313): `builtinTypeName` sees the
+        // imported `astNode == nullptr` / `importedName` shape that a
+        // `Channel<T>` returned by an imported factory arrives in; the
+        // hand-rolled `astNode` test did not, so the arm was skipped, no
+        // `d.channel` disposal was registered, the value leaked at scope end,
+        // and #2992's end-of-chain guard fired `internal:` (measured 1600
+        // allocations / 412800 bytes over 200 iterations). Same third shape
+        // and same fix as the `IsClosed` property arm in LlvmBackend_Exprs.cpp
+        // and sema's `builtinInstName`.
         auto isChannelTypeName = [](const sema::TypeRef* rt) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
-                   !rt->declaration && rt->astNode && rt->astNode->name &&
-                   !rt->astNode->name->parts.empty() &&
-                   rt->headName() == "Channel";
+                   builtinTypeName(rt) == "Channel";
         };
         if (ld->type)
             isCh = isChannelTypeName(ctx_.resolvedType(*ld->type));
@@ -21072,11 +21079,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // the channel if this was the last sender).
     {
         bool isTx = false;
+        // #5313: same `builtinTypeName` chokepoint and same imported-shape
+        // reason as the `Channel` arm directly above — a `ChannelSender<T>`
+        // reached through an imported factory skipped its release too.
         auto isSenderTypeName = [](const sema::TypeRef* rt) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
-                   !rt->declaration && rt->astNode && rt->astNode->name &&
-                   !rt->astNode->name->parts.empty() &&
-                   rt->headName() == "ChannelSender";
+                   builtinTypeName(rt) == "ChannelSender";
         };
         if (ld->type)
             isTx = isSenderTypeName(ctx_.resolvedType(*ld->type));
@@ -22668,11 +22676,17 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // releases only on unwind (releaseOnUnwindOnly), mirroring the generic
     // unwindOnly owned-param path — the discharge site owns the normal exit.
     {
+        // #5313 / §30.15 / stdlib §6.9 (v0.313): `builtinTypeName` — the
+        // chokepoint that also sees the imported `astNode == nullptr` /
+        // `importedName` shape. The hand-rolled `astNode` gate below skipped
+        // the auto-drop release for a `Channel<T>` / `ChannelSender<T>` that
+        // arrived from an imported factory, leaving the channel open (it was
+        // the last sender) and the graph leaked. Same third shape and same fix
+        // as the two `using var` arms above.
         auto builtinHead = [](const sema::TypeRef* r) -> std::string_view {
-            if (!r || r->kind != sema::TypeRef::Kind::Named || r->declaration ||
-                !r->astNode || !r->astNode->name || r->astNode->name->parts.empty())
+            if (!r || r->kind != sema::TypeRef::Kind::Named)
                 return std::string_view{};
-            return r->headName();
+            return builtinTypeName(r);
         };
         std::string_view bhead = builtinHead(rt);
         bool isTx = bhead == "ChannelSender";

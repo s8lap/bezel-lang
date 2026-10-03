@@ -4591,11 +4591,20 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (ma->target &&
             (ma->member == "IsClosed" || ma->member == "Count")) {
             auto* tt = ctx_.exprType(*ma->target);
+            // #5313 / §30.15 / stdlib §6.9 (v0.313): read the builtin head
+            // through `builtinTypeName`, the ONE chokepoint that sees all three
+            // TypeRef shapes (declaration-less w/ astNode; builtinClassSym; and
+            // the imported `astNode == nullptr` / `importedName` form). This
+            // arm hand-rolled its own `astNode`-gated test, which rejected the
+            // imported form outright: `ch.IsClosed` on a `Channel<T>` returned
+            // by an imported factory emitted NOTHING (not even the line
+            // terminator — the #3079 warning), so the program printed one line
+            // short with no diagnostic pointing at a cause. Mirrors the fix in
+            // sema's `builtinInstName` (ExprTypecheck_Calls.cpp) — same third
+            // shape, same reason the precondition was wrong rather than the
+            // name read.
             bool isChProp = (tt && tt->kind == sema::TypeRef::Kind::Named &&
-                             !tt->declaration && tt->astNode &&
-                             tt->astNode->name &&
-                             !tt->astNode->name->parts.empty() &&
-                             tt->headName() == "Channel");
+                             builtinTypeName(tt) == "Channel");
             if (isChProp) {
                 llvm::Value* ch = lowerExpr(*ma->target);
                 if (ch) {

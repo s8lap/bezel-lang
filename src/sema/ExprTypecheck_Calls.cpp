@@ -11842,6 +11842,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (rt->astNode && rt->astNode->name &&
                                 !rt->astNode->name->parts.empty())
                                 return rt->headName();
+                            // #5313 / §2.5 (v0.313): an IMPORTED builtin reaches
+                            // sema with `astNode == nullptr` (no AST exists for
+                            // another module's source) and the name carried in
+                            // `importedName` — ModuleLoader.cpp convert() sets
+                            // that when `lookupNamed` returns null, i.e. exactly
+                            // when the named type is NOT an exported user type of
+                            // the dependency and so must be a compiler built-in
+                            // (the '@'-spelled §2.2 alias-qualified form takes
+                            // the same carriage, gated there on
+                            // `builtinTypeHomeModuleOf(bare) == <home module>`).
+                            // `headName()` already falls back to `importedName`,
+                            // but the `astNode` precondition above returned
+                            // first, so the fallback was unreachable: a
+                            // `Channel<T>` returned by an imported factory was
+                            // invisible to every `rcn == "…"` arm below, its
+                            // method calls went UNTYPED, and the whole family
+                            // silently mis-lowered. #662 foundation B / #2809
+                            // established this third shape for the codegen
+                            // chokepoint `Emitter::builtinTypeName`; this is the
+                            // sema-side twin of that read. Safe because
+                            // `importedName` is only ever set on a name no
+                            // user type resolved to — see the convert() cites.
+                            if (!rt->importedName.empty())
+                                return rt->importedName;
                             return {};
                         }
                         if (!rt->declaration->decl) return rt->declaration->name;
