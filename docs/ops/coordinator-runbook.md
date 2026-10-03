@@ -11,7 +11,7 @@ disagreement is a defect to fix in whichever file is stale.
 
 **Who reads this:** coordinators (orchestrators) before running a gate, a
 dual-coordinator run, or a pool. Lanes read `CLAUDE.md` and
-`docs/lane-contract.md`. They do not need this file unless a rule's reason
+`docs/ops/lane-contract.md`. They do not need this file unless a rule's reason
 matters to their task.
 
 **Pre-gate in one command:** `scripts/pregate.sh [--filters "…"]` runs every

@@ -2,7 +2,7 @@
 
 This file is the first thing every Claude Code session should read. It encodes the conventions and disciplines this project operates under. Following these rules is more important than moving quickly; a fast contribution that drifts from the spec is worse than a slow one that doesn't.
 
-This file holds the **rules**. The evidence behind the operational rules (the incidents that paid for them) and the full coordinator procedures live in [`docs/coordinator-runbook.md`](docs/coordinator-runbook.md). Lanes also follow [`docs/lane-contract.md`](docs/lane-contract.md). If either disagrees with this file, this file wins.
+This file holds the **rules**. The evidence behind the operational rules (the incidents that paid for them) and the full coordinator procedures live in [`docs/ops/coordinator-runbook.md`](docs/ops/coordinator-runbook.md). Lanes also follow [`docs/ops/lane-contract.md`](docs/ops/lane-contract.md). If either disagrees with this file, this file wins.
 
 ## What this repository is
 
@@ -113,7 +113,7 @@ These require explicit human direction:
 
 ## Gates (coordinator only)
 
-Full procedures and the evidence behind each rule: [`docs/coordinator-runbook.md`](docs/coordinator-runbook.md).
+Full procedures and the evidence behind each rule: [`docs/ops/coordinator-runbook.md`](docs/ops/coordinator-runbook.md).
 
 - **Both oracles, always.** Land only with `scripts/gate_and_push.sh` (plain cycle, then ASan `--full`). Neither oracle dominates. `scripts/gate.sh` alone gates one oracle and is not an acceptance verdict.
 - **Before launch: `scripts/pregate.sh [--filters "…"]` must say READY.** It runs every build-free gate phase (ratchets derived from the gate, gate and corpus self-tests with the pidfile redirected, corpus `--strict`, stale needles) plus the preflight (clean tree, no builders via `scripts/no_builders.sh`, fast-disk symlinks, disk headroom). Also run every targeted filter for known regressions. **Never launch a gate you expect to fail.**

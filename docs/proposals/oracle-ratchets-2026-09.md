@@ -298,7 +298,7 @@ converted suites with `BEZEL_AOT_FORCE_SANITIZE=address`".
 
 The gate's own floor already exists for this counter (`tests/run_parallel.sh:480–495`), which is
 why the gate saw the regression. **A lane never runs `run_parallel.sh`** — CLAUDE.md and
-`docs/lane-contract.md:14–15` forbid it — so the floor is structurally unreachable from the place
+`docs/ops/lane-contract.md:14–15` forbid it — so the floor is structurally unreachable from the place
 where the vacuity happened.
 
 **#3676 is live and has partly moved.** The helper at

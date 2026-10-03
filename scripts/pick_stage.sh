@@ -46,7 +46,7 @@
 # REBASING staging drops notes unless you pass, per command (never git config):
 #   git -c notes.rewriteRef=refs/notes/bezel-picks rebase …
 # pick_ledger.sh then recovers notes by patch-id + subject, best effort only
-# (see docs/coordinator-runbook.md for when it cannot), marking rows `~`.
+# (see docs/ops/coordinator-runbook.md for when it cannot), marking rows `~`.
 #
 # Hooks (scripts/hooks/pre-commit, worktree ownership): measured on git 2.55,
 # `git cherry-pick` does NOT run pre-commit, but the `--amend` below DOES. So in

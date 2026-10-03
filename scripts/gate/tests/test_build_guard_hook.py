@@ -279,7 +279,7 @@ class BriefLintTest(HookTestBase):
                                                            "new_string": f"1. {INCIDENT}\n"}}))
 
     def test_non_brief_file_is_not_linted(self):
-        path = os.path.join(self.repo, "docs", "coordinator-runbook.md")
+        path = os.path.join(self.repo, "docs", "ops", "coordinator-runbook.md")
         self.assertIsNone(self.decision({"tool_name": "Write", "cwd": self.repo,
                                          "tool_input": {"file_path": path,
                                                         "content": f"{INCIDENT}\n"}}))

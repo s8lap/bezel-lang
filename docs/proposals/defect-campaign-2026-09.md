@@ -811,7 +811,7 @@ it unblocks.
 ## 7. How a lane uses this document
 
 1. Take **one family**. Read its anchor issue in full — the body is the design; do not
-   re-derive it. Read `docs/lane-contract.md`.
+   re-derive it. Read `docs/ops/lane-contract.md`.
 2. **Verify-first, on HEAD, every listed member** before changing anything. Record which
    still reproduce, which have moved, which were fixed by something else. Members that no
    longer reproduce close with the commit that fixed them named, not "cannot reproduce".
