@@ -4464,7 +4464,27 @@ private:
     // because nothing marked it moved-from after the first accept, since
     // `producerState`/`states_` deliberately still say Borrowed — see
     // `ownedArgSourceIsBorrow`'s own header comment for why that must stay
-    // true). // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057
+    // true).
+    //
+    // fix #5284 (§28.8, stdlib §6.1/§7.3/§7.4/§8.1/§4.19): widened from
+    // `isBuiltinOwnedMaterializerCall` ALONE to ALSO include
+    // `common::isBuiltinOwnedStaticFactoryCall` — the builtin
+    // `owned`-returning STATIC-factory family (`Stopwatch.StartNew`,
+    // `CancellationTokenSource.WithCancelAfter`/`CreateLinked`/`CreateLinked
+    // All`, `File.ReadAllBytes`/`ReadAllLines`, `Directory.GetFiles`/
+    // `GetDirectories`, `FrozenArray<T>.From`). The name is deliberately KEPT
+    // (one fact, one predicate) rather than renamed, so the two #4042/#4057
+    // consumers and any future one continue to share a single decision.
+    //
+    // The #4042 safety premise — "codegen already reclaims these, so
+    // reclassifying would double-free" — is MEASURED FALSE for the static
+    // factory family: amplified 300-iteration LSan loops before this change
+    // leaked 299/299 (Stopwatch.StartNew), 299/299
+    // (CancellationTokenSource.WithCancelAfter), 1499 (File.ReadAllLines) and
+    // 18300 (Directory.GetFiles) allocations, so codegen registers NO reclaim
+    // for these locals at all. On the transfer path the value consequently has
+    // exactly ONE disposer (the `owned` sink) and admitting the transfer
+    // cannot double-free. // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057, #5284
     bool isMaterializerCarveOutBorrow(const ast::IdentifierExpr& id);
 
     // fix #5278 (§15.4, §28.3 Producers table, K3.13): true when `e` (after

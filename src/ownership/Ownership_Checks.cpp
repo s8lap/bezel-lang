@@ -14311,7 +14311,30 @@ bool MethodOwnership::isMaterializerCarveOutBorrow(const ast::IdentifierExpr& id
     auto* ld = dynamic_cast<const ast::LocalDecl*>(st->obligationOrigin);
     if (!ld || !ld->initializer) return false;
     auto* mce = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
-    return mce && common::isBuiltinOwnedMaterializerCall(*mce, ctx_);
+    if (!mce) return false;
+    // fix #5284 (§28.8, stdlib §6.1/§7.3/§7.4/§8.1/§4.19): a builtin
+    // `owned`-returning STATIC factory (`var s := Stopwatch.StartNew();`) is
+    // the same shape as a builtin owned materializer — a direct CallExpr
+    // initializer whose stdlib signature declares `owned` — but reached no
+    // `producerState` `owned` arm (no `ast::MethodDecl` to read
+    // `md->returnOwned` from, no ModuleLoader side-table entry for the
+    // `importedReturnOwned` arm), so the local fell through to the Borrowed
+    // default and `Take(move s)` was rejected with the §28.8
+    // "a borrow cannot be passed where an `owned` value is required" needle.
+    // The #4042 premise that admitting it is safe ("codegen already reclaims,
+    // so reclassifying would double-free") is MEASURED FALSE for this family:
+    // amplified 300-iteration LSan loops before this change leaked 299/299
+    // (Stopwatch.StartNew), 299/299 (CancellationTokenSource.WithCancelAfter),
+    // 1499 (File.ReadAllLines) and 18300 (Directory.GetFiles) allocations —
+    // codegen registers NO reclaim for these locals at all (only the `using
+    // var` spelling reaches the disposal arms). So on the transfer path the
+    // value has exactly ONE disposer, the `owned` sink, and admitting the
+    // transfer cannot double-free. A never-transferred local of this family
+    // still leaks; that is a SEPARATE, PRE-EXISTING reclamation defect
+    // (unfixed here — this change is diagnostic-only and cannot alter
+    // disposal, since `producerState` still reports Borrowed for these).
+    return common::isBuiltinOwnedMaterializerCall(*mce, ctx_) ||
+           common::isBuiltinOwnedStaticFactoryCall(*mce, ctx_);
 }
 
 bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
@@ -14566,6 +14589,16 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
         // when this fires — closing the measured double-free where a SECOND
         // owned-field / owning-slot store of the same local sailed through
         // unmarked). // per §21.1, §28.3, stdlib §5/§4.4/§9.6, #4042, #4057
+        //
+        // fix #5284 (§28.8, stdlib §6.1/§7.3/§7.4/§8.1/§4.19): the SAME
+        // carve-out now also covers a builtin `owned`-returning STATIC factory
+        // initializer (`var s := Stopwatch.StartNew();`), whose call the
+        // stdlib signature declares `owned` — see the predicate's header for
+        // the leak measurement that makes admitting the transfer safe, and for
+        // the NOT-EXHAUSTIVE list. Still diagnostic-only: this returns
+        // "not a borrow" and leaves `states_` saying Borrowed, so a
+        // never-transferred local of this family keeps its (separately
+        // tracked, pre-existing) reclamation gap unchanged.
         if (isMaterializerCarveOutBorrow(*id)) return false;
         return true;
     }

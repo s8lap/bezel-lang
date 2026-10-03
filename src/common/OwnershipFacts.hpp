@@ -685,6 +685,55 @@ bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
 bool isEventSubscribeCall(const ast::CallExpr& call,
                           const sema::SemaContext& ctx);
 
+// §28.8 / §28.3 *Producers* / stdlib §6.1, §7.3, §7.4, §8.1, §4.19 (fix #5284):
+// a STATIC call to a BUILTIN (stdlib) class's `owned`-returning factory — one
+// with NO `ast::MethodDecl` and NO `MethodSymbol` — whose result the stdlib
+// signature declares `owned`. The stdlib declaration is the ONLY authority
+// there is: `producerState`'s `md->returnOwned` arm reads a user MethodDecl
+// that does not exist for these, and the #1415 `importedReturnOwned` arm reads
+// a side-table ModuleLoader populates only for imported module members. So the
+// call fell through to the Borrowed default, the bound local was tracked
+// Borrowed, and `Take(move s)` into an `owned` parameter was rejected with the
+// §28.8 "a borrow cannot be passed" diagnostic — on a call the spec says
+// returns `owned` (e.g. stdlib §8.1 `public static method StartNew(): owned
+// Stopwatch;`).
+//
+// WHAT IT RECOGNIZES, and why that cannot over-fire. Mirrors the ONE sema arm
+// that types each of these results (ExprTypecheck_Calls.cpp's `colName`-keyed
+// static-surface blocks) and the stdlib signature beside it:
+//   (a) the CALLEE is a `Col.Member(...)` static shape whose `Col` names one of
+//       the documented `owned`-returning builtin factories below, AND
+//   (b) the RECEIVER is a BUILTIN name, not a user declaration — the §2.3 /
+//       #5272 `isUserDeclaredTypeSym` discriminator. §2.3 (v0.313) states only
+//       the §3.4 reserved row (`Int32`… aliases + `String`) cannot be shadowed;
+//       "every other always-available name may be shadowed by local
+//       declarations", and §2.7 makes the current-module declaration win the
+//       bare name. So a user `class Stopwatch` with its own
+//       `static method StartNew(): owned Stopwatch` (MEASURED: compiles and
+//       runs today via the ordinary user-MethodDecl path) must NOT be claimed
+//       here — it already classifies Owned through `md->returnOwned`.
+//   (c) the RESULT is a declaration-less / builtin-symbol Named TypeRef whose
+//       head is the class the stdlib declares — the same cross-check
+//       `isBuiltinOwnedMaterializerCall` makes, and the same fail-open
+//       polarity: a shape this cannot type is ACCEPTED as not-claimed, never
+//       over-claimed.
+//   (d) NO `MethodSymbol` is attached to the callee — the same "no symbol at
+//       all" test `isBuiltinOwnedMaterializerCall` uses, and the same premise:
+//       a user/imported static method carries one and is classified by the
+//       user-call rules, never by this predicate.
+//
+// NOT EXHAUSTIVE, knowingly — the same measurement-gated philosophy
+// `isBuiltinOwnedMaterializerCall` documents, for the same reason: a
+// measurement-free name is not evidence of severity. `Task.FromOwnedResult`,
+// `Domain.Spawn`, the `Task`-family heads, `CString`/`WString`/`RawBytes`
+// `.From`, `JsonSerializer.ParseOwned` and `BinarySerializer.Deserialize` all
+// declare `owned` statics too, and all are ALREADY classified Owned by earlier
+// `producerState` arms (MEASURED: `Take(move …)` accepted for each) — they are
+// omitted here because adding them would be redundant, not because they are
+// not `owned`.
+bool isBuiltinOwnedStaticFactoryCall(const ast::CallExpr& call,
+                                     const sema::SemaContext& ctx);
+
 // §28.3 "Factory methods and sourceless returns" / Appendix C.3 (fix #1499): a
 // STATIC method returning a plain class/interface type with NO `owned`
 // annotation has no STRUCTURAL borrow source — a static call has no receiver —

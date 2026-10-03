@@ -838,6 +838,177 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
     return head == "Array" || head == "Set" || head == "Dictionary";
 }
 
+// §28.8 / §28.3 *Producers* / stdlib §6.1, §7.3, §7.4, §8.1, §4.19 (fix #5284).
+// See the header for the full recognition argument. // per §28.8, §28.3, §2.3,
+// §2.7, stdlib §4.19/§6.1/§7.3/§7.4/§8.1
+bool isBuiltinOwnedStaticFactoryCall(const ast::CallExpr& call,
+                                     const sema::SemaContext& ctx) {
+    // (a) The STATIC shape `Col.Member(...)`. There is no `?.` form: a static
+    // factory is reached through a TYPE NAME, which has no value to
+    // null-conditionally access, and `builtinInstanceCallee`'s NullCond arm
+    // exists for the INSTANCE materializer shape only. Extracting through the
+    // same helper anyway would be harmless (a NullCondMemberExpr target is a
+    // value, which (b) below rejects), but reading the MemberAccessExpr
+    // directly states the shape this predicate is about.
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+        call.callee.get());
+    if (!ma || !ma->target) return false;
+
+    // The RECEIVER's class-name head, in all three spellings the surface
+    // admits. `D.Stopwatch.StartNew()` (import alias) and
+    // `System.Diagnostics.Stopwatch.StartNew()` (module-qualified) put the
+    // class name in the LAST component of a dotted receiver rather than in a
+    // bare IdentifierExpr, and MEASURED both were rejected identically
+    // pre-fix, so a bare-identifier-only read would fix one spelling of three
+    // — the #4698 alias trap. Read the last dotted component, which is the
+    // class name in all three.
+    std::string_view colName;
+    for (const ast::Expr* t = ma->target.get();;) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(t)) {
+            colName = id->name;
+            break;
+        }
+        if (auto* inner =
+                dynamic_cast<const ast::MemberAccessExpr*>(t)) {
+            t = inner->target.get();
+            continue;
+        }
+        return false;  // a non-name receiver: not a static-class shape
+    }
+    if (colName.empty()) return false;
+
+    // The stdlib table, transcribed from the `owned`-returning static
+    // declarations beside each class's own section. Each entry is
+    // (member name, the class head the stdlib declares the result as) — the
+    // second element is the (c) cross-check, not a re-derivation:
+    //
+    //   stdlib §8.1  Stopwatch.StartNew(): owned Stopwatch
+    //   stdlib §6.1  CancellationTokenSource.WithCancelAfter(delay): owned CTS
+    //   stdlib §6.1  CancellationTokenSource.CreateLinked(a, b): owned CTS
+    //   stdlib §6.1  CancellationTokenSource.CreateLinkedAll(parents): owned CTS
+    //   stdlib §7.3  File.ReadAllBytes(path): owned Array<byte>
+    //   stdlib §7.3  File.ReadAllLines(path): owned Array<string>
+    //   stdlib §7.4  Directory.GetFiles(path): owned Array<string>
+    //   stdlib §7.4  Directory.GetDirectories(path): owned Array<string>
+    //   stdlib §4.19 FrozenArray<T>.From(...): owned FrozenArray<T>
+    //
+    // MEASURED pre-fix on r23-c28 (4e996839): every one of these nine was
+    // rejected by the §28.8 "a borrow cannot be passed where an `owned` value
+    // is required" diagnostic at the `Take(move x)` call site.
+    //
+    // BUT THE LAST TWO ROWS ARE CURRENTLY INERT, and deliberately so. The
+    // (c) cross-check reads `ctx.exprType(call)`, and MEASURED (with
+    // temporary instrumentation: the factory table matched, the result
+    // TypeRef did not exist) sema types NO result for `Directory.GetFiles` /
+    // `Directory.GetDirectories` — the `colName == "Directory"` arm in
+    // ExprTypecheck_Calls.cpp types only `Exists`, and `src/` contains no
+    // other `GetFiles` arm. `ctx.exprType` is therefore null, (c) fails
+    // open, and the row returns false. The rows are kept because the table
+    // documents the stdlib's `owned` surface, and because the day sema gains
+    // the missing typing these two become correct with no further change.
+    // Claiming ownership of a value the front end never typed would classify
+    // a notional `owned` and dispose a zero — the wrong polarity to fail in.
+    // The two stay rejected for now; that residual is a SEPARATE
+    // missing-sema-typing defect, not a classification one.
+    //
+    // NOT listed, with the reason in each case (all MEASURED to already accept
+    // `Take(move x)`, i.e. already classified Owned by an earlier arm):
+    // `Task.FromOwnedResult` / `WhenAllOwned` / `WhenEachOwned` /
+    // `Domain.Spawn` / the whole Task family (producerState's SB01-A
+    // `isTaskFamilyHead` arm), `CString.From`/`FromBytes`, `WString.From`,
+    // `RawBytes.From` (producerState's FFI-buffer arm), and
+    // `JsonSerializer.ParseOwned` / `BinarySerializer.Deserialize` (the
+    // serializer arms). `Environment.Variables(): owned Dictionary<string,
+    // string>` (stdlib §3) is a TENTH `owned` static whose local is ALSO
+    // rejected pre-fix, but is DELIBERATELY excluded here: MEASURED, sema
+    // types no result for that call at all (the call is not in sema's
+    // `colName` surface table, and `src/` contains no `Variables` arm), so
+    // there is no TypeRef for the (c) cross-check to read and no codegen
+    // lowering — the callee degrades to a zero value (#2434). Admitting a
+    // shape whose value the compiler cannot produce would classify a
+    // notional `owned` and dispose a zero. That API gap is a separate defect,
+    // filed alongside this fix.
+    struct OwnedStaticFactory {
+        std::string_view colName;
+        std::string_view member;
+        std::string_view resultHead;
+    };
+    static const OwnedStaticFactory kOwnedStaticFactories[] = {
+        {"Stopwatch", "StartNew", "Stopwatch"},
+        {"CancellationTokenSource", "WithCancelAfter", "CancellationTokenSource"},
+        {"CancellationTokenSource", "CreateLinked", "CancellationTokenSource"},
+        {"CancellationTokenSource", "CreateLinkedAll", "CancellationTokenSource"},
+        {"File", "ReadAllBytes", "Array"},
+        {"File", "ReadAllLines", "Array"},
+        {"Directory", "GetFiles", "Array"},
+        {"Directory", "GetDirectories", "Array"},
+        {"FrozenArray", "From", "FrozenArray"},
+    };
+    const OwnedStaticFactory* hit = nullptr;
+    for (const OwnedStaticFactory& f : kOwnedStaticFactories)
+        if (f.colName == colName && f.member == ma->member) { hit = &f; break; }
+    if (!hit) return false;
+
+    // (b) The RECEIVER must be the BUILTIN class, not a user declaration that
+    // took the spelling. §2.3 (v0.313) puts every one of these names outside
+    // the §3.4 reserved row, so a user `class Stopwatch { static method
+    // StartNew(): owned Stopwatch }` is legal and MEASURED compiles today —
+    // through the ordinary user-MethodDecl path (`md->returnOwned`), which this
+    // predicate must not shadow. `isUserDeclaredTypeSym` is the §2.3/#5272
+    // discriminator: a builtinClassSym is `decl == nullptr &&
+    // moduleName.empty()`; a user's TypeSymbol is the exact complement. A
+    // receiver with NO symbol is NOT a user type, and the pre-existing builtin
+    // behaviour stands.
+    //
+    // Tested on EVERY component of a dotted receiver, not just the class-name
+    // one: a user `class Stopwatch` reached through a user alias
+    // (`using NS.Stopwatch.StartNew()`) puts the user TypeSymbol on the
+    // OUTER expression. Checking only `ma->target` would miss exactly that and
+    // claim a user type's factory as a builtin one.
+    for (const ast::Expr* t = ma->target.get(); t;) {
+        if (sema::isUserDeclaredTypeSym(ctx.exprSymbol(*t))) return false;
+        auto* inner = dynamic_cast<const ast::MemberAccessExpr*>(t);
+        t = inner ? inner->target.get() : nullptr;
+    }
+
+    // (d) A USER / imported static method carries a MethodSymbol on the callee
+    // and is classified by the user-call rules, never here — the same
+    // "no symbol at all" test and the same premise
+    // `isBuiltinOwnedMaterializerCall` uses (the builtin member-call typing
+    // path lives entirely inside `if (!calleeSym)`, so a symbol-less callee is
+    // what a builtin static factory looks like).
+    if (dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
+        return false;
+
+    // (c) The RESULT must be the class/head the stdlib declares. This is the
+    // fail-open cross-check: a shape this cannot read is NOT claimed (the
+    // caller then keeps the conservative Borrowed verdict, which over-rejects
+    // rather than over-accepts) — the same polarity
+    // `isBuiltinOwnedMaterializerCall`'s result-head gate documents.
+    //
+    // Two result shapes occur, matching the sema arms that type them: a
+    // `builtinClassSym` DECLARATION (Stopwatch / CancellationTokenSource /
+    // FrozenArray<T> — `rt->declaration` is the synthetic TypeSymbol, so
+    // `headName()` is empty and the head is read off the symbol), and a
+    // declaration-LESS `astNode`-carrying Named TypeRef (Array<T>). A
+    // value-builtin declaration is excluded: a value type carries no disposal
+    // obligation at all (§28.3), so claiming one would be claiming ownership
+    // of nothing.
+    const sema::TypeRef* rt = ctx.exprType(call);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration) {
+        if (sema::isUserDeclaredTypeSym(rt->declaration)) return false;
+        if (rt->declaration->isValueBuiltin) return false;
+        if (rt->declaration->name != hit->resultHead) return false;
+        return true;
+    }
+    // Declaration-less: read the syntactic head (alias-aware, #1462), which is
+    // what `makeConcreteCollectionResult` stamps for the `Array<T>` results.
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        return rt->headName() == hit->resultHead;
+    return !rt->importedName.empty() && rt->importedName == hit->resultHead;
+}
+
 bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
                                    const sema::SemaContext& ctx) {
     // See the header contract. // per §28.3 producers "Range slice" row, §15.6,
