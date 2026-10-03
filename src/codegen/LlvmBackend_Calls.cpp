@@ -13071,10 +13071,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // #5296 / stdlib §9.3 (v0.313, #1810): the span overload. A
+            // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3),
+            // not a bz.string, so it was passed straight to the
+            // `bz_decimal_try_parse(const void*, …)` entry and the module failed
+            // verifyModule with a call-parameter type mismatch. This is the
+            // class-name spelling; the keyword spelling in LlvmBackend_Calls2.cpp
+            // carries the same fix. bz_decimal_try_parse is width-aware
+            // (dec_src carries the §4.6 storage width), so it reads the
+            // materialized window directly.
+            auto win = parseWindow(strVal);
             llvm::AllocaInst* slot = makeDecSlot();
             auto* fn = declareC("bz_decimal_try_parse", i32(),
                                 {ptrTy(), ptrTy()});
-            llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "dec.tryp.ok");
+            llvm::Value* ok = builder_.CreateCall(fn, {win.str, slot}, "dec.tryp.ok");
             // Write the result into the out parameter. // fix #2938 / §22.3
             // The pre-fix branch was `if (outAddr)`, which silently dropped
             // the write when the target was an accessor-mediated location
@@ -13086,11 +13096,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* outAddr = resolveBuiltinOutArg(
                 call.args[1], dst, et, outArgs);
             if (!outAddr) {
+                if (win.owned) emitStringRelease(win.owned);
                 emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
                 return nullptr;
             }
             llvm::Value* result = builder_.CreateLoad(dst, slot, "dec.tryp.val");
             builder_.CreateStore(result, outAddr);
+            // #5296: drop the window materialization. Safe here —
+            // bz_decimal_try_parse swallows the parser's
+            // FormatException/OverflowException into its 0 return, so this path
+            // never throws and nothing unwinds past this.
+            if (win.owned) emitStringRelease(win.owned);
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dec.tryp.bool");
         }

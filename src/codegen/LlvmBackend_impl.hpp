@@ -6116,6 +6116,145 @@ private:
         return builder_.CreateAnd(spellsFinite, isInf, "fpo.ovf");
     }
 
+    // stdlib §9.1 / §9.2 / §9.3 (v0.313, #1810, #5296): the `Parse` /
+    // `TryParse` SPAN overloads. `ReadOnlyStringSpan` (stdlib §3.3) is the
+    // ordinary record `{Source: string, Start: int, Length: int}` — the
+    // {ptr, i32, i32} `%bz.arrayspan` value shape
+    // (LlvmBackend_Layout.cpp:1116) — a window of CODE-POINT indices, NOT a
+    // string pointer.
+    //
+    // #5296: every one of these arms dispatched on the member name and arity
+    // alone and then ran the operand through `loadStringData` (or passed it
+    // straight to the decimal entry), i.e. a `CreateStructGEP(%bz.string,
+    // spanVal, 0)`. On a `%bz.arrayspan` value that is not a pointer at all, so
+    // the module failed verifyModule:
+    //
+    //   GEP base pointer is not a vector or a vector of pointers
+    //     %10 = getelementptr inbounds nuw %bz.string, %bz.arrayspan %9, i32 0, i32 0
+    //   Load operand must be a pointer.
+    //     %str.data = load ptr, %bz.arrayspan %10, align 8
+    //
+    // These arms validate through the C library (`strtoll`/`strtod`/`strtof`
+    // with an endptr slot), which is byte-oriented, so a window has to be
+    // reduced to a NUL-terminated byte range first — see `parseWindow` below.
+    //
+    // Is this lowered operand a `ReadOnlyStringSpan`? The {ptr,i32,i32}
+    // `%bz.arrayspan` shape (LlvmBackend_Layout.cpp:1116) — §3.3's record, used
+    // by the Parse/TryParse arms to pick the span path over the string one
+    // (#5296). A genuine `string` operand is always a pointer, never a
+    // 3-field struct, so the shape test discriminates the two exactly.
+    static bool isStringSpanValue(llvm::Value* v) {
+        if (!v || !v->getType()->isStructTy()) return false;
+        auto* st = llvm::cast<llvm::StructType>(v->getType());
+        if (st->getNumElements() != 3) return false;
+        return st->getElementType(0)->isPointerTy() &&
+               st->getElementType(1)->isIntegerTy(32) &&
+               st->getElementType(2)->isIntegerTy(32);
+    }
+    struct ParseWindow {
+        llvm::Value* data = nullptr;  // NUL-terminated bytes to hand the parser
+        llvm::Value* str = nullptr;   // a bz.string for the width-aware decimal
+        llvm::Value* owned = nullptr; // fresh +1 bz.string to release, or null
+        bool isSpan = false;           // the operand was a ReadOnlyStringSpan
+    };
+    // #5296: reduce a `Parse`/`TryParse` operand to a NUL-terminated byte range
+    // the byte-oriented C parser can consume.
+    //
+    // The validation every one of these arms performs is "the conversion must
+    // consume the WHOLE input": first char not whitespace, conversion advanced,
+    // and nothing left over. That last test is spelled `*endptr == '\0'`, which
+    // works only because the buffer is NUL-terminated at the END OF THE INPUT.
+    // A WINDOW is not: the source continues past it. So the reduction must
+    // produce a buffer whose end IS the window's end.
+    //
+    // The reduction is: materialize the window as a `bz.string`, then parse
+    // that. Two properties make this the right shape, and both are load-
+    // bearing:
+    //
+    //  1. `bz_str_substring` slices by CODE-POINT index (§3.3's ToString() is
+    //     lowered to exactly this call) and re-packs at the NARROWEST width
+    //     that fits the window's code points (bz_str_slice_cp,
+    //     src/runtime/bezel_runtime_strings.cpp:45). So the result is a
+    //     well-formed string for ANY source width, and the code-point index
+    //     arithmetic is the runtime's, not ours.
+    //  2. The materialized buffer IS NUL-terminated at the window's end.
+    //     That is what lets every caller's existing validation — "the
+    //     conversion must advance AND `*endptr == '\0'`" — work UNCHANGED and
+    //     mean "the window, and only the window, was valid input".
+    //
+    // Property 2 is why this does not merely GEP the source's buffer. The
+    // window's bytes are contiguous in the source only for a width-1 source
+    // (§4.6), and even then they are not NUL-terminated at the window's end,
+    // so `strtoll` would read straight past it into the source's tail: window
+    // (0,2) of "4212" is "42", but a non-bounded `strtoll` sees "4212", returns
+    // 4212, and leaves `endptr` at the source's end. Every window whose end is
+    // not the source's end would be mis-parsed. A length-bounded parse would
+    // need a new runtime entry point per parse family (or an inlined code-point
+    // scanner); materializing is the one approach that reuses the parser and
+    // its validation exactly.
+    //
+    // Width: a window holding a non-Latin-1 code point materializes to width>1,
+    // whose "data" is not a byte string. §9.1/§9.2/§9.3's grammars are pure
+    // ASCII, so such a window is never a valid input: point the byte-oriented
+    // parsers at an empty C string instead, where the conversion does not
+    // advance and their own "must advance" test rejects it. The DECIMAL entry
+    // takes a `bz.string` and is width-aware (dec_src carries the width), so it
+    // reads the materialized string directly and needs none of this.
+    //
+    // Latin-1 (a width-1 source carrying bytes >= 0x80, e.g. "é" = 0xE9) needs
+    // no special case either: those bytes are outside every one of these ASCII
+    // grammars, so the parser stops on them and the NUL check rejects the
+    // window — exactly as `int.TryParse("é")` on a `string` is rejected.
+    ParseWindow parseWindow(llvm::Value* v) {
+        ParseWindow w;
+        w.isSpan = isStringSpanValue(v);
+        if (!w.isSpan) {
+            // A `string`: its own buffer, and the string itself for the
+            // width-aware decimal entry.
+            w.data = loadStringData(v);
+            w.str = v;
+            return w;
+        }
+        // The span is a struct VALUE here, so the fields are ExtractValue, not
+        // the StructGEP+Load pair the §3.3 member-call arm uses on its slot.
+        llvm::Value* src = builder_.CreateExtractValue(v, {0u}, "pw.src");
+        llvm::Value* start = builder_.CreateExtractValue(v, {1u}, "pw.st");
+        llvm::Value* len = builder_.CreateExtractValue(v, {2u}, "pw.len");
+        auto* fn = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
+        // A fresh +1 string (rc := 1); the caller releases it after the parse.
+        w.str = builder_.CreateCall(
+            fn, {src, builder_.CreateSExt(start, i64(), "pw.st64"),
+                 builder_.CreateSExt(len, i64(), "pw.len64s")}, "pw.str");
+        w.owned = w.str;
+        auto* i8t = llvm::Type::getInt8Ty(llvm_);
+        // Width-1 result: its bytes are the window's code points, NUL-
+        // terminated. Wider: the window carries a non-Latin-1 code point, so
+        // it is not a valid input to any of these ASCII grammars — hand the
+        // byte-oriented parsers an empty string, which they reject on their
+        // own "must advance" test.
+        llvm::Value* latin1 = builder_.CreateICmpEQ(
+            loadStringWidth(w.str), llvm::ConstantInt::get(i8t, 1), "pw.l1");
+        w.data = builder_.CreateSelect(
+            latin1, loadStringData(w.str), emptyCString(), "pw.data");
+        return w;
+    }
+    // A shared, immutable, NUL-terminated empty byte string. Used as the parse
+    // input for a window that carries a non-Latin-1 code point (#5296):
+    // `strtoll("")` / `strtod("")` consume nothing, so the caller's existing
+    // "the conversion must advance" test rejects the window exactly as it
+    // rejects any other malformed input — no separate rejection path, and the
+    // non-ASCII code points are never reinterpreted as bytes.
+    llvm::Value* emptyCString() {
+        // Same shape as the "true"/"false" literals the bool.TryParse arm
+        // builds: a ConstantDataArray global, used as a value it decays to a
+        // pointer to its first element — which is what the byte parsers take.
+        llvm::Constant* emptyStr =
+            llvm::ConstantDataArray::getString(llvm_, "", /*AddNull=*/true);
+        return new llvm::GlobalVariable(
+            *module_, emptyStr->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, emptyStr, ".bz.pw.empty");
+    }
+
     // §11.8 / stdlib §2.19 (#1470): store a TryParse out-result. The per-type
     // CONCRETE member's out is a BARE value (stdlib §9.1: `out result: int`), so
     // a direct `int.TryParse(s, out var b)` slot is a plain scalar and the bare

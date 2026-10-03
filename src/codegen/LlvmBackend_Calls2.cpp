@@ -654,12 +654,23 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // #5296 / stdlib §9.3 (v0.313, #1810): the span overload. This is the
+        // arm the `decimal.TryParse` KEYWORD spelling reaches (the class-name
+        // spelling has its own copy in LlvmBackend_Calls.cpp, fixed by the same
+        // change). A `ReadOnlyStringSpan` is the {Source, Start, Length} record
+        // (§3.3), not a bz.string, so it was passed straight to the
+        // `bz_decimal_try_parse(const void*, …)` entry and the module failed
+        // verifyModule with a call-parameter type mismatch. bz_decimal_try_parse
+        // is width-aware (dec_src carries the §4.6 storage width), so it reads
+        // the materialized window directly.
+        auto win = parseWindow(s);
         // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
         std::vector<AccessorRefArg> outArgs;
         llvm::Value* outAddr = resolveBuiltinOutArg(
             call.args[1], lowerPrimitive(P::Decimal), et, outArgs);
         if (!outAddr) {
+            if (win.owned) emitStringRelease(win.owned);
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
         }
@@ -681,7 +692,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             decScratch = entryAlloca(decimalStructType());
             target = decScratch;
         }
-        llvm::Value* r = builder_.CreateCall(fn, {s, target}, "dectp.r");
+        llvm::Value* r = builder_.CreateCall(fn, {win.str, target}, "dectp.r");
         llvm::Value* okDec =
             builder_.CreateICmpNE(r, builder_.getInt32(0), "dectp.ok");
         if (decScratch) {
@@ -689,6 +700,10 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 builder_.CreateLoad(decimalStructType(), decScratch, "dectp.v");
             storeTryParseOut(outAddr, et, dv, okDec);
         }
+        // #5296: drop the window materialization. Safe here — bz_decimal_try_parse
+        // swallows the parser's FormatException/OverflowException into its 0
+        // return, so this path never throws and nothing unwinds past this.
+        if (win.owned) emitStringRelease(win.owned);
         // fix #2938 / §22.3: flush any bracket on the normal-return edge.
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return okDec;
@@ -1117,13 +1132,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         (pt == P::Double || pt == P::Float)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
-        llvm::Value* strData = loadStringData(strVal);
+        // #5296 / stdlib §9.2 (v0.313, #1810): the span overload — see the
+        // integer tower arm above for the full rationale.
+        auto win = parseWindow(strVal);
+        llvm::Value* strData = win.data;
         // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
         std::vector<AccessorRefArg> outArgs;
         llvm::Value* outAddr = resolveBuiltinOutArg(
             call.args[1], lowerPrimitive(pt), et, outArgs);
         if (!outAddr) {
+            if (win.owned) emitStringRelease(win.owned);
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
         }
@@ -1141,6 +1160,10 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* endPtrD = builder_.CreateLoad(ptrTy(), endSlotD);
         // ok = (endPtr != strData) AND (*endPtr == '\0') AND first char not whitespace
         // per §9.3: no surrounding whitespace is accepted.
+        // #5296: for a span operand `strData` is the materialized window, whose
+        // buffer is NUL-terminated at the WINDOW's end (see parseWindow), so
+        // the `*endPtr == 0` test means "the window, and only the window, was
+        // valid input" — a window like (0,2) of "4212" is "42", not "4212".
         auto* i8TyD = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* fcD = builder_.CreateLoad(i8TyD, strData, "tryp.fc");
         llvm::Value* fcWsD = builder_.CreateICmpULE(
@@ -1165,6 +1188,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // §11.8 / §2.19 (#1470): nullable-companion aware store (generic
         // IParsable<double>/<float> dispatch into a `out T?`); bare otherwise.
         storeTryParseOut(outAddr, et, selD, okD);
+        // #5296: drop the window materialization (see the integer arm).
+        if (win.owned) emitStringRelease(win.owned);
         // fix #2938 / §22.3: flush any bracket on the normal-return edge.
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return okD;
@@ -1187,7 +1212,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
          pt == P::SByte)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
-        llvm::Value* strData = loadStringData(strVal);
+        // #5296 / stdlib §9.1 (v0.313, #1810): the span overload. A
+        // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3), not
+        // a string pointer, so `loadStringData` on it was a StructGEP of a
+        // %bz.string off a %bz.arrayspan and the module failed verifyModule.
+        // parseWindow reduces either operand to a NUL-terminated window string,
+        // so the validation below is unchanged and means "the window, and only
+        // the window, was valid input" for a span.
+        auto win = parseWindow(strVal);
+        llvm::Value* strData = win.data;
         // Get address of the out parameter. // per §22.3 / #2938
         // fix #2938: a property or indexer slot target is admitted by §22.3
         // and resolves through the §22.3 copy-in/copy-out bracket; `lvalueAddr`
@@ -1200,6 +1233,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* outAddr = resolveBuiltinOutArg(
             call.args[1], lowerPrimitive(pt), et, outArgs);
         if (!outAddr) {
+            if (win.owned) emitStringRelease(win.owned);
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
         }
@@ -1212,6 +1246,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             strtoFnT, {strData, endSlotI, builder_.getInt32(10)}, "tryp.val");
         llvm::Value* endPtrI = builder_.CreateLoad(ptrTy(), endSlotI);
         // ok = first-char not whitespace AND (endPtr != strData) AND (*endPtr == '\0')
+        // #5296: for a span operand `strData` is the materialized window, whose
+        // buffer is NUL-terminated at the WINDOW's end (see parseWindow), so
+        // this test means "the window, and only the window, was valid input".
         auto* i8TyI = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* fcI = builder_.CreateLoad(i8TyI, strData, "tryp.fc");
         llvm::Value* fcWsI = builder_.CreateICmpULE(
@@ -1267,6 +1304,12 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             // §11.8 / §2.19 (#1470): nullable-companion aware store (see above).
             storeTryParseOut(outAddr, et, selV, ok);
         }
+        // #5296: drop the window materialization (the fresh +1 string
+        // parseWindow made for a span operand). Every read of strData is above
+        // and this path never throws (TryParse is shape (c) of the §1 Try
+        // convention — the failure is a `false` return, not an unwind), so
+        // nothing can escape past this release.
+        if (win.owned) emitStringRelease(win.owned);
         // fix #2938 / §22.3: flush any bracket on the normal-return edge.
         // The TryParse path never throws, so emit is always true.
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
