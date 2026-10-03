@@ -142,7 +142,7 @@
 # (unlike sanitizer_exempt.txt's UB rows) does not cover this file — see the
 # RESIDUAL RISK note above.
 
-inline_array_string_call_result_param_alias_uaf_4265.heap_array_string_factory_control_still_leaks_not_uaf  # status:trade #4265: the safe (no-UAF) control case still leaks rather than releasing cleanly. tests/codegen/inline_array_string_call_result_param_alias_uaf_4265_test.cpp:310
+inline_array_string_call_result_param_alias_uaf_4265.heap_array_string_owned_factory_into_borrowing_add_still_leaks_not_uaf  # status:trade #4265: an owned Array<string> factory result handed to a borrowing collection Add still leaks (§15.4 hazard), never a UAF; renamed from the factory_control row by the #5123 fixture migration. tests/codegen/inline_array_string_call_result_param_alias_uaf_4265_test.cpp:316
 record_declare_then_assign_call_result_release_4266.multi_assignment_site_stays_safe_no_uaf  # status:trade #4266: the multi-assignment site is safe from use-after-free but still leaks. tests/codegen/record_declare_then_assign_call_result_release_4266_test.cpp:455
 record_factory_unbound_temporary_argument_uaf_4322.unrelated_second_argument_no_longer_uaf_but_leaks_call_wide  # status:trade #4322: fixing the UAF on the unrelated second argument left a call-wide leak. tests/codegen/record_factory_unbound_temporary_argument_uaf_4322_test.cpp:245
 nested_record_string_field_leak_4237.nested_field_is_borrowed_identifier_not_admitted_no_uaf  # status:trade #4237: a borrowed-identifier nested field is not UAF-admitted but still leaks. tests/codegen/nested_record_string_field_leak_4237_test.cpp:298

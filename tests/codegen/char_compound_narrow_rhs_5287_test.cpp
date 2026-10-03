@@ -14,6 +14,7 @@
 // it compiles: a sign/zero-extension error in the §6.2 promotion or a
 // truncation instead of §5.2's checked narrowing would still compile.
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -106,6 +107,9 @@ BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, char_rhs_still_rejected) {
                     "c -= d; return int(c); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "operator `-` is not defined for `char` operands"));
 }
 
 // §6.6: "a non-constant `uint` or `ulong` operand has no §6.2 promotion with
@@ -116,6 +120,9 @@ BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, uint_rhs_still_rejected) {
                     "c += u; return int(c); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "compound assignment `+=` on a `char` target has no `uint` right operand"));
 }
 
 // §6.6: "`c *= 2`, `c /= 2` and `c mod= n` are compile errors — `char` is not
@@ -126,6 +133,9 @@ BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, byte_rhs_times_is_still_reject
                     "c *= b; return int(c); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "operator `*` is not defined for `char` operands"));
 }
 
 // A bitwise form on a `char` target has no R (§6.6) — the #2155 bitwise
@@ -136,6 +146,9 @@ BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, byte_rhs_bitwise_still_rejecte
                     "c &= b; return int(c); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "compound assignment `&=` has no implicit conversion between operand types `char` and `byte`"));
 }
 
 // The #2155 pair rejection that this fix exempts ONLY for a `char` target is
@@ -147,6 +160,9 @@ BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, int_target_uint_rhs_still_reje
                     "i += u; return i; end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "compound assignment `+=` has no implicit conversion between operand types `int` and `uint`"));
 }
 
 // The §6.6 narrow-integer write-back for a NON-char target is untouched:
@@ -176,6 +192,9 @@ BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, nullable_rhs_still_rejected) {
                     "c += b; return int(c); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "compound assignment `+=` is not defined when the right-hand operand is nullable (`byte?`)"));
 }
 
 BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, nullable_char_target_still_rejected) {
@@ -184,4 +203,7 @@ BEZEL_TEST(codegen_5287_char_compound_narrow_rhs, nullable_char_target_still_rej
                     "c += b; return 0; end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "compound assignment `+=` is not defined when the target is nullable (`char?`)"));
 }
