@@ -25971,6 +25971,7 @@ static RefFormalVerdict refFormalWriteVerdict(const sema::SemaContext& ctx,
     // plainBorrowAnalysisCallee's filter when ctx knows it, but has no body here
     // — nothing can be proven about its writes, so NoWrite, which is exactly the
     // pre-#5275 behavior for it.
+    // SEAM-DEBT: #5275 a body walk needs the AST; an imported callee answers NoWrite (pre-#5275 behavior)
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) return RefFormalVerdict::NoWrite;
     // Abstract / interface body — §22.3's `ref` callee is a true alias of
@@ -32207,6 +32208,7 @@ void Emitter::collectStringReleaseEligible(
                     }
                 }
             } else if (!v.init && !v.isUsing && v.type &&
+                       // LOCALDECL-ONLY: a `const` local always has an initializer (§21.1), so it never reaches this no-initializer arm
                        dynamic_cast<const ast::LocalDecl*>(s)) {
                 // fix #5253 (§4.6 / §7.9 / §28.9, v0.313): a NO-INITIALIZER
                 // `var s: string;` / `var s: string?;`. It was never a

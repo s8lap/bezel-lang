@@ -41,9 +41,9 @@
 11   src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
-13   src/codegen/LlvmBackend_Setup.cpp
+14   src/codegen/LlvmBackend_Setup.cpp
 5    src/codegen/LlvmBackend_Stmts.cpp
-25   src/codegen/LlvmBackend_impl.hpp
+26   src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
 4    src/module/ModuleLoader.cpp
 10   src/module/ModuleMetadataBuilder.cpp

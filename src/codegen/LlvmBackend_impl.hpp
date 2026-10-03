@@ -17059,6 +17059,7 @@ private:
     bool isOwnedStringParamSlot(const sema::Symbol* sym) const;
     // fix #5253: does `ms`'s declaration carry an `ensures` clause (§22.16)?
     static bool hasEnsuresClause(const sema::MethodSymbol* ms) {
+        // SEAM-DEBT: #5253 an imported callee has no decl; answers the conservative "yes" (no release)
         auto* md = ms ? dynamic_cast<const ast::MethodDecl*>(ms->decl) : nullptr;
         if (!md) return true;  // unknown: conservatively "yes" (no release)
         for (const auto& c : md->contractClauses)

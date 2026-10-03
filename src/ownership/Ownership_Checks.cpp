@@ -14278,6 +14278,7 @@ bool MethodOwnership::isUnassignedHeapCollectionLiteralLocal(
     sema::Symbol* sym = ctx_.exprSymbol(*id);
     auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
     if (!ls || !ls->decl) return false;
+    // LOCALDECL-DEBT: #5278 a `const` collection-literal local is not admitted (a conservative false reject, never a leak)
     auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!ld || !ld->initializer) return false;
     if (!dynamic_cast<const ast::CollectionLiteralExpr*>(ld->initializer.get()))
