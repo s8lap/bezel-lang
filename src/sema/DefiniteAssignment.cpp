@@ -2325,6 +2325,19 @@ private:
         // Only flag locals declared in this method that haven't been
         // assigned. Fields, params, and outer scopes pass silently.
         if (declared_.count(id.name) && !assigned_.count(id.name)) {
+            // fix #5314 (§7.9 / §2.7 rule 1, v0.313): `declared_`/`assigned_`
+            // are keyed by NAME, so a nested-block local that shadows a
+            // PARAMETER (or a field) leaves the name in `declared_` yet drops
+            // it from `assigned_` at the block's join; a later read that sema
+            // resolved to the parameter/field (never a local) then looked like
+            // an unassigned local. A read is a tracked-local read only when it
+            // resolves to a local — or to an `out` parameter, which is seeded
+            // unassigned on purpose (§22.3). An unresolved reference keeps the
+            // by-name behaviour.
+            if (Symbol* rs = ctx_.exprSymbol(id))
+                if (!dynamic_cast<LocalSymbol*>(rs) &&
+                    !outParams_.count(id.name))
+                    return;
             ctx_.diagnostics().report(
                 Severity::Error, id.span.begin,
                 std::string("read of unassigned local `") +
