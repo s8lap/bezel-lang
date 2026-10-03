@@ -4535,6 +4535,15 @@ bool sharedEventHandlerAdmissible(
     // when ascription is present, unit return when ascription is present.
     // An inferred-parameter lambda is left to `lowerEventHandlerClosure`
     // to resolve via the synthesized (payload) -> () expected type.
+    //
+    // fix-forward #4972: the "sema already rejected the capturing forms"
+    // premise above holds ONLY for the SUBSCRIBE positions (`Subscribe` on
+    // both faces, `Add`, `+=`) — those are where §6.5's capture-free clause
+    // applies and where #4920's admission runs. `Remove` is call-bounded
+    // ("compares only", stdlib §6.5) and exempt, so no sema admission guards
+    // it and this arm would otherwise admit a CAPTURING lambda whose captured
+    // cell leaks on every call. The `Remove` arm above therefore refuses a
+    // lambda literal outright rather than relying on this premise.
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(handler)) {
         if (lam->isAsync) return false;
         if (lam->params.size() != 1) return false;
@@ -4981,13 +4990,22 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
     //   * Subscribe / Add — sharedEventHandlerAdmissible (a static
     //     non-overloaded method ref of exactly `(T) -> ()` OR a capture-free
     //     lambda of exactly `(T) -> ()`; fix #4972 lifts the second half).
-    //   * Remove — the SAME gate. §6.5 exempts Remove from capture-freedom
-    //     ("call-bounded: compares only"), but a lambda-literal argument is a
-    //     fresh closure that can never compare equal to a subscribed handler,
-    //     and a capturing one leaks its environment; the same admission
-    //     gate as Subscribe/Add (the lift to lambdas #4972 made is harmless
-    //     — Remove simply never matches the registered closure). (Even a
-    //     static Remove leaks its closure record, #4970.)
+    //   * Remove — the SAME shape gate, PLUS a lambda-literal refusal.
+    //     §6.5 exempts Remove from capture-freedom ("call-bounded: compares
+    //     only"), and sema's #4920 admission therefore never runs here — so
+    //     the (1a) LambdaExpr arm of sharedEventHandlerAdmissible below
+    //     admits a CAPTURING lambda too (its "sema already rejected the
+    //     capturing forms" premise holds for Subscribe/Add/`+=` only). A
+    //     lambda literal is additionally a fresh closure per call that can
+    //     never compare equal to a registered handler, so Remove on one is a
+    //     semantic no-op that only costs a closure record (leaked per call,
+    //     #4970) plus, for a capturing lambda, its captured cell (MEASURED
+    //     LSan: 6400 B / 300 allocs over 100 iterations, versus 4800 B /
+    //     100 for the capture-free and static forms — the extra 200
+    //     allocations are the captured box). Keep the pre-#4972 refusal of a
+    //     lambda literal here so the call falls through to the #2457 backstop
+    //     (`Remove` on built-in type `SharedEventSource` produced no value).
+    //     (Even a STATIC Remove leaks its closure record, #4970 — separate.)
     //   * Raise — sharedEventRaiseAdmissible (one argument of type exactly T,
     //     or none for a unit payload). Unchecked, `Raise("s")` on an int
     //     feed, `Raise()` on a class feed and `Raise(1, 2)` all compiled.
@@ -4999,6 +5017,17 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
             handlerMember
                 ? (call.args.size() == 1 && call.args[0].value &&
                    call.args[0].name.empty() &&
+                   // fix-forward #4972: `Remove` is not a subscribe position,
+                   // so §6.5's capture-free clause does not apply and sema's
+                   // #4920 admission never guards this route — a lambda
+                   // literal here may capture, and its captured cell leaks on
+                   // every call (MEASURED LSan). Refuse a lambda literal here,
+                   // exactly as the pre-#4972 gate did, so the call falls
+                   // through to the #2457 backstop. A static method reference
+                   // is unaffected (it is still admitted by the (1b) arm).
+                   !(ma->member == "Remove" &&
+                     dynamic_cast<const ast::LambdaExpr*>(
+                         call.args[0].value.get())) &&
                    sharedEventHandlerAdmissible(
                        ctx_, call.args[0].value.get(), ma->target.get(),
                        sharedPayload, builtinName,
