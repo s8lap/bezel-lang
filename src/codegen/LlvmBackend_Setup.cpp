@@ -17111,10 +17111,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // gate. It and `wrapAsIEnumerableForTarget`'s gate are the same
         // decision at two faces and must widen together — they did not when
         // #3355 widened one of them, which is #3392.
+        // fix #5329 (§29.2 / §2.5 / stdlib §4, v0.313): the local-decl MINT
+        // gate is half of the pair the paragraph above says "must widen
+        // together" — #5308 widened the other half
+        // (`wrapAsIEnumerableForTarget`'s target gate) and left the `astNode`
+        // conjunct here, so the pair drifted exactly as #3392 describes. An
+        // imported formal's TypeRef has no `astNode`; `headName()` already
+        // falls back to `importedName`. The head test alone is the gate.
         if (declTR && declTR->kind == sema::TypeRef::Kind::Named &&
-            !declTR->declaration &&
-            declTR->astNode && declTR->astNode->name &&
-            !declTR->astNode->name->parts.empty() &&
+            !declTR->declaration && !declTR->headName().empty() &&
             common::isSyncIterFormatEnumerableHead(declTR->headName())) {
             const sema::TypeRef* initTR = ctx_.exprType(*init);
             // fix #747 R43 / §29.2: an Array<T> initializer assigned to an
@@ -17144,10 +17149,25 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // `wrapAsIEnumerableForTarget`'s `actualIsArray` and
             // `nestedIEnumViewNeeded`'s `isArrayBacked` — three verbatim copies
             // of the same seven names before this commit.
+            //
+            // fix #5329 (§29.2 / §2.5 / stdlib §4, v0.313): the `astNode &&
+            // name && parts` conjunct on the three predicates below is the
+            // local-decl face of the same defect the argument/return face got
+            // in `wrapAsIEnumerableForTarget` in the same commit. An imported
+            // declaration's type is reconstructed from module metadata and has
+            // NO `astNode` — its head is `TypeRef::importedName`, which
+            // `headName()` already falls back to (src/sema/TypeRef.hpp:80) — so
+            // the conjunct left all three false for every imported-typed
+            // initializer, the raw collection pointer was stored in the
+            // `IEnumerable<T>` local, and the following for-in vtable-dispatched
+            // on it and jumped to a null pc. MEASURED on d27e5597:
+            // `AddressSanitizer: SEGV on unknown address 0x000000000000
+            // (pc 0x000000000000)`, exit 1, for `var e: IEnumerable<int> := a;`
+            // where `a` is an `Array<int>` returned by an imported method. The
+            // head test alone is the gate, as in `nestedIEnumViewNeeded`
+            // (11373), which already reads `headName()` with no such conjunct.
             bool initIsArray = initTR &&
                 initTR->kind == sema::TypeRef::Kind::Named &&
-                initTR->astNode && initTR->astNode->name &&
-                !initTR->astNode->name->parts.empty() &&
                 common::isArrayEnumeratorWrapSourceName(initTR->headName());
             // fix #1069 / stdlib §4.10 / §29.2: a `Set<T>`/`OwningSet<T>` bound to
             // an explicit `IEnumerable<T>` local, mirroring the buildOrderedArgs
@@ -17156,14 +17176,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // it takes the plain (borrowing) array wrapper; a DICT-backed set is a
             // hash table and is snapshotted below.
             bool initIsClassSet =
-                !initIsArray && initTR && initTR->astNode &&
-                initTR->astNode->name && !initTR->astNode->name->parts.empty() &&
+                !initIsArray && initTR &&
                 (initTR->headName() == "Set" ||
                  initTR->headName() == "OwningSet") &&
                 genericBackingType(initTR, 0, /*isSet=*/true, nullptr) == nullptr;
             bool initIsDictSet =
-                !initIsArray && initTR && initTR->astNode &&
-                initTR->astNode->name && !initTR->astNode->name->parts.empty() &&
+                !initIsArray && initTR &&
                 (initTR->headName() == "Set" ||
                  initTR->headName() == "OwningSet") &&
                 genericBackingType(initTR, 0, /*isSet=*/true, nullptr) != nullptr;

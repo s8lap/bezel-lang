@@ -8839,10 +8839,23 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         if (outWrapMade) *outWrapMade = true;
         return drainLazyPipelineToOwnedIEnumerable(v, targetTy);
     }
+    // fix #5329 (§29.2 / §2.5 / stdlib §4, v0.313): the SOURCE axis of the
+    // same grid, and the mirror of the target-axis fix in #5308 above. A source
+    // expression whose static type comes from an IMPORTED declaration is
+    // reconstructed from module metadata and so carries NO `astNode` — its head
+    // lives in `TypeRef::importedName`, which `headName()` already falls back to
+    // (src/sema/TypeRef.hpp:80). The `astNode && name && parts` conjunct this
+    // used to require therefore left `an` EMPTY for every imported-typed source,
+    // `actualIsArray` false, and the function returned the RAW collection
+    // pointer; the consumer's for-in then read that pointer's first word as an
+    // `IEnumerable` vtable and jumped to a null pc. MEASURED on d27e5597:
+    // `AddressSanitizer: SEGV on unknown address 0x000000000000
+    // (pc 0x000000000000)`, exit 1, for an `Array<int>` returned by an imported
+    // method and widened at a local decl, an imported `IEnumerable<T>` formal,
+    // or a direct imported call. The head test alone is the gate, exactly as
+    // #5308 did for the target axis.
     std::string_view an;
-    if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
-        actualTy->astNode && actualTy->astNode->name &&
-        !actualTy->astNode->name->parts.empty())
+    if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named)
         an = actualTy->headName();
     // fix #3419 (§29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14, v0.283): the grid's
     // SOURCE axis. This function is the wrap AUTHORITY, and its own list was
