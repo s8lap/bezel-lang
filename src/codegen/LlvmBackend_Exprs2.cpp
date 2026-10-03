@@ -9424,6 +9424,83 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 builder_.CreateCall(ctorFn, args);
                 emittedImportedCtorCall = true;  // fix #2658
+                // fix #5342 (a) (§4.6 / §28.9 "Fresh-class disposal" /
+                // §23.2 "Deferred visibility" / §14.1 "Owner substitution" /
+                // §2.5 "Library import", v0.313): the #429 ARGUMENT-PASS
+                // release, which BOTH in-module ctor sites already run
+                // (the `inlineCtorBody` arm at :8899 and the
+                // `ctorFns_`-declared call arm at :10094) and which
+                // `lowerCall` runs for an imported METHOD
+                // (LlvmBackend_Calls2.cpp:13943). This hand-rolled imported
+                // path is the missing twin: it evaluated every argument by
+                // value and emitted no release for any of them.
+                //
+                // WHY IT LEAKED. A `+1` string producer passed directly as an
+                // argument (a concatenation, an interpolation, a
+                // user-method return) holds an INDEPENDENT rc=1 reference.
+                // Constructor formals are BORROWS (§22.7), so the callee never
+                // takes ownership of that reference: a ctor that only READS
+                // the formal, or never mentions it at all, returns with the
+                // caller's rc=1 still outstanding and nothing left to
+                // discharge it. The import boundary (§2.5) made it invisible:
+                // the importing module has no `ast::ConstructorDecl` for the
+                // callee, so it cannot inspect the body to prove the argument
+                // was never stored — but ownership does not depend on the
+                // callee storing it. The asymmetry is ctor-vs-method, not
+                // imported-vs-local: `lowerCall`'s imported-method arm was
+                // already covered, and this arm was not. MEASURED at
+                // r23-c28 = 67bab85c: `constructor(f: string, n: int)` whose
+                // body never mentions `f`, called as
+                // `new LK("o" + i.ToString(), i)` over a 200-iteration loop,
+                // leaked 7290 B in 400 allocations under ASan/LSan; the same
+                // class declared LOCALLY was clean, and so was the parallel
+                // imported METHOD taking the identical `+1` argument.
+                //
+                // WHY THE RELEASE IS SAFE, and why it is not a double free.
+                // Exactly the argument the other three sites make: when the
+                // ctor body DOES store the formal into a string field or
+                // auto-property, that store retains it independently (rc→2),
+                // so releasing the caller's own reference here (rc→1) leaves
+                // the field's +1 intact; the field's own disposal reclaims it.
+                // A callee that only reads or ignores the formal ends at rc=0
+                // here, which is the reclamation this site owes. The
+                // `owned` formals are already excluded above — their slot was
+                // NULLED by `nullTransferredOwnedLocalSlot` and the callee now
+                // owns the value (fix #2659), so a release would be a double
+                // free. The `ref`/`out` formals are excluded for the same
+                // reason the other three sites exclude them: their `args[ai+1]`
+                // is the caller's lvalue ADDRESS or the §22.3 copy-IN slot, not
+                // an owned value.
+                //
+                // POSITION MAPPING. This arm is all-positional (guarded by
+                // `allPositional` above), so `args[0]` is `obj` and
+                // `args[ai + 1]` is `ne.args[ai]` for every source-written
+                // argument — the same `args[1..]` parallel `ctorArgExprs`
+                // carries in the two in-module arms, minus the vector. The
+                // loop is bounded by `ne.args.size()`, not `args.size()`, so a
+                // §22.5 default-argument slot (materialized above by
+                // `importedCtorDefaultArgValue`, which has no call-site
+                // expression and no caller-owned reference to release) is
+                // never touched. A `throw` argument set `diverged_` while
+                // evaluating, so the `!diverged_` guard leaves the temporary
+                // to leak rather than emitting a release into the
+                // already-terminated block (the same leak-over-UAF default
+                // `lowerCall` takes, CG40).
+                if (!diverged_) {
+                    for (std::size_t ai = 0;
+                         ai < ne.args.size() && ai + 1 < args.size(); ++ai) {
+                        const auto& a = ne.args[ai];
+                        if (a.isDiscard || !a.value) continue;
+                        if (a.modifier == "owned" ||
+                            importedFormalMod(ai) == "owned")
+                            continue;
+                        if (isByRefMod(a.modifier) ||
+                            isByRefMod(importedFormalMod(ai)))
+                            continue;
+                        if (isPlusOneStringProducer(a.value.get()))
+                            emitStringRelease(args[ai + 1]);
+                    }
+                }
             }
             // fix #2319 / §22.3: flush the copy-OUT half of every accessor-
             // mediated `ref`/`out` argument. Skipped on the throw edge per
