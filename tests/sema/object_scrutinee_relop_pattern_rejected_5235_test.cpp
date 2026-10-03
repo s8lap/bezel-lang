@@ -150,6 +150,46 @@ BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
     BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
 }
 
+// §19.3 / §16.6 (v0.313, #5235, fix-forward): the `|`-ALTERNATION spelling.
+// A.7's `AltPattern ::= Pattern ("|" Pattern)*` explicitly admits relationals
+// and ranges as `|`-joined members, so `> 5 | < 1` is an ordinary spelling of
+// the very pattern this file gates — not a corner. The gate originally
+// dynamic_cast ONE node per arm, which returned null on the AltPattern that
+// wraps the two RelOpPatterns, so the arm reached codegen and emitted
+// `icmp sgt ptr %1, i32 5` / `icmp slt ptr %1, i32 1` before verifyModule
+// failed with "Both operands to ICmp instruction are not of the same type!".
+// Same rule, same diagnostic — the alternation is not a second policy.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           alt_relop_over_object_rejected) {
+    auto r = runAot(
+        "module M; class P "
+        "  public static method Main(): int "
+        "    var o: Object := null; "
+        "    return (case o of > 5 | < 1 => 1, _ => 2); "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}
+
+// The same alternation in the STATEMENT-position spelling. Two `case` visit
+// sites take this one shared gate, so both spellings are pinned here for the
+// alternation exactly as they are for the bare relational above.
+BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
+           alt_relop_over_object_stmt_rejected) {
+    auto r = runAot(
+        "module M; class P public static method Main(): int "
+        "  var o: Object := null; "
+        "  case o of "
+        "    > 5 | < 1 => return 1;, "
+        "    _ => return 2; "
+        "  end case; "
+        "  return 0; "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
+}
+
 // CONTROLS — the three ordered scrutinee types the issue names must keep
 // compiling. §19.3's rule is about the scrutinee's type HAVING an ordering,
 // not about relational patterns as such: `int` is ordered natively, `decimal`

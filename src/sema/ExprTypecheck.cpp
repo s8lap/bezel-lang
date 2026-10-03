@@ -13495,13 +13495,35 @@ void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
     // relop arm over the same Object scrutinee is the same error restated,
     // and repeating it per arm would bury the one that matters.
     for (const ast::CaseArm& arm : arms) {
-        if (dynamic_cast<const ast::RelOpPattern*>(arm.pattern.get()) ||
-            dynamic_cast<const ast::RangePattern*>(arm.pattern.get())) {
-            ctx_.diagnostics().report(
-                Severity::Error, arm.pattern->span.begin,
-                "a relational or range pattern cannot be used with an Object "
-                "scrutinee (\xC2\xA7""19.3) — Object has no defined ordering");
-            return;
+        // Iterative walk, mirroring checkOrderingPatternOverNullableType
+        // above: A.7 admits relationals and ranges as `|`-joined alternative
+        // members, so `> 5 | < 1` parses as an AltPattern WRAPPING the two
+        // RelOpPatterns and a single-node dynamic_cast sees none of them. The
+        // gate walks no tree otherwise, and the arm reaches codegen to emit
+        // `icmp sgt ptr %obj, i32 5` — the same malformed IR this gate exists
+        // to prevent (#5235). Members go back on the QUEUE rather than being
+        // tested once: A.7's `Pattern` production does not itself include
+        // AltPattern, so an alternation cannot nest today (`> 5 | (< 1 | = 3)`
+        // is a §17.1 precedence parse error), but the walk costs one `push`
+        // and keeps this gate structurally identical to the nullable sibling
+        // instead of encoding "a member is never an alternation" as a second
+        // assumption that a future A.7 amendment would silently break.
+        std::vector<const ast::Pattern*> queue{arm.pattern.get()};
+        while (!queue.empty()) {
+            const ast::Pattern* q = queue.back();
+            queue.pop_back();
+            if (!q) continue;
+            if (dynamic_cast<const ast::RelOpPattern*>(q) ||
+                dynamic_cast<const ast::RangePattern*>(q)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, q->span.begin,
+                    "a relational or range pattern cannot be used with an "
+                    "Object scrutinee (\xC2\xA7""19.3) — Object has no defined "
+                    "ordering");
+                return;
+            }
+            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+                for (const auto& m : ap->members) queue.push_back(m.get());
         }
     }
 }
