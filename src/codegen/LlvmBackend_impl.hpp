@@ -17178,14 +17178,6 @@ private:
     // borrow-with-leak handling. Operators / constructors are excluded too.
     bool isUserMethodStringReturnCall(const ast::Expr* init) const;
 
-    // fix #5277 (§18.5 / §28.9, v0.313): is `e` a plain READ of a `string?`
-    // storage slot (a local, a parameter, a field or an auto-property's
-    // storage, by bare name or `x.M`) that is not a +1 producer? Such a read
-    // is a borrow of the slot's reference: the interpolation hole that renders
-    // it must not release it. Computed properties, calls and every other shape
-    // answer false and keep their existing release.
-    bool isNullableStringSlotRead(const ast::Expr* e) const;
-
     // #429 (RETURN-escape category) / §4.6 / §28.9: is `e` an IDENTIFIER naming a
     // non-nullable string LOCAL that already OWNS a +1 reference in its slot?
     // True for a producer-initialized local (the producer's +1 was transferred

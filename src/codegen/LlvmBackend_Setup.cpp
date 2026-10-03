@@ -25257,30 +25257,6 @@ bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
 }
 
 
-// fix #5277 (§18.5 / §28.9, v0.313): see the declaration in
-// LlvmBackend_impl.hpp and appendPart's `nullableStringSlotBorrow` in
-// LlvmBackend_Exprs.cpp.
-bool Emitter::isNullableStringSlotRead(const ast::Expr* e) const {
-    if (!e) return false;
-    if (!dynamic_cast<const ast::IdentifierExpr*>(e) &&
-        !dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return false;
-    const sema::TypeRef* t = ctx_.exprType(*e);
-    if (!t || !t->nullable || t->kind != sema::TypeRef::Kind::Primitive ||
-        t->primitive != sema::PrimitiveType::String)
-        return false;
-    if (isPlusOneStringProducer(e)) return false;
-    sema::Symbol* sym = ctx_.exprSymbol(*e);
-    if (!sym) return false;
-    if (dynamic_cast<const ast::IdentifierExpr*>(e) &&
-        (dynamic_cast<sema::LocalSymbol*>(sym) ||
-         dynamic_cast<sema::ParameterSymbol*>(sym)))
-        return true;
-    return dynamic_cast<sema::FieldSymbol*>(sym) ||
-           sema::isAutoPropertyStorageSymbol(sym, ctx_);
-}
-
-
 // #429 (RETURN-escape category) / §4.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. A returned IDENTIFIER names a non-nullable string LOCAL
 // that owns a +1 in its slot when EITHER it was retained at bind (a borrow local

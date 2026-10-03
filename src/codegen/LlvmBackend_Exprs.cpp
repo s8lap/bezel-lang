@@ -297,17 +297,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // up here so the lambda can capture by reference and reset to nullptr
         // at the top of each iteration.
         llvm::Value* inlineBoxMint = nullptr;
-        // fix #5277 (§18.5 / §28.9, v0.313): set by the nullable-REFERENCE arm
-        // below when the hole is a `string?` slot READ (a local, parameter,
-        // field or auto-property) rendered by identity. Its rendering is the
-        // PHI(slot value, "null" literal), a new Value* distinct from `srcEv`,
-        // so the `pv != srcEv` rule took it for a fresh render and released
-        // it, dropping the reference the slot owns (the slot's own scope-end /
-        // drop-on-overwrite release then aborted with "refcount over-release
-        // (string)"; a field's string was freed while reachable). It is a
+        // fix #5277 / #5290 / #5291 (§18.5 / §28.9, v0.313): set by the
+        // nullable-REFERENCE arm below when a `string?` hole renders its live
+        // arm by identity. Its rendering is PHI(live value, "null" literal), a
+        // new Value* distinct from `srcEv`, so the `pv != srcEv` rule took it
+        // for a fresh render and released it, dropping a reference the hole
+        // never owned (a slot read, a computed property, `a[i]`, `m[k]`, `q?.M`:
+        // "refcount over-release (string)" or a use-after-free). It is a
         // BORROW exactly as the non-nullable `string` hole is (the
         // `pv == srcEv` case), and the "null" arm is a sentinel literal, so the
-        // PHI is released only when the hole is a +1 producer. Reset per part.
+        // PHI is released only when the hole is a +1 producer
+        // (isPlusOneStringProducer, below). Reset per part.
         bool nullableStringSlotBorrow = false;
         auto appendPart = [&](llvm::Value* pv, llvm::Value* srcEv,
                               const ast::Expr* srcExpr) {
@@ -851,8 +851,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // renders its live arm by identity (`liveStr == ev`), so
                     // the PHI below borrows the slot's reference — see
                     // `nullableStringSlotBorrow` above appendPart.
-                    if (liveStr == ev &&
-                        isNullableStringSlotRead(part.expr.get()))
+                    // fix #5290 / #5291: every `string?` hole renders by
+                    // identity, so it mirrors the non-nullable `string` rule
+                    // exactly: a BORROW unless the hole is a +1 producer
+                    // (released via isPlusOneStringProducer in appendPart).
+                    // This replaces #5277's slot-shape whitelist, which left a
+                    // computed property, `a[i]`, `m[k]` and `q?.M` releasing a
+                    // borrowed reference.
+                    if (liveStr == ev && rt->kind == sema::TypeRef::Kind::Primitive &&
+                        rt->primitive == sema::PrimitiveType::String)
                         nullableStringSlotBorrow = true;
                     auto* liveEnd = builder_.GetInsertBlock();
                     builder_.CreateBr(endBB);
