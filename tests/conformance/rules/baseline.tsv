@@ -2076,7 +2076,7 @@ l6_5_0001	pass
 l6_5_0002	pass	
 l6_5_0003	pass	
 l6_5_0004	pass	
-l6_5_0005	fail	divergence
+l6_5_0005	pass	
 l6_5_0006	pass	
 l6_5_0007	pass	
 l6_5_0008	pass	
@@ -2088,7 +2088,7 @@ l6_5_0013	pass
 l6_5_0014	pass	
 l6_5_0015	pass	
 l6_5_0016	pass	
-l6_5_0017	fail	divergence
+l6_5_0017	pass	
 l6_5_0018	pass	
 l6_5_0019	pass	
 l6_6_0001	fail	divergence
