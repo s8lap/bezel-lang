@@ -101,6 +101,29 @@ using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::diagnosticMessageContains;
 
+namespace {
+
+// T9–T11's shared runner. The 200-iteration loop is the ONE-SHOT-ORACLE net
+// this family needs: the defect these rows pin is not "the answer is wrong
+// once", it is "the accessor compiled against `Box<int>`'s layout is re-entered
+// on a `Box<long>` receiver" — an ABI mismatch whose damage depends on what the
+// mis-laid-out load produces on each iteration, not on a single read. The
+// program counts its own wrong answers and PRINTS the total (an 8-bit exit code
+// truncates at 256 iterations, so the count belongs on stdout), and the row
+// asserts the printed total is `0`.
+std::string runLoop200(const std::string& src) {
+    auto r = runAot(src);
+    if (!r.ran) return std::string("<did-not-run>");
+    std::string out = r.stdoutText;
+    if (!out.empty() && out.back() == '\n') {
+        out.pop_back();
+        if (!out.empty() && out.back() == '\r') out.pop_back();
+    }
+    return out;
+}
+
+}  // namespace
+
 // ── T1 — the issue's own repro (§23.2, v0.313). The getter reads the SAME
 // property on a DIFFERENT instance, which the spec admits and which
 // terminates at run time. Pre-fix: bezelc exits 139 (SIGSEGV).
@@ -339,4 +362,150 @@ BEZEL_TEST(codegen_issue_5319,
     // MEASURED post-fix: 39 — identical to T1's arrow-form leaf, which is the
     // point: the arrow and block spellings agree.
     BEZEL_EXPECT_EQ(r.exitCode, 39);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// T9–T11 — the GENERIC-OWNER fix-forward (lane 5319-ff).
+//
+// WHAT T1–T8 DID NOT COVER, AND WHY IT MATTERED. Every row above declares a
+// NON-generic class, so the accessor T1–T4 materialise is the only one that
+// class shape can ever need. §14.1 admits `class Box<T>` and a computed
+// property on it, and §23.2 puts no restriction on the body's expressions, so
+//
+//     class Box<T>
+//       private _v: T;
+//       private _next: Box<T>?;
+//       public property Rec: T => (if _next = null then _v else _next!.Rec);
+//     end Box<T>;
+//
+// is the SAME legal, run-time-terminating program as T1's, now with the type
+// parameter in every position. With TWO live instantiations (`Box<int>` and
+// `Box<long>`) the two have DIFFERENT layouts — `T` is 4 bytes in one and 8 in
+// the other, so `_v` and `_next` sit at different offsets — and the T1–T8 rows,
+// being single-instantiation, could never see it.
+//
+// THE DEFECT THESE ROWS PIN. `callComputedGetterFn` reached
+// `ensurePropertyAccessorFn(cls, ps, false)` DIRECTLY. That builder memoises on
+// (property, isSet, `accessorSpecTagNow()`), and at an ordinary read site no
+// specialization tag is installed — `accessorSpecTag_` is 0, the "shared/erased
+// template" key. So the FIRST instantiation read built the accessor body
+// against the ERASED `T -> i32` layout, memoised it under tag 0, and every
+// later read — including the second instantiation's — got that same body back.
+// The `Box<int>`-compiled accessor then recursed on a `Box<long>` receiver and
+// read `_next` at the int offset, so the walk never found the null base and ran
+// off the end of the object. MEASURED at this branch's pre-fix-forward state:
+// bezelc exits 139 (SIGSEGV) on T9, and T10/T11 abort in LLVM IR verification
+// ("PHI node operands are not the same type") — the tag-0 body, compiled for
+// one `T`, having its own recursive call wired against another's.
+//
+// The vtable and itable faces never had this bug because they do NOT reach
+// `ensurePropertyAccessorFn` directly: they install the per-(class,
+// substitution) tag `accessorSpecTagFor` mints, snapshot the substitution under
+// it, and only then call the builder (`buildSpecializedAccessorFn`,
+// LlvmBackend_Setup.cpp). T9–T11 are the fix-forward making the recursive-read
+// path use that same vehicle, so a generic owner's recursive read names the
+// accessor for ITS OWN instantiation.
+//
+// The 200-iteration loop (see `runLoop200`) is the one-shot net: an
+// off-by-one-offset `_next` load is not reliably wrong on iteration 1 — it is
+// wrong according to what the adjacent bytes happen to hold, which is why a
+// single read is a weak oracle for exactly this class of bug.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── T9 — `Box<int>` AND `Box<long>`, both live. The two instantiations differ
+// in WIDTH (`T` is i32 vs i64), so the erased-template reuse lands `_next` at
+// the wrong offset. Pre-fix-forward: bezelc SIGSEGV (exit 139).
+BEZEL_TEST(codegen_issue_5319,
+           generic_owner_recursive_computed_property_int_and_long_spec_23_2_14_1) {
+    std::string out = runLoop200(
+        "module M5319P2j; "
+        "class Box5319P2j<T> "
+        "  private _v: T; "
+        "  private _next: Box5319P2j<T>?; "
+        "  public constructor(v: T, next: Box5319P2j<T>?) _v := v; _next := next; end constructor; "
+        // §23.2 / §14.1: the same terminating chain-walk as T1, with `T`
+        // threaded through the value, the null test, and the field it walks.
+        "  public property Rec: T => (if _next = null then _v else _next!.Rec); "
+        "end Box5319P2j; "
+        "class C "
+        "  public static method Main(): int "
+        "    var fails := 0; "
+        "    for var k in 0..<200 do "
+        "      using var bi := new Box5319P2j<int>(1, new Box5319P2j<int>(2, new Box5319P2j<int>(3, null))); "
+        "      if bi.Rec <> 3 then fails := fails + 1; end if; "
+        // The SECOND instantiation is the load-bearing half: `T` is 8 bytes
+        // here, so the same body that answered `bi` reads `_next` at the wrong
+        // offset when handed `bl`.
+        "      using var bl := new Box5319P2j<long>(4L, new Box5319P2j<long>(5L, new Box5319P2j<long>(6L, null))); "
+        "      if bl.Rec <> 6L then fails := fails + 1; end if; "
+        "    end for; "
+        "    Console.WriteLine(fails); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(out, "0");
+}
+
+// ── T10 — same shape, but the second instantiation is `string`. A POINTER-
+// sized `T` erases to the same `ptr` as a class reference, which is precisely
+// why this row is not redundant with T9: the erased template's field offsets
+// and the two instantiations' disagree in a different pattern, and the failure
+// surfaces in LLVM IR VERIFICATION rather than as a runtime SEGV. Pre-fix-
+// forward: "PHI node operands are not the same type".
+BEZEL_TEST(codegen_issue_5319,
+           generic_owner_recursive_computed_property_int_and_string_spec_23_2_14_1) {
+    std::string out = runLoop200(
+        "module M5319P2f; "
+        "class Box5319P2f<T> "
+        "  private _v: T; "
+        "  private _next: Box5319P2f<T>?; "
+        "  public constructor(v: T, next: Box5319P2f<T>?) _v := v; _next := next; end constructor; "
+        "  public property Rec: T => (if _next = null then _v else _next!.Rec); "
+        "end Box5319P2f; "
+        "class C "
+        "  public static method Main(): int "
+        "    var fails := 0; "
+        "    for var k in 0..<200 do "
+        "      using var bi := new Box5319P2f<int>(1, new Box5319P2f<int>(2, new Box5319P2f<int>(3, null))); "
+        "      if bi.Rec <> 3 then fails := fails + 1; end if; "
+        "      using var bs := new Box5319P2f<string>(\"a\", new Box5319P2f<string>(\"b\", new Box5319P2f<string>(\"c\", null))); "
+        "      if bs.Rec <> \"c\" then fails := fails + 1; end if; "
+        "    end for; "
+        "    Console.WriteLine(fails); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(out, "0");
+}
+
+// ── T11 — same shape with `bool`. The third distinct `T` LOWERING: `i1`-vs-
+// `i32` width in the erased template, and a `bool` property whose getter
+// returns a value whose representation the wrong-layout body would load from
+// the wrong slot. Three instantiations across T9–T11 (int/long, int/string,
+// int/bool) is what makes the row set a claim about PER-INSTANTIATION
+// specialization rather than about one lucky second type.
+BEZEL_TEST(codegen_issue_5319,
+           generic_owner_recursive_computed_property_int_and_bool_spec_23_2_14_1) {
+    std::string out = runLoop200(
+        "module M5319P2h; "
+        "class Box5319P2h<T> "
+        "  private _v: T; "
+        "  private _next: Box5319P2h<T>?; "
+        "  public constructor(v: T, next: Box5319P2h<T>?) _v := v; _next := next; end constructor; "
+        "  public property Rec: T => (if _next = null then _v else _next!.Rec); "
+        "end Box5319P2h; "
+        "class C "
+        "  public static method Main(): int "
+        "    var fails := 0; "
+        "    for var k in 0..<200 do "
+        "      using var bi := new Box5319P2h<int>(1, new Box5319P2h<int>(2, new Box5319P2h<int>(3, null))); "
+        "      if bi.Rec <> 3 then fails := fails + 1; end if; "
+        "      using var bb := new Box5319P2h<bool>(true, new Box5319P2h<bool>(false, new Box5319P2h<bool>(true, null))); "
+        "      if bb.Rec <> true then fails := fails + 1; end if; "
+        "    end for; "
+        "    Console.WriteLine(fails); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_EQ(out, "0");
 }
