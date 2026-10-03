@@ -3268,6 +3268,13 @@ private:
     // pre-#2928 caller asks for, so the tag-0 key space is exactly today's.
     std::map<std::pair<const ast::PropertyDecl*, unsigned>, llvm::Function*>
         propBlockGetterFns_;
+    // fix #5315 (§14.1 / §23, v0.313): the NAMED-property block getters of
+    // `ensurePropertyBlockGetter`, per (decl, accessor tag, owner
+    // instantiation) — the last two vectors are `propertyThunkSubstKey`'s.
+    using PropBlockGetterKey =
+        std::tuple<const ast::PropertyDecl*, unsigned,
+                   std::vector<llvm::Type*>, std::vector<std::string>>;
+    std::map<PropBlockGetterKey, llvm::Function*> propBlockGetterInstFns_;
 
     // #815 / §9.1: standalone getter functions for a positional record field
     // used as the implementation of an interface property (the itable slot).
@@ -6891,8 +6898,11 @@ private:
     // property getter body (`get => do…end;`).  Calling it with `this` as the
     // sole argument returns the getter's value — avoids premature `ret` in the
     // outer method when `return` appears inside the getter.
-    llvm::Function* ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
-                                              const ast::PropertyAccessor* acc);
+    // `ps` (optional) keys the memo on the owner's §14.1 instantiation
+    // (fix #5315); null keeps the instantiation-agnostic key.
+    llvm::Function* ensurePropertyBlockGetter(
+        const ast::PropertyDecl* pd, const ast::PropertyAccessor* acc,
+        const sema::PropertySymbol* ps = nullptr);
 
     // #481 / §12.1 / §12.5 / §23: emit (or retrieve cached) a uniform-signature
     // accessor FUNCTION for a virtual property, so it can be installed in a

@@ -5479,12 +5479,23 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
 
 
 llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
-                                          const ast::PropertyAccessor* acc) {
+                                          const ast::PropertyAccessor* acc,
+                                          const sema::PropertySymbol* ps) {
     // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
     // the shared/erased template every ordinary caller wants.
-    auto bgKey = std::make_pair(pd, accessorSpecTagNow());
-    auto it = propBlockGetterFns_.find(bgKey);
-    if (it != propBlockGetterFns_.end()) return it->second;
+    //
+    // fix #5315 (§14.1 / §23, v0.313): ...and the OWNER's instantiation, the
+    // same `propertyThunkSubstKey` #5306 keys `propertyThunks_` on. A getter's
+    // signature (`lowerType(pd->type)`) and body (field GEPs typed against one
+    // `class.Holder$specN`) are lowered under the live §14.1 substitution, so
+    // one memo entry per `pd` froze the first instantiation's getter for every
+    // later one (`Holder<int>`'s `bw` served `Holder<string>`, whose `_w` sits
+    // at a different offset). A caller that passes no symbol (the inline read
+    // sites) keeps the empty key, i.e. today's behaviour.
+    PropBlockGetterKey bgKey{pd, accessorSpecTagNow(), {}, {}};
+    if (ps) propertyThunkSubstKey(ps, std::get<2>(bgKey), std::get<3>(bgKey));
+    auto it = propBlockGetterInstFns_.find(bgKey);
+    if (it != propBlockGetterInstFns_.end()) return it->second;
 
     llvm::Type* retTy = lowerType(pd->type.get());
     if (!retTy) retTy = i32();
@@ -5493,7 +5504,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     auto* fn = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage,
         "bz$prop$" + std::string(pd->name) + "$get", *module_);
-    propBlockGetterFns_[bgKey] = fn;
+    propBlockGetterInstFns_[bgKey] = fn;
     // no capture attribute added (Captures API varies by LLVM version)
 
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
