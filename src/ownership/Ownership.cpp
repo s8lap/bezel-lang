@@ -3661,7 +3661,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                     ds->value.get())) {
                 if (id->name != "this" && id->name != "base") {
-                    auto* dstate = lookupState(id->name);
+                    auto* dstate = lookupStateFor(*id);
                     // fix #4734 (§35.5 *The owning match*, §17.13, v0.307):
                     // `_ := r;` where `r` is an arm binding an OWNING match
                     // transferred a payload into. §35.5 makes it "an **owned
@@ -3744,7 +3744,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                                 if (ld->isUsing && ld->usingVarSourceIsBorrow)
                                     aliasIsBorrowPin = true;
                         if (!aliasIsBorrowPin) {
-                            markDisposedByName(id->name, id->span.begin);
+                            markDisposedByName(id->name, id->span.begin, id);
                             const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
                                 true;
                             // fix #1892 / §17.13 / §28.5: when the discarded named
@@ -4123,7 +4123,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         ys->value.get())) {
                     if (id->name != "this" && id->name != "base") {
-                        if (auto* st = lookupState(id->name)) {
+                        if (auto* st = lookupStateFor(*id)) {
                             // fix #1267 / §29.2 "Iterator yield ownership" +
                             // §28.10 (axiom A5): the consume above is a MOVE OUT
                             // of the named binding, and a `using var` /
@@ -4154,7 +4154,7 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                                     "consumer");
                                 st->state = OwnershipState::Poisoned;
                             } else if (st->state == OwnershipState::Owned) {
-                                markDisposedByName(id->name, id->span.begin);
+                                markDisposedByName(id->name, id->span.begin, id);
                             }
                         }
                     }
@@ -4261,9 +4261,9 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     dynamic_cast<const ast::IdentifierExpr*>(
                         lookThroughForceUnwrap(th->value.get()))) {
                 if (id->name != "this" && id->name != "base") {
-                    if (auto* st = lookupState(id->name)) {
+                    if (auto* st = lookupStateFor(*id)) {
                         if (st->state == OwnershipState::Owned)
-                            markDisposedByName(id->name, id->span.begin);
+                            markDisposedByName(id->name, id->span.begin, id);
                     }
                 }
             }
@@ -7563,7 +7563,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         if (const auto* id =
                 dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
             for (auto& [sym, st] : states_) {
-                if (sym->name != id->name) continue;
+                if (!refersTo(sym, *id)) continue;
                 if (st.state == OwnershipState::PolyNull) {
                     // The assignment provably occurs; mirror the `:=` path's
                     // bare-identifier arm (§28.3, §28.7). recordMovesIn runs
@@ -7668,7 +7668,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be REASSIGNED until the bounding scope exits.
     if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))
-        checkScopedFreeze(tid->name, as.target->span.begin, "reassign");
+        checkScopedFreeze(tid->name, as.target->span.begin, "reassign", ctx_.exprSymbol(*tid));
     // §28.3 / §28.7 / §28.10 (v0.180, #1965): the assignment-position `owned`
     // transfer marker — `y := owned x;`. A MARKED read of a named owned binding
     // is a MOVE (the source is left moved-from; the target adopts owned and
@@ -7686,7 +7686,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     if (as.valueHasOwnedMarker) {
         const auto* tid =
             dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
-        if (tid && lookupState(tid->name)) {
+        if (tid && lookupStateFor(*tid)) {
             handleMarkedOwnedAssignment(as);
             return;
         }
@@ -7918,7 +7918,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         if (const auto* id =
                 dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
             if (!checkOwnedArgSource(*as.value, id->span.begin))
-                markMovedByName(id->name, id->span.begin);
+                markMovedByName(id->name, id->span.begin, id);
         } else {
             checkOwnedArgSource(*as.value, as.value->span.begin);
         }
@@ -7947,7 +7947,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
         }
         for (auto& [sym, st] : states_) {
-            if (sym->name != id->name) continue;
+            if (!refersTo(sym, *id)) continue;
             // §22.3 + §28.8: assigning an owned value to an `out owned`
             // parameter transfers ownership OUT through the out-location to
             // the caller, who becomes responsible for discharging it. The
@@ -8046,7 +8046,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // owned (a borrowed-state local has no disposal, so nothing is
             // silently killed).
             if (st.state == OwnershipState::Owned)
-                checkConsumeFreeze(id->name, as.target->span.begin);
+                checkConsumeFreeze(id->name, as.target->span.begin, ctx_.exprSymbol(*id));
             // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
             // non-loop `if … then` / no-else merge, `joinInto`'s catch-all sets
             // the local's state to Poisoned while preserving its `obligationOrigin`
@@ -8305,7 +8305,7 @@ void MethodOwnership::handleMarkedOwnedAssignment(const ast::AssignmentStmt& as)
     sema::Symbol* tsym = nullptr;
     if (tid) {
         for (auto& [sym, st] : states_) {
-            if (sym->name != tid->name) continue;
+            if (!refersTo(sym, *tid)) continue;
             tst = &st;
             tsym = sym;
             break;
@@ -8344,7 +8344,7 @@ void MethodOwnership::handleMarkedOwnedAssignment(const ast::AssignmentStmt& as)
     // killed). Codegen disposes the displaced value exactly once
     // (disposeDisplacedOwnedClassLocal) — this is the accept side (#1465).
     if (tst->state == OwnershipState::Owned)
-        checkConsumeFreeze(tid->name, as.target->span.begin);
+        checkConsumeFreeze(tid->name, as.target->span.begin, ctx_.exprSymbol(*tid));
     // fix #3950 (§28.7 v0.294 / §28.3 K1.3 v0.294): the marked-transfer twin of
     // the flag set in handleAssignment — `Sink.Take(move x); x := owned y;`
     // reaches the identical codegen path (disposeDisplacedOwnedClassLocal) and
@@ -8420,7 +8420,7 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
     if (!id) return;  // only a WHOLE-array read (a[i]/a.f/a.M() are borrows)
     long long size = 0;
     if (!isMoveOnlyInlineArrayType(ctx_.exprType(src), size)) return;
-    auto* st = lookupState(id->name);
+    auto* st = lookupStateFor(*id);
     if (!st) {
         // §15.3 (#1922) "Parameter passing": a move-only inline-array PARAMETER is
         // passed by value-MOVE and — unlike an `owned` local/parameter — carries
@@ -8446,7 +8446,7 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
         LocalOwnership lo;
         lo.state = OwnershipState::Borrowed;
         states_[ps] = lo;
-        st = lookupState(id->name);
+        st = lookupStateFor(*id);
         if (!st) return;  // defensive — the insertion above always succeeds
     }
     // A live source (Owned when a `using var`, Borrowed when a plain `var` — the
@@ -8458,7 +8458,7 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
     if (st->state != OwnershipState::Owned &&
         st->state != OwnershipState::Borrowed)
         return;
-    markMovedByName(id->name, id->span.begin);
+    markMovedByName(id->name, id->span.begin, id);
 }
 
 // §15.3 (#4587) bullet 1: mark an owning-choice local read by a bare
@@ -8503,7 +8503,7 @@ void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
     if (!ld) return;
     auto verdict = common::classifyChoiceType(ctx_.exprType(src), ctx_);
     if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
-    auto* st = lookupState(id->name);
+    auto* st = lookupStateFor(*id);
     if (!st) return;
     // A live source (Owned when a `using var`, Borrowed when a plain `var` —
     // the default bare-identifier producerState, mirroring
@@ -8516,7 +8516,7 @@ void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
     if (st->state != OwnershipState::Owned &&
         st->state != OwnershipState::Borrowed)
         return;
-    markMovedByName(id->name, id->span.begin);
+    markMovedByName(id->name, id->span.begin, id);
 }
 
 void MethodOwnership::moveOnlyArrayNoteSlotMoved(const ast::IndexExpr& ix) {
@@ -8999,7 +8999,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
         const auto* bid =
             dynamic_cast<const ast::IdentifierExpr*>(peelTopCastBang(&e));
         if (bid) {
-            if (auto* st = lookupState(bid->name)) {
+            if (auto* st = lookupStateFor(*bid)) {
                 if (st->implicitDischarge) {
                     report(
                         Severity::Error, bid->span.begin,
@@ -9040,7 +9040,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
         // fast-path here ran before both the owned-move-out and borrow-escape
         // checks and silently marked the local discharged; reject instead,
         // mirroring the `markMovedByName` scope-bound guard. // per §28.3, §28.10
-        if (auto* st = lookupState(id->name)) {
+        if (auto* st = lookupStateFor(*id)) {
             if (st->implicitDischarge) {
                 report(
                     Severity::Error, id->span.begin,
@@ -9082,7 +9082,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
         // (the idempotent §28.2 discharge), but `return x;` is not a second
         // dispose: it is a USE of the already-disposed variable. Error here,
         // and poison the state so the rest of the analysis skips this variable.
-        if (auto* st = lookupState(id->name)) {
+        if (auto* st = lookupStateFor(*id)) {
             if (st->state == OwnershipState::Disposed) {
                 report(
                     Severity::Error, id->span.begin,
@@ -9093,7 +9093,7 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
                 return;
             }
         }
-        markDisposedByName(id->name, id->span.begin);
+        markDisposedByName(id->name, id->span.begin, id);
         return;
     }
     // Slice O7: borrow-escape check. `return localRef.M(...)` /
@@ -10980,7 +10980,7 @@ void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
 // body reclaims the slot via `markExplicitDisposeReclaimIfReassignedBorrow`.
 // Without this seed, the body's fresh `states_` finds NOTHING for the
 // captured local, the assignment arm's `for (auto& [sym, st] : states_)
-// if (sym->name != tid->name) continue;` loop never matches, none of the
+// if (!refersTo(sym, *tid)) continue;` loop never matches, none of the
 // bookkeeping runs, and codegen falls back to `unwindOwnedLocalClass(ld)` —
 // which classifies purely from the local's DECLARATION initializer form
 // (here, a borrow-init `var y := x;`) and returns false, leaving the heap
@@ -11515,7 +11515,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
                 }
                 for (auto& [sym, st] : states_) {
-                    if (sym->name != tid->name) continue;
+                    if (!refersTo(sym, *tid)) continue;
                     if (st.state == OwnershipState::Owned && st.maybeConsumed &&
                         localDropOnOverwriteCovered(sym)) {
                         report(Severity::Error, as->target->span.begin,
@@ -11542,7 +11542,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // reassignment is about to displace must reject, exactly
                     // as `handleAssignment` (Ownership.cpp ~6758) does.
                     if (st.state == OwnershipState::Owned)
-                        checkConsumeFreeze(tid->name, as->target->span.begin);
+                        checkConsumeFreeze(tid->name, as->target->span.begin, ctx_.exprSymbol(*tid));
                     if (!suppressDiag_ && st.state == OwnershipState::MovedFrom)
                         const_cast<ast::AssignmentStmt*>(as)
                             ->lhsMovedFromAtStore = true;
@@ -11657,7 +11657,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             if (const auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     as->target.get())) {
                 for (auto& [sym, st] : states_) {
-                    if (sym->name != tid->name) continue;
+                    if (!refersTo(sym, *tid)) continue;
                     if (st.state == OwnershipState::PolyNull) {
                         // The assignment provably occurs; mirror the `:=` path's
                         // bare-identifier arm (§28.3, §28.7). recordMovesIn
@@ -13518,7 +13518,7 @@ void MethodOwnership::checkInstanceBorrowReturn(const ast::Expr& e) {
                 producerState(*core) == OwnershipState::Owned;
         } else if (auto* rid =
                        dynamic_cast<const ast::IdentifierExpr*>(core)) {
-            if (auto* st = lookupState(rid->name))
+            if (auto* st = lookupStateFor(*rid))
                 // Exclude a maybe-consumed local (K7.4 join): that is a
                 // narrower, separately-diagnosed hazard (checkRead's
                 // maybe-consumed report), not this rule's business —
@@ -13795,7 +13795,7 @@ void MethodOwnership::checkBareTypeParamReturn(const ast::Expr& e) {
     // ADMITTED: every caller re-establishes it against its own receiver and
     // arguments (§28.3 v0.194 lifts the parameter-sourced prohibition here). // per §28.3
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-        if (auto* st = lookupState(id->name)) {
+        if (auto* st = lookupStateFor(*id)) {
             if (st->implicitDischarge ||
                 st->state == OwnershipState::Owned) {
                 reportBareTypeParamOwnedReturn(e);
@@ -14340,7 +14340,7 @@ void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
         // symbol, then implicit-this field — the same 3-arm logic this
         // function uses for a bare IdentifierExpr.
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&expr)) {
-            if (auto* st = lookupState(id->name))
+            if (auto* st = lookupStateFor(*id))
                 return st->state == OwnershipState::Borrowed;
             if (auto* sym = ctx_.exprSymbol(*id))
                 if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym))
@@ -14365,7 +14365,7 @@ void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
     }
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
     if (!id) return;
-    if (auto* st = lookupState(id->name)) {
+    if (auto* st = lookupStateFor(*id)) {
         // A tracked local: Owned (plain `var`, genuine kind-1 source) is
         // admitted; Borrowed is the measured defect. Any other tracked state
         // (Disposed / MovedFrom / PolyNull / Poisoned) is some OTHER check's
@@ -14786,7 +14786,7 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
         // A non-tracked local (e.g. an out-of-method binding) is conservatively
         // admitted; the runtime is the caller's problem.
         if (auto* sym = ctx_.exprSymbol(*id)) {
-            if (auto* st = lookupState(id->name)) {
+            if (auto* st = lookupStateFor(*id)) {
                 // `using var` (implicitDischarge) OR a plain owned local
                 // recorded in everOwnedPlainLocals_ — both disposed at this
                 // method's exit; a borrow derived from either is an escape.
@@ -14840,7 +14840,7 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(root)) {
             if (id->name == "this") return;  // `this.f.Drain()` — admitted
             if (auto* sym = ctx_.exprSymbol(*id)) {
-                if (auto* st = lookupState(id->name)) {
+                if (auto* st = lookupStateFor(*id)) {
                     const bool usingVar = st->implicitDischarge;
                     const bool plainOwnedLocal =
                         st->state == OwnershipState::Owned &&
@@ -15021,11 +15021,11 @@ void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
         //     head; that is the only authoritative signal when the
         //     dataflow classifier is blind.
         const bool usingVar =
-            lookupState(id->name) &&
-            lookupState(id->name)->implicitDischarge;
+            lookupStateFor(*id) &&
+            lookupStateFor(*id)->implicitDischarge;
         const bool plainOwnedLocal =
-            lookupState(id->name) &&
-            lookupState(id->name)->state == OwnershipState::Owned &&
+            lookupStateFor(*id) &&
+            lookupStateFor(*id)->state == OwnershipState::Owned &&
             everOwnedPlainLocals_.count(sym) != 0;
         const bool heapCollectionLiteralLocal =
             !usingVar && !plainOwnedLocal &&
@@ -15066,7 +15066,7 @@ void MethodOwnership::checkReturnGetEnumeratorFromScopeBoundReceiver(
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(root)) {
             if (id->name == "this") return;  // `this.f.GetEnumerator()` — admitted
             if (auto* sym = ctx_.exprSymbol(*id)) {
-                if (auto* st = lookupState(id->name)) {
+                if (auto* st = lookupStateFor(*id)) {
                     const bool usingVar = st->implicitDischarge;
                     const bool plainOwnedLocal =
                         st->state == OwnershipState::Owned &&

@@ -3547,7 +3547,8 @@ private:
     // the borrow's surviving use. No-op when no live borrow exists (the
     // unborrowed transfer / drop-on-overwrite stays legal). // per §28.3, §28.7, §30.14
     void checkConsumeFreeze(std::string_view consumedName,
-                            SourceLocation consumeLoc);
+                            SourceLocation consumeLoc,
+                            const sema::Symbol* consumedSym = nullptr);
     // §28.3 / §28.7 (v0.180, #1465): true when the reassigned owned local `sym`
     // is a plain owned class/interface local whose drop-on-overwrite codegen
     // implements — so its FINAL value is safely auto-droppable at scope end.
@@ -4283,6 +4284,12 @@ private:
 
     LocalOwnership* lookupState(std::string_view name);
 
+    // fix #5267 (§28.3, v0.313): true when the tracked symbol `sym` is the
+    // binding the identifier `id` resolves to (sema's exprSymbol). Falls back
+    // to a name match only for an UNRESOLVED reference, so a shadowing local
+    // is never confused with an enclosing owned parameter of the same name.
+    bool refersTo(const sema::Symbol* sym, const ast::IdentifierExpr& id) const;
+
     // fix #5252 (§28.3, v0.313): the state of the binding `id` actually
     // resolves to (sema's exprSymbol), falling back to the by-name
     // `lookupState` only when that symbol is untracked. `lookupState` scans
@@ -4290,9 +4297,11 @@ private:
     // once an inner block declares a same-named local (`do var value := 5;
     // end;`) it can answer with the shadowing local's state instead of the
     // outer binding's.
-    LocalOwnership* lookupStateFor(const ast::IdentifierExpr& id);
+    LocalOwnership* lookupStateFor(const ast::IdentifierExpr& id,
+                                   sema::Symbol** keyOut = nullptr);
 
-    void markDisposedByName(std::string_view name, SourceLocation loc);
+    void markDisposedByName(std::string_view name, SourceLocation loc,
+                            const ast::IdentifierExpr* id = nullptr);
 
     // fix #4246 (§28.3 / §28.6, v0.298): stamp `id` (an explicit
     // `.Dispose()`/`?.Dispose()` receiver) with `disposeReclaimsReassigned-
@@ -4304,7 +4313,8 @@ private:
     void markExplicitDisposeReclaimIfReassignedBorrow(
         const ast::IdentifierExpr& id);
 
-    void markMovedByName(std::string_view name, SourceLocation loc);
+    void markMovedByName(std::string_view name, SourceLocation loc,
+                         const ast::IdentifierExpr* id = nullptr);
 
     // §22.3 (v0.169, #1348): true when `e` is a NAMED OWNED BINDING — a bare
     // identifier (other than `this`/`base`) resolving to a tracked owned local
@@ -4455,7 +4465,7 @@ private:
     // `producerState`/`states_` deliberately still say Borrowed — see
     // `ownedArgSourceIsBorrow`'s own header comment for why that must stay
     // true). // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057
-    bool isMaterializerCarveOutBorrow(std::string_view name);
+    bool isMaterializerCarveOutBorrow(const ast::IdentifierExpr& id);
 
     // fix #5278 (§15.4, §28.3 Producers table, K3.13): true when `e` (after
     // peeling a leading `move` / bare `!`) is a bare read of a LOCAL declared
@@ -5684,7 +5694,8 @@ private:
     // source and the mutation site `loc` is at-or-after the admission site.
     // `action` names the rejected operation for the diagnostic.
     void checkScopedFreeze(std::string_view name, SourceLocation loc,
-                           std::string_view action);
+                           std::string_view action,
+                           const sema::Symbol* sym = nullptr);
 
     // §28.14 callee verification pre-pass (see the header comment above).
     void scopedCalleeScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);

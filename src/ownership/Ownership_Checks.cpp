@@ -997,7 +997,7 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     recordFieldMove(id->name, un->span.begin);
                     return;
                 }
-                markMovedByName(id->name, id->span.begin);
+                markMovedByName(id->name, id->span.begin, id);
                 return;
             }
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(mop)) {
@@ -1439,7 +1439,7 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
                         reportMissingOwnedMarker(id->name, id->span.begin,
                                                  /*withBang=*/argValue != a.value.get());
-                    markMovedByName(id->name, id->span.begin);
+                    markMovedByName(id->name, id->span.begin, id);
                     ++pos; continue;
                 }
                 if (exprIsOwnedFieldRead(*a.value)) {
@@ -1758,7 +1758,7 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                 if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
                     reportMissingOwnedMarker(id->name, id->span.begin,
                                              /*withBang=*/argValue != a.value.get());
-                markMovedByName(id->name, id->span.begin);
+                markMovedByName(id->name, id->span.begin, id);
                 ++pos; continue;
             }
             if (exprIsOwnedFieldRead(*a.value)) {
@@ -1951,9 +1951,9 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     dynamic_cast<const ast::IdentifierExpr*>(
                         lookThroughForceUnwrap(te->operand.get()))) {
                 if (id->name != "this" && id->name != "base") {
-                    if (auto* st = lookupState(id->name)) {
+                    if (auto* st = lookupStateFor(*id)) {
                         if (st->state == OwnershipState::Owned)
-                            markDisposedByName(id->name, id->span.begin);
+                            markDisposedByName(id->name, id->span.begin, id);
                     }
                 }
             }
@@ -2151,7 +2151,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 // suppress the generic read diagnostic here to avoid a
                 // double report).
                 for (auto& [s, lo] : states_) {
-                    if (s->name == tid->name) {
+                    if (refersTo(s, *tid)) {
                         skipCalleeReadForDispose =
                             (lo.state == OwnershipState::Disposed) ||
                             lo.maybeConsumed;
@@ -2244,7 +2244,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // a borrow. On violation, report and skip the bogus move;
                     // either way the arg is handled (do not re-read it below).
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
+                        markMovedByName(id->name, id->span.begin, id);
                     consumed = true;
                 } else if (exprIsOwnedFieldRead(*a.value)) {
                     // §28.3 / §28.8.1 (#398): `owned obj.f` on a bare owned-
@@ -2297,7 +2297,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                             // wrapper): an owned local is moved out, a borrow is
                             // reported and NOT marked. // per §28.8
                             else if (!checkOwnedArgSource(*mop, id->span.begin))
-                                markMovedByName(id->name, id->span.begin);
+                                markMovedByName(id->name, id->span.begin, id);
                             consumed = true;
                         } else if (auto* ma =
                                        dynamic_cast<const ast::MemberAccessExpr*>(
@@ -2336,7 +2336,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                         // §28.8 (#395): `move b` of a borrow is not an owned
                         // value — reject rather than silently consuming it.
                         if (!checkOwnedArgSource(*a.value, id->span.begin))
-                            markMovedByName(id->name, id->span.begin);
+                            markMovedByName(id->name, id->span.begin, id);
                         consumed = true;
                     } else if (auto* ma =
                                    dynamic_cast<const ast::MemberAccessExpr*>(
@@ -2379,7 +2379,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     // §28.8 (#395): reject a borrow flowing into the owned
                     // formal; otherwise record the implicit move.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
+                        markMovedByName(id->name, id->span.begin, id);
                     consumed = true;
                 } else if (exprIsOwnedFieldRead(*a.value)) {
                     // §28.3 / §28.8.1 (#398): a bare owned-field read implicitly
@@ -2516,7 +2516,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         lookThroughForceUnwrap(ma->target.get()))) {
                     markExplicitDisposeReclaimIfReassignedBorrow(*id);
-                    markDisposedByName(id->name, id->span.begin);
+                    markDisposedByName(id->name, id->span.begin, id);
                 }
             }
         }
@@ -2539,7 +2539,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         nm->target.get())) {
                     markExplicitDisposeReclaimIfReassignedBorrow(*id);
-                    markDisposedByName(id->name, id->span.begin);
+                    markDisposedByName(id->name, id->span.begin, id);
                 }
             }
         }
@@ -2565,7 +2565,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     recordFieldMove(id->name, un->span.begin);
                     return;
                 }
-                markMovedByName(id->name, id->span.begin);
+                markMovedByName(id->name, id->span.begin, id);
                 return; // don't re-check the now-moved-from operand
             }
             // Slice O8: `move this.field` — mark the field as
@@ -2661,7 +2661,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
                     // §28.8 (#395): an `owned`-modified arg must be owned.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
+                        markMovedByName(id->name, id->span.begin, id);
                     consumed = true;
                 } else if (exprIsOwnedFieldRead(*a.value)) {
                     // §28.3 / §28.8.1 (#398): `owned obj.f` of a bare owned-
@@ -2698,7 +2698,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                             // owner both dispose the value (a double-free). See the
                             // CallExpr twin above for the full rationale. // per §28.8
                             else if (!checkOwnedArgSource(*mop, id->span.begin))
-                                markMovedByName(id->name, id->span.begin);
+                                markMovedByName(id->name, id->span.begin, id);
                             consumed = true;
                         } else if (auto* ma =
                                        dynamic_cast<const ast::MemberAccessExpr*>(
@@ -2727,7 +2727,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(un->operand.get())) {
                         // §28.8 (#395): `move b` of a borrow is not an owned value.
                         if (!checkOwnedArgSource(*a.value, id->span.begin))
-                            markMovedByName(id->name, id->span.begin);
+                            markMovedByName(id->name, id->span.begin, id);
                         consumed = true;
                     }
                 }
@@ -2743,7 +2743,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
                     // §28.8 (#395): reject a borrow flowing into the owned formal.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
-                        markMovedByName(id->name, id->span.begin);
+                        markMovedByName(id->name, id->span.begin, id);
                     consumed = true;
                 } else if (exprIsOwnedFieldRead(*a.value)) {
                     // §28.3 / §28.8.1 (#398): a bare owned-field read flowing
@@ -2911,7 +2911,7 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         sema::Symbol* sym = nullptr;
         LocalOwnership* st = nullptr;
         for (auto& [s, lo] : states_) {
-            if (s->name == id->name) { sym = s; st = &lo; break; }
+            if (refersTo(s, *id)) { sym = s; st = &lo; break; }
         }
         if (!st) return;
         // §28.3 (#1626, v0.180): a maybe-consumed local — owned on one
@@ -3254,7 +3254,7 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                         a.value.get())) {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                             un->operand.get())) {
-                        if (auto* st = lookupState(id->name)) {
+                        if (auto* st = lookupStateFor(*id)) {
                             if (st->maybeConsumed) sourceMaybeConsumed = true;
                         }
                     }
@@ -3825,7 +3825,7 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
     for (const auto& [root, how] : roots) {
     if (reported.count(root->name)) continue;
     for (const auto& [sym, st] : states_) {
-        if (sym->name != root->name) continue;
+        if (!refersTo(sym, *root)) continue;
         // §28.3 borrow-lifetime rule (#1960): a borrow whose source is a scope-
         // bound owned local may not be returned — the source is disposed before
         // control returns to the caller, so the returned borrow dangles (UAF).
@@ -5909,7 +5909,7 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
             auto it = states_.find(sym);
             if (it != states_.end()) st = &it->second;
         }
-        if (!st) {
+        if (!st && !sym) {
             for (const auto& [s, lo] : states_)
                 if (s->name == root->name) { st = &lo; break; }
         }
@@ -11836,12 +11836,39 @@ LocalOwnership* MethodOwnership::lookupState(std::string_view name) {
     return nullptr;
 }
 
-LocalOwnership* MethodOwnership::lookupStateFor(const ast::IdentifierExpr& id) {
+// fix #5267 (§28.3, §22.3, v0.313): resolve `id` to the state of the binding
+// it NAMES (sema's exprSymbol), returning the tracked key through `keyOut`.
+// A reference that sema resolved to a local or parameter is looked up by
+// that symbol ONLY: an untracked local (a value-typed `var value := 5`) that
+// shadows a tracked `owned` parameter of the same name must NOT fall back to
+// the by-name scan, which would answer with the parameter's state. The
+// by-name scan stays the fallback for an unresolved reference and for a
+// non-local resolution (a field read through its bare name).
+bool MethodOwnership::refersTo(const sema::Symbol* sym,
+                               const ast::IdentifierExpr& id) const {
+    if (const sema::Symbol* r = ctx_.exprSymbol(id)) return sym == r;
+    return sym->name == id.name;
+}
+
+LocalOwnership* MethodOwnership::lookupStateFor(const ast::IdentifierExpr& id,
+                                                sema::Symbol** keyOut) {
     if (sema::Symbol* sym = ctx_.exprSymbol(id)) {
         auto it = states_.find(sym);
-        if (it != states_.end()) return &it->second;
+        if (it != states_.end()) {
+            if (keyOut) *keyOut = sym;
+            return &it->second;
+        }
+        if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+            dynamic_cast<sema::ParameterSymbol*>(sym))
+            return nullptr;
     }
-    return lookupState(id.name);
+    for (auto& [sym, st] : states_) {
+        if (sym->name == id.name) {
+            if (keyOut) *keyOut = sym;
+            return &st;
+        }
+    }
+    return nullptr;
 }
 
 // fix #4246 (§28.3 / §28.6, v0.298): see IdentifierExpr::disposeReclaims-
@@ -11854,7 +11881,7 @@ LocalOwnership* MethodOwnership::lookupStateFor(const ast::IdentifierExpr& id) {
 // Disposed. // per §28.3, §28.6
 void MethodOwnership::markExplicitDisposeReclaimIfReassignedBorrow(
         const ast::IdentifierExpr& id) {
-    if (LocalOwnership* st = lookupState(id.name)) {
+    if (LocalOwnership* st = lookupStateFor(id)) {
         // fix #4246 follow-up: `state == Owned` covers the FIRST dispose of
         // this value-epoch; `explicitDisposeReclaimedSlot` (already true)
         // covers a REPEATED dispose of the SAME epoch after the first one
@@ -11872,11 +11899,17 @@ void MethodOwnership::markExplicitDisposeReclaimIfReassignedBorrow(
     }
 }
 
-void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation loc) {
+void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation loc,
+                                         const ast::IdentifierExpr* id) {
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be disposed until the bounding scope exits.
-    checkScopedFreeze(name, loc, "dispose");
-    auto* st = lookupState(name);
+    checkScopedFreeze(name, loc, "dispose", id ? ctx_.exprSymbol(*id) : nullptr);
+    sema::Symbol* stKey = nullptr;
+    auto* st = id ? lookupStateFor(*id, &stKey) : lookupState(name);
+    if (!id && st) {
+        for (auto& [s, stt] : states_)
+            if (&stt == st) { stKey = s; break; }
+    }
     if (!st) return;
     if (st->state == OwnershipState::Disposed) {
         // §28.2: `Dispose()` is idempotent — a further call "remains a no-op,
@@ -11983,13 +12016,11 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
     st->explicitDisposeLoc = loc;
     // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
     // check skips a parameter the body explicitly disposes on some path.
-    for (auto& [s, stt] : states_)
-        if (s->name == name) { everDischarged_.insert(s); break; }
+    if (stKey) everDischarged_.insert(stKey);
     // §28.3 (#1900): any subsequent dispose/move on a previously-restored local
     // re-poisons it — `x := new R(); x.Dispose();` leaves the slot disposed, so
     // the next endState-Owned check must NOT auto-drop the slot.
-    for (auto& [s, stt] : states_)
-        if (s->name == name) { definitelyRestoredLocals_.erase(s); break; }
+    if (stKey) definitelyRestoredLocals_.erase(stKey);
 }
 
 // -------------------------------------------------------------------------
@@ -12803,12 +12834,18 @@ bool MethodOwnership::borrowHolderUsedAfterInWindow(
 }
 
 void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
-                                         SourceLocation consumeLoc) {
+                                         SourceLocation consumeLoc,
+                                         const sema::Symbol* consumedSym) {
     // Resolve the consumed binding's symbol (the in-scope one of that name), so
     // holders are matched by symbol identity, not just name.
     const sema::Symbol* consumed = nullptr;
-    for (auto& [sym, st] : states_)
-        if (sym->name == consumedName) { consumed = sym; break; }
+    if (consumedSym) {
+        if (states_.count(const_cast<sema::Symbol*>(consumedSym)))
+            consumed = consumedSym;
+    } else {
+        for (auto& [sym, st] : states_)
+            if (sym->name == consumedName) { consumed = sym; break; }
+    }
     if (!consumed) return;
     for (auto& [holder, st] : states_) {
         if (holder == consumed) continue;
@@ -12877,11 +12914,17 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
     }
 }
 
-void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc) {
+void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc,
+                                      const ast::IdentifierExpr* id) {
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be moved from until the bounding scope exits.
-    checkScopedFreeze(name, loc, "move from");
-    auto* st = lookupState(name);
+    checkScopedFreeze(name, loc, "move from", id ? ctx_.exprSymbol(*id) : nullptr);
+    sema::Symbol* stKey = nullptr;
+    auto* st = id ? lookupStateFor(*id, &stKey) : lookupState(name);
+    if (!id && st) {
+        for (auto& [s, stt] : states_)
+            if (&stt == st) { stKey = s; break; }
+    }
     if (!st) return;
     if (st->state == OwnershipState::MovedFrom) {
         report(
@@ -13003,16 +13046,14 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
     // `using var y := x` adoption. Consuming while a LIVE local borrow of the
     // binding's current value exists is a data race across a domain boundary and
     // a use-after-free within one — reject before marking the binding moved-from.
-    checkConsumeFreeze(name, loc);
+    checkConsumeFreeze(name, loc, stKey);
     st->state = OwnershipState::MovedFrom;
     // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
     // check skips a parameter the body moves out on some path.
-    for (auto& [s, stt] : states_)
-        if (s->name == name) { everDischarged_.insert(s); break; }
+    if (stKey) everDischarged_.insert(stKey);
     // §28.3 (#1900): a move after a restore re-poisons — see the matching
     // comment in markDisposedByName above.
-    for (auto& [s, stt] : states_)
-        if (s->name == name) { definitelyRestoredLocals_.erase(s); break; }
+    if (stKey) definitelyRestoredLocals_.erase(stKey);
 }
 
 // §22.3 (v0.169, #1348): see the header. A named owned binding is exactly the
@@ -13035,7 +13076,7 @@ bool MethodOwnership::isNamedOwnedBinding(const ast::Expr& e) {
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
     if (!id) return false;
     if (id->name == "this" || id->name == "base") return false;
-    const LocalOwnership* st = lookupState(id->name);
+    const LocalOwnership* st = lookupStateFor(*id);
     return st && st->state == OwnershipState::Owned;
 }
 
@@ -13107,7 +13148,7 @@ void MethodOwnership::checkAndMoveBindingOwnedMarker(const ast::Expr& init) {
         if (checkOwnedArgSource(init, id->span.begin)) return;
         // A valid owned source: the named binding is moved-from by this transfer.
         if (isNamedOwnedBinding(init)) {
-            markMovedByName(id->name, id->span.begin);
+            markMovedByName(id->name, id->span.begin, id);
             return;
         }
         // A bare id that is not a live owned binding (`this`/`base`, a moved-from
@@ -13163,7 +13204,9 @@ void MethodOwnership::recordFieldMove(std::string_view name,
 // discharge check requires it to be disposed / moved / returned.
 void MethodOwnership::markOwnedByName(std::string_view name, SourceLocation loc,
                                       const ast::Node* origin) {
-    auto* st = lookupState(name);
+    // fix #5267: resolve by the identifier's symbol when the origin is one.
+    const auto* originId = dynamic_cast<const ast::IdentifierExpr*>(origin);
+    auto* st = originId ? lookupStateFor(*originId) : lookupState(name);
     if (!st) return;                       // not a tracked local: nothing to do
     // A `using var` is scope-bound and implicitly discharged; do not disturb
     // its obligation. (A pre-declared `var` target — the modelled form — is
@@ -13287,7 +13330,7 @@ void MethodOwnership::checkRefOutOwnedOperand(const ast::CallArgument& a) {
             // checkRefOutOperandCategory already reports the more specific
             // "using var" diagnostic for it — skip to avoid a duplicate.
             if (ls->isUsing) return;
-            if (auto* st = lookupState(id->name)) {
+            if (auto* st = lookupStateFor(*id)) {
                 if (st->state == OwnershipState::Owned) {
                     report(
                         Severity::Error, target.span.begin,
@@ -14251,8 +14294,8 @@ bool MethodOwnership::isUnassignedHeapCollectionLiteralLocal(
 // exactly this predicate being asked (and answered) in the classification
 // call but never asked again at the consume-tracking call, so a second
 // owned-field / owning-slot store of the SAME local sailed through unmarked.
-bool MethodOwnership::isMaterializerCarveOutBorrow(std::string_view name) {
-    auto* st = lookupState(name);
+bool MethodOwnership::isMaterializerCarveOutBorrow(const ast::IdentifierExpr& id) {
+    auto* st = lookupStateFor(id);
     if (!st || st->state != OwnershipState::Borrowed) return false;
     // A `const` local's `LocalOwnership` never sets `obligationOrigin` —
     // visitStmt's `LocalConstDecl` arm (fix #3687) populates only
@@ -14523,7 +14566,7 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
         // when this fires — closing the measured double-free where a SECOND
         // owned-field / owning-slot store of the same local sailed through
         // unmarked). // per §21.1, §28.3, stdlib §5/§4.4/§9.6, #4042, #4057
-        if (isMaterializerCarveOutBorrow(id->name)) return false;
+        if (isMaterializerCarveOutBorrow(*id)) return false;
         return true;
     }
     // Not a tracked local. Resolve the symbol to classify the two remaining
@@ -14851,7 +14894,7 @@ void MethodOwnership::checkOwnedReturnDirectBorrow(const ast::Expr& e) {
         if (auto* pid = pb->operand ? dynamic_cast<const ast::IdentifierExpr*>(
                                           pb->operand.get())
                                     : nullptr) {
-            if (auto* st = lookupState(pid->name)) {
+            if (auto* st = lookupStateFor(*pid)) {
                 if (st->state == OwnershipState::Owned) return;
             } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                            ctx_.exprSymbol(*pid))) {
@@ -15664,7 +15707,7 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
         lookThroughForceUnwrap(as.value.get()));
     if (!id) return;
-    auto* st = lookupState(id->name);
+    auto* st = lookupStateFor(*id);
     if (!st) return;
     if (st->state != OwnershipState::Owned) {
         // fix #4057 (§21.1 / §28.3 / §28.5 / §28.11, v0.294): the #4042
@@ -15711,8 +15754,8 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
         // reached for a `ParameterSymbol` (a materializer-bound local is
         // always a `var`-declared LocalDecl, never a parameter).
         // // per §21.1, §28.3, §28.5, §28.11, stdlib §5/§4.4/§9.6, #4042, #4057
-        if (isMaterializerCarveOutBorrow(id->name))
-            markMovedByName(id->name, id->span.begin);
+        if (isMaterializerCarveOutBorrow(*id))
+            markMovedByName(id->name, id->span.begin, id);
         return;
     }
     // A bare owned-PARAMETER read discharges the parameter (the §28.8
@@ -15722,9 +15765,9 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
     // correctly rejects moving out of a `using var`, which is scope-bound).
     sema::Symbol* sym = ctx_.exprSymbol(*id);
     if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
-        markDisposedByName(id->name, id->span.begin);
+        markDisposedByName(id->name, id->span.begin, id);
     } else {
-        markMovedByName(id->name, id->span.begin);
+        markMovedByName(id->name, id->span.begin, id);
     }
 }
 
@@ -17908,7 +17951,7 @@ void MethodOwnership::recordAwaitOperandConsume(
     const ast::Expr* core = lookThroughForceUnwrap(&awaitOperand);
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
     if (!id) return;
-    LocalOwnership* st = lookupState(id->name);
+    LocalOwnership* st = lookupStateFor(*id);
     if (!st) return;
     // §30.5 (v0.190, #1785): a `using var`/`await using var`-bound OwningTask is
     // §28.3-immovable — a read of it is a BORROW, so its Pattern B await is the
@@ -17987,7 +18030,7 @@ void MethodOwnership::recordAwaitOperandConsume(
         // a body-end fire-and-forget — the await never frees a bound task), but the
         // lint that implies the user forgot to discharge must not fire. // per §30.5
         for (auto& [s, stt] : states_)
-            if (s->name == id->name) {
+            if (refersTo(s, *id)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s))
                     if (dynamic_cast<const ast::ForStmt*>(ls->decl))
                         awaitDischargedIterVars_.insert(s);
@@ -18794,7 +18837,7 @@ const ast::Expr* MethodOwnership::assignmentIs28_8_1ThrowableByOverwrite(
     }
     // Plain-`var` owned local: alive iff state is Owned at this program point.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
-        if (auto* st = lookupState(id->name)) {
+        if (auto* st = lookupStateFor(*id)) {
             if (st->state == OwnershipState::Owned) return as.value.get();
         }
     }
@@ -21166,9 +21209,11 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
 
 void MethodOwnership::checkScopedFreeze(std::string_view name,
                                         SourceLocation loc,
-                                        std::string_view action) {
+                                        std::string_view action,
+                                        const sema::Symbol* wanted) {
     for (const auto& [sym, fr] : scopedFrozen_) {
-        if (!sym || sym->name != name) continue;
+        if (!sym) continue;
+        if (wanted ? sym != wanted : sym->name != name) continue;
         // Only mutation AT-OR-AFTER the admission site violates the freeze
         // (source order; a move before the callback was ever admitted is the
         // ordinary §28.3 regime). Loop-carried mutation that lexically
@@ -23461,8 +23506,8 @@ void MethodOwnership::consumeMarkedArmTransfer(std::string_view name,
     }
     // The K5.1 consume-site freeze and the scoped-callback freeze — both
     // diagnose-only, name-keyed like every other consume site's.
-    checkScopedFreeze(name, loc, "move from");
-    checkConsumeFreeze(name, loc);
+    checkScopedFreeze(name, loc, "move from", sym);
+    checkConsumeFreeze(name, loc, sym);
     // The state transition is applied to the SEMA-RESOLVED symbol directly
     // (not via the name-keyed markMovedByName, whose unordered name-scan
     // could mutate a same-named SHADOWED sibling while codegen nulls this
