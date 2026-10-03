@@ -14034,6 +14034,13 @@ void Emitter::disposeDiscardedOwnedOut(llvm::Value* scratch,
     const ast::TypeDeclKind tk = elem->declaration->kind;
     if (tk != ast::TypeDeclKind::Class && tk != ast::TypeDeclKind::Interface)
         return;
+    // fix #5297 / §22.6 "out _", §28.3 *Unbound owned temporaries* rule 1
+    // (v0.313): the discarded `out owned` value is disposed "at the end of the
+    // full statement", after every later operand ran — not right after this
+    // call. Queue it on the K8 boundary; a scratch that is not a plain pointer
+    // alloca keeps the immediate disposal below.
+    if (auto* sa = llvm::dyn_cast<llvm::AllocaInst>(scratch))
+        if (deferUnboundOwnedTempToK8(sa)) return;
     llvm::Value* obj = builder_.CreateLoad(ptrTy(), scratch, "outdisc.obj");
     llvm::Value* isNull = builder_.CreateICmpEQ(
         obj, llvm::ConstantPointerNull::get(ptrTy()));

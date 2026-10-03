@@ -14033,6 +14033,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         for (std::size_t di = discardOwnedBase;
              di < discardOwnedOutSlots_.size(); ++di) {
             llvm::AllocaInst* slot = discardOwnedOutSlots_[di];
+            // fix #5297 / §22.6 "out _", §28.3 rule 1 (v0.313): dispose at the
+            // full statement's end, after every later operand — queue on the
+            // K8 boundary instead of disposing right after the call.
+            if (deferUnboundOwnedTempToK8(slot)) continue;
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), slot, "outdisc.obj");
             llvm::Value* isNull = builder_.CreateICmpEQ(
                 obj, llvm::ConstantPointerNull::get(ptrTy()));

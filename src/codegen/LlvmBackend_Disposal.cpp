@@ -7191,6 +7191,40 @@ void Emitter::registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
 }
 
 
+bool Emitter::deferUnboundOwnedTempToK8(llvm::AllocaInst* slot) {
+    if (!slot || !currentFn_ || emittingDisposerBody_) return false;
+    if (slot->getAllocatedType() != ptrTy()) return false;
+    if (slot->getFunction() != currentFn_) return false;
+    // Entry-block null init, placed right after the alloca so it dominates every
+    // path (#2733). A frame-spilled slot is zeroed by the frame calloc instead
+    // (the entryAllocaNullPtr rationale: the promoted GEP would not dominate an
+    // entry store).
+    if (smStateStruct_) {
+        if (std::find(asyncHandlerSpillSlots_.begin(),
+                      asyncHandlerSpillSlots_.end(),
+                      slot) == asyncHandlerSpillSlots_.end())
+            asyncHandlerSpillSlots_.push_back(slot);
+    } else {
+        llvm::IRBuilder<> tmp(slot->getParent(), std::next(slot->getIterator()));
+        tmp.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), slot);
+    }
+    if (!disposeStack_.empty()) {
+        auto& scope = disposeStack_.back();
+        bool covered = false;
+        for (const auto& d : scope)
+            if (d.slot == slot && d.dynamicDispose) { covered = true; break; }
+        if (!covered) {
+            Disposal d{slot, nullptr};
+            d.unwindOnly = true;
+            d.dynamicDispose = true;
+            scope.push_back(d);
+        }
+    }
+    k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_});
+    return true;
+}
+
+
 void Emitter::flushK8RecvTemps() {
     // Mirrors flushFfiExprTemps / flushAwaitedTaskTemps exactly, including the
     // two retains those document: an entry belonging to ANOTHER function is

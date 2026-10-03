@@ -19188,6 +19188,16 @@ private:
                                         const sema::TypeRef* resultTy);
     // Emit the queued reclaims at a K8 full-expression boundary.
     void flushK8RecvTemps();
+    // fix #5297 / §28.3 *Unbound owned temporaries* rule 1, §22.6 (v0.313):
+    // defer the disposal of an unbound owned class/interface temporary parked
+    // in `slot` (a pointer alloca) to the enclosing K8 full-expression
+    // boundary, the same queue as the receiver temporary above.
+    // Null-initialises the slot at function entry (a sibling branch may never
+    // run the production store), frame-spills it in a state-machine body, and
+    // makes sure an `unwindOnly dynamicDispose` entry covers the exception edge
+    // (a LATER operand that throws). Returns false when the queue cannot be
+    // used (no function / disposer body); the caller keeps its old path.
+    bool deferUnboundOwnedTempToK8(llvm::AllocaInst* slot);
     // Record an awaited Pattern A task temporary at the await's success edge:
     // registers the null-guarded bz_task_free on disposeStack_ (covering the
     // exception edge and acting as the conservative backstop) and queues it for
