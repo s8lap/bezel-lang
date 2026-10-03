@@ -49,6 +49,9 @@ bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 // with ties to even (not double-rounded through a `double` intermediate).
 // `strtof` does exactly this.  Returns {value, overflow}; overflow is true when
 // the correctly-rounded value is not finite (magnitude ≥ float.MaxValue + ½ ulp).
+// fix #5299: errno == ERANGE is deliberately NOT consulted — glibc also sets it
+// on underflow, and §4.3 (v0.313) errors only on a non-finite rounding, so
+// `5e-324` / `1e-400` / `1e-50f` (subnormal or zero) are in range.
 // The `double` overload is provided for callers that need a double result.
 struct FloatLiteralResult {
     float       value;
@@ -62,14 +65,14 @@ inline FloatLiteralResult parseFloatLiteralText(const char* text, size_t) {
     char* end = nullptr;
     errno = 0;
     float v = std::strtof(text, &end);
-    bool overflow = (end == text) || errno == ERANGE || !std::isfinite(v);
+    bool overflow = (end == text) || !std::isfinite(v);
     return {v, overflow};
 }
 inline DoubleLiteralResult parseDoubleLiteralText(const char* text, size_t) {
     char* end = nullptr;
     errno = 0;
     double v = std::strtod(text, &end);
-    bool overflow = (end == text) || errno == ERANGE || !std::isfinite(v);
+    bool overflow = (end == text) || !std::isfinite(v);
     return {v, overflow};
 }
 
