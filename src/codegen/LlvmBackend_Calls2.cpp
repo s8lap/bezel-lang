@@ -13901,6 +13901,48 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // (a second, unrelated +1-producer argument to the same call ALSO loses
     // its release — leaking instead of being reclaimed — the pre-existing
     // leak-over-UAF safe default), not per-argument.
+    // fix #5301 (§14.1 / §28.3 *Bare-type-parameter returns* / §28.9, v0.313):
+    // the COPY a bare-type-parameter return takes at a RUNTIME-MANAGED
+    // substitution, minted HERE at the call rather than in the callee body.
+    //
+    // §28.3's callee-side rule 1 is explicit that the value- and
+    // runtime-managed substitutions are where "returning a parameter COPIES the
+    // value" — so `Mk<string>(p)` hands the caller a FRESH reference, not the
+    // argument's own pointer and not a borrow of it. The compiler must mint
+    // that +1, and it must mint it BEFORE the argument's own discharge below
+    // (the unbound +1-producer release), because at `T = string` the two are
+    // the same allocation: #5301 measured a `heap-use-after-free` on
+    // `var x := Mk<string>("w" + i.ToString())` from exactly that inversion
+    // (7253 B / 398 allocations' sibling issue #5300 leaked instead, because a
+    // NAMED argument's own scope-end release is what the escape walk had
+    // suppressed).
+    //
+    // WHY HERE AND NOT IN THE CALLEE. The callee body is not a reliable place:
+    // the identity `Mk<T>(x: T): T => x` is never emitted at all (there is no
+    // `Program$Mk$spec` in the module for that body form), so a body-side mint
+    // is simply absent for the very shape the issue reports. The call site is
+    // where the classification is decided anyway — `isUserMethodStringReturnCall`
+    // (LlvmBackend_Setup.cpp, the caller-side half of this same change) is what
+    // tells the bind to TRANSFER rather than retain — so the mint and the
+    // transfer cannot drift apart. A block-bodied generic specialization
+    // (`var y: T := x; return y;`) does get emitted, and mints nothing here or
+    // there: the two are alternatives, never both, so exactly one +1 is minted
+    // for every such call.
+    //
+    // Gated on the CALL SITE's substituted result type, not the declaration's:
+    // at `T = SomeClass` §28.3 caller-side clause 1 makes the result a BORROW
+    // (no +1 is minted, and none is owed — the callee's own field stores
+    // retain), and at `T = int` the result is not a pointer at all. So this is
+    // exactly the runtime-managed instantiation the rule speaks about, and
+    // `bz_string_retain`'s existing null-safety (a no-op on a null or an
+    // immortal literal) covers a `T?` substitution's `null`.
+    if (!diverged_ && result && result->getType()->isPointerTy() &&
+        methodReturnsBareTypeParam(ctx_, ms)) {
+        if (const sema::TypeRef* rt = ctx_.exprType(call))
+            if (rt->kind == sema::TypeRef::Kind::Primitive &&
+                rt->primitive == sema::PrimitiveType::String)
+                emitStringRetain(result);
+    }
     if (!diverged_ && !args.empty()) {
         std::size_t argOffset = isStaticMethod(ms) ? 0 : 1;
         bool calleeMayAliasArg =

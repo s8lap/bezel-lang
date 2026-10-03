@@ -263,6 +263,69 @@ inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
 // new one; `record_factory_unbound_temporary_argument_uaf_4322_test.cpp`'s
 // `unrelated_second_argument_no_longer_uaf_but_leaks_call_wide` row pins
 // this (measured: 19890 B / 1000 allocations, a floor per LANE_RULES §30).
+// fix #5300 / #5301 (§14.1 / §28.3 *Bare-type-parameter returns* / §28.9,
+// v0.313): does `ms` DECLARE a return type that is a bare type parameter in
+// scope at its own declaration — the §28.3 bare-type-parameter RETURN
+// signature, keyed PRE-substitution exactly as that rule's clause 1 keys it
+// ("read from the signature *before* generic substitution, with nullability
+// stripped — `T?` qualifies; an `owned T` return is not bare").
+//
+// It is a FREE function, not an Emitter member, so `StringEscapeWalker::
+// walkCallArgs` (a free struct holding only a `SemaContext`, not an `Emitter`)
+// and the Emitter-side consumers read ONE definition.
+//
+// `isBareTypeParamRef` alone is not enough — a declaration-less single-part
+// Named ref is also what an unresolvable name looks like — so the head must be
+// one of the method's OWN declared type-parameter names (§14.1: "a method-,
+// type-, or extension-block-level parameter"). That is strictly fail-closed: an
+// enclosing TYPE's parameter is not matched here, so no such leg answers true.
+//
+// The consumer is the runtime-managed (string) substitution of
+// `Mk<T>(x: T): T`, where §28.3's callee-side rule 1 makes the return-path
+// check vacuous and states the semantics outright — "returning a parameter
+// COPIES the value" — so the call's result is a fresh reference the caller
+// owns, NOT a borrow of the argument and NOT a consumption of it. The pre-fix
+// compiler did neither: it returned the argument's own pointer (no copy) while
+// the caller treated the argument as consumed (no copy for the argument
+// either), which is #5300 (a borrowed local's scope-end release suppressed, its
+// +1 orphaned) and #5301 (a fresh argument freed at the call boundary, then
+// read back through the result).
+inline bool methodReturnsBareTypeParam(const sema::SemaContext& ctx,
+                                       const sema::MethodSymbol* ms) {
+    if (!ms || ms->genericParams.empty() || ctx.isImported(ms)) return false;
+    // SEAM-ACCESSOR: local-path cast — `ctx.isImported(ms)` returns early
+    // above, and an imported method's AST is never reconstructed, so there is
+    // nothing to read. Same #3152 marker as isUserMethodStringReturnCall's own
+    // cast.
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md || !md->returnType) return false;
+    // The `owned` marker is on the DECLARATION NODE, not on the resolved
+    // TypeRef — `ctx.resolvedType(*md->returnType)` cannot see it, and
+    // `sema::methodReturnsOwned` (src/sema/SymbolCollection.cpp) reads exactly
+    // this `md->returnOwned` bit. Without this line the resolved ref of
+    // `owned T` is indistinguishable from that of a bare `T` and the predicate
+    // would answer true for a signature §28.3's clause 1 explicitly excludes
+    // ("an `owned T` return is not bare — it is the ordinary
+    // ownership-transferring return, §28.8").
+    //
+    // It is NOT dead weight. The `owned T` signature is a real, declarable and
+    // instantiable shape (§28.1 admits `owned` on a bare type parameter — it
+    // is the spell §28.3's empty-source-set rule REQUIRES for a factory), and
+    // at a CLASS substitution it reaches the walker's consumer below, which is
+    // NOT string-gated: without this line a plain parameter of an `owned T`
+    // method would be admitted as a borrow SOURCE, while the callee in fact
+    // CONSUMES it into the `owned` return. Answering false keeps the walker's
+    // conservative escape for that shape — leak over UAF.
+    if (md->returnOwned) return false;
+    const sema::TypeRef* rt = ctx.resolvedType(*md->returnType);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration ||
+        !rt->genericArgs.empty() || rt->headName().empty())
+        return false;
+    for (const sema::Symbol* gp : ms->genericParams)
+        if (gp && gp->name == rt->headName()) return true;
+    return false;
+}
+
 inline bool calleeReturnMayAliasStringArgUnretained(
         const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
     if (!ms) return false;
@@ -21081,6 +21144,10 @@ private:
         if (!t->genericArgs.empty()) return false;  // `Foo<X>`, not a bare param
         return !isBuiltinTypeRefName(t->headName());
     }
+
+    // fix #5300 / #5301: the bare-type-parameter-RETURN predicate is the free
+    // `methodReturnsBareTypeParam(ctx, ms)` above (it must also be readable from
+    // `StringEscapeWalker`, which holds no Emitter).
 
     // fix #5242 / fix #3143 (§14.1, v0.313): THE one "is this generic argument
     // a still-unbound template parameter?" predicate behind the `allUnbound`

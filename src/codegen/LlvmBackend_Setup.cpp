@@ -25353,6 +25353,30 @@ bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md || !md->returnType) return false;
     const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+    // fix #5300 / #5301 (§14.1 / §28.3 *Bare-type-parameter returns* /
+    // §28.9, v0.313): the bare-type-parameter RETURN signature at a
+    // RUNTIME-MANAGED substitution. §28.3's callee-side rule 1 makes the
+    // return-path check vacuous there and says what happens instead —
+    // "returning a parameter COPIES the value" — and the call site's mint
+    // (the sibling half of this change, in `lowerCallDispatch`,
+    // LlvmBackend_Calls2.cpp) now takes that copy at `T = string`. So the call
+    // hands the caller exactly +1, and this predicate must say so: the caller
+    // TRANSFERS it (no bind-time retain), exactly as it does for a spelled
+    // `string` return. The mint cannot live in the callee BODY — the
+    // expression-bodied identity is never emitted at all — which is why it is
+    // here at the classification site instead, where the two halves meet.
+    //
+    // The gate is the CALL SITE's expression type, not the declaration's: at
+    // `T = SomeClass` §28.3 caller-side clause 1 makes the result a BORROW
+    // (which mints no +1, and is not this predicate's business), and at
+    // `T = int` the value is not a pointer at all. Reading the substituted
+    // expression type is what keeps the two apart — the same pre-substitution
+    // keying the return-side mint resolves through `genericSubstSemaTy_`.
+    if (methodReturnsBareTypeParam(ctx_, ms)) {
+        const sema::TypeRef* et = ctx_.exprType(*init);
+        return et && et->kind == sema::TypeRef::Kind::Primitive &&
+               et->primitive == sema::PrimitiveType::String;
+    }
     // fix #2196 / §4.6 / §28.9: the locally-compiled-body leg also extends to
     // `string?` — the SAME return-mint above (now nullable-aware) runs in the
     // callee, so the caller receives exactly +1. Excluding nullable here would
@@ -25844,13 +25868,29 @@ void Emitter::armClosureLocalRefcount(const void* declNode,
 // exactly the risk CLAUDE.md rule 6 names. A MethodSymbol that fails ANY clause
 // is null, meaning "no compiled body here to hold the discipline", which is the
 // conservative direction both callers want.
+//
+// fix #5300 / #5301 (§14.1 / §28.3 *Bare-type-parameter returns* / §28.9,
+// v0.313): `admitBareTypeParamReturn` is the ONE clause on which the two
+// consumers differ, and it is a PARAMETER rather than a second copy of the
+// filter for exactly the reason stated above. `StringEscapeWalker::walkCallArgs`
+// passes true (its rationale is at the call site); `refFormalWriteVerdict` keeps
+// the default false, because it goes on to read the callee's AST BODY to decide
+// whether the callee WRITES the formal, and for a GENERIC callee that body is
+// the unsubstituted template — the statements it walks are not the statements
+// the specialization emits. Keeping the default conservative leaves #5275's
+// proven rows verbatim (NoWrite for a generic callee, which is also the
+// pre-#5275 behavior for one) and keeps a body-walk this analysis has never
+// asserted off a shape neither issue covers.
 static const sema::MethodSymbol* plainBorrowAnalysisCallee(
-        const sema::SemaContext& ctx, const ast::Expr* callee) {
+        const sema::SemaContext& ctx, const ast::Expr* callee,
+        bool admitBareTypeParamReturn = false) {
     if (!callee) return nullptr;
     auto* ms = dynamic_cast<const sema::MethodSymbol*>(
         ctx.exprSymbol(*callee));
     if (ms && (ms->isOperator || ms->extensionDecl ||
-               !ms->genericParams.empty() ||
+               (!ms->genericParams.empty() &&
+                !(admitBareTypeParamReturn &&
+                  methodReturnsBareTypeParam(ctx, ms))) ||
                (ms->decl == nullptr && !ctx.isImported(ms))))
         return nullptr;
     return ms;
@@ -26998,7 +27038,52 @@ struct StringEscapeWalker {
             // spelling of the #1430 admission test — refFormalWriteVerdict
             // applies the identical filter to the same callee expression, and a
             // second copy here is the drift CLAUDE.md rule 6 names.
-            ms = plainBorrowAnalysisCallee(ctx, callee);
+            //
+            // fix #5300 (§14.1 / §28.3 *Bare-type-parameter returns* / §28.9,
+            // v0.313): a GENERIC method is still a plain compiled method, and
+            // the blanket `!ms->genericParams.empty()` exclusion made the
+            // walker treat every argument passed to one as an ESCAPE — so a
+            // tracked string local's own scope-end release never armed and its
+            // +1 leaked. `Mk<string>(p)` leaked 7253 B / 398 allocations at
+            // 200x (#5300) for exactly this reason, while the twin without the
+            // generic call was ASan+LSan clean.
+            //
+            // The relaxation is admitted for the ONE generic signature the
+            // argument accounting can be right about without a new analysis:
+            // the bare-type-parameter RETURN (§28.3, keyed pre-substitution by
+            // `methodReturnsBareTypeParam`). At a runtime-managed substitution
+            // §28.3's callee-side rule 1 makes the return path a COPY — the
+            // CALL SITE mints its own +1 for the result (the sibling half in
+            // `lowerCallDispatch`, LlvmBackend_Calls2.cpp; the expression-bodied
+            // identity is never emitted, so there is no callee body to mint it
+            // in) — and the caller's argument keeps its OWN reference, because a
+            // PLAIN parameter is a borrow SOURCE (§28.3 clause 4: "`owned`
+            // parameters are never sources — they are consumed into the callee
+            // and die there", so a plain one is not). At a class or interface
+            // substitution the result is a BORROW re-established against the
+            // caller's own arguments (clause 1) and a parameter stored into a
+            // field is retained by that store — the #5244/#5262
+            // borrowed-argument pin, which covers the call itself. So neither
+            // side can leave the caller's local without an owner.
+            //
+            // Every OTHER generic signature keeps the conservative ESCAPE: the
+            // class-substitution borrow rules, the record/choice/inline-array
+            // return aliases, and the field-store shapes a bare `T` can take are
+            // analyses this walk has never asserted, and leak-over-UAF is the
+            // safe default for them. `calleeReturnMayAliasArgUnretained` below
+            // still applies on top for the return-alias family.
+            //
+            // HOW THE TWO CHANGES COMPOSE. #5275 owns the EXTRACTION (one
+            // spelling of the filter); this call owns the ONE clause on which
+            // the two consumers differ, and passes it as
+            // `admitBareTypeParamReturn` rather than re-inlining the test. The
+            // default stays conservative for `refFormalWriteVerdict`, which
+            // goes on to walk the callee's BODY and cannot for a generic callee
+            // (see the parameter's own comment). `calleeReturnMayAliasArgUn
+            // Retained` below is unchanged and still applies on top of the
+            // admitted `ms` exactly as it did before this relaxation.
+            ms = plainBorrowAnalysisCallee(ctx, callee,
+                                           /*admitBareTypeParamReturn=*/true);
             // fix #2222 residue (FFI+concat scope-end release gap): when the
             // callee is NOT a compiled MethodSymbol, fall through to the FFI
             // form (`extern`/`extern "c"`/`extern block`). An FFI callee with
