@@ -9623,6 +9623,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         // ensureOutVarSlots sized the slot with the i32
                                         // default and the lowering wrote the 8-byte
                                         // `T?` through it (stack-buffer-overflow).
+                                        // fix #5332 (stdlib §4.10 / §1 shape (a),
+                                        // v0.313): `OwningSet<T>.TryPop(query: T,
+                                        // out owned removed: T?)` is the
+                                        // keyed/positional shape-(a) extraction
+                                        // stdlib §1 names, and its element type is
+                                        // `T` = genericArgs[0] (the same slot the
+                                        // Stack/Queue/OwningStack/OwningQueue arms
+                                        // read) — but the table had no OwningSet
+                                        // arm at all, so the inline `out var`
+                                        // recipient was left UNTYPED.
                                         bool posElem =
                                             ((cn == "Stack" || cn == "Queue" ||
                                               cn == "OwningStack" ||
@@ -9631,7 +9641,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                               mn == "TryDequeue" ||
                                               mn == "TryPeek")) ||
                                             (cn == "Channel" &&
-                                             mn == "TryReceive");
+                                             mn == "TryReceive") ||
+                                            (cn == "OwningSet" &&
+                                             mn == "TryPop");
                                         bool valElem =
                                             (cn == "Dictionary" ||
                                              cn == "SortedDictionary" ||
@@ -9907,6 +9919,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             //   OwningArray<T>.TryPopFirst/TryPopLast         → T         (arg 0)
             //   OwningLinkedList<T>.TryPopFirst/TryPopLast    → T         (arg 0)
             //   OwningSet<T>.TryTake                          → T (T?, arg 1)
+            //   OwningSet<T>.TryPop                           → T (T?, arg 1)  #5332
             //   OwningDictionary<K,V>.TryPopValue             → V         (arg 1)
             //   Channel<T>.TryReceive                        → T (T?, arg 0)
             //
@@ -10044,6 +10057,22 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                           pos2 == 0) ||
                                          (cn == "OwningSet" &&
                                           mn == "TryTake" && pos2 == 1) ||
+                                        // fix #5332 (stdlib §4.10 / §1 shape (a),
+                                        // v0.313): `OwningSet<T>.TryPop(query: T,
+                                        // out owned removed: T?)` — the out
+                                        // param is at position 1 (the `query`
+                                        // comes first) and its element type is `T`
+                                        // = genericArgs[0]. MEASURED pre-fix: the
+                                        // arm was missing, so the inline
+                                        // `out using var` recipient was left
+                                        // UNTYPED and the read of it emitted
+                                        // `internal: the argument of this
+                                        // Console.WriteLine failed to lower to a
+                                        // value` (#3079) with the whole
+                                        // statement — line terminator included —
+                                        // dropped from the output.
+                                        (cn == "OwningSet" &&
+                                          mn == "TryPop" && pos2 == 1) ||
                                          (cn == "Channel" &&
                                           mn == "TryReceive" && pos2 == 0)) &&
                                         !rt->genericArgs.empty() &&
