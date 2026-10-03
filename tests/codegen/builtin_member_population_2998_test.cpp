@@ -242,8 +242,13 @@ const std::vector<BuiltinCase>& registryCases() {
         {"CancellationTokenSource",         "import System.Threading; ", "var v := new CancellationTokenSource();", "v"},
 
         // ── §28.13 / §2.16 Shared/Weak references ────────────────────────
-        {"Shared",                          "import System.Threading; ", "var o := new Object(); var v := new Shared<object>(o);", "v"},
-        {"Weak",                            "import System.Threading; ", "var o := new Object(); var v := new Weak<object>(o);", "v"},
+        // §3.4 (v0.313): the type is named `Object` or `System.Object`;
+        // there is no `object` spelling. The lowercase form still reached
+        // this member call — it merely added two unrelated type-resolution
+        // errors, which could mask a regression on the closed-surface arm
+        // this row exists to prove.
+        {"Shared",                          "import System.Threading; ", "var o := new Object(); var v := new Shared<Object>(o);", "v"},
+        {"Weak",                            "import System.Threading; ", "var o := new Object(); var v := new Weak<Object>(o);", "v"},
 
         // ── §3 nullary heap classes (stdlib §2.7/§3.1/§8.1/§7.2) ─────────
         {"Random",                          "import System.Threading; ", "var v := new Random();", "v"},
