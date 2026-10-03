@@ -4485,6 +4485,39 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             else if (a && a->astNode && a->astNode->name &&
                      !a->astNode->name->parts.empty())
                 base = std::string(a->astNode->name->parts.back());
+            // fix #5282 (§14.2 / §14.5, v0.313): an ARGUMENT-INFERRED
+            // substitution is built by `unifyArgSubst` from the argument's
+            // sema TypeRef, which for a PRIMITIVE carries neither
+            // `declaration` nor a name-bearing `astNode` — so this lambda
+            // fell through to the generic "the type argument" and the
+            // diagnostic read "type argument `the type argument` does not
+            // satisfy ...", naming nothing. The explicitly-spelled
+            // `Method<int>` path never hit this because its TypeRef is
+            // resolved from a written ast::Type and keeps its name head.
+            // Spell the primitive the way the sibling `spellTR` lambda in
+            // the non-void arm does, so the inferred form names the same
+            // offending type the explicit form does.
+            else if (a && a->kind == TypeRef::Kind::Primitive) {
+                using P = PrimitiveType;
+                switch (a->primitive) {
+                    case P::Bool:    base = "bool";    break;
+                    case P::Char:    base = "char";    break;
+                    case P::String:  base = "string";  break;
+                    case P::Byte:    base = "byte";    break;
+                    case P::SByte:   base = "sbyte";   break;
+                    case P::Short:   base = "short";   break;
+                    case P::UShort:  base = "ushort";  break;
+                    case P::Int:     base = "int";     break;
+                    case P::UInt:    base = "uint";    break;
+                    case P::Long:    base = "long";    break;
+                    case P::ULong:   base = "ulong";   break;
+                    case P::Float:   base = "float";   break;
+                    case P::Double:  base = "double";  break;
+                    case P::Decimal: base = "decimal"; break;
+                    case P::Object:  base = "Object";  break;
+                    default:         return "the type argument";
+                }
+            }
             else return "the type argument";
             // §7.1 (#741/f13): a nullable type argument displays with its
             // `?` so the diagnostic names the actual offending type
@@ -5720,6 +5753,72 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                     checkMethodGenericConstraints(explicitSubst);
                     checkAsyncInstantiationBorrowBearing(explicitSubst);
+                } else {
+                    // fix #5282 (§14.2 / §14.5, v0.313): #5162 above wired
+                    // only the EXPLICIT type-argument-list half of the
+                    // sibling arm's checks into this void-returning path, so
+                    // a call that OMITS the list — letting §14.5 infer the
+                    // method's type arguments from the arguments — reached
+                    // no `checkMethodGenericConstraints` at all and its
+                    // `where` clause went unenforced. §14.5's closing
+                    // paragraph is explicit that this makes no difference:
+                    // "§14.2 constraint satisfaction is checked after
+                    // inference completes, on the full substitution,
+                    // exactly as for a written type-argument list." The
+                    // non-void arm has run the inferred half since #729;
+                    // run it here too, over the substitution this arm has
+                    // to build itself (the non-void arm's `argSubst` is
+                    // scoped inside its own `md->returnType` branch).
+                    //
+                    // No return-type substitution applies — there is no
+                    // return type — so this is exactly the sibling's
+                    // inference block minus its `rt = ...` line.
+                    std::unordered_set<std::string_view> paramNames;
+                    for (const auto& gp : md->genericParams)
+                        paramNames.insert(gp.name);
+                    std::unordered_map<std::string_view, TypeRef*> argSubst;
+                    // §14.5 *Agreement* / #896: a second, disagreeing binding
+                    // for the same parameter leaves `argSubst` holding the
+                    // first (winning) one, so a constraint checked against it
+                    // would name a type the call never actually proposed. The
+                    // non-void arm reports the disagreement and abandons the
+                    // call (~L5380); this arm does not — a disagreeing
+                    // inference on a void generic method is accepted here
+                    // today, and reporting it is a separate §14.5 concern
+                    // from this issue's where-clause gap. So detect the
+                    // conflict and skip the check, leaving the call's
+                    // accept/reject behavior exactly as it is.
+                    std::unordered_set<std::string_view> inferConflicts;
+                    for (std::size_t pi = 0;
+                         pi < md->params.size() && pi < ce.args.size(); ++pi) {
+                        if (!md->params[pi].type || !ce.args[pi].value) continue;
+                        // §14.5 / §22.4 / #1164: an inline `out var x` (and
+                        // `out using var` / `out owned var`) argument's type is
+                        // inferred FROM the matched `out` parameter, so its
+                        // sema type is the still-unbound parameter itself —
+                        // unifying it here would bind `T` to `T`. The
+                        // non-void arm's skip, verbatim.
+                        {
+                            std::string_view amod = ce.args[pi].modifier;
+                            if (amod == "out var" || amod == "out using var" ||
+                                amod == "out owned var")
+                                continue;
+                        }
+                        TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+                        // §14.1 / #885/#886: a bare `null` literal is typed as
+                        // nullable Object and contributes no binding. Same
+                        // skip as the non-void arm and codegen's lowerCall.
+                        if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
+                            argTy->primitive == PrimitiveType::Object &&
+                            argTy->nullable)
+                            continue;
+                        unifyArgSubst(md->params[pi].type.get(), argTy,
+                                      paramNames, argSubst, &inferConflicts);
+                    }
+                    if (inferConflicts.empty() && !argSubst.empty()) {
+                        checkMethodGenericConstraints(argSubst);
+                        checkAsyncInstantiationBorrowBearing(argSubst);
+                    }
                 }
             }
             auto* unit = ctx_.makeTypeRef();
