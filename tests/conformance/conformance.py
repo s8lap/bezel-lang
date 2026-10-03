@@ -86,9 +86,12 @@ _RUN_SCOPE_ARGV = ["systemd-run", "--user", "--scope", "-q",
 _IN_RUN_CAGE_ENV = "BEZEL_CONFORMANCE_RUN_CAGE"
 _RUN_LOCK_PATH = os.environ.get("BEZEL_CORPUS_LOCK",
                                 "/var/tmp/bezel-scratch/corpus-run.lock")
-# The case enters its worker cgroup, then execs timeout. 125 is timeout's own
-# "could not run" status, so a failed entry never reads as a case verdict.
-_ENTER_SH = ('echo $$ > "$0" || { echo "conformance cage: cannot enter $0" >&2;'
+# The case enters its worker cgroup, then execs timeout. A failed entry exits
+# 125 with _ENTER_FAILED in its output, and caged_run raises on it: a
+# nonzero rc from a case that never ran would otherwise vacuously pass every
+# `reject` row.
+_ENTER_FAILED = "conformance cage: cannot enter"
+_ENTER_SH = ('echo $$ > "$0" || { echo "' + _ENTER_FAILED + ' $0" >&2;'
              ' exit 125; }; exec "$@"')
 
 
@@ -125,13 +128,17 @@ class _WorkerPool:
     def release(self, path):
         # Kill whatever the case left running (a backgrounded child outlives
         # `timeout`); a reused worker must start empty.
-        if _read(os.path.join(path, "cgroup.procs")).strip():
-            _write(os.path.join(path, "cgroup.kill"), "1")
-            deadline = time.monotonic() + 5
-            while "populated 1" in _read(os.path.join(path, "cgroup.events")):
-                if time.monotonic() > deadline:
-                    return  # still dying: retire it rather than reuse it
-                time.sleep(0.01)
+        try:
+            if _read(os.path.join(path, "cgroup.procs")).strip():
+                _write(os.path.join(path, "cgroup.kill"), "1")
+                deadline = time.monotonic() + 5
+                while "populated 1" in _read(os.path.join(path,
+                                                          "cgroup.events")):
+                    if time.monotonic() > deadline:
+                        return  # still dying: retire it rather than reuse it
+                    time.sleep(0.01)
+        except OSError:
+            return  # cannot verify it is empty: retire it rather than reuse it
         with self._lock:
             self._free.append(path)
 
@@ -808,6 +815,8 @@ def caged_run(cmd, cwd=None):
         if worker:
             pool.release(worker)
     text = proc.stdout.decode("utf-8", errors="replace")
+    if worker and proc.returncode == 125 and _ENTER_FAILED in text:
+        raise RuntimeError(text.strip())
     return proc.returncode, text
 
 
