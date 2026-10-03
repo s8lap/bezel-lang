@@ -983,6 +983,39 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
 }
 
 
+// fix #4290 / #5249 / #5270 / #5274 (§28.4 / §28.5, v0.313): the builtin type
+// name of an `owned` field of a VTABLE-LESS builtin class (Mutex, Lock,
+// Semaphore, CancellationTokenSource, Channel, Stopwatch, FileStream, ...),
+// or empty when `fs` is not one. These have no user TypeDecl and no vtable, so
+// `isOwnedReferenceField` is false for them. The declared type is resolved
+// through the ACTIVE substitution first (#5249: a class type parameter shadows
+// a same-named builtin), and only an `owned` field qualifies (#5270: a plain
+// field is a borrow). Single source for the container disposer
+// (emitOwnedFieldDisposals) and the owned-field store gate.
+std::string_view Emitter::ownedVtablelessBuiltinFieldName(
+        const sema::FieldSymbol* fs) {
+    const sema::TypeRef* rt = nullptr;
+    if (fs->decl) {
+        // SEAM-DEBT: #4290 vtableless-builtin release walker — same
+        // imported-symbol seam as the rest of #3149/#3149; fix #4290
+        // demands this read; canonical accessor (sema::fieldDeclTypeOf)
+        // would still need the FieldDecl decl guard for the
+        // `no user TypeDecl` builtin class case.
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (fd && fd->type) rt = ctx_.resolvedType(*fd->type);
+    } else {
+        rt = ctx_.importedMemberType(fs);
+    }
+    rt = resolveTypeParamRef(rt);
+    if (!rt || !hasOwnedModifier(fs)) return {};
+    std::string_view n = builtinTypeName(rt);
+    if (n.empty() ||
+        classifyVtablelessBuiltinRelease(n) == VtablelessBuiltinReleaseArm::None)
+        return {};
+    return n;
+}
+
+
 void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // Each owned field carries either a class/interface object (disposed via
     // its vtable) or — #362 / stdlib §4.5 — a heap collection (freed via
@@ -1207,41 +1240,17 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // isOwnedReferenceField returns false and the field would otherwise be
             // silently skipped.  Classify by name via builtinTypeName +
             // classifyVtablelessBuiltinRelease.
-            const sema::TypeRef* rt = nullptr;
-            if (fs->decl) {
-                // SEAM-DEBT: #4290 vtableless-builtin release walker — same
-                // imported-symbol seam as the rest of #3149/#3149; fix #4290
-                // demands this read; canonical accessor (sema::fieldDeclTypeOf)
-                // would still need the FieldDecl decl guard for the
-                // `no user TypeDecl` builtin class case.
-                auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                if (fd && fd->type) rt = ctx_.resolvedType(*fd->type);
-            } else {
-                rt = ctx_.importedMemberType(fs);
-            }
-            // fix #5249 / §14.1 (v0.313): a class type parameter shadows a
-            // same-named builtin in the class body, so a field typed by the
-            // parameter (`class Box<Stopwatch> v: Stopwatch`) must be resolved
-            // through the ACTIVE substitution BEFORE the name-keyed builtin
-            // classification — otherwise `Box<int>` frees an int as a Stopwatch.
-            rt = resolveTypeParamRef(rt);
-            // fix #5270 (§28.4 / §28.5, v0.313): only an `owned` field is
-            // disposed with its container. A plain field of a vtableless
-            // builtin type (`public v: Stopwatch;`, the §28.3 back-reference
-            // idiom, or a generic `v: T` instantiated at one) is a BORROW whose
-            // owner disposes it; releasing it here was a double free. Every
-            // sibling arm (isOwnedReferenceField, taskFamilyTypeFromField
-            // #2260, isOwnedFfiBufferField, isOwnedSharedWeakField) already
-            // gates on the modifier; this arm alone did not.
-            if (rt && hasOwnedModifier(fs)) {
-                if (auto n = builtinTypeName(rt); !n.empty()) {
-                    if (classifyVtablelessBuiltinRelease(n) !=
-                        VtablelessBuiltinReleaseArm::None) {
-                        OwnedField of{fs, nullptr};
-                        of.vtablelessBuiltin = std::string(n);
-                        owned.push_back(of);
-                    }
-                }
+            // fix #5274 (§28.3 / §28.8, v0.313): the classification (resolve
+            // the declared type through the active substitution, require the
+            // `owned` modifier per #5270/#5249, take the builtin's name) lives
+            // in ONE helper, `ownedVtablelessBuiltinFieldName`, shared with the
+            // owned-field STORE gate (`isOwnedFieldStoreTarget`) so the store's
+            // consume of an `owned` parameter and this disposal cannot drift.
+            if (std::string_view n = ownedVtablelessBuiltinFieldName(fs);
+                !n.empty()) {
+                OwnedField of{fs, nullptr};
+                of.vtablelessBuiltin = std::string(n);
+                owned.push_back(of);
             }
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
             // Weak<T> type.  These are compiler-known ref-counted heap objects

@@ -18350,6 +18350,17 @@ private:
     // instances remain; these are disposed at scope end by emitOwnedFieldDisposals
     // and need drop-on-overwrite on reassignment.
     bool isOwnedClassFieldLvalue(const ast::Expr& target);
+    // fix #5274 (§28.3 K7.4 / K1.4, §28.8, v0.313): the builtin name of an
+    // `owned` vtable-less builtin class field (Stopwatch, Mutex, ...), else empty.
+    std::string_view ownedVtablelessBuiltinFieldName(const sema::FieldSymbol* fs);
+    // fix #5274: is `target` ANY `owned` instance-field lvalue of a CLASS that
+    // the container's disposer (emitOwnedFieldDisposals) releases, whatever the
+    // field's type kind (class / interface, collection, Task, Shared/Weak,
+    // Subscription, event source, FFI buffer, vtable-less builtin, iterator
+    // interface, builtin exception)? The store of a bare `owned` parameter into
+    // such a field transfers the obligation, so one predicate gates both the
+    // slot-null at the store and the unwind-ineligibility exemption.
+    bool isOwnedFieldStoreTarget(const ast::Expr& target);
     // §28.7 / #1328: dispose the prior value of an owned class/interface CLASS
     // field before storing the new owner.  Order (per spec §28.7): load-old →
     // null-guard (moved-from / never-assigned slot holds null) → identity-guard

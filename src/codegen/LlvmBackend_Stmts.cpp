@@ -2127,16 +2127,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // moved path and still disposes the no-store path. Without
                 // this the drop freed the object the field now owns
                 // (heap-use-after-free). Self-gated: only an `owned`
-                // parameter source into an owned class/collection/task field.
+                // parameter source into ANY owned field the container disposes
+                // (fix #5274: not only class/collection/task, also vtable-less
+                // builtins, Shared/Weak, Subscription, event sources, FFI buffers).
                 if (as->value && !as->valueHasOwnedMarker) {
                     if (auto* vid = dynamic_cast<const ast::IdentifierExpr*>(
                             as->value.get())) {
                         auto* vps = dynamic_cast<sema::ParameterSymbol*>(
                             ctx_.exprSymbol(*vid));
                         if (vps && vps->modifier == "owned" &&
-                            (isOwnedClassFieldLvalue(*as->target) ||
-                             isOwnedCollectionFieldLvalue(*as->target) ||
-                             isOwnedTaskField(*as->target)))
+                            isOwnedFieldStoreTarget(*as->target))
                             nullTransferredOwnedLocalSlot(as->value.get());
                     }
                 }

@@ -23719,8 +23719,7 @@ void Emitter::collectUnwindIneligible(
     unwindIneligible_.clear();
     UnwindIneligibleWalker w{ctx_, unwindIneligible_};
     w.ownedFieldStoreNulls = [this](const ast::Expr& t) {
-        return isOwnedClassFieldLvalue(t) || isOwnedCollectionFieldLvalue(t) ||
-               isOwnedTaskField(t);
+        return isOwnedFieldStoreTarget(t);
     };
     for (auto& s : body) w.stmt(s.get());
 }
@@ -30281,6 +30280,32 @@ bool Emitter::isOwnedClassFieldLvalue(const ast::Expr& target) {
     // disposes the displaced iterator FRAME on reassignment (via the iterator-
     // vtable slot-1 protocol, mirroring emitOwnedFieldDisposals' iterField branch).
     return isOwnedReferenceField(fs) || isOwnedIteratorInterfaceField(fs);
+}
+
+
+// fix #5274 (§28.3 K7.4 / K1.4, §28.8, v0.313): see the declaration. The
+// lvalue-shape guards are the same as isOwnedClassFieldLvalue /
+// isOwnedTaskField; the type-kind arms are exactly the kinds
+// emitOwnedFieldDisposals disposes, so "the store transfers the obligation"
+// holds for every owned field the disposer will later release.
+bool Emitter::isOwnedFieldStoreTarget(const ast::Expr& target) {
+    if (isOwnedClassFieldLvalue(target) || isOwnedCollectionFieldLvalue(target) ||
+        isOwnedTaskField(target))
+        return true;
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(target));
+    if (!fs || !fs->parent || fs->parent->kind != ast::TypeDeclKind::Class)
+        return false;
+    if (fieldIndex_.find(fs) == fieldIndex_.end()) return false;
+    return isOwnedBuiltinExceptionField(fs) || isOwnedSubscriptionField(fs) ||
+           isOwnedEventSourceField(fs) || isOwnedSharedEventSourceField(fs) ||
+           isOwnedSharedWeakField(fs) || isOwnedFfiBufferField(fs) ||
+           !ownedVtablelessBuiltinFieldName(fs).empty();
 }
 
 
