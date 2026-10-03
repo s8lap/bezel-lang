@@ -20,4 +20,5 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conformance  # noqa: E402
 
 if __name__ == "__main__":
+    conformance.enter_run_cage(__file__, sys.argv[1:])
     sys.exit(conformance.main(sys.argv[1:]))

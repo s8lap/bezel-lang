@@ -45,6 +45,8 @@ def cage(cmd, use_cage):
         return cmd
     return [
         "systemd-run", "--user", "--scope", "-q",
+        # Never app.slice, the desktop's own CPU group (2026-10-03 freeze).
+        "-p", "Slice=bezel-heavy.slice",
         "-p", "MemoryMax=20G", "-p", "MemorySwapMax=0",
     ] + cmd
 

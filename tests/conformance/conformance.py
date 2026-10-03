@@ -22,19 +22,23 @@ WHY PYTHON
   injectable via the `run` callable.
 
 MEMORY DISCIPLINE
-  Every bezelc call AND every compiled-program run is wrapped in
-  `systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 -- timeout
-  30`, exactly as the bash did. Cases are processed SEQUENTIALLY.
+  Every bezelc call AND every compiled-program run is caged at MemoryMax=4G,
+  no swap, under `timeout 30`. The cage is a per-worker cgroup inside ONE
+  delegated scope in bezel-heavy.slice per run (see "The per-case cage" below);
+  one corpus run at a time machine-wide.
 
 Stdlib only (subprocess/tempfile/re/csv); no pytest, no new deps (#3010).
 """
 
+import fcntl
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 # -----------------------------------------------------------------------
 # Wrap modes (mirror run_conformance.sh wrap_fragment's emitted mode strings)
@@ -44,16 +48,150 @@ WRAP_AS_IS_LIB = "as-is-lib"          # has `module`, no Main → compile as lib
 WRAP_LIB = "lib"                      # wrapped with `module Conf;`, compile -c
 WRAP_STMT = "stmt"                    # wrapped as Main-body statements
 
-# Per-case compile/run timeout (seconds), inside the systemd-run scope. per the
-# bash harness comment block.
+# Per-case compile/run timeout (seconds), inside the cage. per the bash harness
+# comment block.
 CASE_TIMEOUT_S = 30
 
-# The MemoryMax/MemorySwapMax cage every bezelc invocation and every
-# compiled-program run is wrapped in (#3010 memory discipline; anti-freeze
-# cgroup policy). Sequential, never parallel.
+# -----------------------------------------------------------------------
+# The per-case cage: MemoryMax=4G, no swap, `timeout CASE_TIMEOUT_S`, around
+# every bezelc invocation and every compiled-program run (#3010 memory
+# discipline).
+#
+# Where it lives (2026-10-03 desktop freeze). It used to be one
+# `systemd-run --user --scope` per call with no Slice=, which (a) put every
+# case in app.slice, the interactive desktop's own CPU group, uncapped and
+# outside both the bezel slices and the jobserver, and (b) created ~2k
+# transient units per corpus run (1.7M over one 12-day uptime), backlogging
+# the systemd user manager that also runs the desktop session. With a few
+# 12-job runs overlapping, the desktop stayed unusable for 30 minutes.
+#
+# Now a run re-execs itself into ONE delegated scope in bezel-heavy.slice
+# (enter_run_cage, called by the entry points) and holds the machine-wide
+# corpus lock. Each concurrent worker reuses its own child cgroup carrying the
+# same 4G / no-swap limits, and anything a case leaves behind is killed via
+# cgroup.kill. Without a delegated scope (a caller that never entered one, or
+# delegation unavailable) each call falls back to its own scope, still in
+# bezel-heavy.slice, never app.slice.
+# -----------------------------------------------------------------------
+_CAGE_SLICE = "bezel-heavy.slice"
+_CASE_LIMITS = (("memory.max", "4G"), ("memory.swap.max", "0"))
 _CAGE_ARGV = ["systemd-run", "--user", "--scope", "-q",
+              "-p", "Slice=" + _CAGE_SLICE,
               "-p", "MemoryMax=4G", "-p", "MemorySwapMax=0",
               "--", "timeout", str(CASE_TIMEOUT_S)]
+# The whole run's scope: a ceiling over all workers together.
+_RUN_SCOPE_ARGV = ["systemd-run", "--user", "--scope", "-q",
+                   "-p", "Slice=" + _CAGE_SLICE, "-p", "Delegate=yes",
+                   "-p", "MemoryMax=10G", "-p", "MemorySwapMax=0", "--"]
+_IN_RUN_CAGE_ENV = "BEZEL_CONFORMANCE_RUN_CAGE"
+_RUN_LOCK_PATH = os.environ.get("BEZEL_CORPUS_LOCK",
+                                "/var/tmp/bezel-scratch/corpus-run.lock")
+# The case enters its worker cgroup, then execs timeout. 125 is timeout's own
+# "could not run" status, so a failed entry never reads as a case verdict.
+_ENTER_SH = ('echo $$ > "$0" || { echo "conformance cage: cannot enter $0" >&2;'
+             ' exit 125; }; exec "$@"')
+
+
+class _WorkerPool:
+    """Reusable per-worker child cgroups of the delegated run scope."""
+
+    def __init__(self, root):
+        self._root = root
+        self._free = []
+        self._made = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def setup(root):
+        # cgroup v2 "no internal processes": the run's own process moves into
+        # a leaf before controllers can be enabled for the worker children.
+        # Writing a pid to cgroup.procs moves the whole thread group.
+        os.mkdir(os.path.join(root, "main"))
+        _write(os.path.join(root, "main", "cgroup.procs"), str(os.getpid()))
+        _write(os.path.join(root, "cgroup.subtree_control"), "+memory +pids")
+        return _WorkerPool(root)
+
+    def acquire(self):
+        with self._lock:
+            if self._free:
+                return self._free.pop()
+            self._made += 1
+            path = os.path.join(self._root, "w%d" % self._made)
+        os.mkdir(path)
+        for knob, value in _CASE_LIMITS:
+            _write(os.path.join(path, knob), value)
+        return path
+
+    def release(self, path):
+        # Kill whatever the case left running (a backgrounded child outlives
+        # `timeout`); a reused worker must start empty.
+        if _read(os.path.join(path, "cgroup.procs")).strip():
+            _write(os.path.join(path, "cgroup.kill"), "1")
+            deadline = time.monotonic() + 5
+            while "populated 1" in _read(os.path.join(path, "cgroup.events")):
+                if time.monotonic() > deadline:
+                    return  # still dying: retire it rather than reuse it
+                time.sleep(0.01)
+        with self._lock:
+            self._free.append(path)
+
+
+def _write(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def _read(path):
+    with open(path) as f:
+        return f.read()
+
+
+_pool = None
+_pool_init_lock = threading.Lock()
+_pool_tried = False
+
+
+def _worker_pool():
+    """The delegated-scope pool, or None (fall back to a scope per call)."""
+    global _pool, _pool_tried
+    with _pool_init_lock:
+        if _pool_tried:
+            return _pool
+        _pool_tried = True
+        if os.environ.get(_IN_RUN_CAGE_ENV) != str(os.getpid()):
+            return None
+        try:
+            rel = [l[3:] for l in _read("/proc/self/cgroup").splitlines()
+                   if l.startswith("0::")][0].strip()
+            _pool = _WorkerPool.setup("/sys/fs/cgroup" + rel)
+        except (OSError, IndexError) as e:
+            print("conformance cage: no delegated cgroup (%s); falling back to "
+                  "one scope per case" % e, file=sys.stderr)
+        return _pool
+
+
+def enter_run_cage(script, argv):
+    """Entry-point prologue: re-exec `script argv` inside one delegated scope in
+    bezel-heavy.slice (unless already there), then take the machine-wide corpus
+    lock. Without systemd-run it returns and every call cages itself."""
+    if os.environ.get(_IN_RUN_CAGE_ENV) != str(os.getpid()) \
+            and shutil.which("systemd-run"):
+        # `systemd-run --scope` execs the command itself, so the pid is kept:
+        # the marker names exactly this process, never a child that inherits it.
+        os.environ[_IN_RUN_CAGE_ENV] = str(os.getpid())
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execvp("systemd-run", _RUN_SCOPE_ARGV +
+                  [sys.executable, os.path.abspath(script)] + list(argv))
+    os.makedirs(os.path.dirname(_RUN_LOCK_PATH), exist_ok=True)
+    fd = os.open(_RUN_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("conformance: another corpus run holds %s; waiting"
+              % _RUN_LOCK_PATH, file=sys.stderr, flush=True)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    # fd stays open (and locked) until the process exits.
 
 # -----------------------------------------------------------------------
 # Wrap heuristic — PURE function of the source text.
@@ -647,7 +785,7 @@ def read_manifest(path):
 # -----------------------------------------------------------------------
 
 def caged_run(cmd, cwd=None):
-    """Run cmd under the systemd-run MemoryMax/swap=0 cage + `timeout`, merging
+    """Run cmd in the 4G/no-swap per-case cage + `timeout`, merging
     stderr into stdout. Returns (rc, combined_text). timeout's exit is 124.
     This is the ONLY non-pure seam in a case run; run_case accepts it via the
     `run` parameter so tests inject a fake and never touch bezelc/systemd."""
@@ -655,9 +793,20 @@ def caged_run(cmd, cwd=None):
     # input must see end-of-input, or its verdict becomes a property of the
     # machine the gate runs on (a TTY blocks to the shard ceiling; a pipe
     # feeds it data the case never asked for).
-    proc = subprocess.run(_CAGE_ARGV + list(cmd), cwd=cwd,
-                          stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    pool = _worker_pool()
+    worker = pool.acquire() if pool else None
+    if worker:
+        argv = ["sh", "-c", _ENTER_SH, os.path.join(worker, "cgroup.procs"),
+                "timeout", str(CASE_TIMEOUT_S)] + list(cmd)
+    else:
+        argv = _CAGE_ARGV + list(cmd)
+    try:
+        proc = subprocess.run(argv, cwd=cwd,
+                              stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    finally:
+        if worker:
+            pool.release(worker)
     text = proc.stdout.decode("utf-8", errors="replace")
     return proc.returncode, text
 

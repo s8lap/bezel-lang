@@ -1565,7 +1565,7 @@ if [ ! -x "$REPO/build/bezelc" ]; then
   say "  cannot run"
   exit 1
 fi
-if ! python3 scripts/gate_rule_corpus_baseline.py --strict \
+if ! python3 scripts/gate_rule_corpus_baseline.py --strict --jobs 8 \
       --bezelc "$REPO/build/bezelc" \
       >> "$_rcb_log" 2>&1; then
   say "CYCLE FAILURE: the rule corpus has a REGRESSION or UNBANKED row"

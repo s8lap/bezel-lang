@@ -261,7 +261,9 @@ def main(argv):
                      help="gate mode: run the corpus for real and fail on "
                           "any REGRESSION/UNBANKED row or a low case count")
     ap.add_argument("--bezelc", default=os.path.join(REPO, "build", "bezelc"))
-    ap.add_argument("--jobs", type=int, default=12)
+    # Small default: lanes run this concurrently with builds and suites. The
+    # gate and pregate own the box and pass a larger --jobs explicitly.
+    ap.add_argument("--jobs", type=int, default=4)
     args = ap.parse_args(argv)
 
     if args.self_test:

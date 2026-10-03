@@ -11,10 +11,10 @@
 # `run_conformance.sh <bezelc>` interface stable for callers/docs (CLAUDE.md,
 # the gate wiring, the 0022 proposal) so the port needs no companion churn.
 #
-# Memory discipline is unchanged: every bezelc call and every compiled-program
-# run is still wrapped (inside the Python) in
-#   systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 -- timeout 30
-# and cases are processed SEQUENTIALLY.
+# Memory discipline: every bezelc call and every compiled-program run is caged
+# (inside the Python) at MemoryMax=4G, no swap, under `timeout 30`, within one
+# delegated scope in bezel-heavy.slice per run (conformance.py, "The per-case
+# cage"). Cases are processed SEQUENTIALLY.
 #
 # Exit code: 0 iff every non-skip case passes AND at least one case passed
 # (Plan-A 5.1); 1 otherwise.

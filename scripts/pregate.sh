@@ -126,7 +126,7 @@ corpus() {
   python3 tests/conformance/rules/corpus.py check || return 1
   python3 -m unittest discover -s tests/conformance -p 'test_conformance.py' || return 1
   python3 scripts/gate_rule_corpus_baseline.py --self-test || return 1
-  python3 scripts/gate_rule_corpus_baseline.py --strict --bezelc "$BEZELC" || return 1
+  python3 scripts/gate_rule_corpus_baseline.py --strict --jobs 8 --bezelc "$BEZELC" || return 1
 }
 if [ "${RESULT[bezelc]}" = PASS ]; then run_bg corpus corpus; fi
 

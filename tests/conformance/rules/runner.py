@@ -463,4 +463,5 @@ def main(argv, base_dir=None, run=conformance.caged_run):
 
 
 if __name__ == "__main__":
+    conformance.enter_run_cage(__file__, sys.argv[1:])
     sys.exit(main(sys.argv[1:]))

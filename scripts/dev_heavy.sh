@@ -117,9 +117,12 @@ case "$kind" in
     # terminal and the Claude session live, and probe pressure there gets THEM
     # killed by systemd-oomd rather than the probe (three konsole tabs died this
     # way on 2026-09-20, one taking a running gate with it). Give probes their own
-    # slice, likewise opted out of the kill-on-pressure default.
+    # slice, likewise opted out of the kill-on-pressure default. CPU is capped
+    # too (it had no CPU limit at all; 2026-10-03 desktop freeze): 6 of 20
+    # cores, and the same background weight as the heavy slice.
     systemctl --user set-property bezel-probe.slice \
-      MemoryMax=6G ManagedOOMMemoryPressure=auto >/dev/null 2>&1 || true
+      MemoryMax=6G CPUQuota=600% CPUWeight=60 \
+      ManagedOOMMemoryPressure=auto >/dev/null 2>&1 || true
     exec systemd-run --user --scope -q -p Slice=bezel-probe.slice \
       -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;
 esac
