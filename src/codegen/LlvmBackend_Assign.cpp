@@ -2512,6 +2512,21 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                 genericSubstSemaTy_ = std::move(ancSema);
                 idxSubstInstalled = true;
             }
+        } else if (idxRecvTy4973 &&
+                   idxRecvTy4973->kind == sema::TypeRef::Kind::Named &&
+                   idxRecvTy4973->declaration == ps->parent &&
+                   !idxRecvTy4973->genericArgs.empty()) {
+            // fix #5315-family (§14.1 / §23.4, v0.313): a DIRECT generic
+            // receiver (`b[i]` where `b: Holder<string>`, the indexer declared
+            // on `Holder<T>`) — the case the ancestor branch above skips. Without
+            // the receiver's substitution the standalone getter lowers against
+            // the erased T->i32 template (wrong signature and field offsets),
+            // and the owner-instantiation memo key would be empty for every
+            // instantiation. Same helper the expression-bodied twin uses.
+            auto directSaved = setupReceiverGenericSubst(ix.target.get(), ps->parent);
+            savedIdxSubst = std::move(directSaved.subst);
+            savedIdxSema = std::move(directSaved.semaTy);
+            idxSubstInstalled = true;
         }
         llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
         llvm::Value* res =
@@ -6390,9 +6405,16 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     const sema::PropertySymbol* ps) {
     // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
     // the shared/erased template every ordinary caller wants.
-    auto bgKey = std::make_pair(pd, accessorSpecTagNow());
-    auto it = propBlockGetterFns_.find(bgKey);
-    if (it != propBlockGetterFns_.end()) return it->second;
+    //
+    // fix #5315-family (§14.1 / §23.4, v0.313): ...and the OWNER's instantiation
+    // (`propertyThunkSubstKey`, the key `ensurePropertyBlockGetter` uses). The
+    // signature (`lowerType(pd->type)`) and body (field GEPs against one
+    // `class.Holder$specN`) are lowered under the live §14.1 substitution, so a
+    // memo per `pd` froze the first instantiation's getter for every later one.
+    PropBlockGetterKey bgKey{pd, accessorSpecTagNow(), {}, {}};
+    if (ps) propertyThunkSubstKey(ps, std::get<2>(bgKey), std::get<3>(bgKey));
+    auto it = propBlockGetterInstFns_.find(bgKey);
+    if (it != propBlockGetterInstFns_.end()) return it->second;
 
     llvm::Type* retTy = lowerType(pd->type.get());
     if (!retTy) retTy = i32();
@@ -6409,7 +6431,7 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage, "bz$indexer$get", *module_);
-    propBlockGetterFns_[bgKey] = fn;
+    propBlockGetterInstFns_[bgKey] = fn;
 
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
 
