@@ -14416,32 +14416,48 @@ private:
                                   const std::function<void()>& onFault = {},
                                   bool deferToScopeOnly = false,
                                   bool drainChainOnTake = false,
-                                  // #5305 / §30.14 (v0.313) / §30.15: the awaited
-                                  // result is a channel item WORD holding a cell
-                                  // pointer to an aggregate element's copy, so
-                                  // read the word as a pointer and unbox it (see
-                                  // decodeChannelItemWord) rather than loading
-                                  // `resultTy` bytes out of the result buffer.
-                                  bool resultBoxed = false);
+                                  // #5305 / §30.14 (v0.313) / §30.15 /
+                                  // #5305-ff2: non-null exactly when the awaited
+                                  // result is a channel item WORD holding a
+                                  // cell pointer to an AGGREGATE element's copy
+                                  // — the element TypeRef T itself, so the decode
+                                  // below asks `sema::isAggregateChannelElement`
+                                  // about the very same T the encoder boxed for
+                                  // (rather than loading `resultTy` bytes out of
+                                  // the result buffer). See
+                                  // decodeChannelItemWord.
+                                  const sema::TypeRef* resultBoxedTy = nullptr);
 
-    // #5305 / §30.14 (v0.313) / §30.15: is `e` a `Channel<T>.Receive()` call on
-    // an AGGREGATE-element channel? Defined in LlvmBackend_Async.cpp beside
-    // lowerAwait, its only caller.
+    // #5305 / §30.14 (v0.313) / §30.15 / #5305-ff2: the element TypeRef T of an
+    // `await`-able `Channel<T>.Receive()` whose element T is an AGGREGATE
+    // value type, or nullptr. Defined in LlvmBackend_Async.cpp beside
+    // lowerAwait. The bool-only form is kept for callers that only need the
+    // yes/no.
+    const sema::TypeRef* channelReceiveAggregateElementTy(const ast::Expr* e);
     bool channelReceiveHasAggregateElement(const ast::Expr* e);
 
-    // #5305 / §30.14 (v0.313) / §30.15: the `await for … in ch.ReceiveAll()`
-    // twin of channelReceiveHasAggregateElement — the drain yields an
-    // AGGREGATE element through the same item WORD, so the loop variable must
-    // be unboxed the same way. See the definition in LlvmBackend_Async.cpp.
+    // #5305 / §30.14 (v0.313) / §30.15 / #5305-ff2: the `await for … in
+    // ch.ReceiveAll()` twin of channelReceiveAggregateElementTy — the drain
+    // yields an AGGREGATE element through the same item WORD, so the loop
+    // variable must be unboxed the same way. See the definition in
+    // LlvmBackend_Async.cpp.
+    const sema::TypeRef* channelDrainAggregateElementTy(const ast::Expr* e);
     bool channelDrainHasAggregateElement(const ast::Expr* e);
 
-    // #5305 / §30.14 (v0.313) / §30.15: the channel ITEM-WORD codec — one
-    // encode and one decode shared by all three Send sites, the TryReceive
-    // decode, and the `await ch.Receive()` result decode, so no two can drift.
-    // See the definition comments in LlvmBackend_Calls3.cpp.
+    // #5305 / §30.14 (v0.313) / §30.15 / #5305-ff2: the channel ITEM-WORD codec
+    // — one encode and one decode shared by all three Send sites, the
+    // TryReceive decode, the `await ch.Receive()` result decode and the
+    // `ReceiveAll()` drain, so no two can drift. `elemTy` is the channel's
+    // ELEMENT type T; BOTH halves gate the aggregate case on
+    // `sema::isAggregateChannelElement(elemTy)`, never on the lowered LLVM
+    // type, so the encode and decode decisions are made from one predicate
+    // over one TypeRef. See the definition comments in LlvmBackend_Calls3.cpp.
     llvm::Value* encodeChannelItemWord(llvm::Value* item,
+                                       const sema::TypeRef* elemTy,
                                        const std::string& prefix);
-    llvm::Value* decodeChannelItemWord(llvm::Value* rawPtr, llvm::Type* valTy,
+    llvm::Value* decodeChannelItemWord(llvm::Value* rawPtr,
+                                       const sema::TypeRef* elemTy,
+                                       llvm::Type* valTy,
                                        const std::string& prefix);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`

@@ -10648,11 +10648,16 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // Every other async enumerable is untouched: the by-value slot-3 call is
     // exactly what they produce.
     llvm::Value* curVal = nullptr;
-    if (channelDrainHasAggregateElement(fs.iterable.get())) {
+    // #5305-ff2: the element TypeRef T travels with the flag, so the decode
+    // gates on `sema::isAggregateChannelElement(T)` — the same predicate on
+    // the same T the encoder boxed for.
+    if (const sema::TypeRef* drainElemTy =
+            channelDrainAggregateElementTy(fs.iterable.get())) {
         auto* cellTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
         llvm::Value* cell =
             builder_.CreateCall(cellTy, curFnPtr, {enumObj2}, "afor.boxed.ptr");
-        curVal = decodeChannelItemWord(cell, elemTy, "afor.boxed");
+        curVal = decodeChannelItemWord(cell, drainElemTy, elemTy,
+                                       "afor.boxed");
     } else {
         curVal = builder_.CreateCall(currentTy, curFnPtr, {enumObj2}, "afor.cur");
     }

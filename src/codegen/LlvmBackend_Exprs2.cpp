@@ -7444,14 +7444,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // (per §30.15 / §28.11 v0.135: class elements are owned, the
                 // runtime disposes them when the channel is closed/drained).
                 llvm::Value* dispArg = elementDisposerArg(chElemTy, /*owningFamily=*/true);
-                // #5305 / §30.15: an AGGREGATE element (a sendable record or a
-                // choice, §30.14 v0.313; choice sendability is §35.12 v0.313)
-                // is not a bare value in the channel's item deque — the
-                // Send encoding puts it in a fresh heap cell (encodeChannelItemWord),
-                // so the cell IS a heap object the channel owns while it sits
-                // buffered. §30.15's undelivered-items rule ("undelivered items
-                // disposed at the channel's disposal", and the same for a send
-                // refused because the channel is closed or full) therefore has a
+                // #5305 / §30.15 / #5305-ff2: an AGGREGATE element (any
+                // §30.14-sendable type whose lowering is a struct or array —
+                // the set is `sema::isAggregateChannelElement`, whose members
+                // and evidence are enumerated at its definition) is not a bare
+                // value in the channel's item deque — the Send encoding puts it
+                // in a fresh heap cell (encodeChannelItemWord), so the cell IS a
+                // heap object the channel owns while it sits buffered.
+                // §30.15's undelivered-items rule ("undelivered items disposed
+                // at the channel's disposal", and the same for a send refused
+                // because the channel is closed or full) therefore has a
                 // disposer for this element type: plain `free` of the cell. The
                 // received-and-decoded cell is released by the decoder instead,
                 // so the two obligations never overlap.

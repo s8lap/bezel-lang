@@ -52,21 +52,31 @@ inline bool isSendableType(const TypeRef* rt, SemaContext& ctx) {
 //
 // A `Channel<T>` item rides one ptr-sized word (§30.15's `void*` cell). A
 // scalar value type (primitive, enum, `double`, `char`) rides it directly; an
-// AGGREGATE value type — a sendable record, or a choice (the two kinds §30.14's
-// value-type bullet names; the choice's own sendability rule is §35.12, v0.313)
-// — has no such ≤64-bit encoding, so the compiler carries it as a POINTER to
-// a fresh heap cell holding a copy of the value (§30.14's value-type bullet,
-// "A sendable value crosses as a copy"). The set is declared HERE, once, so
-// that every site which must agree on it by construction does. All three are
-// codegen, and all three are keyed on the same predicate rather than on the
-// lowered LLVM type, so the ENCODER and each DECODER cannot drift:
+// AGGREGATE value type — one whose §2.8.3 lowering is an LLVM struct or array,
+// which is every sendable value type with no ≤64-bit encoding — has no such
+// encoding, so the compiler carries it as a POINTER to a fresh heap cell
+// holding a copy of the value — §30.14's value-type bullet verbatim:
+// "A sendable value crosses as a copy". The set is declared HERE, once, so
+// that every site
+// which must agree on it by construction does. All of them are codegen, and
+// all of them are keyed on this predicate rather than on the lowered LLVM
+// type, so the ENCODER and each DECODER cannot drift:
 //
 //   - the item-word codec `encodeChannelItemWord` / `decodeChannelItemWord`
 //     (LlvmBackend_Calls3.cpp) — `Send`, `SendAsync`, `TryReceive`;
 //   - `channelReceiveHasAggregateElement` (LlvmBackend_Async.cpp) — the
 //     `await ch.Receive()` result;
 //   - `channelDrainHasAggregateElement` (LlvmBackend_Async.cpp) — the
-//     `await for … in ch.ReceiveAll()` loop variable.
+//     `await for … in ch.ReceiveAll()` loop variable;
+//   - the `new Channel<T>()` element disposer (LlvmBackend_Exprs2.cpp) — an
+//     item still buffered at disposal is a CELL, so the disposer frees the
+//     cell rather than the value.
+//
+// The members (a sendable record, a choice — §35.12 v0.313 for the latter —
+// an inline array `[N]T` §15.1, the `decimal` primitive §4.4, and the
+// nullable VALUE forms of each, which §7.11 lowers to a tagged
+// `{i8 hasValue; T}` struct) are enumerated with their per-member evidence in
+// the definition, Sendability.cpp.
 //
 // Deliberately NOT keyed on the lowered LLVM type (which would also catch the
 // `Span`/`Range`/`Guid` struct builtins): those carry borrows and are not

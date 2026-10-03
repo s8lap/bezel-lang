@@ -1025,12 +1025,85 @@ std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
     return {};
 }
 
-// #5305 / §30.14 (v0.313) / §30.15: the aggregate channel-element set — see
-// the declaration in Sendability.hpp for why it lives here and why it is
-// keyed on the DECLARATION kind rather than the lowered LLVM type.
+// #5305 / §30.14 (v0.313) / §30.15 / #5305-ff2: the aggregate channel-element
+// set — see the declaration in Sendability.hpp for why it lives here and why
+// it is keyed on the SEMANTIC type rather than the lowered LLVM type.
+//
+// #5305-ff2 widened this from `Record || Choice`. The pre-#5305-ff2 members
+// were correct for what they covered, but the SET was short of the sendable
+// types that also have no ≤64-bit encoding, and the encoder and the three
+// decode sites disagreed about the set (the encoder keyed on the lowered LLVM
+// type, the decoders on this function), so an element outside the set took
+// the encoder's scalar arm and the decoders' non-aggregate arm. Each member
+// below is a §30.14-sendable type whose §2.8.3 lowering is an LLVM STRUCT or
+// ARRAY — i.e. exactly the types that cannot ride the ptr-sized item word:
+//
+//   - record / choice — the two kinds §30.14's value-type bullet names (the
+//     choice's own sendability rule is §35.12, v0.313);
+//   - inline array `[N]T` (§15.1) — lowers to `[N x T]`. §30.14's value-type
+//     bullet admits it ("an inline array iff its element type is sendable")
+//     and sema admits it at the `Kind::InlineArray` arm above;
+//   - `decimal` (§4.4) — a §30.14-sendable PRIMITIVE (every primitive but
+//     `Object` is sendable) that lowers to the 16-byte `%bz.decimal` STRUCT,
+//     not to a scalar. MEASURED on c32d8f08: with `decimal` outside this set
+//     the `await ch.Receive()` result read the cell ADDRESS as the decimal's
+//     bytes (a 16-byte `heap-buffer-overflow` under ASan) and the
+//     `ReceiveAll()` drain printed the address as the value, while the
+//     TryReceive site — the one place that still keyed on the lowered type —
+//     happened to be right. Dropping `decimal` from the encoder along with
+//     the LLVM-type gate would have turned a working `Channel<decimal>` into
+//     an IR-verification abort, so the widening is load-bearing, not
+//     cosmetic;
+//   - a NULLABLE VALUE type of any element kind (`int?`, `Col?`, `()?`,
+//     `P?`, `decimal?`) — §7.11 lowers it to the tagged
+//     `{i8 hasValue; T}` struct (isNullableValueTy, LlvmBackend_impl.hpp), so
+//     it has no ≤64-bit encoding either. §6.9 declares `TryReceive(out item:
+//     T?)`, and `isSendableType` never tests `rt->nullable`, so sema ADMITS a
+//     nullable element (`Channel<int?>` compiles). Excluding that shape here
+//     would send it down the encoder's scalar arm —
+//     `CreateBitCast({i8, i32} to i64)`, an IR-verification abort — turning a
+//     (separately broken, see the handback) silent-garbage case into a
+//     compile-time failure, so the nullable VALUE forms are members. The
+//     nullable REFERENCE forms (`string?`, `Object?`, a nullable
+//     class/interface) are not: §8.3 lowers those to a plain `ptr`.
+//
+// NOT members: `Span`/`Range`/`Guid`/`DateTime` and the other struct-lowering
+// BUILTINS. Those lower to a struct or array too, but §30.14 does not admit
+// them as sendable (Guid/Span/Range are borrow-bearing or value-builtins the
+// sendability table rejects; `isSendableType` returns false for each, and
+// `Channel<T>`'s `T: sendable` constraint rejects them at the declaration), so
+// they never reach any of the sites below. That is why this predicate keys on
+// the SEMANTIC type and not on `lowerTypeRef(...)->isAggregateType()`.
 bool isAggregateChannelElement(const TypeRef* rt) {
-    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration)
+    if (!rt) return false;
+    using K = TypeRef::Kind;
+    using P = PrimitiveType;
+    // A NULLABLE VALUE type (§7.11) is the tagged {i8 hasValue; T} struct —
+    // an aggregate. The nullable REFERENCE forms (§8.3) are a plain `ptr`.
+    if (rt->nullable) {
+        if (rt->kind == K::Primitive)
+            return rt->primitive != P::String && rt->primitive != P::Object;
+        if (rt->kind == K::Named && rt->declaration) {
+            const ast::TypeDeclKind nk = rt->declaration->kind;
+            return nk != ast::TypeDeclKind::Class &&
+                   nk != ast::TypeDeclKind::Interface;
+        }
+        // A nullable INLINE ARRAY would lower to the bare `[N x T]` (§15.1) —
+        // `isNullableValueTy` does not list the InlineArray kind, so
+        // nullability adds no tag to it — which is an aggregate either way.
+        // MEASURED: sema does not admit the type at all today (`var o: [3]int?
+        // := null;` is rejected with "the initializer for `o` is nullable but
+        // the target type is non-nullable (§7)"), so this arm is unreachable
+        // as of this revision and is a forward-compatibility guard only: if
+        // the type is ever admitted it must be treated as an aggregate, or
+        // the encoder would bitcast an `[N x T]` into the item word.
+        if (rt->kind == K::InlineArray) return true;
         return false;
+    }
+    if (rt->kind == K::InlineArray) return true;      // §15.1 [N x T]
+    // `decimal` (§4.4) is the one PRIMITIVE that lowers to a struct.
+    if (rt->kind == K::Primitive) return rt->primitive == P::Decimal;
+    if (rt->kind != K::Named || !rt->declaration) return false;
     const ast::TypeDeclKind k = rt->declaration->kind;
     return k == ast::TypeDeclKind::Record || k == ast::TypeDeclKind::Choice;
 }

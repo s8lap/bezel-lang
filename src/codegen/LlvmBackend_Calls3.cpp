@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/Sendability.hpp"  // #5305: isAggregateChannelElement — §30.14 aggregate channel element
 
 namespace bezel::codegen {
 // ===========================================================================
@@ -5184,22 +5185,34 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
 // bitcast"), so `Channel<Record>` aborted the compiler at IR verification.
 //
 // The aggregate word is a POINTER to a fresh heap cell holding a copy of the
-// value — §30.14's value-type bullet verbatim ("A sendable value crosses as a
-// copy"). The three Send sites encode through `encodeChannelItemWord` and the
-// two decode sites (TryReceive, and the `await ch.Receive()` result) decode
-// through `decodeChannelItemWord`; the cell is released by the decoder, and by
-// the channel's `dispose_elem` for an item still buffered when the channel is
-// disposed or the send is refused (§30.15's undelivered-items rule).
+// value — §30.14's value-type bullet verbatim:
+// "A sendable value crosses as a copy".
+// The three Send sites encode through `encodeChannelItemWord` and the
+// decode sites (TryReceive, the `await ch.Receive()` result, and the
+// `ReceiveAll()` drain) decode through `decodeChannelItemWord`; the cell is
+// released by the decoder, and by the channel's `dispose_elem` for an item
+// still buffered when the channel is disposed or the send is refused
+// (§30.15's undelivered-items rule).
 llvm::Value* Emitter::encodeChannelItemWord(llvm::Value* item,
+                                            const sema::TypeRef* elemTy,
                                             const std::string& prefix) {
     if (!item) return nullptr;
     llvm::Type* ity = item->getType();
-    // #5305: the aggregate case, checked BEFORE the float/double bitcast arm
-    // below (which is where the pre-fix malformed `bitcast %record.P to i64`
-    // came from). `isAggregateValueTy` keeps the boxing decision on the LLVM
-    // value actually being sent, so it cannot disagree with the decode side,
-    // which sees the same `lowerTypeRef` lowering of the same T.
-    if (ity->isAggregateType()) {
+    // #5305 / #5305-ff2: the aggregate case, checked BEFORE the float/double
+    // bitcast arm below (which is where the pre-fix malformed
+    // `bitcast %record.P to i64` came from). #5305-ff2: the gate is
+    // `sema::isAggregateChannelElement(elemTy)` over the channel's ELEMENT
+    // TypeRef — the SAME predicate, on the SAME TypeRef, that every decode
+    // site and the element disposer use. The pre-fix code tested the lowered
+    // LLVM type `ity->isAggregateType()` here while the decoders keyed on the
+    // sema predicate, and the two sets disagreed (§30.14 sends `decimal` and
+    // `[N]T`, which lower to a struct/array, but the pre-fix sema predicate
+    // named only Record and Choice): an element in one set and not the other
+    // was boxed here and read back raw — silently wrong values plus a leaked
+    // cell. Keying both halves on the one predicate is what makes "cannot
+    // drift" true. `ity` is still used below to SIZE the cell, which is a
+    // property of the value actually being sent.
+    if (sema::isAggregateChannelElement(elemTy)) {
         auto* allocFn = declareC("calloc", ptrTy(), {i64(), i64()});
         // The DataLayout's ALLOC size, not `Type::getPrimitiveSizeInBits()`:
         // for a STRUCT that intrinsic reports the size of the FIRST ELEMENT
@@ -5237,13 +5250,16 @@ llvm::Value* Emitter::encodeChannelItemWord(llvm::Value* item,
 // the moment the runtime hands it over (§30.15: `Send` consumes the value in
 // the sending domain; `TryReceive` produces it in the receiving domain).
 llvm::Value* Emitter::decodeChannelItemWord(llvm::Value* rawPtr,
+                                            const sema::TypeRef* elemTy,
                                             llvm::Type* valTy,
                                             const std::string& prefix) {
     if (!rawPtr) return nullptr;
-    // #5305: the aggregate decode — the pre-fix fallback stored the raw i64 and
-    // then asked `CreateIntCast` to coerce it to the record struct, which is
-    // "Trunc only produces integer" at IR verification.
-    if (valTy->isAggregateType()) {
+    // #5305 / #5305-ff2: the aggregate decode — the pre-fix fallback stored the
+    // raw i64 and then asked `CreateIntCast` to coerce it to the record struct,
+    // which is "Trunc only produces integer" at IR verification. #5305-ff2:
+    // gated on `sema::isAggregateChannelElement(elemTy)`, the same predicate
+    // and the same TypeRef the encoder and the element disposer use.
+    if (sema::isAggregateChannelElement(elemTy)) {
         llvm::Value* v = builder_.CreateLoad(valTy, rawPtr, prefix + ".val");
         builder_.CreateCall(declareC("free", llvm::Type::getVoidTy(llvm_),
                                      {ptrTy()}),
@@ -5318,14 +5334,20 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
-                // #5305 / §30.15: the item WORD — the single encoding shared by
-                // all three Send sites and both decode sites. Scalar value types
-                // ride the ptr-size word directly; an aggregate (record/choice)
-                // rides it as a pointer to a fresh cell. (This arm is not
-                // reachable from Bezel source — sema rejects `Channel<T>.Send`,
-                // §6.9 / #640 — but it decodes through the SAME helper so the
-                // two cannot drift.)
-                llvm::Value* itemArg = encodeChannelItemWord(item, "send");
+                // #5305 / §30.15 / #5305-ff2: the item WORD — the single
+                // encoding shared by all three Send sites and every decode
+                // site. Scalar value types ride the ptr-size word directly; an
+                // aggregate rides it as a pointer to a fresh cell. (This arm is
+                // not reachable from Bezel source — sema rejects
+                // `Channel<T>.Send`, §6.9 / #640 — but it decodes through the
+                // SAME helper so the two cannot drift.) #5305-ff2: the
+                // element TypeRef T is threaded in so the codec gates on
+                // `sema::isAggregateChannelElement(T)` rather than on the
+                // lowered LLVM type.
+                llvm::Value* itemArg = encodeChannelItemWord(
+                    item, recvTy->genericArgs.empty() ? nullptr
+                                                     : recvTy->genericArgs[0],
+                    "send");
                 auto* fn = declareC("bz_channel_send",
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
@@ -5400,7 +5422,50 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 // the nullable struct {i8=1, innerVal}.
                 // For pointer types (class, string) the item IS the raw pointer; store
                 // directly (the slot holds a nullable pointer: non-null = has value).
-                if (outEty && outEty->isStructTy()) {
+                //
+                // #5305-ff2: the AGGREGATE case is selected by
+                // `sema::isAggregateChannelElement(chElem)` — the same
+                // predicate, on the same element TypeRef, that the three Send
+                // sites, the two async decode sites and the element disposer
+                // use. The pre-fix gate here was `outEty->isStructTy()`, a test
+                // of the OUT-SLOT's LLVM type, which is a different question:
+                // §7.11 gives a nullable value type the tagged
+                // `{i8 hasValue; T}` struct, but an inline array `[N]T?` is
+                // NOT in `isNullableValueTy`, so it keeps its bare `[N x T]`
+                // array lowering and failed the struct test. Such an element
+                // therefore fell to the else arm below and stored the raw CELL
+                // POINTER into the caller's array — valid IR, silently wrong
+                // values, and a leaked cell. Gating on the element type is
+                // what makes this site agree with the encoder by construction.
+                if (sema::isAggregateChannelElement(chElem)) {
+                    // The word is the CELL the Send allocated; the value is
+                    // loaded out of it and the cell released here — the
+                    // receiver owns the item from this point (§30.15).
+                    // `valTy` is the ELEMENT's own lowering (`[N x T]` for an
+                    // inline array, the record/choice struct, the
+                    // `%bz.decimal` struct), which is what the cell holds.
+                    llvm::Type* valTy = lowerTypeRef(chElem);
+                    if (!valTy) valTy = i32();
+                    llvm::Value* decoded = decodeChannelItemWord(
+                        rawItem, chElem, valTy, "tr");
+                    if (outEty && outEty->isStructTy() &&
+                        outEty != valTy) {
+                        // The out-slot is the TAGGED nullable struct
+                        // `{i8 hasValue; T}` (§7.11) — wrap the decoded value.
+                        auto* stTy = llvm::cast<llvm::StructType>(outEty);
+                        llvm::Value* nv = llvm::UndefValue::get(stTy);
+                        nv = builder_.CreateInsertValue(
+                            nv, llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                            {0u}, "tr.hv");
+                        nv = builder_.CreateInsertValue(nv, decoded, {1u},
+                                                        "tr.nv");
+                        builder_.CreateStore(nv, outSlot);
+                    } else {
+                        // The out-slot IS the element's own type (an inline
+                        // array's bare `[N x T]`) — store it unwrapped.
+                        builder_.CreateStore(decoded, outSlot);
+                    }
+                } else if (outEty && outEty->isStructTy()) {
                     // Nullable value type path.
                     auto* stTy = llvm::cast<llvm::StructType>(outEty);
                     llvm::Type* innerTy = stTy->getNumElements() > 1
@@ -5409,14 +5474,9 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                     // #5305 / §30.15: the decode twin of the Send item word
                     // (decodeChannelItemWord). For a scalar inner type this is
                     // the unchanged fix-#667 rule (ptrtoint + trunc/bitcast into
-                    // the word). For an AGGREGATE inner type — a record's
-                    // `{i8 hasValue, %record.P}` slot, the pre-fix
-                    // "Trunc only produces integer" `tr.coerce` — the word is
-                    // the cell the Send allocated, the record is loaded out of
-                    // it, and the cell is released here: the receiver owns the
-                    // item from this point (§30.15).
-                    llvm::Value* decoded =
-                        decodeChannelItemWord(rawItem, innerTy, "tr");
+                    // the word).
+                    llvm::Value* decoded = decodeChannelItemWord(
+                        rawItem, chElem, innerTy, "tr");
                     // Build the nullable struct {i8=1, decoded}.
                     llvm::Value* nv = llvm::UndefValue::get(stTy);
                     nv = builder_.CreateInsertValue(
@@ -5537,11 +5597,16 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
-                // #5305 / §30.15: shared item-word encoding (see
-                // encodeChannelItemWord) — an aggregate record/choice element
-                // crosses as a pointer to a fresh cell instead of the pre-fix
-                // illegal `bitcast %record.P to i64`.
-                llvm::Value* itemArg = encodeChannelItemWord(item, "send");
+                // #5305 / §30.15 / #5305-ff2: shared item-word encoding (see
+                // encodeChannelItemWord) — an aggregate element crosses as a
+                // pointer to a fresh cell instead of the pre-fix illegal
+                // `bitcast %record.P to i64`. #5305-ff2: the element TypeRef T
+                // is threaded in so the codec gates on
+                // `sema::isAggregateChannelElement(T)`.
+                llvm::Value* itemArg = encodeChannelItemWord(
+                    item, recvTy->genericArgs.empty() ? nullptr
+                                                     : recvTy->genericArgs[0],
+                    "send");
                 auto* fn = declareC("bz_channel_sender_send",
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
@@ -5562,10 +5627,14 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 call.args[0].value) {
                 llvm::Value* item = lowerExpr(*call.args[0].value);
                 if (!item) return nullptr;
-                // #5305 / §30.15: the SAME item-word encoding as the sync Send
-                // above (encodeChannelItemWord) — SendAsync hands the identical
-                // word to the identical runtime entry point.
-                llvm::Value* itemArg = encodeChannelItemWord(item, "sendasync");
+                // #5305 / §30.15 / #5305-ff2: the SAME item-word encoding as the
+                // sync Send above (encodeChannelItemWord) — SendAsync hands the
+                // identical word to the identical runtime entry point, so it
+                // gets the identical element TypeRef T.
+                llvm::Value* itemArg = encodeChannelItemWord(
+                    item, recvTy->genericArgs.empty() ? nullptr
+                                                     : recvTy->genericArgs[0],
+                    "sendasync");
                 auto* fn = declareC("bz_channel_sender_send_async", ptrTy(),
                                     {ptrTy(), ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {tx, itemArg, getCCEVtable()},
