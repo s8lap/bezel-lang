@@ -23,11 +23,21 @@ namespace bezel::sema {
 // back into a nested foldIntConst call when it recurses into a const's
 // initializer, so the shared depth guard bounds cyclic const references.
 // Returns nullopt for any expression that is not a foldable integer constant.
+//
+// fix #5402 (§10.2, v0.315): an optional `resolveMemberAccess` callback
+// handles qualified enum-constant references (`E.A`) in enum value initializers.
+// The callback takes the base expression and member name; if the base refers
+// to the current enum and the member is an earlier sibling constant, it
+// returns that sibling's underlying value. On error (self/forward reference)
+// the callback should return `std::nullopt` and set `*errorSeen = true`.
 std::optional<long long> foldIntConst(
     const ast::Expr& e,
     const std::function<std::optional<long long>(std::string_view, int)>&
         resolveIdent,
-    int depth = 0);
+    int depth = 0,
+    std::function<std::optional<long long>(
+        const ast::Expr& base, std::string_view member, bool& errorSeen)>
+        resolveMemberAccess = nullptr);
 
 // §17.14 (v0.184, #1688): does the compile-time-constant value `v` fit the
 // representable range of integer-family primitive type `p`? Shared by every

@@ -4,9 +4,11 @@
 // equality is an integer comparison. Observable via the int exit code.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -163,4 +165,38 @@ BEZEL_TEST(codegen_enum, arithmetic_and_sibling_value_739) {
         "enum E A := 10, B, C := A + 100, D := -3; end E; ",
         // A=10, B=11 (auto), C=110, D=-3 → 10+11+110-(-3) = 134
         "return int(E.A) + int(E.B) + int(E.C) - int(E.D);"), 134);
+}
+
+// fix #5402 (§10.2, v0.315): a qualified sibling `E.A` in an enum value
+// initializer denotes that sibling's underlying value. Before the fix,
+// MemberAccessExpr was not handled by foldIntConst, so `E.A` fell back to
+// auto-increment and silently produced the wrong value.  Test values are
+// chosen so auto-increment (base) gives a DIFFERENT sum than the folded
+// computed values (fixed).
+BEZEL_TEST(codegen_enum, qualified_sibling_value_5402) {
+    // A=10, B=E.A+5=15, C=E.B+5=20
+    // Base (no MemberAccessExpr fold): A=10, B=11 (auto), C=12 (auto) → 33
+    // Fixed (MemberAccessExpr folds): A=10, B=15, C=20 → 45
+    BEZEL_EXPECT_EQ(run(
+        "enum E A := 10, B := E.A + 5, C := E.B + 5; end E; ",
+        "return int(E.A) + int(E.B) + int(E.C);"),
+        45);
+}
+
+// fix #5402 (§10.2, v0.315): a SELF-reference in an enum value initializer
+// is a compile error. Before the fix, the self-reference was not detected
+// and the value silently fell back to auto-increment.
+BEZEL_TEST(codegen_enum, self_reference_rejected_5402) {
+    auto r = runAot(
+        "module M; enum E A := A + 1; end E; class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+}
+
+// fix #5402 (§10.2, v0.315): a FORWARD-reference in an enum value initializer
+// is a compile error. Before the fix, the forward-reference was not detected
+// and the value silently fell back to auto-increment.
+BEZEL_TEST(codegen_enum, forward_reference_rejected_5402) {
+    auto r = runAot(
+        "module M; enum E C := B + 1, B := 10; end E; class C public static method Main(): int return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
 }

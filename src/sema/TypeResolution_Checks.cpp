@@ -1346,17 +1346,159 @@ void Resolver::checkEnumRestrictions() {
             };
             std::unordered_map<std::string_view, long long> siblings;
             long long running = 0;
+            // fix #5402 (§10.2, v0.315): build the set of "later" constant names
+            // (current + after) for self/forward-reference detection.
+            std::unordered_set<std::string_view> laterConstants;
+            for (const auto& ec : td->enumConstants)
+                laterConstants.insert(ec.name);
+
             for (const auto& ec : td->enumConstants) {
+                // Remove current from laterConstants so only truly LATER constants remain.
+                laterConstants.erase(ec.name);
+
+                // Helper: walks an expression tree to detect a self- or forward
+                // reference to the enum's own constants (§10.2, v0.315). A bare
+                // name or qualified `E.A` that refers to the constant being
+                // declared (self) or to one declared later (forward) is a compile
+                // error. Returns true if an error was reported.
+                std::function<bool(const ast::Expr&)> checkRef = [&](
+                    const ast::Expr& e) -> bool {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+                        // Bare self/forward reference?
+                        if (laterConstants.count(id->name) > 0) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "enum member `" + std::string(ec.name) +
+                                "` initializer contains a forward reference to `" +
+                                std::string(id->name) +
+                                "`, which is declared later in the same enum "
+                                "(§10.2 — a reference to a later enum member is "
+                                "a compile error)");
+                            return true;
+                        }
+                        if (id->name == ec.name) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "enum member `" + std::string(ec.name) +
+                                "` initializer contains a self-reference to its "
+                                "own value (§10.2 — a self-reference in an enum "
+                                "member value initializer is a compile error)");
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                        // Qualified reference `E.A` — check if base is this enum.
+                        if (auto* baseType = ctx_.exprType(*ma->target)) {
+                            if (baseType->declaration &&
+                                baseType->declaration->decl == td) {
+                                // Base refers to this enum. Is the member self/forward?
+                                if (laterConstants.count(ma->member) > 0) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, e.span.begin,
+                                        "enum member `" + std::string(ec.name) +
+                                        "` initializer contains a forward reference "
+                                        "to `." + std::string(ma->member) +
+                                        "`, which is declared later in the same "
+                                        "enum (§10.2)");
+                                    return true;
+                                }
+                                if (ma->member == ec.name) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, e.span.begin,
+                                        "enum member `" + std::string(ec.name) +
+                                        "` initializer contains a self-reference "
+                                        "to its own value (§10.2)");
+                                    return true;
+                                }
+                            }
+                        }
+                        // Not a reference to this enum's constants: fall through
+                        // to recurse on children.
+                    }
+                    // Recurse into child expressions.
+                    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+                        if (b->left && checkRef(*b->left)) return true;
+                        if (b->right && checkRef(*b->right)) return true;
+                        return false;
+                    }
+                    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+                        if (u->operand && checkRef(*u->operand)) return true;
+                        return false;
+                    }
+                    if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) {
+                        for (const auto& arg : c->args) {
+                            if (arg.value && checkRef(*arg.value)) return true;
+                        }
+                        return false;
+                    }
+                    if (auto* cond = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+                        if (checkRef(*cond->condition)) return true;
+                        if (checkRef(*cond->thenValue)) return true;
+                        if (checkRef(*cond->elseValue)) return true;
+                        return false;
+                    }
+                    return false;
+                };
+
                 long long val = running;
                 bool haveVal = true;
                 if (ec.value) {
+                    // First: check for self/forward references before folding.
+                    bool errorSeen = checkRef(*ec.value);
+
                     auto resolve = [&](std::string_view name, int)
                         -> std::optional<long long> {
                         auto it = siblings.find(name);
                         if (it != siblings.end()) return it->second;
                         return std::nullopt;
                     };
-                    if (auto folded = foldIntConst(*ec.value, resolve))
+
+                    // Callback to resolve qualified `E.A` references in enum value
+                    // initializers (§10.2, v0.315).
+                    auto resolveMemberAccess =
+                        [&](const ast::Expr& base,
+                            std::string_view member,
+                            bool& cbError) -> std::optional<long long> {
+                        cbError = false;
+                        // Try exprType first (set when base has typeArgs or is
+                        // a member-access chain). If null (bare type identifier in
+                        // expression position, e.g. `E` in `E.A` where E is an enum),
+                        // fall back to checking if the base is an IdentifierExpr
+                        // naming the current enum type (`t`).
+                        TypeSymbol* baseTs = nullptr;
+                        if (auto* baseType = ctx_.exprType(base)) {
+                            baseTs = baseType->declaration;
+                        } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&base)) {
+                            // Bare type identifier: if it names the current enum, use t.
+                            if (id->name == t->name) baseTs = t;
+                        }
+                        if (!baseTs || baseTs->decl != td)
+                            return std::nullopt;  // not a qualifier ref to this enum
+                        // Is the member an earlier sibling (valid)?
+                        auto it = siblings.find(member);
+                        if (it != siblings.end()) return it->second;
+                        // Is it the current constant (self-reference)?
+                        if (member == ec.name) {
+                            cbError = true;
+                            return std::nullopt;
+                        }
+                        // Is it a later constant (forward reference)?
+                        // Rebuild the "later" set: constants after ec in the enum.
+                        // We need to check against the ORIGINAL laterConstants (which
+                        // includes current). Since we removed ec.name from
+                        // laterConstants at loop top, a name in laterConstants
+                        // is definitely a forward reference.
+                        if (laterConstants.count(member) > 0) {
+                            cbError = true;
+                            return std::nullopt;
+                        }
+                        return std::nullopt;  // not a const of this enum
+                    };
+
+                    bool foldErrorSeen = false;
+                    if (auto folded = foldIntConst(
+                            *ec.value, resolve, 0, resolveMemberAccess))
                         val = *folded;
                     else
                         // non-constant — a separate concern. §6.5/§17.14

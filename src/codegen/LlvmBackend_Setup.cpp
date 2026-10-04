@@ -240,7 +240,44 @@ void Emitter::populateEnumValuesFromDecl(const sema::TypeSymbol* ts) {
                     }
                 return std::nullopt;
             };
-            if (auto folded = sema::foldIntConst(*ec.value, resolveSibling))
+            // fix #5402 (§10.2, v0.315): handle qualified enum-constant references
+            // `E.A` in enum value initializers. The callback resolves the base
+            // expression; if it refers to this enum and the member is an earlier
+            // sibling, it returns that sibling's underlying value. On self/forward
+            // reference it returns nullopt (the sema pass already reported the
+            // error — codegen just skips folding in that case).
+            auto resolveMemberAccess =
+                [&](const ast::Expr& base,
+                    std::string_view member,
+                    bool& cbError) -> std::optional<long long> {
+                cbError = false;
+                // Get the base expression's type from the sema context.
+                // If exprType is null (bare type identifier in expression position),
+                // fall back to checking if the base is an IdentifierExpr naming
+                // the current enum type (`ts`).
+                const sema::TypeSymbol* baseTs = nullptr;
+                if (auto* baseType = ctx_.exprType(base)) {
+                    baseTs = baseType->declaration;
+                } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&base)) {
+                    if (id->name == ts->name) baseTs = ts;
+                }
+                if (!baseTs || baseTs->decl != td)
+                    return std::nullopt;  // not a qualifier ref to this enum
+                // Is the member an earlier sibling (valid)?
+                for (const sema::Symbol* m : ts->members) {
+                    if (auto* ecSym = dynamic_cast<const sema::EnumConstantSymbol*>(m)) {
+                        if (ecSym->name == member) {
+                            auto vit = enumValue_.find(m);
+                            if (vit != enumValue_.end()) return vit->second;
+                        }
+                    }
+                }
+                // Not an earlier sibling of this enum — self/forward ref (sema
+                // already reported) or not a const of this enum. Don't fold.
+                return std::nullopt;
+            };
+            if (auto folded = sema::foldIntConst(*ec.value, resolveSibling, 0,
+                                                resolveMemberAccess))
                 val = *folded;
         }
         for (const sema::Symbol* m : ts->members) {

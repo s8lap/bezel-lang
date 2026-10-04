@@ -96,7 +96,10 @@ std::optional<long long> foldIntConst(
     const ast::Expr& e,
     const std::function<std::optional<long long>(std::string_view, int)>&
         resolveIdent,
-    int depth) {
+    int depth,
+    std::function<std::optional<long long>(
+        const ast::Expr& base, std::string_view member, bool& errorSeen)>
+        resolveMemberAccess) {
     if (depth > 64) return std::nullopt;  // cyclic / runaway const reference
 
     // Integer literal — the leaf case.
@@ -133,7 +136,8 @@ std::optional<long long> foldIntConst(
         // Resolver::resolveTypesInExpr's `if (ue->operand)` guard so the
         // absent operand declines to fold instead of dereferencing null.
         if (!u->operand) return std::nullopt;
-        auto v = foldIntConst(*u->operand, resolveIdent, depth + 1);
+        auto v = foldIntConst(*u->operand, resolveIdent, depth + 1,
+                              resolveMemberAccess);
         if (!v) return std::nullopt;
         if (u->op == "-") return -*v;
         if (u->op == "+") return *v;
@@ -154,8 +158,10 @@ std::optional<long long> foldIntConst(
         // guards so a null operand declines to fold instead of dereferencing
         // null.
         if (!b->left || !b->right) return std::nullopt;
-        auto l = foldIntConst(*b->left, resolveIdent, depth + 1);
-        auto r = foldIntConst(*b->right, resolveIdent, depth + 1);
+        auto l = foldIntConst(*b->left, resolveIdent, depth + 1,
+                              resolveMemberAccess);
+        auto r = foldIntConst(*b->right, resolveIdent, depth + 1,
+                              resolveMemberAccess);
         if (!l || !r) return std::nullopt;
         if (b->op == "+") return *l + *r;
         if (b->op == "-") return *l - *r;
@@ -211,6 +217,24 @@ std::optional<long long> foldIntConst(
     // initializer is itself an expression).
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         return resolveIdent(id->name, depth);
+    }
+
+    // fix #5402 (§10.2, v0.315): a qualified enum-constant reference `E.A`
+    // in an enum value initializer. The caller-supplied `resolveMemberAccess`
+    // callback resolves the base expression to the enum type and looks up the
+    // member; if the member is an earlier sibling, the callback returns its
+    // underlying value. On self/forward reference it returns nullopt and sets
+    // `errorSeen = true` so the caller can report the error.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (resolveMemberAccess) {
+            bool errorSeen = false;
+            if (auto v = resolveMemberAccess(*ma->target, ma->member, errorSeen)) {
+                return v;
+            }
+            if (errorSeen) return std::nullopt;  // error already reported
+        }
+        // Not a qualifier reference (or no callback): not foldable.
+        return std::nullopt;
     }
 
     return std::nullopt;
