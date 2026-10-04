@@ -26798,6 +26798,27 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // then transitively each base type — first match wins (no
     // ambiguity resolution between base interfaces yet).
     Symbol* member = lookupMember(targetType, ma.member);
+    // fix #5403 (§22.10, v0.315): a primary-constructor parameter's capture
+    // field is not a declared member. `this.name` is member access (§2.7) and
+    // reaches declared members only, never a primary-constructor parameter or
+    // its capture. When `this.p` resolves to a capture field (a FieldSymbol
+    // with posParam != nullptr on a class — records' positional fields are
+    // real members and are exempt), reject.
+    if (auto* fs = dynamic_cast<FieldSymbol*>(member)) {
+        if (fs->posParam && targetType->kind == ast::TypeDeclKind::Class) {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
+                if (id->name == "this") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        std::string("`this.") + std::string(ma.member) +
+                        "` cannot reach a primary-constructor parameter's "
+                        "capture field; the capture field is not a declared "
+                        "member (\xC2\xA7" "22.10, v0.315; fix #5403)");
+                    return;
+                }
+            }
+        }
+    }
     // §26.5: extension members are consulted ONLY when no instance member
     // matched (instance members win — an extension never shadows a real
     // member, #433). The receiver's compile-time type is the access target's

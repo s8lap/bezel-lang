@@ -160,16 +160,15 @@ BEZEL_TEST(primary_ctor_param_not_promoted_4868,
     BEZEL_EXPECT_FALSE(hasNoMemberDiagnostic(r));
 }
 
-// #4868 / §22.10 (v0.307): in-class `this.x` on a captured primary-
-// constructor parameter — the parameter is in scope inside the body of any
-// method of the class (§22.10 "Inside the body of any method, property,
-// constructor, or destructor of the class"), and `this.x` is the explicit
-// spelling the §22.10 case `s22_10_0003` exercises. The fix's `currentType_
-// != fs->parent` arm must be inert for this case. Without this control
-// row, a too-aggressive fix would over-reject `this.x` and break the
-// capture-as-field surface (#4601 follow-ups).
+// #5403 / §22.10 (v0.315): in-class `this.x` on a captured primary-
+// constructor parameter is now a COMPILE ERROR. The capture field is not
+// a declared member: `this.name` is member access (§2.7) and reaches
+// declared members only, never a primary-constructor parameter or its
+// capture (§22.10). This row was previously accepts_in_class_this_access
+// (the pre-v0.315 rule let `this.x` reach the capture), but v0.315's
+// ruling on #5383 makes this a reject.
 BEZEL_TEST(primary_ctor_param_not_promoted_4868,
-           accepts_in_class_this_access_spec_22_10) {
+           rejects_in_class_this_capture_access_spec_22_10) {
     JitResult r = runAot(
         "module M; "
         "class Counter(start: int) "
@@ -179,10 +178,40 @@ BEZEL_TEST(primary_ctor_param_not_promoted_4868,
         "  using var c := new Counter(5); "
         "  Console.WriteLine(c.Value()); "
         "end Main; end Program;");
+    // Must NOT run — the program is rejected at compile time.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // Verify the specific diagnostic mentions the §22.10 capture rule.
+    bool sawCaptureRule = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("capture field") != std::string::npos &&
+            d.message.find("22.10") != std::string::npos) {
+            sawCaptureRule = true;
+        }
+    }
+    BEZEL_EXPECT_TRUE(sawCaptureRule);
+}
+
+// #5403 / §22.10 (v0.315): control row — a class where a captured
+// primary-constructor parameter coexists with a same-named member parameter.
+// The bare name must resolve without error (whether to member param or
+// capture is spec-question #5404 — this lane does NOT decide it).
+// This row only verifies the compile succeeds.
+BEZEL_TEST(primary_ctor_param_not_promoted_4868,
+           bare_name_resolves_with_shadowed_capture_spec_22_10) {
+    JitResult r = runAot(
+        "module M; "
+        "class Counter(p: int) "
+        "  private method Use(): int => p; "  // p captured as field
+        "  public method Value(p: int): int => p; "  // member param `p`
+        "end Counter; "
+        "class Program public static method Main() "
+        "  using var c := new Counter(99); "
+        "  Console.WriteLine(c.Value(5)); "
+        "end Main; end Program;");
+    // Just verify it compiles and runs — the value depends on bare-name
+    // resolution (§22.10, v0.315, spec-question #5404).
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    // Value oracle, not a diagnostic scan: a program that ran has an empty
-    // r.diagnostics by construction, so an EXPECT_FALSE over it cannot fail
-    // (check_vacuous_tests, #3138).
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\n"));
 }

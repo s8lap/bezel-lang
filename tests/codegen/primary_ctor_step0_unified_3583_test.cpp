@@ -474,11 +474,13 @@ BEZEL_TEST(primary_ctor_step0_unified_3583,
         "end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // fix #5403 (§22.10, v0.315): `this.s` cannot reach the capture field
+    // (capture fields are not declared members). The original "cannot read in
+    // chaining position" error is superseded by the more specific capture-field
+    // rule. Both reject, but the needle changed.
     bool sawRule = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find(
-                "cannot read primary-constructor parameter `s` in the "
-                "chaining position") != std::string::npos)
+        if (d.message.find("capture field") != std::string::npos)
             sawRule = true;
     }
     BEZEL_EXPECT_TRUE(sawRule);
