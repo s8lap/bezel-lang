@@ -9690,11 +9690,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                              cn == "SortedDictionary" ||
                                              cn == "OwningDictionary") &&
                                             mn == "TryGetValue";
+                                        bool ownSetElem =
+                                            cn == "OwningSet" &&
+                                            mn == "TryPop" && pos2 == 1;
                                         if (posElem && !rt->genericArgs.empty())
                                             elemT = rt->genericArgs[0];
                                         else if (valElem &&
                                                  rt->genericArgs.size() >= 2)
                                             elemT = rt->genericArgs[1];
+                                        else if (ownSetElem &&
+                                                 !rt->genericArgs.empty())
+                                            elemT = rt->genericArgs[0];
                                         if (elemT) {
                                             TypeRef* nn =
                                                 ctx_.makeTypeRef(*elemT);
@@ -9918,7 +9924,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                               mn == "TryPopLast") &&
                                              pos2 == 0) ||
                                             (cn == "OwningSet" &&
-                                             mn == "TryTake" && pos2 == 1) ||
+                                             mn == "TryPop" && pos2 == 1) ||
                                             (cn == "Channel" &&
                                              mn == "TryReceive" && pos2 == 0)) {
                                             if (!rt->genericArgs.empty() &&
