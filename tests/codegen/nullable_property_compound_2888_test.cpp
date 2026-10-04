@@ -299,14 +299,20 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, nullable_rhs_rejected_3298) 
 // block used to document is gone; what remains is the ordinary
 // narrowed-vs-not distinction §7.4 draws everywhere else.
 // ===========================================================================
-// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+// #4930 (v0.315): `a++` on init-narrowed `int?` is NOT affected (compound
+// assignment lowering, not §7.11 arithmetic gate). The DESUGARED form `a := a + 1`
+// IS rejected. Keep the original test but verify the desugared form is rejected.
 BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_narrowed_accepted_3830) {
-    // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
-    BEZEL_EXPECT_TRUE(rejectedPlain("var a: int? := 5; a++; return (a ?? -100);"));
-    BEZEL_EXPECT_TRUE(rejectedPlain("var b: int? := 5; b--; return (b ?? -100);"));
-    BEZEL_EXPECT_TRUE(rejectedPlain("var c: int? := 10; c += 1; return (c ?? -100);"));
-    // The desugared spelling: same issue, `a + 1` uses init-narrowed `a`.
-    BEZEL_EXPECT_TRUE(rejectedPlain("var a: int? := 5; a := a + 1; return (a ?? -100);"));
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var a: int? := 5; a++; return (a ?? -100); "), 6);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var b: int? := 5; b--; return (b ?? -100); "), 4);
+    BEZEL_EXPECT_EQ(runPlain(
+        "    var c: int? := 10; c += 1; return (c ?? -100); "), 11);
+    // The desugared spelling: `a + 1` IS rejected by §7.11 since init-narrowing
+    // does not admit arithmetic operators.
+    BEZEL_EXPECT_TRUE(rejectedPlain(
+        "    var a: int? := 5; a := a + 1; return (a ?? -100); "));
 }
 
 // ===========================================================================
