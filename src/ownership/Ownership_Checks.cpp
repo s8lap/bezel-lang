@@ -15895,14 +15895,19 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
             markMovedByName(id->name, id->span.begin, id);
         return;
     }
-    // A bare owned-PARAMETER read discharges the parameter (the §28.8
+    // A bare owned-PARAMETER read transfers ownership into the field (the §28.8
     // `_resource := resource;` ownership-transfer pattern: the caller
-    // relinquished ownership and the field now holds it). A bare owned-LOCAL
-    // read moves out of the local, leaving it moved-from (markMovedByName also
-    // correctly rejects moving out of a `using var`, which is scope-bound).
+    // relinquished ownership and the field now holds it). Per K3.1 (consume
+    // table, v0.313): the post-state for "store into an `owned` field" is
+    // **moved-from** — "a later read is an error until reassigned". Using
+    // `markDisposedByName` (Disposed state) drew the §28.2 warning regime
+    // for later reads/moves; K3.1 requires the §28.3 K3.1 error.
+    // A bare owned-LOCAL read moves out of the local, leaving it moved-from
+    // (markMovedByName also correctly rejects moving out of a `using var`,
+    // which is scope-bound). // per §28.8, K3.1, v0.313, #5326
     sema::Symbol* sym = ctx_.exprSymbol(*id);
     if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
-        markDisposedByName(id->name, id->span.begin, id);
+        markMovedByName(id->name, id->span.begin, id);
     } else {
         markMovedByName(id->name, id->span.begin, id);
     }
