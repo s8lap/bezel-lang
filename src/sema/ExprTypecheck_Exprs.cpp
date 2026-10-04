@@ -754,6 +754,15 @@ TypeRef* ExprTC::bindLambdaDestructure(const ast::DestructuringPattern& dp,
             // per §27.4: "each binding is an ordinary read of the
             // corresponding positional field at body entry" — a naked
             // identifier slot (`Entry(k, v)`).
+            // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
+            if (sp.nakedBinding != "_" &&
+                scope.names.find(sp.nakedBinding) != scope.names.end()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, sp.nakedAnchor->span.begin,
+                    std::string("a local named `") +
+                    std::string(sp.nakedBinding) +
+                    "` is already declared in this scope (§19.3, §21.1, v0.314)");
+            }
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
             lsym->name = sp.nakedBinding;
             lsym->decl = sp.nakedAnchor.get();  // #1271 real Node anchor
@@ -9781,6 +9790,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             }
                         }
                     }
+                    // §21.1 (#5370, v0.314): a local's name must be unique within
+                    // its immediate scope — inline `out var` is a local declaration.
+                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
+                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
+                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            std::string("a local named `") + std::string(id->name) +
+                            "` is already declared in this scope (§21.1, v0.314)");
+                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -9936,6 +9955,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 }
                             }
                         }
+                    }
+                    // §21.1 (#5370, v0.314): a local's name must be unique within
+                    // its immediate scope — inline `out owned var` is a local declaration.
+                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
+                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
+                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            std::string("a local named `") + std::string(id->name) +
+                            "` is already declared in this scope (§21.1, v0.314)");
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -10145,6 +10174,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         }
                     }
                     }  // close `if (!lsym->declType)` (#1304)
+                    // §21.1 (#5370, v0.314): a local's name must be unique within
+                    // its immediate scope — inline `out using var` is a local declaration.
+                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
+                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
+                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            std::string("a local named `") + std::string(id->name) +
+                            "` is already declared in this scope (§21.1, v0.314)");
+                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -10811,6 +10850,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // already has `nullable == false`, so removing the
                         // strip is a no-op for that case.
                     }
+                    // §21.1 (#5370, v0.314): a local's name must be unique within
+                    // its immediate scope — inline `out var` is a local declaration.
+                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
+                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
+                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            std::string("a local named `") + std::string(id->name) +
+                            "` is already declared in this scope (§21.1, v0.314)");
+                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -10860,6 +10909,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // handled by the OWNERSHIP pass instead, and are
                         // deliberately not DA-tracked here.
                     }
+                    // §21.1 (#5370, v0.314): a local's name must be unique within
+                    // its immediate scope — inline `out owned var` is a local declaration.
+                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
+                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
+                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            std::string("a local named `") + std::string(id->name) +
+                            "` is already declared in this scope (§21.1, v0.314)");
+                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -10901,6 +10960,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // per §22.4 / §7.9: do NOT strip the declared
                         // nullability — same reasoning as the `out var` /
                         // `out owned var` blocks above.
+                    }
+                    // §21.1 (#5370, v0.314): a local's name must be unique within
+                    // its immediate scope — inline `out using var` is a local declaration.
+                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
+                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
+                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, id->span.begin,
+                            std::string("a local named `") + std::string(id->name) +
+                            "` is already declared in this scope (§21.1, v0.314)");
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -12864,6 +12933,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             checkOrderingPatternOverUnorderedType(
                                 fieldTy, sp.pattern.get());
                             if (!sp.nakedBinding.empty()) {
+                                // §19.3 (#5401, v0.314): bindings of one pattern
+                                // must be distinct.
+                                if (sp.nakedBinding != "_" &&
+                                    armScope.names.find(sp.nakedBinding) != armScope.names.end()) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, sp.nakedAnchor->span.begin,
+                                        std::string("a local named `") +
+                                        std::string(sp.nakedBinding) +
+                                        "` is already declared in this scope (§19.3, §21.1, v0.314)");
+                                }
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = sp.nakedBinding;
                                 lsym->decl = sp.nakedAnchor.get();
@@ -12872,6 +12951,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
                                                sp.pattern.get())) {
+                                // §19.3 (#5401, v0.314): bindings of one pattern
+                                // must be distinct.
+                                if (vbp->name != "_" &&
+                                    armScope.names.find(vbp->name) != armScope.names.end()) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, vbp->span.begin,
+                                        std::string("a local named `") +
+                                        std::string(vbp->name) +
+                                        "` is already declared in this scope (§19.3, §21.1, v0.314)");
+                                }
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = vbp->name;
                                 lsym->decl = vbp;
@@ -13235,6 +13324,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                                           sp.pattern.get());
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
+                        // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
+                        if (sp.nakedBinding != "_" &&
+                            armScope.names.find(sp.nakedBinding) != armScope.names.end()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, sp.nakedAnchor->span.begin,
+                                std::string("a local named `") +
+                                std::string(sp.nakedBinding) +
+                                "` is already declared in this scope (§19.3, §21.1, v0.314)");
+                        }
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                         lsym->name = sp.nakedBinding;
                         lsym->decl = sp.nakedAnchor.get();  // #1271 real Node anchor
@@ -13245,6 +13343,15 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // §19.3: `Pt(var x, var y)` — equivalent to bare form;
                         // register the bound name keyed on the BindingPattern
                         // node (codegen keys its slot on the same pointer).
+                        // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
+                        if (vbp->name != "_" &&
+                            armScope.names.find(vbp->name) != armScope.names.end()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, vbp->span.begin,
+                                std::string("a local named `") +
+                                std::string(vbp->name) +
+                                "` is already declared in this scope (§19.3, §21.1, v0.314)");
+                        }
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                         lsym->name = vbp->name;
                         lsym->decl = vbp;

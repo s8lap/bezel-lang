@@ -13364,6 +13364,15 @@ void ExprTC::bindNestedDestructuringNames(
             // codegen and emitted `icmp sgt ptr %obj, i32 5`.
             checkOrderingPatternOverUnorderedType(fieldTy, s.pattern.get());
             if (!s.nakedBinding.empty()) {
+                // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
+                if (s.nakedBinding != "_" &&
+                    armScope.names.find(s.nakedBinding) != armScope.names.end()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, s.nakedAnchor->span.begin,
+                        std::string("a local named `") +
+                        std::string(s.nakedBinding) +
+                        "` is already declared in this scope (§19.3, §21.1, v0.314)");
+                }
                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                 lsym->name = s.nakedBinding;
                 lsym->decl = s.nakedAnchor.get();  // #1271 real Node anchor
@@ -13371,6 +13380,15 @@ void ExprTC::bindNestedDestructuringNames(
                 armScope.names[s.nakedBinding] = lsym;
             } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                            s.pattern.get())) {
+                // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
+                if (vbp->name != "_" &&
+                    armScope.names.find(vbp->name) != armScope.names.end()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, vbp->span.begin,
+                        std::string("a local named `") +
+                        std::string(vbp->name) +
+                        "` is already declared in this scope (§19.3, §21.1, v0.314)");
+                }
                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                 lsym->name = vbp->name;
                 lsym->decl = vbp;
@@ -17627,10 +17645,20 @@ void ExprTC::visitMember(const ast::Member& m) {
                 }
                 ast::Param vp; vp.name = vname;
                 sp.push_back(std::move(vp));
+                // §21.1 / §23.3 (#5401, v0.314): track whether this setter's
+                // implicit `value` param is exempt from the duplicate-local check.
+                // Only true for regular property setters (not indexers) with no
+                // explicit SetterParamSpec written — Appendix B / §23.3 lets the
+                // setter body redeclare `value`. An explicit setter param
+                // (e.g. `set(x)`) IS in the parameter clause and shadowing it
+                // is rejected; indexer setter params (including value) are all
+                // in the parameter clause per §23.4.
+                setterImplicitValueExempt_ = !pd->isIndexer && a.setterParamName.empty();
                 if (a.exprBody)
                     runMethodBody(sp, nullptr, a.exprBody.get(), &ssyms);
                 if (!a.stmts.empty())
                     runMethodBody(sp, &a.stmts, nullptr, &ssyms);
+                setterImplicitValueExempt_ = false;
                 continue;
             }
             // Getter: include indexer params. §5.1/§23.3 (#1777): run the
@@ -18597,6 +18625,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         if (currentScope_ && !ld->name.empty()) {
+            // §21.1 (#5370, v0.314): a local's name must be unique within its
+            // immediate scope. Do NOT walk parent scopes — nested shadowing is
+            // undecided (§5382). _ is exempt. The setter's implicit `value`
+            // param is also exempt when no SetterParamSpec was written AND
+            // it's a regular property setter (not indexer) per Appendix B / §23.3.
+            if (ld->name != "_" &&
+                !(setterImplicitValueExempt_ && ld->name == "value") &&
+                currentScope_->names.find(ld->name) != currentScope_->names.end()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ld->span.begin,
+                    std::string("a local named `") + std::string(ld->name) +
+                    "` is already declared in this scope (§21.1, v0.314)");
+            }
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
             lsym->name = ld->name;
             lsym->decl = ld;
@@ -19090,6 +19131,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         if (currentScope_ && !lc->name.empty()) {
+            // §21.1 (#5370, v0.314): a local's name must be unique within its
+            // immediate scope. Do NOT walk parent scopes — nested shadowing is
+            // undecided (§5382). _ is exempt. The setter's implicit `value`
+            // param is also exempt when no SetterParamSpec was written AND
+            // it's a regular property setter (not indexer) per Appendix B / §23.3.
+            if (lc->name != "_" &&
+                !(setterImplicitValueExempt_ && lc->name == "value") &&
+                currentScope_->names.find(lc->name) != currentScope_->names.end()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->span.begin,
+                    std::string("a local named `") + std::string(lc->name) +
+                    "` is already declared in this scope (§21.1, v0.314)");
+            }
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
             lsym->name = lc->name;
             lsym->decl = lc;

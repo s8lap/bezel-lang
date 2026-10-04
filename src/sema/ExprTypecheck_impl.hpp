@@ -423,6 +423,17 @@ private:
     // constraint's member set, not the (null) declaration of T's TypeRef.
     const ast::MethodDecl* currentMethodDecl_ = nullptr;
 
+    // §21.1 (#5370 / §23.3 / §23.4, v0.314): true while visiting a setter
+    // body where the implicit `value` param IS exempt from the duplicate-local
+    // check. This is ONLY true for regular property setters (not indexers)
+    // with no explicit SetterParamSpec written — Appendix B / §23.3 lets the
+    // setter body redeclare `value`. For indexer setters, the implicit value
+    // is NOT exempt (§23.4: indexer params, and indexer setter value, are all
+    // in the parameter clause). Also false for explicit setter params
+    // (e.g. `set(x)` — those ARE in the parameter clause and shadowing them
+    // IS rejected).
+    bool setterImplicitValueExempt_ = false;
+
     // §11.8 (v0.176, #807): while visiting a MemberAccessExpr's TARGET child,
     // this points at that target node. It lets the IdentifierExpr handler
     // recognize `T` in `T.Member(...)` — a type-parameter receiver — and mark
