@@ -94,6 +94,12 @@ inline bool hasCannotMoveFromDisposedError(const OwnershipResult& r) {
                 std::string::npos) return true;
     return false;
 }
+inline bool hasUseAfterDisposeError(const OwnershipResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
 
 } // namespace
 
@@ -345,29 +351,28 @@ BEZEL_TEST(owned_field_assign, owned_local_moved_from_after_field_store_rejected
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §28.8 / §28.3: after a bare owned-PARAMETER read is consumed into the owned
-// field (the §28.8 `_resource := resource;` pattern), the parameter is
-// discharged and may not be used again — a later `move resource` is reading a
-// disposed/consumed value. v0.303 / #4450 demoted the dominating-kill arm
-// from §28.3 ERROR to §28.2 WARNING (the ruling is option 1 of #3975), so
-// the verdict MOVED: pre-fix this was a hard REJECT, post-fix it is a
-// WARNING admitted by §28.2's checked-disposal backstop.  The OLD §28.3
-// "cannot move from disposed local" ERROR text is GONE — the negative
-// guard below pins it as absent.
-BEZEL_TEST(owned_field_assign, owned_param_consumed_then_reused_warns_28_2_4450) {
+// §28.3 K3.1 (v0.315): an `owned` parameter stored into an `owned` field
+// (`this._c := resource;`) leaves the parameter in moved-from state; a
+// later `move resource` is a second consume of the same value and is a
+// hard error.  The pre-v0.315 demotion (v0.303 / #4450 / option 1 of #3975)
+// that admitted this pattern with a §28.2 WARNING is no longer in the spec.
+// The program is rejected with the §28.3 K3.1 diagnostic.
+BEZEL_TEST(owned_field_assign, owned_param_consumed_then_reused_errors_28_3_K3_1) {
     auto r = parseAndCheckOwnership(mod(
         "public method Bad(owned resource: Inner) "
         "  this._c.Dispose(); "
         "  this._c := resource; "
         "  using var again := move resource; "
         "end Bad;"));
-    // §28.2 (v0.303) WARNING — the dominating-kill verdict, not the
-    // §28.3 consume-table error.  The consume-side wording, distinct from
-    // `checkRead`'s read-side text.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasUseAfterDisposeWarning(r));
-    // Negative guard: the OLD §28.3 ERROR text must NOT have re-appeared.
-    BEZEL_EXPECT_FALSE(hasCannotMoveFromDisposedError(r));
+    // K3.1 post-state: "a later read is an error until reassigned"
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // The specific §28.3 K3.1 error: "owned value in `resource` was
+    // already moved out"
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r, "owned value in `resource` was already moved out"));
+    // §28.3 diagnostic, not the old §28.2 warning regime
+    BEZEL_EXPECT_TRUE(hasUseAfterDisposeError(r, "§28.3"));
+    // Negative guard: the OLD §28.2 warning text must NOT have appeared.
+    BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
 }
 
 // ---- §28.6 / #1484: fresh owned value in a FIELD INITIALIZER ---------------
