@@ -600,6 +600,15 @@ void Resolver::bindExtensionTargetTypeParams(
             // Single-part bare name with no generic args of its own: treat
             // as a type parameter.
             std::string_view paramName = ga->name->parts[0];
+            // §14.1 / §26.4 (fix #5393, v0.314): the names in one type-parameter
+            // list are distinct.  Check for duplicate within this list first.
+            if (extScope.names.count(paramName) > 0) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ga->span.begin,
+                    "duplicate type parameter name `" +
+                        std::string(paramName) +
+                        "` in this type-parameter list (§14.1, v0.314)");
+            }
             // §26.4 (#1346, v0.160): warn when the bare identifier that
             // becomes a block-level type parameter shadows a same-named
             // type already in scope. The binding is always the extension's
@@ -1016,6 +1025,21 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
                     tsym = nts->type;
                     break;
                 }
+            }
+        }
+    }
+    // §14.1 (fix #5393, v0.314): the names in one type-parameter list are
+    // distinct.  Check for duplicate within this list before registering.
+    for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+        const auto& g = td.genericParams[i];
+        for (std::size_t j = 0; j < i; ++j) {
+            if (td.genericParams[j].name == g.name) {
+                ctx_.diagnostics().report(
+                    Severity::Error, td.span.begin,
+                    "duplicate type parameter name `" +
+                        std::string(g.name) +
+                        "` in this type-parameter list (§14.1, v0.314)");
+                break;
             }
         }
     }
