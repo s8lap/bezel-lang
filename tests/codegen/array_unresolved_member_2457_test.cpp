@@ -19,11 +19,11 @@
 // Per-member disposition (verified against docs/Bezel_Standard_Library.md
 // §4.4/§4.5/§5, not inferred from what the compiler special-cases):
 //   - Count/Capacity: already typed by a pre-existing property handler.
-//   - `.Length`: NOT in stdlib's documented surface, but a real, WORKING,
-//     tested alias for `.Count` (LlvmBackend_Exprs.cpp's structural
-//     `isCollectionTypeName` dispatch) — caught by this fix's own
-//     adversarial `array_` filter sweep (55 failures) before landing;
-//     exempted, not implemented (it needed no new implementation).
+//   - `.Length`: NOT in stdlib's documented surface. fix #4811 (stdlib
+//     §4.4, v0.315) removed it — previously it was an undocumented
+//     working alias for `.Count` (LlvmBackend_Exprs.cpp's structural
+//     `isCollectionTypeName` dispatch) that this fix's own adversarial
+//     `array_` filter sweep found and corrected.
 //   - Every declared method (stdlib §4.4/§4.5) and §5 LINQ operator: a
 //     CALL is exempted via `calleeOfCallCtx_`; language spec §27.6 also
 //     sanctions a BARE reference to an instance method with no call
@@ -109,15 +109,21 @@ BEZEL_TEST(array_unresolved_member_2457, bogus_property_on_owningarray_rejected_
 
 // ── Legitimate members keep working, VALUE-correct ──────────────────────
 
-// `.Length` — the undocumented-but-real, working alias for `.Count`.
-BEZEL_TEST(array_unresolved_member_2457, legit_length_alias_value_correct) {
+// fix #4811 (stdlib §4.4, v0.315): `.Length` is NOT a working alias for
+// `.Count` on Array<T> — stdlib §4.4's Count-vs-Length convention says
+// resizable Array<T> uses Count, not Length. This row was repurposed from
+// the pre-fix "legit_length_alias_value_correct" accept row to assert the
+// specific diagnostic.
+BEZEL_TEST(array_unresolved_member_2457, array_length_rejected_per_stdlib_4_4_4811) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
         "  var a: Array<int> := [7, 8, 9]; "
         "  return a.Length; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 3);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "no member `Length` on `Array<T>`: use `Count`"));
 }
 
 // A bare (uncalled) method reference — language spec §27.6 — must still
@@ -361,7 +367,7 @@ BEZEL_TEST(array_unresolved_member_2457, legit_call_form_methods_value_correct) 
         "  a.Dispose(); "
         "  if not found then return 1; end; "
         "  if idx <> 2 then return 2; end; "     // sorted: [1,2,3] -> 3 at index 2
-        "  return copy.Length; "
+        "  return copy.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 3);
 }

@@ -13,7 +13,7 @@
 // every reachable branch in sequence and ANY escape on ANY branch tainted
 // the local globally. For the borrowing-`Array`-materializer (#1003 /
 // #4042) eligibility set this was too coarse: an `if flag then
-// this.Data := items; else var n := items.Length; end if;` was taint-marked
+// this.Data := items; else var n := items.Count; end if;` was taint-marked
 // by the if-branch's field store even though on the else-branch the local
 // was provably alive at scope end — the conservative walk suppressed the
 // scope-end `bz_array_free` on EVERY path including the else-branch,
@@ -87,7 +87,7 @@ int run(const std::string& src) {
 
 // §28.3 / §28.9 (#4068): the issue's canonical repro. A `var items :=
 // seq.Sorted();` whose ONE escaping use is `this.Data := items;` on the
-// `then` branch; the `else` branch reads `items.Length` only (safe). On
+// `then` branch; the `else` branch reads `items.Count` only (safe). On
 // the else-branch the local must be freed at scope end (its only
 // reference is the slot itself); on the then-branch the field STORE
 // nulls the slot after the move, and the field's destructor-side free
@@ -97,7 +97,7 @@ int run(const std::string& src) {
 // 300 iter × 2 holders = 602 allocs can be a marginal-signal case; ×
 // ~1.66 amplification clears the vacuous-pass threshold). Without the
 // fix: -999 (LSan-detected leak); with: 4500 (500 iter × (3+3 from
-// each holder's Data.Length sum) × 3 alloc-free amplifications —
+// each holder's Data.Count sum) × 3 alloc-free amplifications —
 // well, see the run's exitCode for the exact expected).
 BEZEL_TEST(codegen_borrow_array_materializer_branch_insensitive_leak_4068,
            ctor_field_store_only_on_taken_branch_spec_28_3) {
@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_borrow_array_materializer_branch_insensitive_leak_4068,
         "    if flag then "
         "      this.Data := items; "
         "    else "
-        "      var n := items.Length; "
+        "      var n := items.Count; "
         "      this.Data := new Array<int>(); "
         "    end if; "
         "  end constructor; "
@@ -123,7 +123,7 @@ BEZEL_TEST(codegen_borrow_array_materializer_branch_insensitive_leak_4068,
         "  for var i in 0..500 do "
         "    using var h1 := new Holder(seq, true); "
         "    using var h2 := new Holder(seq, false); "
-        "    total := total + h1.Data.Length + h2.Data.Length; "
+        "    total := total + h1.Data.Count + h2.Data.Count; "
         "  end for; "
         "  return total mod 251; "
         "end Main; end C;";
@@ -157,7 +157,7 @@ BEZEL_TEST(codegen_borrow_array_materializer_branch_insensitive_leak_4068,
         "  var total := 0; "
         "  for var i in 0..500 do "
         "    using var h := new Holder(seq); "
-        "    total := total + h.Data.Length; "
+        "    total := total + h.Data.Count; "
         "  end for; "
         "  return total mod 251; "
         "end Main; end C;";
@@ -215,7 +215,7 @@ BEZEL_TEST(codegen_borrow_array_materializer_branch_insensitive_leak_4068,
         "  for var i in 0..500 do "
         "    using var h1 := new Holder(seq, true); "
         "    using var h2 := new Holder(seq, false); "
-        "    total := total + h1.Data.Length + h2.Data.Length; "
+        "    total := total + h1.Data.Count + h2.Data.Count; "
         "  end for; "
         "  return total mod 251; "
         "end Main; end C;";
