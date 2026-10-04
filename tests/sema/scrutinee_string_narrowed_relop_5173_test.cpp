@@ -35,13 +35,25 @@
 // lands, the narrowed reference form is the same predicate-excluded
 // reference type as a class scrutinee.
 
+#include "support/aot_support.hpp"
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
+
+using bezel::test::runAot;
 
 namespace {
 
 bezel::test::SemaResult parseSemaAll(std::string_view src) {
     return bezel::test::parseAndTypecheckGated(src);
+}
+
+// runAot drives the real AOT path (fork-isolated Driver::compileFile + clang
+// link + native exec) — the strict oracle. A program that fails to compile or
+// link reports `ran == false`; -999 keeps such a row from reading as an
+// accidental match on a real exit code.
+int runExit(const std::string& body) {
+    auto r = runAot(body);
+    return r.ran ? r.exitCode : -999;
 }
 
 // §19.3 / §16.6 / §7.11 / #3298 / #5173: the predicate's diagnostic family.
@@ -188,4 +200,136 @@ BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ===========================================================================
+// #5220 — the issue's ACTUAL repro, and the coverage holes it left behind.
+// ===========================================================================
+//
+// Every row above reaches the gate through a `string?` PARAMETER
+// (`Main(s: string?)`), which this predicate rejects for a DIFFERENT reason:
+// a parameter carries no `nullNarrowed_` entry, so the narrowed-non-null-read
+// arm of `checkOrderingPatternsOverNullableScrutinee` never fires and the
+// historical un-narrowed reject path runs instead. #5220's repro is the shape
+// that DID open the admit — a §7.4-narrowed LOCAL (`var s: string? := "z";
+// if s <> null then case s of < "a" => …`), where `s` is a local carrying a
+// `nullNarrowed_` fact. No row above pinned that shape, so the rows guarding
+// the fix-forward were guarding a sibling of the defect, not the defect.
+//
+// Pre-fix-forward (the predicate admitting every `TypeRef::Kind::Primitive`),
+// each REJECT row below compiled cleanly and lowered to
+// `CreateICmpSLT(bz_string*, bz_string*)` — comparing heap addresses, not the
+// §4.6 ordinal content. Post-fix-forward each is rejected at sema with the
+// §19.3 / §16.6 / §7.11 needle.
+
+// #5220's literal repro (sema half): a §7.4-narrowed `string?` LOCAL at a
+// relational pattern is REJECTED. Statement-position `case`, as filed.
+BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
+           narrowed_local_nullable_string_scrutinee_relop_rejected_5220) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := \"z\"; "
+        "  if s <> null then "
+        "    case s of < \"a\" => return 1;, _ => return 0; end case; "
+        "  end if; "
+        "  return 7; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+// Same narrowed LOCAL, range form — §16.6 parity with the relational row.
+BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
+           narrowed_local_nullable_string_scrutinee_range_rejected_5220) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := \"z\"; "
+        "  if s <> null then "
+        "    case s of \"a\"..\"z\" => return 1;, _ => return 0; end case; "
+        "  end if; "
+        "  return 7; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+// Same narrowed LOCAL for `Object?` — the other §3 builtin primitive that
+// lowers to a heap pointer (`bz_object*`) and the other member of the
+// value-primitive exclude list this predicate now carries.
+BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
+           narrowed_local_nullable_object_scrutinee_relop_rejected_5220) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  var o: Object? := null; "
+        "  if o <> null then "
+        "    case o of < null => return 1;, _ => return 0; end case; "
+        "  end if; "
+        "  return 7; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
+}
+
+// CONTROL — the narrowed LOCAL path for a VALUE-typed scrutinee, which is
+// the #5173 admit the tightening must not take away. `int?` is the SAME
+// `TypeRef::Kind::Primitive` arm as `string?`; only the enumerated member
+// list separates them, so an over-tightened predicate would reject this.
+BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
+           narrowed_local_nullable_int_scrutinee_relop_admitted_5220) {
+    auto r = parseSemaAll(
+        "module M; class C public static method Main(): int "
+        "  var n: int? := 5; "
+        "  if n <> null then "
+        "    case n of < 7 => return 1;, _ => return 0; end case; "
+        "  end if; "
+        "  return 7; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// #5220's second acceptance criterion, verbatim: "the post-fix accept with
+// exit code matching ordinal semantics (e.g. 'z' < 'a' → false, 'a' < 'z' →
+// true)". A `string?` carrier can only reach a relational pattern through
+// the §7.8 non-null ASSERTION (`s!`), which yields a NON-NULLABLE scrutinee
+// and routes to the `emitStringOrdCmp` arm the #5220 codegen work added
+// (the RelOpPattern handler in LlvmBackend_Exprs2.cpp, which calls
+// `bz_str_compare_cp`, §4.6). The pre-fix `CreateICmpSLT(bz_string*,
+// bz_string*)` compared heap addresses instead.
+//
+// Both operands are string LITERALS materialized into globals, so under the
+// pre-fix lowering each row answers from CG27a allocation order rather than
+// content — which is exactly what makes this row separate ordinal from
+// pointer order rather than merely repeat it.
+BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
+           non_null_asserted_string_relop_ordinal_semantics_5220) {
+    // "z" is GREATER than "a" (§4.6 code-point order), so `< "a"` is false
+    // and the `_` arm (2) is selected.
+    BEZEL_EXPECT_EQ(runExit(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := \"z\"; "
+        "  return (case s! of < \"a\" => 1, _ => 2); "
+        "end Main; end C;"),
+        2);
+    // "a" is LESS than "z", so `< "z"` is true and arm 1 is selected.
+    BEZEL_EXPECT_EQ(runExit(
+        "module M; class C public static method Main(): int "
+        "  var s: string? := \"a\"; "
+        "  return (case s! of < \"z\" => 1, _ => 2); "
+        "end Main; end C;"),
+        1);
+}
+
+// The #5220 accept criterion on the VALUE-typed side: the narrowed `int?`
+// local admitted above must also SELECT THE CORRECT ARM, not merely compile.
+// `5 < 7` is true, so arm 1 (exit 1) — the `return 7` fall-through would mean
+// the narrowed box was mis-unwrapped and the whole `case` silently skipped,
+// which is the no-arm-lowered shape measured for a narrowed `record?`
+// scrutinee (filed separately; not this predicate's defect).
+BEZEL_TEST(scrutinee_string_narrowed_relop_5173,
+           narrowed_local_nullable_int_relop_selects_arm_5220) {
+    BEZEL_EXPECT_EQ(runExit(
+        "module M; class C public static method Main(): int "
+        "  var n: int? := 5; "
+        "  if n <> null then return (case n of < 7 => 1, _ => 2); end if; "
+        "  return 7; "
+        "end Main; end C;"),
+        1);
 }
