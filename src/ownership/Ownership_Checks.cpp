@@ -8656,6 +8656,28 @@ void MethodOwnership::collectCaseArmBorrowSourcesExpr(const ast::Expr& e) {
             if (cl && cl->initializer)
                 collectCaseArmBorrowSourcesExpr(*cl->initializer);
         if (bx->body) collectCaseArmBorrowSourcesExpr(*bx->body);
+    } else if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        // fix #4837: string interpolation operands can contain a move of a
+        // borrow-only case arm binding (e.g. $"result={Take(y)}").
+        for (const auto& p : is->parts)
+            if (p.expr) collectCaseArmBorrowSourcesExpr(*p.expr);
+        reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+            e, "an interpolation operand (\xc2\xa7""15.3 *String interpolation*)");
+    } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // fix #4837: a lambda body inside the arm can contain a consuming call
+        // of a borrow-only case arm binding.
+        if (lam->exprBody) collectCaseArmBorrowSourcesExpr(*lam->exprBody);
+        for (const auto& s : lam->stmts)
+            if (s) collectCaseArmBorrowSourcesStmt(*s);
+        reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+            e, "a lambda body (\xc2\xa7""15.3 *Lambda*)");
+    } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        // fix #4837: a collection-literal element can move a borrow-only case
+        // arm binding into an owning collection.
+        for (const auto& el : cl->elements)
+            if (el) collectCaseArmBorrowSourcesExpr(*el);
+        reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+            e, "a collection literal element (\xc2\xa7""15.3 *Collection literal*)");
     }
 }
 
@@ -8743,7 +8765,13 @@ void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
             return;
         }
         if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&cur)) {
-            if (ys->value) collectCaseArmBorrowSourcesExpr(*ys->value);
+            if (ys->value) {
+                collectCaseArmBorrowSourcesExpr(*ys->value);
+                // fix #4837: yield return moves its operand into the iterator's
+                // yield position — a consume of a borrow-only case arm binding.
+                reportIfBorrowOnlyMoveOnlyArmBindingConsume(
+                    *ys->value, "a `yield return` (\xc2\xa7""17.14)");
+            }
             return;
         }
         // Control-flow forms — scan their guard/condition/iterable

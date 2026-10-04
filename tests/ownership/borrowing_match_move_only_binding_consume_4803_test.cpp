@@ -294,3 +294,62 @@ BEZEL_TEST(borrowing_match_move_only_binding_consume_4803,
         "    return 0; "));
     expectRun(r, "s=700 disposed=100\n");
 }
+
+// --- fix #4837: four previously-uncovered consumption paths -------------------
+
+// (13) Interpolation operand: $"result={Take(y)}" moves y through the
+// Take(y) call inside the interpolation. Pre-fix: compiled cleanly.
+BEZEL_TEST(borrowing_match_move_only_binding_consume_4803,
+           spec_15_3_interpolation_operand_consumes_borrowed_binding_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(kDecls,
+        "  public static method Take(x: Outer): int return 1; end Take; ",
+        "    var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
+        "    case o of "
+        "      var y => do Console.WriteLine($\"result={Take(y)}\"); end "
+        "    end case; "
+        "    return 0; "), kNeedle));
+}
+
+// (14) Lambda body: a consuming call inside the lambda body.
+// Pre-fix: compiled cleanly.
+BEZEL_TEST(borrowing_match_move_only_binding_consume_4803,
+           spec_15_3_lambda_body_consumes_borrowed_binding_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(kDecls,
+        "  public static method Take(x: Outer): int return 1; end Take; ",
+        "    var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
+        "    case o of "
+        "      var y => do var f := lambda(): int => Take(y); Console.WriteLine($\"done\"); end "
+        "    end case; "
+        "    return 0; "), kNeedle));
+}
+
+// (15) Collection literal element: a consuming call as element.
+// The element Take(y) moves y. Pre-fix: compiled cleanly.
+// (A direct [y] element does not type-check: no standard owning collection
+// can hold a move-only choice type, so the type error fires first.)
+BEZEL_TEST(borrowing_match_move_only_binding_consume_4803,
+           spec_15_3_collection_literal_element_consumes_borrowed_binding_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(kDecls,
+        "  public static method Take(x: Outer): int return 1; end Take; ",
+        "    var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
+        "    case o of "
+        "      var y => do var arr: [1]int := [Take(y)]; Console.WriteLine($\"done\"); end "
+        "    end case; "
+        "    return 0; "), kNeedle));
+}
+
+// (16) yield return: a borrow-only case arm binding moved into the iterator's
+// yield position. Pre-fix: compiled cleanly.
+BEZEL_TEST(borrowing_match_move_only_binding_consume_4803,
+           spec_17_14_yield_return_consumes_borrowed_binding_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(prog(kDecls,
+        "  public static method Iter(): IEnumerable<Outer> "
+        "    var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
+        "    case o of "
+        "      var y => yield return y; "
+        "    end case; "
+        "  end Iter; ",
+        "    var count := 0; "
+        "    for var x in Iter() do count := count + 1; end; "
+        "    return count; "), kNeedle));
+}
