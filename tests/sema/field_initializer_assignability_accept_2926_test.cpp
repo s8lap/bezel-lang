@@ -130,7 +130,7 @@ BEZEL_TEST(sema_field_initializer_assignability_accept_2926, non_numeric_shapes_
         "    if int(b._c)   = 1       then acc := acc + 1; end; "
         "    if b._pt.x + b._pt.y = 3 then acc := acc + 1; end; "
         "    if b._th.Go()  = 7       then acc := acc + 1; end; "
-        "    if b._arr.Length = 3     then acc := acc + 1; end; "
+        "    if b._arr.Count = 3     then acc := acc + 1; end; "
         "    return acc; "
         "  end Main; "
         "end M;"), 14);
@@ -198,7 +198,7 @@ BEZEL_TEST(sema_field_initializer_assignability_accept_2926, generic_type_param_
         "  public static method Main(): int "
         "    using var b := new Box<(int) -> int>(); "
         "    b.V := Id; "
-        "    return b.V(42) + b.A.Length + 7; "
+        "    return b.V(42) + b.A.Count + 7; "
         "  end Main; "
         "end Box;"), 49);
 }

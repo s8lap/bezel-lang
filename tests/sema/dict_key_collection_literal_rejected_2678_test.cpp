@@ -197,7 +197,7 @@ BEZEL_TEST(sema_dict_key_collection_literal_rejected_2678,
            nested_array_literal_in_sequence_position_admitted_spec_15_4) {
     expectAccepted(
         "    var g: Array<Array<int>> := [[1, 2], [3, 4]]; "
-        "    return g.Length; ",
+        "    return g.Count; ",
         2);
 }
 
