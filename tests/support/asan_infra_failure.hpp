@@ -218,6 +218,7 @@ inline int asanBuildFailure(const char* stage, const char* tag = nullptr) {
 // reported under an ASan banner. Measured while verifying #4569 — dropping the
 // `san == "address"` guard there produced 23 rows reporting
 // "`clang++ -fsanitize=address` failed" for a `-fsanitize=thread` link.
+inline constexpr int kAsanLinkFailure = -3;
 inline int asanLinkFailure(const char* stage, const std::string& captured = {},
                            const char* tag = nullptr) {
     asan_detail::noteAsanInfraFailureOf(
@@ -228,7 +229,7 @@ inline int asanLinkFailure(const char* stage, const std::string& captured = {},
             (captured.empty() ? std::string("; stderr was not captured")
                               : "; captured stderr:\n" + captured),
         "#4563");
-    return -3;
+    return kAsanLinkFailure;
 }
 
 // -4: `system()` could not run the linked program at all (fork/exec-level:

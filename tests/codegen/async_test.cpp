@@ -114,6 +114,7 @@ bool compileFails(const std::string& source) {
 //   0  — ran clean: no leak / UAF / double-free / data race reported.
 //   1  — sanitizer reported a problem: test failure.
 //  -1  — toolchain unavailable / build step failed: SKIP (not a failure).
+//  -3  — sanitizer link step failed: SKIP (not a failure) per #5348 / #3633.
 // The runtime is rebuilt under the same sanitizer and linked with the program's
 // object so the sanitizer instruments both the generated code and the runtime
 // (where the thread pool, refcounts, and task state live).
@@ -217,9 +218,9 @@ void expectValueCrossThread(const std::string& source, int expectedExitCode) {
     for (int i = 0; i < 3; ++i)
         BEZEL_EXPECT_EQ(compileAndRun(source), expectedExitCode);
     int lsan = runUnderLeakSanitizer(source);
-    if (lsan != -1) BEZEL_EXPECT_EQ(lsan, 0);   // 0 == ASan/LSan clean
+    if (lsan != -1 && lsan != bezel::test::kAsanLinkFailure) BEZEL_EXPECT_EQ(lsan, 0);   // 0 == ASan/LSan clean
     int tsan = runUnderThreadSanitizer(source);
-    if (tsan != -1) BEZEL_EXPECT_EQ(tsan, 0);   // 0 == TSan clean (no race)
+    if (tsan != -1 && tsan != bezel::test::kAsanLinkFailure) BEZEL_EXPECT_EQ(tsan, 0);   // 0 == TSan clean (no race)
 }
 
 }  // namespace

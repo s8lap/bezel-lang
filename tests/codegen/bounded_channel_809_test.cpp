@@ -326,7 +326,9 @@ BEZEL_TEST(bounded_channel_809, asan_close_while_waiting_disposal_no_leak) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (r != -1) BEZEL_EXPECT_EQ(r, 0);
+    // r == -1: toolchain unavailable (CI skip); r == -3: link failed (CI skip
+    // per #5348); r == 0: ASan-clean; r == 1: sanitizer finding → test fails.
+    if (r != -1 && r != bezel::test::kAsanLinkFailure) BEZEL_EXPECT_EQ(r, 0);
 }
 
 // §6.9 v0.174 ASan: a full bounded produce/consume lifecycle.  A producer fills
@@ -349,5 +351,5 @@ BEZEL_TEST(bounded_channel_809, asan_full_bounded_produce_consume_lifecycle) {
         "    return a.V + b.V + c.V; "                 // received + disposed once each
         "  end Main; "
         "end C;");
-    if (r != -1) BEZEL_EXPECT_EQ(r, 0);
+    if (r != -1 && r != bezel::test::kAsanLinkFailure) BEZEL_EXPECT_EQ(r, 0);
 }

@@ -195,10 +195,10 @@ void expectValueCrossThread618(const std::string& source, int expected) {
         BEZEL_EXPECT_EQ(compileAndRunRetrying(source), expected);
     int lsan = runUnderSanitizer(source, "address",
                                  "ASAN_OPTIONS=detect_leaks=1:exitcode=99");
-    if (lsan != -1) BEZEL_EXPECT_EQ(lsan, 0);
+    if (lsan != -1 && lsan != bezel::test::kAsanLinkFailure) BEZEL_EXPECT_EQ(lsan, 0);
     int tsan = runUnderSanitizer(source, "thread",
                                  "TSAN_OPTIONS=exitcode=99");
-    if (tsan != -1) BEZEL_EXPECT_EQ(tsan, 0);
+    if (tsan != -1 && tsan != bezel::test::kAsanLinkFailure) BEZEL_EXPECT_EQ(tsan, 0);
 }
 
 }  // namespace
@@ -477,7 +477,8 @@ BEZEL_TEST(async_618_domain_serial, domain_spawn_uaf_stress_fix_632) {
         "end Program;",
         "address",
         "ASAN_OPTIONS=detect_leaks=0:exitcode=99");
-    // result == -1: compiler unavailable (CI skip); result == 0: ASan-clean
-    // (no heap-use-after-free); result == 1: sanitizer triggered → test fails.
-    if (result != -1) BEZEL_EXPECT_EQ(result, 0);
+    // result == -1: compiler unavailable (CI skip); result == -3: link failed
+    // (CI skip per #5348); result == 0: ASan-clean (no heap-use-after-free);
+    // result == 1: sanitizer triggered → test fails.
+    if (result != -1 && result != bezel::test::kAsanLinkFailure) BEZEL_EXPECT_EQ(result, 0);
 }
