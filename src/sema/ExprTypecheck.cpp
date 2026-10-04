@@ -11691,13 +11691,27 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
         // as a spec-clarification issue.)
         if (memberBeforeModuleType && s == moduleScope_.get() && currentType_) {
             if (Symbol* m = lookupMember(currentType_, name)) {
-                // §22.10 (v0.315, #5404): a static member has no `this`, so a
-                // primary-constructor parameter capture field (`posParam != nullptr`)
-                // is not in scope. Filter it out so the name falls through to
-                // "unresolved identifier" rather than silently lowering to zero.
+                // A static member body has no `this`, so an instance field is not
+                // in scope; the name must fall through to "unresolved identifier"
+                // rather than silently lower to a zero/null return (only an
+                // `internal:` Warning, #2491 — the program then runs and returns
+                // the wrong value).
+                //
+                // §2.7 (v0.217, #2097): "a static body has no `this`".
+                // §22.10 (v0.315, #5404): a primary-constructor parameter is in
+                // scope in instance bodies, and a capture field is not a member.
+                // Both rules reject the read; the modifier test is the general
+                // form and subsumes the `posParam` case, which is kept explicit
+                // because it is a distinct spec rule with its own citation.
                 if (inStaticMember_) {
                     if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
                         if (fs->posParam) return nullptr;
+                        auto hasMod = [](const std::vector<std::string_view>& mods,
+                                         std::string_view mod) {
+                            for (auto x : mods) if (x == mod) return true;
+                            return false;
+                        };
+                        if (!hasMod(fs->modifiers, "static")) return nullptr;
                     }
                 }
                 return m;
@@ -11727,13 +11741,17 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
     // the in-loop member check above never fired.)
     if (currentType_) {
         if (Symbol* m = lookupMember(currentType_, name)) {
-            // §22.10 (v0.315, #5404): a static member has no `this`, so a
-            // primary-constructor parameter capture field (`posParam != nullptr`)
-            // is not in scope. Filter it out so the name falls through to
-            // "unresolved identifier" rather than silently lowering to zero.
+            // §2.7 (v0.217, #2097) / §22.10 (v0.315, #5404): a static member body
+            // has no `this`. See the twin call site above for the full rationale.
             if (inStaticMember_) {
                 if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
                     if (fs->posParam) return nullptr;
+                    auto hasMod = [](const std::vector<std::string_view>& mods,
+                                     std::string_view mod) {
+                        for (auto x : mods) if (x == mod) return true;
+                        return false;
+                    };
+                    if (!hasMod(fs->modifiers, "static")) return nullptr;
                 }
             }
             return m;
