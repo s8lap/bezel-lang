@@ -262,6 +262,23 @@ const std::string kLocalAppSrc =
 // pass takes the `else` arm and prints `none`; post-fix every pass prints
 // `5`. 200 is the issue's own count and also the LEAK multiplier for the
 // two disposal sites (a per-iteration leak cannot hide at that count).
+
+// A lib module with a method that takes an `owned Channel<R>` PARAMETER and
+// throws — exercise the exception-unwind release path (Site 5) on an
+// IMPORTED builtin (shape c). Without the fix, the auto-drop disposal is not
+// registered for shape (c), so the channel leaks on unwind. With the fix it is
+// registered and the channel is released.
+const std::string kThrowLibSrc =
+    "module Lib; "
+    "import System.Threading; "
+    "public class E: Exception "
+    "  public constructor() base(\"boom\"); end constructor; "
+    "end E; "
+    "public class Hub "
+    "  public static method Consume(owned ch: Channel<int>) "
+    "    throw new E(); "
+    "  end Consume; "
+    "end Hub; ";
 const std::string kLoopAppSrc =
     "module App; "
     "import Lib; "
@@ -278,6 +295,31 @@ const std::string kLoopAppSrc =
     "      else "
     "        Console.WriteLine(\"none\"); "
     "      end if; "
+    "      i := i + 1; "
+    "    end; "
+    "    return 0; "
+    "  end Main; "
+    "end C; ";
+
+// App that calls Hub.Consume (which takes an owned Channel<int> param) and
+// throws. The sender is disposed at scope end, closing the channel. Pre-fix:
+// the auto-drop is not registered for shape (c), so the channel leaks on
+// unwind. Post-fix: the fix registers the type-specific disposal, it fires on
+// unwind, and the channel is released. LSan catches the leak pre-fix.
+const std::string kThrowAppSrc =
+    "module App; "
+    "import Lib; "
+    "class C "
+    "  public static method Main(): int "
+    "    var i := 0; "
+    "    while i < 50 do "
+    "      var inbox := new Channel<int>(); "
+    "      using var tx := inbox.NewSender(); "
+    "      tx.Send(i); "
+    "      try "
+    "        Hub.Consume(move inbox); "
+    "      catch E => do end "
+    "      end try; "
     "      i := i + 1; "
     "    end; "
     "    return 0; "
@@ -434,6 +476,48 @@ BEZEL_TEST(imported_channel_factory_send_receive_5313,
     BEZEL_EXPECT_EQ(rr.code, 0);
     // One item was sent and not yet received, so Count is 1.
     BEZEL_EXPECT_EQ(rr.out, std::string("1\n"));
+}
+
+// ── SITE 5 PIN — exception-unwind release of an IMPORTED owned Channel param ─
+//
+// #5313 fixed FIVE sites (sema builtinInstName, codegen isChProp, and three
+// using-var disposal arms). Site 5 is the exception-unwind release path:
+// registerUnwindOwnedParam registers bz_channel_dispose on an `owned Channel<T>`
+// param and calls it if the method exits via exception. None of the existing
+// rows exercise this path with an IMPORTED builtin (shape c).
+//
+// The pre-existing #1957 row `sender_autodrop_no_leak_spec_30_15_28_3`
+// exercises the same unwind path but with a LOCAL Channel (the channel is
+// constructed in-module and passed in). This row exercises it with an IMPORTED
+// Channel: Hub.Consume (in Lib) takes an `owned Channel<int>` param and throws.
+// Pre-fix: the auto-drop is not registered for shape (c) — no release, LSan
+// reports a leak. Post-fix: the fix registers the type-specific disposal, it
+// fires on unwind, and LSan reports no leak.
+//
+// NOTE: the functional pin (IsClosed check) is VACUOUS in this environment
+// because after `Hub.Consume(move inbox)` the variable `inbox` is moved-from
+// and cannot be inspected. The load-bearing oracle is the LSan assertion:
+// without the fix the channel object itself leaks (50 channels + 50 undelivered
+// items) and LSan reports it; with the fix all 50 are released cleanly. The
+// ASan build (sanitize=true) is the LSan oracle; a pre-fix run would FAIL.
+// (The #1957 sibling `sender_autodrop_crossdomain_no_deadlock_spec_30_15_28_3`
+// provides the non-vacuous functional pin by other means.)
+BEZEL_TEST(imported_channel_factory_send_receive_5313,
+           imported_channel_owned_param_throws_through_unwind_site_5_pin) {
+    auto dir = wtDir5313();
+    LibHandle libH = buildLib(dir, kThrowLibSrc);
+    BEZEL_EXPECT_TRUE(libH.ok);
+    if (!libH.ok) return;
+    AppHandle appH = buildApp(dir, libH.objPath, kThrowAppSrc, /*sanitize=*/true);
+    BEZEL_EXPECT_TRUE(appH.ok);
+    if (!appH.ok) return;
+    RunResult rr = runCapture(appH.exePath);
+    BEZEL_EXPECT_EQ(rr.code, 0);
+    // LSan: no leaks. Pre-fix the auto-drop is not registered for shape (c),
+    // so the channel leaks on every iteration (50 channels + 50 undelivered
+    // items). Post-fix all 50 are released cleanly.
+    BEZEL_EXPECT_TRUE(rr.out.find("LeakSanitizer") == std::string::npos);
+    BEZEL_EXPECT_TRUE(rr.out.find("leaked") == std::string::npos);
 }
 
 }  // namespace bezel::codegen
