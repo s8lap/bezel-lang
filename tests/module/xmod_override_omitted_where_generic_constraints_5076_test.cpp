@@ -42,6 +42,7 @@
 #include "sema/TypeResolution.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "support/driver_run_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 #include "support/unique_stem.hpp"
 
@@ -238,16 +239,21 @@ BEZEL_TEST(xmod_override_omitted_where_generic_constraints_5076,
 }
 
 // ===========================================================================
-// T4 — CONTROL: override that RESTATES the clause verbatim still exports it.
+// T4 — STRENGTHENING: interface declares no constraint; implementation adds
+// `where T: class` — a strengthened clause per §14.2 (v0.314).  The sema
+// check in checkAbstractImplementations (§14.2 / A.4, v0.314) fires and
+// reports an error.  This row was vacuous before the syntax fix: the harness
+// ignored diagnostics and `implements` (not `:`) was not valid Bezel interface
+// implementation syntax, so the constraint check never ran.
 // ===========================================================================
 BEZEL_TEST(xmod_override_omitted_where_generic_constraints_5076,
-           restate_where_override_meta_carries_class_constraint) {
+           strengthened_where_clause_on_impl_is_rejected) {
     const char* kSrc =
         "module Mod5076T4; "
         "public interface I5076T4 "
         "  method M<T>(x: T): int; "
         "end I5076T4; "
-        "public class C5076T4 implements I5076T4 "
+        "public class C5076T4 : I5076T4 "
         "  public method M<T>(x: T): int "
         "    where T: class "
         "    return 0; "
@@ -261,9 +267,20 @@ BEZEL_TEST(xmod_override_omitted_where_generic_constraints_5076,
         "end D5076T4; "
         "public class Entry public static method Main(): int => 0; end Entry;";
 
-    ModuleMetadata meta = buildMetaFor5076(kSrc);
-    bool hasClass = gpHasSpecialConstraint(meta, "D5076T4", "M", "T", "class");
-    BEZEL_EXPECT_TRUE(hasClass);
+    auto r = test::runAot(kSrc);
+    // Must be rejected: adding `where T: class` when the interface declares
+    // no constraint is a differing clause per §14.2.
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool hasWhereDiag = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("where") != std::string::npos ||
+            d.message.find("equivalent") != std::string::npos ||
+            d.message.find("restate") != std::string::npos) {
+            hasWhereDiag = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(hasWhereDiag);
 }
 
 // ===========================================================================
