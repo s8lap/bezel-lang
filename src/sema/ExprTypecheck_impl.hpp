@@ -2810,7 +2810,8 @@ private:
     // user type that DECLARES comparison operators is left alone pending the
     // #5269 ruling.
     void checkOrderingPatternsOverUnorderedScrutinee(
-        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms);
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms,
+        const ast::Expr* scrutinee);
 
     // §19.3 (v0.313, #5235 fix-forward): the single-pattern half of
     // `checkOrderingPatternsOverUnorderedScrutinee`, factored out for the

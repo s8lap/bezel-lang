@@ -12339,11 +12339,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // One shared checker with the CaseStmt site below.
         checkOrderingPatternsOverNullableScrutinee(
             scrutTy, ce->arms, ce->scrutinee.get());
-        // §19.3 (v0.313, #5235): a relational or range pattern requires a
-        // scrutinee with a defined ordering. Object has no ordering, so
-        // reject RelOpPattern and RangePattern over an Object scrutinee.
+        // §19.3 (v0.314, #5269/#5273): a relational pattern requires a
+        // scrutinee with an intrinsic ordering (integer types, float, double,
+        // decimal, char, string); a range pattern requires integer types or char.
         // Shared with the CaseStmt site — one rule, two spellings of `case`.
-        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, ce->arms);
+        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, ce->arms, ce->scrutinee.get());
         // §10.6 (#772): "Inside a `case` whose scrutinee is an enum, the enum
         // prefix may be omitted." This holds throughout the construct, INCLUDING
         // arm bodies (`Red => Green`), not only patterns. Inject the scrutinee

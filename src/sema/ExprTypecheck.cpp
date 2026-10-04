@@ -13502,44 +13502,142 @@ void ExprTC::checkOrderingPatternsOverNullableScrutinee(
         checkOrderingPatternOverNullableType(scrutTy, arm.pattern.get());
 }
 
-// §19.3 / §16.6 (v0.313, #5235): reject a relational or range pattern whose
-// scrutinee's type defines NO ordering. §19.3 compares the scrutinee against
-// the right-hand operand "under the ordering of the scrutinee's type"; the
-// spec defines an ordering for the primitive value types and, per §4.6, an
-// ordinal ordering for `string`. `Object` (§3 builtin, lowers to a heap
-// pointer) has none, so `case o of > 5 => …` over an `Object` scrutinee has
-// no meaning — codegen used to emit `icmp sgt ptr %obj, i32 5` and the module
-// failed `verifyModule` with "Both operands to ICmp instruction are not of
-// the same type!". Rejecting at sema turns that internal error into a
-// diagnostic that names §19.3 and the offending scrutinee type.
-//
-// Narrow scope, deliberately: only `Object` is gated here. A user type that
-// DECLARES comparison operators may legitimately have "the ordering of the
-// scrutinee's type" — whether it does is the open spec-question in #5269
-// (owner-ruled), so those scrutinees keep today's behavior here. §7.4
-// narrowing does not reopen the gate: `Object` is a reference type, so the
-// nullable-scrutinee checker above still rejects a narrowed `Object?`
-// independently, and this one reads the scrutinee's static type either way.
+// §19.3 / §16.6 (v0.314, #5269/#5273/#5235): reject a relational or range
+// pattern whose scrutinee's type has NO intrinsic ordering. §19.3 (v0.314)
+// defines an intrinsic ordering for: the integer types, float, double, decimal,
+// char (§3.5), and string (§4.6) — and a range pattern's T is restricted to
+// the integer types and char only (§16.3). Every other scrutinee type — bool,
+// unit, inline array, record, enum, choice, class, interface, Object, function
+// type, and a type parameter whatever its constraints — is a compile error
+// naming the type (§19.3). A user-declared `operator <` group on a record,
+// enum, choice or class is NOT intrinsic ordering; a relational or range
+// pattern over such a type is a compile error (§19.3, v0.314 ruling on #5269).
 //
 // Shared by the CaseExpr and CaseStmt sites — the two spellings of `case`
 // take the same rule and the same diagnostic.
+
+namespace {
+// §19.3 (v0.314, #5269): intrinsic ordering for relational patterns.
+// Returns true for the integer types, float, double, decimal, char, string.
+static bool isRelOpOrderedType(const TypeRef* ty) {
+    if (!ty || ty->kind != TypeRef::Kind::Primitive || ty->nullable)
+        return false;
+    switch (ty->primitive) {
+        case PrimitiveType::Byte: case PrimitiveType::SByte:
+        case PrimitiveType::Short: case PrimitiveType::UShort:
+        case PrimitiveType::Int: case PrimitiveType::UInt:
+        case PrimitiveType::Long: case PrimitiveType::ULong:
+        case PrimitiveType::Float: case PrimitiveType::Double:
+        case PrimitiveType::Decimal: case PrimitiveType::Char:
+        case PrimitiveType::String:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// §19.3 / §16.3 (v0.314, #5273): intrinsic ordering for range patterns.
+// Returns true for the integer types and char only (Range<T>'s T is restricted
+// to these per §16.3).
+static bool isRangeOrderedType(const TypeRef* ty) {
+    if (!ty || ty->kind != TypeRef::Kind::Primitive || ty->nullable)
+        return false;
+    switch (ty->primitive) {
+        case PrimitiveType::Byte: case PrimitiveType::SByte:
+        case PrimitiveType::Short: case PrimitiveType::UShort:
+        case PrimitiveType::Int: case PrimitiveType::UInt:
+        case PrimitiveType::Long: case PrimitiveType::ULong:
+        case PrimitiveType::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::string getTypeNameForOrderingDiag(const TypeRef* ty) {
+    if (ty->kind == TypeRef::Kind::Named && ty->declaration)
+        return std::string(ty->declaration->name);
+    if (ty->kind == TypeRef::Kind::Unit) return "()";
+    if (ty->kind == TypeRef::Kind::InlineArray) return "[...]";
+    if (ty->kind == TypeRef::Kind::Function) return "<function>";
+    switch (ty->primitive) {
+        case PrimitiveType::Bool: return "bool";
+        case PrimitiveType::Byte: return "byte";
+        case PrimitiveType::SByte: return "sbyte";
+        case PrimitiveType::Short: return "short";
+        case PrimitiveType::UShort: return "ushort";
+        case PrimitiveType::Int: return "int";
+        case PrimitiveType::UInt: return "uint";
+        case PrimitiveType::Long: return "long";
+        case PrimitiveType::ULong: return "ulong";
+        case PrimitiveType::Float: return "float";
+        case PrimitiveType::Double: return "double";
+        case PrimitiveType::Decimal: return "decimal";
+        case PrimitiveType::Char: return "char";
+        case PrimitiveType::String: return "string";
+        case PrimitiveType::Object: return "Object";
+        default: return "<unknown type>";
+    }
+}
+}  // namespace
+
 void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
-        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms) {
-    if (!scrutTy || scrutTy->kind != TypeRef::Kind::Primitive ||
-        scrutTy->primitive != PrimitiveType::Object)
-        return;
-    // One diagnostic per `case`, at the first offending pattern: a second
-    // relop arm over the same Object scrutinee is the same error restated,
-    // and repeating it per arm would bury the one that matters. The walk
-    // returns true once it has reported a diagnostic; false otherwise (clean
-    // walk, or the scrutinee's type was not Object — the early-out below).
-    // A relational pattern in arm[1+] must NOT skip this gate: an earlier
-    // revision returned unconditionally after arm[0] and let the malformed
-    // IR through (#5235-ff2-rv). The behaviour-preserving change is to stop
-    // at the first arm that DIAGNOSES, not at the first arm that exists.
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms,
+        const ast::Expr* scrutinee) {
+    // §7.4 / §19.3 (v0.314): a §7.4-narrowed non-null read of a nullable
+    // value-typed scrutinee is tested at its non-nullable type. Mirror the
+    // nullable sibling's narrowing check here: if the scrutinee is narrowed
+    // non-null AND its non-nullable underlying type has an intrinsic ordering,
+    // admit it. The scrutinee type is the declared (possibly nullable) type;
+    // we must check the underlying type for ordering when narrowing applies.
+    // For a non-nullable type the check is direct; for a nullable type we
+    // extract the inner primitive/declaration to test against the ordering list.
+    if (scrutinee && isNarrowedNonNullRead(scrutinee)) {
+        if (scrutTy) {
+            if (!scrutTy->nullable && isRelOpOrderedType(scrutTy))
+                return; // non-nullable ordered type — admitted
+            if (scrutTy->nullable) {
+                // Nullable: check the underlying non-nullable type.
+                if (scrutTy->kind == TypeRef::Kind::Primitive) {
+                    TypeRef tmp = *scrutTy;
+                    tmp.nullable = false;
+                    if (isRelOpOrderedType(&tmp))
+                        return; // underlying non-null primitive is ordered
+                } else if (scrutTy->kind == TypeRef::Kind::Named &&
+                           scrutTy->declaration) {
+                    TypeRef tmp = *scrutTy;
+                    tmp.nullable = false;
+                    if (isRelOpOrderedType(&tmp))
+                        return; // underlying non-null Named is ordered
+                }
+            }
+        }
+    }
+    if (isRelOpOrderedType(scrutTy))
+        return; // relational patterns admitted over this type
+    // Scrutinee is not ordered for relational patterns. Report the first
+    // RelOpPattern or RangePattern found in the arms.
     for (const ast::CaseArm& arm : arms) {
-        if (checkOrderingPatternOverUnorderedType(scrutTy, arm.pattern.get()))
-            return;
+        const ast::Pattern* p = arm.pattern.get();
+        if (!p) continue;
+        std::vector<const ast::Pattern*> queue{p};
+        while (!queue.empty()) {
+            const ast::Pattern* q = queue.back();
+            queue.pop_back();
+            if (!q) continue;
+            if (dynamic_cast<const ast::RelOpPattern*>(q) ||
+                dynamic_cast<const ast::RangePattern*>(q)) {
+                std::string tyName = getTypeNameForOrderingDiag(scrutTy);
+                ctx_.diagnostics().report(
+                    Severity::Error, q->span.begin,
+                    "\"" + tyName + "\" has no intrinsic ordering (§"
+                    "19.3) — a relational or range pattern is not admitted "
+                    "over this type");
+                return;
+            }
+            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+                for (const auto& m : ap->members) queue.push_back(m.get());
+        }
     }
 }
 
@@ -13576,28 +13674,40 @@ void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
     // a relational in arm[1+] reach codegen as malformed IR.
     bool ExprTC::checkOrderingPatternOverUnorderedType(
             const TypeRef* ty, const ast::Pattern* pat) {
-        if (!ty || ty->kind != TypeRef::Kind::Primitive ||
-            ty->primitive != PrimitiveType::Object || !pat)
-            return false;
-        std::vector<const ast::Pattern*> queue{pat};
-        while (!queue.empty()) {
-            const ast::Pattern* q = queue.back();
-            queue.pop_back();
-            if (!q) continue;
-            if (dynamic_cast<const ast::RelOpPattern*>(q) ||
-                dynamic_cast<const ast::RangePattern*>(q)) {
+    if (!ty || !pat) return false;
+    // §19.3 (v0.314): check each pattern kind against the type's ordering.
+    // Walk the pattern tree (including AltPattern alternatives).
+    std::vector<const ast::Pattern*> queue{pat};
+    while (!queue.empty()) {
+        const ast::Pattern* q = queue.back();
+        queue.pop_back();
+        if (!q) continue;
+        if (auto* rp = dynamic_cast<const ast::RelOpPattern*>(q)) {
+            if (!isRelOpOrderedType(ty)) {
+                std::string tyName = getTypeNameForOrderingDiag(ty);
                 ctx_.diagnostics().report(
-                    Severity::Error, q->span.begin,
-                    "a relational or range pattern cannot be used with an "
-                    "Object scrutinee (\xC2\xA7""19.3) — Object has no defined "
-                    "ordering");
+                    Severity::Error, rp->span.begin,
+                    """ + tyName + "" has no intrinsic ordering (§"
+                    "19.3) — a relational pattern is not admitted "
+                    "over this type");
                 return true;
             }
-            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
-                for (const auto& m : ap->members) queue.push_back(m.get());
+        } else if (auto* rpp = dynamic_cast<const ast::RangePattern*>(q)) {
+            if (!isRangeOrderedType(ty)) {
+                std::string tyName = getTypeNameForOrderingDiag(ty);
+                ctx_.diagnostics().report(
+                    Severity::Error, rpp->span.begin,
+                    """ + tyName + "" has no intrinsic ordering (§"
+                    "19.3) — a range pattern is not admitted "
+                    "over this type");
+                return true;
+            }
         }
-        return false;
+        if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+            for (const auto& m : ap->members) queue.push_back(m.get());
     }
+    return false;
+}
 
 // §7.4 (issue #418): refresh `nullNarrowed_` for `sym := value`. A non-null
 // value proves the variable non-null from here; a nullable value (including a
@@ -23047,12 +23157,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // non-null read of a nullable scrutinee.
         checkOrderingPatternsOverNullableScrutinee(
             scrutTy, cs->arms, cs->scrutinee.get());
-        // §19.3 / §16.6 (v0.313, #5235): the statement-position form takes the
-        // same "the scrutinee's type has an ordering" rule as the CaseExpr
-        // site — one shared checker, so the two spellings of `case` cannot
-        // drift apart. Pre-fix this form reached codegen unchecked and emitted
-        // `icmp sgt ptr %obj, i32 5` (MEASURED malformed IR, #5235).
-        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, cs->arms);
+        // §19.3 / §16.6 (v0.314, #5269/#5273): the statement-position form
+        // takes the same intrinsic-ordering rule as the CaseExpr site — one
+        // shared checker, so the two spellings of `case` cannot drift apart.
+        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, cs->arms, cs->scrutinee.get());
         // §5.1 / §19 (#1153): reject an out-of-range integer pattern literal
         // (statement-position `case` is exempt from exhaustiveness but not from
         // the literal-range gate — codegen would otherwise truncate it).

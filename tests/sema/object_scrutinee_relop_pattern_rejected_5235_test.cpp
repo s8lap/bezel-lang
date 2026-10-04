@@ -17,9 +17,11 @@ using bezel::test::runAot;
 
 namespace {
 
+// §19.3 (v0.314, #5269): checks for the ordering-diagnostic message.
+// The diagnostic now names the type: "X has no intrinsic ordering (§19.3)".
 bool hasObjectOrderingDiag(const bezel::test::JitResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("Object has no defined ordering") !=
+        if (d.message.find("has no intrinsic ordering (\xC2\xA7""19.3)") !=
                 std::string::npos)
             return true;
     return false;
@@ -311,19 +313,11 @@ BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
     BEZEL_EXPECT_EQ(1, r.exitCode);
 }
 
-// NARROW-SCOPE GUARD. Whether a user type that DECLARES comparison operators
-// counts as having "the ordering of the scrutinee's type" (§19.3) is the open
-// spec-question in #5269 (owner-ruled, NOT this lane's to decide). This fix
-// gates PrimitiveType::Object only, so it must not change what happens to
-// such a scrutinee. This row pins that boundary from BOTH sides: the program
-// is still rejected (MEASURED on this branch — codegen emits
-// `icmp slt %record.V %9, %10` and `verifyModule` fails), and it is NOT
-// rejected by the new §19.3 gate. The first assertion is what makes the row
-// non-vacuous; the second is the actual scope claim.
-//
-// `failedAtCompileTimeNotRuntime`, not `...WithRealLocation`: this program's
-// rejection is an IR-verification failure raised by the backend, which carries
-// no source location, so the location-based helper cannot see it.
+// §19.3 (v0.314, #5269 ruling): a user-declared `operator <` group on a record
+// is NOT an intrinsic ordering. A relational pattern over a record scrutinee is
+// a compile error naming the type. The verdict is keyed on the TYPE, never on
+// whether a declaration supplies ordering operators. This row pins that verdict:
+// the program is rejected at sema with a §19.3 diagnostic (not at codegen).
 BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
            user_declared_ordering_not_gated_5269) {
     auto r = runAot(
@@ -341,8 +335,8 @@ BEZEL_TEST(object_scrutinee_relop_pattern_rejected_5235,
         "    return (case a of < b => 1, _ => 2); "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeNotRuntime(r));
-    BEZEL_EXPECT_FALSE(hasObjectOrderingDiag(r));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasObjectOrderingDiag(r));
 }
 
 // NON-VACUOUS ARM-LEVEL PIN (#5235-ff2-rv regression). The destructuring-slot
