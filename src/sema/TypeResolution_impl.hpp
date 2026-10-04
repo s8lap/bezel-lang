@@ -597,9 +597,19 @@ private:
 
     void checkTypeOverloads(TypeSymbol* t);
 
-    bool signaturesIndistinguishable(const std::vector<Symbol*>& a,
-                                     const std::vector<Symbol*>& b,
-                                     const MemberSymbol* enclosing);
+    // §11.3 / §14.5 (v0.314, #5364/#5394): the overload-indistinguishability
+    // predicate.  `aGenericParams` / `bGenericParams` are the method's own type
+    // parameter lists (empty for constructors and indexers); when both are
+    // non-empty with equal size, bare type parameters at corresponding
+    // parameter positions are compared by their POSITION in the generic list,
+    // not by `typeRefEqual` (which has no position concept and equates all
+    // bare type parameters with `declaration == nullptr`).
+    bool signaturesIndistinguishable(
+        const std::vector<Symbol*>& a,
+        const std::vector<Symbol*>& b,
+        const MemberSymbol* enclosing,
+        const std::vector<Symbol*>& aGenericParams = {},
+        const std::vector<Symbol*>& bGenericParams = {});
 
     // §22.6 (v0.250, proposal 0091) declaration guard helpers. A pair
     // differing only by ordinary `owned` is *distinguishable* at a

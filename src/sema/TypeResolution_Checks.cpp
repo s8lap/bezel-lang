@@ -3091,9 +3091,30 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
                           const std::string& label) {
         for (std::size_t i = 0; i < overloads.size(); ++i) {
             for (std::size_t j = i + 1; j < overloads.size(); ++j) {
+                // §11.3 / §14.5 (v0.314, #5364/#5394): two methods
+                // with different numbers of type parameters of their own
+                // never clash.  `signaturesIndistinguishable` compares
+                // parameter types but does not read `genericParams`, so a
+                // pair like `M<T>(x: T)` / `M<T,U>(x: T)` or
+                // `N(x: int)` / `N<T>(x: int)` was falsely rejected as
+                // indistinguishable.  Check generic arity first; differing
+                // arity is always a hard distinguish regardless of parameter
+                // type equality.
+                const auto* msI =
+                    dynamic_cast<const MethodSymbol*>(overloads[i].second);
+                const auto* msJ =
+                    dynamic_cast<const MethodSymbol*>(overloads[j].second);
+                if (msI && msJ &&
+                    msI->genericParams.size() != msJ->genericParams.size()) {
+                    continue;  // distinguishable by generic arity
+                }
                 if (signaturesIndistinguishable(
                         *overloads[i].first, *overloads[j].first,
-                        dynamic_cast<const MemberSymbol*>(overloads[i].second))) {
+                        dynamic_cast<const MemberSymbol*>(overloads[i].second),
+                        msI ? msI->genericParams
+                            : std::vector<Symbol*>{},
+                        msJ ? msJ->genericParams
+                            : std::vector<Symbol*>{})) {
                     if (clauseOnlyDifference(overloads[i].second,
                                              overloads[j].second)) {
                         ctx_.diagnostics().report(
@@ -3132,12 +3153,62 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
 
 bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                            const std::vector<Symbol*>& b,
-                                           const MemberSymbol* enclosing) {
+                                           const MemberSymbol* enclosing,
+                                           const std::vector<Symbol*>& aGenericParams,
+                                           const std::vector<Symbol*>& bGenericParams) {
     if (a.size() != b.size()) return false;
+    // §11.3 / §14.5 (v0.314, #5364/#5394): when both methods have the same
+    // number of type parameters, compare bare type parameters by their
+    // POSITION in the generic list, not by `typeRefEqual` (which equates all
+    // declaration-less bare type parameters).  If at any parameter position the
+    // bare type parameters have different positions in their respective generic
+    // lists, the pair is distinguishable (no clash).
+    const bool doPositionalCheck =
+        !aGenericParams.empty() &&
+        aGenericParams.size() == bGenericParams.size();
+    // Helper: returns the position of a bare type parameter `paramType` in
+    // `genericParams`, or -1 if `paramType` is not a bare type parameter.
+    auto getTypeParamPosition =
+        [&](const TypeRef* paramType,
+            const std::vector<Symbol*>& genericParams) -> int {
+        if (!paramType || paramType->kind != TypeRef::Kind::Named ||
+            paramType->declaration != nullptr) {
+            return -1;  // not a bare type parameter
+        }
+        if (!paramType->astNode || !paramType->astNode->name ||
+            paramType->astNode->name->parts.empty()) {
+            return -1;
+        }
+        std::string_view name = paramType->astNode->name->parts[0];
+        for (std::size_t k = 0; k < genericParams.size(); ++k) {
+            if (auto* gps =
+                    dynamic_cast<GenericParamSymbol*>(genericParams[k])) {
+                if (gps->name == name) return static_cast<int>(k);
+            }
+        }
+        return -1;  // not found (should not happen for a valid bare T ref)
+    };
     for (std::size_t i = 0; i < a.size(); ++i) {
         auto* pa = dynamic_cast<ParameterSymbol*>(a[i]);
         auto* pb = dynamic_cast<ParameterSymbol*>(b[i]);
         if (!pa || !pb) return false;
+        // §11.3 / §14.5 (v0.314): positional correspondence check for
+        // same-count generics.  If both parameter types are bare type
+        // parameters (Kind::Named, declaration == nullptr), compare their
+        // positions in their method's own generic parameter list.  Different
+        // positions means the parameter types do NOT correspond positionally
+        // and the pair is distinguishable.
+        if (doPositionalCheck) {
+            TypeRef* ta =
+                pa->declType ? ctx_.resolvedType(*pa->declType) : nullptr;
+            TypeRef* tb =
+                pb->declType ? ctx_.resolvedType(*pb->declType) : nullptr;
+            int posA = getTypeParamPosition(ta, aGenericParams);
+            int posB = getTypeParamPosition(tb, bGenericParams);
+            if (posA >= 0 && posB >= 0 && posA != posB) {
+                return false;  // distinguishable: bare TPs at different positions
+            }
+        }
         std::string_view ma = overloadModifier(pa->modifier);
         std::string_view mb = overloadModifier(pb->modifier);
         if (ma != mb) {
