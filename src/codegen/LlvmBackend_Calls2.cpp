@@ -13453,10 +13453,68 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                : containsYield(mdIt->stmts));
         if (isIterCallee) {
             std::size_t clOffset = isStaticMethod(ms) ? 0 : 1;
+            // fix #5231 (§28.9 / §28.14, v0.313): when the callee is a sync
+            // iterator and a method-own-U formal IS referenced in the body in a
+            // non-invocation way (e.g. stored in a collection via l.Add(x)),
+            // the lambda must NOT be released at the call end because it has
+            // escaped into the collection. Without this check, syncIterClosureArgs
+            // releases the caller's +1 while the collection still points at the
+            // cell — a heap-use-after-free on the next invocation.
+            //
+            // Unlike the call-bounded arm (line 13727-13729) which skips release
+            // when calleeBodyUsesFormalOnlyByInvocation returns false (including
+            // when the formal is NEVER referenced), for sync iterators we must
+            // still release when the formal is never referenced — the callee
+            // never held it, so the caller's +1 is unpaired. Use
+            // collectClosureArgBodyIdentifiers to check if the formal is
+            // referenced at all; if so, apply the conservative check.
             for (std::size_t ai = clOffset;
-                 ai < args.size() && ai < argExprs.size(); ++ai)
-                if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
-                    syncIterClosureArgs.push_back(args[ai]);
+                 ai < args.size() && ai < argExprs.size(); ++ai) {
+                if (!argExprs[ai] || !isPlusOneClosureProducer(argExprs[ai]))
+                    continue;
+                const std::size_t pi = ai - (args.size() - mdIt->params.size());
+                if (pi >= mdIt->params.size()) continue;
+                const ast::Param& p = mdIt->params[pi];
+                if (!p.modifier.empty() || !p.type) continue;
+                bool formalIsFunction = p.type->kind == ast::TypeKind::Function;
+                if (!formalIsFunction && p.type->kind == ast::TypeKind::Named &&
+                    p.type->name && p.type->name->parts.size() == 1) {
+                    std::string_view formalHead = p.type->name->parts.front();
+                    bool isMethodOwnTypeParam = false;
+                    for (const auto& gp : mdIt->genericParams)
+                        if (gp.name == formalHead) {
+                            isMethodOwnTypeParam = true;
+                            break;
+                        }
+                    if (isMethodOwnTypeParam && argExprs[ai]) {
+                        if (auto* argTy = ctx_.exprType(*argExprs[ai])) {
+                            if (argTy->kind == sema::TypeRef::Kind::Function)
+                                formalIsFunction = true;
+                        }
+                    }
+                    // fix #5231: skip release only if the formal IS referenced
+                    // AND the reference is not a bare invocation. If the formal
+                    // is never referenced, the callee never held it — release.
+                    if (formalIsFunction && isMethodOwnTypeParam) {
+                        std::vector<const ast::IdentifierExpr*> refs;
+                        if (mdIt->bodyKind == ast::MethodBodyKind::Expression &&
+                            mdIt->exprBody) {
+                            collectClosureArgBodyIdentifiers(*mdIt->exprBody, refs);
+                        } else if (mdIt->bodyKind == ast::MethodBodyKind::Block) {
+                            for (const auto& s : mdIt->stmts)
+                                collectClosureArgBodyIdentifiers(*s, refs);
+                        }
+                        bool formalReferenced = false;
+                        for (const auto* ref : refs) {
+                            if (ref->name == p.name) { formalReferenced = true; break; }
+                        }
+                        if (formalReferenced &&
+                            !calleeBodyUsesFormalOnlyByInvocation(*mdIt, p.name))
+                            continue;
+                    }
+                }
+                syncIterClosureArgs.push_back(args[ai]);
+            }
         }
     }
     // fix #1073 / §28.14 (the CALL-BOUNDED DEFAULT) / §28.9 / §27.5: the same
