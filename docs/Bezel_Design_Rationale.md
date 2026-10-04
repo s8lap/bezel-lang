@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.314 — October 2026**
+**Companion to the Bezel Language Specification, v0.315 — October 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -1170,6 +1170,12 @@ v0.61 lifts the restriction. Enums may now declare interface conformance. The in
 **The cost.** C# habit writes `level >= Level.Warning`, which meets a compile error; the diagnostic should name the three remedies.
 
 **Reopening bar:** a proposal that gives enums an ordering together with its `IComparable<E>` conformance (so operators and generics move together), names one of the two orders and says what it does under aliasing, and brings evidence that the explicit spellings cause defects that an intrinsic order would prevent.
+
+**Sibling constants in value initializers (v0.315, [#5380](https://github.com/s8lap/bezel-lang/issues/5380)).** Spec §10.2 lets an enum's value initializer name an earlier constant of the same enum, and the name denotes that constant's underlying value at the underlying type. The values the list computes are constants *of the underlying type* (§10.2), and the list is the one place those integers are written, so inside it the integer view is the one in play; the reading is a rule about the list, not a consequence of §10.2's identity of a value with its integer, which supplies no operator (spec §10.5, *Ordering*). C# reads the same construct the same way. The reading stops at the list: member bodies and every other use see enum values, so reason 3 above is untouched. Nor does it open a flags idiom (§9.12, *The flags question*): `ReadWrite := Read | Write` declares one more named constant, and enum operands still have no `|`. Three alternatives were declined.
+
+1. **The sibling is an enum value, and the remedy is `int(A)`.** §17.14 admits no conversion in a constant expression, so this remedy needs the cast lift §17.14 records as liftable, opened for one position. It would also make `Current := Legacy` ill-typed, though that spelling states an alias exactly.
+2. **No sibling references at all.** This rejects the alias spelling and offset layouts (`C := A + 100`) for no safety gain, because nothing outside the list observes the integer.
+3. **Forward references with cycle detection.** Auto-increment continuation makes each value depend on its predecessor, so declaration order is already the evaluation order. An earlier-only rule needs no cycle check, and an author who wants a forward reference can reorder the list.
 
 <a id="sec-sealed-abstract-classes"></a>
 <a id="sec-closed-classes"></a>

@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.314. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.315. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -10,7 +10,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.314 and `Bezel_Standard_Library.md` v0.314 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.315 and `Bezel_Standard_Library.md` v0.315 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -96,7 +96,7 @@ public sealed class BankAccount(name: string, start: decimal): Account(name), IA
 end BankAccount;                          // or `end;`
 ```
 
-Modifiers on a type are `abstract | closed | sealed | static` (A.3). `closed` is the closed abstract class and combines with no other class-shape modifier (✗ `sealed abstract class C` ✓ `closed class C`, §11.7). Base class first in the inheritance list, then interfaces; **only the base** may carry `(args)`. Generic constraints come *after* the inheritance clause. Primary-constructor parameters are in scope throughout the body, including initializers (§22.10).
+Modifiers on a type are `abstract | closed | sealed | static` (A.3). `closed` is the closed abstract class and combines with no other class-shape modifier (✗ `sealed abstract class C` ✓ `closed class C`, §11.7). Base class first in the inheritance list, then interfaces; **only the base** may carry `(args)`. Generic constraints come *after* the inheritance clause. Primary-constructor parameters are in scope throughout the body, including initializers (§22.10). One is read by its bare name only: ✗ `this.host` (the capture is not a member). A member's own parameter of the same name hides it throughout that member; to read both, declare `private _host: string := host;`.
 
 ```bezel
 public interface IBankAccount: IAudited
@@ -608,7 +608,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.314 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.315 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
