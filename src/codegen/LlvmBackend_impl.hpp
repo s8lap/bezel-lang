@@ -798,6 +798,7 @@ public:
         // Exceptions only creates module globals + the shared no-op dispose; it
         // depends on nothing declared later.
         setupBuiltinExceptions();  // CG22
+        setupBuiltinObject();      // CG22 / fix #5340
         declareStructs();
         declareStatics();
         declareFunctions();
@@ -9465,6 +9466,13 @@ private:
     // types (which have no user TypeSymbol). A type's descriptor lists its
     // own and all ancestor descriptors so `catch Ancestor` matches.
     void setupBuiltinExceptions();
+
+    // fix #5340 (§2.8.3 / §8.1, v0.314): build the Object type descriptor
+    // and vtable. Object is the root class and has no user TypeSymbol, so it
+    // bypasses the normal buildVtable path. Its vtable carries Dispose (no-op),
+    // ToString ("System.Object"), Equals (reference equality), and GetHashCode
+    // (identity hash) — the correct defaults per §8.1 / §8.3.
+    void setupBuiltinObject();
 
     // CG22: descriptor global for a catch-arm/throw type name — a user
     // type's descArray_ or a built-in exception's descriptor.

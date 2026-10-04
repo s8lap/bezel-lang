@@ -5750,16 +5750,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // `genericBackingType`'s dictionary row and `collectionElemIsClass`
         // use), not a new spelling of it.
         //
-        // Leaving the policy table alone is safe here because the OWNING column
-        // is unreachable for `Object` regardless: sema rejects `OwningSet<Object>`
-        // / `OwningArray<Object>` at instantiation ("requires a class or
-        // interface element type … a primitive value type has no disposal
-        // obligation", stdlib §4.2/§14.4, #1327 — VERIFIED by probe, not
-        // assumed), so every `arrIsOwning && arrElemIsClass` gate below stays
-        // dead for `Object` and only the BORROWING `Set<Object>` arms and the
-        // shared membership scans (`Contains`/`IndexOf`/`Remove`) change. For
-        // those three the policy row is `ClassBorrow`-equivalent anyway: a null
-        // disposer and a pointer slot.
+        // fix #5340 (§2.8.3, v0.314): `Object` is now admitted by sema as an
+        // owning-collection element type (stdlib §4.2/§14.4: "Object is a class",
+        // owningElementBadDesc returns {} for Object). The owning-element path is
+        // now reachable: `OwningArray<Object> := [new Object()]` compiles and
+        // runs. The element policy for Object is Value (no per-element disposer),
+        // so the `arrIsOwning && arrElemIsClass` gates below stay dead for
+        // Object regardless — the element slot is a bare pointer, not an owned
+        // reference requiring disposal. The comment above is kept as historical
+        // record of the pre-ruling state.
         bool arrElemIsClass =
             arrElemPol.cat == ElementPolicy::Category::ClassOwned ||
             arrElemPol.cat == ElementPolicy::Category::ClassBorrow ||
@@ -5952,9 +5951,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // `Object`/interface element slot before the dedup scan and the
             // append — `boxForTarget` is a byte-identical no-op for a class
             // element or an already-reference source, so `OwningSet<C>` is
-            // unchanged. UNREACHABLE for `Object` today (sema rejects
-            // `OwningSet<Object>`, #1327); written for symmetry with the two
-            // borrowing arms below so the three set-insert sites cannot drift.
+            // unchanged. fix #5340 (§2.8.3, v0.314): `OwningSet<Object>` is now
+            // admitted by sema (stdlib §4.2/§14.4: "Object is a class"), so this
+            // arm IS reachable for Object — boxForTarget is still a no-op (Object
+            // is already reference-shaped at the slot) and the comment above
+            // applies unchanged. Written for symmetry with the borrowing arms below
+            // so the three set-insert sites cannot drift.
             item = boxForTarget(item, arrElemRef, call.args[0].value.get());
             if (!emitSetDedupInsert(item)) return nullptr;
             // fix #1970 / §28.4 / §28.6: OwningSet<T>.Add takes `owned item`

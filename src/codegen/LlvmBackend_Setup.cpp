@@ -6126,6 +6126,100 @@ void Emitter::setupBuiltinExceptions() {
 }
 
 
+// fix #5340 (§2.8.3 / §8.1 / §8.3, v0.314): the Object type is the root
+// class. It has no user TypeSymbol (PrimitiveType::Object, not Named), so it
+// bypasses buildVtable. This function creates the Object descriptor and vtable
+// so that `new Object()` produces a valid heap object.
+//
+// Descriptor layout: [Object, null] — Object is the root, no ancestors.
+// Vtable layout (6 slots per §8.6):
+//   [0]=td, [1]=itmap (null=empty), [2]=Dispose (no-op),
+//   [3]=ToString ("System.Object"), [4]=Equals (ref equality),
+//   [5]=GetHashCode (identity hash).
+void Emitter::setupBuiltinObject() {
+    // Descriptor: [Object, null]. Object has no base, so chain is just [Object].
+    // Use LinkOnceODR like the exception descriptors so catch/throw can share it.
+    auto* descArrTy = llvm::ArrayType::get(ptrTy(), 2);
+    auto* objDesc = new llvm::GlobalVariable(
+        *module_, descArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::LinkOnceODRLinkage, nullptr, "btd$Object");
+    objDesc->setInitializer(llvm::ConstantArray::get(descArrTy, {
+        llvm::ConstantExpr::getPointerCast(objDesc, ptrTy()),
+        llvm::ConstantPointerNull::get(ptrTy())
+    }));
+    builtinDesc_["Object"] = objDesc;
+
+    // Shared empty itmap (same as exceptions use).
+    auto* emptyItmapTy = llvm::ArrayType::get(ptrTy(), 1);
+    auto* emptyItmap = new llvm::GlobalVariable(
+        *module_, emptyItmapTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(emptyItmapTy,
+                                 {llvm::ConstantPointerNull::get(ptrTy())}),
+        "itmap$bz$empty");
+
+    // §8.5: Object's ToString returns "System.Object" — the qualified type name.
+    auto* tsFnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    auto* objToStringThunk = llvm::Function::Create(
+        tsFnTy, llvm::Function::InternalLinkage,
+        "bz$extostr$Object", module_.get());
+    {
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", objToStringThunk);
+        llvm::IRBuilder<> tb(bb);
+        std::string_view mod = common::builtinClassModulePathOf("Object");
+        std::string rendered = mod.empty()
+                                  ? "Object"
+                                  : (std::string(mod) + ".Object");
+        llvm::Value* nameStr = lowerStringLiteral(
+            std::string("\"") + rendered + "\"", false);
+        tb.CreateRet(nameStr);
+    }
+
+    // Equals: reference equality (boxDefaultEqualsThunk pattern).
+    auto* eqFnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+    auto* objEqualsThunk = llvm::Function::Create(
+        eqFnTy, llvm::Function::LinkOnceODRLinkage,
+        "bz$obj$eq", module_.get());
+    {
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", objEqualsThunk);
+        llvm::IRBuilder<> b(bb);
+        b.CreateRet(b.CreateICmpEQ(
+            objEqualsThunk->getArg(0), objEqualsThunk->getArg(1)));
+    }
+
+    // GetHashCode: identity hash (boxDefaultHashCodeThunk pattern).
+    auto* hashFnTy = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+    auto* objHashThunk = llvm::Function::Create(
+        hashFnTy, llvm::Function::LinkOnceODRLinkage,
+        "bz$obj$hash", module_.get());
+    {
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", objHashThunk);
+        llvm::IRBuilder<> b(bb);
+        b.CreateRet(b.CreateCall(
+            declareC("bz_obj_identity_hash", i32(), {ptrTy()}),
+            {objHashThunk->getArg(0)}));
+    }
+
+    // Vtable: [td, itmap, Dispose, ToString, Equals, GetHashCode].
+    std::vector<llvm::Constant*> vtableElems = {
+        llvm::ConstantExpr::getPointerCast(objDesc, ptrTy()),
+        llvm::ConstantExpr::getPointerCast(emptyItmap, ptrTy()),
+        builtinDisposeFn_,   // no-op Dispose (correct for Object — no destructor)
+        objToStringThunk,    // "System.Object" (§8.5 class default)
+        objEqualsThunk,      // reference equality (§8.3)
+        objHashThunk         // identity hash (§8.3)
+    };
+    auto* vtableArrTy = llvm::ArrayType::get(ptrTy(), vtableElems.size());
+    auto* objVtable = new llvm::GlobalVariable(
+        *module_, vtableArrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(vtableArrTy, vtableElems),
+        "bvt$Object");
+    builtinVtable_["Object"] = objVtable;
+    allVtables_.push_back(objVtable);  // §8.6 #417
+}
+
+
 llvm::GlobalVariable* Emitter::descriptorForTypeName(const sema::TypeRef* rt,
                                             const ast::Type* tyNode) {
     if (rt && rt->declaration) {

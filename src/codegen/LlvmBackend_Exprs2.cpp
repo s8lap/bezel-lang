@@ -6134,6 +6134,43 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     sema::TypeRef* rt = ne.type
         ? ctx_.resolvedType(*ne.type)
         : const_cast<sema::TypeRef*>(ctx_.exprType(ne));
+    // fix #5340 (§2.8.3 / §8.1 / §8.3, v0.314): Object is a primitive type
+    // with no user TypeSymbol, so `rt->declaration` is null and every Named-type
+    // branch below falls through. Object is the root class: a heap object carrying
+    // only the object header (vtable ptr at offset 0). Allocate one word (the ptr
+    // slot) and install the Object vtable built by setupBuiltinObject — its
+    // Dispose is a no-op (§8.7 — Object has no destructor), its ToString returns
+    // "System.Object" (§8.5 class default), Equals is reference equality, and
+    // GetHashCode is identity hash (§8.3) — all correct for Object.
+    // The owning-array element path (LlvmBackend_Setup.cpp's
+    // materializeHeapCollectionLiteral) now successfully lowers `[new Object()]`
+    // without triggering the #1386 ICE. Placed BEFORE the Named guard because
+    // Object is Primitive, not Named.
+    if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+        rt->primitive == sema::PrimitiveType::Object &&
+        !rt->nullable) {
+        llvm::Value* obj = builder_.CreateCall(
+            callocFn(),
+            {builder_.getInt64(1), builder_.getInt64(8)},
+            "object.new");
+        // fix #5340 (§2.8.3 / §8.1 / §8.3, v0.314): install the proper
+        // Object vtable (built by setupBuiltinObject), not the Exception vtable
+        // stand-in. The Object vtable's ToString returns "System.Object"
+        // (§8.5 class default), Dispose is a no-op (§8.7 — Object has no
+        // destructor), Equals is reference equality (§8.3), and GetHashCode is
+        // identity hash (§8.3) — all correct for Object.
+        auto vit = builtinVtable_.find("Object");
+        if (vit != builtinVtable_.end()) {
+            llvm::Value* vtable = vit->second;
+            llvm::Value* vtableSlot =
+                builder_.CreateGEP(llvm::Type::getInt8Ty(llvm_), obj,
+                                  builder_.getInt64(0));
+            llvm::Value* vtableSlotPtr =
+                builder_.CreateBitCast(vtableSlot, ptrTy()->getPointerTo());
+            builder_.CreateStore(vtable, vtableSlotPtr);
+        }
+        return obj;
+    }
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
     // §22.4 / §28.3 (#1833 (b), #1467 sibling): snapshot the
     // discardOwnedOutSlots_ stack at the entry of `lowerNew` so the
