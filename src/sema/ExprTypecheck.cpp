@@ -18777,7 +18777,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (currentScope_ && !ld->name.empty()) {
             // §21.1 (#5370, v0.314): a local's name must be unique within its
             // immediate scope. Do NOT walk parent scopes — nested shadowing is
-            // undecided (§5382). _ is exempt. The setter's implicit `value`
+            // undecided (#5382). _ is exempt. The setter's implicit `value`
             // param is also exempt when no SetterParamSpec was written AND
             // it's a regular property setter (not indexer) per Appendix B / §23.3.
             if (ld->name != "_" &&
@@ -19283,7 +19283,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (currentScope_ && !lc->name.empty()) {
             // §21.1 (#5370, v0.314): a local's name must be unique within its
             // immediate scope. Do NOT walk parent scopes — nested shadowing is
-            // undecided (§5382). _ is exempt. The setter's implicit `value`
+            // undecided (#5382). _ is exempt. The setter's implicit `value`
             // param is also exempt when no SetterParamSpec was written AND
             // it's a regular property setter (not indexer) per Appendix B / §23.3.
             if (lc->name != "_" &&
