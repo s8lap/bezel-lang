@@ -38,6 +38,15 @@ int runExit(const std::string& body) {
     return r.ran ? r.exitCode : -999;
 }
 
+// §19.3 (v0.314, #5269/#5273): checks for the ordering-diagnostic message.
+bool hasOrderingDiag(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("has no intrinsic ordering (\xC2\xA7""19.3)") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 // §19.3 / §4.6 / spec v0.313 line 511 / fix #5220 / fix #5173-ff:
@@ -95,39 +104,19 @@ BEZEL_TEST(scrutinee_nonnull_string_relop_5173,
         1);
 }
 
-// §19.3 / §4.6 / spec v0.313 line 511: range pattern `"a".."c"`
-// (closed, both bounds inclusive) — `s = "a"`, `"b"`, `"c"` all match
-// (select 1); `s = "d"` is past the upper bound (selects 2).
+// §19.3 / §16.3 (v0.314, #5273): a range pattern is admitted only
+// over the integer types and char. A string scrutinee is NOT a valid range
+// type, so `case s of "a".."c" => …` is a compile error naming "string".
 BEZEL_TEST(scrutinee_nonnull_string_relop_5173,
-           nonnull_string_range_pattern_inclusive_bounds) {
-    BEZEL_EXPECT_EQ(runExit(
+           nonnull_string_range_pattern_inclusive_bounds_rejected) {
+    auto r = runAot(
         "module M; "
         "class C public static method Main(): int "
         "  var s: string := \"a\"; "
         "  return (case s of \"a\"..\"c\" => 1, _ => 2); "
-        "end Main; end C;"),
-        1);
-    BEZEL_EXPECT_EQ(runExit(
-        "module M; "
-        "class C public static method Main(): int "
-        "  var s: string := \"b\"; "
-        "  return (case s of \"a\"..\"c\" => 1, _ => 2); "
-        "end Main; end C;"),
-        1);
-    BEZEL_EXPECT_EQ(runExit(
-        "module M; "
-        "class C public static method Main(): int "
-        "  var s: string := \"c\"; "
-        "  return (case s of \"a\"..\"c\" => 1, _ => 2); "
-        "end Main; end C;"),
-        1);
-    BEZEL_EXPECT_EQ(runExit(
-        "module M; "
-        "class C public static method Main(): int "
-        "  var s: string := \"d\"; "
-        "  return (case s of \"a\"..\"c\" => 1, _ => 2); "
-        "end Main; end C;"),
-        2);
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasOrderingDiag(r));
 }
 
 // §19.3 / §4.6: lexicographic ordering — `"apple"` is BEFORE

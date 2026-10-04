@@ -13579,6 +13579,26 @@ static bool isRelOpOrderedType(const TypeRef* ty) {
     }
 }
 
+// §19.3 (v0.314, #5269/#5273): returns true if any arm in `arms` contains
+// a RangePattern (including inside AltPattern alternatives).
+static bool armsContainRangePattern(const std::vector<ast::CaseArm>& arms) {
+    for (const auto& arm : arms) {
+        const ast::Pattern* p = arm.pattern.get();
+        if (!p) continue;
+        std::vector<const ast::Pattern*> queue{p};
+        while (!queue.empty()) {
+            const ast::Pattern* q = queue.back();
+            queue.pop_back();
+            if (!q) continue;
+            if (dynamic_cast<const ast::RangePattern*>(q))
+                return true;
+            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+                for (const auto& m : ap->members) queue.push_back(m.get());
+        }
+    }
+    return false;
+}
+
 // §19.3 / §16.3 (v0.314, #5273): intrinsic ordering for range patterns.
 // Returns true for the integer types and char only (Range<T>'s T is restricted
 // to these per §16.3).
@@ -13637,26 +13657,38 @@ void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
     // extract the inner primitive/declaration to test against the ordering list.
     if (scrutinee && isNarrowedNonNullRead(scrutinee)) {
         if (scrutTy) {
-            if (!scrutTy->nullable && isRelOpOrderedType(scrutTy))
-                return; // non-nullable ordered type — admitted
-            if (scrutTy->nullable) {
+            const bool hasRange = armsContainRangePattern(arms);
+            if (!scrutTy->nullable) {
+                // §19.3 / §16.3 (v0.314, #5273): a range pattern is admitted
+                // only over the integer types and char. Admit only if no range
+                // pattern is present, or if the type is range-ordered.
+                if (isRelOpOrderedType(scrutTy) &&
+                    (!hasRange || isRangeOrderedType(scrutTy)))
+                    return; // non-nullable ordered type — admitted
+            } else if (scrutTy->nullable) {
                 // Nullable: check the underlying non-nullable type.
                 if (scrutTy->kind == TypeRef::Kind::Primitive) {
                     TypeRef tmp = *scrutTy;
                     tmp.nullable = false;
-                    if (isRelOpOrderedType(&tmp))
+                    if (isRelOpOrderedType(&tmp) &&
+                        (!hasRange || isRangeOrderedType(&tmp)))
                         return; // underlying non-null primitive is ordered
                 } else if (scrutTy->kind == TypeRef::Kind::Named &&
                            scrutTy->declaration) {
                     TypeRef tmp = *scrutTy;
                     tmp.nullable = false;
-                    if (isRelOpOrderedType(&tmp))
+                    if (isRelOpOrderedType(&tmp) &&
+                        (!hasRange || isRangeOrderedType(&tmp)))
                         return; // underlying non-null Named is ordered
                 }
             }
         }
     }
-    if (isRelOpOrderedType(scrutTy))
+    // §19.3 / §16.3 (v0.314, #5273): if a range pattern is present, also
+    // require the type to be range-ordered (integer types and char only).
+    // Relational patterns are admitted for isRelOpOrderedType types.
+    if (isRelOpOrderedType(scrutTy) &&
+        (!armsContainRangePattern(arms) || isRangeOrderedType(scrutTy)))
         return; // relational patterns admitted over this type
     // Scrutinee is not ordered for relational patterns. Report the first
     // RelOpPattern or RangePattern found in the arms.

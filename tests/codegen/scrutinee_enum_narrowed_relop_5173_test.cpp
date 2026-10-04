@@ -1,24 +1,12 @@
-// Spec-derived codegen tests for fix-forward #5173 — §19.3 / §7.11 / §10
-// (v0.310, #5143 ruling): a §7.4-narrowed non-null read of a nullable
-// ENUM scrutinee with a relational/range pattern is ADMITTED at sema AND
-// lowers to a correct ordinal comparison at codegen (the §10 enum lowers
-// to i32 — CG44 — and patternMatches's `isNullableVal` branch extracts
-// the unwrapped i32 payload from the `{i8 hasValue; i32}` box via
-// `nullablePrimValue`).
-//
-// CONTROL tests for the predicate tightening at src/sema/ExprTypecheck.cpp:
-// 13036–13062. The narrowing path opens for value-typed scrutinees
-// (Primitive+value / Unit / InlineArray / Named+Record+Enum+Choice);
-// the fix-forward excludes Primitive's reference members (String, Object,
-// None) from the value arm. enum E? is in the Named+Enum arm — pre- and
-// post-fix-forward ADMITTED, and the codegen path lowers correctly. These
-// rows prove the predicate tightening does NOT accidentally over-restrict
-// the enum admit.
+// Spec-derived codegen tests for #5269/#5273 — §19.3 / §7.11 / §10
+// (v0.314 ruling): a relational pattern over an enum scrutinee is a compile
+// error naming the type — an enum has no intrinsic ordering (§19.3). The
+// verdict is keyed on the TYPE, never on whether a declaration supplies
+// ordering operators. These rows pin the reject verdict.
 //
 // runAot drives the real AOT path (fork-isolated Driver::compileFile + clang
-// link + native exec) — the strict oracle. Each row asserts the SELECTED
-// arm's value on stdout, so a regression in the enum's lower (pointer-compare
-// shape, missing isNullableVal branch, etc.) flips a test.
+// link + native exec) — the strict oracle. Each row asserts compile-time
+// rejection.
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
@@ -27,34 +15,22 @@ using bezel::test::runAot;
 
 namespace {
 
-// §19.3 / §10 (v0.310, #5143 ruling): a §7.4-narrowed non-null read of a
-// nullable ENUM scrutinee (`E?`) at a relational pattern is admitted at
-// sema and lowers via patternMatches's `isNullableVal` path
-// (isNullableEnumTy → nullablePrimValue extracts the unwrapped i32
-// underlying type from the {i8 hasValue; i32} box). The selected arm's
-// value is observed in the exit code.
-//
-// Helper.Get(): T? returns the nullable form so `valueProvesNonNull` is
-// false and the local is NOT narrowed at the assignment; the
-// `if x <> null then case x of …` block performs the §7.4 narrowing for
-// the case form (§19.1). Same Main/Helper structure the existing
-// case_relop_nullable_1074 rows use (#5173's documentation).
-struct RunResult {
-    bool ran;
-    int exitCode;
-};
-RunResult runProg(const std::string& body) {
-    auto r = runAot(body);
-    return {r.ran, r.exitCode};
+// §19.3 (v0.314, #5269): checks for the ordering-diagnostic message.
+bool hasOrderingDiag(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("has no intrinsic ordering (\xC2\xA7""19.3)") !=
+                std::string::npos)
+            return true;
+    return false;
 }
 
 }  // namespace
 
-// §19.3 / §10 / #5173: enum E? narrowed — `1` matches `> E.A` (where E.A
-// is ordinal 0, E.B is ordinal 1, E.C is ordinal 2) and selects arm 1.
+// §19.3 (v0.314, #5269): an enum has no intrinsic ordering. A relational
+// pattern over an enum scrutinee is a compile error naming "E".
 BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
-           narrowed_enum_scrutinee_gt_admitted_5173) {
-    auto r = runProg(
+           narrowed_enum_scrutinee_gt_rejected_5173) {
+    auto r = runAot(
         "module M; "
         "enum E A, B, C; end E; "
         "class Helper public static method Get(): E? "
@@ -66,15 +42,15 @@ BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
         "  end if; "
         "  return 99; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 1);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasOrderingDiag(r));
 }
 
-// §19.3 / §10: enum E? narrowed, `E.A` does NOT match `> E.A` and selects
-// the `_ => 2` arm.
+// §19.3 (v0.314, #5269): same — the relational pattern is rejected regardless
+// of which arm it would select.
 BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
-           narrowed_enum_scrutinee_gt_no_match_admitted_5173) {
-    auto r = runProg(
+           narrowed_enum_scrutinee_gt_no_match_rejected_5173) {
+    auto r = runAot(
         "module M; "
         "enum E A, B, C; end E; "
         "class Helper public static method Get(): E? "
@@ -86,15 +62,14 @@ BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
         "  end if; "
         "  return 99; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 2);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasOrderingDiag(r));
 }
 
-// §19.3 / §10: enum E? narrowed — `E.B` (ordinal 1) matches `<= E.B`
-// (boundary inclusive) and selects arm 8.
+// §19.3 (v0.314, #5269): `<=` form.
 BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
-           narrowed_enum_scrutinee_le_boundary_admitted_5173) {
-    auto r = runProg(
+           narrowed_enum_scrutinee_le_boundary_rejected_5173) {
+    auto r = runAot(
         "module M; "
         "enum E A, B, C; end E; "
         "class Helper public static method Get(): E? "
@@ -106,15 +81,14 @@ BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
         "  end if; "
         "  return 99; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 8);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasOrderingDiag(r));
 }
 
-// §19.3 / §10: `<` and `>=` spellings — `E.A` (ordinal 0) matches `< E.B`
-// (ordinal 1); `E.C` (ordinal 2) matches `>= E.C`.
+// §19.3 (v0.314, #5269): `<` and `>=` spellings — all forms are rejected.
 BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
-           narrowed_enum_scrutinee_lt_and_ge_admitted_5173) {
-    auto r1 = runProg(
+           narrowed_enum_scrutinee_lt_and_ge_rejected_5173) {
+    auto r1 = runAot(
         "module M; "
         "enum E A, B, C; end E; "
         "class Helper public static method Get(): E? "
@@ -126,10 +100,10 @@ BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
         "  end if; "
         "  return 99; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r1.ran);
-    BEZEL_EXPECT_EQ(r1.exitCode, 4);
+    BEZEL_EXPECT_FALSE(r1.ran);
+    BEZEL_EXPECT_TRUE(hasOrderingDiag(r1));
 
-    auto r2 = runProg(
+    auto r2 = runAot(
         "module M; "
         "enum E A, B, C; end E; "
         "class Helper public static method Get(): E? "
@@ -141,16 +115,6 @@ BEZEL_TEST(scrutinee_enum_narrowed_relop_5173,
         "  end if; "
         "  return 99; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r2.ran);
-    BEZEL_EXPECT_EQ(r2.exitCode, 6);
+    BEZEL_EXPECT_FALSE(r2.ran);
+    BEZEL_EXPECT_TRUE(hasOrderingDiag(r2));
 }
-
-// (Range patterns over enum scrutinees — `E.A..E.C` — are not part of the
-// #5173 spec coverage: the existing parser/codegen path emits "expected
-// '=>' after case-arm pattern" for an enum-bounded RangePattern, so the
-// range form is excluded from this control file. The relational patterns
-// above exercise the same `isNullableVal` branch — `isNullableEnumTy` is
-// the enum analogue of `isNullablePrimTy` per §10 / CG44, and patternMatches
-// unwraps the {i8 hasValue; i32} box via `nullablePrimValue` exactly as it
-// does for a primitive. Range-pattern coverage for a NARROWED ENUM
-// scrutinee stays a residual — separate from #5173 (filed separately).)

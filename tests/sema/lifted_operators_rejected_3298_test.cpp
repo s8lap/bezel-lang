@@ -156,6 +156,15 @@ bool hasNullablePatternError(const bezel::test::SemaResult& r) {
     return false;
 }
 
+// §19.3 (v0.314, #5269): checks for the ordering-diagnostic message.
+bool hasOrderingDiag(const bezel::test::SemaResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("has no intrinsic ordering (\xC2\xA7""19.3)") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+
 // §17.5 / §16.6 / #3298: the range-receiver `in` gate's diagnostic. Distinct
 // from the pattern one — §16.6 says the two rejections are "reached by
 // different rules and their diagnostics differ; what agrees is the verdict".
@@ -668,12 +677,11 @@ BEZEL_TEST(lifted_operators_rejected_3298,
     BEZEL_EXPECT_TRUE(hasNullablePatternError(r));
 }
 
-// fix #5173 / §19.3 (v0.310, #5143 ruling): narrowed record-scrutinee
-// `case q of .. => 1, _ => 2` is admitted. patternMatches's `isNullableVal`
-// path covers `record?` via `isNullableRecordTy` and unwraps with
-// `nullablePrimValue` exactly as it does for a primitive.
+// §19.3 (v0.314, #5269/#5273 ruling): a range pattern is admitted only
+// over integer types and char. A record has no intrinsic ordering, so a
+// range pattern over a record scrutinee is a compile error naming the type.
 BEZEL_TEST(lifted_operators_rejected_3298,
-           case_range_pattern_over_narrowed_nullable_record_scrutinee_admitted_5173) {
+           case_range_pattern_over_narrowed_nullable_record_scrutinee_rejected_5173) {
     auto r = parseSemaAll(
         "module M; record R(X: int); "
         "class C public static method Main(q: R?): int "
@@ -683,8 +691,8 @@ BEZEL_TEST(lifted_operators_rejected_3298,
         "  end if; "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasNullablePatternError(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasOrderingDiag(r));
 }
 
 BEZEL_TEST(lifted_operators_rejected_3298,
