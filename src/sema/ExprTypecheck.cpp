@@ -11690,7 +11690,18 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
         // and how the unrelated-typed-member head shape should read, is raised
         // as a spec-clarification issue.)
         if (memberBeforeModuleType && s == moduleScope_.get() && currentType_) {
-            if (Symbol* m = lookupMember(currentType_, name)) return m;
+            if (Symbol* m = lookupMember(currentType_, name)) {
+                // §22.10 (v0.315, #5404): a static member has no `this`, so a
+                // primary-constructor parameter capture field (`posParam != nullptr`)
+                // is not in scope. Filter it out so the name falls through to
+                // "unresolved identifier" rather than silently lowering to zero.
+                if (inStaticMember_) {
+                    if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                        if (fs->posParam) return nullptr;
+                    }
+                }
+                return m;
+            }
         }
         auto it = s->names.find(name);
         if (it != s->names.end()) {
@@ -11715,7 +11726,18 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
     // (Reached when the current scope chain did not include `moduleScope_`, so
     // the in-loop member check above never fired.)
     if (currentType_) {
-        if (Symbol* m = lookupMember(currentType_, name)) return m;
+        if (Symbol* m = lookupMember(currentType_, name)) {
+            // §22.10 (v0.315, #5404): a static member has no `this`, so a
+            // primary-constructor parameter capture field (`posParam != nullptr`)
+            // is not in scope. Filter it out so the name falls through to
+            // "unresolved identifier" rather than silently lowering to zero.
+            if (inStaticMember_) {
+                if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                    if (fs->posParam) return nullptr;
+                }
+            }
+            return m;
+        }
     }
     return nullptr;
 }
