@@ -2425,6 +2425,12 @@ void bz_tcs_fault_if_pending(void* tcs, void* ioe_vtable);
 // This just frees the bz_tcs_t struct itself.
 void bz_tcs_free(void* tcs);
 
+// fix #4748 / stdlib §4.4 (v0.307): register the InvalidOperationException
+// vtable with the runtime so bz_array_add and other structural mutators can
+// throw it when called from a sort comparator.  Called once from
+// emitMainStaticInitPrologue before any user code runs.
+void bz_ioe_vtable_init(void* vtable);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

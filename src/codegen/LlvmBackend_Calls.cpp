@@ -5457,6 +5457,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 llvm::Type::getVoidTy(llvm_),
                 {ptrTy(), i64(), ptrTy(), ptrTy()});
             builder_.CreateCall(sortClFn, {recv, builder_.getInt64(esz), closure, tramp});
+            emitPendingCheck();  // fix #4748: bz_array_sort_closure raises IOE on mutation during sort
             // Release inline-lambda closure after the sort completes (#422).
             if (argIsInlineLambda(0)) emitClosureRelease(closure);
             return llvm::ConstantInt::get(i32(), 0);
@@ -5693,6 +5694,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 llvm::Type::getVoidTy(llvm_),
                 {ptrTy(), i64(), ptrTy(), ptrTy()});
             builder_.CreateCall(sortClFn2, {copy, builder_.getInt64(esz), closure, tramp2});
+            emitPendingCheck();  // fix #4748: bz_array_sort_closure raises IOE on mutation during sort
             // Release inline-lambda closure after the sort completes (#422).
             if (argIsInlineLambda(0)) emitClosureRelease(closure);
             freeFreshInputTemp();  // #1004: reclaim a fresh ownerless input temp

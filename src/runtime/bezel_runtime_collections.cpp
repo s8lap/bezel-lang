@@ -2,6 +2,21 @@
 // Split from bezel_runtime.cpp per #1414 stage 2 (behavior-preserving motion).
 #include "bezel_runtime_internal.hpp"
 
+// fix #4748 / stdlib §4.4 (v0.307): thread-local sort-in-progress tracking.
+// Approach: during bz_array_sort_closure, any structural mutator (Add/RemoveAt/
+// InsertAt/Clear) calls longjmp to escape back. bz_array_sort_closure uses
+// setjmp to catch this, and after std::sort returns, checks the flag and
+// throws InvalidOperationException so the Bezel landing pad catches it.
+#include <csetjmp>
+thread_local void*  bz_sort_in_progress_arr = nullptr;  // null = no sort in progress
+thread_local bool   bz_sort_mutation_attempted = false;  // true = mutation during sort
+thread_local std::jmp_buf* bz_sort_jmp_buf = nullptr;   // non-null = jump target
+
+// fix #4748 / stdlib §4.4: the InvalidOperationException vtable, registered at program
+// startup via bz_ioe_vtable_init. Used by bz_throw_invalid_operation and the shim's
+// catch block to allocate a well-formed exception object.
+void* bz_ioe_vtable = nullptr;
+
 // ---------------------------------------------------------------------------
 // fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 / §4.6-§4.9, v0.240):
 // the polymorphic collection-interface dispose dispatcher. The dispose chain
@@ -140,8 +155,19 @@ static void bz_array_grow(bz_array_t* arr, int64_t elem_size, int64_t min_cap) {
     arr->capacity = new_cap;
 }
 
+// fix #4748 / stdlib §4.4: forward declaration — implementation below.
+static inline void bz_throw_invalid_operation(void);
+
 void bz_array_add(void* arrp, const void* elem, int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
+    // fix #4748 / stdlib §4.4: structural mutation during sort callback → longjmp out.
+    // Using longjmp instead of throw avoids std::terminate() from C++ exceptions
+    // propagating through std::sort.
+    if (bz_sort_in_progress_arr == arr && bz_sort_jmp_buf) {
+        bz_sort_mutation_attempted = true;
+        std::longjmp(*bz_sort_jmp_buf, 1);
+        return;  // not reached
+    }
     if (arr->count >= arr->capacity) bz_array_grow(arr, elem_size, arr->count + 1);
     memcpy((char*)arr->data + arr->count * elem_size, elem, (size_t)elem_size);
     arr->count++;
@@ -175,6 +201,12 @@ void bz_array_set_disposing(void* arrp, int64_t idx, const void* elem,
 
 void bz_array_remove_at(void* arrp, int64_t idx, int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
+    // fix #4748 / stdlib §4.4: structural mutation during sort callback → longjmp out.
+    if (bz_sort_in_progress_arr == arr && bz_sort_jmp_buf) {
+        bz_sort_mutation_attempted = true;
+        std::longjmp(*bz_sort_jmp_buf, 1);
+        return;  // not reached
+    }
     if (idx < 0 || idx >= arr->count) return;
     // Shift elements left
     int64_t tail = arr->count - idx - 1;
@@ -191,6 +223,12 @@ void bz_array_remove_at(void* arrp, int64_t idx, int64_t elem_size) {
 void bz_array_insert_at(void* arrp, int64_t idx, const void* elem,
                         int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
+    // fix #4748 / stdlib §4.4: structural mutation during sort callback → longjmp out.
+    if (bz_sort_in_progress_arr == arr && bz_sort_jmp_buf) {
+        bz_sort_mutation_attempted = true;
+        std::longjmp(*bz_sort_jmp_buf, 1);
+        return;  // not reached
+    }
     if (idx < 0) idx = 0;
     if (idx > arr->count) idx = arr->count;            // clamp; idx==count appends
     if (arr->count >= arr->capacity)
@@ -209,6 +247,12 @@ void bz_array_insert_at(void* arrp, int64_t idx, const void* elem,
 void bz_array_clear(void* arrp) {
     if (arrp) {
         auto* arr = (bz_array_t*)arrp;
+        // fix #4748 / stdlib §4.4: structural mutation during sort callback → longjmp out.
+        if (bz_sort_in_progress_arr == arr && bz_sort_jmp_buf) {
+            bz_sort_mutation_attempted = true;
+            std::longjmp(*bz_sort_jmp_buf, 1);
+            return;  // not reached
+        }
         arr->count = 0;
         arr->mod_count++;  // §29.12 / #1232: structural mutation
     }
@@ -218,6 +262,10 @@ void bz_array_clear(void* arrp) {
 void bz_array_clear_disposing(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;
+    // fix #4748 / stdlib §4.4: structural mutation during sort callback.
+    // Dispose elements FIRST (before any jump), then signal the mutation.
+    // Since the sort result is abandoned anyway when a mutation is detected,
+    // disposing before longjmp is correct — the array contents are discarded.
     if (dispose_elem && arr->data) {
         for (int64_t i = 0; i < arr->count; ++i) {
             void* elem_ptr = ((void**)arr->data)[i];
@@ -229,6 +277,11 @@ void bz_array_clear_disposing(void* arrp, void (*dispose_elem)(void*)) {
     }
     arr->count = 0;
     arr->mod_count++;  // §29.12 / #1232: structural mutation
+    if (bz_sort_in_progress_arr == arr && bz_sort_jmp_buf) {
+        bz_sort_mutation_attempted = true;
+        std::longjmp(*bz_sort_jmp_buf, 1);
+        // not reached
+    }
 }
 
 // stdlib §4.5: dispose the non-null element at idx, then remove it.
@@ -347,25 +400,113 @@ void bz_array_sort(void* arrp, int64_t elem_size,
 // `cmpfn(closure, a, b)` wraps the user lambda `(T, T) -> int`.
 // We use a thread-local shim so qsort (which takes a plain function pointer)
 // can reach the closure without a global lock.
-namespace {
-thread_local void*  bz_sort_cl_closure = nullptr;
-thread_local int  (*bz_sort_cl_fn)(void*, const void*, const void*) = nullptr;
-extern "C" int bz_sort_cl_shim(const void* a, const void* b) {
-    return bz_sort_cl_fn(bz_sort_cl_closure, a, b);
+//
+// fix #4748 / stdlib §4.4 (v0.307): a structural mutation that reaches the
+// same array from inside its own sort callback must raise InvalidOperationException
+// (§4.4 loud-failure discipline, extended from enumerator invalidation).
+// We use setjmp/longjmp to escape from the mutation in the comparator back to
+// bz_array_sort_closure, where we throw after std::sort returns.
+// fix #4748 / stdlib §4.4: signal a pending InvalidOperationException during a sort
+// callback. After std::sort returns, bz_array_sort_closure checks the mutation flag
+// and throws InvalidOperationException so the Bezel landing pad catches it.
+extern "C" thread_local void* bz_exc;  // defined in bezel_runtime_itable.cpp
+extern "C" void bz_ioe_vtable_init(void* vtable) { bz_ioe_vtable = vtable; }
+// fix #4748 / stdlib §4.4: raise InvalidOperationException by setting bz_exc.
+// Bezel's exception handling uses explicit control flow (setjmp/longjmp), NOT C++
+// EH with landing pads. The generated code checks bz_exc after the call via
+// emitPendingCheck() and branches to the catch handler. Returning normally lets
+// the generated code's pending-check mechanism handle the control-flow transfer.
+__attribute__((noinline)) static void bz_throw_invalid_operation(void) {
+    if (!bz_ioe_vtable) return;  // defensive: not initialized (shouldn't happen)
+    void* obj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+    if (!obj) return;
+    *(void**)obj = bz_ioe_vtable;
+    bz_exc = obj;  // set so emitPendingCheck() in generated code branches to catch
 }
-}  // namespace
 
 void bz_array_sort_closure(void* arrp, int64_t elem_size,
                            void* closure,
                            int (*cmpfn)(void*, const void*, const void*)) {
     auto* arr = (bz_array_t*)arrp;
     if (!arr || arr->count < 2) return;
-    bz_sort_cl_closure = closure;
-    bz_sort_cl_fn      = cmpfn;
-    qsort(arr->data, (size_t)arr->count, (size_t)elem_size, bz_sort_cl_shim);
-    bz_sort_cl_closure = nullptr;
-    bz_sort_cl_fn      = nullptr;
-    arr->mod_count++;  // §29.12 / #4631: structural mutation (Sort(comparer) repositions)
+    bz_sort_in_progress_arr = arr;       // fix #4748: mark sort-in-progress
+    bz_sort_mutation_attempted = false;  // clear any stale flag
+
+    // fix #4748 / stdlib §4.4: use setjmp/longjmp to escape from the comparator.
+    // longjmp from inside std::sort avoids C++ exception propagation issues.
+    // After longjmp returns (non-zero), we throw InvalidOperationException.
+    // Declare volatile variables BEFORE setjmp so their values survive longjmp.
+    volatile int64_t volatile_count = arr->count;
+    volatile void** volatile_ptrs = nullptr;  // heap-allocated, survives longjmp
+    volatile bool did_longjmp = false;
+    jmp_buf jbuf;
+    bz_sort_jmp_buf = &jbuf;
+    if (::setjmp(jbuf) == 0) {
+        // Normal path: run std::sort
+        int64_t count = volatile_count;
+        void** ptrs = (void**)malloc((size_t)count * sizeof(void*));
+        if (!ptrs) {
+            bz_sort_in_progress_arr = nullptr;
+            bz_sort_jmp_buf = nullptr;
+            return;  // allocation failure: skip sort
+        }
+        volatile_ptrs = (volatile void**)ptrs;
+        char* base = (char*)arr->data;
+        for (int64_t i = 0; i < count; i++)
+            ptrs[i] = base + i * elem_size;
+        std::sort(ptrs, ptrs + count,
+            [cmpfn, closure](void* a, void* b) -> bool {
+                return cmpfn(closure, a, b) < 0;
+            });
+        // Permute elements in place to match sorted order.
+        // ptrs[i] now points to the slot holding the element that belongs at position i.
+        // Walk the permutation chain: at position i, if ptrs[i] != &base[i], swap the
+        // bytes and follow where the displaced element came from until we return to i.
+        // This is the standard in-place permutation algorithm (heap's algorithm variant).
+        for (int64_t i = 0; i < count; i++) {
+            char* target_slot = base + i * elem_size;  // slot that should hold element i
+            char* elem_slot = (char*)ptrs[i];         // slot currently holding element i
+            if (elem_slot == target_slot) continue;    // already in place
+            // Swap the bytes at target_slot and elem_slot
+            char tmp[256];
+            if (elem_size > 256) {
+                for (int64_t b = 0; b < elem_size; b++) {
+                    char t = target_slot[b];
+                    target_slot[b] = elem_slot[b];
+                    elem_slot[b] = t;
+                }
+            } else {
+                memcpy(tmp, target_slot, (size_t)elem_size);
+                memcpy(target_slot, elem_slot, (size_t)elem_size);
+                memcpy(elem_slot, tmp, (size_t)elem_size);
+            }
+            // Now elem_slot holds the bytes that were at target_slot.
+            // Find which sorted position these bytes belong at: search ptrs for the slot
+            // that pointed to target_slot before the swap.
+            char* displaced = target_slot;  // the slot whose bytes we just moved to elem_slot
+            for (int64_t j = i + 1; j < count; j++) {
+                if ((char*)ptrs[j] == displaced) {
+                    ptrs[j] = elem_slot;  // update ptrs so it stays consistent
+                    break;
+                }
+            }
+        }
+        free(ptrs);
+        bz_sort_in_progress_arr = nullptr;
+        bz_sort_jmp_buf = nullptr;
+        arr->mod_count++;  // §29.12 / #4631
+    } else {
+        // longjmp path: a mutation was attempted during the sort
+        did_longjmp = true;
+        bz_sort_in_progress_arr = nullptr;
+        bz_sort_jmp_buf = nullptr;
+        // volatile_ptrs still holds the malloc'd pointer if we got it before the jump
+        if (volatile_ptrs) free((void*)volatile_ptrs);
+    }
+    if (did_longjmp) {
+        // Throw InvalidOperationException so the Bezel landing pad catches it
+        bz_throw_invalid_operation();
+    }
 }
 
 // §29.12, v0.307: record an in-place repositioning that the CALLER performed.

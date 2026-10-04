@@ -10292,6 +10292,17 @@ void Emitter::emitMainStaticInitPrologue() {
             builder_.CreateCall(initFn, {vit->second});
         }
     }
+    // fix #4748 / stdlib §4.4 (v0.307): register the InvalidOperationException
+    // vtable with the runtime so structural mutators (bz_array_add etc.) can throw
+    // it when called from a sort comparator. Must run before any user code.
+    {
+        auto vit = builtinVtable_.find("InvalidOperationException");
+        if (vit != builtinVtable_.end()) {
+            auto* initFn = declareC("bz_ioe_vtable_init",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(initFn, {vit->second});
+        }
+    }
     // issue 2330 / §31.4 / §30.9: hand the built-in exception vtable and
     // type-descriptor tables to the runtime, for the same reason and by the
     // same mechanism as the SerializationException vtable just above. The
