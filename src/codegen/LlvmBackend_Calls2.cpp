@@ -15142,7 +15142,7 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 // 48) with no diagnostic, because no argument had type `T` for the #1943
 // width gate to catch.
 //
-// fix-forward 5: a user-type bound counts WHEREVER it is declared, not only
+// fix #5009 fix-forward 5: a user-type bound counts WHEREVER it is declared, not only
 // in the method's own module. The exporter's `isConstraintUsingGenericMethod`
 // ships a body only for a bound its own module declares, so a bound from a
 // THIRD module (`RD2.G.VB3<T>(b: RBox<T>) where T: RD1.IShape`) left no body
@@ -15153,6 +15153,45 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 // itself cannot reach an imported method. Builtin bounds (`class`, `value`,
 // `notnull`, a synthesized builtin interface) are sound at i32 and are not
 // counted.
+//
+// fix #5033 (v0.315): the `new()`-constraint arm was too broad. The gate
+// fires when an imported generic virtual method carries a constraint whose
+// satisfaction requires body monomorphization. For `new()` the constraint is
+// satisfiable at any width — `new T()` works identically at i32 or pointer
+// width — and the only way it requires body monomorphization is when T
+// appears in a parameter type: the caller's argument would then be passed at the
+// wrong width through the vtable slot. When T does NOT appear in any parameter
+// (the VOnly shape: `virtual VOnly<T>(): int where T: new() { var t := new
+// T(); return 96; }`), the body computes a constant and the `new T()` at the
+// concrete instantiation, so the placeholder template produces the same result and
+// the gate is a false positive.
+//
+// fix-forward 5's type-bound arm is NARROWER than this fix: it still rejects
+// every type-bound constraint (the body necessarily calls an interface method
+// on a T-typed receiver, which requires the concrete vtable). Only the
+// `new()` arm is widened here.
+//
+// §14.1 / §14.2 / §2.8.3 rule 4 (v0.315).
+
+// Does generic param `gp` appear in parameter types or return type of `ms`?
+// A parameter's type is a generic param reference when its resolved TypeRef has
+// kind Named and declaration == nullptr (per resolveNamed's generic-param case,
+// TypeResolution_Names.cpp ~2593).
+static bool genericParamAppearsInSignature(const sema::MethodSymbol* ms,
+                                          const sema::GenericParamSymbol* gp) {
+    if (!ms || !gp) return false;
+    // Check parameters.
+    for (const sema::Symbol* ps : ms->params) {
+        auto* param = dynamic_cast<const sema::ParameterSymbol*>(ps);
+        if (!param) continue;
+        sema::TypeRef* rt = param->resolvedDeclType;
+        if (!rt) continue;
+        if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration == nullptr)
+            return true;  // named with null declaration = generic param ref
+    }
+    return false;
+}
+
 static bool importedGenericLacksConstraintBody5009(
         const sema::SemaContext& ctx, const sema::MethodSymbol* ms) {
     if (!ms || !ctx.isImported(ms) || ms->genericParams.empty()) return false;
@@ -15169,9 +15208,14 @@ static bool importedGenericLacksConstraintBody5009(
         auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s);
         if (!gp) continue;
         for (const sema::GenericParamConstraint& c : gp->constraints) {
-            if (c.kind == "new") return true;
             if (c.kind == "type" && c.importedBound &&
                 isUserType(c.importedBound->declaration))
+                return true;
+            // fix #5033: `new()` is safe when T does not appear in any
+            // parameter type. When T is absent from the signature the body
+            // computes a constant at any instantiation and the placeholder
+            // template produces the same result.
+            if (c.kind == "new" && genericParamAppearsInSignature(ms, gp))
                 return true;
         }
     }
