@@ -1498,6 +1498,18 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 if (isMoveOnlyInlineArrayType(pt, moSize))
                     noteMoveOnlyArrayWholeMoveRead(*a.value);
             }
+            // fix #5388 (§22.3, v0.314): a `move x` call-site marker is valid
+            // ONLY on an argument to an `owned` parameter. At any other
+            // position the parameter takes a borrow and the marker is
+            // rejected — an owned expression may not feed a borrow slot.
+            if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
+                if (un->op == "move") {
+                    report(Severity::Error, un->span.begin,
+                           "the `move` call-site marker is only valid on an argument "
+                           "to an `owned` parameter; this parameter does not take "
+                           "ownership — remove `move` (§22.3, v0.314)");
+                }
+            }
             recordMovesIn(*a.value);
             ++pos;
         }
@@ -1833,6 +1845,24 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
             long long moSize = 0;
             if (isMoveOnlyInlineArrayType(pt, moSize))
                 noteMoveOnlyArrayWholeMoveRead(*a.value);
+        }
+        // fix #5388 (§22.3, v0.314): a `move x` call-site marker is valid ONLY
+        // on an argument to an `owned` parameter. At any other position the
+        // parameter takes a borrow and the marker is rejected — an owned
+        // expression may not feed a borrow slot. Only emit when the formal
+        // parameter list is available — built-in / stdlib methods may not have
+        // a resolvable symbol, and a `move` there is handled by their
+        // dedicated lowering logic.
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
+            if (un->op == "move" && formals.valid()) {
+                const std::size_t bp = boundParamIndex(args, pos, formals);
+                if (bp < formals.size() && formals.modifier(bp) != "owned") {
+                    report(Severity::Error, un->span.begin,
+                           "the `move` call-site marker is only valid on an argument "
+                           "to an `owned` parameter; this parameter does not take "
+                           "ownership — remove `move` (§22.3, v0.314)");
+                }
+            }
         }
         recordMovesIn(*a.value);
         ++pos;
@@ -2360,6 +2390,24 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                             // §28.8.1 / §28.8 (#2005): TEMPORARY receiver — same
                             // rejection rule (leak; no restoration possible).
                             consumed = true;
+                        }
+                    }
+                    // fix #5388 (§22.3, v0.314): a bare `move x` at a non-`owned`
+                    // argument position (one that reached here because it was not
+                    // an owned-sink and was not a fresh-producer / `owned` modifier)
+                    // is silently accepted by the existing code. Add the explicit
+                    // §22.3 rejection here: a `move x` at a non-owned parameter is
+                    // meaningless — the parameter takes a borrow, not ownership.
+                    if (!ownedSink && discFormals.valid()) {
+                        const std::size_t bp =
+                            boundParamIndex(call->args, pos, discFormals);
+                        if (bp < discFormals.size() &&
+                            discFormals.modifier(bp) != "owned") {
+                            report(Severity::Error, un->span.begin,
+                                   "the `move` call-site marker is only valid on an "
+                                   "argument to an `owned` parameter; this parameter "
+                                   "does not take ownership — remove `move` (§22.3, "
+                                   "v0.314)");
                         }
                     }
                 }

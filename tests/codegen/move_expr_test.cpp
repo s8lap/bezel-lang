@@ -5,9 +5,11 @@
 // codegen case — it lowered to null and segfaulted as an argument / RHS —
 // and no recorded type — member access on a moved value returned 0.)
 
-#include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
+#include "support/aot_support.hpp"         // runAot — AOT test harness (JIT->AOT migration)
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -26,15 +28,21 @@ BEZEL_TEST(codegen_move, move_local_preserves_value_and_type) {
         "end Main; end C;"), 9);
 }
 
+// fix #5388 (§22.3, v0.314): `move r` at a non-`owned` parameter position is
+// a compile error — the parameter takes a borrow, not ownership, so the
+// transfer marker is meaningless. Before the fix this compiled and ran (r was
+// marked moved-from), returning 5. After the fix it is rejected with the §22.3
+// diagnostic naming the borrow default.
 BEZEL_TEST(codegen_move, move_as_constructor_argument) {
-    BEZEL_EXPECT_EQ(runProg(std::string(kR) +
-        "class Box public item: R; "
-        "  public constructor(r: R) item := r; end constructor; "
-        "  public method Val(): int => item.V; end Box; "
-        "class C public static method Main(): int "
-        "  var r := new R(); r.V := 5; var b := new Box(move r); "
-        "  return b.Val(); "
-        "end Main; end C;"), 5);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(
+        runAot(std::string(kR) +
+               "class Box public item: R; "
+               "  public constructor(r: R) item := r; end constructor; "
+               "  public method Val(): int => item.V; end Box; "
+               "class C public static method Main(): int "
+               "  var r := new R(); r.V := 5; var b := new Box(move r); "
+               "  return b.Val(); "
+               "end Main; end C;")));
 }
 
 // `move r` as the RHS of a field assignment (§28.8.1). The field-assignment
@@ -56,10 +64,16 @@ BEZEL_TEST(codegen_move, move_as_field_assignment_rhs) {
         "end Main; end C;"), 6);
 }
 
+// fix #5388 (§22.3, v0.314): `move r` at a non-`owned` parameter position is
+// a compile error — the parameter takes a borrow, not ownership, so the
+// transfer marker is meaningless. Before the fix this compiled and ran (r was
+// marked moved-from), returning 8. After the fix it is rejected with the §22.3
+// diagnostic naming the borrow default.
 BEZEL_TEST(codegen_move, move_as_method_argument) {
-    BEZEL_EXPECT_EQ(runProg(std::string(kR) +
-        "class C public static method Take(r: R): int => r.V; "
-        "  public static method Main(): int "
-        "    var r := new R(); r.V := 8; return Take(move r); "
-        "  end Main; end C;"), 8);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(
+        runAot(std::string(kR) +
+               "class C public static method Take(r: R): int => r.V; "
+               "  public static method Main(): int "
+               "    var r := new R(); r.V := 8; return Take(move r); "
+               "  end Main; end C;")));
 }
