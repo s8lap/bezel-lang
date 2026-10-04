@@ -2018,6 +2018,11 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
             }
             m->returnType = parseType();
         }
+        // §14.2 / A.4 (v0.314, #5248): IfaceMethod and IfaceStaticMethod
+        // admit `GenericConstraints*` after the return type, exactly as class
+        // methods do (line 2578 in this file). Before this fix, interface
+        // generic methods could not declare `where` clauses.
+        m->genericConstraints = parseGenericConstraints();
         // per §11.8: static interface members are ABSTRACT-ONLY — a body (the
         // `=>` expression form is the recognisable shape) is a compile error.
         if (staticMod && isPunctuator("=>")) {

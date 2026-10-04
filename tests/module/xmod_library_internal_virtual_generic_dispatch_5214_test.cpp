@@ -555,8 +555,9 @@ BEZEL_TEST(xmod_library_internal_virtual_generic_dispatch_5214,
 }
 
 // INTERFACE parent: a library's internal call of a generic interface method
-// on a public interface (A.3 `IfaceMethod` carries no `where` clause, so the
-// bodies are constants). A known implementer runs its own body (12); an
+// on a public interface (A.4 `IfaceMethod` admits `where` clauses, but the
+// absence of a clause is also valid; without a clause the bodies are
+// constants). A known implementer runs its own body (12); an
 // implementer declared in the importer aborts — pre-fix it silently ran the
 // library implementer's body (12 where 5 is correct).
 BEZEL_TEST(xmod_library_internal_virtual_generic_dispatch_5214,

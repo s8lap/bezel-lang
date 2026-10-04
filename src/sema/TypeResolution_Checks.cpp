@@ -7948,6 +7948,151 @@ void Resolver::checkAbstractImplementations() {
                         "dropped across an interface implementation "
                         "(\xC2\xA7""22.15)");
                 }
+                // §14.2 / A.4 (v0.314, #5248): an implementing method's
+                // `where` clause must match the interface method's constraint
+                // set exactly (or be omitted to inherit it). A differing clause
+                // is a compile error. Constraints are compared positionally by
+                // the method's own generic parameter (not the interface's
+                // substitution — method type parameters are fresh per
+                // declaration and are not mapped by the interface substitution).
+                // Only report a mismatch when the interface DECLARES a
+                // constraint the implementation does not match — a constraint
+                // the interface does not declare is inherited from the
+                // implementation's own inheritance chain, and comparing it
+                // against the interface's empty set would false-reject a legal
+                // override that tightens or adds constraints (§14.2).
+                {
+                    auto findGC = [](const std::vector<ast::GenericConstraint>& v,
+                                     std::string_view name)
+                        -> const ast::GenericConstraint* {
+                        for (const auto& gc : v)
+                            if (gc.typeParam == name) return &gc;
+                        return nullptr;
+                    };
+                    // imDecl: non-null when the interface is locally declared.
+                    const bool imIsLocal = (imDecl != nullptr);
+                    // implDecl: non-null when the implementation is locally declared.
+                    const bool implIsLocal = (implDecl != nullptr);
+                    // implIsImported: the impl came from an imported base class
+                    // (ctx_.isImported, cached in implSymIsImported above).
+                    const bool implIsImp = !implIsLocal && implSymIsImported;
+                    // Number of method generic parameters on each side (for
+                    // positional correspondence). Use the interface's param
+                    // count as canonical; impl must match (arity check above).
+                    std::size_t gpCount = imIsLocal
+                        ? imDecl->genericParams.size()
+                        : im->genericParams.size();
+                    // Fetch the imported constraint side-tables if either side
+                    // is imported.
+                    const std::vector<ImportedGenericConstraint>*
+                        imImpGCs = nullptr;
+                    if (!imIsLocal) {
+                        imImpGCs = ctx_.importedGenericConstraints(im);
+                    }
+                    const std::vector<ImportedGenericConstraint>*
+                        implImpGCs = nullptr;
+                    if (implIsImp) {
+                        implImpGCs = ctx_.importedGenericConstraints(impl);
+                    }
+                    for (std::size_t gi = 0; gi < gpCount; ++gi) {
+                        std::string_view imGpName;
+                        if (imIsLocal) {
+                            imGpName = imDecl->genericParams[gi].name;
+                        } else if (imImpGCs && gi < imImpGCs->size()) {
+                            imGpName = (*imImpGCs)[gi].typeParam;
+                        } else {
+                            continue;  // no constraint side-table entry
+                        }
+                        const ast::GenericConstraint* imGC =
+                            imIsLocal
+                                ? findGC(imDecl->genericConstraints, imGpName)
+                                : nullptr;
+                        // impl's constraint for this position
+                        std::string_view implGpName;
+                        if (implIsLocal) {
+                            implGpName = implDecl->genericParams[gi].name;
+                        } else if (implImpGCs && gi < implImpGCs->size()) {
+                            implGpName = (*implImpGCs)[gi].typeParam;
+                        } else {
+                            continue;
+                        }
+                        const ast::GenericConstraint* implGC =
+                            implIsLocal
+                                ? findGC(implDecl->genericConstraints, implGpName)
+                                : nullptr;
+                        // If impl declares no constraint, it inherits — always
+                        // legal (§14.2: "omit the clause to inherit it exactly").
+                        if (!implGC) continue;
+                        // The interface declares a constraint the impl does not
+                        // match — report an error.
+                        bool match = false;
+                        if (imIsLocal && implIsLocal) {
+                            match = constraintSetsEquivalent(imGC, implGC);
+                        } else if (!imIsLocal && implIsLocal) {
+                            // Interface imported, impl local: build a temporary
+                            // AST constraint from the imported metadata.
+                            if (imImpGCs && gi < imImpGCs->size()) {
+                                const auto& igc = (*imImpGCs)[gi];
+                                ast::GenericConstraint tmp;
+                                tmp.typeParam = igc.typeParam;
+                                for (std::string_view sv : igc.specialConstraints) {
+                                    tmp.items.emplace_back(sv, nullptr);
+                                }
+                                // Type constraints require resolved TypeRefs, which
+                                // are not reconstructable from metadata — skip
+                                // the check when type constraints are present.
+                                bool hasTypeConstraint = false;
+                                for (const auto& ig : igc.constraintTypes) {
+                                    (void)ig; hasTypeConstraint = true;
+                                }
+                                if (!hasTypeConstraint) {
+                                    match = constraintSetsEquivalent(&tmp, implGC);
+                                }
+                            }
+                        } else if (imIsLocal && !implIsLocal) {
+                            // Interface local, impl imported: use the imported
+                            // comparison helper directly.
+                            if (implImpGCs && gi < implImpGCs->size()) {
+                                match = derivedConstraintMatchesImported(
+                                    implGC, &(*implImpGCs)[gi]);
+                            }
+                        } else {
+                            // Both imported: compare imported-to-imported via
+                            // temporary AST constraints (special-constraint bag
+                            // only — type constraints need resolved TypeRefs and
+                            // are not reconstructable from metadata).
+                            if (imImpGCs && gi < imImpGCs->size() &&
+                                implImpGCs && gi < implImpGCs->size()) {
+                                const auto& igc = (*imImpGCs)[gi];
+                                const auto& egc = (*implImpGCs)[gi];
+                                ast::GenericConstraint tmpI;
+                                tmpI.typeParam = igc.typeParam;
+                                for (std::string_view sv : igc.specialConstraints) {
+                                    tmpI.items.emplace_back(sv, nullptr);
+                                }
+                                ast::GenericConstraint tmpE;
+                                tmpE.typeParam = egc.typeParam;
+                                for (std::string_view sv : egc.specialConstraints) {
+                                    tmpE.items.emplace_back(sv, nullptr);
+                                }
+                                match = constraintSetsEquivalent(&tmpI, &tmpE);
+                            }
+                        }
+                        if (!match) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, implLoc,
+                                std::string("method `") +
+                                std::string(name) +
+                                "` implements interface member `" +
+                                std::string(name) +
+                                "` and must restate an equivalent "
+                                "`where` clause — omit the clause to "
+                                "inherit it exactly, or restate the "
+                                "identical set (§14.2)");
+                            break;  // one diagnostic per member
+                        }
+                    }
+                }
                 // #2186 / §11.2: parameter types must match exactly UNDER THE
                 // INTERFACE'S SUBSTITUTION — and the impl's substitution. This
                 // is the substituted-signature comparison the name+arity+modifier
