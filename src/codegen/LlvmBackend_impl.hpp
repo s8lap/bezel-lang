@@ -3878,6 +3878,16 @@ private:
     // extra key dimension is needed for the generic-instantiation case.
     std::unordered_map<llvm::Function*, llvm::Function*>
         virtualStringGetterOwnershipThunks_;
+    // fix #5342 (§2.5 / §23.2 / §14.1 / §28.9, v0.313): the SAME normalization
+    // as the map above, but for a NULLABLE `string?` getter, which the
+    // vtable/itable sites deliberately leave alone (fix #5290 kept
+    // isPlusOneStringProducer's dynamic-slot fast path at `!ty->nullable`
+    // because the thunk declined a nullable return). Only the cross-module
+    // `$propget` stub asks for that mode, and it pairs with an equal
+    // classification change — a SEPARATE table so the twelve vtable/itable call
+    // sites keep resolving through the original one, unchanged.
+    std::unordered_map<llvm::Function*, llvm::Function*>
+        virtualStringGetterNullableOwnershipThunks_;
     // Per class: the itmap$C global ([td$I1, itab$C$I1, …, null]).
     std::unordered_map<const sema::TypeSymbol*, llvm::GlobalVariable*>
         itmaps_;
@@ -9412,8 +9422,31 @@ private:
     // for a currently-clean cross-module borrow read, start leaking) if the
     // shared function's own ABI changed under them. This thunk is installed
     // ONLY into vtable/itable slots, never returned to those other callers.
+    //
+    // fix #5342 (§2.5 "library import" / §23.2 "deferred visibility" / §14.1
+    // "owner substitution" / §28.9 "fresh-class disposal", v0.313): a THIRD
+    // dispatch site now installs this same normalization — the cross-module
+    // `$propget` STUB `emitExportedPropertyGetters` defines. The reasoning is
+    // identical to the vtable slot's: the importer holds no
+    // `ast::PropertyDecl` for the property (`ModuleLoader` never reconstructs
+    // a body-less imported `PropertyDecl`), so it cannot decide
+    // producer-vs-borrow by inspecting the body that actually runs.
+    // `allowNullableResult` widens the declared-type gate to admit a NULLABLE
+    // `string?` getter, which the vtable/itable sites deliberately do NOT take
+    // (fix #5290 kept isPlusOneStringProducer's dynamic-slot fast path at
+    // `return !ty->nullable` precisely because the thunk was not installed for
+    // a nullable return). ONLY the `$propget` stub passes `true`, and only
+    // together with the matching classification change in
+    // isPlusOneStringProducer's own MemberAccessExpr / NullCondMemberExpr arms
+    // — the two halves of one contract, exactly as the vtable pair is. Passing
+    // `true` from a vtable/itable site WITHOUT that classification change would
+    // be an unsound over-release, and leaving the stub at the default `false`
+    // while classification says +1 would be exactly the leak this fixes. The
+    // default keeps all twelve pre-existing call sites byte-for-byte on the
+    // non-nullable-only behavior they were each verified against.
     llvm::Function* ensureVirtualStringGetterOwnershipThunk(
-        const sema::PropertySymbol* impl, llvm::Function* fn);
+        const sema::PropertySymbol* impl, llvm::Function* fn,
+        bool allowNullableResult = false);
 
     void declareVtables();
 

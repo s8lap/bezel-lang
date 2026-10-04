@@ -2770,15 +2770,66 @@ void Emitter::emitExportedPropertyGetters() {
                 fn->eraseFromParent();
                 continue;
             }
+            // fix #5342 (§2.5 "library import" / §23.2 "deferred visibility" /
+            // §14.1 "owner substitution" / §28.9 "fresh-class disposal",
+            // v0.313): THIS STUB IS A DISPATCH SITE, exactly like a vtable or
+            // itable slot, and it was the only one of the three with no
+            // ownership normalization. A vtable/itable slot read is normalized
+            // by ensureVirtualStringGetterOwnershipThunk, and the call site
+            // compensates with isPlusOneStringProducer's `dynamicSlot`
+            // unconditional-`+1` fast path; this stub forwarded
+            // ensurePropertyAccessorFn's result with a bare CreateRet and
+            // NOTHING compensated on the importer side, because an imported
+            // PropertySymbol has no ast::PropertyDecl (`ModuleLoader` never
+            // reconstructs a body-less imported PropertyDecl) — so
+            // isPlusOneStringProducer's body-inspection arm answered null and
+            // classified EVERY cross-module getter read as a borrow. The
+            // consequence was direction-asymmetric:
+            //
+            //   * a FRESH-bodied getter (`=> "l" + _f`, a +1 producer) handed
+            //     the importer a reference nobody would ever release — 400
+            //     allocations over 200 reads of one imported property;
+            //   * a borrow-bodied getter (`=> _f`, +0) stayed correct, because
+            //     the borrow classification happened to match.
+            //
+            // Fixing only the producer direction (releasing the extra
+            // reference in the stub) is the UNSOUND direction — the returned
+            // value is the sole owner of a heap string, so dropping it here
+            // hands the importer a dangling pointer. The sound direction is the
+            // one the vtable path already established and this now mirrors
+            // verbatim: the stub normalizes the hand-back to a guaranteed +1,
+            // and isPlusOneStringProducer classifies an imported-stub read as
+            // +1 (both halves changed together in this commit).
+            //
+            // `allowNullableResult = true` is what makes the `string?` spelling
+            // work here. It is SAFE HERE and only here because the stub's
+            // importer-side callers are all non-dispatching direct calls whose
+            // classification this same commit updates in lockstep — unlike the
+            // vtable/itable slots, whose overrides' bodies are genuinely
+            // uninspectable at the call site (the reason #5290 declined the
+            // nullable case there). A `string?` accessor lowers the same
+            // result value, so the same forward+retain normalizes it.
+            //
+            // The thunk is a SEPARATE function: `innerFn` is
+            // ensurePropertyAccessorFn's memoized body, SHARED with `base.P`
+            // static dispatch and with the itable-fill paths, whose callers
+            // independently re-inspect the same statically-known body. The
+            // normalization therefore rides on this wrapper's forwarding call
+            // alone and leaves the shared body's own ABI untouched — the same
+            // separation ensureVirtualStringGetterOwnershipThunk's own
+            // declaration comment requires.
+            llvm::Function* fwdFn = ensureVirtualStringGetterOwnershipThunk(
+                ps, innerFn, /*allowNullableResult=*/true);
             auto* savedFn = currentFn_;
             auto* savedInsert = builder_.GetInsertBlock();
             currentFn_ = fn;
             auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
             builder_.SetInsertPoint(entry);
             llvm::Value* thisArg = &*fn->args().begin();
-            // Forward: call the (InternalLinkage) inner getter with `this`.
+            // Forward: call the (InternalLinkage) inner getter — or the
+            // ownership thunk wrapping it — with `this`.
             llvm::Value* result = builder_.CreateCall(
-                innerFn->getFunctionType(), innerFn, {thisArg});
+                fwdFn->getFunctionType(), fwdFn, {thisArg});
             builder_.CreateRet(result);
             currentFn_ = savedFn;
             if (savedInsert) builder_.SetInsertPoint(savedInsert);
@@ -4511,10 +4562,22 @@ llvm::Function* Emitter::ensureVtableWideningThunk(
 // re-deriving producer-vs-borrow from a (possibly absent, possibly different)
 // static declaration.
 llvm::Function* Emitter::ensureVirtualStringGetterOwnershipThunk(
-        const sema::PropertySymbol* impl, llvm::Function* fn) {
+        const sema::PropertySymbol* impl, llvm::Function* fn,
+        bool allowNullableResult) {
     if (!fn || !impl) return fn;
-    auto cacheIt = virtualStringGetterOwnershipThunks_.find(fn);
-    if (cacheIt != virtualStringGetterOwnershipThunks_.end())
+    // fix #5342 (§2.5 / §23.2 / §14.1 / §28.9, v0.313): the nullable-capable
+    // mode is a DIFFERENT normalization of the same accessor (it wraps a
+    // `string?` getter the non-nullable mode declines outright), so it needs
+    // its own memo table — sharing one would hand a `true`-mode caller the
+    // `false`-mode thunk, or vice versa, for the same raw accessor. Both modes
+    // build the identical body (a bare forward plus one null-safe retain), so
+    // the code below is shared; only the declared-type gate and the cache key
+    // differ. Every pre-existing vtable/itable call site uses the default
+    // `false` and therefore the original table, unchanged.
+    auto& cache = allowNullableResult ? virtualStringGetterNullableOwnershipThunks_
+                                      : virtualStringGetterOwnershipThunks_;
+    auto cacheIt = cache.find(fn);
+    if (cacheIt != cache.end())
         return cacheIt->second;
 
     if (impl->isIndexer) return fn;  // indexer: out of scope here
@@ -4556,7 +4619,8 @@ llvm::Function* Emitter::ensureVirtualStringGetterOwnershipThunk(
         pd ? (pd->type ? ctx_.resolvedType(*pd->type) : nullptr)
            : ctx_.importedMemberType(impl);
     if (!retTy || retTy->kind != sema::TypeRef::Kind::Primitive ||
-        retTy->primitive != sema::PrimitiveType::String || retTy->nullable)
+        retTy->primitive != sema::PrimitiveType::String ||
+        (retTy->nullable && !allowNullableResult))
         return fn;
 
     // Find the getter body the SAME way isPlusOneStringProducer's own
@@ -4590,11 +4654,16 @@ llvm::Function* Emitter::ensureVirtualStringGetterOwnershipThunk(
 
     std::string name = "bz$vsg$" +
                        std::string(impl->parent ? impl->parent->name : "") +
-                       "$" + std::string(impl->name);
+                       "$" + std::string(impl->name) +
+                       (allowNullableResult ? "$n" : "");
     llvm::FunctionType* fnTy = fn->getFunctionType();
     auto* thunk = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage, name, module_.get());
-    virtualStringGetterOwnershipThunks_[fn] = thunk;
+    // fix #5342: the `$n` suffix above keeps the two modes' InternalLinkage
+    // symbols distinct for a property both modes wrap; the mode-specific cache
+    // above is what guarantees a given caller always gets the normalization its
+    // own classification half expects.
+    cache[fn] = thunk;
 
     // Save/restore builder state (same pattern as ensureVtableWideningThunk —
     // this may run during declareVtables/specializedVtableFor, before every
@@ -25171,6 +25240,62 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // fresh body (`=> "w" + …`) is a +1 the consumer must
                     // discharge and a slot body (`=> _f`) stays a borrow.
                     if (dynamicSlot) return !ty->nullable;
+                    // fix #5342 (§2.5 "library import" / §23.2 "deferred
+                    // visibility" / §14.1 "owner substitution" / §28.9
+                    // "fresh-class disposal", v0.313): the CROSS-MODULE
+                    // `$propget` stub is the third dispatch site, and this is
+                    // the importer-side half of the pair its exporter-side half
+                    // (emitExportedPropertyGetters, same commit) establishes.
+                    // A read that lowers through one of those stubs cannot be
+                    // classified by inspecting a body — the imported
+                    // PropertySymbol has no ast::PropertyDecl at all — but it
+                    // no longer has to be: the stub now normalizes its
+                    // hand-back to a guaranteed +1 for a `string` AND a
+                    // `string?` return, so "always +1, consumer always
+                    // discharges" is the same sound contract the
+                    // `dynamicSlot` line above asserts for a vtable/itable
+                    // slot. This is why the NULLABLE spelling is admitted here
+                    // while `dynamicSlot` (one line up) still declines it:
+                    // there the thunk is not installed for a nullable return
+                    // and the override body is genuinely uninspectable; here
+                    // the exporter — which does hold the body — installed the
+                    // normalization unconditionally for this exact signature.
+                    //
+                    // Reached only after `dynamicSlot` returned, so a VIRTUAL
+                    // imported property (whose map entry is the already-
+                    // normalized vtable-slot forwarder) is answered by that arm
+                    // instead. `importedPropGetterDirectFns_` is the `base.P`
+                    // spelling (§12.3), which bypasses dispatch and calls this
+                    // same `$propget` symbol directly, so it needs the same
+                    // answer. Both maps are populated ONLY from
+                    // ctx_.importedSymbols() (declareImportedPropertyGetters),
+                    // so a LOCAL property read — which is inlined and still
+                    // classified by its own body — can never match here.
+                    //
+                    // The `isStaticProperty` gate is LOAD-BEARING and was added
+                    // after measuring the regression it prevents.
+                    // declareImportedPropertyGetters carries NO static gate of
+                    // its own (unlike emitExportedPropertyGetters and
+                    // declareImportedStaticPropertyGetters, which both gate on
+                    // isStaticProperty), so a STATIC imported property DOES get
+                    // an `importedPropGetterFns_` entry — pointing at a
+                    // never-defined declaration of the INSTANCE mangling that
+                    // nothing ever calls, because the read lowering checks
+                    // `importedStaticPropGetterFns_` FIRST and dispatches to the
+                    // STATIC stub instead (LlvmBackend_Exprs.cpp:6826). That
+                    // static stub is a DIFFERENT function with a DIFFERENT
+                    // signature (no `this`) and is NOT normalized by this fix.
+                    // Classifying such a read +1 therefore released a borrow
+                    // the static stub never owned: measured on this lane as
+                    // `xmod_static_property_2885.auto_and_reference_typed_static_
+                    // properties` aborting with "fatal: refcount over-release
+                    // (string)" (exit 134) on `SStr2885.Name += "!"`, where
+                    // `get => _h.v` is a plain borrow. Gate on exactly the
+                    // shape this fix normalized.
+                    if (!isStaticProperty(ps) &&
+                        (importedPropGetterFns_.count(ps) ||
+                         importedPropGetterDirectFns_.count(ps)))
+                        return true;
                     const ast::Expr* getter = inlinedGetterBody(ps);
                     if (getter && isPlusOneStringProducer(getter)) return true;
                 }
@@ -25189,6 +25314,26 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*nm));
         if (ps && !ps->isIndexer && !propGetSlot_.count(ps) &&
             !ifacePropertyGetIndex_.count(ps)) {
+            // fix #5342 (§2.5 / §23.2 / §14.1 / §28.9, v0.313): the `?.`
+            // spelling of a cross-module property read calls the SAME
+            // `$propget` stub the plain `.` spelling does (LlvmBackend_Exprs.cpp
+            // ~L3162's null-conditional property arm), so it inherits the SAME
+            // normalized +1 contract and must be classified the same way. It
+            // needs this arm for soundness, not just for the leak: leaving it
+            // on the borrow classification while the stub now retains a
+            // borrow-bodied getter would leak one reference per `?.` read of
+            // an imported borrow-bodied string property — turning a currently-
+            // clean shape dirty. The declared-type test below answers null for
+            // an imported property (no PropertyDecl, the #3152 SEAM-ACCESSOR
+            // note), which is exactly why the check has to come FIRST here.
+            const sema::TypeRef* ity = ctx_.exprType(*nm);
+            bool isStrRead =
+                ity && ity->kind == sema::TypeRef::Kind::Primitive &&
+                ity->primitive == sema::PrimitiveType::String;
+            if (isStrRead && !isStaticProperty(ps) &&
+                (importedPropGetterFns_.count(ps) ||
+                 importedPropGetterDirectFns_.count(ps)))
+                return true;
             // SEAM-ACCESSOR: an imported property has no PropertyDecl, so
             // inlinedGetterBody answers null and the read stays a borrow. #3152
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
