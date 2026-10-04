@@ -405,6 +405,9 @@ BEZEL_TEST(sema_owning_collection_choice_element_2744,
 // at the declaration site. This is not #2744's gap to close; it is the
 // #2736(a) gap, and the same predicate change closes BOTH simultaneously.
 // When #2736(a) lands, THIS TEST MUST FLIP to a rejection.
+// ===========================================================================
+// FIX #5393 (§14.1, v0.314): the declaration is now rejected at the type-
+// parameter list. The program no longer compiles.
 BEZEL_TEST(sema_owning_collection_choice_element_2744,
            method_param_shadow_choice_silently_admitted_pending_2736a_2744) {
     auto r = runAot(
@@ -420,9 +423,8 @@ BEZEL_TEST(sema_owning_collection_choice_element_2744,
         "  using var b := new Box<int>(); "
         "  return b.M2<MyChoice>(); "
         "end Main; end C;");
-    // Current (known-buggy) behavior: passes silently. The test pins the
-    // residual so a future fix does not silently regress it.
-    BEZEL_EXPECT_TRUE(r.ran);
+    // After fix #5393: rejected at the declaration site.
+    BEZEL_EXPECT_TRUE(r.ran == false);
 }
 
 }  // namespace

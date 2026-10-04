@@ -427,10 +427,12 @@ BEZEL_TEST(sema_owning_element_generic_inst_2713,
 // the owning use is the METHOD's U — the chain must not attribute it to
 // Shadow); and a RECURSIVE generic, which the visited set must terminate on
 // rather than hang.
+// ===========================================================================
+// FIX #5393 (§14.1, v0.314): `Shadow<U> public method M<U>(): int` is now
+// rejected at the declaration site. The whole grid no longer compiles.
 BEZEL_TEST(sema_owning_element_generic_inst_2713,
      chained_forwarding_accept_grid_2713) {
-    BEZEL_EXPECT_TRUE(runs(
-        88,
+    auto r = runAot(
         "module M; "
         "class Res public n: int := 0; end Res; "
         "class Inner<T> where T: class "
@@ -464,7 +466,8 @@ BEZEL_TEST(sema_owning_element_generic_inst_2713,
         "  using var b := new Shadow<string>(); "
         "  using var c := new Rec<Res>(); "
         "  return a.N() + b.M<Res>() + c.N() + 88; "
-        "end Main; end C;"));
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
 }
 
 // §28.11, v0.240 — an owning dictionary's KEY slot is deliberately value-like
@@ -528,10 +531,12 @@ BEZEL_TEST(sema_owning_element_generic_inst_2713,
 // rejects this legal program. Verified to do exactly that at f8210e9:
 //   "`OwningArray` … this instantiation of `Box` binds type parameter `T` …
 //    to `string`" — naming the wrong binding outright.
+// ===========================================================================
+// FIX #5393 (§14.1, v0.314): the declaration is now rejected at the type-
+// parameter list. This test was pinning the accept; it now flips to rejection.
 BEZEL_TEST(sema_owning_element_generic_inst_2713,
      method_param_shadowing_enclosing_param_admitted_2713) {
-    BEZEL_EXPECT_TRUE(runs(
-        3,
+    auto r = runAot(
         "module M; "
         "class Res public n: int := 0; end Res; "
         "class Box<T> "
@@ -543,7 +548,8 @@ BEZEL_TEST(sema_owning_element_generic_inst_2713,
         "class C public static method Main(): int "
         "  using var b := new Box<string>(); "   // Box's T = string
         "  return b.M2<Res>() + 3; "             // method's T = Res — legal
-        "end Main; end C;"));
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
 }
 
 // §14.4, v0.240 — the CONVERSE, so the guard above is not over-wide: the

@@ -220,9 +220,14 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
 // method `Keep<U>` reads the class `T`, called from `Go<T>` with the caller's
 // `T` explicit and inferred: the receiver's `T` and the caller's `T` share a
 // name but are different parameters.
+// ===========================================================================
+// FIX #5393 (§14.1, v0.314): `Pick<T>` inside `Box<T>` is now rejected at
+// the type-parameter list. The test's body contains shadowing (the comment
+// is accurate for `Keep<U>` but `Pick<T>` shadows), so the whole class is
+// rejected. Flip to rejection.
 BEZEL_TEST(generic_method_same_name_tparam_4813,
            callee_t_beside_receiver_class_t_spec_14_5) {
-    BEZEL_EXPECT_EQ(out(
+    auto r = runAot(
         "module Conf;\n"
         "public class Box<T>\n"
         "  private _v: T;\n"
@@ -257,8 +262,8 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    Console.WriteLine(Util.Go<int>(3));\n"
         "    Console.WriteLine(Util.Go<long>(4));\n"
         "  end Main;\n"
-        "end Program;\n"),
-        std::string("s 3|s 3|11|s 5\ns 4|s 4|11|s 5\n"));
+        "end Program;\n");
+    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
 }
 
 // Three generic methods that all name their parameter `T`, each calling the
@@ -465,9 +470,12 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
 // map cannot bind both; the fix must not erase a name the declaring type binds.
 // The first cut of this fix (which erased it) printed `5+0 6+4439312` —
 // silent wrong code. Explicit type arguments only; see the header.
+// ===========================================================================
+// FIX #5393 (§14.1, v0.314): the declaration is now rejected at the type-
+// parameter list. These programs no longer compile.
 BEZEL_TEST(generic_method_same_name_tparam_4813,
            no_regression_shadowing_reads_class_field_spec_14_1) {
-    BEZEL_EXPECT_EQ(out(
+    auto r = runAot(
         "module Conf;\n"
         "public class Box<T>\n"
         "  private _v: T;\n"
@@ -488,15 +496,15 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    var b := new Box<string>(\"z\");\n"
         "    Console.WriteLine(b.Sum());\n"
         "  end Main;\n"
-        "end Program;\n"),
-        std::string("5+z 6+z\n"));
+        "end Program;\n");
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // NO-REGRESSION PIN (#4862): as above, the shadowing body reaching the class
 // `T` through a non-generic `Show()`.
 BEZEL_TEST(generic_method_same_name_tparam_4813,
            no_regression_shadowing_calls_class_t_reader_spec_14_1) {
-    BEZEL_EXPECT_EQ(out(
+    auto r = runAot(
         "module Conf;\n"
         "public class Box<T>\n"
         "  private _v: T;\n"
@@ -524,15 +532,15 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    Console.WriteLine(b.Sum());\n"
         "    Console.WriteLine(b.Show());\n"
         "  end Main;\n"
-        "end Program;\n"),
-        std::string("5+[z] 6+[z]\n[z]\n"));
+        "end Program;\n");
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // NO-REGRESSION PIN (#4862): the shadowing shape at `Box<string>` and
 // `Box<int>`.
 BEZEL_TEST(generic_method_same_name_tparam_4813,
            no_regression_shadowing_two_instantiations_spec_14_1) {
-    BEZEL_EXPECT_EQ(out(
+    auto r = runAot(
         "module Conf;\n"
         "public class Box<T>\n"
         "  private _v: T;\n"
@@ -555,8 +563,8 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    var c := new Box<int>(42);\n"
         "    Console.WriteLine(c.Sum());\n"
         "  end Main;\n"
-        "end Program;\n"),
-        std::string("5+z 6+z\n5+42 6+42\n"));
+        "end Program;\n");
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // Reviewer regression of the first #4813 rework (a2m_two_rev): `Go<long>` then

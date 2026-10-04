@@ -147,6 +147,9 @@ BEZEL_TEST(inline_owned_array_generic_instantiation_4678,
 // the method-local `T` to Box4678's `int` binding and falsely reject a legal
 // program.
 // ===========================================================================
+// FIX #5393 (§14.1, v0.314): the declaration is now rejected at the type-
+// parameter list. The #2713 guard is no longer needed for this shape.
+// The old test pinned the accept; it now flips to a declaration-site reject.
 BEZEL_TEST(inline_owned_array_generic_instantiation_4678,
            method_generic_param_shadowing_not_misattributed_spec_3_6) {
     auto src = std::string(
@@ -164,5 +167,5 @@ BEZEL_TEST(inline_owned_array_generic_instantiation_4678,
         "    return b.M4678c<Elem4678c>(); "
         "  end Main; "
         "end P4678c;");
-    BEZEL_EXPECT_TRUE(runs(7, src));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, "rename one of them"));
 }

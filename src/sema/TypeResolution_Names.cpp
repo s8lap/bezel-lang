@@ -1467,7 +1467,57 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         currentMethodDecl_ = md;
         Scope methodScope;
         methodScope.parent = parent;
-        for (const auto& g : md->genericParams) {
+        for (std::size_t i = 0; i < md->genericParams.size(); ++i) {
+            const auto& g = md->genericParams[i];
+            // §14.1 / §26.4 / App. C.1 (fix #5393, #5227, #5257, #5264;
+            // v0.314): the names in one type-parameter list are distinct. A
+            // generic method's type parameter may not reuse the name of a type
+            // parameter in scope at its declaration — its enclosing type's or
+            // its generic extension block's.  Check for duplicate within this
+            // list first.
+            for (std::size_t j = 0; j < i; ++j) {
+                if (md->genericParams[j].name == g.name) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, md->span.begin,
+                        "duplicate type parameter name `" +
+                            std::string(g.name) +
+                            "` in this type-parameter list (§14.1, v0.314)");
+                    break;
+                }
+            }
+            // Check against enclosing type's generic params (currentOuterType_ is
+            // set when inside a type; null for extensions at module scope).
+            if (currentOuterType_) {
+                for (const Symbol* gp : currentOuterType_->genericParams) {
+                    if (gp && gp->name == g.name) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, md->span.begin,
+                            "type parameter `" + std::string(g.name) +
+                                "` reuses the name of a type parameter of "
+                                "enclosing type `" +
+                                std::string(currentOuterType_->name) +
+                                "`; rename one of them (§14.1, v0.314)");
+                        break;
+                    }
+                }
+            }
+            // Also check parent scope's names: for extension methods the extension
+            // head's params live there (parent == extScope).  Skip the immediate
+            // type's typeScope when currentOuterType_ is set (already checked
+            // via currentOuterType_->genericParams) to avoid double-reporting.
+            for (Scope* s = parent; s; s = s->parent) {
+                if (currentOuterType_ && s == parent) continue;
+                auto it = s->names.find(g.name);
+                if (it != s->names.end()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, md->span.begin,
+                        "type parameter `" + std::string(g.name) +
+                            "` reuses the name of a type parameter in "
+                            "enclosing scope; rename one of them (§14.1, v0.314)");
+                    break;
+                }
+            }
+            // Register in methodScope only after all checks.
             methodScope.names[g.name] = nullptr;
         }
         for (const auto& p : md->params) {

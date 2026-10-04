@@ -93,6 +93,8 @@ bool rejectsMentioning(const JitResult& r, const char* needle) {
 // The method's `T` is `int`; `Box`'s `T` is a non-hashable record. The `Set`'s
 // element type is the METHOD's `T`, so the program is legal and must run.
 // ===========================================================================
+// FIX #5393 (§14.1, v0.314): `M2742<T>()` inside `Box2742<T>` is now
+// rejected at the type-parameter list. These programs no longer compile.
 BEZEL_TEST(generic_method_param_shadowing_2742, hash_container_false_reject_spec_3_6) {
     auto r = runAot(
         std::string("module M; ") + kUnhashable +
@@ -108,9 +110,7 @@ BEZEL_TEST(generic_method_param_shadowing_2742, hash_container_false_reject_spec
         "    return b.M2742<int>(); "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);  // a fresh Set is empty
+    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
 }
 
 // The `Dictionary` KEY slot reaches the same recorder through the other
@@ -131,9 +131,7 @@ BEZEL_TEST(generic_method_param_shadowing_2742, dictionary_key_false_reject_spec
         "    return b.M2742<int>(); "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
 }
 
 // ===========================================================================
@@ -142,6 +140,8 @@ BEZEL_TEST(generic_method_param_shadowing_2742, dictionary_key_false_reject_spec
 // it is fixed by the same shared predicate, which is the whole point of
 // hoisting rather than patching the one issue that happened to be filed.
 // ===========================================================================
+// FIX #5393 (§14.1, v0.314): `M2742<T>()` inside `Box2742<T>` is now
+// rejected at the type-parameter list. These programs no longer compile.
 BEZEL_TEST(generic_method_param_shadowing_2742, move_only_element_false_reject_spec_28_11) {
     auto r = runAot(
         std::string("module M; ") + kOwningChoice +
@@ -157,13 +157,7 @@ BEZEL_TEST(generic_method_param_shadowing_2742, move_only_element_false_reject_s
         "    return b.M2742<int>(); "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    // `new Array<T>(2)` is the CAPACITY form (stdlib §4.4): Count 0,
-    // Capacity 2. The `100 +` base keeps a silent zero — the shape a
-    // "did it even run" oracle cannot tell from a correct answer — out of
-    // the expected value.
-    BEZEL_EXPECT_EQ(r.exitCode, 102);
+    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
 }
 
 // ===========================================================================
