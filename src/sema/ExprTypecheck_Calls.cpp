@@ -17075,15 +17075,16 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
     if (!tgt) return;
     TypeRef* recvTy = ctx_.exprType(*tgt);
     if (!recvTy || recvTy->kind != TypeRef::Kind::Named) return;
-    // Resolve the builtin head name the same way `builtinInstName` (L6263) does:
-    // synthetic Named (declaration nullptr, astNode set) → headName; builtin-class
-    // stub (declaration set, decl nullptr) → declaration->name; a fully-resolved
-    // record (real decl) → {} (has a MethodSymbol → user path handled it).
+    // Resolve the builtin head name:
+    //   - declaration-less Named → call headName() (falls back to importedName
+    //     for shape (c): an imported builtin whose TypeRef was built from
+    //     .bezel.meta metadata, so astNode is null — the #5356 / #5313 fix)
+    //   - builtin-class stub (declaration set, decl nullptr) → declaration->name
+    //   - fully-resolved record (real decl) → {} (has a MethodSymbol → user
+    //     path handles it)
     std::string_view spanName;
     if (!recvTy->declaration) {
-        if (recvTy->astNode && recvTy->astNode->name &&
-            !recvTy->astNode->name->parts.empty())
-            spanName = recvTy->headName();
+        spanName = recvTy->headName();
     } else if (!recvTy->declaration->decl) {
         spanName = recvTy->declaration->name;
     }
