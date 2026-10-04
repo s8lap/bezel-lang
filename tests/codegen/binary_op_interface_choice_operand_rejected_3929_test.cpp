@@ -441,16 +441,15 @@ BEZEL_TEST(binary_op_iface_choice_operand_rejected_3929,
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
-// An enum's `<` (ordering over the underlying integer, §10.3) is UNAFFECTED
-// — enums are deliberately excluded from this widening (they take a
-// separate, correct code path further down `typeBinary`).
+// §10.5 (v0.314/#5398): enum ordering requires a declared operator group or
+// explicit casts. This row uses explicit casts to verify correct behavior.
 BEZEL_TEST(binary_op_iface_choice_operand_rejected_3929, enum_lt_still_works) {
     auto r = runAot(
         "module M; public enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "var a := Color.Red; "
         "var b := Color.Blue; "
-        "var d := a < b; "
+        "var d := int(a) < int(b); "
         "return (if d then 1 else 0); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);

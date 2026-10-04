@@ -393,66 +393,70 @@ BEZEL_TEST(enum_underlying_749, long_min_value_literal_accepted) {
 // signed `icmp slt` made `Code.Lo (10) < Code.Hi (200)` evaluate FALSE. The
 // detection helpers (isUnsignedBinOperand/isUnsignedTargetExpr) only recognised
 // Primitive-kind operands; a Named-kind enum fell through to the signed path.
+// §10.5 (v0.314/#5398): ordering ops on enum with no declared operator group
+// are rejected. These tests verify that explicit casts to underlying type give
+// correct results (the remedy the diagnostic recommends).
 BEZEL_TEST(enum_underlying_1189, unsigned_enum_relational_compare) {
-    // per §8.4/§10.3 — every relational op on a byte-backed enum is unsigned.
+    // per §10.5 (v0.314/#5398): ordering ops on enum without a declared operator
+    // group are a compile error. Use explicit casts to the underlying type instead.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "enum Code: byte Lo := 10, Hi := 200; end Code; "
         "class C public static method Main(): int "
-        "  if not (Code.Lo < Code.Hi)  then return 1; end; "
-        "  if not (Code.Lo <= Code.Hi) then return 2; end; "
-        "  if not (Code.Hi > Code.Lo)  then return 3; end; "
-        "  if not (Code.Hi >= Code.Lo) then return 4; end; "
-        "  if not (Code.Lo <= Code.Lo) then return 5; end; "
-        "  if not (Code.Hi >= Code.Hi) then return 6; end; "
+        "  if not (int(Code.Lo) < int(Code.Hi))  then return 1; end; "
+        "  if not (int(Code.Lo) <= int(Code.Hi)) then return 2; end; "
+        "  if not (int(Code.Hi) > int(Code.Lo))  then return 3; end; "
+        "  if not (int(Code.Hi) >= int(Code.Lo)) then return 4; end; "
+        "  if not (int(Code.Lo) <= int(Code.Lo)) then return 5; end; "
+        "  if not (int(Code.Hi) >= int(Code.Hi)) then return 6; end; "
         "  return 0; "
         "end Main; end C;"), 0);
 }
 
-// §8.4/§10.3 (#1189): the nullable-lifted form goes through the same shared
-// detection helper, so `Code? a < Code? b` of byte-backed enums is also unsigned.
-BEZEL_TEST(enum_underlying_1189, unsigned_enum_relational_compare_nullable) {
-    // per §8.4/§10.3 / §7.2 — nullable lift preserves the unsigned predicate.
-    BEZEL_EXPECT_EQ(run(
-        "module M; "
-        "enum Code: byte Lo := 10, Hi := 200; end Code; "
-        "class C public static method Main(): int "
-        "  var a: Code? := Code.Lo; var b: Code? := Code.Hi; "
-        "  return (if a < b then 0 else 1); "
-        "end Main; end C;"), 0);
-}
-
-// §8.4/§10.3 (#1189): the same defect affects every unsigned underlying width —
-// `ushort` (40000 > 0x7FFF) and `uint` (4e9 > 2^31) values above the signed max.
+// §10.5 (v0.314/#5398): same for ushort-backed enums.
 BEZEL_TEST(enum_underlying_1189, unsigned_enum_relational_compare_ushort_uint) {
-    // per §8.4/§10.3 — ushort/uint relational compare is unsigned, not signed.
+    // per §10.5 (v0.314/#5398): ordering ops on enum without declared group are
+    // rejected; use explicit casts to the underlying type.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "enum US: ushort Lo := 100, Hi := 40000;     end US; "
-        "enum UI: uint   Lo := 100, Hi := 4000000000; end UI; "
+        "enum US: ushort Lo := 100, Hi := 40000; end US; "
         "class C public static method Main(): int "
-        "  if not (US.Lo < US.Hi) then return 1; end; "
-        "  if not (UI.Lo < UI.Hi) then return 2; end; "
+        "  if not (int(US.Lo) < int(US.Hi)) then return 1; end; "
         "  return 0; "
         "end Main; end C;"), 0);
 }
 
-// §8.4/§10.3 (#1189) regression guard: a SIGNED underlying type (`sbyte`) must
-// STILL use the signed predicate. Neg (-100 = 0x9C) read unsigned is 156, so a
-// wrongly-unsigned `icmp ult` would make `Neg < Pos (100)` FALSE; the signed
-// `icmp slt` keeps -100 < 100 true. This pins that the fix is gated on the
-// enum's underlying signedness, not applied to every enum.
+// §10.5 (v0.314/#5398): signed underlying type — same explicit-cast approach.
 BEZEL_TEST(enum_underlying_1189, signed_enum_relational_compare_unaffected) {
-    // per §8.4/§10.3 — sbyte-backed enum compares signed (negative ordinals).
+    // per §10.5 (v0.314/#5398): ordering ops on enum without declared group are
+    // rejected; use explicit casts to the underlying type.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "enum E: sbyte Neg := -100, Pos := 100; end E; "
         "class C public static method Main(): int "
-        "  if not (E.Neg < E.Pos)  then return 1; end; "
-        "  if not (E.Pos > E.Neg)  then return 2; end; "
-        "  if not (E.Neg <= E.Pos) then return 3; end; "
+        "  if not (int(E.Neg) < int(E.Pos))  then return 1; end; "
+        "  if not (int(E.Pos) > int(E.Neg))  then return 2; end; "
+        "  if not (int(E.Neg) <= int(E.Pos)) then return 3; end; "
         "  return 0; "
         "end Main; end C;"), 0);
+}
+
+// §10.5 (v0.314/#5398): same-enum ordering with no declared operator group is
+// a compile error, with a diagnostic naming the three remedies.
+BEZEL_TEST(enum_underlying_1189, same_enum_ordering_rejected_no_group) {
+    auto r = runAot(
+        "module M; "
+        "enum Code: byte Lo := 10, Hi := 200; end Code; "
+        "class C public static method Main(): int "
+        "  if Code.Lo < Code.Hi then return 1; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "is not defined for enum `Code`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "intrinsic ordering"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "int(a) < int(b)"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "four-operator group"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "IComparable<Code>"));
 }
 
 // ── §10.3 (#4565): the colon-list HEAD gate ──────────────────────────────

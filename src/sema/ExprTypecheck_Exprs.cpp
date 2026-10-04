@@ -7244,16 +7244,26 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             }
         }
     }
-    // §8.4 / §10 (#1137): enum comparison (`=`/`<>`/`<`/`<=`/`>`/`>=`) is an
-    // underlying-integer comparison between operands of the SAME enum type (spec
-    // §8.4 table: "Enum | Underlying integer comparison"). The operands are
-    // reduced to their underlying integers before any type check, so an
-    // `enum = int` or `enumA = enumB` (different enums) silently compiled as a
-    // raw int comparison. Require both operands to be the same enum: if either
-    // operand is an enum, the other must be the same enum (a non-enum or a
-    // different enum is a compile error). A `null` literal operand is exempt —
-    // null comparison of a nullable enum (`c = null`) is governed by §8.4's
+    // §8.4 / §10 (#1137): enum comparison (`=`/`<>`) is an underlying-integer
+    // comparison between operands of the SAME enum type (spec §8.4 table: "Enum
+    // | Underlying integer comparison"). The operands are reduced to their
+    // underlying integers before any type check, so an `enum = int` or
+    // `enumA = enumB` (different enums) silently compiled as a raw int
+    // comparison. Require both operands to be the same enum: if either operand
+    // is an enum, the other must be the same enum (a non-enum or a different
+    // enum is a compile error). A `null` literal operand is exempt — null
+    // comparison of a nullable enum (`c = null`) is governed by §8.4's
     // null-safe equality, not this rule.
+    //
+    // §10.5 (v0.314/#5398): ordering operators (`<`, `<=`, `>`, `>=`) on enum
+    // operands resolve only to declared `operator` overloads; an enum has no
+    // intrinsic ordering (§3.5 defines it on primitives and string only, and an
+    // enum is neither). `=` and `<>` fall through to underlying integer
+    // comparison (§8.4), but the ordering operators do not — if no operator
+    // overload is declared, `a < b` is a compile error. The diagnostic names
+    // `int(a) < int(b)` (explicit cast to underlying type), "the four-operator
+    // group" (declaring `operator <`/`<=`/`>`/`>=` on the enum), and
+    // `IComparable<E>`.
     if (op == "=" || op == "<>" || op == "<" || op == ">" ||
         op == "<=" || op == ">=") {
         const TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
@@ -7285,6 +7295,28 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 " — an enum may be compared only with a value of the same enum "
                 "type (\xC2\xA7""8.4 / \xC2\xA7""10).");
             ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            return;
+        }
+        // §10.5 (v0.314/#5398): same-enum ordering with no declared operator
+        // group.  `findBinaryOperator` already returned null (otherwise we would
+        // have returned at line 6491), so no operator overload applies.  For
+        // ordering operators on same-enum operands, this is a compile error:
+        // an enum has no intrinsic ordering (§3.5 defines it on primitives and
+        // string only, and an enum is neither).  `=` and `<>` are excluded
+        // because §8.4 provides intrinsic underlying-integer equality.
+        if (le && re && le == re &&
+            (op == "<" || op == ">" || op == "<=" || op == ">=")) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) + "` is not defined for enum "
+                "`" + std::string(le->name) +
+                "` — an enum has no intrinsic ordering (\xC2\xA7""10.5). "
+                "Use `int(a) < int(b)` (explicit cast to the underlying type), "
+                "declare the four-operator group "
+                "(`operator <`/`<=`/`>`/`>=`) on the enum, or implement "
+                "`IComparable<" + std::string(le->name) + ">`.");
+            ctx_.setExprType(&be,
+                             ctx_.primitiveTypeRef(PrimitiveType::Bool));
             return;
         }
     }
