@@ -1739,7 +1739,15 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
                 continue;  // fix #3152 — see the string walk above
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
-            if (!isClosureStorageMember(m)) continue;
+            // fix #5389 (§23.1 / §28.9, v0.314): also a bare-`T` member at
+            // `T = function type` — this walk runs inside the per-instantiation
+            // disposer (needsSpecDispose's layoutDiffers clause forces one at every
+            // pointer-sized instantiation) with the substitution active, and every
+            // store into such a member now retains (see isTypeParamBoundToFunction).
+            // The slot-type check is unnecessary here (closure fields are always ptr).
+            if (!isClosureStorageMember(m) &&
+                !isTypeParamFunctionStorageMember(m))
+                continue;
             unsigned idx = fieldIndex_[m];
             llvm::Value* addr = builder_.CreateStructGEP(cst, currentThis_, idx,
                                                          "clf.addr");

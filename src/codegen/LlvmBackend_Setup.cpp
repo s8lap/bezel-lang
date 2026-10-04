@@ -13224,6 +13224,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             if (!isProducer)
                 emitClosureRetain(v);
         }
+        // fix #5389 (§23.1 / §28.9, v0.314): a bare-`T` auto-property
+        // initializer at `T = function type` — the initializer is `T`-typed,
+        // so it is never a recognised producer: always retain (a spurious retain
+        // only leaks). The specialized disposer releases it.
+        else if (v->getType()->isPointerTy() &&
+                 isTypeParamFunctionStorageMember(m)) {
+            emitClosureRetain(v);
+        }
         // #429 (box FIELD-STORE category) / §8.6 / §28.9: a CLASS Object/
         // interface field / auto-property initializer that stores a boxable
         // value gives the field its own reference, like a later assignment.

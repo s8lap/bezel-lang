@@ -13142,6 +13142,24 @@ private:
         return isTypeParamBoundToString(recordMemberType(m));
     }
 
+    // fix #5389 (§23.1 / §28.9, v0.314): the closure twin of
+    // isTypeParamBoundToString / isTypeParamStringStorageMember. A bare `T`
+    // type parameter that resolves to a function type under the active
+    // substitution (e.g. Holder<() -> int> with property v: T) needs the same
+    // retain/release treatment as a directly-declared function-typed member.
+    // Without this, emitInstanceInit skips the retain and emitOwnedFieldDisposals
+    // skips the release for the T-bound-to-function case, and the closure cell
+    // leaks (~48 bytes per instance).
+    bool isTypeParamBoundToFunction(const sema::TypeRef* rt) const {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        const sema::TypeRef* r = resolveTypeParamRef(rt);
+        return r && r != rt && r->kind == sema::TypeRef::Kind::Function;
+    }
+    bool isTypeParamFunctionStorageMember(const sema::Symbol* m) {
+        return isTypeParamBoundToFunction(recordMemberType(m));
+    }
+
     // fix #3945 / #3964 review (§9.7 / §28.9 / §14.1, v0.294): the
     // substitution-aware twin of isStringStorageMember just above, used ONLY
     // by the RECORD string-field walk — recordHasStringFields and
