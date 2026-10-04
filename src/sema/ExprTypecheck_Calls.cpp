@@ -11130,6 +11130,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ctx_.setExprType(&ce, fTy);
                             }
                         }
+                        // fix #5353 (§4.19, v0.315): bare `FrozenArray.From(src)` —
+                        // no explicit type argument on the callee target. Infer T
+                        // from the source argument: `FrozenArray.From(items: Array<T>)`
+                        // yields `FrozenArray<T>`.
+                        else if (TypeRef* argTy = ctx_.exprType(*ce.args[0].value)) {
+                            if (argTy->kind == TypeRef::Kind::Named &&
+                                argTy->headName() == "Array" &&
+                                !argTy->genericArgs.empty()) {
+                                TypeRef* elementTy = argTy->genericArgs[0];
+                                auto* fTy = ctx_.makeTypeRef();
+                                fTy->kind = TypeRef::Kind::Named;
+                                fTy->declaration = builtinClassSym("FrozenArray");
+                                fTy->genericArgs.push_back(elementTy);
+                                ctx_.setExprType(&ce, fTy);
+                            }
+                        }
                     }
 
                     // §6.1 / §30.8: CancellationToken instance method return types.
