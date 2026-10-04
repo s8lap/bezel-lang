@@ -471,7 +471,34 @@ extern "C" void bz_decimal_mod(const bz_decimal_t* a, const bz_decimal_t* b,
     // Align to common scale.
     __uint128_t ra, rb; uint32_t rs;
     dec_align(ma, sa, mb, sb, &ra, &rb, &rs);
-    if (rb == 0) { abort(); return; }  // shouldn't happen given non-zero divisor
+    // fix #4855 / §6.4: dec_align can round the divisor's mantissa to 0
+    // when sa < sb and ma * 10^(sb-sa) would overflow the 96-bit limit
+    // (e.g. decimal.MaxValue mod 0.4m: ma = 2^96-1, mb = 4, sa = 0, sb = 1).
+    // In that case dec_align divides mb by 10 until sb == sa, which rounds
+    // 4 -> 0. The standard ra/rb path then has rb==0 and cannot proceed.
+    //
+    // The true remainder is computed at the DIVISOR'S original scale sb:
+    //   r' = (ma * 10^(sb-sa)) % mb   (r' is an integer at scale sb)
+    //   r  = r' * 10^(-sb)
+    // This formula is derived from: a = ma*10^(-sa), b = mb*10^(-sb),
+    //   a mod b = ((ma*10^(sb-sa)) % mb) * 10^(-sb)
+    // For MaxValue mod 0.4: ((2^96-1)*10 % 4) * 10^(-1) = 2 * 0.1 = 0.2.
+    //
+    // To avoid __uint128_t overflow when sb-sa is large (e.g. 28), the
+    // product ma * 10^(sb-sa) is computed via modular decomposition:
+    //   rem = (ma % mb) * 10^k % mb  iteratively in the loop below.
+    if (rb == 0) {
+        uint32_t k = sb - sa;
+        __uint128_t rem = ma % mb;       // initial remainder
+        __uint128_t ten_pow_mod = 1;    // 10^k % mb, iteratively built
+        for (uint32_t i = 0; i < k; ++i) {
+            ten_pow_mod = (ten_pow_mod * 10) % mb;
+            rem = (rem * 10) % mb;
+        }
+        // rem is (ma * 10^k) % mb at the divisor's original scale sb.
+        dec_store(out, rem, sb, signa, ove_vtable);
+        return;
+    }
     __uint128_t q = ra / rb;
     __uint128_t rem = ra - q * rb;
     dec_store(out, rem, rs, signa, ove_vtable);
