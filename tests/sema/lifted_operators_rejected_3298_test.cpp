@@ -1320,7 +1320,14 @@ BEZEL_TEST(lifted_operators_rejected_3298,
 // differently for the two at identical shapes, decided by the operand's width.
 // ---------------------------------------------------------------------------
 
-BEZEL_TEST(lifted_operators_rejected_3298, literal_initializer_narrows_at_every_width) {
+// fix #4930 (v0.315): init-narrowing (§6.6) proves a local non-null for
+// member access but NOT for the §7.11 operator non-lift gate. Only null-test
+// narrowing (§7.4, `if a <> null then`) admits arithmetic/relational operators
+// on nullable operands. The test below was pinning the OLD behavior.
+// BEHAVIOR FLIP: was EXPECT_FALSE (init-narrowing admitted op), now
+// EXPECT_TRUE (init-narrowing does NOT admit operators, only null-test narrowing does).
+BEZEL_TEST(lifted_operators_rejected_3298,
+           init_narrowing_does_not_admit_arithmetic_on_nullable_4930) {
     const char* widths[] = {"byte", "sbyte", "short", "ushort",
                             "int", "long", "double", "float", "decimal"};
     for (const char* w : widths) {
@@ -1330,7 +1337,8 @@ BEZEL_TEST(lifted_operators_rejected_3298, literal_initializer_narrows_at_every_
             "  var b := a + a; "
             "  return 0; "
             "end Main; end C;");
-        BEZEL_EXPECT_FALSE(hasNullableOpError(r));
+        // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
+        BEZEL_EXPECT_TRUE(hasNullableOpError(r));
     }
 }
 

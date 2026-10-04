@@ -7142,8 +7142,9 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 // known non-null even though exprType keeps the nullable flag
                 // (null-narrowing does not rewrite exprType). This is the same
                 // question §7.11's own gates ask, so it is the same predicate
-                // (#3298) rather than a fifth copy of the lookup.
-                return !isNarrowedNonNullRead(operand);
+                // (#3298) rather than a fifth copy of the lookup. initNarrow=false
+                // excludes init-narrowing: only null-test narrowing admits the operator.
+                return !isNarrowedNonNullRead(operand, false);
             };
             if (nullableStringOperand(be.left.get()) ||
                 nullableStringOperand(be.right.get())) {
@@ -7543,11 +7544,12 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             };
             // §7.11 reads the operand's STATIC type at this program point, so a
             // §7.4-narrowed operand is a non-nullable operand here — the ONE
-            // narrowing predicate (#3298), not a local copy of it.
+            // narrowing predicate (#3298), not a local copy of it. initNarrow=false
+            // excludes init-narrowing: only null-test narrowing admits the operator.
             bool lNull = isNullableValueOperand(ltN) &&
-                         !isNarrowedNonNullRead(be.left.get());
+                         !isNarrowedNonNullRead(be.left.get(), false);
             bool rNull = isNullableValueOperand(rtN) &&
-                         !isNarrowedNonNullRead(be.right.get());
+                         !isNarrowedNonNullRead(be.right.get(), false);
             if (lNull || rNull) {
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
@@ -7614,7 +7616,7 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         if (inLt && inLt->nullable && inRt &&
             inRt->kind == TypeRef::Kind::Named &&
             inRt->declaration == ctx_.builtinClassSym("Range") &&
-            !isNarrowedNonNullRead(be.left.get())) {
+            !isNarrowedNonNullRead(be.left.get(), false)) {
             ctx_.diagnostics().report(
                 Severity::Error, be.span.begin,
                 "the left operand of `in` over a range is nullable \xE2\x80\x94 "
@@ -7982,11 +7984,13 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             // at this program point even though exprType keeps the nullable
             // flag; `isNarrowedNonNullRead` is the ONE predicate that decides
             // that (#3298) — mutable fields and properties never narrow (§7.4),
-            // and `this`/`base` are not narrowable operands.
+            // and `this`/`base` are not narrowable operands. initNarrow=false
+            // excludes init-narrowing (the §6.6 worked example): only null-test
+            // narrowing (e.g. `if a <> null`) admits the §7.11 operator.
             bool lNull = isNullablePrim(lt) &&
-                         !isNarrowedNonNullRead(be.left.get());
+                         !isNarrowedNonNullRead(be.left.get(), false);
             bool rNull = isNullablePrim(rt) &&
-                         !isNarrowedNonNullRead(be.right.get());
+                         !isNarrowedNonNullRead(be.right.get(), false);
             // Per §3.5 only the §7.11-gated operator families are subject to
             // this rule. Equality (`=`/`<>`) is excluded above. User-declared
             // operators on a nullable user-type operand are rejected at the
@@ -8797,8 +8801,9 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // lookup-time narrowing analysis, #914) is a non-nullable operand here
         // and the ordinary unary operator applies. Mirror the §7.11 binary
         // operator's narrower rejection family so the diagnostic matches.
+        // initNarrow=false excludes init-narrowing: only null-test narrowing admits.
         if (ot && ot->kind == TypeRef::Kind::Primitive && ot->nullable) {
-            if (!isNarrowedNonNullRead(ue.operand.get())) {
+            if (!isNarrowedNonNullRead(ue.operand.get(), false)) {
                 const char* opWord =
                     (op == "~") ? "bitwise complement (`~`)" :
                     (op == "-") ? "negation (unary `-`)" :
@@ -9038,6 +9043,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // replacement idiom (`s = null or s.IsEmpty`) did not type-check.
         if (be->op == "and" && be->left && be->right) {
             auto savedNull = nullNarrowed_;
+            auto savedInit = initNarrowed_;
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
@@ -9055,7 +9061,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // `s.Length` compiled to a null dereference (silent ACCEPT,
             // SIGSEGV). The intersection keeps the drop and still discards the
             // left operand's seeded facts (absent from the snapshot).
-            intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
+            intersectNarrowingSetsWith(savedNull, savedInit, savedNarrow, savedField);
         } else if (be->op == "or" && be->left && be->right) {
             // fix #3877 (§7.4, v0.294): symmetric to the `and` case above,
             // false-facts instead of true-facts. Same intersect-not-assign
@@ -9064,11 +9070,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // dropping mutably-captured locals), and un-seeding must keep
             // that drop rather than resurrecting the entry snapshot.
             auto savedNull = nullNarrowed_;
+            auto savedInit = initNarrowed_;
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/false);
             visitExpr(*be->right);
-            intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
+            intersectNarrowingSetsWith(savedNull, savedInit, savedNarrow, savedField);
         } else if (be->right) {
             visitExpr(*be->right);
         }
@@ -10538,6 +10545,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 dynamic_cast<ParameterSymbol*>(asym)) {
                                 narrowings_.erase(asym);
                                 nullNarrowed_.erase(asym);
+                                initNarrowed_.erase(asym);  // init-narrowing (§6.6) also invalidated by out/ref
                                 // §7.4 v0.214 (#2085/#2116): the callee may
                                 // rebind the ref/out local, so any `local._f`
                                 // facts riding it no longer hold.
@@ -11347,12 +11355,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // branch).
         auto entryNarrowings = narrowings_;
         auto entryNullNarrowed = nullNarrowed_;
+        auto entryInit = initNarrowed_;
         auto entryFieldNarrowed = fieldNarrowed_;
         // §28.3 A7 (v0.209, #2080): an if-expression BRANCH is a marked-
         // transfer admission position — announce the exact child node.
         const ast::Expr* savedSlot = markedArmSlot_;
         bool haveThenExit = false;
         std::unordered_set<Symbol*> thenExitNull;
+        std::unordered_set<Symbol*> thenExitInit;
         std::unordered_map<Symbol*, TypeRef*> thenExitNarrowings;
         std::set<std::pair<std::uint32_t, std::uint32_t>> thenExitField;
         if (ce->thenValue) {
@@ -11364,11 +11374,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // path where the test FAILED (probe-confirmed silent ACCEPT).
             narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
+            initNarrowed_ = entryInit;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/true);
             markedArmSlot_ = ce->thenValue.get();
             visitExpr(*ce->thenValue);
             thenExitNull = nullNarrowed_;
+            thenExitInit = initNarrowed_;
             thenExitNarrowings = narrowings_;
             thenExitField = fieldNarrowed_;
             haveThenExit = true;
@@ -11376,6 +11388,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (ce->elseValue) {
             narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
+            initNarrowed_ = entryInit;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/false);
             markedArmSlot_ = ce->elseValue.get();
@@ -11385,11 +11398,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // The live sets hold the else branch's exit (or, for a branch-less
         // malformed atom, the entry state); fold in the entry snapshot and the
         // then branch's exit. // per §7.4 (#2258)
-        intersectNarrowingSetsWith(entryNullNarrowed, entryNarrowings,
-                                   entryFieldNarrowed);
+        intersectNarrowingSetsWith(entryNullNarrowed, entryInit,
+                                   entryNarrowings, entryFieldNarrowed);
         if (haveThenExit)
-            intersectNarrowingSetsWith(thenExitNull, thenExitNarrowings,
-                                       thenExitField);
+            intersectNarrowingSetsWith(thenExitNull, thenExitInit,
+                                       thenExitNarrowings, thenExitField);
     } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         if (te->operand) visitExpr(*te->operand);
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
@@ -13427,11 +13440,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // same wording as the CaseStmt counterpart.
                 auto armEntryNarrow = narrowings_;
                 auto armEntryNull = nullNarrowed_;
+                auto armEntryInit = initNarrowed_;
                 auto armEntryField = fieldNarrowed_;
                 if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
                         arm.pattern.get())) {
                     if (!cp->constants.empty() && cp->constants[0]) {
                         nullNarrowed_ = armEntryNull;
+                        initNarrowed_ = armEntryInit;
                         fieldNarrowed_ = armEntryField;
                         collectNarrowings(cp->constants[0].get(),
                                           /*forTrueBranch=*/true);
@@ -13448,8 +13463,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     markedArmSlot_ = savedMtSlot;
                 }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
-                intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
-                                           armEntryField);  // §7.4 #2258
+                intersectNarrowingSetsWith(armEntryNull, armEntryInit,
+                                           armEntryNarrow, armEntryField);  // §7.4 #2258
             }
             // §7.4 #2116/#2258: fold this arm's exit into the running
             // intersection (see the lambda).

@@ -13084,10 +13084,13 @@ TypeRef* ExprTC::declaredTypeOf(Symbol* sym) {
 // §7.4 (issue #418): a simple variable is known non-null when null-narrowing
 // has proved it so (`nullNarrowed_`), when a §12.7 type-narrowing is in effect
 // (those always narrow to a non-nullable form), or when its declared type is
-// itself non-nullable.
-bool ExprTC::isKnownNonNull(Symbol* sym) {
+// itself non-nullable. `initNarrow` (default true) controls whether
+// init-narrowing (`var a: int? := 5`) counts; the §7.11 operator gates pass
+// false to exclude it.
+bool ExprTC::isKnownNonNull(Symbol* sym, bool initNarrow) {
     if (!sym) return false;
     if (nullNarrowed_.count(sym)) return true;
+    if (initNarrow && initNarrowed_.count(sym)) return true;
     if (auto it = narrowings_.find(sym); it != narrowings_.end())
         return it->second && !it->second->nullable;
     TypeRef* dt = declaredTypeOf(sym);
@@ -13100,15 +13103,15 @@ bool ExprTC::isKnownNonNull(Symbol* sym) {
 // `typeUnary`, where the operand expression has been visited but a
 // binding-site symbol may not yet be recorded on it, and the lexical lookup is
 // what `isKnownNonNull`'s own callers (resolveMemberAccess, the #1575 guard)
-// already use.
-bool ExprTC::isNarrowedNonNullRead(const ast::Expr* e) {
+// already use. `initNarrow` (default true) is passed through to isKnownNonNull.
+bool ExprTC::isNarrowedNonNullRead(const ast::Expr* e, bool initNarrow) {
     if (!e) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
     if (id && id->name != "this" && id->name != "base") {
         if (Symbol* s = lookupName(id->name))
             if (dynamic_cast<LocalSymbol*>(s) ||
                 dynamic_cast<ParameterSymbol*>(s))
-                return isKnownNonNull(s);
+                return isKnownNonNull(s, initNarrow);
     }
     // §7.4 (v0.214, #2085/#2116): a nullable `readonly` FIELD narrows too — it
     // has no writer after construction, so there is no TOCTOU hazard, and
@@ -13771,10 +13774,13 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType,
     // hold (they were about the old referent). Drop them regardless of the new
     // value's nullability.
     dropFieldFactsRooted(sym);
-    if (valueProvesNonNull(value, valueType))
+    if (valueProvesNonNull(value, valueType)) {
         nullNarrowed_.insert(sym);
-    else
+        initNarrowed_.insert(sym);
+    } else {
         nullNarrowed_.erase(sym);
+        initNarrowed_.erase(sym);
+    }
 }
 
 // §7.4 (issue #2118): join the narrowing state across a loop body's two
@@ -13799,20 +13805,21 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType,
 // (#2116).
 void ExprTC::intersectNarrowingSetsAfterLoop(
     const std::unordered_set<Symbol*>& entryNull,
+    const std::unordered_set<Symbol*>& entryInit,
     const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings,
     const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField,
     const LoopEdgeNarrowing& edges) {
-    intersectNarrowingSetsWith(entryNull, entryNarrowings, entryField);
+    intersectNarrowingSetsWith(entryNull, entryInit, entryNarrowings, entryField);
     // §7.4 (#2152): fold each break/continue edge snapshot into the
     // intersection. A `break`/`continue` edge state is a possible after-loop
     // state (see the function header); a local the edge left possibly-null is
     // absent from the edge's null set, so the intersection drops it — the bare
-    // member access after the loop is then correctly rejected. The three
-    // parallel vectors are pushed together by recordLoopEdgeNarrowing, so they
-    // share one length.
+    // member access after the loop is then correctly rejected. The parallel
+    // vectors are pushed together by recordLoopEdgeNarrowing, so they share one
+    // length.
     for (std::size_t i = 0; i < edges.nullEdges.size(); ++i)
-        intersectNarrowingSetsWith(edges.nullEdges[i], edges.typeEdges[i],
-                                   edges.fieldEdges[i]);
+        intersectNarrowingSetsWith(edges.nullEdges[i], edges.initEdges[i],
+                                   edges.typeEdges[i], edges.fieldEdges[i]);
 }
 
 // §7.4 (#2258): the one intersection primitive — see the declaration in
@@ -13820,6 +13827,7 @@ void ExprTC::intersectNarrowingSetsAfterLoop(
 // this and never an assignment.
 void ExprTC::intersectNarrowingSetsWith(
     const std::unordered_set<Symbol*>& otherNull,
+    const std::unordered_set<Symbol*>& otherInit,
     const std::unordered_map<Symbol*, TypeRef*>& otherNarrowings,
     const std::set<std::pair<std::uint32_t, std::uint32_t>>& otherField) {
     // §7.4 (v0.214, #2116): the readonly-field facts join the same way — a fact
@@ -13831,6 +13839,12 @@ void ExprTC::intersectNarrowingSetsWith(
             ++it;
         else
             it = nullNarrowed_.erase(it);
+    }
+    for (auto it = initNarrowed_.begin(); it != initNarrowed_.end();) {
+        if (otherInit.count(*it))
+            ++it;
+        else
+            it = initNarrowed_.erase(it);
     }
     // §12.7 type-narrowings are keyed by symbol AND narrowed type: an entry
     // whose narrowed type differs from the snapshot's is not the same fact, so
@@ -13858,6 +13872,7 @@ void ExprTC::recordLoopEdgeNarrowing(int targetOffset) {
         return;
     auto& col = loopEdgeNarrowing_[static_cast<std::size_t>(idx)];
     col.nullEdges.push_back(nullNarrowed_);
+    col.initEdges.push_back(initNarrowed_);
     col.typeEdges.push_back(narrowings_);
     col.fieldEdges.push_back(fieldNarrowed_);
 }
@@ -14257,11 +14272,13 @@ void ExprTC::checkOutPostcondAtReturn(const ast::Expr* returnValue,
         // stated constant, then require the parameter provably non-null. Save
         // and restore the flow state so this probe does not leak.
         auto savedNull = nullNarrowed_;
+        auto savedInit = initNarrowed_;     // init-narrowing: probe-local
         auto savedNarrow = narrowings_;
         auto savedField = fieldNarrowed_;  // §7.4 #2116: probe-local
         collectNarrowings(returnValue, /*forTrueBranch=*/whenTrue);
         const bool ok = isKnownNonNull(psym);
         nullNarrowed_ = std::move(savedNull);
+        initNarrowed_ = std::move(savedInit);
         narrowings_ = std::move(savedNarrow);
         fieldNarrowed_ = std::move(savedField);
         if (!ok) {
@@ -15953,6 +15970,15 @@ void ExprTC::invalidateCapturedNarrowings() {
             !(dynamic_cast<LocalSymbol*>(s) &&
               dynamic_cast<LocalSymbol*>(s)->isConst))
             it = nullNarrowed_.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = initNarrowed_.begin(); it != initNarrowed_.end();) {
+        Symbol* s = *it;
+        if (s && mutablyCapturedNames_.count(s->name) &&
+            !(dynamic_cast<LocalSymbol*>(s) &&
+              dynamic_cast<LocalSymbol*>(s)->isConst))
+            it = initNarrowed_.erase(it);
         else
             ++it;
     }
@@ -19139,7 +19165,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // `var a: int? := 3;` narrowed.
                 if (valueProvesNonNull(ld->initializer.get(),
                                        ctx_.exprType(*ld->initializer)))
-                    nullNarrowed_.insert(lsym);
+                    initNarrowed_.insert(lsym);
             }
         }
     } else if (auto* lc =
@@ -21959,6 +21985,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // intersection of the surviving paths' exit sets (§7.4 "Narrowing also
         // applies after early return").
         auto savedNarrowings = narrowings_;
+        auto savedInitNarrowed = initNarrowed_;
         auto entryNullNarrowed = nullNarrowed_;
         // §7.4 (v0.214, #2085/#2116): readonly-field facts flow through the
         // branches and join like `nullNarrowed_`, with two hygiene upgrades
@@ -22008,6 +22035,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             fieldExits.push_back(fieldNarrowed_);
         }
         narrowings_ = savedNarrowings;
+        initNarrowed_ = savedInitNarrowed;
         for (std::size_t i = 0; i < ifs->elifBranches.size(); ++i) {
             const auto& el = ifs->elifBranches[i];
             // §7.4 (v0.214, #2116): this elif CONDITION executes only when
@@ -22066,6 +22094,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 fieldExits.push_back(fieldNarrowed_);
             }
             narrowings_ = savedNarrowings;
+            initNarrowed_ = savedInitNarrowed;
         }
         // The else body (explicit or implicit fall-through): all preceding
         // guards were false, so each contributes its else-branch narrowing.
@@ -22088,6 +22117,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             fieldExits.push_back(fieldNarrowed_);
         }
         narrowings_ = savedNarrowings;
+        initNarrowed_ = savedInitNarrowed;
         // After-if nullability = intersection of all fall-through exit sets.
         if (fallThroughExits.empty()) {
             // Every path exits the method; the after-if point is unreachable.
@@ -22130,6 +22160,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // each `break`/`continue` in the body can snapshot its state; the join
         // folds those edges in alongside the entry ∩ body-exit intersection.
         auto whileEntryNull = nullNarrowed_;
+        auto whileEntryInit = initNarrowed_;
         auto whileEntryNarrowings = narrowings_;
         auto whileEntryField = fieldNarrowed_;  // §7.4 #2116
         // fix #5331 (§7.4, v0.313): a null test in a `while` condition
@@ -22155,7 +22186,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
             currentScope_ = saveScope;
         }
-        intersectNarrowingSetsAfterLoop(whileEntryNull, whileEntryNarrowings,
+        intersectNarrowingSetsAfterLoop(whileEntryNull, whileEntryInit,
+                                        whileEntryNarrowings,
                                         whileEntryField,
                                         loopEdgeNarrowing_.back());
         loopEdgeNarrowing_.pop_back();
@@ -22396,11 +22428,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // each `break`/`continue` in the body can snapshot its state; the join
         // folds those edges in alongside the entry ∩ body-exit intersection.
         auto forEntryNull = nullNarrowed_;
+        auto forEntryInit = initNarrowed_;
         auto forEntryNarrowings = narrowings_;
         auto forEntryField = fieldNarrowed_;  // §7.4 #2116
         loopEdgeNarrowing_.emplace_back();
         for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
-        intersectNarrowingSetsAfterLoop(forEntryNull, forEntryNarrowings,
+        intersectNarrowingSetsAfterLoop(forEntryNull, forEntryInit,
+                                        forEntryNarrowings,
                                         forEntryField,
                                         loopEdgeNarrowing_.back());
         loopEdgeNarrowing_.pop_back();
@@ -22470,6 +22504,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // #2164
         auto tryEntryField = fieldNarrowed_;
         auto tryEntryNull = nullNarrowed_;
+        auto tryEntryInit = initNarrowed_;
         const std::uint64_t tryDropEpoch0 = fieldFactDropEpoch_;
         {
             // per §21.6 / §21.1 (#5334, the #5314 residual): the PROTECTED
@@ -22490,6 +22525,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto afterBodyField = fieldNarrowed_;
         auto tryJoinField = afterBodyField;
         auto afterBodyNull = nullNarrowed_;
+        auto afterBodyInit = initNarrowed_;
         // Catch-arm running base (#2116 pre-gate review, hardened): the body
         // can be interrupted at ANY point, and the exit-state intersection
         // entry ∩ after-body is BLIND to an interior drop that a later
@@ -22530,11 +22566,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (afterBodyNull.count(*it)) ++it;
             else it = catchRunningNull.erase(it);
         }
+        auto catchRunningInit = tryEntryInit;
+        for (auto it = catchRunningInit.begin();
+             it != catchRunningInit.end();) {
+            if (afterBodyInit.count(*it)) ++it;
+            else it = catchRunningInit.erase(it);
+        }
         // §7.4 #2164: the after-try join is after-body ∩ every catch's
         // exit. Initialized to afterBodyNull once, then shrunken by each
         // arm's exit (the same shape tryJoinField has for the field set,
         // just without drop-edge carving).
         auto tryJoinNull = afterBodyNull;
+        auto tryJoinInit = afterBodyInit;
         for (const auto& arm : trys->catches) {
             // §31.2.1/§12.7/§2.8.3 rule 4 (#1939): the CATCH-surface copy of the
             // #2006/#2012/#2018 erasure guard. §31.2.1: an arm "matches any
@@ -22579,6 +22622,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // running field facts. No ordering dependence.
             fieldNarrowed_ = catchRunningField;          // §7.4 #2116
             nullNarrowed_ = catchRunningNull;            // §7.4 #2164
+            initNarrowed_ = catchRunningInit;
             // §31.2: a `catch var e: T` arm binds the caught exception
             // to `e` (a borrow of the caught type) in the guard and
             // body scope. The binding's decl anchors on the arm body so
@@ -22650,6 +22694,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (nullNarrowed_.count(*it)) ++it;
                 else it = catchRunningNull.erase(it);
             }
+            for (auto it = tryJoinInit.begin(); it != tryJoinInit.end();) {
+                if (initNarrowed_.count(*it)) ++it;
+                else it = tryJoinInit.erase(it);
+            }
+            for (auto it = catchRunningInit.begin();
+                 it != catchRunningInit.end();) {
+                if (initNarrowed_.count(*it)) ++it;
+                else it = catchRunningInit.erase(it);
+            }
         }
         // §7.4 (v0.214, #2116 pre-gate review): the FINALLY body runs on every
         // exit from the construct — the body's normal completion, its EARLY
@@ -22716,6 +22769,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // intersection-only discipline (matches the §7.4 join the if-stmt
         // and case-stmt handlers already apply).
         nullNarrowed_.insert(tryJoinNull.begin(), tryJoinNull.end());
+        initNarrowed_.insert(tryJoinInit.begin(), tryJoinInit.end());
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         // §29.9: `yield` is a method-level construct only — `yield return` and
         // `yield break` are both forbidden inside a lambda. Without this the
@@ -24183,6 +24237,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // alt, and scrutinee-less boolean arms).
                 auto armEntryNarrow = narrowings_;
                 auto armEntryNull = nullNarrowed_;
+                auto armEntryInit = initNarrowed_;
                 auto armEntryField = fieldNarrowed_;
                 if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
                         arm.pattern.get())) {
@@ -24206,7 +24261,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
                     currentScope_ = saveScope;
                 }
-                intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
+                intersectNarrowingSetsWith(armEntryNull, armEntryInit,
+                                           armEntryNarrow,
                                            armEntryField);  // §7.4 #2258
             }
             // §7.4 #2116/#2164/#2258: fold this arm's exit into the running

@@ -327,6 +327,16 @@ private:
     // Block-scoped the same way `narrowings_` is (saved/restored per block).
     std::unordered_set<Symbol*> nullNarrowed_;
 
+    // §7.11 / §6.6 (issue #4930): init-narrowing. Separate from `nullNarrowed_`
+    // because init-narrowing (a non-null literal assigned to a nullable local)
+    // proves the local is non-null for member access purposes (§6.6) but NOT for
+    // the §7.11 operator non-lift gate. The latter only admits null-test
+    // narrowing (`if a <> null then`). Tracked separately so that
+    // `isKnownNonNull(sym, initNarrow)` can be called with initNarrow=false to
+    // exclude init-narrowing from the §7.11 gates while still counting it for
+    // member access. Cleared on reassignment (like nullNarrowed_).
+    std::unordered_set<Symbol*> initNarrowed_;
+
     // §7.4 (v0.214, #2085 redone per #2116): flow-narrowing facts for nullable
     // `readonly` fields. Spec §7.4 (v0.214): "A nullable `readonly` field —
     // instance or `static` — participates in flow narrowing … The tracked shape
@@ -564,6 +574,7 @@ private:
     // own callable — a `break` inside it cannot target an enclosing loop).
     struct LoopEdgeNarrowing {
         std::vector<std::unordered_set<Symbol*>> nullEdges;
+        std::vector<std::unordered_set<Symbol*>> initEdges;
         std::vector<std::unordered_map<Symbol*, TypeRef*>> typeEdges;
         std::vector<std::set<std::pair<std::uint32_t, std::uint32_t>>>
             fieldEdges;
@@ -2746,9 +2757,11 @@ private:
     TypeRef* declaredTypeOf(Symbol* sym);
 
     // §7.4 (issue #418): is `sym` a simple variable currently known non-null?
-    // True when it is in `nullNarrowed_` OR has a §12.7 type-narrowing (which is
-    // always to a non-nullable form) OR its declared type is non-nullable.
-    bool isKnownNonNull(Symbol* sym);
+    // True when it is in `nullNarrowed_` OR (if `initNarrow` is true) in
+    // `initNarrowed_` OR has a §12.7 type-narrowing (always to a non-nullable
+    // form) OR its declared type is non-nullable. The §7.11 operator gates pass
+    // initNarrow=false to exclude init-narrowing.
+    bool isKnownNonNull(Symbol* sym, bool initNarrow = true);
 
     // §7.4 / §7.11 (v0.286, #3298): the ONE "is this operand read as
     // non-null here?" test. §7.11 reads an operand's STATIC type and states
@@ -2760,13 +2773,14 @@ private:
     // copy of the same lookup; a sixth copy is how the family drifts.
     //
     // §7.4 narrows TWO kinds of storage and this consults both:
-    //   * a simple local or parameter — `nullNarrowed_` / `narrowings_`, via
-    //     isKnownNonNull (`this`/`base` are never narrowable operands);
+    //   * a simple local or parameter — `nullNarrowed_` / `narrowings_` /
+    //     `initNarrowed_` (if initNarrow is true), via isKnownNonNull
+    //     (`this`/`base` are never narrowable operands);
     //   * a `readonly` FIELD path (`this._f`, `TypeName._s`, `local._f`) —
     //     `fieldNarrowed_`, v0.214/#2085/#2116, admitted because a readonly
     //     field has no writer after construction and so no TOCTOU hazard.
     // A MUTABLE field or a property never narrows and is excluded by both.
-    bool isNarrowedNonNullRead(const ast::Expr* e);
+    bool isNarrowedNonNullRead(const ast::Expr* e, bool initNarrow = true);
 
     // §7.11 (v0.286, #3298): the static type an operand is READ AT, which is
     // the declared type with the nullable flag dropped when
@@ -2942,20 +2956,21 @@ private:
     // processes (#2116).
     void intersectNarrowingSetsWith(
         const std::unordered_set<Symbol*>& otherNull,
+        const std::unordered_set<Symbol*>& otherInit,
         const std::unordered_map<Symbol*, TypeRef*>& otherNarrowings,
         const std::set<std::pair<std::uint32_t, std::uint32_t>>& otherField);
 
     // §7.4 (issue #2118): after a loop body (which may execute ZERO times),
     // reduce the current narrowing state to the intersection of what holds on
-    // the zero-iteration path (`entryNull` / `entryNarrowings`, captured before
-    // the body) and what the body left (the current `nullNarrowed_` /
-    // `narrowings_`). A fact ESTABLISHED inside the body is dropped (absent from
-    // the entry sets); an entry fact the body INVALIDATED is dropped (the body
-    // walk removed it, so it is absent from the current sets); an entry fact the
-    // body left untouched survives (present in both). Result membership is a
-    // pure set intersection, independent of container iteration order and
-    // emitting no diagnostic, so it is deterministic across shard processes
-    // (#2116).
+    // the zero-iteration path (`entryNull` / `entryInit` / `entryNarrowings`,
+    // captured before the body) and what the body left (the current
+    // `nullNarrowed_` / `initNarrowed_` / `narrowings_`). A fact ESTABLISHED
+    // inside the body is dropped (absent from the entry sets); an entry fact the
+    // body INVALIDATED is dropped (the body walk removed it, so it is absent
+    // from the current sets); an entry fact the body left untouched survives
+    // (present in both). Result membership is a pure set intersection,
+    // independent of container iteration order and emitting no diagnostic, so it
+    // is deterministic across shard processes (#2116).
     // #2116: `entryField` joins `fieldNarrowed_` under the same
     // zero-iteration-path intersection rule.
     // #2152: `edges` folds each break/continue edge snapshot into the same
@@ -2964,6 +2979,7 @@ private:
     // left a local possibly-null drops it from the after-loop state.
     void intersectNarrowingSetsAfterLoop(
         const std::unordered_set<Symbol*>& entryNull,
+        const std::unordered_set<Symbol*>& entryInit,
         const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings,
         const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField,
         const LoopEdgeNarrowing& edges);
