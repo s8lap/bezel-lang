@@ -1347,7 +1347,23 @@ static double bz_jder_parse_float(bz_binder_t* d) {
     if (numlen > 50) { bz_ser_throw_at_json("JSON float too long (§2.15)", d); return 0.0; }
     char buf[64] = {};
     memcpy(buf, d->data + start, (size_t)numlen);
-    return strtod(buf, nullptr);
+    // stdlib §2.15 (v0.314, #5200/#5369): JSON requires at least one digit
+    // after '.', and at least one digit after the exponent sign.  Reject
+    // forms like "1." and "1e" before calling strtod.
+    char lastChar = buf[numlen - 1];
+    if (lastChar == '.' || lastChar == 'e' || lastChar == 'E' ||
+        lastChar == '+' || lastChar == '-') {
+        bz_ser_throw_at_json("JSON float has invalid form (§2.15)", d);
+        return 0.0;
+    }
+    double v = strtod(buf, nullptr);
+    // stdlib §2.15 (v0.314, #5200/#5369): a JSON number whose rounded value
+    // is not finite raises SerializationException.
+    if (!std::isfinite(v)) {
+        bz_ser_throw_at_json("JSON float is not finite (§2.15)", d);
+        return 0.0;
+    }
+    return v;
 }
 
 // Parse a JSON number as a decimal, returns a pointer to a thread-local bz_decimal_t.

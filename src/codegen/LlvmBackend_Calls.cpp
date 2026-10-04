@@ -10960,12 +10960,86 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 llvm::Value* echCd = builder_.CreateLoad(i8Cd, epCd, "cvtd.ech");
                 llvm::Value* nulCd = builder_.CreateICmpEQ(
                     echCd, llvm::ConstantInt::get(i8Cd, 0), "cvtd.nul");
+                // stdlib §9.2 (v0.314, #5199/#5368): the first character (after
+                // optional sign) must be a digit — reject ".5", etc.  Allow '+'
+                // and '-' as the first char (they are checked separately), and
+                // 'i'/'n' for the inf/nan spellings accepted by strtod (#4890).
+                llvm::Value* isSignCd = builder_.CreateOr(
+                    builder_.CreateICmpEQ(fcCd,
+                        llvm::ConstantInt::get(i8Cd, '+')),
+                    builder_.CreateICmpEQ(fcCd,
+                        llvm::ConstantInt::get(i8Cd, '-')), "cvtd.isSign");
+                llvm::Value* infMaskCd = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcCd,
+                            llvm::ConstantInt::get(i8Cd, 'i')),
+                        builder_.CreateICmpEQ(fcCd,
+                            llvm::ConstantInt::get(i8Cd, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcCd,
+                            llvm::ConstantInt::get(i8Cd, 'n')),
+                        builder_.CreateICmpEQ(fcCd,
+                            llvm::ConstantInt::get(i8Cd, 'N'))),
+                    "cvtd.infMask");
+                llvm::Value* notDigitCd = builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isSignCd),
+                        builder_.CreateNot(infMaskCd)),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcCd, llvm::ConstantInt::get(i8Cd, '0')),
+                        llvm::ConstantInt::get(i8Cd, 10)), "cvtd.ndig");
+                // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float).
+                llvm::Value* secondCharCd = builder_.CreateLoad(i8Cd,
+                    builder_.CreateGEP(i8Cd, data,
+                        builder_.getInt64(1), "cvtd.scptr"), "cvtd.sc");
+                llvm::Value* isLeadingZeroCd = builder_.CreateICmpEQ(
+                    fcCd, llvm::ConstantInt::get(i8Cd, '0'), "cvtd.lzero");
+                llvm::Value* isHexIndicatorCd = builder_.CreateOr(
+                    builder_.CreateICmpEQ(secondCharCd,
+                        llvm::ConstantInt::get(i8Cd, 'x')),
+                    builder_.CreateICmpEQ(secondCharCd,
+                        llvm::ConstantInt::get(i8Cd, 'X')), "cvtd.hex");
+                llvm::Value* isHexFloatCd = builder_.CreateAnd(
+                    isLeadingZeroCd, isHexIndicatorCd, "cvtd.hfloat");
+                // stdlib §9.2 (v0.314, #5199/#5368): the last character strtod
+                // consumed must not be '.', 'e', 'E', '+', or '-'.
+                auto* i64tCd = llvm::Type::getInt64Ty(llvm_);
+                llvm::Value* consumedBytesCd = builder_.CreateSub(
+                    builder_.CreatePtrToInt(epCd, i64tCd),
+                    builder_.CreatePtrToInt(data, i64tCd), "cvtd.cb");
+                llvm::Value* lastCharOffCd = builder_.CreateSub(
+                    consumedBytesCd, builder_.getInt64(1), "cvtd.lco");
+                llvm::Value* lastCharPtrCd = builder_.CreateGEP(
+                    i8Cd, data, lastCharOffCd, "cvtd.lcp");
+                llvm::Value* lastCharCd = builder_.CreateLoad(i8Cd, lastCharPtrCd, "cvtd.lc");
+                llvm::Value* badLastCharCd = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(lastCharCd,
+                            llvm::ConstantInt::get(i8Cd, '.')),
+                        builder_.CreateICmpEQ(lastCharCd,
+                            llvm::ConstantInt::get(i8Cd, 'e'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(lastCharCd,
+                            llvm::ConstantInt::get(i8Cd, 'E')),
+                        builder_.CreateOr(
+                            builder_.CreateICmpEQ(lastCharCd,
+                                llvm::ConstantInt::get(i8Cd, '+')),
+                            builder_.CreateICmpEQ(lastCharCd,
+                                llvm::ConstantInt::get(i8Cd, '-')))),
+                    "cvtd.blc");
                 llvm::Value* validCd = builder_.CreateAnd(
-                    builder_.CreateNot(fcWsCd),
-                    builder_.CreateAnd(advCd, nulCd), "cvtd.vfmt");
+                    builder_.CreateAnd(
+                        builder_.CreateAnd(
+                            builder_.CreateAnd(
+                                builder_.CreateNot(fcWsCd),
+                                builder_.CreateNot(notDigitCd)),
+                            builder_.CreateAnd(advCd, nulCd)),
+                        builder_.CreateNot(badLastCharCd)),
+                    builder_.CreateNot(isHexFloatCd),
+                    "cvtd.vfmt");
                 emitGuardThrow(builder_.CreateNot(validCd, "cvtd.fmtbad"),
                                "FormatException");
-                // stdlib §2.3 / §9.2 (v0.313, #5198): out-of-range -> OverflowException.
+                // stdlib §2.3 / §9.2 (v0.314, #5199/#5368): out-of-range -> OverflowException.
                 emitGuardThrow(emitFloatParseOverflow(data, dvCd),
                                "OverflowException");
                 return dvCd;
@@ -11149,10 +11223,85 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* endChTd = builder_.CreateLoad(i8td, endPtrTd, "tryd.end");
             llvm::Value* atNulTd = builder_.CreateICmpEQ(
                 endChTd, llvm::ConstantInt::get(i8td, 0), "tryd.nul");
+            // stdlib §9.2 (v0.314, #5199/#5368): the first character (after
+            // optional sign) must be a digit — reject ".5", etc.  Allow '+'
+            // and '-' as the first char (they are checked separately), and
+            // 'i'/'n' for the inf/nan spellings accepted by strtod (#4890).
+            llvm::Value* isSignTd = builder_.CreateOr(
+                builder_.CreateICmpEQ(fcTd,
+                    llvm::ConstantInt::get(i8td, '+')),
+                builder_.CreateICmpEQ(fcTd,
+                    llvm::ConstantInt::get(i8td, '-')), "tryd.isSign");
+            llvm::Value* infMaskTd = builder_.CreateOr(
+                builder_.CreateOr(
+                    builder_.CreateICmpEQ(fcTd,
+                        llvm::ConstantInt::get(i8td, 'i')),
+                    builder_.CreateICmpEQ(fcTd,
+                        llvm::ConstantInt::get(i8td, 'I'))),
+                builder_.CreateOr(
+                    builder_.CreateICmpEQ(fcTd,
+                        llvm::ConstantInt::get(i8td, 'n')),
+                    builder_.CreateICmpEQ(fcTd,
+                        llvm::ConstantInt::get(i8td, 'N'))),
+                "tryd.infMask");
+            llvm::Value* notDigitTd = builder_.CreateAnd(
+                builder_.CreateAnd(
+                    builder_.CreateNot(isSignTd),
+                    builder_.CreateNot(infMaskTd)),
+                builder_.CreateICmpUGE(
+                    builder_.CreateSub(fcTd, llvm::ConstantInt::get(i8td, '0')),
+                    llvm::ConstantInt::get(i8td, 10)), "tryd.ndig");
+            // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float).
+            llvm::Value* secondCharTd = builder_.CreateLoad(i8td,
+                builder_.CreateGEP(i8td, strData,
+                    builder_.getInt64(1), "tryd.scptr"), "tryd.sc");
+            llvm::Value* isLeadingZeroTd = builder_.CreateICmpEQ(
+                fcTd, llvm::ConstantInt::get(i8td, '0'), "tryd.lzero");
+            llvm::Value* isHexIndicatorTd = builder_.CreateOr(
+                builder_.CreateICmpEQ(secondCharTd,
+                    llvm::ConstantInt::get(i8td, 'x')),
+                builder_.CreateICmpEQ(secondCharTd,
+                    llvm::ConstantInt::get(i8td, 'X')), "tryd.hex");
+            llvm::Value* isHexFloatTd = builder_.CreateAnd(
+                isLeadingZeroTd, isHexIndicatorTd, "tryd.hfloat");
+            // stdlib §9.2 (v0.314, #5199/#5368): same grammar-validation as the
+            // Parse path: the last character strtod consumed must not be
+            // '.', 'e', 'E', '+', or '-'.
+            auto* i64tTd = llvm::Type::getInt64Ty(llvm_);
+            llvm::Value* consumedBytesTd = builder_.CreateSub(
+                builder_.CreatePtrToInt(endPtrTd, i64tTd),
+                builder_.CreatePtrToInt(strData, i64tTd), "tryd.cb");
+            llvm::Value* lastCharOffTd = builder_.CreateSub(
+                consumedBytesTd, builder_.getInt64(1), "tryd.lco");
+            llvm::Value* lastCharPtrTd = builder_.CreateGEP(
+                i8td, strData, lastCharOffTd, "tryd.lcp");
+            llvm::Value* lastCharTd = builder_.CreateLoad(i8td, lastCharPtrTd, "tryd.lc");
+            llvm::Value* badLastCharTd = builder_.CreateOr(
+                builder_.CreateOr(
+                    builder_.CreateICmpEQ(lastCharTd,
+                        llvm::ConstantInt::get(i8td, '.')),
+                    builder_.CreateICmpEQ(lastCharTd,
+                        llvm::ConstantInt::get(i8td, 'e'))),
+                builder_.CreateOr(
+                    builder_.CreateICmpEQ(lastCharTd,
+                        llvm::ConstantInt::get(i8td, 'E')),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(lastCharTd,
+                            llvm::ConstantInt::get(i8td, '+')),
+                        builder_.CreateICmpEQ(lastCharTd,
+                            llvm::ConstantInt::get(i8td, '-')))),
+                "tryd.blc");
             llvm::Value* okTd = builder_.CreateAnd(
-                builder_.CreateNot(fcWsTd),
-                builder_.CreateAnd(advTd, atNulTd), "tryd.fmtok");
-            // stdlib §2.3 / §9.2 (v0.313, #5198): out-of-range -> false.
+                builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateAnd(
+                            builder_.CreateNot(fcWsTd),
+                            builder_.CreateNot(notDigitTd)),
+                        builder_.CreateAnd(advTd, atNulTd)),
+                    builder_.CreateNot(badLastCharTd)),
+                builder_.CreateNot(isHexFloatTd),
+                "tryd.fmtok");
+            // stdlib §2.3 / §9.2 (v0.314, #5199/#5368): out-of-range -> false.
             okTd = builder_.CreateAnd(
                 okTd,
                 builder_.CreateNot(emitFloatParseOverflow(strData, dvTd)),

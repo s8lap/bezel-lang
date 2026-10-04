@@ -1172,10 +1172,85 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* endChD = builder_.CreateLoad(i8TyD, endPtrD, "tryp.end");
         llvm::Value* atNulD = builder_.CreateICmpEQ(
             endChD, llvm::ConstantInt::get(i8TyD, 0), "tryp.nul");
+        // stdlib §9.2 (v0.314, #5199/#5368): the first character (after
+        // optional sign) must be a digit — reject ".5", etc.  Allow '+' and '-'
+        // as the first char (they are checked separately), and 'i'/'n' for the
+        // inf/nan spellings accepted by strtod per #4890's round-trip.
+        llvm::Value* isSignD = builder_.CreateOr(
+            builder_.CreateICmpEQ(fcD,
+                llvm::ConstantInt::get(i8TyD, '+')),
+            builder_.CreateICmpEQ(fcD,
+                llvm::ConstantInt::get(i8TyD, '-')), "tryp.isSignD");
+        llvm::Value* infMaskD = builder_.CreateOr(
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(fcD,
+                    llvm::ConstantInt::get(i8TyD, 'i')),
+                builder_.CreateICmpEQ(fcD,
+                    llvm::ConstantInt::get(i8TyD, 'I'))),
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(fcD,
+                    llvm::ConstantInt::get(i8TyD, 'n')),
+                builder_.CreateICmpEQ(fcD,
+                    llvm::ConstantInt::get(i8TyD, 'N'))),
+            "tryp.infMaskD");
+        llvm::Value* notDigitD = builder_.CreateAnd(
+            builder_.CreateAnd(
+                builder_.CreateNot(isSignD),
+                builder_.CreateNot(infMaskD)),
+            builder_.CreateICmpUGE(
+                builder_.CreateSub(fcD, llvm::ConstantInt::get(i8TyD, '0')),
+                llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
+        // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float form).
+        llvm::Value* secondCharD = builder_.CreateLoad(i8TyD,
+            builder_.CreateGEP(i8TyD, strData,
+                builder_.getInt64(1), "tryp.scptr"), "tryp.sc");
+        llvm::Value* isLeadingZeroD = builder_.CreateICmpEQ(
+            fcD, llvm::ConstantInt::get(i8TyD, '0'), "tryp.lzeroD");
+        llvm::Value* isHexIndicatorD = builder_.CreateOr(
+            builder_.CreateICmpEQ(secondCharD,
+                llvm::ConstantInt::get(i8TyD, 'x')),
+            builder_.CreateICmpEQ(secondCharD,
+                llvm::ConstantInt::get(i8TyD, 'X')), "tryp.hexD");
+        llvm::Value* isHexFloatD = builder_.CreateAnd(
+            isLeadingZeroD, isHexIndicatorD, "tryp.hfloatD");
+        // stdlib §9.2 (v0.314, #5199/#5368): same grammar-validation as the
+        // Parse path above: the last character strtod consumed must not be
+        // '.', 'e', 'E', '+', or '-'.
+        auto* i64tD = llvm::Type::getInt64Ty(llvm_);
+        llvm::Value* consumedBytesD = builder_.CreateSub(
+            builder_.CreatePtrToInt(endPtrD, i64tD),
+            builder_.CreatePtrToInt(strData, i64tD), "tryp.cb");
+        llvm::Value* lastCharOffD = builder_.CreateSub(
+            consumedBytesD, builder_.getInt64(1), "tryp.lco");
+        llvm::Value* lastCharPtrD = builder_.CreateGEP(
+            i8TyD, strData, lastCharOffD, "tryp.lcp");
+        llvm::Value* lastCharD = builder_.CreateLoad(i8TyD, lastCharPtrD, "tryp.lc");
+        llvm::Value* badLastCharD = builder_.CreateOr(
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(lastCharD,
+                    llvm::ConstantInt::get(i8TyD, '.')),
+                builder_.CreateICmpEQ(lastCharD,
+                    llvm::ConstantInt::get(i8TyD, 'e'))),
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(lastCharD,
+                    llvm::ConstantInt::get(i8TyD, 'E')),
+                builder_.CreateOr(
+                    builder_.CreateICmpEQ(lastCharD,
+                        llvm::ConstantInt::get(i8TyD, '+')),
+                    builder_.CreateICmpEQ(lastCharD,
+                        llvm::ConstantInt::get(i8TyD, '-')))),
+            "tryp.blc");
         llvm::Value* fmtOkD = builder_.CreateAnd(
-            builder_.CreateNot(fcWsD),
-            builder_.CreateAnd(advD, atNulD), "tryp.fmtok");
-        // stdlib §9.2 (v0.313, #5198): a finite spelling that rounds to a
+            builder_.CreateAnd(
+                builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateNot(fcWsD),
+                        builder_.CreateNot(notDigitD)),
+                    builder_.CreateAnd(advD, atNulD)),
+                builder_.CreateNot(badLastCharD)),
+            builder_.CreateNot(isHexFloatD),
+            "tryp.fmtok");
+        // stdlib §9.2 (v0.314, #5199/#5368): a finite spelling that rounds to a
         // non-finite value is out of range -> false (before the out store, so a
         // nullable `out T?` slot reads null).
         llvm::Value* okD = builder_.CreateAnd(
@@ -1654,13 +1729,96 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* endChF = builder_.CreateLoad(i8TyF, endPtrF, "parse.echF");
                 llvm::Value* atNulF = builder_.CreateICmpEQ(
                     endChF, llvm::ConstantInt::get(i8TyF, 0), "parse.nulF");
+                // stdlib §9.2 (v0.314, #5199/#5368): the grammar requires at
+                // least one digit BEFORE any decimal or exponent.  Check the
+                // first character strtod saw: it must be a digit, OR it must be
+                // '+' or '-' (the sign is checked separately), OR it must be
+                // 'i'/'I' or 'n'/'N' (the inf/nan spellings accepted by strtod
+                // per #4890's round-trip requirement).  Reject ".5", etc.
+                // (strtod(".5") = 0.5 — finite, so the overflow check misses it.)
+                llvm::Value* isSignF = builder_.CreateOr(
+                    builder_.CreateICmpEQ(fcF,
+                        llvm::ConstantInt::get(i8TyF, '+')),
+                    builder_.CreateICmpEQ(fcF,
+                        llvm::ConstantInt::get(i8TyF, '-')), "parse.isSignF");
+                // Detect "inf" / "INF" / "INF" spellings (case-insensitive).
+                llvm::Value* infMask = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'i')),
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'n')),
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'N'))),
+                    "parse.infMask");
+                llvm::Value* notDigitF = builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isSignF),
+                        builder_.CreateNot(infMask)),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
+                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
+                // stdlib §9.2 (v0.314, #5199/#5368): the grammar does not
+                // admit a hexadecimal float form ("0x1p3").  strtod accepts it
+                // (returns 8.0, finite).  Detect: first char is '0' and second
+                // char is 'x' or 'X' (after optional sign).
+                llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
+                    builder_.CreateGEP(i8TyF, data,
+                        builder_.getInt64(1), "parse.scptr"), "parse.sc");
+                llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
+                    fcF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
+                llvm::Value* isHexIndicatorF = builder_.CreateOr(
+                    builder_.CreateICmpEQ(secondCharF,
+                        llvm::ConstantInt::get(i8TyF, 'x')),
+                    builder_.CreateICmpEQ(secondCharF,
+                        llvm::ConstantInt::get(i8TyF, 'X')), "parse.hexF");
+                llvm::Value* isHexFloatF = builder_.CreateAnd(
+                    isLeadingZeroF, isHexIndicatorF, "parse.hfloatF");
+                // stdlib §9.2 (v0.314, #5199/#5368): strtod accepts "5." and
+                // "1e" (consumes "5" and "1", stops at '.' and 'e').  Check
+                // the last character strtod consumed: it must not be '.', 'e',
+                // 'E', '+', or '-'.
+                auto* i64t = llvm::Type::getInt64Ty(llvm_);
+                llvm::Value* consumedBytes = builder_.CreateSub(
+                    builder_.CreatePtrToInt(endPtrF, i64t),
+                    builder_.CreatePtrToInt(data, i64t), "parse.cb");
+                llvm::Value* lastCharOff = builder_.CreateSub(
+                    consumedBytes, builder_.getInt64(1), "parse.lco");
+                llvm::Value* lastCharPtr = builder_.CreateGEP(
+                    i8TyF, data, lastCharOff, "parse.lcp");
+                llvm::Value* lastChar = builder_.CreateLoad(i8TyF, lastCharPtr, "parse.lc");
+                llvm::Value* badLastChar = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(lastChar,
+                            llvm::ConstantInt::get(i8TyF, '.')),
+                        builder_.CreateICmpEQ(lastChar,
+                            llvm::ConstantInt::get(i8TyF, 'e'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(lastChar,
+                            llvm::ConstantInt::get(i8TyF, 'E')),
+                        builder_.CreateOr(
+                            builder_.CreateICmpEQ(lastChar,
+                                llvm::ConstantInt::get(i8TyF, '+')),
+                            builder_.CreateICmpEQ(lastChar,
+                                llvm::ConstantInt::get(i8TyF, '-')))),
+                    "parse.blc");
                 llvm::Value* validF = builder_.CreateAnd(
-                    builder_.CreateNot(fcWsF),
-                    builder_.CreateAnd(advF, atNulF), "parse.vfmtF");
+                    builder_.CreateAnd(
+                        builder_.CreateAnd(
+                            builder_.CreateAnd(
+                                builder_.CreateNot(fcWsF),
+                                builder_.CreateNot(notDigitF)),
+                            builder_.CreateAnd(advF, atNulF)),
+                        builder_.CreateNot(badLastChar)),
+                    builder_.CreateNot(isHexFloatF),
+                    "parse.vfmtF");
                 emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
                                "FormatException");
-                // stdlib §9.2 (v0.313, #5198): a finite spelling whose rounding
-                // is not finite raises OverflowException.
+                // stdlib §9.2 (v0.314, #5199/#5368): a finite spelling whose
+                // rounding is not finite raises OverflowException.
                 emitGuardThrow(emitFloatParseOverflow(data, dVal),
                                "OverflowException");
                 return dVal;
