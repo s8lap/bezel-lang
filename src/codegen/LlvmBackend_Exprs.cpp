@@ -7010,6 +7010,61 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     obj = tmp;
                 }
                 if (obj && obj->getType()->isPointerTy()) {
+                    // fix #5317 (§14.1 / §2.8.3 rule 4 / §23.1, v0.313): an
+                    // imported generic class's non-T sibling auto-property at a
+                    // layout-moving instantiation reads a wrong value through the
+                    // erased exported accessor (the exporter's $propget stub,
+                    // which GEPs the template layout with T as i32 placeholder).
+                    // The thunk path (makePropertyThunk, LlvmBackend_Layout.cpp)
+                    // uses classStruct with the §14.1 substitution installed and
+                    // is correct. Route the direct read through the same
+                    // per-instantiation lowering.
+                    if (ps->parent && !ps->parent->genericParams.empty()) {
+                        sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                        if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                            recvTy->declaration == ps->parent &&
+                            recvTy->genericArgs.size() ==
+                                ps->parent->genericParams.size()) {
+                            // Set up the §14.1 substitution so classStruct
+                            // produces the correct per-instantiation struct.
+                            std::unordered_map<std::string_view, llvm::Type*>
+                                newSubst;
+                            std::unordered_map<std::string_view,
+                                               const sema::TypeRef*>
+                                newSema;
+                            const std::vector<std::string_view>& gpNames =
+                                sema::genericParamNames(ps->parent);
+                            for (std::size_t gi = 0; gi < gpNames.size();
+                                 ++gi) {
+                                newSubst[gpNames[gi]] =
+                                    lowerTypeRef(recvTy->genericArgs[gi]);
+                                newSema[gpNames[gi]] =
+                                    resolveTypeParamRef(recvTy->genericArgs[gi]);
+                            }
+                            auto savedSubst = genericSubst_;
+                            auto savedSemaTy = genericSubstSemaTy_;
+                            genericSubst_ = std::move(newSubst);
+                            genericSubstSemaTy_ = std::move(newSema);
+                            auto idxIt = fieldIndex_.find(ps);
+                            if (idxIt != fieldIndex_.end()) {
+                                llvm::StructType* st =
+                                    classStruct(ps->parent);
+                                llvm::Type* fty =
+                                    st->getElementType(idxIt->second);
+                                llvm::Value* fieldAddr =
+                                    builder_.CreateStructGEP(st, obj,
+                                                            idxIt->second);
+                                llvm::Value* res =
+                                    builder_.CreateLoad(fty, fieldAddr);
+                                genericSubst_ = std::move(savedSubst);
+                                genericSubstSemaTy_ =
+                                    std::move(savedSemaTy);
+                                return res;
+                            }
+                            genericSubst_ = std::move(savedSubst);
+                            genericSubstSemaTy_ = std::move(savedSemaTy);
+                        }
+                    }
                     // fix #2816 / §28.3 (v0.240): establish the temporary's
                     // disposal at its production, so the imported getter's
                     // throw edge (emitPendingCheck below) unwinds through it.
