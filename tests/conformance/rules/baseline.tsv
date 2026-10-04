@@ -852,7 +852,7 @@ s22_3_0005	pass
 s22_3_0006	pass	
 s22_3_0007	fail	divergence
 s22_3_0008	pass	
-s22_3_0009	fail	divergence
+s22_3_0009	pass	
 s22_3_0012	pass	
 s22_3_0013	pass	
 s22_3_0014	pass	
@@ -1821,7 +1821,7 @@ l2_9_0003	pass
 l2_10_0001	pass	
 l2_10_0002	pass	
 l2_10_0003	pass	
-l2_10_0004	fail	divergence
+l2_10_0004	pass	
 l2_10_0005	pass	
 l2_11_0001	pass	
 l2_11_0002	pass	
