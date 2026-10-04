@@ -193,6 +193,59 @@ BEZEL_TEST(primary_ctor_param_not_promoted_4868,
     BEZEL_EXPECT_TRUE(sawCaptureRule);
 }
 
+// #5403 / §22.10 (v0.315): `this.p` in a PROPERTY INITIALIZER (not a
+// method body) must be rejected. The existing rejects_in_class_this_capture
+// test covers the method-body case; this row covers the property-initializer
+// case the issue title specifically names ("in a property initialiser context").
+// The fix is in resolveMemberAccess and covers all `this.p` access shapes
+// uniformly — both method body and property initializer go through the same
+// member-access resolution path.
+BEZEL_TEST(primary_ctor_param_not_promoted_4868,
+           rejects_this_p_in_property_initializer_spec_22_10) {
+    JitResult r = runAot(
+        "module M; "
+        "class Counter(start: int) "
+        "  public property Value: int := this.start; "
+        "end Counter; "
+        "class Program public static method Main() "
+        "  using var c := new Counter(5); "
+        "  Console.WriteLine(c.Value()); "
+        "end Main; end Program;");
+    // Must NOT run — the program is rejected at compile time.
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // Verify the specific diagnostic mentions the §22.10 capture rule.
+    bool sawCaptureRule = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("capture field") != std::string::npos &&
+            d.message.find("22.10") != std::string::npos) {
+            sawCaptureRule = true;
+        }
+    }
+    BEZEL_EXPECT_TRUE(sawCaptureRule);
+}
+
+// Control row: the same property spelled with the bare name (the capture
+// field is in scope in a property initializer, so `:= start` is legal).
+// This ensures the fix does NOT reject all property initializers in a
+// primary-constructor class — only the `this.p` qualified form.
+BEZEL_TEST(primary_ctor_param_not_promoted_4868,
+           accepts_bare_name_in_property_initializer_spec_22_10) {
+    JitResult r = runAot(
+        "module M; "
+        "class Counter(start: int) "
+        "  public property Value: int := start; "
+        "end Counter; "
+        "class Program public static method Main() "
+        "  using var c := new Counter(5); "
+        "  Console.WriteLine(c.Value()); "
+        "end Main; end Program;");
+    // Must compile and run successfully.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
 // #5403 / §22.10 (v0.315): control row — a class where a captured
 // primary-constructor parameter coexists with a same-named member parameter.
 // The bare name must resolve without error (whether to member param or
