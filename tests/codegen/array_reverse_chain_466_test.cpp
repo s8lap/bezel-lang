@@ -117,7 +117,7 @@ BEZEL_TEST(array_reverse_chain_466, direct_reverse_toarray_is_rejected_spec_26_5
         "  using var a := new Array<int>(); "
         "  a.Add(1); "
         "  using var rev: Array<int> := a.Reverse().ToArray(); "
-        "  return rev.Length; "
+        "  return rev.Count; "
         "end Main; end C;"));
 }
 
@@ -129,7 +129,7 @@ BEZEL_TEST(array_reverse_chain_466, direct_reverse_toarray_diagnostic_cites_26_5
         "  using var a := new Array<int>(); "
         "  a.Add(1); "
         "  using var rev: Array<int> := a.Reverse().ToArray(); "
-        "  return rev.Length; "
+        "  return rev.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(diagContains(src, "26.5"));
     BEZEL_EXPECT_TRUE(diagContains(src, "in place"));
@@ -142,7 +142,7 @@ BEZEL_TEST(array_reverse_chain_466, direct_reverse_toarray_single_rejected_spec_
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(42); "
         "  using var rev: Array<int> := a.Reverse().ToArray(); "
-        "  return rev.Length; "
+        "  return rev.Count; "
         "end Main; end C;"));
 }
 
@@ -152,7 +152,7 @@ BEZEL_TEST(array_reverse_chain_466, direct_reverse_toarray_empty_rejected_spec_2
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  using var rev: Array<int> := a.Reverse().ToArray(); "
-        "  return rev.Length; "
+        "  return rev.Count; "
         "end Main; end C;"));
 }
 
@@ -164,7 +164,7 @@ BEZEL_TEST(array_reverse_chain_466, direct_reverse_toarray_string_rejected_spec_
         "  using var a := new Array<string>(); "
         "  a.Add(\"x\"); a.Add(\"y\"); "
         "  using var rev: Array<string> := a.Reverse().ToArray(); "
-        "  return rev.Length; "
+        "  return rev.Count; "
         "end Main; end C;"));
 }
 
@@ -175,7 +175,7 @@ BEZEL_TEST(array_reverse_chain_466, direct_sort_toarray_is_rejected_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(3); a.Add(1); "
         "  using var s: Array<int> := a.Sort(lambda(x: int, y: int) => x - y).ToArray(); "
-        "  return s.Length; "
+        "  return s.Count; "
         "end Main; end C;"));
 }
 
@@ -200,23 +200,23 @@ BEZEL_TEST(array_reverse_chain_466, inplace_reverse_source_still_usable_spec_3) 
         "end Main; end C;", 162);
 }
 
-// §3: in-place Reverse on a single-element array is a no-op; Length is still 1.
+// §3: in-place Reverse on a single-element array is a no-op; Count is still 1.
 BEZEL_TEST(array_reverse_chain_466, inplace_reverse_single_element_spec_3) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(7); "
         "  a.Reverse(); "
-        "  return a.Length * 10 + a.Get(0); "  // 1*10 + 7 = 17
+        "  return a.Count * 10 + a.Get(0); "  // 1*10 + 7 = 17
         "end Main; end C;", 17);
 }
 
-// §3: in-place Reverse on an empty array is a no-op; Length stays 0.
+// §3: in-place Reverse on an empty array is a no-op; Count stays 0.
 BEZEL_TEST(array_reverse_chain_466, inplace_reverse_empty_spec_3) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Reverse(); "
-        "  return a.Length; "  // 0
+        "  return a.Count; "  // 0
         "end Main; end C;", 0);
 }
 
@@ -245,14 +245,14 @@ BEZEL_TEST(array_reverse_chain_466, chained_where_reverse_toarray_still_works_sp
 }
 
 // §5: single-element source through the lazy Reverse. Where(x>0) on [9] = [9];
-// Reverse = [9]; rev.Length*10 + rev.Get(0) = 1*10 + 9 = 19.
+// Reverse = [9]; rev.Count*10 + rev.Get(0) = 1*10 + 9 = 19.
 BEZEL_TEST(array_reverse_chain_466, chained_where_reverse_single_spec_5) {
     expectValueAndAsanClean(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(9); "
         "  using var rev: Array<int> := "
         "    a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
-        "  return rev.Length * 10 + rev.Get(0); "
+        "  return rev.Count * 10 + rev.Get(0); "
         "end Main; end C;", 19);
 }
 

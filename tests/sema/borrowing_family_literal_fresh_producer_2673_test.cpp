@@ -286,19 +286,19 @@ BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
 // =====================================================================
 
 // §15.4: "A fresh element of **trivial-dispose** class type (§28.9) is
-// admitted". A primitive element is the floor case of that. `Length` = 3.
+// admitted". A primitive element is the floor case of that. `Count` = 3.
 // per §15.4, §28.9 (#2673)
 BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
            trivial_dispose_int_elements_admitted_spec_15_4_28_9) {
-    expectAccepted("    var xs: Array<int> := [1, 2, 3]; return xs.Length; ", 3);
+    expectAccepted("    var xs: Array<int> := [1, 2, 3]; return xs.Count; ", 3);
 }
 
 // `string` is on §28.9's runtime-managed list by name ("`string` — pervasive").
-// `Length` = 2. // per §15.4, §28.9 (#2673)
+// `Count` = 2. // per §15.4, §28.9 (#2673)
 BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
            trivial_dispose_string_elements_admitted_spec_15_4_28_9) {
     expectAccepted(
-        "    var xs: Array<string> := [\"a\", \"b\"]; return xs.Length; ", 2);
+        "    var xs: Array<string> := [\"a\", \"b\"]; return xs.Count; ", 2);
 }
 
 // THE control that separates this fix from an over-broad one: `Box` is a
@@ -369,17 +369,17 @@ BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
     expectAccepted(
         "    var xs: Array<Conn> := []; "
         "    xs.Add(new Conn(4)); "
-        "    return xs.Length; ",
+        "    return xs.Count; ",
         1);
 }
 
 // §15.4's empty-literal carve-out: "the empty literal `[]` is admitted for
 // every collection target listed above". There is no element to classify, so
 // the new check must be a no-op — and must not, for instance, fault on the
-// empty `elements` vector. `Length` = 0. // per §15.4 (#2673)
+// empty `elements` vector. `Count` = 0. // per §15.4 (#2673)
 BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
            empty_borrowing_family_literal_admitted_spec_15_4) {
-    expectAccepted("    var xs: Array<Conn> := []; return xs.Length; ", 0);
+    expectAccepted("    var xs: Array<Conn> := []; return xs.Count; ", 0);
 }
 
 // §15.4's literal-tree paragraph relies on this shape staying legal: "in the
@@ -389,9 +389,9 @@ BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
 // therefore admitted — and it is the neighbour of the declined third
 // fresh-producer form (a nested literal at a NON-trivial-dispose collection
 // target), so pinning it here marks the boundary the follow-up must not cross
-// when it lands. Outer `Length` = 2. // per §15.4 (#2673)
+// when it lands. Outer `Count` = 2. // per §15.4 (#2673)
 BEZEL_TEST(sema_borrowing_family_literal_fresh_producer_2673,
            nested_trivial_dispose_literal_admitted_spec_15_4) {
     expectAccepted(
-        "    var g: Array<Array<int>> := [[1, 2], [3]]; return g.Length; ", 2);
+        "    var g: Array<Array<int>> := [[1, 2], [3]]; return g.Count; ", 2);
 }

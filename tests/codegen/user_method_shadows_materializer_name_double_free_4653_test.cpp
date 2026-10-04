@@ -146,7 +146,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "end Box; "
         "class C public static method Main(): int "
         "  using var b := new Box(); "
-        "  const n := b.ToArray().Length; "
+        "  const n := b.ToArray().Count; "
         "  return n; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 1);

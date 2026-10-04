@@ -244,7 +244,7 @@ BEZEL_TEST(string_fallback_positive_list_2933, stringbuilder_param_length_is_par
 BEZEL_TEST(string_fallback_positive_list_2933, array_param_length_is_array_len_spec_4_4) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C "
-        "  public static method Len(a: Array<int>): int return a.Length; end Len; "
+        "  public static method Len(a: Array<int>): int return a.Count; end Len; "
         "  public static method Main(): int "
         "    var arr: Array<int> := [1, 2, 3, 4, 5]; "
         "    return C.Len(arr); "

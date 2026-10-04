@@ -94,7 +94,7 @@ BEZEL_TEST(codegen_array_ienumerable_view_backing_reclaim_1871,
         "    var v: IEnumerable<int> := xs; "
         "    for var x in v do total := total + x; end; "
         "  end; "
-        "  return total + xs.Length; "         // 6 + 3 = 9
+        "  return total + xs.Count; "         // 6 + 3 = 9
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 9);
 }
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_array_ienumerable_view_backing_reclaim_1871,
 // §29.11 (#1871): TWO views of the same array, plus a trailing use. Each view
 // borrows the shared backing; the array reclaims it EXACTLY ONCE at scope end (a
 // double-free through either wrapper would corrupt the heap -> -999).
-// (10+20) + (10+20) + Length 2 = 62. Before the fix: the backing leaks (-999).
+// (10+20) + (10+20) + Count 2 = 62. Before the fix: the backing leaks (-999).
 BEZEL_TEST(codegen_array_ienumerable_view_backing_reclaim_1871,
            two_views_share_backing_reclaimed_once_spec_29_11) {
     std::string src =
@@ -114,7 +114,7 @@ BEZEL_TEST(codegen_array_ienumerable_view_backing_reclaim_1871,
         "  var total: int := 0; "
         "  for var a in v1 do total := total + a; end; "
         "  for var b in v2 do total := total + b; end; "
-        "  return total + xs.Length; "          // 30 + 30 + 2 = 62
+        "  return total + xs.Count; "          // 30 + 30 + 2 = 62
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 62);
 }

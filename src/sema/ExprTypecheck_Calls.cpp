@@ -23519,13 +23519,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // of built-in heap types that no path above types. Left untyped, the
         // read reaches `checkAssignable` with a null source and §5.1 is
         // skipped outright, so `var b: bool := a.Length;` compiled clean.
-        //   - `Length` on Array/Stack/Queue (and Owning twins): the
-        //     undocumented structural alias for `Count` that codegen lowers
-        //     through the same runtime length call (see the #2459 exemption
-        //     `isLengthAlias` below); typed exactly as `Count` above. ⚠ stdlib
-        //     §4.4 (and its Count-vs-Length note) gives these types `Count`
-        //     ONLY; whether the alias should exist at all is tracked by #4811.
-        //     It is typed here only so §5.1 is not skipped while it does.
+        //   - `Length` on Stack/Queue (and Owning twins): the structural
+        //     Count alias that codegen lowers through the same runtime length
+        //     call (see the #2459 exemption `isLengthAlias` below); typed
+        //     exactly as `Count` above.
         //   - `Length` on StringBuilder (stdlib §3.1), OwningBuffer<T>
         //     (stdlib §4.14) and FrozenArray<T> (stdlib §4.19; the
         //     annotation shape only — the `From(...)` result carries a
@@ -23533,6 +23530,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         //     lookup path instead); `Count` on SortedDictionary<K, V> (stdlib
         //     §4.17), SortedSet<T> (§4.18) and Channel<T> (§6.9) — each declared
         //     `readonly property … : int`.
+        //
+        // fix #4811 (§4.4, v0.315): `Array` and `OwningArray` have been
+        // REMOVED from `kBuiltinIntLengthPropertyHeads`. Per the Count-vs-Length
+        // convention (stdlib §4.4 p.74): "the resizable Array<T> says Count
+        // where .NET's fixed array says Length" — `Array<T>.Length` was an
+        // undocumented impl divergence that should never have been typed.
         // Bare reads and 0-arity calls only, mirroring the `Count` arm; a
         // call with arguments keeps its existing handling.
         //
@@ -23557,6 +23560,33 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (isIntProperty) {
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+                // fix #4811 (§4.4 p.74, v0.315): `Array<T>` and
+                // `OwningArray<T>` declare only `Count`, not `Length` (the
+                // Count-vs-Length convention: "the resizable Array<T> says Count
+                // where .NET's fixed array says Length"). When `Length` was typed
+                // as an alias for Count (before this fix), the expression was
+                // correctly typed but compiled. Now that Array/OwningArray have
+                // been removed from `kBuiltinIntLengthPropertyHeads`, the branch
+                // above does NOT type the expression. However, codegen
+                // (LlvmBackend_Exprs.cpp:~5176) has a direct lowering for
+                // `Array.Length` and `Array.Count` that bypasses sema typing
+                // entirely. To properly reject `Array.Length`, we must emit the
+                // "no member" diagnostic here so the expression is rejected
+                // before it reaches codegen's lowering.
+                if (ma.member == "Length" && cn == "Array") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "no member `Length` on `Array<T>`: use `Count` "
+                        "(stdlib \\S4.4)");
+                    return;
+                }
+                if (ma.member == "Length" && cn == "OwningArray") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "no member `Length` on `OwningArray<T>`: use `Count` "
+                        "(stdlib \\S4.5)");
                     return;
                 }
             }

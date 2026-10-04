@@ -283,7 +283,7 @@ BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
 BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
            array_array_int_literal_admitted_spec_15_4) {
     expectAccepted(
-        "    var g: Array<Array<int>> := [[1, 2], [3, 4]]; return g.Length; ",
+        "    var g: Array<Array<int>> := [[1, 2], [3, 4]]; return g.Count; ",
         2);
 }
 
@@ -295,13 +295,13 @@ BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
 // literal node" admission therefore carries the inner `[new Box(1)]`
 // aggregate under the OUTER `OwningArray<Box>` slot — exactly as a
 // trivial-dispose fresh element does (#2673's `trivial_dispose_class
-// _fresh_element_admitted_spec_15_4_28_9` row). Outer `Length` = 2.
+// _fresh_element_admitted_spec_15_4_28_9` row). Outer `Count` = 2.
 // per §15.4, §28.9 (#3307)
 BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
            array_owning_array_box_literal_admitted_spec_15_4) {
     expectAccepted(
         "    var g: Array<OwningArray<Box>> := [[new Box(1)], [new Box(2)]]; "
-        "    return g.Length; ",
+        "    return g.Count; ",
         2);
 }
 
@@ -313,7 +313,7 @@ BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
 BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
            empty_array_owning_array_admitted_spec_15_4) {
     expectAccepted(
-        "    var xs: Array<OwningArray<Conn>> := []; return xs.Length; ", 0);
+        "    var xs: Array<OwningArray<Conn>> := []; return xs.Count; ", 0);
 }
 
 // The borrowed element — the remedy's first half, executed. The element

@@ -132,7 +132,7 @@ BEZEL_TEST(array_reversed_sorted_472, reversed_single_element_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(7); "
         "  using var rev := a.Reversed(); "
-        "  return rev.Length * 10 + rev.Get(0); "  // 1*10+7=17
+        "  return rev.Count * 10 + rev.Get(0); "  // 1*10+7=17
         "end Main; end C;", 17);
 }
 
@@ -142,7 +142,7 @@ BEZEL_TEST(array_reversed_sorted_472, reversed_empty_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  using var rev := a.Reversed(); "
-        "  return rev.Length; "  // 0
+        "  return rev.Count; "  // 0
         "end Main; end C;", 0);
 }
 
@@ -166,7 +166,7 @@ BEZEL_TEST(array_reversed_sorted_472, reversed_string_copy_length_spec_3) {
         "  using var a := new Array<string>(); "
         "  a.Add(\"alpha\"); a.Add(\"beta\"); a.Add(\"gamma\"); "
         "  using var rev := a.Reversed(); "
-        "  return rev.Length; "  // 3
+        "  return rev.Count; "  // 3
         "end Main; end C;", 3);
 }
 
@@ -215,7 +215,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_single_element_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(42); "
         "  using var s := a.Sorted(lambda(x: int, y: int) => x - y); "
-        "  return s.Length * 100 + s.Get(0); "  // 1*100+42=142
+        "  return s.Count * 100 + s.Get(0); "  // 1*100+42=142
         "end Main; end C;", 142);
 }
 
@@ -226,7 +226,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_comparer_chained_length_spec_3) {
         "  using var a := new Array<int>(); "
         "  a.Add(9); a.Add(1); a.Add(5); "
         "  using var s := a.Sorted(lambda(x: int, y: int) => x - y); "
-        "  return s.Length; "  // 3
+        "  return s.Count; "  // 3
         "end Main; end C;"), 3);
 }
 
@@ -263,7 +263,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_empty_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  using var s := a.Sorted(); "
-        "  return s.Length; "  // 0
+        "  return s.Count; "  // 0
         "end Main; end C;", 0);
 }
 
@@ -273,7 +273,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_single_element_spec_3) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); a.Add(7); "
         "  using var s := a.Sorted(); "
-        "  return s.Length * 10 + s.Get(0); "  // 1*10+7=17
+        "  return s.Count * 10 + s.Get(0); "  // 1*10+7=17
         "end Main; end C;", 17);
 }
 
@@ -286,7 +286,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_non_comparable_rejected_spec_
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  using var s := a.Sorted(); "  // Point is not IComparable<Point>
-        "  return s.Length; "
+        "  return s.Count; "
         "end Main; end C;"));
 }
 
@@ -298,7 +298,7 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_non_comparable_diag_spec_3) {
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  using var s := a.Sorted(); "
-        "  return s.Length; "
+        "  return s.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(diagContains(src, "IComparable"));
     BEZEL_EXPECT_TRUE(diagContains(src, "comparer"));
@@ -359,7 +359,7 @@ BEZEL_TEST(array_reversed_sorted_472, ownedarray_reversed_rejected_spec_3) {
         "  using var a := new OwningArray<int>(); "
         "  a.Add(1); a.Add(2); "
         "  using var rev := a.Reversed(); "  // OwningArray has no Reversed()
-        "  return rev.Length; "
+        "  return rev.Count; "
         "end Main; end C;"));
 }
 
@@ -370,7 +370,7 @@ BEZEL_TEST(array_reversed_sorted_472, ownedarray_sorted_rejected_spec_3) {
         "  using var a := new OwningArray<int>(); "
         "  a.Add(3); a.Add(1); "
         "  using var s := a.Sorted(); "  // OwningArray has no Sorted()
-        "  return s.Length; "
+        "  return s.Count; "
         "end Main; end C;"));
 }
 
@@ -499,6 +499,6 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_non_icomparable_class_rejecte
         "class C public static method Main(): int "
         "  using var a := new Array<Widget>(); "
         "  using var s := a.Sorted(); "  // Widget does not implement IComparable
-        "  return s.Length; "
+        "  return s.Count; "
         "end Main; end C;"));
 }
