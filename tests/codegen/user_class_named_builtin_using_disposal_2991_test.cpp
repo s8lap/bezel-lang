@@ -231,7 +231,7 @@ BEZEL_TEST(user_class_named_builtin_using_disposal_2991,
                           "using var s := new Stopwatch();",
                           "using var s := new Mutex();",
                           "using var s := new Semaphore(2);",
-                          "using var s := new Buffer<int>(4);",
+                          "using var s := new __Buffer<int>(4);",
                           "using var s := new CancellationTokenSource();",
                           "using var s := new TaskCompletionSource<int>();",
                           // the ANNOTATED spelling — a different probe
