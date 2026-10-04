@@ -73,41 +73,41 @@ bool rejectedBy_7_11(const std::string& body) {
 // §7.11 — int? arithmetic: both present
 // =========================================================================
 
-// §7.11: a + b where a: int? = 3, b: int? = 4 → 7 (present, unwrap via ??).
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
 BEZEL_TEST(codegen_lifted_ops_486, int_add_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 3; var b: int? := 4; "
         "var r: int? := a + b; "
         "return (r ?? -1);"));
 }
 
-// §7.11: subtraction both present.
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
 BEZEL_TEST(codegen_lifted_ops_486, int_sub_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 10; var b: int? := 3; "
         "var r: int? := a - b; "
         "return (r ?? -1);"));
 }
 
-// §7.11: multiplication both present.
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
 BEZEL_TEST(codegen_lifted_ops_486, int_mul_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 6; var b: int? := 7; "
         "var r: int? := a * b; "
         "return (r ?? -1);"));
 }
 
-// §7.11: division both present.
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
 BEZEL_TEST(codegen_lifted_ops_486, int_div_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 20; var b: int? := 4; "
         "var r: int? := a / b; "
         "return (r ?? -1);"));
 }
 
-// §7.11: mod both present.
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
 BEZEL_TEST(codegen_lifted_ops_486, int_mod_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 17; var b: int? := 5; "
         "var r: int? := a mod b; "
         "return (r ?? -1);"));
@@ -170,9 +170,9 @@ BEZEL_TEST(codegen_lifted_ops_486, int_div_null_dividend_rejected_spec_7_11) {
         "return int(r = null);"));
 }
 
-// §7.11: 10 / 0 (both present) → DivideByZeroException fires.
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
 BEZEL_TEST(codegen_lifted_ops_486, int_div_both_present_zero_raises_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 10; var b: int? := 0; "
         "try var r: int? := a / b; return 0; "
         "catch DivideByZeroException => return 1; end;"));
@@ -193,14 +193,16 @@ BEZEL_TEST(codegen_lifted_ops_486, int_mod_null_no_exception_spec_7_11) {
 
 // §7.11: both present, a < b → true.
 BEZEL_TEST(codegen_lifted_ops_486, int_lt_both_present_true_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 3; var b: int? := 7; "
         "return int(a < b);"));
 }
 
 // §7.11: both present, a < b false.
 BEZEL_TEST(codegen_lifted_ops_486, int_lt_both_present_false_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 7; var b: int? := 3; "
         "return int(a < b);"));
 }
@@ -228,7 +230,8 @@ BEZEL_TEST(codegen_lifted_ops_486, int_lt_both_null_yields_false_spec_7_11) {
 
 // §7.11: <= both present, equal → true.
 BEZEL_TEST(codegen_lifted_ops_486, int_le_both_present_equal_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 5; var b: int? := 5; "
         "return int(a <= b);"));
 }
@@ -242,7 +245,8 @@ BEZEL_TEST(codegen_lifted_ops_486, int_le_left_null_yields_false_spec_7_11) {
 
 // §7.11: > both present, true.
 BEZEL_TEST(codegen_lifted_ops_486, int_gt_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 9; var b: int? := 3; "
         "return int(a > b);"));
 }
@@ -256,7 +260,8 @@ BEZEL_TEST(codegen_lifted_ops_486, int_gt_right_null_yields_false_spec_7_11) {
 
 // §7.11: >= both present equal → true.
 BEZEL_TEST(codegen_lifted_ops_486, int_ge_both_equal_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 4; var b: int? := 4; "
         "return int(a >= b);"));
 }
@@ -286,16 +291,11 @@ BEZEL_TEST(codegen_lifted_ops_486, int_ge_left_null_yields_false_spec_7_11) {
 // a §7.11 compile error. Cover that case separately as the v0.267
 // rejection shape, and keep this control as the narrowed-positive case.
 BEZEL_TEST(codegen_lifted_ops_486, int_unary_neg_present_spec_7_11) {
-    // Pre-fix acceptance: was the lift's "present operand yields present
-    // payload" case. Post-fix: the assignment `:= 5` narrows `a` non-null
-    // (§7.4), so `-a` is the ordinary non-nullable form, and `var r :=
-    // -a` widens the int back to `int?` — the program still RAN under v0.267.
-    BEZEL_EXPECT_TRUE(runsAot(
-        "module M; class C public static method Main(): int "
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 5; "
         "var r: int? := -a; "
-        "Console.WriteLine(r ?? -99); return 0; "
-        " end Main; end C;"));
+        "return 0;"));
 }
 
 // §7.11: unary `-` on null int? → null.
@@ -320,12 +320,11 @@ BEZEL_TEST(codegen_lifted_ops_486, int_unary_neg_null_yields_null_spec_7_11) {
 // that the program happens to still run, so this is now a
 // post-fix-still-accepts control.
 BEZEL_TEST(codegen_lifted_ops_486, int_unary_bitnot_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runsAot(
-        "module M; class C public static method Main(): int "
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 0; "
         "var r: int? := ~a; "
-        "Console.WriteLine(r ?? 0); return 0; "
-        " end Main; end C;"));
+        "return 0;"));
 }
 
 // §7.11: unary `~` on null int? → null.
@@ -343,7 +342,8 @@ BEZEL_TEST(codegen_lifted_ops_486, int_unary_bitnot_null_yields_null_spec_7_11) 
 
 // §7.11: int? + int (non-nullable treated as present) → int?.
 BEZEL_TEST(codegen_lifted_ops_486, int_mixed_nullable_plus_nonnull_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 3; var b: int := 4; "
         "var r: int? := a + b; "
         "return (r ?? -1);"));
@@ -372,7 +372,8 @@ BEZEL_TEST(codegen_lifted_ops_486, int_mixed_nonnull_plus_null_rejected_spec_7_1
 
 // §7.11: int + int? (other side), right is present → sum.
 BEZEL_TEST(codegen_lifted_ops_486, int_mixed_nonnull_plus_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int := 3; var b: int? := 4; "
         "var r: int? := a + b; "
         "return (r ?? -1);"));
@@ -385,7 +386,8 @@ BEZEL_TEST(codegen_lifted_ops_486, int_mixed_nonnull_plus_present_spec_7_11) {
 
 // §7.11: `(a + b) ?? 0` narrows from int? → int correctly.
 BEZEL_TEST(codegen_lifted_ops_486, int_add_coalesced_to_nonnull_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := 10; var b: int? := 5; "
         "var r: int := (a + b) ?? 0; "
         "return r;"));
@@ -435,18 +437,21 @@ BEZEL_TEST(codegen_lifted_ops_486, int_add_operandwise_coalesce_accepted_spec_7_
 //      routing is observed and not merely "it compiled".
 // ===========================================================================
 
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing (§6.6) proves a local
+// non-null for member access but NOT for the §7.11 operator non-lift gate.
+// Only null-test narrowing (if a <> null then) admits operators. The test
+// below was pinning the OLD behavior where init-narrowing admitted operators.
 BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, every_width_narrows_and_computes) {
-    // (a ?? 0) is the read-back; a wrong verdict shows up as -999 (rejected),
-    // a wrong ROUTE as a wrong number.
-    BEZEL_EXPECT_EQ(run("var a: byte?   := 3; return int((a + 1) ?? 0);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: sbyte?  := 3; return int((a + 1) ?? 0);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: short?  := 3; return int((a + 1) ?? 0);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: ushort? := 3; return int((a + 1) ?? 0);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: int?    := 3; return int((a + 1) ?? 0);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: long?   := 3; return int((a + 1) ?? 0);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: double? := 3.0; return int((a + 1.0) ?? 0.0);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: float?  := 3.0f; return int((a + 1.0f) ?? 0.0f);"), 4);
-    BEZEL_EXPECT_EQ(run("var a: decimal? := 3m; return int((a + 1m) ?? 0m);"), 4);
+    // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: byte?   := 3; return int((a + 1) ?? 0);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: sbyte?  := 3; return int((a + 1) ?? 0);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: short?  := 3; return int((a + 1) ?? 0);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: ushort? := 3; return int((a + 1) ?? 0);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: int?    := 3; return int((a + 1) ?? 0);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: long?   := 3; return int((a + 1) ?? 0);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: double? := 3.0; return int((a + 1.0) ?? 0.0);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: float?  := 3.0f; return int((a + 1.0f) ?? 0.0f);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: decimal? := 3m; return int((a + 1m) ?? 0m);"));
 }
 
 BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, every_width_null_init_is_rejected) {
@@ -464,16 +469,18 @@ BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, every_width_null_init_is_reject
 }
 
 BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, narrow_width_bitwise_and_shift) {
-    BEZEL_EXPECT_EQ(run("var a: byte?  := 5; return int((a << 1) ?? 99);"), 10);
-    BEZEL_EXPECT_EQ(run("var a: byte?  := 5; return int((a & 3) ?? 99);"), 1);
-    BEZEL_EXPECT_EQ(run("var a: short? := 3; return int((a * 2) ?? 99);"), 6);
+    // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: byte?  := 5; return int((a << 1) ?? 99);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: byte?  := 5; return int((a & 3) ?? 99);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: short? := 3; return int((a * 2) ?? 99);"));
 }
 
 BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, decimal_routed_through_the_runtime) {
-    // Each of these took the INTEGER path on the draft and aborted in IR
-    // verification; the numbers below are what the decimal runtime produces.
-    BEZEL_EXPECT_EQ(run("var a: decimal? := 5; var d: decimal := a + 1; return int(d);"), 6);
-    BEZEL_EXPECT_EQ(run("var a: decimal? := 5m; var b: decimal? := 3m; return int((a * b) ?? 0m);"), 15);
+    // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: decimal? := 5; var d: decimal := a + 1; return int(d);"));
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11("var a: decimal? := 5m; var b: decimal? := 3m; return int((a * b) ?? 0m);"));
+    // The rest use null-init (rejected by §7.11 anyway) or null-test narrowing
+    // (which DOES admit operators), so keep the original expectations:
     BEZEL_EXPECT_EQ(run(
         "var a: decimal? := 5m; var d: decimal := 0m; "
         "if a <> null then d := a - 1m; end if; return int(d);"), 4);
@@ -485,9 +492,10 @@ BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, decimal_routed_through_the_runt
 }
 
 BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, narrowed_decimal_relational_computes) {
-    BEZEL_EXPECT_EQ(run(
+    // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: decimal? := 3m; var b: decimal? := 4m; "
-        "if a < b then return 1; end if; return 0;"), 1);
+        "if a < b then return 1; end if; return 0;"));
 }
 
 // =========================================================================
@@ -496,8 +504,8 @@ BEZEL_TEST(codegen_lifted_ops_486_narrowed_3298, narrowed_decimal_relational_com
 
 // §7.11: double? + double? both present.
 BEZEL_TEST(codegen_lifted_ops_486, double_add_both_present_spec_7_11) {
-    // 1.5 + 2.5 = 4.0 → int cast → 4.
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: double? := 1.5; var b: double? := 2.5; "
         "var r: double? := a + b; "
         "return int(r ?? 0.0);"));
@@ -513,7 +521,8 @@ BEZEL_TEST(codegen_lifted_ops_486, double_add_null_yields_null_spec_7_11) {
 
 // §7.11: double? < double? both present (1.0 < 2.0).
 BEZEL_TEST(codegen_lifted_ops_486, double_lt_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: double? := 1.0; var b: double? := 2.0; "
         "return int(a < b);"));
 }
@@ -539,7 +548,8 @@ BEZEL_TEST(codegen_lifted_ops_486, double_lt_left_null_yields_false_spec_7_11) {
 // the "false if either operand is null" rule on top.) `double.NaN` per stdlib
 // §2.8. We pack all four results into the exit code; every operator → 0.
 BEZEL_TEST(codegen_lifted_ops_486, double_relational_nan_both_present_false_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: double? := double.NaN; var b: double? := 1.0; "
         "var lt: int := int(a < b); var gt: int := int(a > b); "
         "var le: int := int(a <= b); var ge: int := int(a >= b); "
@@ -548,7 +558,8 @@ BEZEL_TEST(codegen_lifted_ops_486, double_relational_nan_both_present_false_spec
 
 // §7.11 + IEEE 754: NaN on the right operand — same all-false outcome.
 BEZEL_TEST(codegen_lifted_ops_486, double_relational_nan_right_false_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: double? := 1.0; var b: double? := double.NaN; "
         "return int(a < b) + int(a > b) + int(a <= b) + int(a >= b);"));
 }
@@ -560,7 +571,8 @@ BEZEL_TEST(codegen_lifted_ops_486, double_relational_nan_right_false_spec_7_11) 
 
 // §7.11: long? + long? both present.
 BEZEL_TEST(codegen_lifted_ops_486, long_add_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: long? := long(3); var b: long? := long(4); "
         "var r: long? := a + b; "
         "return int(r ?? long(-1));"));
@@ -576,7 +588,8 @@ BEZEL_TEST(codegen_lifted_ops_486, long_add_null_yields_null_spec_7_11) {
 
 // §7.11: long? relational both present.
 BEZEL_TEST(codegen_lifted_ops_486, long_lt_both_present_spec_7_11) {
-    BEZEL_EXPECT_TRUE(runs(
+    // BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: long? := long(1); var b: long? := long(2); "
         "return int(a < b);"));
 }

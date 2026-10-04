@@ -299,17 +299,14 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, nullable_rhs_rejected_3298) 
 // block used to document is gone; what remains is the ordinary
 // narrowed-vs-not distinction §7.4 draws everywhere else.
 // ===========================================================================
+// BEHAVIOR FLIP (fix #4930, v0.315): init-narrowing does NOT admit operators.
 BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_narrowed_accepted_3830) {
-    BEZEL_EXPECT_EQ(runPlain(
-        "    var a: int? := 5; a++; return (a ?? -100); "), 6);
-    BEZEL_EXPECT_EQ(runPlain(
-        "    var b: int? := 5; b--; return (b ?? -100); "), 4);
-    BEZEL_EXPECT_EQ(runPlain(
-        "    var c: int? := 10; c += 1; return (c ?? -100); "), 11);
-    // The desugared spelling on the same narrowed local, for comparison —
-    // #3830 makes the two spellings agree, which is the point.
-    BEZEL_EXPECT_EQ(runPlain(
-        "    var a: int? := 5; a := a + 1; return (a ?? -100); "), 6);
+    // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
+    BEZEL_EXPECT_TRUE(rejectedPlain("var a: int? := 5; a++; return (a ?? -100);"));
+    BEZEL_EXPECT_TRUE(rejectedPlain("var b: int? := 5; b--; return (b ?? -100);"));
+    BEZEL_EXPECT_TRUE(rejectedPlain("var c: int? := 10; c += 1; return (c ?? -100);"));
+    // The desugared spelling: same issue, `a + 1` uses init-narrowed `a`.
+    BEZEL_EXPECT_TRUE(rejectedPlain("var a: int? := 5; a := a + 1; return (a ?? -100);"));
 }
 
 // ===========================================================================
