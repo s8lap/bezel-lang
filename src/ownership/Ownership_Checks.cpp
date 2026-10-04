@@ -6339,6 +6339,12 @@ void MethodOwnership::checkRefOutLambdaCaptureOnStore(
             // Bare unqualified field name (implicit `this._field` form, #1082).
             dest = Dest::Field;
             destName = id->name;
+        } else if (dynamic_cast<sema::PropertySymbol*>(sym)) {
+            // Bare auto-property identifier: a property store is a §28.3 store
+            // per the v0.314 ruling on #5303. Store of a capture-bearing
+            // function value to a property is rejected.
+            dest = Dest::Field;
+            destName = id->name;
         } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (ps->modifier == "out" || ps->modifier == "ref" ||
                 ps->modifier == "out owned") {
@@ -6349,7 +6355,28 @@ void MethodOwnership::checkRefOutLambdaCaptureOnStore(
             }
         }
     }
-    if (dest == Dest::None) return;
+    if (dest == Dest::None) {
+        // Sink: store of lambda through a local indexer (the set accessor may
+        // capture the lambda into escaping storage — per #5396 / #5303,
+        // §28.3, v0.314). The MemberAccessExpr arm above handles
+        // `obj.Prop := …`; the bare-IdentifierExpr arm above handles
+        // `Prop := …` (field, property, out-param). This arm handles
+        // `Items[i] := …` for a local indexer variable.
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get())) {
+            if (ix->target) {
+                const auto* base = dynamic_cast<const ast::IdentifierExpr*>(
+                    ix->target.get());
+                if (base) {
+                    sema::Symbol* sym = ctx_.exprSymbol(*base);
+                    if (sym && !dynamic_cast<sema::FieldSymbol*>(sym)) {
+                        dest = Dest::Field;
+                        destName = base->name;
+                    }
+                }
+            }
+        }
+        if (dest == Dest::None) return;
+    }
 
     // Find lambdas in the RHS.
     std::vector<const ast::LambdaExpr*> lambdas;
@@ -22029,15 +22056,18 @@ void MethodOwnership::callBoundedWalkStmt(const ast::Stmt& s) {
         // `+=` form is the stdlib-certified Add path — §24, v0.177.)
         if (src && as->target) {
             // Sink: store into a FIELD of any object (qualified, bare, or
-            // another object's). A `scoped`-field target is reported by the
-            // scoped machinery with the assignment-specific message — skip
-            // the duplicate here.
+            // another object's) or a PROPERTY (bare auto-property identifier,
+            // per #5396 / #5303, §28.3, v0.314). A `scoped`-field target is
+            // reported by the scoped machinery with the assignment-specific
+            // message — skip the duplicate here.
             const bool fieldTarget =
                 dynamic_cast<const ast::MemberAccessExpr*>(as->target.get()) !=
                     nullptr ||
                 (dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
-                 dynamic_cast<sema::FieldSymbol*>(
-                     ctx_.exprSymbol(*as->target)));
+                 (dynamic_cast<sema::FieldSymbol*>(
+                      ctx_.exprSymbol(*as->target)) != nullptr ||
+                  dynamic_cast<sema::PropertySymbol*>(
+                      ctx_.exprSymbol(*as->target)) != nullptr));
             if (fieldTarget) {
                 if (scopedUseKind(*as->target) != 2)
                     reportCallBounded(as->span.begin, src->name,
@@ -22074,6 +22104,26 @@ void MethodOwnership::callBoundedWalkStmt(const ast::Stmt& s) {
                         as->span.begin, src->name,
                         "stored into a collection reachable beyond the call");
                     return;
+                }
+                // Sink: store of call-bounded source through a LOCAL indexer
+                // (the set accessor may capture the value — per #5396 / #5303,
+                // §28.3, v0.314). The existing arm above handles param/field/
+                // borrow targets; this arm handles the local-indexer case where
+                // exprReachableBeyondCall returns false.
+                if (ix->target) {
+                    const auto* base = dynamic_cast<const ast::IdentifierExpr*>(
+                        ix->target.get());
+                    if (base) {
+                        sema::Symbol* sym = ctx_.exprSymbol(*base);
+                        if (sym && !dynamic_cast<sema::FieldSymbol*>(sym)) {
+                            // Local or parameter indexer: the set accessor
+                            // may capture the source into escaping storage.
+                            reportCallBounded(
+                                as->span.begin, src->name,
+                                "stored through a local indexer");
+                            return;
+                        }
+                    }
                 }
             }
         }
