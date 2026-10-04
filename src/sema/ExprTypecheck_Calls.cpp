@@ -4703,6 +4703,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 report(std::string(bound->headName()));
                                 continue;
                             }
+                            // §9.7 (v0.307): records and enums can never implement
+                            // IDisposable/IAsyncDisposable — which only classes
+                            // implement. These builtin interfaces resolve to a Named
+                            // TypeRef WITHOUT a synthesized declaration, so without
+                            // this they fall through the type-parameter-bound branch
+                            // below (which defers on builtin interfaces), then to
+                            // the decl-null defer below, silently accepting the
+                            // invalid instantiation.
+                            if (argRef->kind == TypeRef::Kind::Named &&
+                                argDecl &&
+                                (argDecl->kind == ast::TypeDeclKind::Record ||
+                                 argDecl->kind == ast::TypeDeclKind::Enum) &&
+                                bound && !bound->declaration &&
+                                primitiveNeverConformsToBuiltinIface(
+                                    bound->headName())) {
+                                report(std::string(bound->headName()));
+                                continue;
+                            }
                             // §14.2 type-parameter bound (`where T: U`):
                             // the bound is another type parameter of this
                             // method, so it carries no declaration of its

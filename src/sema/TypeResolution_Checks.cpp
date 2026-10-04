@@ -10906,6 +10906,21 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
             report(std::string(bound->headName()));
             return;
         }
+        // §9.7 (v0.307): records and enums can never implement
+        // IDisposable/IAsyncDisposable — which only classes implement. These
+        // auto-imported builtin interfaces resolve to a Named TypeRef WITHOUT a
+        // synthesized declaration, so without this they would fall through the
+        // decl-null defer below. Mirrors the primitive check at lines 10903-10908
+        // and the call-site check in ExprTypecheck_Calls.cpp.
+        if (arg->kind == TypeRef::Kind::Named &&
+            arg->declaration &&
+            (arg->declaration->kind == ast::TypeDeclKind::Record ||
+             arg->declaration->kind == ast::TypeDeclKind::Enum) &&
+            bound->kind == TypeRef::Kind::Named && !bound->declaration &&
+            primitiveNeverConformsToBuiltinIface(bound->headName())) {
+            report(std::string(bound->headName()));
+            return;
+        }
         // We can only verify a type-bound when both sides are user-declared
         // named types (BFS over baseTypes). Built-in bounds/args carry no
         // base-type chain here; defer to avoid false positives.
