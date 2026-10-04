@@ -10578,6 +10578,31 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                              primCastCalleeId->name,
                                              nc->span.begin);
         }
+        // fix #5344 (§5.3, v0.314): `T?(x)` is admitted exactly when the
+        // corresponding non-nullable conversion `T(v)` is admitted. Since
+        // `bool(decimal)` / `bool(float)` / `bool(double)` / `bool(char)` is
+        // not admitted (§5.2: truthiness-shaped, partial), `bool?(decimal?)` /
+        // `bool?(float?)` / `bool?(double?)` / `bool?(char?)` is not admitted
+        // either.
+        if (typedAsPrimCast && primCastTarget == PrimitiveType::Bool &&
+            nc->args.size() == 1 && nc->args[0].value) {
+            const TypeRef* argTy = ctx_.exprType(*nc->args[0].value);
+            if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
+                argTy->nullable) {
+                PrimitiveType srcPt = argTy->primitive;
+                if (srcPt == PrimitiveType::Char ||
+                    srcPt == PrimitiveType::Float ||
+                    srcPt == PrimitiveType::Double ||
+                    srcPt == PrimitiveType::Decimal) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nc->span.begin,
+                        "conversion between a numeric type and `bool` "
+                        "is not permitted (§5.1/§5.2, §5.3 nullable "
+                        "operand)");
+                    return;
+                }
+            }
+        }
         if (!typedAsPrimCast) {
             // §27.7 (#738): `f?(args)` invokes the nullable function value `f`
             // when non-null, else is a no-op; the result is the function's
