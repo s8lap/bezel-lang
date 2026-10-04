@@ -254,10 +254,11 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "x"));
 }
 
+// fix #5390 (§2.3, v0.314): renamed to internal-only `__Buffer<T>`.
 BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
            buffer_int_factory_call_no_vacuous_spec_28_9_28_10) {
-    auto r = parseAndCheckOwnership(factoryProg("Buffer<int>",
-                                                "new Buffer<int>(4)"));
+    auto r = parseAndCheckOwnership(factoryProg("__Buffer<int>",
+                                                "new __Buffer<int>(4)"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
     BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "x"));
@@ -300,7 +301,8 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
         "SortedSet<int>",
         "Dictionary<string, int>", "SortedDictionary<string, int>",
         "LinkedList<int>",
-        "Buffer<int>",
+        // fix #5390 (§2.3, v0.314): `Buffer<T>` renamed to `__Buffer<T>`.
+        "__Buffer<int>",
     };
     for (const char* ty : cases) {
         auto alias = parseAndCheckOwnership(prog(

@@ -10678,13 +10678,13 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         return nullptr;
                     }
                 }
-                // issue #545: Buffer<T>.Dispose() — free via bz_buffer_free.
+                // issue #545: __Buffer<T>.Dispose() — free via bz_buffer_free.
                 // bz_buffer_free is null-safe (no-op on null); value elements carry
                 // no ownership obligation so no per-element callback is needed.
                 {
                     auto* recvTy = ctx_.exprType(*ma->target);
                     if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
-                        builtinTypeName(recvTy) == "Buffer") {
+                        builtinTypeName(recvTy) == "__Buffer") {
                         llvm::Value* buf = lowerExpr(*ma->target);
                         if (buf && buf->getType()->isPointerTy()) {
                             auto* fn = declareC("bz_buffer_free",

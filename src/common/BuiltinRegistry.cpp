@@ -316,9 +316,9 @@ constexpr std::array<std::string_view, 73> kHeapPointerReferenceBuiltins = {
     "EventSource", "AsyncEventSource", "SharedEventSource",
     // §6.2/§6.3 sync primitives
     "Mutex", "Lock", "Semaphore", "SemaphoreToken",
-    // §6.6 task-completion sources; §6.4 atomics; #545 Buffer
+    // §6.6 task-completion sources; §6.4 atomics; #545 __Buffer
     "TaskCompletionSource", "OwningTaskCompletionSource",
-    "Atomic", "AtomicInteger", "Buffer",
+    "Atomic", "AtomicInteger", "__Buffer",
     // §2.14–2.15 serialization vocabulary + concrete handles (#1390)
     "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
     "BinarySerializer", "BinaryDeserializer", "JsonSerializer",
@@ -1185,7 +1185,7 @@ bool isDisposableBuiltinHeadName(std::string_view head) {
 constexpr std::array<std::string_view, 14> kChainClaimedBuiltinHeadNames = {
     "Array", "Stack", "Queue", "Set", "SortedSet",
     "Dictionary", "SortedDictionary", "LinkedList",
-    "Random", "Atomic", "AtomicInteger", "Stopwatch", "Buffer",
+    "Random", "Atomic", "AtomicInteger", "Stopwatch", "__Buffer",
     "StringBuilder",
 };
 

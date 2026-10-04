@@ -807,8 +807,16 @@ std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
         // mis-identify the builtin. aliasResolvedHead carries the underlying head.
         if (!rt->aliasResolvedHead.empty()) return rt->aliasResolvedHead;
         if (rt->astNode && rt->astNode->name &&
-            !rt->astNode->name->parts.empty())
-            return rt->headName();
+            !rt->astNode->name->parts.empty()) {
+            std::string_view head = rt->headName();
+            // fix #5390 (§2.3, v0.314): the Buffer intrinsic was renamed to
+            // __Buffer (internal-only spelling). Map the old source-level name
+            // to the canonical internal name so codegen checks for __Buffer
+            // accept both "Buffer" (existing source using the old builtin name)
+            // and "__Buffer" (new internal spelling).
+            if (head == "Buffer") return "__Buffer";
+            return head;
+        }
         // #662 foundation B: for IMPORTED fields the TypeRef has no astNode;
         // the loader stores the raw type name in importedName when lookupNamed
         // returns null (see ModuleLoader.cpp convert(), §2.5).

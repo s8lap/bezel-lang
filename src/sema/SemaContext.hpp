@@ -1452,7 +1452,7 @@ inline bool isValueBuiltinByName(std::string_view n) {
         return true;
     // Secondary: other non-class/non-interface builtins that have no
     // disposal obligation (value records, FFI value types, span views).
-    if (n == "Range"    || n == "Buffer"   ||
+    if (n == "Range"    || n == "__Buffer" ||
         n == "IntPtr"   || n == "UIntPtr"  ||
         n == "ReadOnlyStringSpan" || n == "Boolean" ||
         n == "Span"     || n == "ReadOnlySpan" ||

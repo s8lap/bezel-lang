@@ -313,14 +313,15 @@ BEZEL_TEST(const_move_declless_builtin_3709,
 // accept, and the Buffer allocation LEAKED 4016 bytes at program exit
 // (verified under `--sanitize=address`). The new
 // `isNoDisposalObligationBuiltinName` predicate explicitly EXCLUDES
-// `Buffer`, so this rejection stays loud.
+// `__Buffer`, so this rejection stays loud.
+// fix #5390 (§2.3, v0.314): renamed to internal-only `__Buffer<T>`.
 // =============================================================================
 BEZEL_TEST(const_move_declless_builtin_3709,
            move_buffer_into_const_rejected_narrow_4196) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static method Main(): int "
-        "    var b2 := new Buffer<int>(4); "
+        "    var b2 := new __Buffer<int>(4); "
         "    const b3 := move b2; "
         "    _ := b3; "
         "    return 0; "

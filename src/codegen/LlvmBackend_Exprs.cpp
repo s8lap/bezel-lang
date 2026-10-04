@@ -5231,7 +5231,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 bool isBuf = tt && tt->kind == sema::TypeRef::Kind::Named &&
                              !tt->declaration && tt->astNode && tt->astNode->name &&
                              !tt->astNode->name->parts.empty() &&
-                             tt->headName() == "Buffer";
+                             tt->headName() == "__Buffer";
                 if (isBuf && ma->member == "Length") {
                     llvm::Value* obj = lowerExpr(*ma->target);
                     if (obj) {

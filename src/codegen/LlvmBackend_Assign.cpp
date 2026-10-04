@@ -471,7 +471,7 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         bool isBuf = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                      !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
                      !recvTy->astNode->name->parts.empty() &&
-                     recvTy->headName() == "Buffer";
+                     recvTy->headName() == "__Buffer";
         if (isBuf) {
             llvm::Value* buf = lowerExpr(*ix.target);
             if (!buf) return nullptr;
@@ -1120,14 +1120,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         bool isBuf = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                      !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
                      !recvTy->astNode->name->parts.empty() &&
-                     recvTy->headName() == "Buffer";
+                     recvTy->headName() == "__Buffer";
         if (isBuf) {
             llvm::Value* buf = lowerExpr(*ix.target);
             if (!buf) return false;
             llvm::Value* idx = lowerExpr(*ix.indices[0].value);
             if (!idx) return false;
             // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before
-            // the sext (same soundness story as the Buffer<T> indexer-get
+            // the sext (same soundness story as the __Buffer<T> indexer-get
             // fix above; checkIndexArgNullability already rejects the
             // un-narrowed form).
             idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());

@@ -211,12 +211,14 @@ BEZEL_TEST(object_contract_unlowered_member_2922,
 }
 
 // A generic-typed receiver reaches the same fallthrough through a different
-// door: `Buffer<T>` (stdlib §4.14 family) carries generic args, so this pins
-// that the gate does not depend on the receiver being nullary.
+// door: `Atomic<T>` carries generic args, so this pins that the gate does not
+// depend on the receiver being nullary. fix #5390 (§2.3, v0.314): `Buffer<T>`
+// is no longer user-spellable; replaced with `Atomic<T>` which also hits the
+// kUnimplemented gate for ToString.
 BEZEL_TEST(object_contract_unlowered_member_2922,
            tostring_then_length_on_generic_builtin_rejected_spec_8_1) {
     BEZEL_EXPECT_TRUE(
-        hasError(toStringThenLength("new Buffer<int>(4)"), kUnimplemented));
+        hasError(toStringThenLength("new Atomic<int>(0)"), kUnimplemented));
 }
 
 // ── The FALSE REJECT this gate caused, and the narrowing that fixed it ──────

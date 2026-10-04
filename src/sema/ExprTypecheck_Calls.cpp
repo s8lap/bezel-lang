@@ -13137,20 +13137,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "(stdlib \xC2\xA7""6.10, v0.175)");
                         }
                     }
-                    // issue #545: Buffer<T> instance methods.
-                    // Receiver: Named, no declaration, name "Buffer", genericArgs[0]=T.
+                    // issue #545: __Buffer<T> instance methods.
+                    // Receiver: Named, no declaration, name "__Buffer", genericArgs[0]=T.
                     // Surface: [i] (indexer), Length (property), Dispose().
                     // Unknown method produces a clean compile error.
-                    if (rcn == "Buffer" && recvTy) {
+                    if (rcn == "__Buffer" && recvTy) {
                         if (m == "Dispose") {
                             // Dispose(): unit; no return type set.
                         } else {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string("no member `") + std::string(m) +
-                                "` on `Buffer<T>`; documented surface: "
+                                "` on `__Buffer<T>`; documented surface: "
                                 "[i] (get/set), Length, Dispose() "
-                                "(issue #545)");
+                                "(issue #545, \xC2\xA7""2.3, v0.314)");
                         }
                     }
                     // §6.4 / issue #647: Atomic<T> instance methods.
@@ -23861,7 +23861,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             bool isBuffer = tt && tt->kind == TypeRef::Kind::Named &&
                 !tt->declaration && tt->astNode && tt->astNode->name &&
                 !tt->astNode->name->parts.empty() &&
-                tt->headName() == "Buffer";
+                tt->headName() == "__Buffer";
             if (isBuffer && ma.member == "Length") {
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 return;

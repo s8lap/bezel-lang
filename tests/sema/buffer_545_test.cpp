@@ -52,7 +52,7 @@ BEZEL_TEST(buffer_545_sema_restriction, int_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<int>(4); "
+        "    using var b := new __Buffer<int>(4); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -64,7 +64,7 @@ BEZEL_TEST(buffer_545_sema_restriction, byte_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<byte>(8); "
+        "    using var b := new __Buffer<byte>(8); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -76,7 +76,7 @@ BEZEL_TEST(buffer_545_sema_restriction, short_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<short>(2); "
+        "    using var b := new __Buffer<short>(2); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -88,7 +88,7 @@ BEZEL_TEST(buffer_545_sema_restriction, long_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<long>(2); "
+        "    using var b := new __Buffer<long>(2); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -100,7 +100,7 @@ BEZEL_TEST(buffer_545_sema_restriction, double_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<double>(3); "
+        "    using var b := new __Buffer<double>(3); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -112,7 +112,7 @@ BEZEL_TEST(buffer_545_sema_restriction, decimal_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<decimal>(2); "
+        "    using var b := new __Buffer<decimal>(2); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -124,7 +124,7 @@ BEZEL_TEST(buffer_545_sema_restriction, char_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<char>(16); "
+        "    using var b := new __Buffer<char>(16); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -136,7 +136,7 @@ BEZEL_TEST(buffer_545_sema_restriction, bool_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<bool>(4); "
+        "    using var b := new __Buffer<bool>(4); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_FALSE(hasDiagContaining(r, "Buffer<T> requires"));
@@ -153,7 +153,7 @@ BEZEL_TEST(buffer_545_sema_restriction, string_rejected) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<string>(4); "
+        "    using var b := new __Buffer<string>(4); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -168,7 +168,7 @@ BEZEL_TEST(buffer_545_sema_restriction, class_element_rejected) {
         "class Elem end Elem; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<Elem>(2); "
+        "    using var b := new __Buffer<Elem>(2); "
         "  end Test; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -185,7 +185,7 @@ BEZEL_TEST(buffer_545_sema_length, length_property_accepted) {
         "module M; "
         "class C "
         "  public static method Test(): int "
-        "    using var b := new Buffer<int>(10); "
+        "    using var b := new __Buffer<int>(10); "
         "    return b.Length; "
         "  end Test; "
         "end C;");
@@ -202,7 +202,7 @@ BEZEL_TEST(buffer_545_sema_dispose, dispose_accepted) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    var b := new Buffer<int>(2); "
+        "    var b := new __Buffer<int>(2); "
         "    b.Dispose(); "
         "  end Test; "
         "end C;");
@@ -220,7 +220,7 @@ BEZEL_TEST(buffer_545_sema_unknown_method, resize_rejected) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<int>(4); "
+        "    using var b := new __Buffer<int>(4); "
         "    b.Resize(8); "
         "  end Test; "
         "end C;");
@@ -234,7 +234,7 @@ BEZEL_TEST(buffer_545_sema_unknown_method, add_rejected) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<int>(4); "
+        "    using var b := new __Buffer<int>(4); "
         "    b.Add(1); "
         "  end Test; "
         "end C;");
@@ -248,7 +248,7 @@ BEZEL_TEST(buffer_545_sema_unknown_method, diagnostic_names_surface) {
         "module M; "
         "class C "
         "  public static method Test() "
-        "    using var b := new Buffer<int>(4); "
+        "    using var b := new __Buffer<int>(4); "
         "    b.Bogus(); "
         "  end Test; "
         "end C;");

@@ -7751,13 +7751,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     {builder_.getInt32(cellSize), initVal},
                     "atom.new");
             }
-            // issue #545: new Buffer<T>(n) — allocate via bz_buffer_new(len, elem_size).
+            // issue #545: new __Buffer<T>(n) — allocate via bz_buffer_new(len, elem_size).
             // The element size is derived from T (genericArgs[0]) via collectionElemSize-
             // style logic; for decimal (16-byte struct) we use the DataLayout alloc size
             // so the #685 16-byte slot category works correctly.
             // The length argument (n) is required; it is evaluated and passed as i64.
             // Result: opaque heap pointer (bz_buffer_hdr_t*); zero-initialised payload.
-            if (colName == "Buffer") {
+            if (colName == "__Buffer") {
                 // Determine elem_size from T.
                 int64_t eSize = 8;  // default (double / long)
                 const sema::TypeRef* newTR = rt;

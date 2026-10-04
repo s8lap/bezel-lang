@@ -323,8 +323,9 @@ BEZEL_TEST(codegen_narrowed_indexer_arg_2799, array_span_set_narrowed_index) {
 // OwningBuffer<T> indexer get/set — §4.14. The issue's "likely affected"
 // footnote says the buffer family shares the `sext`-the-index shape; pinned
 // here. (The type is `OwningBuffer<T>`; `Buffer<T>` is not a stdlib name —
-// the value-typed storage primitive that owns its elements is stdlib §4.14's
-// `OwningBuffer<T>`, span-record sibling of the class-typed `Array<T>`.)
+// fix #5390 (§2.3, v0.314) renamed the builtin to internal-only `__Buffer<T>`
+// which is not user-spellable. The value-typed storage primitive is stdlib
+// §4.14's `OwningBuffer<T>`, span-record sibling of `Array<T>`.)
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(codegen_narrowed_indexer_arg_2799, buffer_get_narrowed_index) {

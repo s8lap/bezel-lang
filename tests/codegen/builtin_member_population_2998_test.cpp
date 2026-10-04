@@ -207,7 +207,11 @@ const std::vector<BuiltinCase>& registryCases() {
 
         // ── §4.14-§4.15 / §3.3 spans ─────────────────────────────────────
         {"OwningBuffer",                    "import System.Threading; ", "var v := new OwningBuffer<int>(4);", "v"},
-        {"Buffer",                          "import System.Threading; ", "var v := new Buffer<int>(4);", "v"},
+        // fix #5390 (§2.3, v0.314): `Buffer<T>` is no longer user-spellable
+        // (the builtin was renamed to internal-only `__Buffer<T>`). The table
+        // row testing unknown-member rejection on `Buffer` is removed; no
+        // user-spellable generic builtin can substitute. The gate is still
+        // exercised by all other entries.
         // Spans cannot be constructed standalone (they wrap a backing
         // storage); construct via the canonical `AsSpan()` form. `arr` is
         // an Array<int> that is then converted to each span flavor.

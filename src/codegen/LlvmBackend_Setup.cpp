@@ -21380,8 +21380,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
-    // issue #545: a `using var` bound to a Buffer<T>.
-    // No user TypeSymbol; recognised by type name "Buffer" in the declared type
+    // issue #545: a `using var` bound to a __Buffer<T>.
+    // No user TypeSymbol; recognised by type name "__Buffer" in the declared type
     // or the NewExpr type name.  At scope end, bz_buffer_free is called (null-safe
     // plain free — value elements carry no disposal obligation).
     {
@@ -21390,14 +21390,14 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
                    !rt->declaration && rt->astNode && rt->astNode->name &&
                    !rt->astNode->name->parts.empty() &&
-                   rt->headName() == "Buffer";
+                   rt->headName() == "__Buffer";
         };
         if (ld->type)
             isBuf = isBufferTypeName(ctx_.resolvedType(*ld->type));
         if (!isBuf && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isBuf = newExprBuiltinHead(ne) == "Buffer";
+                isBuf = newExprBuiltinHead(ne) == "__Buffer";
         }
         if (!isBuf && ld->initializer)
             isBuf = isBufferTypeName(ctx_.exprType(*ld->initializer));

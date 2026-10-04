@@ -429,10 +429,13 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // ever sees it, so the §9.2/§25.2 reject of FFI-pointer-component records
     // is unreachable.
     if (n == "Ptr") return 1;
-    // issue #545: Buffer<T> — fixed-capacity compiler-intrinsic primitive (arity 1).
+    // issue #545: __Buffer<T> — fixed-capacity compiler-intrinsic primitive (arity 1).
     // T restricted to value-type primitives (int/byte/short/long/double/decimal/
-    // char/bool) in this revision; class-element Buffer is the §5.20 design pass.
-    if (n == "Buffer") return 1;
+    // char/bool) in this revision; class-element __Buffer is the §5.20 design pass.
+    // fix #5390 (§2.3, v0.314): the builtin was previously named "Buffer". The
+    // rename to "__Buffer" makes it internal-only (not always-available). "Buffer"
+    // without a declaration in scope is now an unresolved type.
+    if (n == "__Buffer") return 1;
     // §6.2 / issue #647: Mutex and Lock — synchronization primitives.
     // Mutex has a public constructor(). Lock has NO public constructor (obtained
     // only from Mutex.Acquire / TryAcquire); both are nullary class types.

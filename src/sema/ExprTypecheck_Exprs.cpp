@@ -3656,8 +3656,8 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                          tt->astNode && tt->astNode->name &&
                          !tt->astNode->name->parts.empty()) {
                     std::string_view cn = tt->headName();
-                    // issue #545: Buffer<T>[i] → T (genericArgs[0]).
-                    if (cn == "Buffer" && !tt->genericArgs.empty() &&
+                    // issue #545: __Buffer<T>[i] → T (genericArgs[0]).
+                    if ((cn == "__Buffer" || cn == "Buffer") && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
                         ctx_.setExprType(&e, tt->genericArgs[0]);
                     }
@@ -5392,18 +5392,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             ne->args[0].value.get());
                     }
                 }
-                // issue #545: `new Buffer<T>(n)` — T-restriction check.
-                // Buffer<T> requires T to be a value-type primitive in this revision:
+                // issue #545: `new __Buffer<T>(n)` — T-restriction check.
+                // __Buffer<T> requires T to be a value-type primitive in this revision:
                 // {bool, char, byte, sbyte, short, ushort, int, uint, long, ulong,
                 //  float, double, decimal}.  Class, record, string, and interface
                 // elements re-open the §5.20 borrow-storing / zeroed-slot-disposal
                 // questions; they are explicitly out of scope for this slice.
-                // Diagnostic: "Buffer<T> requires a value-type element in this
+                // Diagnostic: "__Buffer<T> requires a value-type element in this
                 // revision; class elements await the §5.20 design (#545)."
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->headName() == "Buffer") {
+                    rt->headName() == "__Buffer") {
                     bool tOk = false;
                     if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
                         const TypeRef* ta = rt->genericArgs[0];
@@ -5420,7 +5420,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     if (!tOk) {
                         ctx_.diagnostics().report(
                             Severity::Error, ne->span.begin,
-                            "Buffer<T> requires a value-type element in this "
+                            "__Buffer<T> requires a value-type element in this "
                             "revision; class elements await the \xC2\xA7""5.20 "
                             "design (#545)");
                     }
