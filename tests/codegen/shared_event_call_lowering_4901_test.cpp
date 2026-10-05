@@ -870,24 +870,23 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
     BEZEL_EXPECT_TRUE(r.stdoutText == "9\n" || r.stdoutText == "9\r\n");
 }
 
-// p06 via `+=`: an overload GROUP whose first member is `On(int)`. Sema's
-// `+=` assignability check passes (measured: with `On(string)` declared first
-// it rejects instead), but which overload codegen would bind is not what sema
-// checked, so the gate rejects every overload group. The diagnostic's lead-in
-// phrase is unchanged; only the post-semicolon segment was reworded by #4972
-// (the lift to capture-free lambda handlers dropped the now-stale "(#4972)"
-// continuation).
+// fix #5219 (§17.2, v0.313): an overload GROUP via `+=`. Sema's `+=`
+// assignability check (§17.2 desugaring to `.Add`) resolves `H.On` against
+// the `(int) -> ()` target and picks `On(int)` — the codegen gate now
+// (fix #4978 / §27.6, v0.313) honours the selector-chosen overload,
+// so `+=` admits an overload group the same way `.Subscribe`/`.Add` do.
+// String-first ordering (stdlib §27.6: "declared first" binding).
 BEZEL_TEST(codegen_shared_event_call_lowering_4901,
-           plus_eq_overloaded_static_group_rejected_by_codegen_gate) {
-    BEZEL_EXPECT_TRUE(rejectedWith(
+           plus_eq_overloaded_static_group_accepted_and_runs) {
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "import System.Threading; "
         "class Bus "
         "  public static owned readonly Feed: SharedEventSource<int> := new(); "
         "end Bus; "
         "class H "
-        "  public static method On(x: int) Console.WriteLine($\"int:{x}\"); end On; "
         "  public static method On(x: string) Console.WriteLine($\"str:{x}\"); end On; "
+        "  public static method On(x: int) Console.WriteLine($\"int:{x}\"); end On; "
         "end H; "
         "class C "
         "  public static method Main(): int "
@@ -895,9 +894,34 @@ BEZEL_TEST(codegen_shared_event_call_lowering_4901,
         "    Bus.Feed.Raise(5); "
         "    return 0; "
         "  end Main; "
-        "end C;",
-        {"`+=` on a `SharedEventSource<T>` is lowered only for a static, "
-         "non-overloaded method reference whose signature is exactly "
-         "`(T) -> ()`",
-         "this handler is not one"}));
+        "end C;"),
+        "int:5");
 }
+
+// fix #5219: same as above, via `-=` to unsubscribe. The handler is
+// capture-free and exactly `(T) -> ()`, so it is admitted by the gate
+// (`-=` is not a subscribe position, but the handler shape is the same).
+BEZEL_TEST(codegen_shared_event_call_lowering_4901,
+           minus_eq_overloaded_static_group_removes_handler) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; "
+        "import System.Threading; "
+        "class Bus "
+        "  public static owned readonly Feed: SharedEventSource<int> := new(); "
+        "end Bus; "
+        "class H "
+        "  public static method On(x: string) Console.WriteLine($\"str:{x}\"); end On; "
+        "  public static method On(x: int) Console.WriteLine($\"int:{x}\"); end On; "
+        "end H; "
+        "class C "
+        "  public static method Main(): int "
+        "    Bus.Feed += H.On; "
+        "    Bus.Feed.Raise(5); "
+        "    Bus.Feed -= H.On; "
+        "    Bus.Feed.Raise(6); "
+        "    return 0; "
+        "  end Main; "
+        "end C;"),
+        "int:5");
+}
+

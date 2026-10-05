@@ -8795,37 +8795,33 @@ bool Emitter::tryLowerEventCompound(const ast::AssignmentStmt& as) {
         // the desugaring of `.Add(handler)` (spec §17.2), a subscribe position
         // of the shared pair. Sema (#4920) rejects a capturing handler here,
         // and its assignability check rejects a wrong arity, a mismatched
-        // parameter type or an `owned` formal, but it judges an overload group
-        // by the overload it happens to bind and admits a non-capturing
-        // lambda. Codegen lowers only what it has measured sound,
-        // so apply the SAME gate the `.Subscribe`/`.Add` call arms use
-        // (sharedEventHandlerAdmissible, LlvmBackend_Calls2.cpp): a static,
-        // non-overloaded method reference of exactly `(T) -> ()` OR a
-        // capture-free lambda of exactly `(T) -> ()` (lifted from static-
-        // method-ref-only to "capture-free static OR capture-free lambda",
-        // mirroring stdlib §6.5 / spec §28.14, fix #4972). Unlike those
-        // arms there is no #2457 backstop behind this statement, so reject
-        // here. `-=` (Remove, "call-bounded: compares only") is not a
+        // parameter type or an `owned` formal. Codegen lowers only what it has
+        // measured sound, so apply the SAME gate the `.Subscribe`/`.Add` call
+        // arms use (sharedEventHandlerAdmissible, LlvmBackend_Calls2.cpp):
+        // a static method reference of exactly `(T) -> ()` (overload groups
+        // admitted via the selector-chosen overload, fix #4978 / §27.6, v0.313)
+        // OR a capture-free lambda of exactly `(T) -> ()` (lifted from
+        // static-method-ref-only to "capture-free static OR capture-free
+        // lambda", mirroring stdlib §6.5 / spec §28.14, fix #4972). Unlike
+        // those arms there is no #2457 backstop behind this statement, so
+        // reject here. `-=` (Remove, "call-bounded: compares only") is not a
         // subscribe position and is left as it was; its per-call
         // closure-record leak is #4970.
         if (as.op == "+=" && isSharedEventSourceTypeName(tgtTy) &&
             !sharedEventHandlerAdmissible(
                 ctx_, as.value.get(), as.target.get(), payloadTy,
                 [this](std::string_view n) { return isBuiltinTypeRefName(n); },
-                // #4978 scope: only the `.Subscribe`/`.Add`/`.Remove` arms
-                // honour a selector-chosen overload; `+=` on an overloaded
-                // group stays the #4901 deliberate spurious reject.
-                /*honourSelectedOverload=*/false)) {
+                // fix #4978 (§27.6, v0.313): the `.Subscribe`/`.Add`/`.Remove`
+                // arms honour the selector-chosen overload; `+=` now does too.
+                /*honourSelectedOverload=*/true)) {
             ctx_.diagnostics().report(
                 Severity::Error, as.value->span.begin,
                 "`+=` on a `SharedEventSource<T>` is lowered only for a "
-                "static, non-overloaded method reference whose signature is "
-                "exactly `(T) -> ()` for the source's payload type `T`, or "
-                "for a capture-free lambda of that signature (stdlib §6.5); "
-                "this handler is not one — an overload group, an `owned`-"
-                "formal, a mistyped parameter, or a non-capture-free "
-                "handler is rejected (a handler held in a local or field "
-                "is rejected by #4920's admission-erase)");
+                "static method reference whose signature is exactly `(T) -> ()` "
+                "for the source's payload type `T`, or for a capture-free "
+                "lambda of that signature (stdlib §6.5); this handler is not "
+                "one — an `owned` formal, a mistyped parameter, or a "
+                "non-capture-free handler is rejected (stdlib §6.5, v0.313)");
             return true;
         }
         src = lowerExpr(*as.target);
