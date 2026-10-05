@@ -21,13 +21,13 @@ class C5351
     // With the fix, `lines` is Owned and triggers §28.3 auto-drop warning.
     // The warning confirms the ownership obligation is registered.
     var lines := File.ReadAllLines("/tmp/test.txt");
-    return lines.Length;
+    return lines.Count;
   end TestPlainVar;
 
   public static method TestUsingVar(): int
     // using var: explicit scope-bound disposal
     using var lines := File.ReadAllLines("/tmp/test.txt");
-    return lines.Length;
+    return lines.Count;
   end TestUsingVar;
 
   public static method Main(): int

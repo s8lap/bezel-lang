@@ -4810,6 +4810,42 @@ private:
         for (llvm::Value* pv : pins) emitStringRelease(pv);
     }
 
+    // fix-forward #5281 (§4.6 / §28.9, v0.313): the borrowed-string-argument pin
+    // for a CLOSURE-CALL (bound method reference) invocation. Mirrors
+    // `emitBorrowedStringArgPins` but operates on function-type `funcParams`
+    // instead of `ParameterSymbol` list — closure calls (bound method refs stored
+    // in locals/params/fields) carry no per-parameter symbol, only the
+    // function TypeRef from the capture site.
+    //
+    // IMPORTANT: for closure calls, `args[0]` is the ENV POINTER (the captured
+    // receiver), not a user argument. User arguments start at `args[1]`.
+    std::vector<llvm::Value*> emitBorrowedStringArgPinsForClosure(
+        const std::vector<llvm::Value*>& args,
+        const std::vector<const ast::Expr*>* argExprs,
+        const std::vector<sema::TypeRef::FuncParam>& funcParams) {
+        std::vector<llvm::Value*> pinned;
+        if (!argExprs) return pinned;
+        // For closure calls, args[0] is the env pointer (captured receiver).
+        // User arguments start at args[1]. funcParams[fi] maps to args[fi + 1].
+        for (std::size_t fi = 0; fi < funcParams.size(); ++fi) {
+            const std::size_t ai = fi + 1;  // +1: skip env pointer at args[0]
+            if (ai >= args.size() || ai >= argExprs->size()) break;
+            if (!funcParams[fi].modifier.empty()) continue;
+            const sema::TypeRef* pty =
+                funcParams[fi].type
+                    ? resolveTypeParamRef(funcParams[fi].type)
+                    : nullptr;
+            if (!isStringPinFormalType(pty)) continue;
+            if (!args[ai] || !args[ai]->getType()->isPointerTy()) continue;
+            if (isPlusOneStringProducer((*argExprs)[ai])) continue;
+            if (dynamic_cast<const ast::StringLiteralExpr*>((*argExprs)[ai]))
+                continue;
+            emitStringRetain(args[ai]);
+            pinned.push_back(args[ai]);
+        }
+        return pinned;
+    }
+
     // #422 / #672 / §27.5 / §28.9 / §27.7.1 (#1544) / #4475 (§28.2): the
     // closure-cell heap layout —
     //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24),
