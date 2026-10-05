@@ -19,7 +19,12 @@ module M;
 import System.Diagnostics;
 
 class C
-  public property SwExpr: Stopwatch get => Stopwatch.StartNew(); end;
+  // With the #5351 fix, Stopwatch.StartNew() returns owned, which cannot be
+  // returned from a getter (§28.6). Store in an owned field and return a borrow.
+  private owned swExpr: Stopwatch;
+  public constructor() swExpr := Stopwatch.StartNew(); end constructor;
+
+  public property SwExpr: Stopwatch get => swExpr; end;
 
   public method Test(): int
     SwExpr.TotallyBogusExprGetterMember4193Lit();

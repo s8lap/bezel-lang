@@ -10,13 +10,18 @@
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --allow-empty %s
+//
+// NOTE: with the #5351 fix, Stopwatch.StartNew() returns owned, so the field
+// must be `owned`. The original CHECK-NOT on dispatch errors is vacuous (the
+// new ownership error is a different diagnostic). The real oracle is that the
+// program compiles and runs correctly — dispatch through the field receiver works.
 
 module M4182;
 
 import System.Diagnostics;
 
 class HasSw
-  public sw: Stopwatch;
+  public owned sw: Stopwatch;
   public constructor() sw := Stopwatch.StartNew(); end constructor;
 end HasSw;
 

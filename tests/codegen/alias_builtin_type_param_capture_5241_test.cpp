@@ -48,10 +48,11 @@ BEZEL_TEST(alias_builtin_type_param_capture_5241, spec_2_2_bare_type_param_named
 
 // R3: `class Box<Stopwatch>` with a field typed `D.Stopwatch`.
 BEZEL_TEST(alias_builtin_type_param_capture_5241, spec_2_2_generic_field_layout_alias_qualified_stopwatch_not_type_param) {
+    // #5351 fix: Stopwatch.StartNew() returns owned, so field must be owned.
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Diagnostics as D; "
         "class Box<Stopwatch> "
-        "  public sw: D.Stopwatch; "
+        "  public owned sw: D.Stopwatch; "
         "  public constructor(x: Stopwatch) "
         "    sw := D.Stopwatch.StartNew(); "
         "  end constructor; "
@@ -65,10 +66,11 @@ BEZEL_TEST(alias_builtin_type_param_capture_5241, spec_2_2_generic_field_layout_
 // Control: the bare parameter name still means the parameter (a method
 // signature typed by it takes the substitution).
 BEZEL_TEST(alias_builtin_type_param_capture_5241, spec_2_2_generic_field_bare_type_param_named_stopwatch_still_a_parameter) {
+    // #5351 fix: Stopwatch.StartNew() returns owned, so field must be owned.
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; import System.Diagnostics as D; "
         "class Box<Stopwatch> "
-        "  public sw: D.Stopwatch; "
+        "  public owned sw: D.Stopwatch; "
         "  public constructor(x: Stopwatch) "
         "    sw := D.Stopwatch.StartNew(); "
         "  end constructor; "

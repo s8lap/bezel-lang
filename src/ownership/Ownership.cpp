@@ -5607,6 +5607,23 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // Owned verdict here. // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
         if (common::isOwningCollectionDrainAliasCall(*ce, ctx_))
             return OwnershipState::Borrowed;
+        // fix #5351 (§28.3, stdlib §7.3, v0.313): builtin static factory calls
+        // (File.ReadAllLines / File.ReadAllBytes / Directory.GetFiles /
+        // GetDirectories / FrozenArray<T>.From / Stopwatch.StartNew /
+        // CancellationTokenSource factories) produce owned values per their
+        // stdlib signatures but isOwningCollectionDrainAliasCall above only
+        // handles the drain-alias subset. These calls reach the owned-sink
+        // position via the #5284 fix widening isMaterializerCarveOutBorrow, but
+        // producerState was still returning Borrowed — the local carried no
+        // disposal obligation and the result leaked silently (1386 B / 99
+        // allocs per 100 iterations for File.ReadAllLines). Classify Owned
+        // here so the local is seeded with an ownership obligation and codegen
+        // registers scope-end disposal. Safe: codegen registers NO reclaim for
+        // these locals (only `using var` reaches the disposal arms), so the
+        // transfer path has exactly one disposer and admitting transfer cannot
+        // double-free. // per §28.3, §21.1, stdlib §7.3, #5284, #5351
+        if (!calleeMs && common::isBuiltinOwnedStaticFactoryCall(*ce, ctx_))
+            return OwnershipState::Owned;
         if (const sema::TypeRef* retTy = ctx_.exprType(e)) {
             if (retTy->kind == sema::TypeRef::Kind::Named &&
                 retTy->astNode && retTy->astNode->name &&
