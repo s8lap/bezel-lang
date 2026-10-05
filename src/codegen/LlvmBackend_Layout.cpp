@@ -2033,7 +2033,8 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
                 // own `impl->isIndexer` guard).
                 llvm::Function* installedCanon =
                     (!isSet && !pimpl->isIndexer)
-                        ? ensureVirtualStringGetterOwnershipThunk(pimpl, canon)
+                        ? ensureVirtualStringGetterOwnershipThunk(pimpl, canon,
+                                         /*allowNullableResult=*/true)  // fix #5320
                         : canon;
                 if (elems[si] != llvm::cast<llvm::Constant>(installedCanon))
                     return;
@@ -2041,7 +2042,8 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
                     buildSpecializedAccessorFn(ts, pimpl, isSet);
                 if (!specFn) return;
                 if (!isSet && !pimpl->isIndexer)
-                    specFn = ensureVirtualStringGetterOwnershipThunk(pimpl, specFn);
+                    specFn = ensureVirtualStringGetterOwnershipThunk(pimpl, specFn,
+                                       /*allowNullableResult=*/true);  // fix #5320
                 if (specFn == installedCanon) return;
                 elems[si] = llvm::cast<llvm::Constant>(specFn);
                 changed = true;

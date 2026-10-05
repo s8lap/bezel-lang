@@ -4598,6 +4598,13 @@ llvm::Function* Emitter::ensureVtableWideningThunk(
 // METHOD calls, which trusts the compiled body unconditionally rather than
 // re-deriving producer-vs-borrow from a (possibly absent, possibly different)
 // static declaration.
+//
+// fix #5320 (§28.9 / §23.2, v0.313): every vtable/itable slot-fill site now
+// passes `allowNullableResult=true`, so `string?` virtual/interface property
+// getters are also normalized. Without this, `isPlusOneStringProducer`'s
+// fast path returned `false` for a nullable dynamic read, so no release fired
+// and the fresh string leaked. bz_string_retain is null-safe, so a null return
+// is a no-op; the non-nullable `string` path is unchanged.
 llvm::Function* Emitter::ensureVirtualStringGetterOwnershipThunk(
         const sema::PropertySymbol* impl, llvm::Function* fn,
         bool allowNullableResult) {
@@ -4681,6 +4688,13 @@ llvm::Function* Emitter::ensureVirtualStringGetterOwnershipThunk(
             }
         }
     }
+    // fix #5320: `allowNullableResult=true` means the caller passed it
+    // specifically because a `string?` slot was found. Even if the body's
+    // already +1 for `string`, the slot dispatch always goes through the
+    // thunk and the consumer always releases (fast path returns `true` for
+    // this slot), so ALWAYS wrap: bz_string_retain is null-safe and a
+    // null return is a no-op.
+    (void)allowNullableResult;
     if (getter && isPlusOneStringProducer(getter)) {
         // The compiled body already hands back a fresh +1 (the same
         // conclusion a direct/inlined read of this exact body would reach) —
@@ -5516,7 +5530,8 @@ void Emitter::declareVtables() {
                         // fix #4952: normalize a dynamically-dispatched
                         // non-nullable `string` getter to +1 (see the
                         // function's declaration comment).
-                        acc = ensureVirtualStringGetterOwnershipThunk(impl, acc);
+                        acc = ensureVirtualStringGetterOwnershipThunk(impl, acc,
+                                           /*allowNullableResult=*/true);  // fix #5320
                         getFp = llvm::cast<llvm::Constant>(acc);
                     }
                 itabElems.push_back(getFp);
@@ -5727,7 +5742,8 @@ void Emitter::declareVtables() {
                     // here would be a no-op vs. actively wrong for a future
                     // wired setter shape, so gate on `!vs.isSet` explicitly).
                     if (fn && !vs.prop->isIndexer && !vs.isSet)
-                        fn = ensureVirtualStringGetterOwnershipThunk(impl, fn);
+                        fn = ensureVirtualStringGetterOwnershipThunk(impl, fn,
+                                           /*allowNullableResult=*/true);  // fix #5320
                     if (fn)
                         elems[kVirtualMethodsBase + i] =
                             llvm::cast<llvm::Constant>(fn);
@@ -8341,7 +8357,8 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                     // class implements an interface with a non-nullable string
                     // property and the call is dispatched through the itable.
                     if (!isSet)
-                        acc = ensureVirtualStringGetterOwnershipThunk(pimpl, acc);
+                        acc = ensureVirtualStringGetterOwnershipThunk(pimpl, acc,
+                                           /*allowNullableResult=*/true);  // fix #5320
                     itabElems[si] = llvm::cast<llvm::Constant>(acc);
                 };
                 if (auto gi = ifacePropertyGetIndex_.find(ip);
@@ -9059,7 +9076,8 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                 // same as the itable twins of this loop. Getter-only.
                 llvm::Function* installedCanon =
                     (!vs.isSet && !impl->isIndexer)
-                        ? ensureVirtualStringGetterOwnershipThunk(impl, canon)
+                        ? ensureVirtualStringGetterOwnershipThunk(impl, canon,
+                                         /*allowNullableResult=*/true)  // fix #5320
                         : canon;
                 // Only a slot that still holds the shared TEMPLATE accessor is
                 // ours to replace (the #2906 guard, verbatim in intent).
@@ -9353,7 +9371,8 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     // patchConcreteDerivedGenericBaseItables). Getter-only.
                     llvm::Function* installedCanon =
                         (!isSet && !pimpl->isIndexer)
-                            ? ensureVirtualStringGetterOwnershipThunk(pimpl, canon)
+                            ? ensureVirtualStringGetterOwnershipThunk(pimpl, canon,
+                                             /*allowNullableResult=*/true)  // fix #5320
                             : canon;
                     if (newItabElems[si] !=
                         llvm::cast<llvm::Constant>(installedCanon))
@@ -9377,7 +9396,8 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     // already install signature-moving specializations on
                     // that premise.
                     if (!isSet && !pimpl->isIndexer)
-                        specFn = ensureVirtualStringGetterOwnershipThunk(pimpl, specFn);
+                        specFn = ensureVirtualStringGetterOwnershipThunk(pimpl, specFn,
+                                           /*allowNullableResult=*/true);  // fix #5320
                     if (specFn == installedCanon) return;
                     newItabElems[si] = llvm::cast<llvm::Constant>(specFn);
                 };
@@ -9470,10 +9490,12 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         // (the thunk shares `fn`'s FunctionType exactly, so this cannot
         // affect the type check just above).
         if (!as.isSet && !as.impl->isIndexer)
-            specFn = ensureVirtualStringGetterOwnershipThunk(as.impl, specFn);
+            specFn = ensureVirtualStringGetterOwnershipThunk(as.impl, specFn,
+                                       /*allowNullableResult=*/true);  // fix #5320
         llvm::Function* installedCanon =
             (!as.isSet && !as.impl->isIndexer)
-                ? ensureVirtualStringGetterOwnershipThunk(as.impl, canon)
+                ? ensureVirtualStringGetterOwnershipThunk(as.impl, canon,
+                                         /*allowNullableResult=*/true)  // fix #5320
                 : canon;
         if (specFn == installedCanon) continue;
         elems[as.slot] = llvm::cast<llvm::Constant>(specFn);
@@ -25420,7 +25442,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // lowerPropertyRead hands back the body's own value, so a
                     // fresh body (`=> "w" + …`) is a +1 the consumer must
                     // discharge and a slot body (`=> _f`) stays a borrow.
-                    if (dynamicSlot) return !ty->nullable;
+                    if (dynamicSlot) return true;  // fix #5320: thunk now installed for string? too
                     // fix #5342 (§2.5 "library import" / §23.2 "deferred
                     // visibility" / §14.1 "owner substitution" / §28.9
                     // "fresh-class disposal", v0.313): the CROSS-MODULE
@@ -43169,7 +43191,8 @@ void Emitter::setupBoxDescriptors() {
                         // the return value through unchanged, so composing the
                         // two in this order gives a boxed-record interface
                         // getter the same +1 guarantee as a class's.
-                        acc = ensureVirtualStringGetterOwnershipThunk(impl, acc);
+                        acc = ensureVirtualStringGetterOwnershipThunk(impl, acc,
+                                           /*allowNullableResult=*/true);  // fix #5320
                         std::string thunkName =
                             "bz$boxpropget$" + std::string(ts->name) + "$" +
                             std::string(ip->name);
