@@ -16761,6 +16761,42 @@ llvm::Value* Emitter::lowerCollectionLiteralElementOrUnitNull(
     return nullptr;
 }
 
+// fix #5173 / §28.11 (v0.315): TRUE when every element source of a collection
+// literal is a FRESH producer — a `new` expression, or a nested collection
+// literal. Such a literal's class elements are held by nobody else, so a
+// borrowing array disposing them at scope end is exactly-once and cannot
+// collide with another holder's obligation.
+//
+// A literal element that NAMES an existing binding (`[c]`, `[obj.f]`) is a
+// BORROW of that holder. Per spec §28.11 "Borrowing collections", a
+// borrowing collection "store[s] references whose holders continue to own the
+// elements. Element disposal is the arrangement of whoever owns the elements
+// — owned bindings, owned fields, or an owning-family collection; it never
+// happens through the borrowing collection", and the slot table's borrow
+// column for `Dispose()` of the collection is "no user-visible work; elements
+// untouched". Installing a class-element disposer on such an array therefore
+// makes the array a SECOND disposer of an element it only borrows: the named
+// holder still discharges its own obligation at its own scope end, and the
+// two collide (measured: `using var c := new Connection(); var conns:
+// Array<Connection> := [c];` printed `1`, then SEGV'd in the second dispose
+// — corpus row s15_4_0007, exit 139).
+//
+// This is the same all-fresh test the #5106 flat-dict-value free uses a few
+// hundred lines below; it is the §15.4 "name the source first" shape
+// (s15_4_0007) that is a borrow, and the §15.4 fresh-literal shape
+// (array_class_element_literal_disposal_leak_5414) that is fresh.
+static bool collectionLiteralElementsAllFresh(const ast::CollectionLiteralExpr* lit) {
+    if (!lit || lit->isDict) return false;
+    for (const auto& el : lit->elements) {
+        const ast::Expr* x = el.get();
+        if (!x) return false;
+        if (dynamic_cast<const ast::NewExpr*>(x)) continue;
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(x)) continue;
+        return false;  // names an existing holder — a borrow, not a fresh source
+    }
+    return true;
+}
+
 void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     const ast::Type* declType) {
     // §27.5 / §28.9 (#969): record this local's block-nesting depth so the
@@ -16870,13 +16906,20 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         // element leaks. The existing string-element branch below handles
                         // strings (RuntimeManaged, co-owned +1 release). The box-element
                         // branch above handles §8.6 box elements (boxElementDisposerThunk).
+                        // fix #5173 / §28.11 (v0.315): GATED ON ALL-FRESH element
+                        // sources. A literal element naming an existing holder is a
+                        // borrow that holder still owns; a borrowing collection must
+                        // not dispose it (slot table, borrow column: "elements
+                        // untouched"). Without this gate the array becomes a second
+                        // disposer and the two collide — s15_4_0007 SEGV'd.
                         if (!d.collectionElemDisposer) {
                             const sema::TypeRef* elt =
                                 (!collTy->genericArgs.empty())
                                     ? collTy->genericArgs[0] : nullptr;
                             if (elt && elt->kind == sema::TypeRef::Kind::Named &&
                                 elt->declaration &&
-                                (elt->declaration->kind == ast::TypeDeclKind::Class)) {
+                                (elt->declaration->kind == ast::TypeDeclKind::Class) &&
+                                collectionLiteralElementsAllFresh(cl)) {
                                 d.collectionElemDisposer =
                                     elementPolicyFor(elt, /*owningFamily=*/true).disposerThunk;
                             }
@@ -16913,7 +16956,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         // and the stamped header would never be consulted, leaving
                         // each class element leaked (measured: 3 × 56 B direct leaks
                         // at main for the three-element repro case).
-                        if (!d.collectionElemDisposer) {
+                        // fix #5173 / §28.11 (v0.315): GATED ON ALL-FRESH element
+                        // sources, same gate and same reason as the #5414 block
+                        // above — a literal element naming an existing holder is a
+                        // borrow that holder still owns, and consulting the stamped
+                        // class disposer here would double-dispose it (s15_4_0007).
+                        if (!d.collectionElemDisposer &&
+                            collectionLiteralElementsAllFresh(cl)) {
                             const sema::TypeRef* el =
                                 (!collTy->genericArgs.empty())
                                     ? collTy->genericArgs[0] : nullptr;
@@ -16932,10 +16981,16 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // backing IS reclaimed (the emitDisposals map deduplicates by addr).
                     // Gated on: not already in borrowingArrayFreeEligible_, not a using
                     // var, collection literal, non-owning Array/Stack/Queue, class element.
+                    // fix #5173 / §28.11 (v0.315): the "elements ARE fresh" premise
+                    // holds only for a literal whose every source is a fresh producer.
+                    // `[c]` names an existing holder, which still owns `c`; disposing
+                    // it here as well double-disposes (s15_4_0007 SEGV'd). Same
+                    // all-fresh gate as the #5414 block above.
                     if (!borrowingArrayFreeEligible_.count(static_cast<const void*>(declNode)) &&
                         !disposeStack_.empty()) {
                         auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
-                        if (cl && !cl->isDict) {
+                        if (cl && !cl->isDict &&
+                            collectionLiteralElementsAllFresh(cl)) {
                             if (const sema::TypeRef* ct = ctx_.resolvedType(*declType)) {
                                 std::string_view head =
                                     ct->astNode && ct->astNode->name &&
@@ -41303,7 +41358,18 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // Shared<T>/Weak<T> elements (correct disposer thunk) and yields a null
     // disposer for value/RuntimeManaged elements (safe no-op), so this single
     // call is correct for all element categories and all collection families.
-    stampOwningElemDisposer(arr, elemRef, /*owning=*/true);
+    // fix #5173 / §28.11 (v0.315): for a BORROWING collection, only when every
+    // element source is a fresh producer. A literal element naming an existing
+    // holder (`[c]`) is a borrow that holder still owns; a borrowing
+    // collection's Dispose leaves elements untouched (slot table, borrow
+    // column), so stamping a class disposer here makes the array a second
+    // disposer of a borrowed element. Measured: s15_4_0007
+    // (`using var c := new Connection(); var conns: Array<Connection> := [c];`)
+    // printed `1`, then SEGV'd disposing `c` twice — exit 139. The owning
+    // family is unaffected: it takes `owned` ingress, so its elements are
+    // never borrows.
+    stampOwningElemDisposer(arr, elemRef, /*owning=*/common::isOwningPrefixedName(name) ||
+                                              collectionLiteralElementsAllFresh(cl));
 
     // fix #5414 (§4.4 / §28.9 / §28.11, v0.315): a non-owning
     // Array<Rec>/Stack<Rec>/Queue<Rec> literal (or interface/Object element)
@@ -41315,7 +41381,10 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // strings are RuntimeManaged and need no deep disposal; the class-element
     // path was missing. Installing the class-vtable disposer (the same one
     // Owning* uses) closes the leak: 168 B / 3 allocs for the issue's repro.
-    {
+    // fix #5173 / §28.11 (v0.315): same all-fresh gate as the stamp above —
+    // a literal element naming an existing holder is a borrow, and this
+    // header disposer would be consulted for it at scope end (s15_4_0007).
+    if (collectionLiteralElementsAllFresh(cl)) {
         bool isNonOwningArrayBacked =
             !common::isOwningPrefixedName(name) &&
             (name == "Array" || name == "Stack" || name == "Queue");
