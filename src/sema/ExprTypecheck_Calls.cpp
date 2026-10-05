@@ -7579,9 +7579,41 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // different receiver shape — stay their own arm rather
                     // than fold in too). The other two arms this replaces are
                     // DELETED below, not left as dead code.
-                    if (common::isLinqLazyPassthroughOperatorName(m) &&
-                        !((m == "Take" || m == "TryTake") &&
-                          colName == "OwningSet")) {
+                    // fix-forward #5362 / stdlib §5 (v0.259) + §4.10: the
+                    // negated conjunct `&& !((m == "Take" || m == "TryTake") &&
+                    // colName == "OwningSet")` that fix #5362 introduced here
+                    // reads as if it preserves `Take`'s typing on every
+                    // non-OwningSet receiver. It does not, and the table
+                    // explains why: `Take` is deliberately ABSENT from
+                    // kLinqLazyPassthroughOperatorNames (BuiltinRegistry.cpp —
+                    // 11 names, no `Take`), because its applicability is
+                    // RECEIVER-dependent. So
+                    // `isLinqLazyPassthroughOperatorName("Take")` is FALSE,
+                    // the negated conjunct is TRUE for every `Take` call
+                    // regardless of receiver, and the arm REJECTS all of them
+                    // — including the ordinary `Array<T>.Take(n)`.
+                    //
+                    // The failure is silent rather than loud because the
+                    // call then falls through untyped: codegen's
+                    // `lowerLocalDecl` cannot lower the initializer and
+                    // degrades to a zero value (#2434), and the following
+                    // `Console.WriteLine`'s argument fails to lower so the
+                    // whole statement emits nothing (#3079). Conformance
+                    // `l5_0006` (`xs.Take(-5).ToArray()` — §5's negative-count
+                    // clamp) printed nothing and exited 0.
+                    //
+                    // `Take` needs an EXPLICIT DISJUNCT precisely BECAUSE it
+                    // is not in the table — the same reason `Reverse` keeps
+                    // its own arm. Restored as the pre-#5362 form: the table
+                    // membership OR an explicit non-OwningSet `Take`.
+                    //
+                    // `TryTake` is NOT restored here, matching #5362's own
+                    // scope: it never had a disjunct (its handling is the
+                    // owning-container `allowedOwningMethod` check, per the
+                    // note at the `OwningSet` + `Take` reject below), and
+                    // re-adding it would answer a question #5362 did not ask.
+                    if (common::isLinqLazyPassthroughOperatorName(m) ||
+                        (m == "Take" && colName != "OwningSet")) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                         return true;
                     }
