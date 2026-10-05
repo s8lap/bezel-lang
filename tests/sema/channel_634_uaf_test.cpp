@@ -29,9 +29,32 @@
 //   L3: dispose permutation: interleaved (partial sender release before channel).
 
 #include "support/codegen_support.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/sema_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runJit;
+
+namespace {
+
+bezel::test::SemaResult parseSemaAll(std::string_view src) {
+    auto r = bezel::test::parseAndCollect(src);
+    if (r.sourceFile && r.ctx) {
+        bezel::sema::resolveTypes(*r.sourceFile, *r.ctx);
+        bezel::sema::typecheckExpressions(*r.sourceFile, *r.ctx);
+    }
+    return r;
+}
+
+bool hasDiagContaining(const bezel::test::SemaResult& r, const std::string& substr) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find(substr) != std::string::npos) return true;
+    }
+    return false;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // P1: send-after-channel-dispose — expect ChannelClosedException (§30.15).
@@ -297,4 +320,44 @@ BEZEL_TEST(channel_634_uaf, l3_interleaved_dispose_no_crash_30_15) {
     // fix #634: core freed exactly once; no double-free or UAF.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// ---------------------------------------------------------------------------
+// #4318 — stdlib §30.15 v0.315: Channel<T> and ChannelSender<T> are
+// null-declaration builtins that skip their own where T: sendable constraint.
+// Before fix: no constraint check fired. Fix adds kNullDeclSendableConstraints
+// to TypeResolution_Names.cpp so the sendable constraint is checked.
+// ---------------------------------------------------------------------------
+
+// §30.15 / #4318: Channel<NC> where NC is a non-sendable class — rejected
+// with "does not satisfy the constraint `where T: sendable`".
+BEZEL_TEST(channel_634_uaf,
+           channel_nonsendable_element_rejected_sendable_constraint_s4318_001) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class NC end NC; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var ch := new Channel<NC>(); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagContaining(r, "does not satisfy the constraint `where T: sendable`"));
+}
+
+// Control: Channel<int> — int is sendable, compiles cleanly (warning only
+// from auto-dispose which is expected).
+BEZEL_TEST(channel_634_uaf,
+           channel_int_element_accepted_sendable_constraint_s4318_002) {
+    auto r = runJit(
+        "module M; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var ch := new Channel<int>(); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

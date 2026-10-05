@@ -277,3 +277,37 @@ BEZEL_TEST(sema_sorted_dictionary_add_nullable_3399,
         "  return od.Count; ")),
         1);
 }
+
+// #4318 (stdlib §4.17 v0.315): SortedDictionary<K,V> null-declaration builtin
+// skips its own where K: IComparable<K> constraint. Before fix, no constraint
+// check fired for null-declaration builtins. Fix adds kNullDeclSelfRefConstraints
+// to TypeResolution_Names.cpp so the self-referential IComparable bound is checked.
+BEZEL_TEST(sema_sorted_dictionary_add_nullable_3399,
+           sorteddictionary_class_key_rejected_icomparable_constraint_s4318_001) {
+    auto r = parseSemaAll(
+        "module M; import System.Collections.Generic; "
+        "class NC end NC; "
+        "class P "
+        "  public static method Main(): int "
+        "    var sd := new SortedDictionary<NC, int>(); "
+        "    return 0; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(hasError(r, "does not satisfy the constraint `where K: IComparable"));
+    BEZEL_EXPECT_TRUE(hasError(r, "(\xC2\xA7""14.2)"));
+}
+
+// Control: SortedDictionary<string,int> — string satisfies IComparable<string>.
+BEZEL_TEST(sema_sorted_dictionary_add_nullable_3399,
+           sorteddictionary_string_key_accepted_icomparable_constraint_s4318_002) {
+    auto r = parseSemaAll(
+        "module M; import System.Collections.Generic; "
+        "class P "
+        "  public static method Main(): int "
+        "    var sd := new SortedDictionary<string, int>(); "
+        "    sd.Add(\"a\", 1); "
+        "    return sd.Count; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(hasError(r, "does not satisfy the constraint"));
+}

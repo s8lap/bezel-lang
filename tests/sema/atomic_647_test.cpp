@@ -519,3 +519,71 @@ BEZEL_TEST(atomic_647_sema_6_4,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasNotSendableDiag(r));
 }
+
+// ===========================================================================
+// (n) Atomic<T> — null-declaration builtin skips where-T:value check (§6.4 / #4318)
+// Before fix: no constraint check fired for null-declaration builtins.
+// Fix adds kNullDeclValueConstraints to TypeResolution_Names.cpp, so the
+// where-T:value gate now fires and rejects a class type argument.
+// ===========================================================================
+
+// §6.4 / #4318: Atomic<C> where C is a class is rejected — the where T: value
+// constraint fires and diagnoses "does not satisfy the constraint `where T: value`".
+BEZEL_TEST(atomic_647_sema_6_4,
+           atomic_class_type_rejected_value_constraint_s4318_001) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C end C; "
+        "class P "
+        "  public static method Main(): int "
+        "    var a := new Atomic<C>(new C()); "
+        "    return 0; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagContaining(r, "does not satisfy the constraint `where T: value`"));
+}
+
+// §6.4 / #4318: AtomicInteger<C> where C is a class is rejected.
+BEZEL_TEST(atomic_647_sema_6_4,
+           atomicinteger_class_type_rejected_value_constraint_s4318_002) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C end C; "
+        "class P "
+        "  public static method Main(): int "
+        "    var a := new AtomicInteger<C>(new C()); "
+        "    return 0; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasDiagContaining(r, "does not satisfy the constraint `where T: value`"));
+}
+
+// §6.4 / #4318: Atomic<int> control — int satisfies where T: value, compiles.
+BEZEL_TEST(atomic_647_sema_6_4,
+           atomic_int_accepted_value_constraint_s4318_003) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class P "
+        "  public static method Main(): int "
+        "    var a := new Atomic<int>(0); "
+        "    return 0; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §6.4 / #4318: AtomicInteger<int> control — int satisfies where T: value.
+BEZEL_TEST(atomic_647_sema_6_4,
+           atomicinteger_int_accepted_value_constraint_s4318_004) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class P "
+        "  public static method Main(): int "
+        "    var a := new AtomicInteger<int>(0); "
+        "    return 0; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

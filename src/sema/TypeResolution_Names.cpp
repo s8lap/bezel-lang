@@ -3279,6 +3279,181 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         break;
                     }
                 }
+                // fix #4318 (§14.2, v0.315): three more constraint kinds for
+                // null-declaration builtin generics that #4305 deliberately left
+                // out (different handling required):
+                //
+                // 1. `value` (Atomic/AtomicInteger): call checkOneConstraint with
+                //    a synthesized GenericParamConstraint{kind="value"}.
+                //
+                // 2. `sendable` (Channel/ChannelSender): defer to
+                //    checkSendableConstraintsLate via pendingSendableConstraints,
+                //    exactly as checkOneConstraint's sendable arm does.
+                //
+                // 3. Self-referential `IComparable<K>` type bound
+                //    (SortedDictionary/SortedSet): checkOneConstraint's `type`
+                //    arm can't handle this (needs astBound/importedBound we lack);
+                //    synthesize the IComparable bound with a bare parameter marker
+                //    and call argSatisfiesTypeBound directly.
+                //
+                // Value-constraint table (§6.4).
+                {
+                    struct NullDeclValueConstraint {
+                        std::string_view name;
+                        std::size_t slot;
+                        std::string_view paramName;
+                    };
+                    static constexpr NullDeclValueConstraint
+                        kNullDeclValueConstraints[] = {
+                            {"Atomic", 0, "T"},        // §6.4
+                            {"AtomicInteger", 0, "T"}, // §6.4
+                        };
+                    for (const auto& c : kNullDeclValueConstraints) {
+                        if (first != c.name) continue;
+                        int declaredArity = builtinTypeArity(c.name);
+                        bool slotInRange =
+                            declaredArity > 0 &&
+                            c.slot < static_cast<std::size_t>(declaredArity);
+                        if (!slotInRange) {
+                            // Cannot happen: builtinTypeArity is the authority.
+                            break;
+                        }
+                        if (c.slot < ref.genericArgs.size() &&
+                            c.slot < t.genericArgs.size()) {
+                            TypeRef* arg = ref.genericArgs[c.slot];
+                            const ast::Type* argAst = t.genericArgs[c.slot].get();
+                            GenericParamConstraint item;
+                            item.kind = "value";
+                            checkOneConstraint(t.span.begin, c.paramName,
+                                               item, argAst, arg, nullptr);
+                        }
+                        break;
+                    }
+                }
+                // Sendable-constraint table (§6.9/§30.15).
+                {
+                    struct NullDeclSendableConstraint {
+                        std::string_view name;
+                        std::size_t slot;
+                        std::string_view paramName;
+                    };
+                    static constexpr NullDeclSendableConstraint
+                        kNullDeclSendableConstraints[] = {
+                            {"Channel", 0, "T"},         // §30.15
+                            {"ChannelSender", 0, "T"},   // §30.15
+                        };
+                    for (const auto& c : kNullDeclSendableConstraints) {
+                        if (first != c.name) continue;
+                        int declaredArity = builtinTypeArity(c.name);
+                        bool slotInRange =
+                            declaredArity > 0 &&
+                            c.slot < static_cast<std::size_t>(declaredArity);
+                        if (!slotInRange) {
+                            // Cannot happen: builtinTypeArity is the authority.
+                            break;
+                        }
+                        if (c.slot < ref.genericArgs.size()) {
+                            TypeRef* arg = ref.genericArgs[c.slot];
+                            // argName is only used in diagnostics; the late pass
+                            // checkSendableConstraintsLate produces the specific
+                            // message. argSpelling (TypeResolution_Checks.cpp) also
+                            // returns "<type>" for a resolved TypeRef with no AST
+                            // node, so use that for consistency.
+                            std::string argName = "<type>";
+                            if (arg && arg->kind == TypeRef::Kind::Named) {
+                                argName = std::string(arg->headName());
+                            }
+                            ctx_.addPendingSendableConstraint(
+                                SemaContext::PendingSendableConstraint{
+                                    t.span.begin,
+                                    std::string(c.paramName),
+                                    argName,
+                                    arg});
+                        }
+                        break;
+                    }
+                }
+                // Self-referential IComparable-bound table (§4.17/§4.18).
+                {
+                    struct NullDeclSelfRefConstraint {
+                        std::string_view name;
+                        std::size_t slot;
+                        std::string_view paramName;
+                    };
+                    static constexpr NullDeclSelfRefConstraint
+                        kNullDeclSelfRefConstraints[] = {
+                            {"SortedDictionary", 0, "K"}, // §4.17
+                            {"SortedSet", 0, "T"},       // §4.18
+                        };
+                    for (const auto& c : kNullDeclSelfRefConstraints) {
+                        if (first != c.name) continue;
+                        int declaredArity = builtinTypeArity(c.name);
+                        bool slotInRange =
+                            declaredArity > 0 &&
+                            c.slot < static_cast<std::size_t>(declaredArity);
+                        if (!slotInRange) {
+                            // Cannot happen: builtinTypeArity is the authority.
+                            break;
+                        }
+                        if (c.slot < ref.genericArgs.size() &&
+                            c.slot < t.genericArgs.size()) {
+                            TypeRef* arg = ref.genericArgs[c.slot];
+                            // Synthesize IComparable bound: build a TypeRef for
+                            // IComparable<K> where K is a bare parameter marker.
+                            // A bare marker is Named with declaration=nullptr;
+                            // argSatisfiesTypeBound identifies it by kind+decl,
+                            // not by name.
+                            TypeRef bareMarker;
+                            bareMarker.kind = TypeRef::Kind::Named;
+                            bareMarker.declaration = nullptr;
+                            TypeRef iComparableBound;
+                            iComparableBound.kind = TypeRef::Kind::Named;
+                            iComparableBound.declaration =
+                                ctx_.builtinInterfaceSym("IComparable");
+                            iComparableBound.genericArgs.push_back(&bareMarker);
+                            std::string argName = "<type>";
+                            if (arg && arg->kind == TypeRef::Kind::Named) {
+                                argName = std::string(arg->headName());
+                            }
+                            // For primitives: use the same authority as
+                            // checkOneConstraint's type arm
+                            // (primitiveConformsToBuiltinInstanceIface).
+                            // For Named types: use argSatisfiesTypeBound.
+                            if (arg && arg->kind == TypeRef::Kind::Primitive) {
+                                if (primitiveConformsToBuiltinInstanceIface(
+                                        arg->primitive, "IComparable",
+                                        iComparableBound.genericArgs) ==
+                                    PrimBuiltinIfaceConformance::Rejects) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, t.span.begin,
+                                        std::string("type argument `") +
+                                        argName +
+                                        "` does not satisfy the constraint "
+                                        "`where " +
+                                        std::string(c.paramName) +
+                                        ": IComparable<" +
+                                        std::string(c.paramName) +
+                                        ">` (§14.2)");
+                                }
+                            } else if (arg && arg->declaration) {
+                                if (!argSatisfiesTypeBound(
+                                        arg, &iComparableBound, &ctx_)) {
+                                    // Defer: same as checkOneConstraint's type
+                                    // arm for unresolved base lists.
+                                    deferredTypeBoundFailures_.push_back(
+                                        DeferredTypeBoundFailure{
+                                            t.span.begin,
+                                            std::string(c.paramName),
+                                            "IComparable",
+                                            argName,
+                                            arg,
+                                            &iComparableBound});
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
                 // §3.6 / §8.3 (v0.158, #1338): record a hash-container key /
                 // element instantiation (`Dictionary`/`OwningDictionary` key K,
                 // `Set`/`OwningSet` element T) so checkHashContainerKeys can

@@ -74,6 +74,24 @@ std::string prog(const std::string& mainBody) {
 
 JitResult reject(const std::string& mainBody) { return runAot(prog(mainBody)); }
 
+// Program template for tests involving a non-IComparable class type NC.
+std::string nonComparableClassProg(const std::string& mainBody) {
+    return "module M;\n"
+           "import System;\n"
+           "class NC\n"
+           "end NC;\n"
+           "class C\n"
+           "  public static method Main(): int\n"
+           + mainBody +
+           "\n    return 0;\n"
+           "  end Main;\n"
+           "end C;\n";
+}
+
+JitResult rejectNonComparable(const std::string& mainBody) {
+    return runAot(nonComparableClassProg(mainBody));
+}
+
 bool hasErrorContaining(const JitResult& r, const std::string& needle) {
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity != bezel::Severity::Error) continue;
@@ -439,6 +457,31 @@ BEZEL_TEST(sortedset_isarrlike_3730,
         "    return s.Contains(s.First());\n"
         "  end CheckSet;"));
     BEZEL_EXPECT_TRUE(hasErrorContaining(r, "requires `T: hashable`"));
+}
+
+// #4318 (stdlib §4.18 v0.315): SortedSet<T> null-declaration builtin skips its
+// own where T: IComparable<T> constraint. Before fix, no constraint check fired
+// for null-declaration builtins. Fix adds kNullDeclSelfRefConstraints to
+// TypeResolution_Names.cpp so the self-referential IComparable bound is checked.
+BEZEL_TEST(sortedset_isarrlike_3730,
+           sortedset_class_type_rejected_icomparable_constraint_s4318_001) {
+    auto r = rejectNonComparable(
+        "    using var ss := new SortedSet<NC>();\n"
+        "    return 0;");
+    BEZEL_EXPECT_TRUE(
+        hasErrorContaining(r, "does not satisfy the constraint `where T: IComparable"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "(\xC2\xA7""14.2)"));
+}
+
+// Control: SortedSet<int> — int satisfies IComparable<int>, compiles cleanly.
+BEZEL_TEST(sortedset_isarrlike_3730,
+           sortedset_int_accepted_icomparable_constraint_s4318_002) {
+    auto r = reject(
+        "    var ss := new SortedSet<int>();\n"
+        "    ss.Add(1); ss.Add(2); ss.Add(3);\n"
+        "    return ss.Count;");
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "does not satisfy the constraint"));
+    BEZEL_EXPECT_FALSE(hasErrorContaining(r, "IComparable"));
 }
 
 }  // namespace
