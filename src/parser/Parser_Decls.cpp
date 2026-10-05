@@ -797,7 +797,13 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
                                 "expected '(' to begin parameter list");
         }
         const SourceLocation paramListLoc = current_.location;
+        // fix #4661 (§32.8, v0.313): set the context flag so that bare `env`
+        // is accepted as an environment-pointer marker in the extern param list
+        // and in any function-type parameters nested within it.
+        bool saved = parsingExternParamList_;
+        parsingExternParamList_ = true;
         decl.params = parseParamList();
+        parsingExternParamList_ = saved;
         // per §32 / §28.14 (v0.175): `scoped` is illegal on extern
         // declarations — neither the callee storage obligations nor the
         // quiescence guarantee can be verified across the FFI boundary.
@@ -984,6 +990,24 @@ std::unique_ptr<ast::Type> Parser::parseType() {
                     // a param NAMED `scoped` by `:`, so neither matches.
                     fp.modifier = "scoped";
                     advance();
+                } else if (parsingExternParamList_ &&
+                           current_.kind == TokenKind::Identifier &&
+                           current_.text == "env" &&
+                           peekAt(1).kind == TokenKind::Punctuator &&
+                           (peekAt(1).text == "," ||
+                            peekAt(1).text == ")" ||
+                            peekAt(1).text == "?")) {
+                    // per §32.8 / App. B.2 (v0.313): the bare `env` marker
+                    // in a function type inside an env-paired extern declaration.
+                    // It appears as a bare identifier token (not `env:`) followed
+                    // by a closing token (`)`, `,`, or `?`) with no type
+                    // expression following it.
+                    // AST shape (sema/ExprTypecheck_Calls.cpp §Shape A):
+                    // `sp.name == "env" && !sp.type`. Use fp.name, not fp.modifier.
+                    fp.name = "env";
+                    fp.type = nullptr;
+                    advance();
+                    return fp;
                 }
                 // Optional `Identifier ":"` prefix per A.5 FuncParamType.
                 if (current_.kind == TokenKind::Identifier &&
@@ -2811,6 +2835,36 @@ std::vector<ast::Param> Parser::parseParamList() {
             // a type alias to a function type resolves transparently.
             p.modifier = "scoped";
             advance();
+        } else if (parsingExternParamList_ &&
+                   current_.kind == TokenKind::Identifier &&
+                   current_.text == "env" &&
+                   peekAt(1).kind == TokenKind::Punctuator &&
+                   peekAt(1).text != ":") {
+            // per §32.8 / App. B.2 (v0.313): the bare `env` marker in an
+            // env-paired extern declaration. It is a bare identifier (not
+            // `env:`) followed by `,` or `)` — it carries no name, no `:`,
+            // and no type annotation; its type is implicitly the environment
+            // pointer. Outside an extern block, `env` is an ordinary identifier.
+            // AST shape (sema/ExprTypecheck_Calls.cpp §Shape A):
+            // `sp.name == "env" && !sp.type`. Use p.name, not p.modifier.
+            p.name = "env";
+            p.type = nullptr;
+            advance();
+            // The env-position marker is complete. Handle the optional
+            // out-nullability `when` clause (§22.4) directly here, then return.
+            if (consumeKeyword("when")) {
+                if (consumeKeyword("true")) {
+                    p.outNullPostcond = ast::OutNullWhen::WhenTrue;
+                } else if (consumeKeyword("false")) {
+                    p.outNullPostcond = ast::OutNullWhen::WhenFalse;
+                } else {
+                    diagnostics_.report(
+                        Severity::Error, current_.location,
+                        "expected `true` or `false` after `when` in an "
+                        "out-nullability postcondition (§22.4)");
+                }
+            }
+            return p;
         }
         if (atDiscard()) {
             // A.4 Param (v0.244, #3049, accepted Q2): "A method/constructor

@@ -393,6 +393,11 @@ private:
     // `with EXPR` cancellation-token clause (§30.7) stays available to the
     // for-statement parser.
     bool disableWithSuffix_ = false;
+    // Slice 58 / fix #4661 (§32.8, v0.313): when true, `env` is accepted as
+    // a bare marker in parameter lists. The `env` marker is valid ONLY inside
+    // an extern declaration's parameter list and the function types within it.
+    // Set only while parsing an extern block's parameter list.
+    bool parsingExternParamList_ = false;
     // (The pre-v0.217 `suppressTopLevelLambda_` when-guard carve (#1256) is
     // deleted: a keyword-led lambda (§27.3, v0.217) commits at `lambda`, so
     // a parenthesized guard followed by the arm `=>` can never be mis-read

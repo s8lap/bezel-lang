@@ -1053,7 +1053,8 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
             // cannot appear as expression operands.  Other keywords (if,
             // while, return, …) cannot appear inside a type arg.
             if (isPrimitiveTypeKeyword(t.text)) continue;
-            if (t.text == "owned" || t.text == "ref" || t.text == "out") continue;
+            if (t.text == "owned" || t.text == "ref" || t.text == "out" ||
+                t.text == "env") continue;
             return false;
         }
         if (t.kind == TokenKind::Identifier) continue; // type name component
@@ -1124,8 +1125,10 @@ bool Parser::tokensLookLikeReceiverTypeArgs() {
         if (t.kind == TokenKind::Keyword) {
             if (isPrimitiveTypeKeyword(t.text)) continue;
             // §A.5 FuncParamMods (`owned` / `ref` / `out`) inside a
-            // function-type GenericArg (#2191).
-            if (t.text == "owned" || t.text == "ref" || t.text == "out") continue;
+            // function-type GenericArg (#2191). `env` is also valid here
+            // (it appears in function-type param lists inside extern decls).
+            if (t.text == "owned" || t.text == "ref" || t.text == "out" ||
+                t.text == "env") continue;
             return false;
         }
         if (t.kind == TokenKind::Identifier) continue;
