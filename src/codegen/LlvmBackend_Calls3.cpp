@@ -5506,20 +5506,17 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                     builder_.CreateStore(nv, outSlot);
                 } else {
                     // Pointer type (class, string): rawItem is the object pointer.
-                    // fix #5304 / stdlib §6.9 / §28.11 / §28.9: for a string
-                    // element, the channel holds a retained reference (the Send
-                    // lowering emits bz_string_retain when storing). TryReceive
-                    // transfers ownership to the caller by releasing the channel's
-                    // reference here; the caller's out-slot takes ownership and the
+                    // Class elements use the dispose_elem mechanism (the channel's
+                    // dispose_elem calls the class destructor on undelivered items;
+                    // a received class item is handed off with no extra release in
+                    // TryReceive — the caller's ownership is balanced by the
+                    // out-slot's own scope-end disposal). For string elements: the
+                    // string from the Send argument is a fresh +1 allocation (e.g.
+                    // a string-interpolation $"s{i}" via emitStringConcat); Send
+                    // transfers ownership to the channel; TryReceive transfers it
+                    // to the caller. There is no extra release in TryReceive — the
+                    // caller's out-slot receives the owned reference and the
                     // stringReleaseEligible_ mechanism discharges it at scope end.
-                    // Class elements use the dispose_elem mechanism instead (the
-                    // channel's dispose_elem calls the class destructor on
-                    // undelivered items; a received class item is handed off with
-                    // no extra release in TryReceive — the caller's ownership is
-                    // balanced by the out-slot's own scope-end disposal).
-                    if (chElem && chElem->kind == sema::TypeRef::Kind::Primitive &&
-                        chElem->primitive == sema::PrimitiveType::String)
-                        emitStringRelease(rawItem);
                     builder_.CreateStore(rawItem, outSlot);
                 }
                 builder_.CreateBr(contBB);
