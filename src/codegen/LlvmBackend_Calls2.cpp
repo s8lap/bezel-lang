@@ -7556,7 +7556,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // { ptr fn, ptr env }. The function's actual type includes an env_ptr
     // as first arg: (ptr env, user_params...) -> ret.
     auto emitClosureCall = [&](llvm::Value* closurePtr,
-                               const sema::TypeRef* rt) -> llvm::Value* {
+                               const sema::TypeRef* rt,
+                               const ast::CallExpr* callExpr) -> llvm::Value* {
         if (!closurePtr || !rt ||
             rt->kind != sema::TypeRef::Kind::Function)
             return nullptr;
@@ -8027,6 +8028,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
         auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
         if (args.size() != allArgTys.size()) return nullptr;
+        // fix-forward #5281 (§4.6 / §28.9, v0.313): compute the borrowed-string pins
+        // for the closure-call path using the dedicated helper (operates on
+        // function-type funcParams instead of ParameterSymbol list). The throw-path
+        // release is handled by `stringPinArgUnwindCleanup` below; the normal-path
+        // release is at the `releaseBorrowedStringArgPins(stringPinArgs)` call.
+        std::vector<const ast::Expr*> argExprs;
+        argExprs.reserve(call.args.size());
+        for (const auto& a : call.args) argExprs.push_back(a.value.get());
+        const std::vector<llvm::Value*> stringPinArgs =
+            emitBorrowedStringArgPinsForClosure(args, &argExprs, rt->funcParams);
         // fix #5347: install the throw-path cleanup BEFORE `emitPendingCheck`.
         // `emitPendingCheck` calls `unwindBB()` to set `call.unwind`'s branch
         // target. By setting `unwindTarget_` to the cleanup block first,
@@ -8034,21 +8045,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // to the saved original `unwindTarget_`. This integrates the pin release
         // INTO the throw chain rather than creating a parallel path.
         llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
-        if (!closureStringPins.empty())
-            unwindTarget_ = stringPinArgUnwindCleanup(closureStringPins);
+        if (!stringPinArgs.empty())
+            unwindTarget_ = stringPinArgUnwindCleanup(stringPinArgs);
         // #719: a lambda body can `throw`; like a normal method call, propagate a
         // pending exception after the call instead of silently continuing with the
         // (default) result. Without this, `var fn := () => throw E(); var v := fn();`
         // swallowed the throw and ran on. emitPendingCheck branches to the unwind
         // path when the exception slot is set; non-throwing calls just fall through.
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
-        emitPendingCheck();
         unwindTarget_ = savedClArgUnwind;
-        // fix-forward #5347: the normal-return release for the string pins.
-        // The throw-path release is emitted by `stringPinArgUnwindCleanup` via the
-        // throw chain (installed above).
-        if (!diverged_)
-            releaseBorrowedStringArgPins(closureStringPins);
+        emitPendingCheck();
         // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): drop the producer's +1
         // for every call-bounded closure argument on the NORMAL return edge.
         // Gated on `!diverged_` (mirror #429's `!diverged_` discipline at line
@@ -8062,6 +8068,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // double-free).
         if (!diverged_) {
             for (llvm::Value* cl : callBoundedClosures) emitClosureRelease(cl);
+            // fix-forward #5281: release the borrowed-string-argument pins on the
+            // normal-return edge. The unwind path is handled by stringPinArgUnwind-
+            // Cleanup above, per §28.3's Exception-path discharge.
+            releaseBorrowedStringArgPins(stringPinArgs);
         }
         return retTy->isVoidTy() ? nullptr : r;
     };
@@ -8089,7 +8099,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 llvm::Value* addr = boxedStorage(pit->second, ety);
                 closurePtr = builder_.CreateLoad(ptrTy(), addr);
             }
-            return emitClosureCall(closurePtr, rt);
+            return emitClosureCall(closurePtr, rt, &call);
         }
     }
     if (auto* loc = dynamic_cast<sema::LocalSymbol*>(calleeSym)) {
@@ -8106,7 +8116,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     closurePtr = builder_.CreateLoad(ptrTy(), addr);
                 }
             }
-            llvm::Value* r = emitClosureCall(closurePtr, rt);
+            llvm::Value* r = emitClosureCall(closurePtr, rt, &call);
             // fix #4422 (§27.5, v0.298): a reassigned closure-typed local's
             // final value is excluded from scope-end release (ClosureEscapeWalker
             // marks any reassigned local as escaped), so without an explicit
@@ -8253,7 +8263,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
-            return emitClosureCall(closurePtr, rt);
+            return emitClosureCall(closurePtr, rt, &call);
         }
     }
     // fix #2589 (§23.1/§23/§2.8.2/§28.9, v0.236): directly invoking a
@@ -8329,7 +8339,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             if (rt && rt->kind == sema::TypeRef::Kind::Function) {
                 llvm::Value* closurePtr = lowerExpr(*call.callee);
-                return emitClosureCall(closurePtr, rt);
+                return emitClosureCall(closurePtr, rt, &call);
             }
         }
     }
@@ -8500,7 +8510,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         sema::TypeRef* calleeTy = ctx_.exprType(*call.callee);
         if (calleeTy && calleeTy->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
-            llvm::Value* ccRes = emitClosureCall(closurePtr, calleeTy);
+            llvm::Value* ccRes = emitClosureCall(closurePtr, calleeTy, &call);
             // fix #4239 (§27.5 / §28.9, v0.300): when the chain-call result is
             // a class/record type, store through the local's OWN slot and register
             // scope-end disposal.  lowerLocalDecl wires the slot to us via
