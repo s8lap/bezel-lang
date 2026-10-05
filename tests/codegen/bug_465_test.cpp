@@ -69,13 +69,13 @@ int run(const std::string& src) {
 
 // ── #465 core: the exact verified reproducer ─────────────────────────────────
 
-// §15.4 / §15.2 / stdlib §4.4 / #465: `var a: Array<int> := [1,2,3]; a.Length`.
+// §15.4 / §15.2 / stdlib §4.4 / #465: `var a: Array<int> := [1,2,3]; a.Count`.
 // Before fix: malformed IR → verifier abort → SIGSEGV. Expected: 3.
 BEZEL_TEST(bug465_heap_array_literal, array_int_literal_length_465) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: Array<int> := [1, 2, 3]; "
-        "  return a.Length; "   // expect 3
+        "  return a.Count; "   // expect 3
         "end Main; end C;"), 3);
 }
 
@@ -136,7 +136,7 @@ BEZEL_TEST(bug465_heap_array_literal, array_string_literal_465) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: Array<string> := [\"ab\", \"cde\", \"f\"]; "
-        "  return a.Length + a[1].Length; "   // 3 + 3 = 6
+        "  return a.Count + a[1].Length; "   // 3 + 3 = 6
         "end Main; end C;"), 6);
 }
 
@@ -181,7 +181,7 @@ BEZEL_TEST(bug465_heap_array_literal, array_interface_literal_465) {
         "class F : IShape public method Area(): int return 42; end Area; end F; "
         "class C public static method Main(): int "
         "  var a: Array<IShape> := [new F(), new F()]; "
-        "  return a[0].Area() + a.Length; "   // 42 + 2 = 44
+        "  return a[0].Area() + a.Count; "   // 42 + 2 = 44
         "end Main; end C;"), 44);
 }
 
@@ -193,7 +193,7 @@ BEZEL_TEST(bug465_heap_array_literal, array_int_empty_literal_465) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: Array<int> := []; "
-        "  return a.Length; "   // expect 0
+        "  return a.Count; "   // expect 0
         "end Main; end C;"), 0);
 }
 
@@ -204,7 +204,7 @@ BEZEL_TEST(bug465_heap_array_literal, array_int_empty_literal_then_add_465) {
         "module M; class C public static method Main(): int "
         "  var a: Array<int> := []; "
         "  a.Add(7); a.Add(8); "
-        "  return a.Length + a[0] + a[1]; "   // 2 + 7 + 8 = 17
+        "  return a.Count + a[0] + a[1]; "   // 2 + 7 + 8 = 17
         "end Main; end C;"), 17);
 }
 
@@ -262,7 +262,7 @@ BEZEL_TEST(bug465_heap_array_literal, field_init_array_int_literal_465) {
         "  public a: Array<int> := [1, 2, 3]; "
         "  public static method Main(): int "
         "    using var c := new C(); "
-        "    return c.a.Length + c.a[2]; "   // 3 + 3 = 6
+        "    return c.a.Count + c.a[2]; "   // 3 + 3 = 6
         "  end Main; end C;"), 6);
 }
 
@@ -276,7 +276,7 @@ BEZEL_TEST(bug465_heap_array_literal, return_array_int_literal_465) {
         "  public static method Make(): owned Array<int> return [9, 8, 7]; end Make; "
         "  public static method Main(): int "
         "    using var a := Make(); "
-        "    return a[0] + a.Length; "   // 9 + 3 = 12
+        "    return a[0] + a.Count; "   // 9 + 3 = 12
         "  end Main; end C;"), 12);
 }
 
@@ -288,7 +288,7 @@ BEZEL_TEST(bug465_heap_array_literal, return_owned_array_int_literal_465) {
         "    return [9, 8, 7]; end Make; "
         "  public static method Main(): int "
         "    using var a := Make(); "
-        "    return a.Length; "   // expect 3
+        "    return a.Count; "   // expect 3
         "  end Main; end C;"), 3);
 }
 
