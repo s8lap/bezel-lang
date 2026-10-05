@@ -88,7 +88,7 @@ BEZEL_TEST(array_local_bound_to_interface_and_object_no_leak_4913,
         "    var a: Array<char> := ['a','b']; "
         "    var e: IEnumerable<char> := a; "
         "    var o: Object := a; "
-        "    sum := sum + a.Length; "
+        "    sum := sum + a.Count; "
         "  end for; "
         "  return sum; "
         "end Main; end C;";
@@ -111,7 +111,7 @@ BEZEL_TEST(array_local_bound_to_interface_and_object_no_leak_4913,
         "  for var i in 0..<100 do "
         "    var a: Array<char> := ['a','b']; "
         "    var o: Object := a; "
-        "    sum := sum + a.Length; "
+        "    sum := sum + a.Count; "
         "  end for; "
         "  return sum; "
         "end Main; end C;";
@@ -137,7 +137,7 @@ BEZEL_TEST(array_local_bound_to_interface_and_object_no_leak_4913,
         "  for var i in 0..<100 do "
         "    var a: Array<char> := ['a','b']; "
         "    var l: IList<char> := a; "
-        "    sum := sum + a.Length; "
+        "    sum := sum + a.Count; "
         "  end for; "
         "  return sum; "
         "end Main; end C;";
@@ -157,7 +157,7 @@ BEZEL_TEST(array_local_bound_to_interface_and_object_no_leak_4913,
         "  for var i in 0..<100 do "
         "    var a: Array<char> := ['a','b']; "
         "    var r: IReadOnlyList<char> := a; "
-        "    sum := sum + a.Length; "
+        "    sum := sum + a.Count; "
         "  end for; "
         "  return sum; "
         "end Main; end C;";
@@ -180,7 +180,7 @@ BEZEL_TEST(array_local_bound_to_interface_and_object_no_leak_4913,
         "  for var i in 0..<100 do "
         "    var a: Array<int> := [1, 2]; "
         "    var o: Object := a; "
-        "    sum := sum + a.Length; "
+        "    sum := sum + a.Count; "
         "  end for; "
         "  return sum; "
         "end Main; end C;";
@@ -204,7 +204,7 @@ BEZEL_TEST(array_local_bound_to_interface_and_object_no_leak_4913,
         "  var sum: int := 0; "
         "  for var i in 0..<100 do "
         "    var a: Array<char> := ['a','b']; "
-        "    sum := sum + a.Length; "
+        "    sum := sum + a.Count; "
         "  end for; "
         "  return sum; "
         "end Main; end C;";
