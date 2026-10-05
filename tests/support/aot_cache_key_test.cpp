@@ -136,22 +136,26 @@ std::string contractsMode() {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// OBJECT KEY (K1): compiler ‖ codegen mode ‖ stdlib prelude ‖ source
-// — and NOTHING else.
+// OBJECT KEY (K1): compiler ‖ runtime ‖ codegen mode ‖ stdlib prelude ‖ source.
+// Per fix #5288, the runtime is NOT free here: decimal literal folding calls
+// bz_decimal_parse_cstr at compile time (LlvmBackend_Exprs.cpp:226,
+// ExprTypecheck_Exprs.cpp:50), so a runtime change that affects parsing produces
+// a different folded constant for the same source. K1 must carry the runtime
+// hash or a stale folded object is served from a warm cache.
 // ---------------------------------------------------------------------------
 
 // A different compiler must never serve another compiler's object. This is the
 // single most important property in the file: it is what makes "the suite
 // validated THIS compiler" true.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_compiler_moves) {
-    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
-                      composeObjectKey(ident(2), plainMode(), kPrelude, kSourceA, kToolchain));
+    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+                      composeObjectKey(ident(2), ident(1), plainMode(), kPrelude, kSourceA, kToolchain));
 }
 
 // A different program must never serve another program's object.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_source_moves) {
-    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
-                      composeObjectKey(ident(1), plainMode(), kPrelude, kSourceB, kToolchain));
+    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+                      composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceB, kToolchain));
 }
 
 // Every CodegenOptions bit alters the emitted object, so each must key apart.
@@ -160,28 +164,29 @@ BEZEL_TEST(aot_cache_key, object_key_moves_when_the_source_moves) {
 // net, and would report clean because nothing was watching.
 BEZEL_TEST(aot_cache_key, object_key_separates_every_codegen_mode) {
     const std::set<std::string> keys{
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain),
-        composeObjectKey(ident(1), asanMode(), kPrelude, kSourceA, kToolchain),
-        composeObjectKey(ident(1), checkedMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), ident(1), asanMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), ident(1), checkedMode(), kPrelude, kSourceA, kToolchain),
         // fix #2877: checked-CONTRACTS is a fourth distinct artifact. It was
         // missing from this row and from both composers, which is how the
         // collision below survived.
-        composeObjectKey(ident(1), contractsMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), ident(1), contractsMode(), kPrelude, kSourceA, kToolchain),
     };
     BEZEL_EXPECT_EQ(keys.size(), static_cast<std::size_t>(4));
 }
 
-// The object key must NOT depend on the runtime archive or the link recipe:
-// codegen consults neither (nothing under src/codegen, src/sema, src/ownership
-// or src/module includes a runtime header or names BEZEL_RUNTIME_LIB_PATH —
-// the archive reaches the build only through Driver's link command). That
-// independence is what keeps every cached object valid across a runtime-only
-// rebuild. The composer has no runtime or recipe parameter at all, which is the
-// structural form of the claim; this pins that the LINK key does move with the
-// runtime, so the two halves genuinely separate rather than both being blind.
-BEZEL_TEST(aot_cache_key, object_key_is_independent_of_runtime_and_recipe) {
-    BEZEL_EXPECT_EQ(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain),
-                    composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain));
+// FIX #5288: the object key MUST depend on the runtime. Decimal literal folding
+// calls bz_decimal_parse_cstr in-process at compile time, so the folded constant
+// depends on the runtime bytes. Before the fix, K1 omitted the runtime and a
+// stale folded object was served after a runtime change. This row pins the fix:
+// a different runtime identity must produce a different object key, so the cache
+// does not serve a stale folded object after a runtime-only rebuild.
+//
+// The link key still moves with the runtime independently — the two halves
+// genuinely separate rather than both being blind to it.
+BEZEL_TEST(aot_cache_key, object_key_moves_when_the_runtime_moves_5288) {
+    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+                      composeObjectKey(ident(1), ident(2), plainMode(), kPrelude, kSourceA, kToolchain));
     const std::string recipe = Driver::linkRecipeSignature(false);
     BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe, kToolchain) !=
                       composeLinkKey(ident(9), ident(2), recipe, kToolchain));
@@ -201,8 +206,8 @@ BEZEL_TEST(aot_cache_key, object_key_is_independent_of_runtime_and_recipe) {
 // removed, so the property cannot regress unnoticed.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_stdlib_prelude_moves) {
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
-        composeObjectKey(ident(1), plainMode(), kPreludeChanged, kSourceA, kToolchain));
+        composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+        composeObjectKey(ident(1), ident(1), plainMode(), kPreludeChanged, kSourceA, kToolchain));
 }
 
 // …and the key the harness actually mints must use the DRIVER's prelude text,
@@ -226,6 +231,7 @@ BEZEL_TEST(aot_cache_key, live_object_key_uses_the_drivers_prelude_text) {
     if (!live.empty()) {  // empty only where the split is unusable
         BEZEL_EXPECT_EQ(live, composeObjectKey(
                                   bezel::test::aot_detail::buildIdentity().compiler,
+                                  bezel::test::aot_detail::buildIdentity().runtime,
                                   plainMode(), driverPrelude, kSourceA,
                                   bezel::test::aot_detail::buildIdentity().toolchain));
     }
@@ -252,8 +258,8 @@ BEZEL_TEST(aot_cache_key, live_object_key_uses_the_drivers_prelude_text) {
 // file exists to prevent. (#3006.)
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_toolchain_moves) {
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)) !=
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(6)));
+        composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, ident(5)) !=
+        composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, ident(6)));
 }
 
 // The same holds for the LINK product: a clang/ld update can link different
@@ -271,8 +277,8 @@ BEZEL_TEST(aot_cache_key, link_key_moves_when_the_toolchain_moves) {
 // failed, the cache would never warm and the fix would be useless.
 BEZEL_TEST(aot_cache_key, toolchain_key_is_stable_across_rebuilds) {
     BEZEL_EXPECT_EQ(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)),
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)));
+        composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, ident(5)),
+        composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, ident(5)));
     const std::string recipe = Driver::linkRecipeSignature(false);
     BEZEL_EXPECT_EQ(composeLinkKey(ident(9), ident(1), recipe, ident(5)),
                     composeLinkKey(ident(9), ident(1), recipe, ident(5)));
@@ -394,7 +400,7 @@ BEZEL_TEST(aot_cache_key, object_and_link_keys_never_collide) {
     // Feed both composers the most similar inputs available and require the
     // outputs to differ; the "k3l;" tag on the link key guarantees it.
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+        composeObjectKey(ident(1), ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
         composeLinkKey(ident(1), ident(1), Driver::linkRecipeSignature(false), kToolchain));
 }
 
@@ -971,8 +977,8 @@ BEZEL_TEST(aot_cache_key, a_clean_environment_contributes_no_key_input_2877) {
     const std::string mode = plainMode();
     BEZEL_EXPECT_TRUE(withEnvironment(mode, "") == mode);
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), withEnvironment(mode, ""), kPrelude, kSourceA, kToolchain) ==
-        composeObjectKey(ident(1), mode, kPrelude, kSourceA, kToolchain));
+        composeObjectKey(ident(1), ident(1), withEnvironment(mode, ""), kPrelude, kSourceA, kToolchain) ==
+        composeObjectKey(ident(1), ident(1), mode, kPrelude, kSourceA, kToolchain));
     // And the live formatter appends via that same seam, so the mode text is
     // still exactly the documented schema when nothing is set. (The literal is
     // hardcoded on purpose — mm=1 because CodegenOptions::isMainModule defaults
@@ -992,7 +998,7 @@ BEZEL_TEST(aot_cache_key, a_behaviour_changing_environment_moves_the_object_key_
     using bezel::test::aot_detail::withEnvironment;
     const std::string mode = plainMode();
     auto keyFor = [&](const char* env) {
-        return composeObjectKey(ident(1), withEnvironment(mode, env), kPrelude,
+        return composeObjectKey(ident(1), ident(1), withEnvironment(mode, env), kPrelude,
                                 kSourceA, kToolchain);
     };
     const std::string clean = keyFor("");

@@ -2256,20 +2256,19 @@ inline std::string computeCacheKey(std::string_view source,
 //   object  = compileExecutableObject(source)   depends on: COMPILER, opts, source
 //   exe     = linkExecutableObject(object)      depends on: object, RUNTIME, recipe
 //
-// VERIFIED, not assumed: nothing under src/codegen, src/sema, src/ownership or
-// src/module includes a runtime header or names BEZEL_RUNTIME_LIB_PATH; the
-// runtime archive appears exactly once in the compiler, in Driver's link
-// command (Driver::linkCommandLine). Every ABI/layout constant codegen shares
-// with the runtime is a literal compiled INTO bezel_core, hence covered by the
-// compiler identity. So the emitted object is independent of the runtime
-// archive's bytes, and the split is exact — not an approximation.
+// EXCEPTION (fix #5288): decimal literal folding (§6.3) calls bz_decimal_parse_cstr
+// in-process at compile time (LlvmBackend_Exprs.cpp:226, ExprTypecheck_Exprs.cpp:50),
+// so the folded constant depends on the runtime bytes, not merely on the compiler.
+// K1 therefore includes the runtime hash — a runtime-only rebuild now re-folds
+// decimal literals rather than serving a stale folded object.
 //
 // Keying each half on its own inputs therefore gives:
-//   * a runtime-only rebuild  → every cached OBJECT stays valid (no front-end
-//     work at all); only links re-run.
-//   * a compiler-only rebuild → every cached LINK stays valid for each object
+//   * a compiler-only rebuild  → every cached LINK stays valid for each object
 //     that came out byte-identical (i.e. all but the handful of tests the
 //     change actually affects), so the gate pays codegen but not the link.
+//   * a runtime-only rebuild   → every cached OBJECT is invalidated by the
+//     runtime hash in K1, so decimal literals are re-folded against the new
+//     runtime rather than served stale from a warm cache.
 //
 // THE THREE KEYS (all SHA-256, all hex):
 //   KE ("k2;", unchanged) = H(compiler ‖ runtime ‖ mode ‖ source) → exe.
@@ -2277,7 +2276,7 @@ inline std::string computeCacheKey(std::string_view source,
 //        its composition untouched, so pre-split entries were still served by
 //        it; fix #2877's `;cc=` bit has since moved it (see modeString), which
 //        orphans those entries rather than mis-serving them.
-//   K1 ("k3o;") = H(compiler ‖ codegen-mode ‖ stdlib-prelude ‖ source) → object.
+//   K1 ("k3o;") = H(compiler ‖ runtime ‖ codegen-mode ‖ stdlib-prelude ‖ source) → object.
 //        The prelude (Driver::preludeSourceFingerprint) is the text the driver
 //        injects into EVERY compilation unit, so it is as much an input to the
 //        emitted object as the user's own source. It is keyed explicitly even
@@ -2351,13 +2350,20 @@ inline const std::string& linkRecipeSignature(bool sanitizeAddress) {
 // compiled-in constant, and a refactor that loaded the stdlib from disk would
 // silently drop that coverage while every test still passed. Keying the text
 // directly makes the property survive that refactor.
+// per #5288: the runtime identity is part of K1 because decimal literal folding
+// calls bz_decimal_parse_cstr at compile time (codegen, not just sema), so the
+// folded constant depends on the runtime bytes. Before the fix, K1 omitted the
+// runtime and a stale folded object was served after a runtime change.
 inline std::string composeObjectKey(const std::array<uint8_t, 32>& compilerId,
+                                    const std::array<uint8_t, 32>& runtimeId,
                                     const std::string& codegenMode,
                                     std::string_view preludeText,
                                     std::string_view source,
                                     const std::array<uint8_t, 32>& toolchainId) {
     llvm::SHA256 h;
     h.update(llvm::ArrayRef<uint8_t>(compilerId.data(), compilerId.size()));
+    // per #5288: runtime identity (for compile-time decimal folding).
+    h.update(llvm::ArrayRef<uint8_t>(runtimeId.data(), runtimeId.size()));
     h.update(llvm::StringRef(codegenMode.data(), codegenMode.size()));
     // Length-prefixed so no prelude/source boundary shuffle can collide.
     const std::string plen = std::to_string(preludeText.size()) + ";";
@@ -2403,14 +2409,20 @@ inline std::string composeLinkKey(const std::array<uint8_t, 32>& objectHash,
     return toHex(h.final());
 }
 
-// K1: the OBJECT key — compiler identity ‖ codegen mode ‖ stdlib prelude ‖
-// source: every input the emitted object depends on. Deliberately free of any
-// runtime component (see above). "" when the split is unusable.
+// K1: the OBJECT key — compiler identity ‖ runtime identity ‖ codegen mode ‖
+// stdlib prelude ‖ source: every input the emitted object depends on.
+//
+// FIX #5288: the runtime is NOT free here. Decimal literal folding (§6.3) calls
+// bz_decimal_parse_cstr from the runtime in-process at compile time
+// (LlvmBackend_Exprs.cpp:226, ExprTypecheck_Exprs.cpp:50), so a runtime change
+// that affects decimal parsing produces a different folded constant for the same
+// source. K1 must include the runtime hash or a stale folded object is served.
+// "" when the split is unusable.
 inline std::string computeObjectKey(std::string_view source,
                                     const codegen::CodegenOptions& opts) {
     const BuildIdentity& id = buildIdentity();
     if (!id.usable || !id.splitUsable) return {};
-    return composeObjectKey(id.compiler, codegenModeString(opts),
+    return composeObjectKey(id.compiler, id.runtime, codegenModeString(opts),
                             preludeFingerprint(), source, id.toolchain);
 }
 
