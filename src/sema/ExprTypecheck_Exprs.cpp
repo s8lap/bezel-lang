@@ -27,6 +27,33 @@ namespace {
 
 // §5: parse an integer literal's magnitude (ignoring base prefix,
 // underscores, and any type suffix). Returns true and the value via `out`
+// when it parses; saturates large hex/decimal in the rare overflow case
+// (which still exceeds int and is reported). Mirrors the codegen parser.
+bool intLiteralMagnitude(std::string_view text, unsigned long long& out) {
+    int base = 10;
+    std::size_t i = 0;
+    if (text.size() >= 2 && text[0] == '0') {
+        char b = text[1];
+        if (b == 'x' || b == 'X') { base = 16; i = 2; }
+        else if (b == 'b' || b == 'B') { base = 2; i = 2; }
+        else if (b == 'o' || b == 'O') { base = 8; i = 2; }
+    }
+    std::string digits;
+    for (; i < text.size(); ++i) {
+        char c = text[i];
+        if (c == '_') continue;
+        bool isDigit = (c >= '0' && c <= '9');
+        bool isHex =
+            isDigit || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (base == 16 ? !isHex : !isDigit) break;  // stop at suffix letters
+        digits.push_back(c);
+    }
+    if (digits.empty()) return false;
+    errno = 0;
+    out = std::strtoull(digits.c_str(), nullptr, base);
+    return true;
+}
+
 // §4.3/§4.4 (v0.190, #1781): true iff the `m`/`M`-suffixed decimal literal
 // `text` denotes a value outside `decimal`'s range. Parses at compile time via
 // the runtime's `bz_decimal_parse_cstr` — the identical parser codegen uses
@@ -727,15 +754,6 @@ TypeRef* ExprTC::bindLambdaDestructure(const ast::DestructuringPattern& dp,
             // per §27.4: "each binding is an ordinary read of the
             // corresponding positional field at body entry" — a naked
             // identifier slot (`Entry(k, v)`).
-            // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
-            if (sp.nakedBinding != "_" &&
-                scope.names.find(sp.nakedBinding) != scope.names.end()) {
-                ctx_.diagnostics().report(
-                    Severity::Error, sp.nakedAnchor->span.begin,
-                    std::string("a local named `") +
-                    std::string(sp.nakedBinding) +
-                    "` is already declared in this scope (§19.3, §21.1, v0.314)");
-            }
             auto* lsym = ctx_.makeSymbol<LocalSymbol>();
             lsym->name = sp.nakedBinding;
             lsym->decl = sp.nakedAnchor.get();  // #1271 real Node anchor
@@ -3629,8 +3647,8 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                          tt->astNode && tt->astNode->name &&
                          !tt->astNode->name->parts.empty()) {
                     std::string_view cn = tt->headName();
-                    // issue #545: __Buffer<T>[i] → T (genericArgs[0]).
-                    if ((cn == "__Buffer" || cn == "Buffer") && !tt->genericArgs.empty() &&
+                    // issue #545: Buffer<T>[i] → T (genericArgs[0]).
+                    if (cn == "Buffer" && !tt->genericArgs.empty() &&
                         tt->genericArgs[0]) {
                         ctx_.setExprType(&e, tt->genericArgs[0]);
                     }
@@ -5365,18 +5383,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             ne->args[0].value.get());
                     }
                 }
-                // issue #545: `new __Buffer<T>(n)` — T-restriction check.
-                // __Buffer<T> requires T to be a value-type primitive in this revision:
+                // issue #545: `new Buffer<T>(n)` — T-restriction check.
+                // Buffer<T> requires T to be a value-type primitive in this revision:
                 // {bool, char, byte, sbyte, short, ushort, int, uint, long, ulong,
                 //  float, double, decimal}.  Class, record, string, and interface
                 // elements re-open the §5.20 borrow-storing / zeroed-slot-disposal
                 // questions; they are explicitly out of scope for this slice.
-                // Diagnostic: "__Buffer<T> requires a value-type element in this
+                // Diagnostic: "Buffer<T> requires a value-type element in this
                 // revision; class elements await the §5.20 design (#545)."
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty() &&
-                    rt->headName() == "__Buffer") {
+                    rt->headName() == "Buffer") {
                     bool tOk = false;
                     if (!rt->genericArgs.empty() && rt->genericArgs[0]) {
                         const TypeRef* ta = rt->genericArgs[0];
@@ -5393,7 +5411,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     if (!tOk) {
                         ctx_.diagnostics().report(
                             Severity::Error, ne->span.begin,
-                            "__Buffer<T> requires a value-type element in this "
+                            "Buffer<T> requires a value-type element in this "
                             "revision; class elements await the \xC2\xA7""5.20 "
                             "design (#545)");
                     }
@@ -7115,9 +7133,8 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 // known non-null even though exprType keeps the nullable flag
                 // (null-narrowing does not rewrite exprType). This is the same
                 // question §7.11's own gates ask, so it is the same predicate
-                // (#3298) rather than a fifth copy of the lookup. initNarrow=false
-                // excludes init-narrowing: only null-test narrowing admits the operator.
-                return !isNarrowedNonNullRead(operand, false);
+                // (#3298) rather than a fifth copy of the lookup.
+                return !isNarrowedNonNullRead(operand);
             };
             if (nullableStringOperand(be.left.get()) ||
                 nullableStringOperand(be.right.get())) {
@@ -7289,13 +7306,30 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         // because §8.4 provides intrinsic underlying-integer equality.
         if (le && re && le == re &&
             (op == "<" || op == ">" || op == "<=" || op == ">=")) {
+            // Get the underlying type name for the diagnostic.
+            std::string underlying = "int";
+            if (le->enumUnderlyingType &&
+                le->enumUnderlyingType->kind == TypeRef::Kind::Primitive) {
+                using P = sema::PrimitiveType;
+                switch (le->enumUnderlyingType->primitive) {
+                    case P::Byte:   underlying = "byte";   break;
+                    case P::SByte:  underlying = "sbyte";  break;
+                    case P::Short:  underlying = "short";  break;
+                    case P::UShort: underlying = "ushort"; break;
+                    case P::Int:    underlying = "int";    break;
+                    case P::UInt:   underlying = "uint";   break;
+                    case P::Long:   underlying = "long";   break;
+                    case P::ULong:  underlying = "ulong";  break;
+                    default:        underlying = "int";    break;
+                }
+            }
             ctx_.diagnostics().report(
                 Severity::Error, be.span.begin,
                 "operator `" + std::string(op) + "` is not defined for enum "
                 "`" + std::string(le->name) +
                 "` — an enum has no intrinsic ordering (\xC2\xA7""10.5). "
-                "Use `int(a) < int(b)` (explicit cast to the underlying type), "
-                "declare the four-operator group "
+                "Use `int(a) < int(b)` (explicit cast to " + underlying +
+                "), declare the four-operator group "
                 "(`operator <`/`<=`/`>`/`>=`) on the enum, or implement "
                 "`IComparable<" + std::string(le->name) + ">`.");
             ctx_.setExprType(&be,
@@ -7517,12 +7551,11 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             };
             // §7.11 reads the operand's STATIC type at this program point, so a
             // §7.4-narrowed operand is a non-nullable operand here — the ONE
-            // narrowing predicate (#3298), not a local copy of it. initNarrow=false
-            // excludes init-narrowing: only null-test narrowing admits the operator.
+            // narrowing predicate (#3298), not a local copy of it.
             bool lNull = isNullableValueOperand(ltN) &&
-                         !isNarrowedNonNullRead(be.left.get(), false);
+                         !isNarrowedNonNullRead(be.left.get());
             bool rNull = isNullableValueOperand(rtN) &&
-                         !isNarrowedNonNullRead(be.right.get(), false);
+                         !isNarrowedNonNullRead(be.right.get());
             if (lNull || rNull) {
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
@@ -7589,7 +7622,7 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         if (inLt && inLt->nullable && inRt &&
             inRt->kind == TypeRef::Kind::Named &&
             inRt->declaration == ctx_.builtinClassSym("Range") &&
-            !isNarrowedNonNullRead(be.left.get(), false)) {
+            !isNarrowedNonNullRead(be.left.get())) {
             ctx_.diagnostics().report(
                 Severity::Error, be.span.begin,
                 "the left operand of `in` over a range is nullable \xE2\x80\x94 "
@@ -7957,13 +7990,11 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             // at this program point even though exprType keeps the nullable
             // flag; `isNarrowedNonNullRead` is the ONE predicate that decides
             // that (#3298) — mutable fields and properties never narrow (§7.4),
-            // and `this`/`base` are not narrowable operands. initNarrow=false
-            // excludes init-narrowing (the §6.6 worked example): only null-test
-            // narrowing (e.g. `if a <> null`) admits the §7.11 operator.
+            // and `this`/`base` are not narrowable operands.
             bool lNull = isNullablePrim(lt) &&
-                         !isNarrowedNonNullRead(be.left.get(), false);
+                         !isNarrowedNonNullRead(be.left.get());
             bool rNull = isNullablePrim(rt) &&
-                         !isNarrowedNonNullRead(be.right.get(), false);
+                         !isNarrowedNonNullRead(be.right.get());
             // Per §3.5 only the §7.11-gated operator families are subject to
             // this rule. Equality (`=`/`<>`) is excluded above. User-declared
             // operators on a nullable user-type operand are rejected at the
@@ -8774,9 +8805,8 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // lookup-time narrowing analysis, #914) is a non-nullable operand here
         // and the ordinary unary operator applies. Mirror the §7.11 binary
         // operator's narrower rejection family so the diagnostic matches.
-        // initNarrow=false excludes init-narrowing: only null-test narrowing admits.
         if (ot && ot->kind == TypeRef::Kind::Primitive && ot->nullable) {
-            if (!isNarrowedNonNullRead(ue.operand.get(), false)) {
+            if (!isNarrowedNonNullRead(ue.operand.get())) {
                 const char* opWord =
                     (op == "~") ? "bitwise complement (`~`)" :
                     (op == "-") ? "negation (unary `-`)" :
@@ -9016,7 +9046,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // replacement idiom (`s = null or s.IsEmpty`) did not type-check.
         if (be->op == "and" && be->left && be->right) {
             auto savedNull = nullNarrowed_;
-            auto savedInit = initNarrowed_;
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
@@ -9034,7 +9063,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // `s.Length` compiled to a null dereference (silent ACCEPT,
             // SIGSEGV). The intersection keeps the drop and still discards the
             // left operand's seeded facts (absent from the snapshot).
-            intersectNarrowingSetsWith(savedNull, savedInit, savedNarrow, savedField);
+            intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
         } else if (be->op == "or" && be->left && be->right) {
             // fix #3877 (§7.4, v0.294): symmetric to the `and` case above,
             // false-facts instead of true-facts. Same intersect-not-assign
@@ -9043,12 +9072,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // dropping mutably-captured locals), and un-seeding must keep
             // that drop rather than resurrecting the entry snapshot.
             auto savedNull = nullNarrowed_;
-            auto savedInit = initNarrowed_;
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/false);
             visitExpr(*be->right);
-            intersectNarrowingSetsWith(savedNull, savedInit, savedNarrow, savedField);
+            intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
         } else if (be->right) {
             visitExpr(*be->right);
         }
@@ -9670,17 +9698,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                              cn == "SortedDictionary" ||
                                              cn == "OwningDictionary") &&
                                             mn == "TryGetValue";
-                                        bool ownSetElem =
-                                            cn == "OwningSet" &&
-                                            mn == "TryPop" && pos2 == 1;
                                         if (posElem && !rt->genericArgs.empty())
                                             elemT = rt->genericArgs[0];
                                         else if (valElem &&
                                                  rt->genericArgs.size() >= 2)
                                             elemT = rt->genericArgs[1];
-                                        else if (ownSetElem &&
-                                                 !rt->genericArgs.empty())
-                                            elemT = rt->genericArgs[0];
                                         if (elemT) {
                                             TypeRef* nn =
                                                 ctx_.makeTypeRef(*elemT);
@@ -9775,16 +9797,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 prim(ptB);
                             }
                         }
-                    }
-                    // §21.1 (#5370, v0.314): a local's name must be unique within
-                    // its immediate scope — inline `out var` is a local declaration.
-                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
-                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
-                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, id->span.begin,
-                            std::string("a local named `") + std::string(id->name) +
-                            "` is already declared in this scope (§21.1, v0.314)");
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -9904,7 +9916,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                               mn == "TryPopLast") &&
                                              pos2 == 0) ||
                                             (cn == "OwningSet" &&
-                                             mn == "TryPop" && pos2 == 1) ||
+                                             mn == "TryTake" && pos2 == 1) ||
                                             (cn == "Channel" &&
                                              mn == "TryReceive" && pos2 == 0)) {
                                             if (!rt->genericArgs.empty() &&
@@ -9941,16 +9953,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 }
                             }
                         }
-                    }
-                    // §21.1 (#5370, v0.314): a local's name must be unique within
-                    // its immediate scope — inline `out owned var` is a local declaration.
-                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
-                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
-                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, id->span.begin,
-                            std::string("a local named `") + std::string(id->name) +
-                            "` is already declared in this scope (§21.1, v0.314)");
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -10160,16 +10162,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         }
                     }
                     }  // close `if (!lsym->declType)` (#1304)
-                    // §21.1 (#5370, v0.314): a local's name must be unique within
-                    // its immediate scope — inline `out using var` is a local declaration.
-                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
-                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
-                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, id->span.begin,
-                            std::string("a local named `") + std::string(id->name) +
-                            "` is already declared in this scope (§21.1, v0.314)");
-                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -10518,7 +10510,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 dynamic_cast<ParameterSymbol*>(asym)) {
                                 narrowings_.erase(asym);
                                 nullNarrowed_.erase(asym);
-                                initNarrowed_.erase(asym);  // init-narrowing (§6.6) also invalidated by out/ref
                                 // §7.4 v0.214 (#2085/#2116): the callee may
                                 // rebind the ref/out local, so any `local._f`
                                 // facts riding it no longer hold.
@@ -10635,31 +10626,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                              primCastTarget,
                                              primCastCalleeId->name,
                                              nc->span.begin);
-        }
-        // fix #5344 (§5.3, v0.314): `T?(x)` is admitted exactly when the
-        // corresponding non-nullable conversion `T(v)` is admitted. Since
-        // `bool(decimal)` / `bool(float)` / `bool(double)` / `bool(char)` is
-        // not admitted (§5.2: truthiness-shaped, partial), `bool?(decimal?)` /
-        // `bool?(float?)` / `bool?(double?)` / `bool?(char?)` is not admitted
-        // either.
-        if (typedAsPrimCast && primCastTarget == PrimitiveType::Bool &&
-            nc->args.size() == 1 && nc->args[0].value) {
-            const TypeRef* argTy = ctx_.exprType(*nc->args[0].value);
-            if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
-                argTy->nullable) {
-                PrimitiveType srcPt = argTy->primitive;
-                if (srcPt == PrimitiveType::Char ||
-                    srcPt == PrimitiveType::Float ||
-                    srcPt == PrimitiveType::Double ||
-                    srcPt == PrimitiveType::Decimal) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, nc->span.begin,
-                        "conversion between a numeric type and `bool` "
-                        "is not permitted (§5.1/§5.2, §5.3 nullable "
-                        "operand)");
-                    return;
-                }
-            }
         }
         if (!typedAsPrimCast) {
             // §27.7 (#738): `f?(args)` invokes the nullable function value `f`
@@ -10837,16 +10803,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // already has `nullable == false`, so removing the
                         // strip is a no-op for that case.
                     }
-                    // §21.1 (#5370, v0.314): a local's name must be unique within
-                    // its immediate scope — inline `out var` is a local declaration.
-                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
-                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
-                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, id->span.begin,
-                            std::string("a local named `") + std::string(id->name) +
-                            "` is already declared in this scope (§21.1, v0.314)");
-                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -10896,16 +10852,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // handled by the OWNERSHIP pass instead, and are
                         // deliberately not DA-tracked here.
                     }
-                    // §21.1 (#5370, v0.314): a local's name must be unique within
-                    // its immediate scope — inline `out owned var` is a local declaration.
-                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
-                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
-                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, id->span.begin,
-                            std::string("a local named `") + std::string(id->name) +
-                            "` is already declared in this scope (§21.1, v0.314)");
-                    }
                     currentScope_->names[id->name] = lsym;
                 }
             }
@@ -10947,16 +10893,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // per §22.4 / §7.9: do NOT strip the declared
                         // nullability — same reasoning as the `out var` /
                         // `out owned var` blocks above.
-                    }
-                    // §21.1 (#5370, v0.314): a local's name must be unique within
-                    // its immediate scope — inline `out using var` is a local declaration.
-                    // The setter's implicit `value` param is exempt (Appendix B / §23.3).
-                    if (!(setterImplicitValueExempt_ && id->name == "value") &&
-                        currentScope_->names.find(id->name) != currentScope_->names.end()) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, id->span.begin,
-                            std::string("a local named `") + std::string(id->name) +
-                            "` is already declared in this scope (§21.1, v0.314)");
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -11328,14 +11264,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // branch).
         auto entryNarrowings = narrowings_;
         auto entryNullNarrowed = nullNarrowed_;
-        auto entryInit = initNarrowed_;
         auto entryFieldNarrowed = fieldNarrowed_;
         // §28.3 A7 (v0.209, #2080): an if-expression BRANCH is a marked-
         // transfer admission position — announce the exact child node.
         const ast::Expr* savedSlot = markedArmSlot_;
         bool haveThenExit = false;
         std::unordered_set<Symbol*> thenExitNull;
-        std::unordered_set<Symbol*> thenExitInit;
         std::unordered_map<Symbol*, TypeRef*> thenExitNarrowings;
         std::set<std::pair<std::uint32_t, std::uint32_t>> thenExitField;
         if (ce->thenValue) {
@@ -11347,13 +11281,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // path where the test FAILED (probe-confirmed silent ACCEPT).
             narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
-            initNarrowed_ = entryInit;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/true);
             markedArmSlot_ = ce->thenValue.get();
             visitExpr(*ce->thenValue);
             thenExitNull = nullNarrowed_;
-            thenExitInit = initNarrowed_;
             thenExitNarrowings = narrowings_;
             thenExitField = fieldNarrowed_;
             haveThenExit = true;
@@ -11361,7 +11293,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (ce->elseValue) {
             narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
-            initNarrowed_ = entryInit;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/false);
             markedArmSlot_ = ce->elseValue.get();
@@ -11371,11 +11302,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // The live sets hold the else branch's exit (or, for a branch-less
         // malformed atom, the entry state); fold in the entry snapshot and the
         // then branch's exit. // per §7.4 (#2258)
-        intersectNarrowingSetsWith(entryNullNarrowed, entryInit,
-                                   entryNarrowings, entryFieldNarrowed);
+        intersectNarrowingSetsWith(entryNullNarrowed, entryNarrowings,
+                                   entryFieldNarrowed);
         if (haveThenExit)
-            intersectNarrowingSetsWith(thenExitNull, thenExitInit,
-                                       thenExitNarrowings, thenExitField);
+            intersectNarrowingSetsWith(thenExitNull, thenExitNarrowings,
+                                       thenExitField);
     } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         if (te->operand) visitExpr(*te->operand);
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
@@ -12331,11 +12262,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // One shared checker with the CaseStmt site below.
         checkOrderingPatternsOverNullableScrutinee(
             scrutTy, ce->arms, ce->scrutinee.get());
-        // §19.3 (v0.314, #5269/#5273): a relational pattern requires a
-        // scrutinee with an intrinsic ordering (integer types, float, double,
-        // decimal, char, string); a range pattern requires integer types or char.
+        // §19.3 (v0.313, #5235): a relational or range pattern requires a
+        // scrutinee with a defined ordering. Object has no ordering, so
+        // reject RelOpPattern and RangePattern over an Object scrutinee.
         // Shared with the CaseStmt site — one rule, two spellings of `case`.
-        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, ce->arms, ce->scrutinee.get());
+        checkOrderingPatternsOverUnorderedScrutinee(scrutTy, ce->arms);
         // §10.6 (#772): "Inside a `case` whose scrutinee is an enum, the enum
         // prefix may be omitted." This holds throughout the construct, INCLUDING
         // arm bodies (`Red => Green`), not only patterns. Inject the scrutinee
@@ -12925,16 +12856,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             checkOrderingPatternOverUnorderedType(
                                 fieldTy, sp.pattern.get());
                             if (!sp.nakedBinding.empty()) {
-                                // §19.3 (#5401, v0.314): bindings of one pattern
-                                // must be distinct.
-                                if (sp.nakedBinding != "_" &&
-                                    armScope.names.find(sp.nakedBinding) != armScope.names.end()) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, sp.nakedAnchor->span.begin,
-                                        std::string("a local named `") +
-                                        std::string(sp.nakedBinding) +
-                                        "` is already declared in this scope (§19.3, §21.1, v0.314)");
-                                }
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = sp.nakedBinding;
                                 lsym->decl = sp.nakedAnchor.get();
@@ -12943,16 +12864,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
                                                sp.pattern.get())) {
-                                // §19.3 (#5401, v0.314): bindings of one pattern
-                                // must be distinct.
-                                if (vbp->name != "_" &&
-                                    armScope.names.find(vbp->name) != armScope.names.end()) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, vbp->span.begin,
-                                        std::string("a local named `") +
-                                        std::string(vbp->name) +
-                                        "` is already declared in this scope (§19.3, §21.1, v0.314)");
-                                }
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = vbp->name;
                                 lsym->decl = vbp;
@@ -13316,15 +13227,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                                           sp.pattern.get());
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
-                        // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
-                        if (sp.nakedBinding != "_" &&
-                            armScope.names.find(sp.nakedBinding) != armScope.names.end()) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, sp.nakedAnchor->span.begin,
-                                std::string("a local named `") +
-                                std::string(sp.nakedBinding) +
-                                "` is already declared in this scope (§19.3, §21.1, v0.314)");
-                        }
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                         lsym->name = sp.nakedBinding;
                         lsym->decl = sp.nakedAnchor.get();  // #1271 real Node anchor
@@ -13335,15 +13237,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // §19.3: `Pt(var x, var y)` — equivalent to bare form;
                         // register the bound name keyed on the BindingPattern
                         // node (codegen keys its slot on the same pointer).
-                        // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
-                        if (vbp->name != "_" &&
-                            armScope.names.find(vbp->name) != armScope.names.end()) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, vbp->span.begin,
-                                std::string("a local named `") +
-                                std::string(vbp->name) +
-                                "` is already declared in this scope (§19.3, §21.1, v0.314)");
-                        }
                         auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                         lsym->name = vbp->name;
                         lsym->decl = vbp;
@@ -13413,13 +13306,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // same wording as the CaseStmt counterpart.
                 auto armEntryNarrow = narrowings_;
                 auto armEntryNull = nullNarrowed_;
-                auto armEntryInit = initNarrowed_;
                 auto armEntryField = fieldNarrowed_;
                 if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(
                         arm.pattern.get())) {
                     if (!cp->constants.empty() && cp->constants[0]) {
                         nullNarrowed_ = armEntryNull;
-                        initNarrowed_ = armEntryInit;
                         fieldNarrowed_ = armEntryField;
                         collectNarrowings(cp->constants[0].get(),
                                           /*forTrueBranch=*/true);
@@ -13436,8 +13327,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     markedArmSlot_ = savedMtSlot;
                 }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
-                intersectNarrowingSetsWith(armEntryNull, armEntryInit,
-                                           armEntryNarrow, armEntryField);  // §7.4 #2258
+                intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
+                                           armEntryField);  // §7.4 #2258
             }
             // §7.4 #2116/#2258: fold this arm's exit into the running
             // intersection (see the lambda).
