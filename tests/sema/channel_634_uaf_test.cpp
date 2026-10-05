@@ -32,8 +32,10 @@
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/sema_support.hpp"
+#include "support/aot_support.hpp"  // runAot
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
@@ -350,7 +352,11 @@ BEZEL_TEST(channel_634_uaf,
 // from auto-dispose which is expected).
 BEZEL_TEST(channel_634_uaf,
            channel_int_element_accepted_sendable_constraint_s4318_002) {
-    auto r = runJit(
+    // runAot, not runJit: this control is about a `using` binding surviving the
+    // ownership + definite-assignment passes, and the in-process JIT harness
+    // skips both (and verifyModule) — so a JIT pass here proves less than the
+    // row's name suggests. Ported off the deprecated oracle per CLAUDE.md.
+    auto r = runAot(
         "module M; "
         "class Program "
         "  public static method Main(): int "

@@ -68,6 +68,7 @@
 
 #include "support/aot_support.hpp"   // runAot
 #include "test_harness.hpp"
+#include "support/aot_result_asserts.hpp"
 
 using bezel::test::runAot;
 
@@ -263,7 +264,11 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    Console.WriteLine(Util.Go<long>(4));\n"
         "  end Main;\n"
         "end Program;\n");
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // Three generic methods that all name their parameter `T`, each calling the
@@ -497,7 +502,11 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    Console.WriteLine(b.Sum());\n"
         "  end Main;\n"
         "end Program;\n");
-    BEZEL_EXPECT_FALSE(r.ran);
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // NO-REGRESSION PIN (#4862): as above, the shadowing body reaching the class
@@ -533,7 +542,11 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    Console.WriteLine(b.Show());\n"
         "  end Main;\n"
         "end Program;\n");
-    BEZEL_EXPECT_FALSE(r.ran);
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // NO-REGRESSION PIN (#4862): the shadowing shape at `Box<string>` and
@@ -564,7 +577,11 @@ BEZEL_TEST(generic_method_same_name_tparam_4813,
         "    Console.WriteLine(c.Sum());\n"
         "  end Main;\n"
         "end Program;\n");
-    BEZEL_EXPECT_FALSE(r.ran);
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // Reviewer regression of the first #4813 rework (a2m_two_rev): `Go<long>` then

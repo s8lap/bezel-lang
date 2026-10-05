@@ -57,6 +57,7 @@
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
+#include "support/aot_result_asserts.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
@@ -110,7 +111,11 @@ BEZEL_TEST(generic_method_param_shadowing_2742, hash_container_false_reject_spec
         "    return b.M2742<int>(); "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // The `Dictionary` KEY slot reaches the same recorder through the other
@@ -131,7 +136,11 @@ BEZEL_TEST(generic_method_param_shadowing_2742, dictionary_key_false_reject_spec
         "    return b.M2742<int>(); "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // ===========================================================================
@@ -157,7 +166,11 @@ BEZEL_TEST(generic_method_param_shadowing_2742, move_only_element_false_reject_s
         "    return b.M2742<int>(); "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // ===========================================================================

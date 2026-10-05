@@ -64,6 +64,7 @@
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
+#include "support/aot_result_asserts.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
@@ -467,7 +468,11 @@ BEZEL_TEST(sema_owning_element_generic_inst_2713,
         "  using var c := new Rec<Res>(); "
         "  return a.N() + b.M<Res>() + c.N() + 88; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // §28.11, v0.240 — an owning dictionary's KEY slot is deliberately value-like
@@ -549,7 +554,11 @@ BEZEL_TEST(sema_owning_element_generic_inst_2713,
         "  using var b := new Box<string>(); "   // Box's T = string
         "  return b.M2<Res>() + 3; "             // method's T = Res — legal
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // rejected at declaration site after fix #5393
+    // #3892: a bare !r.ran cannot distinguish a real rejection from a
+    // crash/signal/timeout/ASan report. Assert the diagnostic itself.
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "reuses the name of a type parameter of"));
 }
 
 // §14.4, v0.240 — the CONVERSE, so the guard above is not over-wide: the
