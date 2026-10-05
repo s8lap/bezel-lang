@@ -17033,7 +17033,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // dictStringKeys +1 release) from `collTy` — reused rather than
                     // duplicated (it already backs the call-argument temp-disposal
                     // path with the identical Set/Dict dispatch).
-                    else if (currentFn_ == setLiteralFreeEligibleFn_ &&
+                    if (currentFn_ == setLiteralFreeEligibleFn_ &&
                         setLiteralFreeEligible_.count(
                             static_cast<const void*>(declNode)) &&
                         !disposeStack_.empty()) {

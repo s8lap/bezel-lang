@@ -36,6 +36,20 @@
 // async resume, async lambda resume, and iterator MoveNext — with no separate
 // per-context patch needed.
 //
+// REGRESSION OF THAT FIX (this commit): the registration site above was written
+// as `else if`, chained to the preceding #5414/#5173 FALLBACK `if` — not to the
+// #1871 Array branch it was written against. #5173 (a1cfa92b) INSERTED that
+// fallback between the Array branch and this `else if`, silently re-binding it.
+// The fallback's guard is `!borrowingArrayFreeEligible_.count(declNode) &&
+// !disposeStack_.empty()`, and a Set literal is NEVER in
+// borrowingArrayFreeEligible_ (isBorrowingArrayLiteralLocal requires the
+// resolved name-head to be exactly "Array"), so that guard is TRUE for every
+// Set literal: the fallback is always taken and this registration became dead
+// code. The eligibility analysis, the recognizer and the pass were all correct
+// and still are — the emit site was simply unreachable, which is why the leak
+// survived every context (sync, async, async-lambda) uniformly: they all share
+// this one registration.
+//
 // fail-without/pass-with (runAotChecked): without the fix every non-escaping
 // Set<T> literal leaks (LSan fires, `r.ran` -> false, mapped to the -999
 // sentinel below); with the fix every program is ASan/LSan-clean and returns
@@ -259,4 +273,62 @@ BEZEL_TEST(set_literal_backing_reclaim_2142, set_literal_iterate_then_read_no_ua
         "  end Main; "
         "end C;"),
         63);
+}
+
+// ── LOOPED sync oracle (the NON-VACUOUS form of the row above). Every other
+// row in this file is a ONE-SHOT repro — one literal, one scope end — and a
+// one-shot leak repro is weak evidence: LSan attributes a small allocation to
+// the still-reachable graph often enough that identical unmodified runs of the
+// same program flip between reporting and not (MEASURED on the sibling
+// `set_as_ienumerable_1069.source_set_intact_after_argument_spec_4_10` row:
+// 7 failures in 10 identical pre-fix runs, 3 clean). This row loops the literal
+// so a missing reclaim accumulates 50 distinct leaked tables instead of one:
+// on the pre-fix compiler that is 50 x (bz_dict_t header + bucket array +
+// order vector) with nothing reachable at exit, which LSan reports
+// deterministically. Per-iteration value is still asserted exactly (150 =
+// 3 x 50), and the loop body re-ENTERS the same scope-end path 50 times, so
+// this also pins that the reclaim is per-scope, not once-per-function.
+// per §28.9, §28.11 (issue #2142)
+BEZEL_TEST(set_literal_backing_reclaim_2142, sync_set_literal_reclaim_looped_spec_28_9) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var acc := 0; "
+        "    var k := 0; "
+        "    while k < 50 do "
+        "      var s: Set<int> := [10, 20, 30]; "
+        "      acc := acc + s.Count; "
+        "      k := k + 1; "
+        "    end while; "
+        "    return acc; "
+        "  end Main; "
+        "end C;"),
+        150);
+}
+
+// ── LOOPED async oracle — the same accumulation across an await, which is the
+// context the shared collectBorrowingArrayFreeEligible pass has to re-run for
+// the RESUME function (LlvmBackend_Async.cpp). Without the reclaim this leaks
+// 50 tables just like the sync twin; with it, every one is freed at its own
+// method scope end. Value: 150 (3 x 50). Deliberately NOT accumulating a count
+// that could exceed 255 (8-bit exit-code truncation) — assert the real value.
+// per §28.9, §28.11, §30.2 (issue #2142)
+BEZEL_TEST(set_literal_backing_reclaim_2142, async_set_literal_reclaim_looped_spec_30_2) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    var acc := 0; "
+        "    var k := 0; "
+        "    while k < 50 do "
+        "      var s: Set<int> := [10, 20, 30]; "
+        "      acc := acc + s.Count; "
+        "      await Task.Delay(1); "
+        "      k := k + 1; "
+        "    end while; "
+        "    return acc; "
+        "  end Main; "
+        "end C;"),
+        150);
 }
