@@ -1245,13 +1245,31 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // targets) before reaching this null check, so the Warning only
                 // fires for non-unit shapes whose lowering actually failed.
                 if (!rhs) {
-                    if (!ctx_.diagnostics().hasErrors())
-                        ctx_.diagnostics().report(
-                            Severity::Warning, as->value->span.begin,
-                            "internal: assignment RHS expression failed to "
-                            "lower to a value for this assignment's target "
-                            "(store dropped — target retains its previous "
-                            "value) — #2961");
+                    if (!ctx_.diagnostics().hasErrors()) {
+                        std::string builtinRecv, member, appliedMember;
+                        builtinRecv = builtinReceiverOfMemberCall(
+                            as->value.get(), &member, &appliedMember);
+                        if (!builtinRecv.empty()) {
+                            // A built-in call whose result has no lowered value
+                            // (e.g. ChannelSender<T>.Send): name it explicitly.
+                            // Keep the original sentence prefix intact so the
+                            // pinned CHECK-DAG in the lit test still matches.
+                            ctx_.diagnostics().report(
+                                Severity::Warning, as->value->span.begin,
+                                "internal: assignment RHS expression failed to "
+                                "lower to a value for this assignment's target "
+                                "(store dropped — target retains its previous "
+                                "value) — " + builtinRecv + "." + member +
+                                " produces no value here (#2961)");
+                        } else {
+                            ctx_.diagnostics().report(
+                                Severity::Warning, as->value->span.begin,
+                                "internal: assignment RHS expression failed to "
+                                "lower to a value for this assignment's target "
+                                "(store dropped — target retains its previous "
+                                "value) — #2961");
+                        }
+                    }
                     return false;
                 }
                 addr = lvalueAddr(*as->target, elemTy);
@@ -1319,13 +1337,27 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // that reached this point without an earlier dedicated arm
                 // having claimed the store.
                 if (!rhs) {
-                    if (!ctx_.diagnostics().hasErrors())
-                        ctx_.diagnostics().report(
-                            Severity::Warning, as->value->span.begin,
-                            "internal: assignment RHS expression failed to "
-                            "lower to a value for this assignment's target "
-                            "(store dropped — target retains its previous "
-                            "value) — #2961");
+                    if (!ctx_.diagnostics().hasErrors()) {
+                        std::string builtinRecv, member, appliedMember;
+                        builtinRecv = builtinReceiverOfMemberCall(
+                            as->value.get(), &member, &appliedMember);
+                        if (!builtinRecv.empty()) {
+                            ctx_.diagnostics().report(
+                                Severity::Warning, as->value->span.begin,
+                                "internal: assignment RHS expression failed to "
+                                "lower to a value for this assignment's target "
+                                "(store dropped — target retains its previous "
+                                "value) — " + builtinRecv + "." + member +
+                                " produces no value here (#2961)");
+                        } else {
+                            ctx_.diagnostics().report(
+                                Severity::Warning, as->value->span.begin,
+                                "internal: assignment RHS expression failed to "
+                                "lower to a value for this assignment's target "
+                                "(store dropped — target retains its previous "
+                                "value) — #2961");
+                        }
+                    }
                     return false;
                 }
             }
