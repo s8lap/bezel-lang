@@ -1607,6 +1607,11 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // through to `return arg`, handing back the string pointer as a decimal
         // struct and crashing codegen with an IntegerType cast assertion.
         if (pt == P::Decimal) {
+            // stdlib §9.3 (#1810): a ReadOnlyStringSpan argument must be materialized
+            // as a bz.string before passing to bz_decimal_parse (which expects a
+            // bz.string).  A bare span struct would reach the IR verifier as an
+            // integer-typed value and crash (#5354 A3).
+            auto win = parseWindow(arg);
             llvm::AllocaInst* slot = entryAlloca(decimalStructType());
             auto vt = [&](const char* n) -> llvm::Value* {
                 auto it = builtinVtable_.find(n);
@@ -1618,8 +1623,10 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
             builder_.CreateCall(
-                fn, {arg, slot, vt("OverflowException"), vt("FormatException")});
+                fn, {win.str, slot, vt("OverflowException"), vt("FormatException")});
             emitPendingCheck();
+            // Release the materialized window on the normal (non-throw) exit.
+            if (win.owned) emitStringRelease(win.owned);
             return builder_.CreateLoad(decimalStructType(), slot, "dec.parsed");
         }
         // If the argument is a string, use atoi/atoll/atof.
@@ -1821,6 +1828,183 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 // rounding is not finite raises OverflowException.
                 emitGuardThrow(emitFloatParseOverflow(data, dVal),
                                "OverflowException");
+                return dVal;
+            }
+        }
+        // #5354 (stdlib §9.1–§9.3, #1810): the span overload. A
+        // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3), not
+        // a bz.string — without parseWindow the span record falls through to
+        // `return arg` and the span struct is returned as the parse result
+        // (int.Parse) or passed directly to the byte-oriented C parser (IR
+        // verification error). parseWindow materializes the window as a fresh
+        // bz.string whose buffer IS NUL-terminated at the window's end, so the
+        // existing validation means exactly "the window, and only the window, was
+        // valid input" for a span.
+        if (isStringSpanValue(arg)) {
+            auto win = parseWindow(arg);
+            if (pt == P::Int || pt == P::UInt || pt == P::Short ||
+                pt == P::UShort || pt == P::Byte || pt == P::SByte) {
+                // int/uint/short/ushort/byte/sbyte: strtoll at full 64-bit width,
+                // then OverflowException if out of range.
+                auto* strtollFnP =
+                    declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                auto* endSlotP = entryAlloca(ptrTy());
+                llvm::Value* v64 = builder_.CreateCall(
+                    strtollFnP, {win.data, endSlotP, builder_.getInt32(10)}, "parse.v");
+                auto* i8TyP = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcP = builder_.CreateLoad(i8TyP, win.data, "parse.fc");
+                llvm::Value* fcWsP = builder_.CreateICmpULE(
+                    fcP, llvm::ConstantInt::get(i8TyP, ' '), "parse.fws");
+                llvm::Value* endPtrP = builder_.CreateLoad(ptrTy(), endSlotP, "parse.ep");
+                llvm::Value* advP = builder_.CreateICmpNE(endPtrP, win.data, "parse.adv");
+                llvm::Value* endChP = builder_.CreateLoad(i8TyP, endPtrP, "parse.ech");
+                llvm::Value* atNulP = builder_.CreateICmpEQ(
+                    endChP, llvm::ConstantInt::get(i8TyP, 0), "parse.nul");
+                llvm::Value* validFmt = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsP),
+                    builder_.CreateAnd(advP, atNulP), "parse.vfmt");
+                emitGuardThrow(builder_.CreateNot(validFmt, "parse.fmt.bad"),
+                               "FormatException");
+                int64_t lo, hi;
+                switch (pt) {
+                    case P::Int:    lo = INT32_MIN; hi = INT32_MAX;   break;
+                    case P::UInt:   lo = 0;         hi = UINT32_MAX;  break;
+                    case P::Short:  lo = INT16_MIN; hi = INT16_MAX;   break;
+                    case P::UShort: lo = 0;         hi = UINT16_MAX;  break;
+                    case P::Byte:   lo = 0;         hi = UINT8_MAX;   break;
+                    default:        lo = INT8_MIN;  hi = INT8_MAX;    break; // SByte
+                }
+                llvm::Value* tooLow = builder_.CreateICmpSLT(
+                    v64, llvm::ConstantInt::getSigned(i64(), lo), "parse.lo");
+                llvm::Value* tooHigh = builder_.CreateICmpSGT(
+                    v64, llvm::ConstantInt::getSigned(i64(), hi), "parse.hi");
+                emitGuardThrow(builder_.CreateOr(tooLow, tooHigh, "parse.ovf"),
+                               "OverflowException");
+                // Release the window on the normal (non-throw) exit.
+                if (win.owned) emitStringRelease(win.owned);
+                return (pt == P::Int || pt == P::UInt)
+                           ? builder_.CreateTrunc(v64, i32())
+                           : builder_.CreateTrunc(v64, lowerPrimitive(pt));
+            }
+            if (pt == P::Long || pt == P::ULong) {
+                auto* strtollFnL =
+                    declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+                auto* endSlotL = entryAlloca(ptrTy());
+                llvm::Value* v64L = builder_.CreateCall(
+                    strtollFnL, {win.data, endSlotL, builder_.getInt32(10)}, "parse.vL");
+                auto* i8TyL = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcL = builder_.CreateLoad(i8TyL, win.data, "parse.fcL");
+                llvm::Value* fcWsL = builder_.CreateICmpULE(
+                    fcL, llvm::ConstantInt::get(i8TyL, ' '), "parse.fwsL");
+                llvm::Value* endPtrL = builder_.CreateLoad(ptrTy(), endSlotL, "parse.epL");
+                llvm::Value* advL = builder_.CreateICmpNE(endPtrL, win.data, "parse.advL");
+                llvm::Value* endChL = builder_.CreateLoad(i8TyL, endPtrL, "parse.echL");
+                llvm::Value* atNulL = builder_.CreateICmpEQ(
+                    endChL, llvm::ConstantInt::get(i8TyL, 0), "parse.nulL");
+                llvm::Value* validL = builder_.CreateAnd(
+                    builder_.CreateNot(fcWsL),
+                    builder_.CreateAnd(advL, atNulL), "parse.vfmtL");
+                emitGuardThrow(builder_.CreateNot(validL, "parse.fmtbadL"),
+                               "FormatException");
+                if (win.owned) emitStringRelease(win.owned);
+                return v64L;
+            }
+            if (pt == P::Double || pt == P::Float) {
+                const bool isFP = (pt == P::Float);
+                auto* fpTyF = isFP ? llvm::Type::getFloatTy(llvm_)
+                                   : llvm::Type::getDoubleTy(llvm_);
+                auto* strtodFnF = declareC(isFP ? "strtof" : "strtod",
+                    fpTyF, {ptrTy(), ptrTy()});
+                auto* endSlotF = entryAlloca(ptrTy());
+                llvm::Value* dVal = builder_.CreateCall(
+                    strtodFnF, {win.data, endSlotF}, "parse.dv");
+                auto* i8TyF = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* fcF = builder_.CreateLoad(i8TyF, win.data, "parse.fcF");
+                llvm::Value* fcWsF = builder_.CreateICmpULE(
+                    fcF, llvm::ConstantInt::get(i8TyF, ' '), "parse.fwsF");
+                llvm::Value* endPtrF = builder_.CreateLoad(ptrTy(), endSlotF, "parse.epF");
+                llvm::Value* advF = builder_.CreateICmpNE(endPtrF, win.data, "parse.advF");
+                llvm::Value* endChF = builder_.CreateLoad(i8TyF, endPtrF, "parse.echF");
+                llvm::Value* atNulF = builder_.CreateICmpEQ(
+                    endChF, llvm::ConstantInt::get(i8TyF, 0), "parse.nulF");
+                llvm::Value* isSignF = builder_.CreateOr(
+                    builder_.CreateICmpEQ(fcF,
+                        llvm::ConstantInt::get(i8TyF, '+')),
+                    builder_.CreateICmpEQ(fcF,
+                        llvm::ConstantInt::get(i8TyF, '-')), "parse.isSignF");
+                llvm::Value* infMask = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'i')),
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'n')),
+                        builder_.CreateICmpEQ(fcF,
+                            llvm::ConstantInt::get(i8TyF, 'N'))),
+                    "parse.infMask");
+                llvm::Value* notDigitF = builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isSignF),
+                        builder_.CreateNot(infMask)),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
+                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
+                auto* i64t = llvm::Type::getInt64Ty(llvm_);
+                // stdlib §9.2 (v0.314, #5199/#5368): strtod accepts a hexadecimal
+                // float form ("0x1p3").  Detect: first char is '0' and second char
+                // is 'x' or 'X' (after optional sign).
+                llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
+                    builder_.CreateGEP(i8TyF, win.data,
+                        builder_.getInt64(1), "parse.scptr"), "parse.sc");
+                llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
+                    fcF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
+                llvm::Value* isHexIndicatorF = builder_.CreateOr(
+                    builder_.CreateICmpEQ(secondCharF,
+                        llvm::ConstantInt::get(i8TyF, 'x')),
+                    builder_.CreateICmpEQ(secondCharF,
+                        llvm::ConstantInt::get(i8TyF, 'X')), "parse.hexF");
+                llvm::Value* isHexFloatF = builder_.CreateAnd(
+                    isLeadingZeroF, isHexIndicatorF, "parse.hfloatF");
+                llvm::Value* consumedBytes = builder_.CreateSub(
+                    builder_.CreatePtrToInt(endPtrF, i64t),
+                    builder_.CreatePtrToInt(win.data, i64t), "parse.cb");
+                llvm::Value* lastCharOff = builder_.CreateSub(
+                    consumedBytes, builder_.getInt64(1), "parse.lco");
+                llvm::Value* lastCharPtr = builder_.CreateGEP(
+                    i8TyF, win.data, lastCharOff, "parse.lcp");
+                llvm::Value* lastChar = builder_.CreateLoad(i8TyF, lastCharPtr, "parse.lc");
+                llvm::Value* badLastChar = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(lastChar,
+                            llvm::ConstantInt::get(i8TyF, '.')),
+                        builder_.CreateICmpEQ(lastChar,
+                            llvm::ConstantInt::get(i8TyF, 'e'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(lastChar,
+                            llvm::ConstantInt::get(i8TyF, 'E')),
+                        builder_.CreateOr(
+                            builder_.CreateICmpEQ(lastChar,
+                                llvm::ConstantInt::get(i8TyF, '+')),
+                            builder_.CreateICmpEQ(lastChar,
+                                llvm::ConstantInt::get(i8TyF, '-')))),
+                    "parse.blc");
+                llvm::Value* validF = builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateAnd(
+                            builder_.CreateAnd(
+                                builder_.CreateNot(fcWsF),
+                                builder_.CreateNot(notDigitF)),
+                            builder_.CreateAnd(advF, atNulF)),
+                        builder_.CreateNot(badLastChar)),
+                    builder_.CreateNot(isHexFloatF),
+                    "parse.vfmtF");
+                emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
+                               "FormatException");
+                emitGuardThrow(emitFloatParseOverflow(win.data, dVal),
+                               "OverflowException");
+                if (win.owned) emitStringRelease(win.owned);
                 return dVal;
             }
         }
