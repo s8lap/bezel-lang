@@ -14865,6 +14865,7 @@ private:
        above -- same exhaustive three-way dispatch, same emitters, was never  \
        folded in alongside them. */                                           \
     X(bool,      iterElemIsRuntimeManagedPrimitive_,     false)   /* #2738 */  \
+    X(bool,      iterElemIsNullableString_,              false)   /* #5323 */  \
     /* async-specific half */                                                  \
     X(unsigned,               asyncOuterTaskField_,      0)                    \
     X(unsigned,               asyncPendingTaskField_,    0)                    \
@@ -15629,6 +15630,12 @@ private:
     // both iterElemIsOwnedClass_ (class/interface kind) and iterIsOwningIter_
     // (owning head) by construction — the three are exhaustive and disjoint.
     bool iterElemIsRuntimeManagedPrimitive_ = false;
+
+    // fix #5323 (§29/§28.9, v0.313): sibling of iterElemIsRuntimeManagedPrimitive_
+    // for the nullable string? element kind. Both are false for class/interface
+    // elements and owning-head iterators by construction. Gated on the nullable
+    // struct elemTy_ ({i8, ptr}) so unspecialized generic templates elide.
+    bool iterElemIsNullableString_ = false;
 
     // ---- Async-specific live state (used only when smKind_ == Await) ----
     // Frame field indices for the two trailing async slots (see emitAsyncMethod):

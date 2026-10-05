@@ -4787,6 +4787,76 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 builder_.getInt8(yieldIsProducer ? 1 : 0),
                                 ownedFld);
                         }
+                        // fix #5323 (§29/§28.9, v0.313): nullable string? element.
+                        // Mirrors the non-nullable string block above (the #2738
+                        // thread): the yield store holds the +1 reference in the
+                        // nullable struct's payload, the next MoveNext advance
+                        // releases the displaced reference before storing the next,
+                        // and iterator Dispose releases the outstanding one. The
+                        // current_val_owned flag has the same meaning for both
+                        // nullable and non-nullable strings. Disjoint from the
+                        // non-nullable string gate by iterElemIsNullableString_.
+                        else if (smKind_ == SuspendKind::Yield &&
+                                 iterElemIsNullableString_) {
+                            // fix #5323 (§29/§28.9, v0.313): nullable string? element.
+                            // A nullable reference type (`string?`) lowers to ptr in
+                            // the frame (per §8.3/§9.1: nullable ref → plain ptr,
+                            // null is a real null pointer — no hasValue tag), so
+                            // the handling mirrors the non-nullable string path
+                            // (the #2738 thread) exactly: load the ptr, null-guard
+                            // it, and if owned release it. The owned flag has the
+                            // same meaning for both nullable and non-nullable
+                            // strings.
+                            llvm::Value* ownedFld = builder_.CreateStructGEP(
+                                smStateStruct_, smSelf_,
+                                iterCurrentValOwnedField_);
+                            // --- dispose previous if owned ---
+                            llvm::Value* prevVal = builder_.CreateLoad(
+                                iterElemTy_, cvField, "ity.nsprev");
+                            llvm::Value* prevIsNull = builder_.CreateICmpEQ(
+                                prevVal,
+                                llvm::ConstantPointerNull::get(ptrTy()),
+                                "ity.nsprevnull");
+                            auto* prevNonNullBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.nsprev.nonnull", currentFn_);
+                            auto* prevContBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.nsprev.cont", currentFn_);
+                            builder_.CreateCondBr(
+                                prevIsNull, prevContBB, prevNonNullBB);
+                            builder_.SetInsertPoint(prevNonNullBB);
+                            llvm::Value* prevOwned = builder_.CreateLoad(
+                                i8(), ownedFld, "ity.nsprevowned");
+                            llvm::Value* prevIsOwned = builder_.CreateICmpNE(
+                                prevOwned, builder_.getInt8(0), "ity.nspredisowned");
+                            auto* dispBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.nsprev.disp", currentFn_);
+                            auto* skipBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.nsprev.skip", currentFn_);
+                            auto* afterDispBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.nsprev.after", currentFn_);
+                            builder_.CreateCondBr(prevIsOwned, dispBB, skipBB);
+                            builder_.SetInsertPoint(dispBB);
+                            // emitStringRelease is null-safe for both the
+                            // nullable and non-nullable cases.
+                            emitStringRelease(prevVal);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(skipBB);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(afterDispBB);
+                            builder_.CreateBr(prevContBB);
+                            builder_.SetInsertPoint(prevContBB);
+                            // --- set owned flag for new value ---
+                            // Owned when the yielded expression is a +1 string
+                            // producer (isPlusOneStringProducer). The predicate
+                            // covers BinaryExpr (+, ??), ConditionalExpr, and
+                            // numeric/Object ToString() calls for both nullable
+                            // and non-nullable string results.
+                            bool yieldIsProducer =
+                                isPlusOneStringProducer(ys->value.get());
+                            builder_.CreateStore(
+                                builder_.getInt8(yieldIsProducer ? 1 : 0),
+                                ownedFld);
+                        }
                         // fix #2621 / §29.1 (v0.236): sync IOwningEnumerable<T> /
                         // IOwningEnumerator<T> — the enumerator ALWAYS owns a
                         // non-null current_val (the §29.1 contract: ownership

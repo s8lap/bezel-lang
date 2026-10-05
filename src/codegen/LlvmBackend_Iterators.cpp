@@ -1660,12 +1660,16 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // elemIsOwnedClass (class/interface kind) and isOwningIter (owning head)
     // by construction.
     bool elemIsRuntimeManagedPrimitive = false;
+    bool elemIsNullableString = false;
     if (!elemIsOwnedClass && !isOwningIter &&
         elemSemaTy &&
         elemSemaTy->kind == sema::TypeRef::Kind::Primitive &&
-        elemSemaTy->primitive == sema::PrimitiveType::String &&
-        !elemSemaTy->nullable) {
-        elemIsRuntimeManagedPrimitive = true;
+        elemSemaTy->primitive == sema::PrimitiveType::String) {
+        if (!elemSemaTy->nullable) {
+            elemIsRuntimeManagedPrimitive = true;
+        } else {
+            elemIsNullableString = true;
+        }
     }
 
     // Build the kind-agnostic frame; the yield driver's extra trailing fields are
@@ -2401,6 +2405,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // kind) and iterIsOwningIter_ (owning head) by construction (see
         // elemIsRuntimeManagedPrimitive computation above).
         iterElemIsRuntimeManagedPrimitive_ = elemIsRuntimeManagedPrimitive;
+        iterElemIsNullableString_ = elemIsNullableString;    // fix #5323
         // #747: enable for-loop frame-spill for THIS MoveNext, reusing the async
         // spill-area mechanism. registerForLoopSpillSlots records a suspending
         // for-loop's implicit allocas (index / array-ptr / enumerator) into
@@ -2880,93 +2885,136 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // called TakeCurrent (manual-protocol abandonment) and we must dispose.
         auto disposeYieldedVal = [&]() {
             if (!elemIsOwnedClass && !isOwningIter &&
-                !elemIsRuntimeManagedPrimitive) return;
+                !elemIsRuntimeManagedPrimitive && !elemIsNullableString) return;
             // #1837 / §4.13 / §29.1 (v0.196): the cleanup below loads current_val
             // and compares it against a null POINTER, so it requires elemTy to be
-            // a pointer. An IOwningEnumerable<T> iterator emitted as its
-            // UNSPECIALIZED generic template (T is an unresolved type parameter, so
-            // lowerTypeRef falls to the i32 value-kind placeholder) has isOwningIter
-            // true but a non-pointer elemTy — the raw i32-vs-ptr ICmp then trips
-            // llvm::ICmpInst::AssertOK. The template is never called (each call site
-            // emits a monomorphized specialization where the class-constrained T is
-            // a concrete reference type ⇒ elemTy is ptr and this dispose runs in
-            // full), so skip it here — mirroring the `isOwningIter &&
-            // elemTy->isPointerTy()` guards already at the TakeCurrent (§29.1) and
-            // MoveNext-exhaustion sites. (elemIsOwnedClass always implies a
-            // class/interface element ⇒ a pointer elemTy, so this never elides a
-            // real IEnumerable<owned T> disposal.)
-            if (!elemTy->isPointerTy()) return;
+            // a pointer for class elements. For nullable string elements (elemIsNullableString)
+            // the elemTy is a nullable struct {i8, ptr}, which is handled separately.
+            // An IOwningEnumerable<T> iterator emitted as its UNSPECIALIZED generic
+            // template (T is an unresolved type parameter, so lowerTypeRef falls to the
+            // i32 value-kind placeholder) has isOwningIter true but a non-pointer elemTy
+            // — the raw i32-vs-ptr ICmp then trips llvm::ICmpInst::AssertOK. The
+            // template is never called (each call site emits a monomorphized
+            // specialization where the class-constrained T is a concrete reference type
+            // ⇒ elemTy is ptr and this dispose runs in full), so skip it here —
+            // mirroring the `isOwningIter && elemTy->isPointerTy()` guards already at
+            // the TakeCurrent (§29.1) and MoveNext-exhaustion sites.
+            if (!elemTy->isPointerTy() && !elemIsNullableString) return;
             llvm::Value* cvField = builder_.CreateStructGEP(
                 stateStructTy, self, CURRENT_VAL_FIELD);
-            llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "ity.yv");
-            llvm::Value* isNull = builder_.CreateICmpEQ(
-                yv, llvm::ConstantPointerNull::get(ptrTy()), "ity.yvnull");
-            auto* nonNullBB = llvm::BasicBlock::Create(
-                llvm_, "ity.yv.nonnull", targetFn);
-            auto* contBB = llvm::BasicBlock::Create(
-                llvm_, "ity.yv.cont", targetFn);
-            builder_.CreateCondBr(isNull, contBB, nonNullBB);
-            builder_.SetInsertPoint(nonNullBB);
-            if (isOwningIter) {
-                // #1349: IOwningEnumerable<T> — enumerator always owns a
-                // non-null current_val (consumer didn't call TakeCurrent);
-                // dispose it unconditionally then null the slot.
-                emitDisposeAndReclaim(yv);
-                builder_.CreateStore(
-                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
-                builder_.CreateBr(contBB);
-            } else {
-                // §29 (#1120) / #2738 (v0.282): gating the dispose on the
-                // current_val_owned flag distinguishes two cases — for
-                // IEnumerable<owned T> (class element, #1120) the enumerator
-                // owns the +1 only when the yield is a `new`; for
-                // IEnumerable<string> / IList<string> / etc. (runtime-
-                // managed primitive, #2738) the enumerator owns the +1 only
-                // when the yield is a +1 string producer (interpolation, +,
-                // ??, case, conditional, range slice, ToString — see
-                // isPlusOneStringProducer). In both cases the predicate is
-                // "the enumerator owns the reference"; the predicate differs
-                // because the minting shape differs. The flag byte is shared
-                // (CURRENT_VAL_OWNED_FIELD) and was already wired by both
-                // yield-store sites.
+            if (elemIsNullableString) {
+                // fix #5323 (§29/§28.9, v0.313): nullable string? element.
+                // A nullable reference type (`string?`) lowers to ptr in the
+                // frame (per §8.3/§9.1: nullable ref → plain ptr, null is a
+                // real null pointer). The handling mirrors the non-nullable
+                // string path exactly: null-guard the ptr and release if owned.
+                llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "ity.nv");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    yv, llvm::ConstantPointerNull::get(ptrTy()), "ity.nvnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.nv.nonnull", targetFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.nv.cont", targetFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
                 llvm::Value* ownedFld = builder_.CreateStructGEP(
                     stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
                 llvm::Value* ownedByte =
-                    builder_.CreateLoad(i8(), ownedFld, "ity.yvowned");
+                    builder_.CreateLoad(i8(), ownedFld, "ity.nvowned");
                 llvm::Value* isOwned = builder_.CreateICmpNE(
-                    ownedByte, builder_.getInt8(0), "ity.yvisowned");
+                    ownedByte, builder_.getInt8(0), "ity.nvisowned");
                 auto* dispBB = llvm::BasicBlock::Create(
-                    llvm_, "ity.yv.disp", targetFn);
+                    llvm_, "ity.nv.disp", targetFn);
                 auto* skipBB = llvm::BasicBlock::Create(
-                    llvm_, "ity.yv.skip", targetFn);
+                    llvm_, "ity.nv.skip", targetFn);
                 auto* afterBB = llvm::BasicBlock::Create(
-                    llvm_, "ity.yv.after", targetFn);
+                    llvm_, "ity.nv.after", targetFn);
                 builder_.CreateCondBr(isOwned, dispBB, skipBB);
                 builder_.SetInsertPoint(dispBB);
-                if (elemIsRuntimeManagedPrimitive) {
-                    // fix #2738: release the +1 reference via the refcounted
-                    // string release path — bz_string_release is the
-                    // canonical releaser for a non-nullable string primitive
-                    // (matching how the §28.3 / §28.9 borrow site releases
-                    // a borrowed +1 on scope exit). emitDisposeAndReclaim
-                    // would dispatch through the class dispatch table and
-                    // is wrong for a non-class element type.
-                    emitStringRelease(yv);
-                } else {
-                    // §29 (#1120): class element — emitDisposeAndReclaim
-                    // walks the vtable dispatch chain.
-                    emitDisposeAndReclaim(yv);
-                }
+                // emitStringRelease is null-safe.
+                emitStringRelease(yv);
                 builder_.CreateBr(afterBB);
                 builder_.SetInsertPoint(skipBB);
                 builder_.CreateBr(afterBB);
                 builder_.SetInsertPoint(afterBB);
+                // Null the slot and reset the owned flag.
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), cvField);
                 builder_.CreateStore(builder_.getInt8(0), ownedFld);
                 builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            } else {
+                // Non-nullable string or class element path (existing code).
+                llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "ity.yv");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    yv, llvm::ConstantPointerNull::get(ptrTy()), "ity.yvnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.yv.nonnull", targetFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.yv.cont", targetFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
+                if (isOwningIter) {
+                    // #1349: IOwningEnumerable<T> — enumerator always owns a
+                    // non-null current_val (consumer didn't call TakeCurrent);
+                    // dispose it unconditionally then null the slot.
+                    emitDisposeAndReclaim(yv);
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                    builder_.CreateBr(contBB);
+                } else {
+                    // §29 (#1120) / #2738 (v0.282): gating the dispose on the
+                    // current_val_owned flag distinguishes two cases — for
+                    // IEnumerable<owned T> (class element, #1120) the enumerator
+                    // owns the +1 only when the yield is a `new`; for
+                    // IEnumerable<string> / IList<string> / etc. (runtime-
+                    // managed primitive, #2738) the enumerator owns the +1 only
+                    // when the yield is a +1 string producer (interpolation, +,
+                    // ??, case, conditional, range slice, ToString — see
+                    // isPlusOneStringProducer). In both cases the predicate is
+                    // "the enumerator owns the reference"; the predicate differs
+                    // because the minting shape differs. The flag byte is shared
+                    // (CURRENT_VAL_OWNED_FIELD) and was already wired by both
+                    // yield-store sites.
+                    llvm::Value* ownedFld = builder_.CreateStructGEP(
+                        stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
+                    llvm::Value* ownedByte =
+                        builder_.CreateLoad(i8(), ownedFld, "ity.yvowned");
+                    llvm::Value* isOwned = builder_.CreateICmpNE(
+                        ownedByte, builder_.getInt8(0), "ity.yvisowned");
+                    auto* dispBB = llvm::BasicBlock::Create(
+                        llvm_, "ity.yv.disp", targetFn);
+                    auto* skipBB = llvm::BasicBlock::Create(
+                        llvm_, "ity.yv.skip", targetFn);
+                    auto* afterBB = llvm::BasicBlock::Create(
+                        llvm_, "ity.yv.after", targetFn);
+                    builder_.CreateCondBr(isOwned, dispBB, skipBB);
+                    builder_.SetInsertPoint(dispBB);
+                    if (elemIsRuntimeManagedPrimitive) {
+                        // fix #2738: release the +1 reference via the refcounted
+                        // string release path — bz_string_release is the
+                        // canonical releaser for a non-nullable string primitive
+                        // (matching how the §28.3 / §28.9 borrow site releases
+                        // a borrowed +1 on scope exit). emitDisposeAndReclaim
+                        // would dispatch through the class dispatch table and
+                        // is wrong for a non-class element type.
+                        emitStringRelease(yv);
+                    } else {
+                        // §29 (#1120): class element — emitDisposeAndReclaim
+                        // walks the vtable dispatch chain.
+                        emitDisposeAndReclaim(yv);
+                    }
+                    builder_.CreateBr(afterBB);
+                    builder_.SetInsertPoint(skipBB);
+                    builder_.CreateBr(afterBB);
+                    builder_.SetInsertPoint(afterBB);
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                    builder_.CreateStore(builder_.getInt8(0), ownedFld);
+                    builder_.CreateBr(contBB);
+                }
+                builder_.SetInsertPoint(contBB);
             }
-            builder_.SetInsertPoint(contBB);
         };
 
         // If no yield was ever inside a try/finally AND no `using var` was active
