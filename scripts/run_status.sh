@@ -28,6 +28,8 @@
 #              fix issues banked (scripts/pick_ledger.sh: kind=fix commits
 #              only, see scripts/pick_issues.sh). FLAG: banked >= --target.
 #   lanes      active lane count from scripts/lane_status.sh.
+#   stale      dry-run count of stale dev processes/waiters (scripts/reap_stale.sh).
+#              INFO, never FLAG: a non-zero count just means "reap_stale.sh --kill".
 #
 # Env overrides (for tests and other machines):
 #   BEZEL_GATE_PIDFILE, BEZEL_GATE_DONEFILE   gate markers (as gate_and_push.sh)
@@ -165,6 +167,33 @@ probe_lanes() {
   row lanes OK "$n active lane worktree(s), $stall stall candidate(s) (scripts/lane_status.sh for detail)"
 }
 
+# Stale dev processes and waiters. R27 2026-10-06: a lane's agent can die while
+# its background waiters keep running, parented to this session's long-lived
+# `claude` rather than to init — which is why reap_orphans.sh (PPID==1 only)
+# never saw a 4.25 h waiter. reap_stale.sh keys on age AND parent plus a
+# CPU/IO progress exemption, so a slow build is never mistaken for a wedged one.
+#
+# INFO, never FLAG, and it never signals anything: this is a dry-run count.
+# A non-zero count is NORMAL between sweeps — it means "run reap_stale.sh --
+# kill", not "something is wrong". A count that GROWS across two consecutive
+# heartbeats is the signal worth acting on, which is why it is a count and not
+# a boolean.
+probe_stale() {
+  local out n
+  [ -x "$HERE/reap_stale.sh" ] || { row stale n/a "reap_stale.sh absent"; return 0; }
+  out="$("$HERE/reap_stale.sh" 2>/dev/null)" || true
+  n="$(printf '%s\n' "$out" | sed -n 's/^candidates: \([0-9]*\).*/\1/p' | head -n 1)"
+  [ -n "$n" ] || n=0
+  local st="INFO"
+  # A live gate makes every long process legitimate; the row is noise then.
+  [ "$GATE_RUNNING" = 1 ] && { row stale INFO "gate running — reaping suppressed"; return 0; }
+  if [ "$n" -gt 0 ]; then
+    st="INFO"
+    ACTIONS+=("stale: $n stale dev process(es) — scripts/reap_stale.sh --kill (dry-run is the default; PID-only, never name-based)")
+  fi
+  row stale "$st" "$n stale dev process(es) (scripts/reap_stale.sh --kill to reap)"
+}
+
 echo "run_status $(date '+%F %T')"
 want gate && probe_gate
 want jobserver && probe_jobserver
@@ -173,5 +202,6 @@ want memory && probe_memory
 want disk && probe_disk
 [ -n "$STAGING" ] && want staging && probe_staging
 want lanes && probe_lanes
+want stale && probe_stale
 for a in "${ACTIONS[@]}"; do echo "ACTION: $a"; done
 exit 0
