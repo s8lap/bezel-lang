@@ -19739,27 +19739,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
-                // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T) is the
-                // same "builtin owned-transfer, no user MethodDecl" shape as
-                // the drain names above — without this, `s.Take(q);` as a bare
-                // discard statement silently leaked the removed element (no
-                // §21.9 diagnostic). Kept separate from the `drain` list above:
-                // Take's single positional arg is the query (not an index/key),
-                // and it is defined on OwningSet alone, so a shared receiver-
-                // head list would not fit it cleanly.
-                if (!ownedProduced && ce->callee) {
-                    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                            ce->callee.get())) {
-                        if (ma->member == "Take" && ma->target) {
-                            if (auto* rt = ctx_.exprType(*ma->target))
-                                if (rt->kind == TypeRef::Kind::Named &&
-                                    rt->astNode && rt->astNode->name &&
-                                    !rt->astNode->name->parts.empty() &&
-                                    rt->headName() == "OwningSet")
-                                    ownedProduced = true;
-                        }
-                    }
-                }
             }
             // §21.9 / §2.11 (#949): an `<event>.Subscribe(...)` statement drops
             // the owned Subscription it returns. Its result is untyped, so the

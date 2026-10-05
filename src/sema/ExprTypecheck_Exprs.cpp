@@ -10102,8 +10102,6 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                           (mn == "TryPopFirst" ||
                                            mn == "TryPopLast") &&
                                           pos2 == 0) ||
-                                         (cn == "OwningSet" &&
-                                          mn == "TryTake" && pos2 == 1) ||
                                         // fix #5332 (stdlib §4.10 / §1 shape (a),
                                         // v0.313): `OwningSet<T>.TryPop(query: T,
                                         // out owned removed: T?)` — the out

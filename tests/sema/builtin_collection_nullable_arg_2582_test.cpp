@@ -376,22 +376,22 @@ BEZEL_TEST(sema_collection_nullable_arg_2582,
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
 }
 
-// #2582 / stdlib §4.10: `OwningSet<T>.Take(query: T): owned T` IS an item-
-// query — the family gate admits it, and an un-narrowed `int?` query on
-// `OwningSet<int>` is rejected. This confirms the family gate's positive side
-// (the item-query form IS checked where it should be).
+// fix #5362 / stdlib §4.10 (v0.259): `OwningSet<T>.Take` was renamed to
+// `Pop`. The pre-rename `Take` name is no longer on the stdlib surface,
+// so `s.Take(N())` on an OwningSet is rejected as "no member `Take` on
+// `OwningSet<T>`" — the owning-container unknown-member check fires before
+// any nullable-argument check would run.
 BEZEL_TEST(sema_collection_nullable_arg_2582,
-           owningset_take_rejects_unnarrowed_nullable_query) {
+           owningset_take_rejected_as_unknown_member) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
         "  private static method N(): int? => null; "
         "  public static method T(): int "
         "    var s := new OwningSet<int>(); "
-        "    var t := s.Take(N()); "  // OwningSet<T>.Take(query: T) <- int?
+        "    var t := s.Take(N()); "  // OwningSet<T>.Take — no longer on stdlib surface
         "    return 0; "
         "  end T; "
         "end C;");
-    BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "OwningSet<T>.Take"));
+    BEZEL_EXPECT_TRUE(hasError(r, "no member `Take` on `OwningSet"));
 }

@@ -7565,29 +7565,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ", expected " + arityList + " (#3726)");
                         return false;
                     }
-                    // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T) is
-                    // typed explicitly (owned T, above in the isArrLike chain)
-                    // and must NOT be re-typed here as the LINQ Take(count:
-                    // int) operator. This lambda is invoked again from an
-                    // UNCONDITIONAL fallback further below that runs as part
-                    // of a SEPARATE if/else-if chain (broken from the one
-                    // above by the intervening standalone Sort / OwningArray
-                    // Reversed-Sorted `if` statements) — that second chain
-                    // runs regardless of what the first chain already decided,
-                    // so without this guard it clobbered the OwningSet.Take
-                    // typing right back to a lazy IEnumerable<T>, leaving
-                    // codegen's now-excluded LINQ dispatcher's absence moot:
-                    // the CALL's own sema type was still wrong, so `using var
-                    // taken := s.Take(q); taken.Tag` failed to resolve
-                    // (lowerExpr-null ICE, #1386) and the transferred element
-                    // was never disposed (a leak — its Dispose() never ran
-                    // because sema thought `taken` was an IEnumerable<T>, not
-                    // an R).
                     // fix #3670: was four separate hand-spelled `if` arms
-                    // (Where/Skip/Distinct here + the guarded Take;
-                    // OrderBy/OrderByDescending; Concat/TakeWhile/SkipWhile,
-                    // further below by Select/SelectMany/Zip;
-                    // Union/Intersect/Except, further below by ThenBy) —
+                    // (Where/Skip/Distinct; OrderBy/OrderByDescending;
+                    // Concat/TakeWhile/SkipWhile; Union/Intersect/Except/ThenBy) —
                     // found, on inspection, to be byte-identical in BODY
                     // (each did exactly `ctx_.setExprType(&ce,
                     // makeLazyEnumerable(srcElem)); return true;`), answering
@@ -7595,14 +7575,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // IEnumerable<T> over the UNCHANGED source element type.
                     // Merged onto the one predicate that answers it,
                     // common::isLinqLazyPassthroughOperatorName (see its
-                    // header for why `Take` stays an explicit conjunct here
-                    // rather than folded into the table, and why
-                    // `ThenBy`/`ThenByDescending` — same body, different
-                    // receiver shape — stay their own arm rather than fold in
-                    // too). The other two arms this replaces are DELETED
-                    // below, not left as dead code.
-                    if (common::isLinqLazyPassthroughOperatorName(m) ||
-                        (m == "Take" && colName != "OwningSet")) {
+                    // header for why `ThenBy`/`ThenByDescending` — same body,
+                    // different receiver shape — stay their own arm rather
+                    // than fold in too). The other two arms this replaces are
+                    // DELETED below, not left as dead code.
+                    if (common::isLinqLazyPassthroughOperatorName(m) &&
+                        !((m == "Take" || m == "TryTake") &&
+                          colName == "OwningSet")) {
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
                         return true;
                     }
@@ -8420,7 +8399,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "PopFirst" || mm == "PopLast" ||
                                 mm == "TryPopFirst" || mm == "TryPopLast" ||
                                 mm == "PopValue" || mm == "TryPopValue" ||
-                                mm == "TryAdd" || mm == "Take" || mm == "TryTake" ||
+                                mm == "TryAdd" ||
                                 mm == "Get" || mm == "TryGetValue" ||
                                 // fix #3510 / stdlib §4.9 (v0.285): `GetOrNull`
                                 // is declared on `OwningDictionary<K, V>` beside
@@ -8730,8 +8709,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // positional or FIFO/LIFO structure (`Array`/
                         // `OwningArray`, `Stack`/`OwningStack`, `Queue`/
                         // `OwningQueue`, `LinkedList`/`OwningLinkedList`) or is
-                        // an unordered hash-set with its own extraction query
-                        // (`Set`/`OwningSet`'s `TryTake`). `SortedSet<T>`
+                        // an unordered hash-set (`Set`/`OwningSet`). `SortedSet<T>`
                         // (stdlib §4.18) declares none of that: its native
                         // surface is exactly `Count`, `Add`, `TryAdd`,
                         // `Contains`, `Remove`, `Clear`, `First`, `Last` (typed
@@ -8743,7 +8721,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // `Peek`, `Pop`, `Dequeue`, `PopLast`, `PopFirst`,
                         // `PopAt`, `IndexOf`, and the `Try*` extraction family
                         // below (`TryPop`/`TryDequeue`/`TryPeek`/
-                        // `TryPopFirst`/`TryPopLast`/`TryTake`) are none of
+                        // `TryPopFirst`/`TryPopLast`) are none of
                         // that — §4.18 declares no index, no front/back, and
                         // no extraction query — and none of them has a
                         // lowering arm for a SortedSet receiver (#3444: an
@@ -8807,7 +8785,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             m == "IndexOf" || m == "TryPop" ||
                             m == "TryDequeue" || m == "TryPeek" ||
                             m == "TryPopFirst" || m == "TryPopLast" ||
-                            m == "TryTake" || m == "Length";
+                            m == "Length";
                         if (colName == "SortedSet" &&
                             sortedSetMemberUndeclared) {
                             ctx_.diagnostics().report(
@@ -8840,6 +8818,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                 ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         }
+                        // fix #5362 / stdlib §4.10 (v0.259): OwningSet<T>.Take
+                        // was renamed to Pop. The old name is no longer on the
+                        // stdlib surface. Emit the "no member" diagnostic here
+                        // so it fires before any fallback LINQ typing can run.
+                        // (TryTake is already handled by the owning-container
+                        // allowedOwningMethod check.)
+                        else if (colName == "OwningSet" && m == "Take") {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `Take` on `OwningSet<T>` "
+                                "(stdlib §4.10 / §22.5, v0.259) — the method was "
+                                "renamed; use `Pop` or `TryPop`"));
+                        }
                         // per §5 LINQ element access: First/Last/Single/ElementAt
                         // each return the source element type T (stdlib §5,
                         // `public method First(): T`). Typing the result lets an
@@ -8857,14 +8848,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Queue.TryDequeue/TryPeek (out item: T): bool.
                         // §4.5/§4.7 (#831/#1354): OwningArray/OwningLinkedList
                         // TryPopFirst/TryPopLast (out owned item: T): bool.
-                        // fix #1476 / stdlib §4.10: OwningSet<T>.TryTake(query: T,
-                        // out owned removed: T?): bool — the no-throw analogue
-                        // of Take (below).
                         else if (m == "Contains" || m == "TryAdd" ||
                                  m == "TryPop" || m == "TryDequeue" ||
                                  m == "TryPeek" ||
-                                 m == "TryPopFirst" || m == "TryPopLast" ||
-                                 m == "TryTake")
+                                 m == "TryPopFirst" || m == "TryPopLast")
                             // fix #3331 (C5, stdlib §5 + proposal 0116 D9):
                             // `Contains` is one of the six `where T: hashable`
                             // operators (stdlib §5's `extension IEnumerable<T>
@@ -8922,23 +8909,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 linqHashableRejected = true;  // gate fired — suppress typeLinqOperator fallback's duplicate
                             else
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
-                        // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T):
-                        // owned T. Gated to colName == "OwningSet" — every other
-                        // isArrLike collection's "Take" is the LINQ Take(count:
-                        // int) operator (typed by the typeLinqOperator fallback
-                        // below as a lazy IEnumerable<T>). Both forms take
-                        // exactly one positional arg, so without this guard
-                        // `s.Take(query)` on an OwningSet fell into that same
-                        // fallback, mistyping the call and leaving codegen's
-                        // upstream LINQ Take(count) dispatcher to treat the
-                        // class-pointer query as an int count — `sext ptr ...
-                        // to i64`, malformed IR LLVM rejects (#1476).
-                        else if (m == "Take" && colName == "OwningSet" &&
-                                 ce.args.size() == 1) {
-                            if (recvTy && !recvTy->genericArgs.empty() &&
-                                recvTy->genericArgs[0])
-                                ctx_.setExprType(&ce, recvTy->genericArgs[0]);
-                        }
                         // fix #3765 (stdlib §4.6/§4.7/§4.10/§4.11, v0.287):
                         // `IndexOf(item)` is declared only by `Array<T>` (§4.4)
                         // and `OwningArray<T>` (§4.5); every OTHER isArrLike
@@ -16592,7 +16562,7 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
 // Stack<T>/Queue<T>.Push/Enqueue/Contains, LinkedList<T>.AddFirst/AddLast/
 // AddBefore/AddAfter/Find/Contains/Remove, Dictionary<K,V>/SortedDictionary<
 // K,V>.ContainsKey/Contains/Remove, OwningDictionary<K,V>.PopValue/
-// TryPopValue, OwningSet<T>.Take/TryTake), the span-buffer family (#2600:
+// TryPopValue), the span-buffer family (#2600:
 // ArraySpan<T>/ReadOnlyArraySpan<T>.IndexOf/Contains/Fill, value-T Span<T>/
 // ReadOnlySpan<T>.IndexOf/Contains/Fill), the atomic family (#2602:
 // Atomic<T>.Exchange/CompareExchange, AtomicInteger<T>.Exchange/
@@ -16850,16 +16820,6 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             m == "IndexOf" || m == "LastIndexOf" ||
             m == "Contains" || m == "ContainsKey" ||
             m == "Find" ||
-            // OwningSet — `Take(query: T): owned T` and
-            // `TryTake(query: T, out owned removed: T?): bool` borrow the
-            // query (the out slot is modifier-marked, skipped below). Gated
-            // to OwningSet: on every OTHER collection family `Take` is the
-            // LINQ `Take(count: int)` operator (stdlib §5), whose `int`
-            // parameter is NOT an item slot — checking it against T would
-            // reject the legitimate `arr.Take(2)`. Sema's existing Take
-            // resolution mirrors this split (L4363: OwningSet.Take is the
-            // item-query form; everywhere else LINQ Take wins).
-            ((m == "Take" || m == "TryTake") && colName == "OwningSet") ||
             // Removal by item/key — `Remove(item: T): bool` /
             // `Remove(key: K): bool`. (RemoveAt/RemoveNode are NOT here:
             // RemoveAt takes int index, RemoveNode takes LinkedListNode<T>.)
