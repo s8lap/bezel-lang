@@ -445,7 +445,7 @@ BEZEL_TEST(nested_collection_literal_2660, for_in_over_root_no_uaf) {
         "      [\"a\": [1, 2], \"b\": [3]]; "
         "    var total := 0; "
         "    for var kv in groups do "
-        "      total := total + kv.Value.Length; "
+        "      total := total + kv.Value.Count; "
         "    end; "
         "    return total; "
         "  end Main; "
