@@ -371,7 +371,7 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
             // half cost the emitted symbol namespace.
             wrapper->type =
                 collectTypeDecl(*nt->decl, ctx, parent.memberScope,
-                                parent.qualifiedTypeName());
+                                parent.arityEnclosingPath());
         }
         return wrapper;
     }

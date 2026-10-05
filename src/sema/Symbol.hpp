@@ -242,6 +242,21 @@ struct TypeSymbol : Symbol {
         return enclosingTypePath + "." + std::string(name);
     }
 
+    // §2.8.3 rule 3 (v0.314): like qualifiedTypeName but appends the arity
+    // suffix for generic enclosing types so that Outer<T>.Inner and Outer.Inner
+    // do not collide in linker symbols. Non-generic enclosing types are
+    // unchanged (ABI stability).
+    std::string arityEnclosingPath() const {
+        if (genericParams.empty()) {
+            return qualifiedTypeName();
+        }
+        std::string arityStr = std::to_string(genericParams.size());
+        if (enclosingTypePath.empty())
+            return std::string(name) + "." + arityStr;
+        else
+            return enclosingTypePath + "." + std::string(name) + "." + arityStr;
+    }
+
     // §12 / §31.4 (#2950): the name of the BUILT-IN exception type this class
     // names DIRECTLY as its base ("Exception", "IOException", …), or empty when
     // it names none. A built-in exception has no user TypeSymbol at all (its

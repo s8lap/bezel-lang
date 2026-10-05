@@ -796,7 +796,7 @@ struct Loader {
             t->scope = parent.memberScope;
             t->memberScope = ctx.newScope();
             t->moduleName = parent.moduleName;
-            t->enclosingTypePath = parent.qualifiedTypeName();
+            t->enclosingTypePath = parent.arityEnclosingPath();
             localTypes[t->qualifiedTypeName()] = t;
             ctx.registerImportedType(parent.moduleName, t);
         }
@@ -6212,7 +6212,7 @@ static void registerNestedTypeShells(
         // as its enclosing type (§11.6 — nesting is not a separate module).
         t->moduleName = parent.moduleName;
         // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): enclosing-type path.
-        t->enclosingTypePath = parent.qualifiedTypeName();
+        t->enclosingTypePath = parent.arityEnclosingPath();
         localTypes[t->qualifiedTypeName()] = t;
         ctx.registerImportedType(parent.moduleName, t);
         // Recurse: a §11.6 type may itself contain nested types.
