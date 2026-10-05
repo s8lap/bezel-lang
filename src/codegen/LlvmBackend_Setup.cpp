@@ -16878,6 +16878,26 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                             if (isStringTypeRefNonNull(elt))
                                 d.collectionElemDisposer = stringElementReleaseThunk();
                         }
+                        // fix #5173 / §28.11: for a borrowing Array<T> with
+                        // class/interface/Shared<T>/Weak<T> elements (whose owning-
+                        // family policy has a non-null disposer thunk), set
+                        // collArrayDynamicFree so the scope-end bz_array_free_dynamic
+                        // call consults the ClassOwned header-disposer stamped by
+                        // materializeHeapCollectionLiteral above. Without this, the
+                        // class-element entries admitted by the #5173 isBorrowingArray-
+                        // LiteralLocal change above would use the null-disposer path
+                        // (collArrayDynamicFree=false, collectionElemDisposer=null)
+                        // and the stamped header would never be consulted, leaving
+                        // each class element leaked (measured: 3 × 56 B direct leaks
+                        // at main for the three-element repro case).
+                        if (!d.collectionElemDisposer) {
+                            const sema::TypeRef* el =
+                                (!collTy->genericArgs.empty())
+                                    ? collTy->genericArgs[0] : nullptr;
+                            if (el && elementPolicyFor(el, /*owningFamily=*/true)
+                                       .disposerThunk != nullptr)
+                                d.collArrayDynamicFree = true;
+                        }
                         disposeStack_.back().push_back(d);
                     }
                     // fix #2142 / §28.9 / §28.11 (v0.220): reclaim the backing of
@@ -35819,10 +35839,17 @@ bool Emitter::isBorrowingArrayLiteralLocal(const LocalDeclInitView& view) {
     // a null per-element disposer AND not a runtime-managed NON-string element
     // (closures have no per-element retain at insert, so a release would be an
     // unpaired -1 — left to a separate fix).
+    // fix #5173 / §28.11: REMOVED the ep.disposerThunk != nullptr gate.
+    // A borrowing Array<T> with class/interface/Shared<T>/Weak<T> elements IS
+    // admitted: the #5173 fix stamps the array header with the ClassOwned
+    // disposer in materializeHeapCollectionLiteral, and the reclaim block below
+    // sets collArrayDynamicFree = true for class elements so bz_array_free_dynamic
+    // consults that stamped header at scope-end — exactly-once, no UAF, no
+    // double-free. Value/RuntimeManaged elements (disposerThunk == nullptr) are
+    // still admitted via the existing null-disposer path below.
     const sema::TypeRef* el =
         (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
     ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
-    if (ep.disposerThunk != nullptr) return false;
     if (ep.cat == ElementPolicy::Category::RuntimeManaged &&
         !isStringTypeRefNonNull(el)) return false;
     return true;
@@ -41123,10 +41150,23 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // field with a NULL header disposer and leaked its elements. Confirmed
     // mechanically: `32 byte(s) leaked in 2 allocation(s)`, both frames the
     // literal's enclosing method, with the bz_array_t backing itself correctly
-    // freed. `name` is the CONCRETE head of the literal's own type, so the
-    // owning test is the same one lowerNew applies; a borrowing literal is
-    // never tagged and keeps a NULL header, i.e. today's behaviour exactly.
-    stampOwningElemDisposer(arr, elemRef, common::isOwningPrefixedName(name));
+    // freed.
+    //
+    // LEAK1: the same reasoning applies to BORROWING collection literals with
+    // owned elements (class/interface/Shared<T>/Weak<T>). A borrowing
+    // `Array<Rec> := [new Rec(), ...]` takes ownership of each class element
+    // from its producer (§28.11 element-slot table: borrowing family, class
+    // element → co-owned, the collection must dispose at scope-end). Before
+    // this fix, only `isOwningPrefixedName` collections were tagged, so the
+    // borrowing `Array<Rec>` literal had a NULL header disposer and each
+    // `Rec` element leaked. Measured: 3 × 56 B direct leaks at `main`.
+    //
+    // Fix: always stamp the element disposer, keyed on the element's owning
+    // policy. The `owning=true` argument selects ClassOwned for class/interface/
+    // Shared<T>/Weak<T> elements (correct disposer thunk) and yields a null
+    // disposer for value/RuntimeManaged elements (safe no-op), so this single
+    // call is correct for all element categories and all collection families.
+    stampOwningElemDisposer(arr, elemRef, /*owning=*/true);
 
     // fix #2791 / §8.6 / §15.4 (v0.240): a literal whose element TYPE is
     // Object/interface AND whose every element SOURCE is a boxable value type
