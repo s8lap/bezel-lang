@@ -37,6 +37,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -48,8 +49,17 @@ namespace {
 // A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
 bool wasSkipped(const JitResult& r) {
     if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        // A toolchain skip and a real finding are DIFFERENT outcomes, and only
+        // the former may be returned past. "runAotChecked: SKIP — C toolchain
+        // (clang) ..." means the sanitizer never ran; "sanitizer fired" means it
+        // ran and found something. Returning true for the second would discard
+        // a genuine leak as if the box merely lacked clang — the #3733 silent
+        // -skip defect, and the reason this predicate is not a bare find("SKIP").
+        if (d.message.find("SKIP") == std::string::npos) continue;
+        if (d.message.find("sanitizer fired") != std::string::npos) return false;
+        return true;
+    }
     return false;
 }
 
@@ -186,6 +196,10 @@ const char* kMultiStmtBothFreshNullable =
 BEZEL_TEST(codegen_block_getter_multi_stmt_string_leak_5321,
            multi_stmt_block_getter_both_returns_fresh_does_not_leak_spec_23_3) {
     JitResult r = runAotChecked(kMultiStmtBothFresh);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 190);
@@ -197,6 +211,10 @@ BEZEL_TEST(codegen_block_getter_multi_stmt_string_leak_5321,
 BEZEL_TEST(codegen_block_getter_multi_stmt_string_leak_5321,
            single_stmt_block_getter_still_clean_spec_23_3) {
     JitResult r = runAotChecked(kSingleStmtBlock);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 140);
@@ -215,6 +233,10 @@ BEZEL_TEST(codegen_block_getter_multi_stmt_string_leak_5321,
 BEZEL_TEST(codegen_block_getter_multi_stmt_string_leak_5321,
            multi_stmt_mixed_returns_stays_borrow_path_spec_23_3) {
     JitResult r = runAot(kMultiStmtMixed);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 165);
@@ -226,6 +248,10 @@ BEZEL_TEST(codegen_block_getter_multi_stmt_string_leak_5321,
 BEZEL_TEST(codegen_block_getter_multi_stmt_string_leak_5321,
            multi_stmt_block_getter_nullable_both_returns_fresh_does_not_leak_spec_23_3) {
     JitResult r = runAotChecked(kMultiStmtBothFreshNullable);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 190);

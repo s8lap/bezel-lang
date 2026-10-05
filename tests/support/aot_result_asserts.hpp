@@ -93,6 +93,38 @@
 
 namespace bezel::test {
 
+// True iff `r` was skipped for want of a toolchain (the ASan/LSan link could
+// not run). Distinct from a genuine compile-time rejection, which is what makes
+// it dangerous to act on: a SKIP means the memory-safety claim was never tested.
+//
+// WHY THIS EXISTS (#3733). A leak row written as
+//
+//     JitResult r = runAotChecked(prog);
+//     if (wasSkipped(r)) return;              // <-- absorbing
+//     BEZEL_EXPECT_TRUE(r.ran);
+//
+// returns WITHOUT asserting on a box whose clang cannot link ASan, so the whole
+// sanitizer tier reports a clean PASS having run no sanitizer at all. That is
+// the "silent skip" defect: the test is green, and it proved nothing. It is
+// counted by scripts/check_toolchain_skip_surface.py as an *absorbing site*.
+//
+// The fix is not to delete the guard — a box genuinely without ASan should not
+// be reported as a product failure — but to make the skip LOUD. `BEZEL_EXPECT_FALSE
+// (checkedToolchainSkipped(r))` inverts the branch: the row still passes where
+// the toolchain is absent, and it FAILS anywhere the skip is being used to
+// paper over a real sanitizer finding, because such a finding is a rejection,
+// not a SKIP.
+//
+// Callers must keep the guard as a separate statement from this predicate — the
+// ratchet inspects a call whose bound result reaches a `return` on the strength
+// of the literal "SKIP", so inlining the check into the `if` re-creates the
+// absorbing shape this predicate is here to end.
+inline bool checkedToolchainSkipped(const JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string::npos) return true;
+    return false;
+}
+
 // True iff some diagnostic in `r` contains `sub`. The single scanning
 // primitive both predicates below are built from.
 inline bool diagnosticMessageContains(const JitResult& r, const char* sub) {

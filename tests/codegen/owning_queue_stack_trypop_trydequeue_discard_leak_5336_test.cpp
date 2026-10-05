@@ -19,6 +19,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -29,8 +30,17 @@ namespace {
 // A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
 bool wasSkipped(const JitResult& r) {
     if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        // A toolchain skip and a real finding are DIFFERENT outcomes, and only
+        // the former may be returned past. "runAotChecked: SKIP — C toolchain
+        // (clang) ..." means the sanitizer never ran; "sanitizer fired" means it
+        // ran and found something. Returning true for the second would discard
+        // a genuine leak as if the box merely lacked clang — the #3733 silent
+        // -skip defect, and the reason this predicate is not a bare find("SKIP").
+        if (d.message.find("SKIP") == std::string::npos) continue;
+        if (d.message.find("sanitizer fired") != std::string::npos) return false;
+        return true;
+    }
     return false;
 }
 
@@ -148,7 +158,11 @@ BEZEL_TEST(codegen_owning_queue_trydequeue_discard_leak_5336,
     // spec §22.6 (v0.313): against `out owned T` the discarded value is an
     // unbound owned temporary disposed at the end of the full statement (§28.3).
     JitResult r = runAotChecked(kOwningQueueTryDequeueDiscard);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -165,6 +179,10 @@ BEZEL_TEST(codegen_owning_queue_trydequeue_discard_leak_5336,
 BEZEL_TEST(codegen_owning_queue_trydequeue_discard_leak_5336,
            owning_queue_trydequeue_out_owned_var_binding_still_works) {
     JitResult r = runAotChecked(kOwningQueueTryDequeueBinding);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
@@ -183,6 +201,10 @@ BEZEL_TEST(codegen_owning_queue_trydequeue_discard_leak_5336,
 BEZEL_TEST(codegen_owning_queue_trydequeue_discard_leak_5336,
            owning_stack_trypop_out_underscore_leaks_spec_22_6_28_3) {
     JitResult r = runAotChecked(kOwningStackTryPopDiscard);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
@@ -199,6 +221,10 @@ BEZEL_TEST(codegen_owning_queue_trydequeue_discard_leak_5336,
 BEZEL_TEST(codegen_owning_queue_trydequeue_discard_leak_5336,
            owning_stack_trypop_out_owned_var_binding_still_works) {
     JitResult r = runAotChecked(kOwningStackTryPopBinding);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);

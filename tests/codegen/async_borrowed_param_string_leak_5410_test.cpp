@@ -40,6 +40,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -49,8 +50,17 @@ using bezel::test::runAotChecked;
 // A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
 static bool wasSkipped(const JitResult& r) {
     if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        // A toolchain skip and a real finding are DIFFERENT outcomes, and only
+        // the former may be returned past. "runAotChecked: SKIP — C toolchain
+        // (clang) ..." means the sanitizer never ran; "sanitizer fired" means it
+        // ran and found something. Returning true for the second would discard
+        // a genuine leak as if the box merely lacked clang — the #3733 silent
+        // -skip defect, and the reason this predicate is not a bare find("SKIP").
+        if (d.message.find("SKIP") == std::string::npos) continue;
+        if (d.message.find("sanitizer fired") != std::string::npos) return false;
+        return true;
+    }
     return false;
 }
 
@@ -100,6 +110,10 @@ BEZEL_TEST(codegen_async_borrowed_param_string_leak_5410,
     // clobbered frame field and releases the new value instead. After the fix:
     // clean — no memory errors, no leaks.
     JitResult r = runAotChecked(kAsyncAssignedStringParamLeakRepro);
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     // BEZEL_EXPECT_TRUE(r.ran) asserts no ASan finding (leak, UAF, OOB) in
     // strict mode; in report mode it is informational. Before the fix this
