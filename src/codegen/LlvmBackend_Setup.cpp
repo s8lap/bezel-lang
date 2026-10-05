@@ -25891,6 +25891,11 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         // Inline inlinedGetterBody(ps) — same predicate as the
                         // MemberAccessExpr arm's lambda (duplicated here because
                         // this arm is added after that lambda's scope ends).
+                        // SEAM-DEBT: #5324 — a class-3 read on ps->decl. The
+                        // distinction this arm needs (is the property an indexer,
+                        // and is its body an expression) lives on ast::PropertyDecl
+                        // and has no sanctioned TypeSymbol accessor; the
+                        // sema::TypeSymbol route cannot answer either question.
                         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                         const ast::Expr* getter = nullptr;
                         if (pd && !pd->isIndexer) {
