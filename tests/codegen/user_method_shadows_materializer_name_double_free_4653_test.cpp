@@ -259,8 +259,8 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "    var a := seq.Sorted(); "
         "    var b := seq.Reversed(); "
         "    var c := seq.ToArray(); "
-        "    total := total + a.Length + b.Length + c.Length; "
-        "    total := total + seq.Sorted().Length; "
+        "    total := total + a.Count + b.Count + c.Count; "
+        "    total := total + seq.Sorted().Count; "
         "  end for; "
         "  return total mod 251; "
         "end Main; end C;";
