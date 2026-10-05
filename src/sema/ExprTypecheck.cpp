@@ -19819,7 +19819,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                         head == "OwningStack" ||
                                         head == "OwningQueue" ||
                                         head == "OwningLinkedList" ||
-                                        head == "OwningDictionary";
+                                        head == "OwningDictionary" ||
+                                        head == "OwningSet";
                                 }
                         }
                     }
