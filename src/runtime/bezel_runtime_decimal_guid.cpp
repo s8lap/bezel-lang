@@ -895,6 +895,11 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
         if (c0 == '-') { neg = 1; ++i; }
         else if (c0 == '+') { ++i; }
     }
+    // §9.3 (v0.314, fix #5400): reject ".5" and "5." — the grammar requires
+    // at least one integer-part digit AND at least one fractional digit; a bare
+    // leading '.' or a trailing '.' does not satisfy either requirement.
+    // Track whether the first non-sign character was a decimal point.
+    bool started_with_decimal_point = false;
     // Collect digits, find decimal point.
     __uint128_t m = 0;
     uint32_t sc = 0;
@@ -927,6 +932,10 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
             // §9.3's "TryParse returns false in every case where Parse would
             // raise" in the *other* direction.
             if (in_frac) { bz_set_exc(fe_vtable); return; }
+            // §9.3 (v0.314, fix #5400): if '.' is the first character after the
+            // sign, the integer-part is absent.  Flag it so the post-loop guard
+            // can reject ".5" and "+.5".
+            if (!any_digit && m == 0) started_with_decimal_point = true;
             in_frac = true;
             continue;
         }
@@ -1006,6 +1015,15 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
     }
     if (!any_digit) {
         // FormatException — no digits found.
+        bz_set_exc(fe_vtable);
+        return;
+    }
+    // §9.3 (v0.314, fix #5400): the grammar requires at least one integer-part
+    // digit AND at least one fractional digit.  Reject ".5" and "+.5" (started
+    // with a bare decimal point) and "5." (entered fractional part but collected
+    // zero fractional digits — drop_top==0 means no fractional digit was ever
+    // processed, even as a dropped digit; sc==0 means nothing reduced the scale).
+    if (started_with_decimal_point || (in_frac && sc == 0 && drop_top == 0)) {
         bz_set_exc(fe_vtable);
         return;
     }

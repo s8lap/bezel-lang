@@ -1302,12 +1302,26 @@ static int64_t bz_jder_parse_int(bz_binder_t* d) {
         return 0;
     }
     while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
-    // No decimal point or exponent allowed for integer reads.
+    // §2.15 (v0.314, fix #5400): no decimal point or exponent allowed for integer
+    // reads — "5.9" must raise SerializationException, not silently truncate to 5.
+    if (d->pos < d->len && (d->data[d->pos] == '.' || d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
+        bz_ser_throw_at_json("JSON integer cannot have fraction or exponent (§2.15)", d);
+        return 0;
+    }
     int64_t numlen = d->pos - start;
     if (numlen > 20) { bz_ser_throw_at_json("JSON integer overflow (§2.15)", d); return 0; }
     char buf[24] = {};
     memcpy(buf, d->data + start, (size_t)numlen);
-    return strtoll(buf, nullptr, 10);
+    errno = 0;
+    int64_t result = strtoll(buf, nullptr, 10);
+    // §2.15 (v0.314, fix #5400): strtoll saturates to LONG_MAX/MIN on overflow
+    // and sets ERANGE.  Detect this so 9223372036854775808 into long raises
+    // SerializationException instead of returning a wrong value.
+    if (errno == ERANGE) {
+        bz_ser_throw_at_json("JSON integer overflow (§2.15)", d);
+        return 0;
+    }
+    return result;
 }
 
 static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
@@ -1318,11 +1332,25 @@ static uint64_t bz_jder_parse_uint(bz_binder_t* d) {
     }
     int64_t start = d->pos;
     while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    // §2.15 (v0.314, fix #5400): no decimal point or exponent allowed.
+    if (d->pos < d->len && (d->data[d->pos] == '.' || d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
+        bz_ser_throw_at_json("JSON unsigned integer cannot have fraction or exponent (§2.15)", d);
+        return 0;
+    }
     int64_t numlen = d->pos - start;
     if (numlen > 20) { bz_ser_throw_at_json("JSON uint overflow (§2.15)", d); return 0; }
     char buf[24] = {};
     memcpy(buf, d->data + start, (size_t)numlen);
-    return strtoull(buf, nullptr, 10);
+    errno = 0;
+    uint64_t result = strtoull(buf, nullptr, 10);
+    // §2.15 (v0.314, fix #5400): strtoull saturates to ULONG_MAX on overflow and
+    // sets ERANGE.  Detect this so 18446744073709551616 into ulong raises
+    // SerializationException instead of returning a wrong value.
+    if (errno == ERANGE) {
+        bz_ser_throw_at_json("JSON uint overflow (§2.15)", d);
+        return 0;
+    }
+    return result;
 }
 
 static double bz_jder_parse_float(bz_binder_t* d) {

@@ -1603,24 +1603,75 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
             // (bz_ser_throw_at_binary) — see the Bool case above for why an
             // unchecked pending exception here leaks.
             emitPendingCheck();
+            // §9.8 / §2.15 (v0.314, fix #5400): byte is 0..255.  Reject values
+            // outside this range rather than silently truncating (300 → 44).
+            {
+                auto* ovfBB = llvm::BasicBlock::Create(llvm_, "deser.byte.ovf", currentFn_);
+                auto* okBB  = llvm::BasicBlock::Create(llvm_, "deser.byte.ok",  currentFn_);
+                llvm::Value* cond = builder_.CreateICmpUGT(v, builder_.getInt64(255), "deser.byte.c");
+                builder_.CreateCondBr(cond, ovfBB, okBB);
+                builder_.SetInsertPoint(ovfBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(okBB);
+            }
             return builder_.CreateTrunc(v, i8(), "deser.byte");
         }
         case sema::PrimitiveType::SByte: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
             emitPendingCheck();  // fix #2378 — see the Byte case above.
+            // §9.8 / §2.15 (v0.314, fix #5400): sbyte is −128..127.
+            {
+                auto* ovfBB = llvm::BasicBlock::Create(llvm_, "deser.sbyte.ovf", currentFn_);
+                auto* okBB  = llvm::BasicBlock::Create(llvm_, "deser.sbyte.ok",  currentFn_);
+                llvm::Value* lo = builder_.CreateICmpSLT(v, builder_.getInt64(-128), "deser.sbyte.lo");
+                llvm::Value* hi = builder_.CreateICmpSGT(v, builder_.getInt64(127),  "deser.sbyte.hi");
+                builder_.CreateCondBr(builder_.CreateOr(lo, hi, "deser.sbyte.ovf"), ovfBB, okBB);
+                builder_.SetInsertPoint(ovfBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(okBB);
+            }
             return builder_.CreateTrunc(v, i8(), "deser.sbyte");
         }
         case sema::PrimitiveType::Short: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
             emitPendingCheck();  // fix #2378 — see the Byte case above.
+            // §9.8 / §2.15 (v0.314, fix #5400): short is −32768..32767.
+            {
+                auto* ovfBB = llvm::BasicBlock::Create(llvm_, "deser.short.ovf", currentFn_);
+                auto* okBB  = llvm::BasicBlock::Create(llvm_, "deser.short.ok",  currentFn_);
+                llvm::Value* lo = builder_.CreateICmpSLT(v, builder_.getInt64(-32768), "deser.short.lo");
+                llvm::Value* hi = builder_.CreateICmpSGT(v, builder_.getInt64(32767),   "deser.short.hi");
+                builder_.CreateCondBr(builder_.CreateOr(lo, hi, "deser.short.ovf"), ovfBB, okBB);
+                builder_.SetInsertPoint(ovfBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(okBB);
+            }
             return builder_.CreateTrunc(v, i16(), "deser.short");
         }
         case sema::PrimitiveType::UShort: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
             emitPendingCheck();  // fix #2378 — see the Byte case above.
+            // §9.8 / §2.15 (v0.314, fix #5400): ushort is 0..65535.
+            {
+                auto* ovfBB = llvm::BasicBlock::Create(llvm_, "deser.ushort.ovf", currentFn_);
+                auto* okBB  = llvm::BasicBlock::Create(llvm_, "deser.ushort.ok",  currentFn_);
+                llvm::Value* cond = builder_.CreateICmpUGT(v, builder_.getInt64(65535), "deser.ushort.c");
+                builder_.CreateCondBr(cond, ovfBB, okBB);
+                builder_.SetInsertPoint(ovfBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(okBB);
+            }
             return builder_.CreateTrunc(v, i16(), "deser.ushort");
         }
         case sema::PrimitiveType::Int: {
@@ -1631,12 +1682,37 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
             // Bool case above for why an unchecked pending exception here leaks
             // the exception object bz_ser_throw allocated.
             emitPendingCheck();
+            // §9.8 / §2.15 (v0.314, fix #5400): int is −2147483648..2147483647.
+            {
+                auto* ovfBB = llvm::BasicBlock::Create(llvm_, "deser.int.ovf", currentFn_);
+                auto* okBB  = llvm::BasicBlock::Create(llvm_, "deser.int.ok",  currentFn_);
+                llvm::Value* lo = builder_.CreateICmpSLT(v, builder_.getInt64(-2147483648LL), "deser.int.lo");
+                llvm::Value* hi = builder_.CreateICmpSGT(v, builder_.getInt64(2147483647LL),   "deser.int.hi");
+                builder_.CreateCondBr(builder_.CreateOr(lo, hi, "deser.int.ovf"), ovfBB, okBB);
+                builder_.SetInsertPoint(ovfBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(okBB);
+            }
             return builder_.CreateTrunc(v, i32(), "deser.int");
         }
         case sema::PrimitiveType::UInt: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
             emitPendingCheck();  // fix #2378 — see the Byte case above.
+            // §9.8 / §2.15 (v0.314, fix #5400): uint is 0..4294967295.
+            {
+                auto* ovfBB = llvm::BasicBlock::Create(llvm_, "deser.uint.ovf", currentFn_);
+                auto* okBB  = llvm::BasicBlock::Create(llvm_, "deser.uint.ok",  currentFn_);
+                llvm::Value* cond = builder_.CreateICmpUGT(v, builder_.getInt64(4294967295LL), "deser.uint.c");
+                builder_.CreateCondBr(cond, ovfBB, okBB);
+                builder_.SetInsertPoint(ovfBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(okBB);
+            }
             return builder_.CreateTrunc(v, i32(), "deser.uint");
         }
         case sema::PrimitiveType::Long: {
