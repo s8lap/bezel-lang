@@ -1,34 +1,41 @@
 // Codegen / refcounting — issue #5410.
 //
-// The #5262 fix added borrowed-string-parameter frame-lifetime pinning to an async
-// method: retain at entry, release at task settlement (emitAsyncComplete or the
-// fault boundary). The release was placed at the terminal teardown, reading the
-// frame field that held the borrowed value at entry.
+// WHAT LEAKS. An async method whose body ASSIGNS to a `string` parameter
+// (`s := s + "-x"`) mints a fresh heap string per resume activation and never
+// releases it. Measured on the repro below (10 awaited calls, ASan/LSan):
+// 390 bytes in 20 allocations — 32 B `bz.string` header + 7 B width-1 payload
+// per call — with allocating frame #1 `bz$async$M.C$Take$Resume`.
 //
-// PROBLEM: if the async body ASSIGNS to the parameter (e.g. `s := s + "-x"`),
-// the assignment OVERWRITES the local slot (and its spill-to-frame image) with the
-// new value before the teardown release runs. The teardown release therefore reads
-// the NEW value (not the original borrowed parameter) and releases it instead — the
-// original borrowed value is never released, leaking one reference per resume
-// activation.
+// IT IS NOT THE BORROWED VALUE. The frame-lifetime pin #5262-ff added (retain
+// the borrowed `string` formals into the frame at entry, release at settlement)
+// is already balanced, and the leak's ALLOCATING stack is inside the resume,
+// which is where `s + "-x"` runs — the leaked object is the CONCAT RESULT, not
+// the caller's `h.Name`. The synchronous twin of this exact body
+// (`static method Take`) does not leak, which is what isolates the defect to
+// the async routing rather than to the reassignment itself.
 //
-// THE FIX: call emitAsyncStringParamRelease(smSelf_) at the START of Resume,
-// before any body statement can overwrite the frame field. The borrowed parameter's
-// entry +1 is dropped exactly once per activation, and the frame field is still
-// correct when read.
+// ROOT CAUSE. retainAssignedStringParams mints the per-activation +1 that
+// licenses lowerStringLocalReassign's drop-on-overwrite release. Its scope-end
+// release of the parameter's FINAL value is gated on `armScopeEndRelease`,
+// which defaults to FALSE. Both existing callers that pass true are synchronous
+// (Setup.cpp:10760, the method body; Calls2.cpp:17140, the generic
+// specialization) and both rely on their body's ROOT `lowerScopedBlock` to
+// drain the queued Disposal out of `pendingChainOutDisposals_`. An async body is
+// lowered through `lowerBody`, which never reaches that drain — so even with
+// the gate opened, the Disposal would be discarded when the resume's
+// `disposeStack_` frame pops. The fix opens the gate in emitAsyncMethod and
+// adds the matching drain.
 //
-// Spec: §30.1 "`async` methods" — the task "settles" when it reaches a
-// terminal state; §4.6 "`string`" and §28.9 "Runtime-managed types" — the
-// reference-counting contract is that a `string` value is reclaimed when no
-// reference to it remains; §28.3 "Local variables, ownership, and borrows" —
-// a borrowed parameter carries no disposal obligation, but its REFERENCE is
-// owned by the caller and must not be leaked. Spec revision v0.313.
+// Spec: §28.9 "Runtime-managed types" — a `string`'s reference is reclaimed
+// when no reference to it remains; §28.7 — reassignment releases the displaced
+// value, and the slot's own final value is released at scope end; §4.6
+// "`string`"; §30.1 "`async` methods" — the task "settles" at a terminal state,
+// which is where this release belongs. Spec revision v0.313.
 //
-// THE REGRESSION: the test uses a borrowed `string` parameter that is ASSIGNED
-// in the body. Before the fix, the entry-retain / teardown-release imbalance
-// caused by the assignment overwriting the frame field leaked one string reference
-// per resume activation. After the fix, the release at Resume start correctly
-// drops the borrowed reference before the body can clobber the frame field.
+// THE REGRESSION: `BEZEL_EXPECT_TRUE(r.ran)` is the whole oracle — under
+// BEZEL_AOT_DETECT_LEAKS=strict a leak fails the row (r.ran == false) and a
+// clean run passes, and `r.exitCode == 60` pins the observable value so a
+// program broken by the fix cannot pass vacuously.
 
 #include <string>
 
@@ -49,16 +56,22 @@ static bool wasSkipped(const JitResult& r) {
 
 // A holder whose string field is the borrowed source. Built at runtime (not a
 // literal, which would be an rc sentinel and make the oracle vacuous).
+//
+// fix-forward #5410: NO `//` comment may appear inside this string. The repro
+// is ONE line, so a `//` comments out everything after it — including `end
+// Take`, `end Main` and `end C` — and the program then fails to PARSE. That is
+// not a hypothetical: the row as first written carried three in-string comments
+// and its own `[ RUN ]` never compiled anything. It reported `ran == false` for
+// a parse error (`expected 'end'`), which the strict-leak assertion read as a
+// leak. Prose about the shape belongs in this file's C++ comments, not in the
+// source text.
 const char* kAsyncAssignedStringParamLeakRepro =
     "module M; class Holder "
     "  public Name: string := \"\"; "
     "end Holder; "
     "class C "
-    "  // Async method with an ASSIGNED string parameter. The assignment clobbers "
-    "  // the frame field before the teardown release can run, so without the "
-    "  // fix the original borrowed value (h.Name) is never released."
     "  private static async method Take(s: string, i: int): Task<int> "
-    "    s := s + \"-x\"; "    // overwrites the local slot and its frame image
+    "    s := s + \"-x\"; "
     "    return s.Length; "
     "  end Take; "
     "  public static async method Main(): Task<int> "
@@ -69,7 +82,7 @@ const char* kAsyncAssignedStringParamLeakRepro =
     "    for var i in 1..10 do "
     "      total := total + await C.Take(h.Name, i); "
     "    end; "
-    "    return total; "                     // 10 * 6 = 60
+    "    return total; "
     "  end Main; "
     "end C;";
 
@@ -88,11 +101,9 @@ BEZEL_TEST(codegen_async_borrowed_param_string_leak_5410,
     // clean — no memory errors, no leaks.
     JitResult r = runAotChecked(kAsyncAssignedStringParamLeakRepro);
     if (wasSkipped(r)) return;
-    // Also skip on infra failure (ASan runtime unavailable).
-    if (!r.ran) return;
-    // Before the fix: r.exitCode == -1 (LSan leak detected in strict mode).
-    // After the fix: r.exitCode == 60 (correct value, no leak).
+    // BEZEL_EXPECT_TRUE(r.ran) asserts no ASan finding (leak, UAF, OOB) in
+    // strict mode; in report mode it is informational. Before the fix this
+    // fires (r.ran == false, LSan leak detected). After the fix it passes.
+    BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 60);
-    // The observable value is correct regardless of the fix (the leak is invisible
-    // on the plain path). The ASan oracle verifies no memory errors and no leaks.
 }

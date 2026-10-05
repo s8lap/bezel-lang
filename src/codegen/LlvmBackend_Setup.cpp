@@ -16858,6 +16858,29 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                             if (litAllBoxes)
                                 d.collectionElemDisposer = boxElementDisposerThunk();
                         }
+                        // fix #5414 (§4.4 / §28.9 / §28.11, v0.315): a non-owning
+                        // `Array<Rec>` literal (or Stack/Queue) whose element is a
+                        // class/interface/Shared<T>/Weak<T> owns those elements and must
+                        // dispose each at scope-end free. The class/interface disposer
+                        // (elementDisposerThunk, which calls the vtable Dispose) is
+                        // the same one OwningArray uses — the owning-family element
+                        // policy gives the correct disposer for the non-owning case.
+                        // Without this branch, d.collectionElemDisposer stays null and
+                        // bz_array_free(arr, null) skips element disposal → every
+                        // element leaks. The existing string-element branch below handles
+                        // strings (RuntimeManaged, co-owned +1 release). The box-element
+                        // branch above handles §8.6 box elements (boxElementDisposerThunk).
+                        if (!d.collectionElemDisposer) {
+                            const sema::TypeRef* elt =
+                                (!collTy->genericArgs.empty())
+                                    ? collTy->genericArgs[0] : nullptr;
+                            if (elt && elt->kind == sema::TypeRef::Kind::Named &&
+                                elt->declaration &&
+                                (elt->declaration->kind == ast::TypeDeclKind::Class)) {
+                                d.collectionElemDisposer =
+                                    elementPolicyFor(elt, /*owningFamily=*/true).disposerThunk;
+                            }
+                        }
                         // fix #2774 / §28.9 / §15.4 (v0.282): for an `Array<string>`
                         // literal, install stringElementReleaseThunk so the scope-
                         // end bz_array_free call releases each co-owned +1 the
@@ -16899,6 +16922,45 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                                 d.collArrayDynamicFree = true;
                         }
                         disposeStack_.back().push_back(d);
+                    }
+                    // fix #5414 (§4.4 / §28.9 / §28.11, v0.315) FALLBACK: if the
+                    // local was NOT added to borrowingArrayFreeEligible_ (the escape
+                    // analysis excluded it for some reason), still register disposal
+                    // for a non-owning Array/Stack/Queue of class/interface elements.
+                    // The elements from a collection literal ARE fresh (no aliases), so
+                    // this fallback is safe: no double-disposal risk, the literal's
+                    // backing IS reclaimed (the emitDisposals map deduplicates by addr).
+                    // Gated on: not already in borrowingArrayFreeEligible_, not a using
+                    // var, collection literal, non-owning Array/Stack/Queue, class element.
+                    if (!borrowingArrayFreeEligible_.count(static_cast<const void*>(declNode)) &&
+                        !disposeStack_.empty()) {
+                        auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
+                        if (cl && !cl->isDict) {
+                            if (const sema::TypeRef* ct = ctx_.resolvedType(*declType)) {
+                                std::string_view head =
+                                    ct->astNode && ct->astNode->name &&
+                                    !ct->astNode->name->parts.empty()
+                                        ? ct->headName() : std::string_view{};
+                                bool isNonOwningArr =
+                                    (head == "Array" || head == "Stack" || head == "Queue") &&
+                                    !common::isOwningPrefixedName(std::string(head));
+                                if (isNonOwningArr && !ct->genericArgs.empty()) {
+                                    const sema::TypeRef* elt = ct->genericArgs[0];
+                                    if (elt && elt->kind == sema::TypeRef::Kind::Named &&
+                                        elt->declaration &&
+                                        (elt->declaration->kind == ast::TypeDeclKind::Class)) {
+                                        auto slotIt = locals_.find(declNode);
+                                        if (slotIt != locals_.end()) {
+                                            Disposal fd{slotIt->second, nullptr};
+                                            fd.collection = true;
+                                            fd.collectionElemDisposer =
+                                                elementPolicyFor(elt, /*owningFamily=*/true).disposerThunk;
+                                            disposeStack_.back().push_back(fd);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     // fix #2142 / §28.9 / §28.11 (v0.220): reclaim the backing of
                     // an eligible borrowing-`Set<T>` LITERAL local at scope end.
@@ -41167,6 +41229,51 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // disposer for value/RuntimeManaged elements (safe no-op), so this single
     // call is correct for all element categories and all collection families.
     stampOwningElemDisposer(arr, elemRef, /*owning=*/true);
+
+    // fix #5414 (§4.4 / §28.9 / §28.11, v0.315): a non-owning
+    // Array<Rec>/Stack<Rec>/Queue<Rec> literal (or interface/Object element)
+    // must install the class-element vtable disposer even though
+    // stampOwningElemDisposer was a no-op (owning=false for the non-Owning*
+    // variants). Per §28.11: class/interface × borrowing → owned slot —
+    // the elements ARE owned by the array and must be disposed at scope-end
+    // free. The string-element path (litIsStrArr below) is already correct —
+    // strings are RuntimeManaged and need no deep disposal; the class-element
+    // path was missing. Installing the class-vtable disposer (the same one
+    // Owning* uses) closes the leak: 168 B / 3 allocs for the issue's repro.
+    {
+        bool isNonOwningArrayBacked =
+            !common::isOwningPrefixedName(name) &&
+            (name == "Array" || name == "Stack" || name == "Queue");
+        // Mirrors the class/interface / Shared/Weak branch of elementPolicyFor:
+        // Shared<T> and Weak<T> have no declaration (compiler-known builtins)
+        // and are identified by head name. Regular class/interface types have
+        // a declaration.
+        auto isSharedOrWeakType = [](const sema::TypeRef* t) -> bool {
+            if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+            if (t->declaration) return false;
+            if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+                return false;
+            auto n = t->headName();
+            return n == "Shared" || n == "Weak";
+        };
+        bool isClassElement =
+            elemRef && !elemRef->nullable &&
+            (isSharedOrWeakType(elemRef) ||
+             (elemRef->kind == sema::TypeRef::Kind::Named &&
+              elemRef->declaration &&
+              (elemRef->declaration->kind == ast::TypeDeclKind::Class)));
+        if (isNonOwningArrayBacked && isClassElement) {
+            llvm::Function* d =
+                elementPolicyFor(resolveTypeParamRef(elemRef),
+                                 /*owningFamily=*/true).disposerThunk;
+            if (d) {
+                auto* setFn = declareC("bz_array_set_elem_disposer",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy()});
+                builder_.CreateCall(setFn, {arr, d});
+            }
+        }
+    }
 
     // fix #2791 / §8.6 / §15.4 (v0.240): a literal whose element TYPE is
     // Object/interface AND whose every element SOURCE is a boxable value type

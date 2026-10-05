@@ -1834,7 +1834,37 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // assignment to a `string` param does not survive a suspend — a
         // separate, pre-existing async defect this fix neither causes nor
         // fixes; the retain-per-activation is what keeps it leak-safe.)
-        retainAssignedStringParams(*ci.stmts, ms->params);
+        //
+        // fix-forward #5410 (§28.9 / §4.6 / §30.1, v0.313): pass
+        // armScopeEndRelease so the parameter's FINAL value gets a scope-end
+        // release, exactly as the synchronous method body (Setup.cpp:10760) and
+        // the generic specialization (Calls2.cpp:17140) already do. Without it
+        // the retain above is a bare +1 whose only consumer is the
+        // drop-on-overwrite release, so a body that assigns ONCE and then
+        // settles leaks the assigned value per activation: `s := s + "-x"`
+        // mints a fresh heap string in the resume, stores it in the slot, and
+        // nothing ever releases it. MEASURED on the issue's own repro
+        // (`scripts/agent_check.sh --probe --asan`, 10 awaited calls): 390 bytes
+        // / 20 allocations, allocating frame #1 `bz$async$M.C$Take$Resume` —
+        // 32 B header + 7 B payload per call, the width-1 concat result, not
+        // the borrowed `h.Name` the frame-pin half (#5262-ff) already balances.
+        // The synchronous twin of the same body (`static method Take`) does NOT
+        // leak, which is what isolates this to the async routing.
+        //
+        // `!hasEnsuresClause(ms)` mirrors both existing call sites: an `ensures`
+        // epilogue runs AFTER the body's scope-end disposals (§22.16), so a
+        // parameter it reads must keep its reference.
+        retainAssignedStringParams(*ci.stmts, ms->params,
+                                   /*setterValueAnchor=*/nullptr,
+                                   /*armScopeEndRelease=*/!hasEnsuresClause(ms));
+        // The queueing target differs from the synchronous paths: those bodies
+        // are lowered through lowerScopedBlock, which drains
+        // pendingChainOutDisposals_ into its ROOT scope (Setup.cpp:42564). An
+        // async body is lowered through lowerBody, so nothing drains it and the
+        // Disposal would be dropped when the resume's disposeStack_ frame pops.
+        // The drain added at the body's disposeStack_.emplace_back() below is
+        // the async counterpart; it must pair with the gate opened here.
+        //
         // fix #4174 follow-up: the closure twin — see
         // retainAssignedClosureParams' own comment. Paired with this
         // function's own collectClosureReleaseEligible(*ci.stmts) /
@@ -1936,14 +1966,31 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // ReturnStmt handlers (gated on smKind_ == Await) interrupt it to emit
         // the suspend transitions / task completion.
         builder_.SetInsertPoint(stateBBs[0]);
-        // fix-forward #5410 (§30.1 / §4.6 / §28.9, v0.313): release the borrowed
-        // string parameters at the START of resume, before any body statement can
-        // overwrite a frame field. Without this, `s := s + "-x"` clobbers the frame
-        // field before emitAsyncComplete/emitAsyncFaultBoundary runs, and the release
-        // reads the NEW string instead of the original borrowed value — one
-        // reference leaks per resume activation.
-        emitAsyncStringParamRelease(smSelf_);
         disposeStack_.emplace_back();
+        // fix-forward #5410 (§28.9 / §4.6 / §30.1, v0.313): drain the
+        // scope-end string-param disposals retainAssignedStringParams queued
+        // above into the resume's own method scope — the frame just pushed,
+        // which is unambiguously the one whose body is about to lower. This is
+        // the async counterpart of the ROOT-scope drain at Setup.cpp:42564,
+        // which the synchronous method body reaches through lowerScopedBlock
+        // and an async body (lowered through lowerBody) never reaches.
+        //
+        // The depth-1 guard is the SAME one the synchronous root drain uses
+        // (Setup.cpp:42564), and for the same reason: only the function's OWN
+        // outermost scope may absorb a Disposal queued for it, so a nested
+        // emission can never register this frame's slots into an enclosing
+        // body. MEASURED: making the drain unconditional instead (dropping
+        // only the guard) is byte-for-byte identical on every row measured —
+        // capture_cell_holder_validity_3484's five leaking rows keep their
+        // exact 600/600/600/400/600 B on both variants — so the guard is kept
+        // for the invariant it states rather than because it changes today's
+        // output. It is the conservative direction either way: a skip leaves
+        // the entry queued (a leak), never an over-release.
+        if (disposeStack_.size() == 1 && !pendingChainOutDisposals_.empty()) {
+            auto pending = std::move(pendingChainOutDisposals_);
+            pendingChainOutDisposals_.clear();
+            for (auto& d : pending) disposeStack_.back().push_back(d);
+        }
         bool term = lowerBody(*ci.stmts);
         // §28.3 / §30.1 (#938): on NORMAL fall-off, dispose the async body's
         // method-level scope's owned locals (`using var` / owned) BEFORE
@@ -2678,10 +2725,6 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
 
         // Emit the body from state 0.
         builder_.SetInsertPoint(stateBBs[0]);
-        // fix-forward #5410 (§30.1 / §30.6 / §4.6 / §28.9, v0.313): same fix as
-        // the named async method: release borrowed string parameters at the START
-        // of resume, before any body statement can overwrite a frame field.
-        emitAsyncStringParamRelease(smSelf_);
         disposeStack_.emplace_back();
         if (lam.exprBody) {
             // §30.6: an expression-bodied async lambda's value completes the
@@ -4161,10 +4204,6 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         }
 
         builder_.SetInsertPoint(stateBBs[0]);
-        // fix-forward #5410 (§29.1 / §30.1 / §4.6 / §28.9, v0.313): same fix as
-        // the named async method: release borrowed string parameters at the START
-        // of resume, before any body statement can overwrite a frame field.
-        emitAsyncStringParamRelease(smSelf_);
         disposeStack_.emplace_back();
         bool term = lowerBody(*ci.stmts);
         if (!term && !builder_.GetInsertBlock()->getTerminator()) {
