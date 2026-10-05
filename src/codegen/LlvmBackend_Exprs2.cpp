@@ -7497,6 +7497,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (sema::isAggregateChannelElement(chElemTy))
                     dispArg = declareC("free", llvm::Type::getVoidTy(llvm_),
                                        {ptrTy()});
+                // fix #5304 / stdlib §6.9 / §28.11 / §28.9: a string element's
+                // RuntimeManaged policy (owningFamily=true falls through to Value
+                // with null disposer) means elementDisposerArg returns null, so the
+                // channel's dispose_elem is null and bz_channel_dispose drains the
+                // deque WITHOUT releasing each string — every undelivered string
+                // leaks. Override with the string-element release thunk: the channel
+                // takes ownership of the string on Send (bz_string_retain is emitted
+                // in the Send lowering) and releases it here for undelivered items
+                // and in TryReceive for received items.
+                if (!dispArg &&
+                    chElemTy && chElemTy->kind == sema::TypeRef::Kind::Primitive &&
+                    chElemTy->primitive == sema::PrimitiveType::String)
+                    dispArg = llvm::cast<llvm::Value>(stringElementReleaseThunk());
                 // v0.174 (#809) / §6.9: bounded ctor `new Channel<T>(capacity)`.
                 // capacity >= 1, else ArgumentException (a catchable guard, per
                 // §6.9). The nullary ctor passes capacity 0 (= unbounded).
