@@ -12843,6 +12843,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             std::vector<llvm::Value*> ordered(formalToArg.size(), nullptr);
             std::vector<const ast::Expr*> orderedExprs(formalToArg.size(),
                                                        nullptr);
+            std::vector<llvm::AllocaInst*> argTempSlots;
             std::vector<int> argToFormal(call.args.size(), -1);
             for (std::size_t j = 0; j < formalToArg.size(); ++j)
                 if (formalToArg[j] >= 0)
@@ -13127,8 +13128,84 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // buildOrderedArgs' #1019 registration — see the helper.
                 if (!byRef && a.modifier != "owned" && formalMod != "owned")
                     registerImportedBorrowedFreshClassTempArg(*a.value, v);
+                // fix #5293 / §28.3 (#993): the IMPORTED-callee twin of
+                // buildOrderedArgs' #993 registration. An `owned` formal receives
+                // ownership of a fresh owned temp (new / move / owned operator /
+                // owned-returning call) on the normal path, so register an
+                // unwind-only disposal entry that fires only when a LATER
+                // argument throws — the temp was produced but the callee never
+                // runs to take ownership. The entry is discharged below before
+                // the call on the normal edge (dispose-exactly-once). Excludes:
+                // ref/out formals (not owned sinks), and the callee-disposal
+                // case already handled by registerImportedBorrowedFreshClassTempArg
+                // (the borrow-formal twin, #1019 / #5268).
+                if (!byRef && formalMod == "owned" && !disposeStack_.empty() &&
+                    v->getType()->isPointerTy() &&
+                    !llvm::isa<llvm::ConstantPointerNull>(v)) {
+                    const ast::Expr* av = a.value.get();
+                    bool isOwnedTempArg = false;
+                    if (dynamic_cast<const ast::NewExpr*>(av)) {
+                        isOwnedTempArg = true;
+                    } else if (auto* un =
+                                   dynamic_cast<const ast::UnaryExpr*>(av)) {
+                        if (un->op == "move") isOwnedTempArg = true;
+                    } else if (auto* be =
+                                   dynamic_cast<const ast::BinaryExpr*>(av)) {
+                        if (auto* osym = ctx_.exprSymbol(*be))
+                            if (auto* oms =
+                                    dynamic_cast<sema::MethodSymbol*>(osym))
+                                isOwnedTempArg =
+                                    oms->isOperator &&
+                                    sema::methodReturnsOwned(*oms, ctx_);
+                    } else if (auto* ce =
+                                   dynamic_cast<const ast::CallExpr*>(av)) {
+                        isOwnedTempArg =
+                            common::calleeReturnsOwned(*ce, ctx_);
+                    }
+                    if (isOwnedTempArg) {
+                        const sema::TypeRef* at = ctx_.exprType(*av);
+                        bool isClassInstance =
+                            at && at->kind == sema::TypeRef::Kind::Named &&
+                            at->declaration &&
+                            at->declaration->kind == ast::TypeDeclKind::Class;
+                        if (isClassInstance) {
+                            llvm::AllocaInst* tslot =
+                                entryAlloca(v->getType());
+                            builder_.CreateStore(v, tslot);
+                            // fix #5286 / §28.3 *Deferred-activation callees*,
+                            // §30.1 (v0.313): as in the local arm, the slot
+                            // must live in the async frame for resumption.
+                            if (smStateStruct_)
+                                asyncHandlerSpillSlots_.push_back(tslot);
+                            Disposal d{tslot, nullptr};
+                            d.unwindOnly = true;  // fires only on throw
+                            d.dynamicDispose = false;
+                            disposeStack_.back().push_back(d);
+                            argTempSlots.push_back(tslot);
+                        }
+                    }
+                }
                 ordered[pi] = v;
                 orderedExprs[pi] = a.value.get();
+            }
+            // fix #5293 / §28.3 (#993): all arguments evaluated successfully —
+            // the call is about to run and will take ownership. Discharge the
+            // transient unwind-only disposals registered above so the normal path
+            // never double-disposes. Gated on !diverged_ (same as the local path):
+            // if an argument evaluation set diverged_ and branched to unwindBB_,
+            // the disposal entries are still live on the unwind edge.
+            if (!diverged_ && !argTempSlots.empty() && !disposeStack_.empty()) {
+                auto& scope = disposeStack_.back();
+                scope.erase(
+                    std::remove_if(
+                        scope.begin(), scope.end(),
+                        [&](const Disposal& d) {
+                            return d.unwindOnly &&
+                                   std::find(argTempSlots.begin(),
+                                             argTempSlots.end(),
+                                             d.slot) != argTempSlots.end();
+                        }),
+                    scope.end());
             }
             // per §22.5: a formal left unbound takes its declared default. The
             // exporter's rendered default rides ParameterSymbol::defaultText
