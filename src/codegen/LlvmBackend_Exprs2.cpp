@@ -7506,7 +7506,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // takes ownership of the string on Send (bz_string_retain is emitted
                 // in the Send lowering) and releases it here for undelivered items
                 // and in TryReceive for received items.
-                if (!dispArg &&
+                if (llvm::isa<llvm::ConstantPointerNull>(dispArg) &&
                     chElemTy && chElemTy->kind == sema::TypeRef::Kind::Primitive &&
                     chElemTy->primitive == sema::PrimitiveType::String)
                     dispArg = llvm::cast<llvm::Value>(stringElementReleaseThunk());

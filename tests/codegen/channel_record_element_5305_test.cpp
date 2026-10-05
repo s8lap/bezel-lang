@@ -460,3 +460,39 @@ BEZEL_TEST(channel_record_element_5305, control_sealed_class) {
                 "  return 0; end Main; end C;",
                 "11\n");
 }
+
+// Regression test for #5304 / stdlib §6.9 / §28.11 / §28.9: a Channel<string>
+// leaks every undelivered string at channel disposal because
+// elementDisposerArg(string, owning) returns a null ConstantPointerNull
+// (RuntimeManaged row: no disposer), so bz_channel_dispose drains the deque
+// WITHOUT calling bz_string_release on each buffered item — every string
+// header+data leaks. 200 iterations pin the leak (one-shot does not reach
+// LSan threshold). The interpolation $"" must be used (a string LITERAL
+// carries no heap allocation and would not be detected).
+//
+// THE FIX: the isAggregateChannelElement null-vs-thunk override in lowerNew
+// used `!dispArg` which is always false for an llvm::Value* (the Value is
+// never a null pointer; it is a ConstantPointerNull at most).  The correct
+// check is llvm::isa<llvm::ConstantPointerNull>(dispArg).
+//
+// The TRYRECEIVE arm is separate (#5304 original): the Send lowering emits
+// bz_string_retain when the channel takes ownership, so TryReceive must
+// release the channel's reference when handing the string to the caller.
+// That fix (emitStringRelease in TryReceive) was already on r23-c28.
+BEZEL_TEST(channel_record_element_5305, channel_string_undelivered_leak_5304) {
+    // 200 iterations with no receive: all items are undelivered at channel
+    // disposal. exitCode==0 + no LSan report = no leak.
+    expectClean("module M; "
+                "class C public static method Main(): int "
+                "  using var cr := new Channel<string>(); "
+                "  using var tr := cr.NewSender(); "
+                "  var i := 0; "
+                "  while i < 200 do "
+                "    var s: string := $\"payload-{i}\"; "
+                "    tr.Send(s); "
+                "    i := i + 1; "
+                "  end; "
+                "  return 0; end Main; end C;",
+                // No output expected; the test asserts exitCode == 0 (no leak)
+                "");
+}
