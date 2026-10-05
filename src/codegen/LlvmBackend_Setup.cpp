@@ -30058,8 +30058,66 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
                     // read; the declared-function gate (`pd->type`) requires
                     // walking the AST through the imported decl.
                     dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-                declaredFunc =
-                    pd->type && pd->type->kind == ast::TypeKind::Function;
+                if (pd->type && pd->type->kind == ast::TypeKind::Function) {
+                    declaredFunc = true;
+                } else if (pd->type && ps->parent && ma && ma->target) {
+                    // fix #5432 (§14.1 / §23.1 / §27.6 / §28.9, v0.314): at a
+                    // GENERIC instantiation the DECLARED type is not the last
+                    // word. A bare-`T` property of `Holder<T>` read as `h.v` on
+                    // a `Holder<() -> int>` has SUBSTITUTED type `() -> int`, and
+                    // `lowerExpr`'s §27.6 gate (LlvmBackend_Exprs.cpp, fix
+                    // #5283) therefore takes the ORDINARY value read: the
+                    // getter already yields the stored closure cell, so no
+                    // thunk cell is calloc'd and NO +1 is minted here.
+                    //
+                    // This predicate answers "did the initializer mint a +1
+                    // cell?", so it must ask the SAME question `lowerExpr`
+                    // asks, or the two disagree and the local's ownership is
+                    // mis-stated. Reading only `pd->type` saw the bare `T`
+                    // (not ast::TypeKind::Function), answered "yes, +1
+                    // producer", and armed a scope-end `bz_closure_release` on
+                    // a slot that owns nothing — while the ordinary read minted
+                    // no matching retain. The owner's DisposeCore releases the
+                    // SAME cell a second time, and two releases for one
+                    // reference abort under the #4547 guard (§28.9).
+                    //
+                    // MEASURED on the issue's own repro (`Holder<() -> int>`,
+                    // `var g: () -> int := h.v;`, `BEZEL_DUMP_IR=1`): ZERO
+                    // `pthunk` definitions in the module, ZERO
+                    // `bz_closure_retain` in `main`, TWO releases of the one
+                    // cell (the scope-end one plus `bz$Holder$DisposeCore$spec0`)
+                    // -> "refcount over-release (closure)", exit 134.
+                    //
+                    // The walk is deliberately the same both-sources
+                    // substitution lookup #5283 performs in `lowerMemberAccess`
+                    // and `makePropertyThunk` performs, ordered by the same
+                    // `sema::genericParamNames`, so the producer predicate and
+                    // the emitter cannot drift: a `T` substituted to a function
+                    // type is an ordinary read in BOTH, and a `T` substituted
+                    // to anything else keeps the §27.6 thunk promotion (and its
+                    // +1) in both. Non-generic and imported spellings are
+                    // untouched.
+                    const sema::TypeRef* declTy = ctx_.resolvedType(*pd->type);
+                    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                    if (isBareTypeParamRef(declTy) && recvTy &&
+                        recvTy->kind == sema::TypeRef::Kind::Named &&
+                        recvTy->declaration == ps->parent &&
+                        !recvTy->genericArgs.empty()) {
+                        const std::vector<std::string_view> gpNames =
+                            sema::genericParamNames(ps->parent);
+                        auto pit = std::find(gpNames.begin(), gpNames.end(),
+                                             declTy->headName());
+                        if (pit != gpNames.end()) {
+                            const std::size_t idx = static_cast<std::size_t>(
+                                std::distance(gpNames.begin(), pit));
+                            if (idx < recvTy->genericArgs.size() &&
+                                recvTy->genericArgs[idx])
+                                declaredFunc =
+                                    recvTy->genericArgs[idx]->kind ==
+                                    sema::TypeRef::Kind::Function;
+                        }
+                    }
+                }
             } else if (sema::TypeRef* tr = ctx_.importedMemberType(ps)) {
                 declaredFunc = tr->kind == sema::TypeRef::Kind::Function;
             }
