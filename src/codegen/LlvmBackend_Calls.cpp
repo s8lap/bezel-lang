@@ -7190,6 +7190,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi = builder_.CreatePHI(i1(), 2, "trypop.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
+            // fix #5289 (§22.6 "out _", §28.3): the discarded `out owned` value is an
+            // unbound owned temporary — dispose it (null-guarded) after the call.
+            if (call.args[0].isDiscard)
+                disposeDiscardedOwnedOut(
+                    outAddr, recvTy && !recvTy->genericArgs.empty()
+                                 ? recvTy->genericArgs[0] : nullptr);
             return phi;
         }
         // fix #642 / stdlib §4.5: .PopAt(index): owned T / .PopLast(): owned T /
