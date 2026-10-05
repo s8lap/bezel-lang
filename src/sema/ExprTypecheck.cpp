@@ -2401,6 +2401,31 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
 // only exhaustiveness closes the fall-through edge). In quiet mode no
 // diagnostic is emitted and the range side-check is skipped (the
 // statement-position caller already ran it — re-running would double-report).
+
+// §19.3 / §4.3.1 / §19.6 (v0.315, #5411): returns true if any arm in `arms`
+// contains a RelOpPattern (including inside AltPattern alternatives). Guards are
+// skipped: a relational pattern in a guard is a boolean expression, not a
+// pattern-binding of the scrutinee, and does not participate in the
+// exhaustiveness proof.
+static bool armsContainRelOpPattern(const std::vector<ast::CaseArm>& arms) {
+    for (const auto& arm : arms) {
+        if (arm.guard) continue;  // guard: not a pattern
+        const ast::Pattern* p = arm.pattern.get();
+        if (!p) continue;
+        std::vector<const ast::Pattern*> queue{p};
+        while (!queue.empty()) {
+            const ast::Pattern* q = queue.back();
+            queue.pop_back();
+            if (!q) continue;
+            if (dynamic_cast<const ast::RelOpPattern*>(q))
+                return true;
+            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+                for (const auto& m : ap->members) queue.push_back(m.get());
+        }
+    }
+    return false;
+}
+
 bool ExprTC::caseArmsExhaustive(
     const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee,
     TypeRef* scrutTy, const SourceLocation& warnLoc, bool quiet) {
@@ -3130,6 +3155,20 @@ bool ExprTC::caseArmsExhaustive(
     // kind exists precisely to suppress such follow-on diagnostics —
     // TypeRef.hpp). The real diagnostic is reported by the resolution pass.
     if (!scrutTy || scrutTy->kind == TypeRef::Kind::Error) return false;
+
+    // §19.3 / §4.3.1 / §19.6 (v0.315, #5411): over float/double, no relational
+    // arm counts toward the exhaustiveness proof. NaN is unmatched by any
+    // relational comparison (§4.3.1: "NaN is unordered — every comparison is
+    // false"), and no finite set of relational arms covers the full value
+    // space (e.g. < 0 and >= 0 together still leave NaN uncovered). Emit a
+    // specific diagnostic rather than the generic fallthrough.
+    if (scrutTy && scrutTy->kind == TypeRef::Kind::Primitive &&
+        (scrutTy->primitive == PrimitiveType::Float ||
+         scrutTy->primitive == PrimitiveType::Double) &&
+        armsContainRelOpPattern(arms)) {
+        warn("relational pattern over float/double cannot cover NaN (§19.6)");
+        return false;
+    }
 
     // --- Every other scrutinee shape (int / string / range / float /
     // open class) cannot be proven exhaustive (§19.6): there is no finite,
