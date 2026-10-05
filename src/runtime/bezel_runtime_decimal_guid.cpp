@@ -923,6 +923,11 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
     uint32_t drop_top = 0;
     bool drop_sticky = false;
     bool saw_dropped = false;
+    // frac_absorbed: set true inside the exponent branch when a positive exponent
+    // absorbed the fractional digits (e.g. "1.23e2" → sc=0 but fraction existed).
+    // Declared here so the post-loop validation can reference it even for inputs
+    // that contain no exponent (where it stays false — no fraction was absorbed).
+    bool frac_absorbed = false;
     for (; i < src.len; ++i) {
         uint32_t c = dec_src_at(src, i);
         if (c == '.') {
@@ -949,25 +954,27 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
                 if (sgn == '-') { exp_neg = 1; ++i; }
                 else if (sgn == '+') { ++i; }
             }
-            int exp = 0;
+            int exp_val = 0;
             bool exp_digit = false;
-            for (; i < src.len; ++i) {
+            // Break out before any non-digit (suffix, null, or trailing junk).
+            // This prevents the pre-fix read-past-end that raised FormatException
+            // for the valid form "1.23e2" (suffix-less literal: no chars after
+            // the digit '2').  The 'm'/'M' suffix is consumed after the loop.
+            while (i < src.len) {
                 uint32_t d = dec_src_at(src, i);
-                // Any non-digit here (including trailing junk after the
-                // exponent) is malformed; pre-fix the loop simply stopped and
-                // the remainder of the string was ignored.
-                if (d < '0' || d > '9') { bz_set_exc(fe_vtable); return; }
+                if (d < '0' || d > '9') break;
                 exp_digit = true;
                 // Saturate: |exp| >= 1000 is out of range for any mantissa, and
                 // accumulating it unbounded is signed-overflow UB.
-                if (exp < 1000) exp = exp * 10 + (int)(d - '0');
+                if (exp_val < 1000) exp_val = exp_val * 10 + (int)(d - '0');
+                ++i;
             }
             if (!exp_digit) { bz_set_exc(fe_vtable); return; }
-            if (exp_neg) sc += (uint32_t)exp;
+            if (exp_neg) sc += (uint32_t)exp_val;
             else {
-                if ((int)sc - exp < 0) {
+                if ((int)sc - exp_val < 0) {
                     // Multiply by 10^(exp-sc): shift mantissa left.
-                    int shift = exp - (int)sc;
+                    int shift = exp_val - (int)sc;
                     for (int k = 0; k < shift; ++k) {
                         if (m > kMax96 / 10) {
                             // §6.4: OverflowException — mantissa too large for decimal range.
@@ -978,8 +985,30 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
                     }
                     sc = 0;
                 } else {
-                    sc -= (uint32_t)exp;
+                    sc -= (uint32_t)exp_val;
                 }
+            }
+            // sc_expanded is the scale before the exponent's absorption.
+            uint32_t sc_expanded = sc + (uint32_t)exp_val;
+            // frac_absorbed: when a positive exponent reduced sc to 0, check
+            // whether the mantissa could have been built from integer digits alone.
+            // If m < 10^sc_expanded, the mantissa has fewer digits than
+            // sc_expanded and couldn't have had integer digits — the exponent
+            // absorbed the fractional part, so this is valid (e.g. "1.23e2" = 123).
+            // If m >= 10^sc_expanded, the mantissa has more digits than
+            // sc_expanded and has integer digits — not purely absorbed (e.g.
+            // "123e2" = 12300, not "1.23e2").  In this case the check below
+            // correctly fires to reject a bare trailing decimal point.
+            frac_absorbed = (exp_val > 0 && sc_expanded > 0 && !(m < kPow10[sc_expanded]));
+            // Consume the decimal `m`/`M` suffix here (FloatLiteral's FloatSuffix)
+            // before breaking — the outer for loop's digit check would otherwise
+            // see it as a non-digit and raise FormatException.  The literal lexer
+            // already validated that the suffix is present when `allow_exp=true`
+            // (the 'm'/'M' suffix sets isFloat in the lexer), so the caller
+            // passed us the full literal text minus the sign.
+            if (i < src.len) {
+                uint32_t suf = dec_src_at(src, i);
+                if (suf == 'm' || suf == 'M') ++i;
             }
             break;
         }
@@ -1023,7 +1052,12 @@ static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
     // with a bare decimal point) and "5." (entered fractional part but collected
     // zero fractional digits — drop_top==0 means no fractional digit was ever
     // processed, even as a dropped digit; sc==0 means nothing reduced the scale).
-    if (started_with_decimal_point || (in_frac && sc == 0 && drop_top == 0)) {
+    // Exception: when an exponent absorbed the fractional digits (sc_expanded >
+    // exp_val and the mantissa was small enough that it couldn't have been built
+    // from integer digits alone), sc=0 is expected and the input is valid
+    // (e.g. "1.23e2" = 123).  The frac_absorbed flag records this case.
+    if (started_with_decimal_point ||
+        (in_frac && sc == 0 && drop_top == 0 && !frac_absorbed)) {
         bz_set_exc(fe_vtable);
         return;
     }
