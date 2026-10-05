@@ -5829,6 +5829,14 @@ bool Resolver::overrideParamTypeMatches(const TypeRef* derivedTy,
 bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
     if (!derived || !base) return false;
     if (derived->params.size() != base->params.size()) return false;
+    // §12.1 (v0.314, #5392): an override declares exactly as many type
+    // parameters of its own as the overridden member. The two lists correspond
+    // by position. Without this check, permuted and count-mismatched overrides
+    // were silently accepted (overrideParamsMatch returned false only on param
+    // type mismatch; a different type-parameter count means there is no
+    // positional correspondence to compare under).
+    if (derived->genericParams.size() != base->genericParams.size())
+        return false;
     std::unordered_map<std::string_view, TypeRef*> genericSubst;
     buildBaseGenericSubst(derived, base, genericSubst);
     for (std::size_t i = 0; i < derived->params.size(); ++i) {
@@ -6298,8 +6306,18 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         ? ctx_.importedGenericConstraints(base) : nullptr;
     if (!bDecl && !importedGCs) return;  // non-generic / stale metadata
     if (dDecl->genericParams.size() != (bDecl ? bDecl->genericParams.size()
-                                              : base->genericParams.size()))
-        return;  // arity mismatch already diagnosed elsewhere
+                                              : base->genericParams.size())) {
+        // §12.1 (v0.314, #5392): an override declares exactly as many type
+        // parameters of its own as the overridden member. When counts differ,
+        // there is no positional correspondence — the override does not match
+        // any base member signature. Note: `checkHidingAndOverride` relies on
+        // overrideParamsMatch (which now checks counts) to determine whether
+        // a valid base member exists; this branch fires only when the counts
+        // match at the overrideParamsMatch level but differ at the constraint-
+        // comparison level (e.g., when bDecl is null for an imported base).
+        err("type parameter count");
+        return;
+    }
     for (std::size_t gi = 0; gi < dDecl->genericParams.size(); ++gi) {
         std::string_view dName = dDecl->genericParams[gi].name;
         const ast::GenericConstraint* dc = nullptr;
@@ -7812,6 +7830,14 @@ void Resolver::checkAbstractImplementations() {
                                                   TypeSymbol* declClass) -> bool {
                     if (candidate->params.size() != im->params.size())
                         return false;
+                    // §11.2 (v0.314, #5392): for interface implementation, the two
+                    // type-parameter lists correspond by position. When both the
+                    // interface's and the candidate's parameter types are declaration-less
+                    // Named refs with no generic args (i.e., bare type parameters at the
+                    // same position in each method's own generic parameter list), they
+                    // are positionally corresponding and should be accepted — a renamed
+                    // `Show<U>(x: U)` implements `Show<T>(x: T)`. The general
+                    // `typesMatch` would reject this because it compares by spelling.
                     std::unordered_map<std::string_view, const TypeRef*>
                         candSubst;
                     auto it2 = classSubst.find(declClass);
@@ -7830,12 +7856,33 @@ void Resolver::checkAbstractImplementations() {
                             ct->kind == TypeRef::Kind::Error) return false;
                         const TypeRef* itSub = substTypeRef(it, obl.subst);
                         const TypeRef* ctSub = substTypeRef(ct, candSubst);
-                        bool match = typesMatch(itSub, ctSub);
-                        if (!match && itSub && ctSub &&
-                            !itSub->nullable && ctSub->nullable) {
-                            TypeRef stripped = *ctSub;
-                            stripped.nullable = false;
-                            match = typesMatch(itSub, &stripped);
+                        // Positional correspondence for method-level type parameters:
+                        // a method-level type param is identified by declaration == nullptr
+                        // (set by resolveNamed when the name resolves as a generic param
+                        // marker in scope). A class-level type param has declaration !=
+                        // nullptr (the GenericParamSymbol). Two method-level type params
+                        // at the same position (both declaration-less) are positionally
+                        // corresponding regardless of spelling — a renamed `Show<U>(x: U)`
+                        // implements `Show<T>(x: T)`. A method-level type param
+                        // (declaration == nullptr) and a class-level type param
+                        // (declaration != nullptr) are NOT positionally corresponding
+                        // — `Show(x: T)` on `class C<T>` does not implement
+                        // `Show<U>(x: U)` (§11.2, v0.314).
+                        bool match;
+                        if (!itSub->declaration && !ctSub->declaration &&
+                            itSub->kind == TypeRef::Kind::Named &&
+                            ctSub->kind == TypeRef::Kind::Named) {
+                            // Both are method-level type params: accept regardless of
+                            // spelling (the renaming is intentional per §11.2).
+                            match = (itSub->nullable == ctSub->nullable);
+                        } else {
+                            match = typesMatch(itSub, ctSub);
+                            if (!match && itSub && ctSub &&
+                                !itSub->nullable && ctSub->nullable) {
+                                TypeRef stripped = *ctSub;
+                                stripped.nullable = false;
+                                match = typesMatch(itSub, &stripped);
+                            }
                         }
                         if (!match) return false;
                     }
@@ -7888,6 +7935,36 @@ void Resolver::checkAbstractImplementations() {
                 if (!impl) impl = nameOnly;
                 if (!impl || impl->params.size() != im->params.size())
                     continue;  // missing/arity mismatch already reported above
+                // §11.2 (v0.314, #5392): an implementing method declares exactly as
+                // many type parameters of its own as the interface member. Without this
+                // check, a non-generic method using the class's own type parameter
+                // (e.g. `Show(x: T)` on `class C<T>`) was falsely accepted as
+                // implementing a generic interface method (`Show<U>(x: U)`) — the
+                // substitution made both parameter types equal, but there is no
+                // positional correspondence when the counts differ. Also guards the
+                // constraint comparison below against out-of-bounds access when
+                // impl->genericParams.size() < gpCount.
+                if (impl->genericParams.size() != im->genericParams.size()) {
+                    // §11.2 (v0.314, #5392): a method that declares a different
+                    // number of type parameters than the interface member has no
+                    // positional correspondence — there is nothing to map the
+                    // interface's type parameters to. Report at the impl's location
+                    // (or at `t`'s decl for an imported impl, per #3194).
+                    const bool implIsImp = ctx_.isImported(impl);
+                    const SourceLocation errLoc = implIsImp ? t->declLoc : impl->declLoc;
+                    ctx_.diagnostics().report(
+                        Severity::Error, errLoc,
+                        std::string("method `") + std::string(name) +
+                        "` does not match interface member `" +
+                        std::string(name) +
+                        "` — the interface member declares " +
+                        std::to_string(im->genericParams.size()) +
+                        " type parameter(s) of its own, but the implementing "
+                        "method declares " +
+                        std::to_string(impl->genericParams.size()) +
+                        " (§11.2, v0.314)");
+                    break;
+                }
                 std::unordered_map<std::string_view, const TypeRef*> implSubst;
                 auto csIt = classSubst.find(implClass);
                 if (csIt != classSubst.end()) implSubst = csIt->second;
@@ -8283,14 +8360,30 @@ void Resolver::checkAbstractImplementations() {
                         ct->kind == TypeRef::Kind::Error) continue;
                     const TypeRef* itSub = substTypeRef(it, obl.subst);
                     const TypeRef* ctSub = substTypeRef(ct, implSubst);
-                    // §11.2 widening: impl may declare T? where interface
-                    // requires T (the implementation accepts more inputs).
-                    bool match = typesMatch(itSub, ctSub);
-                    if (!match && itSub && ctSub &&
-                        !itSub->nullable && ctSub->nullable) {
-                        TypeRef stripped = *ctSub;
-                        stripped.nullable = false;
-                        match = typesMatch(itSub, &stripped);
+                    // §11.2 (v0.314, #5392): positional correspondence for
+                    // method-level type parameters. When both the interface's
+                    // substituted and the impl's parameter types are declaration-less
+                    // Named refs at the same position (both are method-level
+                    // type params), they are positionally corresponding and
+                    // should be accepted regardless of spelling — a renamed
+                    // `Show<U>(x: U)` implements `Show<T>(x: T)`. A method-level
+                    // type param (declaration == nullptr) and a class-level
+                    // type param (declaration != nullptr) are NOT positionally
+                    // corresponding.  See also the same check in
+                    // `paramsMatchObligation` (the candidate-filter loop above).
+                    bool match;
+                    if (!itSub->declaration && !ctSub->declaration &&
+                        itSub->kind == TypeRef::Kind::Named &&
+                        ctSub->kind == TypeRef::Kind::Named) {
+                        match = (itSub->nullable == ctSub->nullable);
+                    } else {
+                        match = typesMatch(itSub, ctSub);
+                        if (!match && itSub && ctSub &&
+                            !itSub->nullable && ctSub->nullable) {
+                            TypeRef stripped = *ctSub;
+                            stripped.nullable = false;
+                            match = typesMatch(itSub, &stripped);
+                        }
                     }
                     if (match) continue;
                     ctx_.diagnostics().report(
