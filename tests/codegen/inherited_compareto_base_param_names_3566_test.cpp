@@ -96,6 +96,33 @@ const char* kGBase =
 // derived parameter x a type argument whose layout differs from the i32
 // placeholder. Keys are inserted 3, 1, 2; a working comparator orders them
 // 1, 2, 3.
+//
+// ⚠ ALL SIX ROWS IN THIS FILE ARE KNOWN RED — COMPILER BUG #5424, NOT STALE
+// NEEDLES. DO NOT "FIX" ANY EXPECTATION HERE. Every one of them makes
+// `Derived<U>: GBase<U>` the key type, where conformance is INHERITED from
+// `GBase<T>: IComparable<GBase<T>>`. Spec §14.2 rule 1 says a class conforms
+// when it "lists I … in its inheritance clause, THAT INHERITS FROM A CLASS
+// WHICH CONFORMS TO I, or that conforms implicitly" — the inherited arm is
+// explicit. Fix #4318's sema check (v0.315,
+// `src/sema/TypeResolution_Names.cpp`, the `kNullDeclSelfRefConstraints`
+// arm calling `argSatisfiesTypeBound`) does not implement that arm, so it
+// rejects the program before any lowering.
+//
+// MEASURED, minimal, no generics and no renaming involved — the defect is
+// purely INHERITED-vs-DIRECT conformance, on f8c6ab5f:
+//
+//   class GBase: IComparable<GBase> … CompareTo(other: GBase): int …
+//   class Derived: GBase …                      (no listing of its own)
+//
+//   SortedDictionary<GBase, int>   -> ACCEPTED
+//   SortedDictionary<Derived, int> -> REJECTED
+//     "type argument `Derived` does not satisfy the constraint `where K: IComparable` (§14.2)"
+//
+// Same base class, same `CompareTo`; only the direct-vs-inherited spelling
+// differs. These rows are the pin for #5424 and turn green when it is fixed.
+// The sibling manifestation (the same defect reading a use-before-declaration
+// as "does not conform") is `key_class_declared_after_its_use` in
+// sorted_dictionary_class_key_3488_test.cpp.
 // ===========================================================================
 BEZEL_TEST(inherited_compareto_3566, renamed_param_base_compareto_spec_4_17) {
     auto out = runAotOut(

@@ -77,6 +77,14 @@ bool rejectsWith(const std::string& src, const std::string& needle) {
 // `Pt`: auto-hashable record (§9.2), NO `CompareTo` — the issue's own shape.
 // `ClsNoCmp`: class, NO `CompareTo` — the reference-key/element analogue.
 // `Cmp`: auto-hashable record WITH `CompareTo` — an accept-side control.
+//
+// `Cmp` LISTS `IComparable<Cmp>`, which is what makes it conform under spec
+// §14.2 rule 2 (a record must both LIST the interface and declare the matching
+// members). The accept-side rows below assert real indexer/for-in VALUES, so
+// the program must stay well-typed: unlisted, fix #4318's
+// `where T: IComparable` sema check (v0.315) rejects the instantiation before
+// any lowering. See the fixture note in
+// sorted_set_sorted_dict_no_compareto_3865_test.cpp for the same change.
 const char* PRELUDE =
     "module M; "
     "record Pt "
@@ -87,7 +95,7 @@ const char* PRELUDE =
     "  public V: int := 0; "
     "  public constructor(v: int) V := v; end constructor; "
     "end ClsNoCmp; "
-    "record Cmp "
+    "record Cmp: IComparable<Cmp> "
     "  public property X: int; "
     "  public constructor(x: int) X := x; end constructor; "
     "  public method CompareTo(other: Cmp): int return X - other.X; "
@@ -115,10 +123,17 @@ std::string borrowedParamProg(const std::string& paramDecl,
            "end C;";
 }
 
-const char* NEEDLE_SET =
-    "requires the element type to implement `IComparable<T>`";
-const char* NEEDLE_DICT =
-    "requires the key type to implement `IComparable<K>`";
+// Fix #4318 (v0.315) decides these constraints in SEMANTIC ANALYSIS
+// (`argSatisfiesTypeBound`, spec §14.2 rule 2), before any lowering, so the
+// sema message replaces the codegen-time needle for every NAMED type here.
+// The needle stops BEFORE the constraint text on purpose: #4318 emits the bare
+// `where T: IComparable` where stdlib §4.17/§4.18 and §14.2 rule 2 spell it
+// `where T: IComparable<T>` — issue #5423 — so pinning only the spec's part
+// keeps these rows correct across that fix.
+std::string constraintNeedle(const std::string& typeName) {
+    return "type argument `" + typeName +
+           "` does not satisfy the constraint `where ";
+}
 
 }  // namespace
 
@@ -128,7 +143,7 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
            verbatim_issue_repro_forin_over_sortedset_now_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<Pt>", "for var e in s do end; "),
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 // ── SortedDictionary<K, V> indexer: record key, no CompareTo ──────────────
@@ -138,7 +153,7 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<Pt, int>",
                           "var v := d[new Pt(1)]; "),
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
@@ -146,7 +161,7 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<Pt, int>",
                           "d[new Pt(1)] := 5; "),
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 // ── SortedDictionary<K, V> indexer: class key, no CompareTo ───────────────
@@ -164,7 +179,7 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
         "  var k := new ClsNoCmp(5); "
         "  d[k] := 1; "
         "  return d[k]; "),
-        NEEDLE_DICT));
+        constraintNeedle("ClsNoCmp")));
 }
 
 // ── for-in: SortedSet<T> element, class, no CompareTo ──────────────────────
@@ -173,7 +188,7 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
            sortedset_forin_class_element_no_compareto_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<ClsNoCmp>", "for var e in s do end; "),
-        NEEDLE_SET));
+        constraintNeedle("ClsNoCmp")));
 }
 
 // ── for-in: SortedDictionary<K, V> ENTRIES (`for var e in sd`) ────────────
@@ -183,7 +198,7 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<Pt, int>",
                           "for var e in d do end; "),
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
@@ -191,7 +206,7 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<ClsNoCmp, int>",
                           "for var e in d do end; "),
-        NEEDLE_DICT));
+        constraintNeedle("ClsNoCmp")));
 }
 
 // ── Accept-side sweep (LANE_RULES §15): every legitimate shape must still ──
@@ -275,7 +290,23 @@ BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
 BEZEL_TEST(sorted_sorteddict_indexer_forin_compareto_3976,
            accept_enum_key_indexer_and_forin_unaffected) {
     BEZEL_EXPECT_EQ(out(std::string(
-        "module M; enum Col Red, Green, Blue; end Col; "
+        // `Col` LISTS `IComparable<Col>` and declares `CompareTo`, which is
+        // what makes an enum satisfy `where K: IComparable<K>` under spec
+        // §14.2 rule 4 ("T is an enum that lists I ... in its inheritance
+        // clause and declares the matching public members"). An enum with no
+        // listing does NOT conform — fix #4318 (v0.315) rejects
+        // `SortedDictionary<Col, int>` in sema before any lowering — so the
+        // row keeps its subject (indexer + for-in over an enum KEY, both
+        // unaffected by #3976) by spelling the enum the way spec §10.5's own
+        // `enum Priority: IComparable<Priority>` example does. MEASURED: the
+        // values below are unchanged by the listing.
+        "module M; import System; "
+        "enum Col: IComparable<Col> Red, Green, Blue; "
+        "  public method CompareTo(other: Col): int => "
+        "    (if int(this) < int(other) then -1 "
+        "     elif int(this) > int(other) then 1 "
+        "     else 0); "
+        "end Col; "
         "class C public static method Main(): int "
         "  var sd := new SortedDictionary<Col, int>(); "
         "  sd.Add(Col.Green, 1); sd.Add(Col.Red, 2); "

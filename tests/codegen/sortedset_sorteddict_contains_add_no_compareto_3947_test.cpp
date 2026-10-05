@@ -125,6 +125,14 @@ bool rejectsWith(const std::string& src, const std::string& needle) {
 // with NO `CompareTo` — the class-side analogue of `Pt`, complementing
 // `sorted_set_sorted_dict_no_compareto_3865_test.cpp`'s `ClassNoCmp`, whose
 // coverage there is `.First`/`.First()` ONLY (this fix's own gap).
+//
+// `AutoHashCmp` LISTS `IComparable<AutoHashCmp>`, which is what makes it
+// conform under spec §14.2 rule 2 (a record must both LIST the interface and
+// declare the matching members). Without the listing, fix #4318's
+// `where T: IComparable` sema check (v0.315) rejects the instantiation before
+// any lowering, so the accept rows below would have nothing to accept. See
+// the fixture note in sorted_set_sorted_dict_no_compareto_3865_test.cpp for
+// the same change to that file's `Cmp`.
 const char* PRELUDE =
     "module M; "
     "record Pt "
@@ -132,7 +140,7 @@ const char* PRELUDE =
     "  public property Y: int; "
     "  public constructor(x: int, y: int) X := x; Y := y; end constructor; "
     "end Pt; "
-    "record AutoHashCmp "
+    "record AutoHashCmp: IComparable<AutoHashCmp> "
     "  public property X: int; "
     "  public constructor(x: int) X := x; end constructor; "
     "  public method CompareTo(other: AutoHashCmp): int return X - other.X; "
@@ -166,10 +174,18 @@ std::string borrowedParamProg(const std::string& paramDecl,
            "end C;";
 }
 
-const char* NEEDLE_SET =
-    "requires the element type to implement `IComparable<T>`";
-const char* NEEDLE_DICT =
-    "requires the key type to implement `IComparable<K>`";
+// Fix #4318 (v0.315) now decides these constraints in SEMANTIC ANALYSIS
+// (`argSatisfiesTypeBound`, spec §14.2 rule 2), before any lowering, so for
+// every NAMED element/key type the sema message is the one the user sees and
+// the codegen needles these rows originally pinned are unreachable for them.
+// The needle stops BEFORE the constraint text on purpose: #4318 emits the bare
+// `where T: IComparable` where stdlib §4.17/§4.18 and §14.2 rule 2 spell it
+// `where T: IComparable<T>` — issue #5423 — and pinning only the spec's part
+// keeps these rows correct across that fix.
+std::string constraintNeedle(const std::string& typeName) {
+    return "type argument `" + typeName +
+           "` does not satisfy the constraint `where ";
+}
 
 }  // namespace
 
@@ -180,7 +196,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<Pt>",
                           "var c := s.Contains(new Pt(1, 2)); "),
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 // The SAME receiver's `.First` (property syntax) already rejected before
@@ -190,7 +206,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
            verbatim_issue_repro_first_still_rejected_consistently) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<Pt>", "var f := s.First; "),
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 // ── SortedSet<T>: AUTO-HASHABLE RECORD, NO CompareTo — every member ────────
@@ -200,7 +216,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<Pt>",
                           "var it := new Pt(1, 2); s.Add(it); "),
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -208,7 +224,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<Pt>",
                           "var it := new Pt(1, 2); var ok := s.TryAdd(it); "),
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -216,7 +232,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<Pt>",
                           "var it := new Pt(1, 2); var ok := s.Remove(it); "),
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -225,7 +241,8 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     // EVERY member reachable through this arm, not only the ones that read
     // `CompareTo`/equality, per this issue's own resolution.
     BEZEL_EXPECT_TRUE(rejectsWith(
-        borrowedParamProg("s: SortedSet<Pt>", "s.Clear(); "), NEEDLE_SET));
+        borrowedParamProg("s: SortedSet<Pt>", "s.Clear(); "),
+        constraintNeedle("Pt")));
 }
 
 // ── SortedSet<T>: CLASS, NO CompareTo — the class-side analogue ────────────
@@ -243,7 +260,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
            sortedset_class_no_compareto_add_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<ClsNoCmp>", "s.Add(new ClsNoCmp(5)); "),
-        NEEDLE_SET));
+        constraintNeedle("ClsNoCmp")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -251,7 +268,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<ClsNoCmp>",
                           "var it := new ClsNoCmp(5); var c := s.Contains(it); "),
-        NEEDLE_SET));
+        constraintNeedle("ClsNoCmp")));
 }
 
 // ── SortedDictionary<K, V>: AUTO-HASHABLE RECORD key, NO CompareTo ─────────
@@ -261,7 +278,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<Pt, int>",
                           "var k := new Pt(1, 2); d.Add(k, 1); "),
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -269,7 +286,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<Pt, int>",
                           "var k := new Pt(1, 2); var ok := d.TryAdd(k, 1); "),
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -277,7 +294,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<Pt, int>",
                           "var k := new Pt(1, 2); var ok := d.ContainsKey(k); "),
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -285,7 +302,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<Pt, int>",
                           "var k := new Pt(1, 2); var ok := d.Remove(k); "),
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 // ── SortedDictionary<K, V>: CLASS key, NO CompareTo ────────────────────────
@@ -298,7 +315,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<ClsNoCmp, int>",
                           "d.Add(new ClsNoCmp(5), 1); "),
-        NEEDLE_DICT));
+        constraintNeedle("ClsNoCmp")));
 }
 
 BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
@@ -306,7 +323,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<ClsNoCmp, int>",
                           "var k := new ClsNoCmp(5); var ok := d.ContainsKey(k); "),
-        NEEDLE_DICT));
+        constraintNeedle("ClsNoCmp")));
 }
 
 // ── NARROW false-reject: auto-hashable + CompareTo is left ALONE ───────────
@@ -365,7 +382,7 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
         "  var k := new ClsNoCmp(5); "
         "  d[k] := 1; "
         "  return d[k]; "),
-        "requires the key type to implement `IComparable<K>`"));
+        constraintNeedle("ClsNoCmp")));
 }
 
 // `for`-in iteration over a `SortedSet<T>` whose element has no `CompareTo`
@@ -384,5 +401,5 @@ BEZEL_TEST(sortedset_sorteddict_contains_add_no_compareto_3947,
     BEZEL_EXPECT_TRUE(rejectsWith(borrowedParamProg(
         "s: SortedSet<Pt>",
         "var n := 0; for var e in s do n := n + e.X; end; return n; "),
-        "requires the element type to implement `IComparable<T>`"));
+        constraintNeedle("Pt")));
 }

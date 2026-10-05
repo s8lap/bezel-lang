@@ -110,7 +110,20 @@ bool lacks(const std::string& src, const std::string& needle) {
 const char* PRELUDE =
     "module M; import System.Collections.Generic; "
     "record Rec(A: int); "
-    "enum Col  Red, Green;  end Col; "
+    // `Col` LISTS `IComparable<Col>` and declares `CompareTo`, which is what
+    // makes an enum satisfy `where T: IComparable<T>` under spec §14.2 rule 4
+    // ("T is an enum that lists I ... in its inheritance clause and declares
+    // the matching public members"). A bare `enum Col Red, Green;` does NOT
+    // conform — fix #4318 (v0.315) rejects `SortedSet<Col>` in sema before
+    // any lowering — so `enum_element_still_constructs` keeps its subject
+    // (an enum element lowers to i32 and dedups) by spelling the enum the way
+    // spec §10.5's own `enum Priority: IComparable<Priority>` example does.
+    "enum Col: IComparable<Col>  Red, Green; "
+    "  public method CompareTo(other: Col): int => "
+    "    (if int(this) < int(other) then -1 "
+    "     elif int(this) > int(other) then 1 "
+    "     else 0); "
+    "end Col; "
     "class Ord: IComparable<Ord> "
     "  public V: int := 0; "
     "  public constructor(v: int) V := v; end constructor; "
@@ -144,14 +157,38 @@ std::string prog(const std::string& body) {
 const char* NEEDLE =
     "`SortedSet<T>` requires an element type with a dispatchable `CompareTo`";
 
-// The head of the NULLABLE-element diagnostic — a SEPARATE message from
-// NEEDLE above (review fix, post-0c8612d): a nullable reference element is
-// excluded by `genericBackingType`'s pre-existing `!ty->nullable` guard
-// BEFORE any `CompareTo` is ever consulted, so the message must not claim
-// "no dispatchable CompareTo" — that claim would be false whenever the
-// underlying type (e.g. `Ord: IComparable<Ord>`) actually declares one.
-const char* NULLABLE_NEEDLE =
-    "`SortedSet<T>` requires a NON-NULLABLE element type";
+// Fix #4318 (v0.315) decides `where T: IComparable<T>` in SEMANTIC ANALYSIS
+// (`argSatisfiesTypeBound`, spec §14.2 rule 2) before any lowering, so for
+// every NAMED element type the sema message is what the user sees and the
+// codegen `NEEDLE` above is unreachable for it. `NEEDLE` is NOT dead: sema has
+// no `Object`→`IComparable` knowledge, so `object_element_still_diagnosed` and
+// `stale_2974_constructor_claim_gone` still reach it and still pin it. The
+// needle below stops BEFORE the constraint text on purpose: #4318 emits the
+// bare `where T: IComparable` where stdlib §4.18 and §14.2 rule 2 spell it
+// `where T: IComparable<T>` — issue #5423 — so pinning only the spec's part
+// keeps these rows correct across that fix.
+std::string constraintNeedle(const std::string& typeName) {
+    return "type argument `" + typeName +
+           "` does not satisfy the constraint `where ";
+}
+
+// The head of the NULLABLE-element diagnostic (review fix, post-0c8612d), a
+// SEPARATE message from NEEDLE above: a nullable reference element was excluded
+// by `genericBackingType`'s pre-existing `!ty->nullable` guard BEFORE any
+// `CompareTo` was ever consulted, so the message must not claim "no
+// dispatchable CompareTo" — a claim false whenever the underlying type (e.g.
+// `Ord: IComparable<Ord>`) actually declares one.
+//
+// The emitter (LlvmBackend_Exprs2.cpp's `rejElemTy->nullable` arm) is now
+// UNREACHABLE for a named element type: fix #4318's sema check (v0.315)
+// rejects the type argument before any lowering, so no test pins this text and
+// the constant is removed rather than left dangling (an unused `const char*`
+// at namespace scope is not a build error but reads as a live pin). The
+// anti-false-claim half of that review fix IS still pinned — by
+// `nullable_class_element_diagnoses_nullability` and
+// `nullable_interface_element_diagnoses_nullability` below, which assert it
+// over every diagnostic the compiler now emits for those shapes. See those
+// rows' comments for the measured replacement message.
 
 }  // namespace
 
@@ -186,27 +223,43 @@ BEZEL_TEST(sorted_set_class_element_3428, interface_element_with_compareto_const
 }
 
 // per stdlib §4.18 (v0.286), spec §14.2 (v0.286), review fix (post-0c8612d):
-// a NULLABLE class element (`SortedSet<Ord?>`) is excluded by
-// `genericBackingType`'s pre-existing nullable guard, NOT by a missing
-// `CompareTo` — `Ord` declares exactly one (`CompareTo(other: Ord): int`,
-// the very same declaration `class_element_with_compareto_constructs` above
-// proves is dispatchable). The message must therefore name NULLABILITY as
-// the reason and must NOT claim `Ord` "declares no ... CompareTo" — that
-// claim is false and was the exact defect this row was added to pin.
+// a NULLABLE class element (`SortedSet<Ord?>`) must not be told `Ord`
+// "declares no ... CompareTo" — that claim is FALSE: `Ord` declares exactly
+// one (`CompareTo(other: Ord): int`, the very same declaration
+// `class_element_with_compareto_constructs` above proves is dispatchable),
+// and the element is excluded because a NULLABLE type cannot satisfy §14.2's
+// `where T: IComparable<T>` at all.
+//
+// ⚠ WHAT CHANGED, AND WHAT THIS ROW NOW PINS. These two rows originally
+// required the message to NAME NULLABILITY (`NULLABLE_NEEDLE`, emitted by
+// LlvmBackend_Exprs2.cpp's `rejElemTy->nullable` arm). Fix #4318 (v0.315)
+// moved the whole decision into sema, which rejects the TYPE ARGUMENT before
+// any lowering runs — so that arm is no longer reached for a named element and
+// `NULLABLE_NEEDLE` is unreachable for this shape. MEASURED on f8c6ab5f, the
+// only diagnostic is:
+//
+//   type argument `Ord` does not satisfy the constraint `where T: IComparable
+//
+// which is TRUE (a nullable `Ord?` does not satisfy the constraint) but names
+// neither the nullability nor the `?`. So the positive assertion is replaced
+// by the constraint needle, and the anti-false-claim assertion — the part
+// these rows were actually added for, per the review fix above — is KEPT
+// VERBATIM and still checked over every diagnostic. The lost nullability
+// naming is reported with the measurements; it is not silently dropped.
 BEZEL_TEST(sorted_set_class_element_3428, nullable_class_element_diagnoses_nullability) {
     auto r = runAot(prog(
         "  using var b := new SortedSet<Ord?>(); "
         "  return b.Count; "));
     BEZEL_EXPECT_FALSE(r.ran);
-    bool foundNullableNeedle = false;
+    bool foundConstraintNeedle = false;
     bool foundFalseNoCompareToClaim = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find(NULLABLE_NEEDLE) != std::string::npos)
-            foundNullableNeedle = true;
+        if (d.message.find(constraintNeedle("Ord")) != std::string::npos)
+            foundConstraintNeedle = true;
         if (d.message.find("`Ord` declares no") != std::string::npos)
             foundFalseNoCompareToClaim = true;
     }
-    BEZEL_EXPECT_TRUE(foundNullableNeedle);
+    BEZEL_EXPECT_TRUE(foundConstraintNeedle);
     BEZEL_EXPECT_FALSE(foundFalseNoCompareToClaim);
 }
 
@@ -223,16 +276,17 @@ BEZEL_TEST(sorted_set_class_element_3428, nullable_interface_element_diagnoses_n
         "  using var b := new SortedSet<IOrd?>(); "
         "  return b.Count; "));
     BEZEL_EXPECT_FALSE(r.ran);
-    bool foundNullableNeedle = false;
+    // See the class-case row above for why NULLABLE_NEEDLE is replaced here.
+    bool foundConstraintNeedle = false;
     bool foundFalseNotSelfComparableClaim = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find(NULLABLE_NEEDLE) != std::string::npos)
-            foundNullableNeedle = true;
+        if (d.message.find(constraintNeedle("IOrd")) != std::string::npos)
+            foundConstraintNeedle = true;
         if (d.message.find("does not declare a SELF-comparable") !=
             std::string::npos)
             foundFalseNotSelfComparableClaim = true;
     }
-    BEZEL_EXPECT_TRUE(foundNullableNeedle);
+    BEZEL_EXPECT_TRUE(foundConstraintNeedle);
     BEZEL_EXPECT_FALSE(foundFalseNotSelfComparableClaim);
 }
 
@@ -246,7 +300,7 @@ BEZEL_TEST(sorted_set_class_element_3428, non_self_comparable_interface_still_di
     BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  using var b := new SortedSet<IComparable<Ord>>(); "
         "  return b.Count; "),
-        NEEDLE));
+        constraintNeedle("IComparable")));
 }
 
 // per stdlib §4.18 (v0.286), fix #2773 (B1): `Object` is a Primitive-kind
@@ -272,7 +326,7 @@ BEZEL_TEST(sorted_set_class_element_3428, class_without_compareto_still_diagnose
         "  using var b := new SortedSet<Plain>(); "
         "  return b.Count; "
         "end Main; end C;",
-        NEEDLE));
+        constraintNeedle("Plain")));
 }
 
 // per stdlib §4.18 (v0.286), fix #2773 (B1): the point of #3428's ORIGINAL
@@ -350,7 +404,7 @@ BEZEL_TEST(sorted_set_class_element_3428, record_element_without_compareto_now_r
         "  var s := new SortedSet<Rec>(); "
         "  s.Add(new Rec(1)); "
         "  return 0; "),
-        "requires the element type to implement `IComparable<T>`"));
+        constraintNeedle("Rec")));
 }
 
 // per stdlib §4.18 (v0.283), #3428: an ENUM element (lowers to i32).

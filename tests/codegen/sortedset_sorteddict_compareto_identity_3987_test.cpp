@@ -93,16 +93,24 @@ std::string out(const std::string& src) { return runAotOut(src); }
 // record with `CompareTo` — used for the `.First`/`.Last`/`.FirstKey`/
 // `.LastKey` rows, where only ordering (not dedup) is under test, and for
 // the existing-#3947-control-unaffected row.
+//
+// BOTH records LIST `IComparable<Self>`, which is what makes them conform
+// under spec §14.2 rule 2 (a record must both LIST the interface and declare
+// the matching members). Every row in this file asserts an ORDERED VALUE, not
+// a rejection, so the program must stay well-typed: unlisted, fix #4318's
+// `where T: IComparable` sema check (v0.315) rejects the instantiation before
+// any lowering. See the fixture note in
+// sorted_set_sorted_dict_no_compareto_3865_test.cpp for the same change.
 const char* PRELUDE =
     "module M; "
-    "record P "
+    "record P: IComparable<P> "
     "  public property X: int; "
     "  public property Y: int; "
     "  public constructor(x: int, y: int) X := x; Y := y; end constructor; "
     "  public method CompareTo(other: P): int return X - other.X; "
     "    end CompareTo; "
     "end P; "
-    "record AutoHashCmp "
+    "record AutoHashCmp: IComparable<AutoHashCmp> "
     "  public property X: int; "
     "  public constructor(x: int) X := x; end constructor; "
     "  public method CompareTo(other: AutoHashCmp): int return X - other.X; "
@@ -280,10 +288,16 @@ BEZEL_TEST(sortedset_sorteddict_compareto_identity_3987,
         "public static method Main(): int return 0; end Main; end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     bool found = false;
+    // Fix #4318 (v0.315) rejects this in SEMANTIC ANALYSIS (`argSatisfiesTypeBound`,
+    // spec §14.2 rule 2) before any lowering, so the codegen needle this row
+    // originally pinned is unreachable for a NAMED element type. The needle
+    // stops before the constraint text: #4318 emits the bare
+    // `where T: IComparable` where stdlib §4.18 and §14.2 rule 2 spell it
+    // `where T: IComparable<T>` (issue #5423), so pinning only the spec's
+    // part keeps this row correct across that fix.
+    const std::string needle =
+        "type argument `Q` does not satisfy the constraint `where ";
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(
-                "requires the element type to implement `IComparable<T>`") !=
-            std::string::npos)
-            found = true;
+        if (d.message.find(needle) != std::string::npos) found = true;
     BEZEL_EXPECT_TRUE(found);
 }

@@ -115,16 +115,41 @@ bool rejectsWith(const std::string& src, const std::string& needle) {
     return false;
 }
 
+// Fix #4318 (v0.315) decides `where K: IComparable<K>` in SEMANTIC ANALYSIS
+// (`argSatisfiesTypeBound`, spec §14.2 rule 2) before any lowering, so for
+// every NAMED key type the sema message is what the user sees and the
+// codegen needle these rows originally pinned is unreachable for them. The
+// needle stops BEFORE the constraint text on purpose: #4318 emits the bare
+// `where K: IComparable` where stdlib §4.17 and §14.2 rule 2 spell it
+// `where K: IComparable<K>` — issue #5423 — so pinning only the spec's part
+// keeps these rows correct across that fix.
+std::string constraintNeedle(const std::string& typeName) {
+    return "type argument `" + typeName +
+           "` does not satisfy the constraint `where ";
+}
+
 // `Ord` satisfies §4.17's `where K: IComparable<K>`. `IOrd`/`Node` are the
 // interface-key shape (spec §14.2 conformance rule 3). `Plain` is a class that
 // declares NO `CompareTo` — the shape nothing checked the constraint for
 // (#3490) until fix #3947 (v0.294) closed it for exactly this member surface
 // (`.Add`/`.TryAdd`/`.ContainsKey`/etc — see that fix for the indexer/for-in
 // residual, issue #3976).
+//
+// `Col` LISTS `IComparable<Col>` and declares `CompareTo`, which is what makes
+// an enum satisfy `where K: IComparable<K>` under spec §14.2 rule 4. A bare
+// `enum Col Red, Green;` does NOT conform, so `enum_key_unchanged` keeps its
+// subject (an enum key orders and dedups by its declared order) by spelling
+// the enum the way spec §10.5's own `enum Priority: IComparable<Priority>`
+// example does.
 const char* PRELUDE =
     "module M; import System.Collections.Generic; "
     "record Rec(A: int); "
-    "enum Col  Red, Green;  end Col; "
+    "enum Col: IComparable<Col>  Red, Green; "
+    "  public method CompareTo(other: Col): int => "
+    "    (if int(this) < int(other) then -1 "
+    "     elif int(this) > int(other) then 1 "
+    "     else 0); "
+    "end Col; "
     "class Ord: IComparable<Ord> "
     "  public V: int := 0; "
     "  public constructor(v: int) V := v; end constructor; "
@@ -344,6 +369,28 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, virtual_compareto_dispatches_the_ov
 // depended on declaration order would silently find no `CompareTo`, fall back to
 // the §8.3 pair, and print insertion order with `tryAdd=True count=3` — a
 // failure mode indistinguishable from the original defect.
+//
+// ⚠ KNOWN RED — COMPILER BUG #5424, NOT A STALE NEEDLE. DO NOT "FIX" THE
+// EXPECTATION HERE. `Late` LISTS `IComparable<Late>` and declares a matching
+// `CompareTo`, so it CONFORMS under spec §14.2 rule 1; fix #4318's sema check
+// (v0.315) rejects it anyway, purely because the class is declared after its
+// use. MEASURED A/B on f8c6ab5f, two programs differing ONLY in declaration
+// order (same body, same `Late`):
+//
+//   `class Late … end Late;` FIRST : ACCEPTS, prints "tryAdd=False count=2\n1,3,\n"
+//   `class Late … end Late;` LAST  : REJECTS —
+//     "type argument `Late` does not satisfy the constraint `where K: IComparable` (§14.2)"
+//
+// The rejection is FALSE: `Late` conforms, and the only difference is where
+// the declaration sits. `src/sema/TypeResolution_Names.cpp`'s #4318 arm
+// consults the type argument's conformance before the class's own members are
+// resolved, so a use-before-declaration is read as "does not conform".
+// Per spec §14.2 rule 1 conformance is a property of the type, not of
+// declaration position. This row is LEFT RED on purpose: it is the pin for
+// #5424, and it turns green when #5424 is fixed. (The same defect also sinks
+// all six `inherited_compareto_3566` rows — there the conformance is
+// INHERITED from `GBase<T>: IComparable<GBase<T>>`, which the same arm does
+// not recognise at all.)
 BEZEL_TEST(sorted_dictionary_class_key_3488, key_class_declared_after_its_use) {
     BEZEL_EXPECT_EQ(out(std::string(
         "module M; import System.Collections.Generic; "
@@ -401,7 +448,7 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, key_without_compareto_now_rejected)
         "  var sd := new SortedDictionary<Plain, int>(); "
         "  sd.Add(p1, 1); "
         "  return 0; "),
-        "requires the key type to implement `IComparable<K>`"));
+        constraintNeedle("Plain")));
 }
 
 // per stdlib §4.17 (v0.283) + spec §8.1 + fix #3947 (v0.294): an `Object` key
@@ -482,7 +529,7 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, record_key_without_compareto_now_re
         "  var sr := new SortedDictionary<Rec, int>(); "
         "  sr.Add(new Rec(2), 1); "
         "  return 0; "),
-        "requires the key type to implement `IComparable<K>`"));
+        constraintNeedle("Rec")));
 }
 
 // per stdlib §4.4 (`Array<T>`'s `public method Sort();  // in place`) and §2.8

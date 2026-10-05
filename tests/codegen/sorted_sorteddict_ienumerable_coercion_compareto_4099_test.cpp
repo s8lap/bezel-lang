@@ -54,23 +54,38 @@ bool rejectsWith(const std::string& src, const std::string& needle) {
 
 // `Pt`: auto-hashable record (§9.2), NO `CompareTo` — the issue's own shape.
 // `Cmp`: auto-hashable record WITH `CompareTo` — an accept-side control.
+//
+// `Cmp` LISTS `IComparable<Cmp>`, which is what makes it conform under spec
+// §14.2 rule 2 (a record must both LIST the interface and declare the matching
+// members). Unlisted, fix #4318's `where T: IComparable` sema check (v0.315)
+// rejects the instantiation before any lowering and the accept-side rows below
+// would have nothing to accept. See the fixture note in
+// sorted_set_sorted_dict_no_compareto_3865_test.cpp for the same change to
+// that file's `Cmp`.
 const char* PRELUDE =
     "module M; "
     "record Pt "
     "  public property X: int; "
     "  public constructor(x: int) X := x; end constructor; "
     "end Pt; "
-    "record Cmp "
+    "record Cmp: IComparable<Cmp> "
     "  public property X: int; "
     "  public constructor(x: int) X := x; end constructor; "
     "  public method CompareTo(other: Cmp): int return X - other.X; "
     "    end CompareTo; "
     "end Cmp; ";
 
-const char* NEEDLE_SET =
-    "requires the element type to implement `IComparable<T>`";
-const char* NEEDLE_DICT =
-    "requires the key type to implement `IComparable<K>`";
+// Fix #4318 (v0.315) decides these constraints in SEMANTIC ANALYSIS
+// (`argSatisfiesTypeBound`, spec §14.2 rule 2), before any lowering, so the
+// sema message replaces the codegen-time needle for every NAMED type here.
+// The needle stops BEFORE the constraint text on purpose: #4318 emits the bare
+// `where T: IComparable` where stdlib §4.17/§4.18 and §14.2 rule 2 spell it
+// `where T: IComparable<T>` — issue #5423 — so pinning only the spec's part
+// keeps these rows correct across that fix.
+std::string constraintNeedle(const std::string& typeName) {
+    return "type argument `" + typeName +
+           "` does not satisfy the constraint `where ";
+}
 
 }  // namespace
 
@@ -91,7 +106,7 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
             "  end Run; "
             "  public static method Main(): int return 0; end Main; "
             "end C;",
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 // Argument-coercion site: SortedSet<Pt> passed to IEnumerable<Pt> sink.
@@ -108,7 +123,7 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
             "  end Run; "
             "  public static method Main(): int return 0; end Main; "
             "end C;",
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 // ── RETURN coercion site ────────────────────────────────────────────────────
@@ -124,7 +139,7 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
             "  end Run; "
             "  public static method Main(): int return 0; end Main; "
             "end C;",
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 // SortedSet returned as IEnumerable<T>.
@@ -138,7 +153,7 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
             "  end Run; "
             "  public static method Main(): int return 0; end Main; "
             "end C;",
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 // Expression-bodied return face (also serves as a sanity coverage of the
@@ -153,7 +168,7 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
             "  public static method Run(s: SortedSet<Pt>): IEnumerable<Pt> => s; "
             "  public static method Main(): int return 0; end Main; "
             "end C;",
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 // ── Local-decl-init coercion site ───────────────────────────────────────────
@@ -170,7 +185,7 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
             "  end Run; "
             "  public static method Main(): int return 0; end Main; "
             "end C;",
-        NEEDLE_DICT));
+        constraintNeedle("Pt")));
 }
 
 // SortedSet assigned to an IEnumerable<T> local.
@@ -185,7 +200,7 @@ BEZEL_TEST(sorted_sorteddict_ienumerable_coercion_compareto_4099,
             "  end Run; "
             "  public static method Main(): int return 0; end Main; "
             "end C;",
-        NEEDLE_SET));
+        constraintNeedle("Pt")));
 }
 
 // ── Accept-side sweep (LANE_RULES §15): every legitimate shape must still ──

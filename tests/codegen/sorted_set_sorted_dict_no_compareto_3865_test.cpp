@@ -138,6 +138,18 @@ bool lacks(const std::string& src, const std::string& needle) {
 // `IComparable<Ord>`, the untouched `Set<T>`/`OwningSet<T>` false-reject
 // control (mirrors sorted_set_class_element_3428_test.cpp's own `Ord`).
 //
+// `Cmp` LISTS `IComparable<Cmp>`, and that listing is what makes it conform
+// under spec §14.2 rule 2: "T is a record that lists I (or any interface
+// extending I) in its inheritance clause AND declares matching members". A
+// record with a `CompareTo` but no listing satisfies neither half, so
+// fix #4318's `where T: IComparable` check rejects `SortedSet<Cmp>` at sema
+// time (v0.315) — correctly, and with no lowering run at all. The listing was
+// added to this fixture for that reason: the rows using `Cmp` are ACCEPT rows
+// whose real subject is the ordering/dedup BEHAVIOUR #3740/#3948 implemented,
+// so they must keep a conforming program and keep asserting those values.
+// (fix #3740's own regression file, sorted_set_record_element_3740_test.cpp,
+// spells its records this way too, so its 11 rows are unaffected.)
+//
 // `ClassNoCmp` / `AutoHashRec`: the review-fix #3956 shapes. Both are
 // `genericBackingType`-ELIGIBLE (`ClassNoCmp` via `hasObjectHeaderEquality`,
 // `AutoHashRec` via `recordTypeOfRef` — an auto-property-only record IS
@@ -151,7 +163,7 @@ const char* PRELUDE =
     "  public Item: int; "
     "  public constructor(i: int) Item := i; end constructor; "
     "end NoCmp; "
-    "record Cmp "
+    "record Cmp: IComparable<Cmp> "
     "  public Item: int; "
     "  public constructor(i: int) Item := i; end constructor; "
     "  public method CompareTo(other: Cmp): int return Item - other.Item; "
@@ -193,10 +205,27 @@ std::string borrowedParamProg(const std::string& paramDecl,
            "end C;";
 }
 
-const char* NEEDLE_SET =
-    "requires the element type to implement `IComparable<T>`";
-const char* NEEDLE_DICT =
-    "requires the key type to implement `IComparable<K>`";
+// The constraint diagnostic fix #4318 (v0.315) now emits for these shapes,
+// once, from SEMANTIC ANALYSIS (`argSatisfiesTypeBound`, spec §14.2 rule 2).
+// That check fires BEFORE any lowering, so for every NAMED element/key type
+// these rows exercise the sema message is what reaches the user and the
+// codegen-time needles these rows originally pinned are no longer reachable
+// for them — they survive only for shapes sema cannot decide on its own
+// (`Object`, a bare type parameter; see sorted_set_class_element_3428_test.cpp,
+// which still pins the codegen needles on exactly those).
+//
+// The needle is built per offending type name rather than shared, so a row
+// can never pass on some OTHER type argument's constraint failure, and the
+// tail deliberately stops BEFORE the constraint text: #4318's message quotes
+// the stdlib constraint as `where T: IComparable`, the bare interface name,
+// where stdlib §4.17/§4.18 and spec §14.2 rule 2 both spell it
+// `where T: IComparable<T>`. That wording is issue #5423, and pinning only
+// the spec's own part keeps every row here correct across its fix.
+std::string constraintNeedle(const std::string& typeName) {
+    return "type argument `" + typeName +
+           "` does not satisfy the constraint `where ";
+}
+
 const char* NEEDLE_DICT_NOT_YET_IMPL =
     "is not yet supported in codegen";
 
@@ -223,7 +252,7 @@ BEZEL_TEST(sorted_set_no_compareto_3865, verbatim_issue_repro_rejected_not_crash
         "  end CheckSorted; "
         "  public static method Main(): int return 0; end Main; "
         "end C;";
-    BEZEL_EXPECT_TRUE(rejectsWith(src, NEEDLE_SET));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, constraintNeedle("NoCmp")));
 }
 
 // ── SortedSet<T>: every member the §4.18 surface declares, on a BORROWED ────
@@ -233,14 +262,14 @@ BEZEL_TEST(sorted_set_no_compareto_3865, contains_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<NoCmp>",
                           "var x := s.Contains(s.First()); "),
-        NEEDLE_SET));
+        constraintNeedle("NoCmp")));
 }
 
 // The CALL-syntax `.First()` (routes through `tryLowerCollectionInstanceCall`).
 BEZEL_TEST(sorted_set_no_compareto_3865, first_call_syntax_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<NoCmp>", "var x := s.First(); "),
-        NEEDLE_SET));
+        constraintNeedle("NoCmp")));
 }
 
 // The PROPERTY-syntax `.First` (no parens — a bare `MemberAccessExpr`, the
@@ -250,34 +279,34 @@ BEZEL_TEST(sorted_set_no_compareto_3865, first_call_syntax_rejected) {
 BEZEL_TEST(sorted_set_no_compareto_3865, first_property_syntax_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<NoCmp>", "var x := s.First; "),
-        NEEDLE_SET));
+        constraintNeedle("NoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865, last_property_syntax_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<NoCmp>", "var x := s.Last; "),
-        NEEDLE_SET));
+        constraintNeedle("NoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865, add_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<NoCmp>",
                           "var it := new NoCmp(5); s.Add(it); "),
-        NEEDLE_SET));
+        constraintNeedle("NoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865, tryadd_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<NoCmp>",
                           "var it := new NoCmp(5); var ok := s.TryAdd(it); "),
-        NEEDLE_SET));
+        constraintNeedle("NoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865, remove_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<NoCmp>",
                           "var it := new NoCmp(5); var ok := s.Remove(it); "),
-        NEEDLE_SET));
+        constraintNeedle("NoCmp")));
 }
 
 // ── REVIEW FIX #3956: `genericBackingType`-ELIGIBLE elements with NO ────────
@@ -294,27 +323,27 @@ BEZEL_TEST(sorted_set_no_compareto_3865, remove_rejected) {
 BEZEL_TEST(sorted_set_no_compareto_3865, class_no_compareto_call_syntax_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<ClassNoCmp>", "var x := s.First(); "),
-        NEEDLE_SET));
+        constraintNeedle("ClassNoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865, class_no_compareto_property_syntax_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<ClassNoCmp>", "var x := s.First; "),
-        NEEDLE_SET));
+        constraintNeedle("ClassNoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865,
           autohashable_record_no_compareto_call_syntax_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<AutoHashRec>", "var x := s.First(); "),
-        NEEDLE_SET));
+        constraintNeedle("AutoHashRec")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865,
           autohashable_record_no_compareto_property_syntax_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("s: SortedSet<AutoHashRec>", "var x := s.First; "),
-        NEEDLE_SET));
+        constraintNeedle("AutoHashRec")));
 }
 
 // ── FALSE-REJECT: the eligibility branches `ClassNoCmp`/`AutoHashRec` take ──
@@ -355,7 +384,7 @@ BEZEL_TEST(sorted_set_no_compareto_3865,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<ClassNoCmp, int>",
                           "var k := d.FirstKey(); "),
-        NEEDLE_DICT));
+        constraintNeedle("ClassNoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865,
@@ -363,7 +392,7 @@ BEZEL_TEST(sorted_set_no_compareto_3865,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<ClassNoCmp, int>",
                           "var k := d.FirstKey; "),
-        NEEDLE_DICT));
+        constraintNeedle("ClassNoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865,
@@ -371,7 +400,7 @@ BEZEL_TEST(sorted_set_no_compareto_3865,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<AutoHashRec, int>",
                           "var k := d.FirstKey(); "),
-        NEEDLE_DICT));
+        constraintNeedle("AutoHashRec")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865,
@@ -379,7 +408,7 @@ BEZEL_TEST(sorted_set_no_compareto_3865,
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<AutoHashRec, int>",
                           "var k := d.FirstKey; "),
-        NEEDLE_DICT));
+        constraintNeedle("AutoHashRec")));
 }
 
 // ── FALSE-REJECT: `Dictionary<K,V>` shares the SAME `hasObjectHeaderEquality`/
@@ -410,14 +439,14 @@ BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_add_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<NoCmp, int>",
                           "var k := new NoCmp(5); d.Add(k, 1); "),
-        NEEDLE_DICT));
+        constraintNeedle("NoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_containskey_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<NoCmp, int>",
                           "var k := new NoCmp(5); var ok := d.ContainsKey(k); "),
-        NEEDLE_DICT));
+        constraintNeedle("NoCmp")));
 }
 
 // PROPERTY-syntax `.FirstKey` (LlvmBackend_Exprs.cpp) — silently zero-degraded
@@ -426,14 +455,14 @@ BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_firstkey_property_reje
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<NoCmp, int>",
                           "var k := d.FirstKey; "),
-        NEEDLE_DICT));
+        constraintNeedle("NoCmp")));
 }
 
 BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_lastkey_property_rejected) {
     BEZEL_EXPECT_TRUE(rejectsWith(
         borrowedParamProg("d: SortedDictionary<NoCmp, int>",
                           "var k := d.LastKey; "),
-        NEEDLE_DICT));
+        constraintNeedle("NoCmp")));
 }
 
 // ── `Cmp` (declares a dispatchable `CompareTo`): a LEGAL §4.17/§4.18 key/ ───
@@ -500,7 +529,7 @@ BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_nocmp_key_still_reject
     const std::string src = borrowedParamProg(
         "d: SortedDictionary<NoCmp, int>",
         "var k := new NoCmp(5); d.Add(k, 1); ");
-    BEZEL_EXPECT_TRUE(rejectsWith(src, NEEDLE_DICT));
+    BEZEL_EXPECT_TRUE(rejectsWith(src, constraintNeedle("NoCmp")));
     BEZEL_EXPECT_TRUE(lacks(src, NEEDLE_DICT_NOT_YET_IMPL));
 }
 
@@ -556,22 +585,49 @@ BEZEL_TEST(sorted_set_no_compareto_3865, sorteddictionary_int_key_unaffected) {
         std::string("1\n10\n2"));
 }
 
-// ── DOCUMENTED SCOPE BOUNDARY: iteration and Count over a non-eligible ─────
-// ── SortedSet<NoCmp> stay UNREJECTED by this fix (pinned, not a defect) ────
+// ── Count and iteration over a SortedSet are NOT over-rejected ─────────────
 //
-// Neither member needs a comparator (`Count` is `bz_dict_count`; the
-// sorted-snapshot iteration path already declines to an UNSORTED snapshot
-// rather than crashing — a pre-existing, separately-documented design choice,
-// `sortedSetSnapshotToSortedArray`'s own comment). Both stay reachable and
-// compiling for a borrowed, never-constructible `SortedSet<NoCmp>` — dead
-// code (no value of this type can ever be constructed in a well-typed
-// program, per the `add_rejected`/`tryadd_rejected` rows above), so this is
-// a scope boundary, not a silent-wrong-value regression risk.
+// #3865's own scope note here recorded that `.Count` and `for`-in over a
+// `SortedSet<NoCmp>` stayed COMPILABLE — neither member needs a comparator
+// (`Count` is `bz_dict_count`; the sorted-snapshot path declines to an
+// UNSORTED snapshot rather than crashing), and the receiver was dead code
+// anyway since `Add`/`TryAdd` were rejected.
+//
+// That scope boundary is now GONE, and correctly so: fix #4318's sema check
+// (v0.315) rejects the TYPE ARGUMENT at the parameter declaration, so
+// `SortedSet<NoCmp>` no longer resolves at all and no lowering — dormant or
+// otherwise — can run on it. Spec §14.2 rule 2 requires the record to LIST
+// `IComparable` and declare the members; `NoCmp` does neither, so the
+// rejection is the spec's, not an over-reach.
+//
+// This row is therefore REPOINTED, not deleted: it now pins that the
+// constraint check fires on the borrowed-PARAMETER spelling (the #3490
+// reachability shape these rows exist for) and names the offending type.
+// The companion row below restores the positive coverage the old row was
+// really after — that `.Count`/iteration are not themselves over-rejected —
+// over a CONFORMING element, where that question is still answerable.
 BEZEL_TEST(sorted_set_no_compareto_3865, count_and_iteration_stay_unrejected_dormant) {
-    BEZEL_EXPECT_EQ(run(borrowedParamProg(
+    BEZEL_EXPECT_TRUE(rejectsWith(borrowedParamProg(
         "s: SortedSet<NoCmp>",
         "var n := s.Count; "
         "for var e in s do var v := e.Item; end; "
-        "return n; ")),
-        0);
+        "return n; "),
+        constraintNeedle("NoCmp")));
+}
+
+// The positive form of the question the row above used to ask: `.Count` and
+// `for`-in over a SortedSet whose element CONFORMS are untouched by the
+// constraint check and by #3865's new `SortedSet` member guard. Built and
+// run for real (not via a never-invoked borrowed parameter), so the row
+// asserts the values rather than merely the absence of a diagnostic.
+BEZEL_TEST(sorted_set_no_compareto_3865, count_and_iteration_work_for_conforming_element) {
+    BEZEL_EXPECT_EQ(out(prog(
+        "  var s := new SortedSet<Cmp>(); "
+        "  s.Add(new Cmp(30)); s.Add(new Cmp(10)); s.Add(new Cmp(20)); "
+        "  Console.WriteLine(s.Count); "
+        "  var acc := 0; "
+        "  for var e in s do acc := acc * 100 + e.Item; end; "
+        "  Console.WriteLine(acc); "
+        "  return 0; ")),
+        std::string("3\n102030"));
 }
