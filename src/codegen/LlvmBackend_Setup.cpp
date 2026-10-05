@@ -17081,6 +17081,37 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // `{i8, T}` for an `[N]T?` literal initializer.
                 builder_.CreateStore(coerceToNullableSlot(elemTy, ev), gep);
             }
+            // fix #5357 (§15.1 / §28.3, v0.313): a literal-initialized `[N]string`
+            // (or `[N]Rec` / `[N]Choice`) local must have its element disposer
+            // registered at scope end.  The non-literal registration lives in
+            // `registerLocalDisposal' at the end of `lowerLocalDecl' (LlvmBackend_
+            // Setup.cpp ~18860), but THIS early-return path bypasses it entirely.
+            // Add the same registration here so a non-escaping literal-initialized
+            // inline array gets the same `inlineArrayStringFields` disposal as its
+            // call-result counterpart.  Gating on
+            // `inlineArrayStringCallResultReleaseEligible_' (populated by
+            // `collectInlineArrayStringCallResultReleaseEligible' during
+            // `collectFunctionBody') mirrors the non-literal path exactly; the
+            // escape walk ran on the full function body before any `lowerLocalDecl'
+            // was entered, so literals are already classified correctly.
+            {
+                const sema::TypeRef* tr = nullptr;
+                if (declType) tr = ctx_.resolvedType(*declType);
+                if (!tr && !cl->elements.empty() && cl->elements[0])
+                    tr = ctx_.exprType(*cl->elements[0]);
+                if (tr && !tr->nullable &&
+                    tr->kind == sema::TypeRef::Kind::InlineArray &&
+                    inlineArrayElementCarriesString(tr) &&
+                    currentFn_ == inlineArrayStringCallResultReleaseEligibleFn_ &&
+                    inlineArrayStringCallResultReleaseEligible_.count(
+                        static_cast<const void*>(declNode)) &&
+                    !disposeStack_.empty()) {
+                    Disposal d{slot, nullptr};
+                    d.inlineArrayStringFields = true;
+                    d.inlineArrayElemType = tr;
+                    disposeStack_.back().push_back(d);
+                }
+            }
             return;
         }
     }
