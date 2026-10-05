@@ -122,7 +122,7 @@ BEZEL_TEST(nested_type_generic_param_enclosing_3584,
         kOuterWithTagUsingT,
         "using var a: Outer.Tag := new Outer.Tag(7); return a.V();");
     BEZEL_EXPECT_TRUE(rejects(p, "nested type `Tag` references type parameter "
-                                  "`T` of its enclosing type `Outer`"));
+                                  "`T` of its enclosing type `Outer.1`"));
     BEZEL_EXPECT_TRUE(rejects(p, "\xc2\xa7""11.6"));
     BEZEL_EXPECT_TRUE(rejects(p, "\xc2\xa7""14.1"));
 }
@@ -141,7 +141,7 @@ BEZEL_TEST(nested_type_generic_param_enclosing_3584,
         "Console.WriteLine(b.V()); "
         "return a.V();");
     BEZEL_EXPECT_TRUE(rejects(p, "nested type `Tag` references type parameter "
-                                  "`T` of its enclosing type `Outer`"));
+                                  "`T` of its enclosing type `Outer.1`"));
     // The diagnostic must NOT silently let the program through to runtime.
     BEZEL_EXPECT_FALSE(run(p) == 4423056);  // pre-fix garbage value
 }
@@ -163,7 +163,7 @@ BEZEL_TEST(nested_type_generic_param_enclosing_3584,
         "end Outer; ",
         "using var a: Outer.Tag := new Outer.Tag(7); return 0;");
     BEZEL_EXPECT_TRUE(rejects(p, "nested type `Tag` references type parameter "
-                                  "`T` of its enclosing type `Outer`"));
+                                  "`T` of its enclosing type `Outer.1`"));
 }
 
 BEZEL_TEST(nested_type_generic_param_enclosing_3584,
@@ -178,7 +178,7 @@ BEZEL_TEST(nested_type_generic_param_enclosing_3584,
         "end Outer; ",
         "using var a: Outer.Tag := new Outer.Tag(7); return 0;");
     BEZEL_EXPECT_TRUE(rejects(p, "nested type `Tag` references type parameter "
-                                  "`T` of its enclosing type `Outer`"));
+                                  "`T` of its enclosing type `Outer.1`"));
 }
 
 // =============================================================================
