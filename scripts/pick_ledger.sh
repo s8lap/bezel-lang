@@ -137,9 +137,17 @@ echo
 echo "-- summary for $RANGE: $total commit(s)   (KIND with * = inferred from the subject, no recorded kind;"
 echo "   KIND with ~ = note recovered by patch-id after a rebase: $recovered row(s))"
 printf '  %-14s %8s %20s\n' POOL COMMITS "FIX-ISSUES(credited)"
-for p in $(printf '%s\n' "${!COMMITS[@]}" | sort); do
-  printf '  %-14s %8d %20d\n' "$p" "${COMMITS[$p]}" "${FIXES[$p]:-0}"
-done
+# `set -f` for this loop: a pool name may legitimately be `?` (a note with no
+# pool field), and unquoted $(...) would glob-expand it against the CWD —
+# turning the placeholder into whatever single-character filenames happen to
+# be lying around, so the lookup below then hits an unset key and `set -u`
+# aborts the whole summary. Read the keys on one line, split on newlines only.
+set -f
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  printf '  %-14s %8d %20d\n' "$p" "${COMMITS[$p]:-0}" "${FIXES[$p]:-0}"
+done < <(printf '%s\n' "${!COMMITS[@]}" | sort)
+set +f
 echo "distinct fix issues: ${#CREDIT[@]} ($inferred_fix_issues from inferred kinds)"
 echo "distinct issues named (all kinds): ${#ALL[@]}"
 if [ "$unattr" -gt 0 ]; then
