@@ -5595,8 +5595,59 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             // v0.174 (#809): cfe_vtable signals ChannelFullException via bz_exc on
             // a full bounded channel (the sync Send never blocks).
             if (mname == "Send" && call.args.size() == 1 && call.args[0].value) {
-                llvm::Value* item = lowerExpr(*call.args[0].value);
-                if (!item) return nullptr;
+                llvm::Value* item = nullptr;
+                // fix #5359 (§15.4, v0.313): lowerExpr returns null for a
+                // CollectionLiteralExpr because it is not a general expression.
+                // Handle inline array literals here the same way buildOrderedArgs
+                // does: materialize element-by-element into a stack alloca.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        call.args[0].value.get())) {
+                    const sema::TypeRef* elemTy =
+                        !recvTy->genericArgs.empty() ? recvTy->genericArgs[0]
+                                                     : nullptr;
+                    if (elemTy && elemTy->kind == sema::TypeRef::Kind::InlineArray) {
+                        llvm::Type* arrLlvmTy = lowerTypeRef(elemTy);
+                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(arrLlvmTy)) {
+                            llvm::AllocaInst* aslot = entryAlloca(aty);
+                            builder_.CreateStore(
+                                llvm::ConstantAggregateZero::get(aty), aslot);
+                            llvm::Type* elTy = aty->getElementType();
+                            for (std::size_t k = 0;
+                                 k < cl->elements.size() &&
+                                 k < aty->getNumElements(); ++k) {
+                                if (!cl->elements[k]) continue;
+                                llvm::Value* ev = lowerExpr(*cl->elements[k]);
+                                if (!ev) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        cl->elements[k]->span.begin,
+                                        "internal: lowerExpr returned null for "
+                                        "inline-array element in ChannelSender.Send "
+                                        "argument — #5359");
+                                    continue;
+                                }
+                                if (ev->getType() != elTy &&
+                                    ev->getType()->isIntegerTy() &&
+                                    elTy->isIntegerTy()) {
+                                    unsigned eb = ev->getType()->getIntegerBitWidth();
+                                    unsigned db = elTy->getIntegerBitWidth();
+                                    ev = db > eb ? builder_.CreateSExt(ev, elTy)
+                                                 : builder_.CreateTrunc(ev, elTy);
+                                }
+                                builder_.CreateStore(
+                                    ev, builder_.CreateGEP(
+                                           aty, aslot,
+                                           {builder_.getInt32(0),
+                                            builder_.getInt32(static_cast<unsigned>(k))}));
+                            }
+                            item = builder_.CreateLoad(aty, aslot);
+                        }
+                    }
+                }
+                if (!item) {
+                    item = lowerExpr(*call.args[0].value);
+                    if (!item) return nullptr;
+                }
                 // #5305 / §30.15 / #5305-ff2: shared item-word encoding (see
                 // encodeChannelItemWord) — an aggregate element crosses as a
                 // pointer to a fresh cell instead of the pre-fix illegal
@@ -5625,8 +5676,57 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             // emitPendingCheck here (unlike the synchronous Send).
             if (mname == "SendAsync" && call.args.size() == 1 &&
                 call.args[0].value) {
-                llvm::Value* item = lowerExpr(*call.args[0].value);
-                if (!item) return nullptr;
+                llvm::Value* item = nullptr;
+                // fix #5359 (§15.4, v0.313): same inline-array materialization as
+                // the Send arm above — lowerExpr returns null for CollectionLiteralExpr.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        call.args[0].value.get())) {
+                    const sema::TypeRef* elemTy =
+                        !recvTy->genericArgs.empty() ? recvTy->genericArgs[0]
+                                                     : nullptr;
+                    if (elemTy && elemTy->kind == sema::TypeRef::Kind::InlineArray) {
+                        llvm::Type* arrLlvmTy = lowerTypeRef(elemTy);
+                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(arrLlvmTy)) {
+                            llvm::AllocaInst* aslot = entryAlloca(aty);
+                            builder_.CreateStore(
+                                llvm::ConstantAggregateZero::get(aty), aslot);
+                            llvm::Type* elTy = aty->getElementType();
+                            for (std::size_t k = 0;
+                                 k < cl->elements.size() &&
+                                 k < aty->getNumElements(); ++k) {
+                                if (!cl->elements[k]) continue;
+                                llvm::Value* ev = lowerExpr(*cl->elements[k]);
+                                if (!ev) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        cl->elements[k]->span.begin,
+                                        "internal: lowerExpr returned null for "
+                                        "inline-array element in ChannelSender.SendAsync "
+                                        "argument — #5359");
+                                    continue;
+                                }
+                                if (ev->getType() != elTy &&
+                                    ev->getType()->isIntegerTy() &&
+                                    elTy->isIntegerTy()) {
+                                    unsigned eb = ev->getType()->getIntegerBitWidth();
+                                    unsigned db = elTy->getIntegerBitWidth();
+                                    ev = db > eb ? builder_.CreateSExt(ev, elTy)
+                                                 : builder_.CreateTrunc(ev, elTy);
+                                }
+                                builder_.CreateStore(
+                                    ev, builder_.CreateGEP(
+                                           aty, aslot,
+                                           {builder_.getInt32(0),
+                                            builder_.getInt32(static_cast<unsigned>(k))}));
+                            }
+                            item = builder_.CreateLoad(aty, aslot);
+                        }
+                    }
+                }
+                if (!item) {
+                    item = lowerExpr(*call.args[0].value);
+                    if (!item) return nullptr;
+                }
                 // #5305 / §30.15 / #5305-ff2: the SAME item-word encoding as the
                 // sync Send above (encodeChannelItemWord) — SendAsync hands the
                 // identical word to the identical runtime entry point, so it
