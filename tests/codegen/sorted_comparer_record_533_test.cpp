@@ -88,7 +88,7 @@ BEZEL_TEST(sorted_comparer_record_533, sorted_result_length_spec_4_4) {
         "  a.Add(new Point(1, 2)); "
         "  a.Add(new Point(2, 0)); "
         "  using var s := a.Sorted(lambda(p, q) => p.X - q.X); "
-        "  return s.Length; "  // 3
+        "  return s.Count; "  // 3
         "end Main; end C;"), 3);
 }
 

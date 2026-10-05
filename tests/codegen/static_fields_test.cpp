@@ -131,7 +131,7 @@ BEZEL_TEST(codegen_cg12, static_array_literal_field_743) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class H public static readonly Nums: Array<int> := [10, 20, 30]; end H; "
         "class C public static method Main(): int "
-        "  Console.WriteLine(H.Nums.Length * 100 + H.Nums.Get(0) + H.Nums.Get(2)); return 0; "  // 3*100+10+30 = 340
+        "  Console.WriteLine(H.Nums.Count * 100 + H.Nums.Get(0) + H.Nums.Get(2)); return 0; "  // 3*100+10+30 = 340
         "end Main; end C;"), "340");
 }
 

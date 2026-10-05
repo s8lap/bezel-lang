@@ -58,7 +58,7 @@ BEZEL_TEST(linq_gaps, union_basic_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); "
         "  using var b := new Array<int>(); b.Add(2); b.Add(3); b.Add(4); "
         "  using var r: Array<int> := a.Union(b).ToArray(); "
-        "  return int(r.Length = 4 and r.Get(0) = 1 and r.Get(1) = 2 "
+        "  return int(r.Count = 4 and r.Get(0) = 1 and r.Get(1) = 2 "
         "             and r.Get(2) = 3 and r.Get(3) = 4); "
         "end Main; end C;"), 1);
 }
@@ -70,7 +70,7 @@ BEZEL_TEST(linq_gaps, union_duplicates_in_self_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(1); a.Add(2); "
         "  using var b := new Array<int>(); b.Add(2); b.Add(3); "
         "  using var r: Array<int> := a.Union(b).ToArray(); "
-        "  return r.Length; "  // {1,2,3} = 3
+        "  return r.Count; "  // {1,2,3} = 3
         "end Main; end C;"), 3);
 }
 
@@ -81,7 +81,7 @@ BEZEL_TEST(linq_gaps, union_empty_self_spec_5) {
         "  using var a := new Array<int>(); "
         "  using var b := new Array<int>(); b.Add(1); b.Add(2); "
         "  using var r: Array<int> := a.Union(b).ToArray(); "
-        "  return r.Length; "  // 2
+        "  return r.Count; "  // 2
         "end Main; end C;"), 2);
 }
 
@@ -92,7 +92,7 @@ BEZEL_TEST(linq_gaps, union_both_empty_spec_5) {
         "  using var a := new Array<int>(); "
         "  using var b := new Array<int>(); "
         "  using var r: Array<int> := a.Union(b).ToArray(); "
-        "  return r.Length; "  // 0
+        "  return r.Count; "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -117,7 +117,7 @@ BEZEL_TEST(linq_gaps, intersect_basic_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  using var b := new Array<int>(); b.Add(2); b.Add(4); b.Add(6); "
         "  using var r: Array<int> := a.Intersect(b).ToArray(); "
-        "  return int(r.Length = 2 and r.Get(0) = 2 and r.Get(1) = 4); "
+        "  return int(r.Count = 2 and r.Get(0) = 2 and r.Get(1) = 4); "
         "end Main; end C;"), 1);
 }
 
@@ -128,7 +128,7 @@ BEZEL_TEST(linq_gaps, intersect_disjoint_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(3); "
         "  using var b := new Array<int>(); b.Add(2); b.Add(4); "
         "  using var r: Array<int> := a.Intersect(b).ToArray(); "
-        "  return r.Length; "  // 0
+        "  return r.Count; "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -139,7 +139,7 @@ BEZEL_TEST(linq_gaps, intersect_duplicates_dedup_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(1); a.Add(2); a.Add(2); "
         "  using var b := new Array<int>(); b.Add(1); b.Add(2); "
         "  using var r: Array<int> := a.Intersect(b).ToArray(); "
-        "  return r.Length; "  // {1,2} = 2
+        "  return r.Count; "  // {1,2} = 2
         "end Main; end C;"), 2);
 }
 
@@ -164,7 +164,7 @@ BEZEL_TEST(linq_gaps, except_basic_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  using var b := new Array<int>(); b.Add(2); b.Add(4); "
         "  using var r: Array<int> := a.Except(b).ToArray(); "
-        "  return int(r.Length = 2 and r.Get(0) = 1 and r.Get(1) = 3); "
+        "  return int(r.Count = 2 and r.Get(0) = 1 and r.Get(1) = 3); "
         "end Main; end C;"), 1);
 }
 
@@ -175,7 +175,7 @@ BEZEL_TEST(linq_gaps, except_all_removed_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(2); "
         "  using var b := new Array<int>(); b.Add(1); b.Add(2); "
         "  using var r: Array<int> := a.Except(b).ToArray(); "
-        "  return r.Length; "  // 0
+        "  return r.Count; "  // 0
         "end Main; end C;"), 0);
 }
 
@@ -186,7 +186,7 @@ BEZEL_TEST(linq_gaps, except_duplicates_dedup_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); a.Add(1); a.Add(2); a.Add(3); "
         "  using var b := new Array<int>(); b.Add(1); "
         "  using var r: Array<int> := a.Except(b).ToArray(); "
-        "  return r.Length; "  // {2,3} = 2
+        "  return r.Count; "  // {2,3} = 2
         "end Main; end C;"), 2);
 }
 
@@ -254,7 +254,7 @@ BEZEL_TEST(linq_gaps, thenby_single_element_spec_5) {
         "  using var r: Array<Point> := a.OrderBy(lambda(p) => p.x)"
         "                               .ThenBy(lambda(p) => p.y)"
         "                               .ToArray(); "
-        "  return r.Length; "
+        "  return r.Count; "
         "end Main; end C;"), 1);
 }
 
@@ -281,7 +281,7 @@ BEZEL_TEST(linq_gaps, reverse_basic_spec_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  using var r: Array<int> := a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
-        "  return int(r.Length = 5 and r.Get(0) = 5 and r.Get(4) = 1); "
+        "  return int(r.Count = 5 and r.Get(0) = 5 and r.Get(4) = 1); "
         "end Main; end C;"), 1);
 }
 
@@ -291,7 +291,7 @@ BEZEL_TEST(linq_gaps, reverse_empty_spec_5) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  using var r: Array<int> := a.Where(lambda(x) => x > 0).Reverse().ToArray(); "
-        "  return r.Length; "
+        "  return r.Count; "
         "end Main; end C;"), 0);
 }
 

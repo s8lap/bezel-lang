@@ -162,7 +162,7 @@ BEZEL_TEST(ienumerable_vtable_linq_995, toarray_length) {
     BEZEL_EXPECT_EQ(run(std::string(kSeq) +
         "  public static method Main(): int "
         "    var a := P.Seq().ToArray(); "
-        "    return a.Length; "
+        "    return a.Count; "
         "  end Main; end P;"), 3);
 }
 

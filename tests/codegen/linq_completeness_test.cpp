@@ -143,7 +143,7 @@ BEZEL_TEST(linq_complete, concat_order_spec_5) {
         "  using var a := new Array<int>(); a.Add(1); "
         "  using var b := new Array<int>(); b.Add(2); "
         "  using var r: Array<int> := a.Concat(b).ToArray(); "
-        "  return int(r.Length = 2 and r.Get(0) = 1 and r.Get(1) = 2); "
+        "  return int(r.Count = 2 and r.Get(0) = 1 and r.Get(1) = 2); "
         "end Main; end C;"), 1);
 }
 

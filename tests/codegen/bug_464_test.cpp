@@ -206,7 +206,7 @@ BEZEL_TEST(bug464_distinct_record_array,
         "  a.Add(new Point(1, 2)); "   // duplicate — should not appear twice
         "  a.Add(new Point(3, 4)); "
         "  using var d: Array<Point> := a.Distinct().ToArray(); "
-        "  if d.Length <> 2 then return -1; end; "
+        "  if d.Count <> 2 then return -1; end; "
         "  var sum := d[0].x + d[1].x; "   // 1 + 3 = 4
         "  return sum; "
         "end Main; end C;"), 4);

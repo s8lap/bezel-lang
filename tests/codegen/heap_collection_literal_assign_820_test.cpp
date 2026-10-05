@@ -28,7 +28,7 @@ BEZEL_TEST(heap_collection_literal_assign_820, array_int_field_ctor_assign) {
         "module M; class Box "
         "  private _arr: Array<int>; "
         "  public constructor() _arr := [1, 2, 3]; end constructor; "
-        "  public method Len(): int => _arr.Length; "
+        "  public method Len(): int => _arr.Count; "
         "  destructor end destructor; "
         "end Box; "
         "class C public static method Main(): int "
@@ -80,7 +80,7 @@ BEZEL_TEST(heap_collection_literal_assign_820, array_field_method_reassign_value
         "  public constructor() _arr := [1]; end constructor; "
         "  public method Reset(): int "
         "    _arr := [10, 20, 30, 40, 50]; "
-        "    return _arr.Length; "
+        "    return _arr.Count; "
         "  end Reset; "
         "  destructor end destructor; "
         "end Box; "
@@ -95,6 +95,6 @@ BEZEL_TEST(heap_collection_literal_assign_820, local_array_initializer_unaffecte
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: Array<int> := [7, 8, 9]; "
-        "  return a.Length; "                                // 3
+        "  return a.Count; "                                // 3
         "end Main; end C;"), 3);
 }

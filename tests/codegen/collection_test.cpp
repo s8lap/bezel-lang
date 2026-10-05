@@ -21,7 +21,7 @@ BEZEL_TEST(collection_array, add_get_length) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); "
-        "  return int(a.Length = 3 and a.Get(0) = 10 and a.Get(2) = 30); "
+        "  return int(a.Count = 3 and a.Get(0) = 10 and a.Get(2) = 30); "
         "end Main; end C;"), 1);
 }
 
@@ -32,7 +32,7 @@ BEZEL_TEST(collection_array, set_and_remove) {
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  a[1] := 99; "
         "  a.RemoveAt(0); "
-        "  return int(a.Length = 2 and a.Get(0) = 99 and a.Get(1) = 3); "
+        "  return int(a.Count = 2 and a.Get(0) = 99 and a.Get(1) = 3); "
         "end Main; end C;"), 1);
 }
 
@@ -41,7 +41,7 @@ BEZEL_TEST(collection_array, string_elements) {
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"hello\"); a.Add(\"world\"); "
-        "  return int(a.Length = 2 and a.Get(0) = \"hello\"); "
+        "  return int(a.Count = 2 and a.Get(0) = \"hello\"); "
         "end Main; end C;"), 1);
 }
 
@@ -85,7 +85,7 @@ BEZEL_TEST(collection_stack, push_peek_pop) {
         "  s.Push(1); s.Push(2); s.Push(3); "
         "  var top := s.Peek(); "
         "  var popped := s.Pop(); "
-        "  return int(top = 3 and popped = 3 and s.Length = 2); "
+        "  return int(top = 3 and popped = 3 and s.Count = 2); "
         "end Main; end C;"), 1);
 }
 
@@ -95,7 +95,7 @@ BEZEL_TEST(collection_queue, enqueue_dequeue) {
         "  using var q := new Queue<int>(); "
         "  q.Enqueue(10); q.Enqueue(20); q.Enqueue(30); "
         "  var front := q.Dequeue(); "
-        "  return int(front = 10 and q.Length = 2 and q.Get(0) = 20); "
+        "  return int(front = 10 and q.Count = 2 and q.Get(0) = 20); "
         "end Main; end C;"), 1);
 }
 
@@ -213,7 +213,7 @@ BEZEL_TEST(linq_int, where) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  using var evens: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
-        "  return int(evens.Length = 2 and evens.Get(0) = 2 and evens.Get(1) = 4); "
+        "  return int(evens.Count = 2 and evens.Get(0) = 2 and evens.Get(1) = 4); "
         "end Main; end C;"), 1);
 }
 
@@ -258,7 +258,7 @@ BEZEL_TEST(linq_int, foreach_and_select) {
         "    a.Add(1); a.Add(2); a.Add(3); "
         // stdlib §5: Select is LAZY — materialize with ToArray() to observe.
         "    using var doubled: Array<int> := a.Select(lambda(x: int) => x * 2).ToArray(); "
-        "    return int(doubled.Length = 3 and doubled.Get(0) = 2 and doubled.Get(2) = 6); "
+        "    return int(doubled.Count = 3 and doubled.Get(0) = 2 and doubled.Get(2) = 6); "
         "  end Main; end C;"), 1);
 }
 
@@ -289,6 +289,6 @@ BEZEL_TEST(linq_string, where) {
         "  a.Add(\"hi\"); a.Add(\"hello\"); a.Add(\"hey\"); "
         // stdlib §5: Where is LAZY — materialize with ToArray() to observe.
         "  using var long2: Array<string> := a.Where(lambda(s) => s.Length > 2).ToArray(); "
-        "  return int(long2.Length = 2 and long2.Get(0) = \"hello\"); "
+        "  return int(long2.Count = 2 and long2.Get(0) = \"hello\"); "
         "end Main; end C;"), 1);
 }

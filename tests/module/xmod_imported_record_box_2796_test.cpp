@@ -249,7 +249,7 @@ BEZEL_TEST(xmod_imported_record_box_2796, imported_record_in_object_collection) 
     BEZEL_EXPECT_EQ(runXmod2796(kLib2796, app2796(
         "    var score: int := 0; "
         "    var a: Array<Object> := [new Pt(1, 2), new Pt(3, 4)]; "
-        "    if a.Length = 2 then score := score + 1; end if; "
+        "    if a.Count = 2 then score := score + 1; end if; "
         "    if a[0] is Pt then score := score + 2; end if; "
         "    if a[1] is Pt then score := score + 4; end if; "
         "    var b: Pt? := (a[1] as Pt); "

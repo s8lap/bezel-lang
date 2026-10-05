@@ -141,7 +141,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var d: Array<Box> := a.Distinct().ToArray(); "
-        "  return d.Length;")), 3);
+        "  return d.Count;")), 3);
 }
 
 // spec §8.4 ("For classes, `=` always invokes `Equals`. … classes customize
@@ -155,7 +155,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var a := new Array<Key>(); "
         "  a.Add(k0); a.Add(k1); a.Add(k2); "
         "  using var d: Array<Key> := a.Distinct().ToArray(); "
-        "  return d.Length;")), 2);
+        "  return d.Count;")), 2);
 }
 
 // spec §3.6 (hashable admits an interface) + §8.3: a statically
@@ -168,7 +168,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var s2 := new Sq(3); "
         "  var a: Array<IShape> := [s0, s1, s2]; "
         "  using var d: Array<IShape> := a.Distinct().ToArray(); "
-        "  return d.Length;")), 3);
+        "  return d.Count;")), 3);
 }
 
 // ===========================================================================
@@ -200,7 +200,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var u: Array<Key> := a.Union(b).ToArray(); "
         "  using var i: Array<Key> := a.Intersect(b).ToArray(); "
         "  using var e: Array<Key> := a.Except(b).ToArray(); "
-        "  return u.Length * 25 + i.Length * 5 + e.Length;")), 81);
+        "  return u.Count * 25 + i.Count * 5 + e.Count;")), 81);
 }
 
 // The same three operators over a class with NO override: §8.3 identity.
@@ -223,7 +223,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var u: Array<Box> := a.Union(b).ToArray(); "
         "  using var i: Array<Box> := a.Intersect(b).ToArray(); "
         "  using var e: Array<Box> := a.Except(b).ToArray(); "
-        "  return u.Length * 25 + i.Length * 5 + e.Length;")), 81);
+        "  return u.Count * 25 + i.Count * 5 + e.Count;")), 81);
 }
 
 // ===========================================================================
@@ -249,8 +249,8 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var i: Array<string> := a.Intersect(b).ToArray(); "
         "  using var e: Array<string> := a.Except(b).ToArray(); "
         "  using var s := a.ToSet(); "
-        "  return d.Length * 50 + u.Length * 20 + i.Length * 10 + "
-        "         e.Length * 5 + s.Count;")), 177);
+        "  return d.Count * 50 + u.Count * 20 + i.Count * 10 + "
+        "         e.Count * 5 + s.Count;")), 177);
 }
 
 // The record element (issue D6's path) is untouched by this fix and must stay
@@ -262,7 +262,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var a := new Array<Pt>(); "
         "  a.Add(new Pt(1)); a.Add(new Pt(2)); a.Add(new Pt(1)); "
         "  using var d: Array<Pt> := a.Distinct().ToArray(); "
-        "  return d.Length;")), 2);
+        "  return d.Count;")), 2);
 }
 
 // The `int` element must stay a plain value compare (the `else` arm).
@@ -273,5 +273,5 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(1); a.Add(3); "
         "  using var d: Array<int> := a.Distinct().ToArray(); "
-        "  return d.Length;")), 3);
+        "  return d.Count;")), 3);
 }

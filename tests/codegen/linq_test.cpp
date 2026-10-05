@@ -61,7 +61,7 @@ BEZEL_TEST(linq, count_where) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  using var evens: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
-        "  return int(a.Where(lambda(x) => x mod 2 = 0).Count() = 2 and evens.Length = 2 "
+        "  return int(a.Where(lambda(x) => x mod 2 = 0).Count() = 2 and evens.Count = 2 "
         "    and evens.Get(0) = 2 and evens.Get(1) = 4); "
         "end Main; end C;"), 1);
 }
@@ -287,9 +287,9 @@ BEZEL_TEST(linq, skip_take) {
         "  using var t: Array<int> := a.Take(3).ToArray(); "
         "  using var s: Array<int> := a.Skip(2).ToArray(); "
         "  using var m: Array<int> := a.Take(4).Skip(1).ToArray(); "
-        "  return int(t.Length = 3 and t.Get(2) = 3 and "
-        "             s.Length = 3 and s.Get(0) = 3 and "
-        "             m.Length = 3 and m.Get(0) = 2); "
+        "  return int(t.Count = 3 and t.Get(2) = 3 and "
+        "             s.Count = 3 and s.Get(0) = 3 and "
+        "             m.Count = 3 and m.Get(0) = 2); "
         "end Main; end C;"), 1);
 }
 
@@ -337,7 +337,7 @@ BEZEL_TEST(linq, distinct_int) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(1); a.Add(3); a.Add(2); "
         "  using var d: Array<int> := a.Distinct().ToArray(); "
-        "  return d.Length; "
+        "  return d.Count; "
         "end Main; end C;"), 3);
 }
 
@@ -347,7 +347,7 @@ BEZEL_TEST(linq, distinct_string) {
         "  using var a := new Array<string>(); "
         "  a.Add(\"apple\"); a.Add(\"banana\"); a.Add(\"apple\"); "
         "  using var d: Array<string> := a.Distinct().ToArray(); "
-        "  return d.Length; "
+        "  return d.Count; "
         "end Main; end C;"), 2);
 }
 
@@ -373,7 +373,7 @@ BEZEL_TEST(linq, chaining) {
         "  for var i in 1..10 do a.Add(i); end; "
         "  using var r: Array<int> := "
         "    a.Where(lambda(x) => x mod 2 = 0).OrderBy(lambda(x: int) => x).Skip(1).Take(3).ToArray(); "
-        "  return int(r.Length = 3 and r.Get(0) = 4 and r.Get(2) = 8); "
+        "  return int(r.Count = 3 and r.Get(0) = 4 and r.Get(2) = 8); "
         "end Main; end C;"), 1);
 }
 
@@ -464,7 +464,7 @@ BEZEL_TEST(linq, where_record_field_spec_5) {
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(5, 1)); a.Add(new Point(2, 2)); a.Add(new Point(5, 3)); "
         "  using var w: Array<Point> := a.Where(lambda(p) => p.x = 5).ToArray(); "
-        "  return int(w.Length = 2 and w.Get(0).y = 1 and w.Get(1).y = 3); "
+        "  return int(w.Count = 2 and w.Get(0).y = 1 and w.Get(1).y = 3); "
         "end Main; end C;"), 1);
 }
 
@@ -504,7 +504,7 @@ BEZEL_TEST(linq, distinct_record_structural_equality_spec_5) {
         "  using var a := new Array<Pt>(); "
         "  a.Add(new Pt(1)); a.Add(new Pt(2)); a.Add(new Pt(1)); a.Add(new Pt(2)); "
         "  using var d: Array<Pt> := a.Distinct().ToArray(); "
-        "  return d.Length; "
+        "  return d.Count; "
         "end Main; end C;"), 2);
 }
 
@@ -517,7 +517,7 @@ BEZEL_TEST(linq, distinct_record_multifield_spec_5) {
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(1, 2)); a.Add(new Point(1, 3)); a.Add(new Point(1, 2)); "
         "  using var d: Array<Point> := a.Distinct().ToArray(); "
-        "  return d.Length; "
+        "  return d.Count; "
         "end Main; end C;"), 2);
 }
 
@@ -794,7 +794,7 @@ BEZEL_TEST(linq, control_lazy_toarray_length_spec_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  using var m: Array<int> := a.Select(lambda(x: int) => x * 2).ToArray(); "
-        "  return m.Length; "  // 3
+        "  return m.Count; "  // 3
         "end Main; end C;"), 3);
 }
 

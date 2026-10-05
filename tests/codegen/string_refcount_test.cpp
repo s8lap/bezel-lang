@@ -553,13 +553,13 @@ BEZEL_TEST(codegen_string_refcount_422, split_char_round_trip_no_uaf_9_6) {
     expectValueAndLeakFree(kSplitCharRoundTrip, 6);
 }
 
-// #1027: the discard form `s.Split(',').Length` (the fresh owned Array<string>
+// #1027: the discard form `s.Split(',').Count` (the fresh owned Array<string>
 // consumed as a receiver, then dropped) is reclaimed exactly once via the
 // ownerless-materializer temp path — was a leak. Returns the part count (3).
 const char* kSplitDiscardLength =
     "module M; class C "
     "  public static method Main(): int "
-    "    return \"a,bb,ccc\".Split(',').Length; "   // 3
+    "    return \"a,bb,ccc\".Split(',').Count; "   // 3
     "  end Main; "
     "end C;";
 BEZEL_TEST(codegen_string_refcount_1027, split_discard_length_reclaimed) {

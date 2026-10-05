@@ -181,7 +181,7 @@ BEZEL_TEST(collections_r9_523, stack_pop_nonempty_returns_top_spec_4_11) {
         "  using var s := new Stack<int>(); "
         "  s.Push(1); s.Push(2); s.Push(3); "
         "  var top := s.Pop(); "          // must be 3 (LIFO)
-        "  return top * 10 + s.Length; "  // 3*10 + 2 = 32
+        "  return top * 10 + s.Count; "  // 3*10 + 2 = 32
         "end Main; end C;"), 32);
 }
 
@@ -192,7 +192,7 @@ BEZEL_TEST(collections_r9_523, queue_dequeue_nonempty_returns_front_spec_4_12) {
         "  using var q := new Queue<int>(); "
         "  q.Enqueue(10); q.Enqueue(20); q.Enqueue(30); "
         "  var front := q.Dequeue(); "    // must be 10 (FIFO)
-        "  return front + q.Length; "     // 10 + 2 = 12
+        "  return front + q.Count; "     // 10 + 2 = 12
         "end Main; end C;"), 12);
 }
 
@@ -218,7 +218,7 @@ BEZEL_TEST(collections_r9_523, stack_peek_nonempty_does_not_remove_spec_4_11) {
         "  using var s := new Stack<int>(); "
         "  s.Push(5); s.Push(7); "
         "  var top := s.Peek(); "         // 7 (top), not removed
-        "  return top * 10 + s.Length; "  // 7*10 + 2 = 72
+        "  return top * 10 + s.Count; "  // 7*10 + 2 = 72
         "end Main; end C;"), 72);
 }
 

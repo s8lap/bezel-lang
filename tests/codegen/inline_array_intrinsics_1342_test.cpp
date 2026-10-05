@@ -38,7 +38,7 @@ BEZEL_TEST(inline_array_intrinsics_1342, to_array_int_length) {
         "module M; class C public static method Main(): int "
         "  var arr: [5]int := [10, 20, 30, 40, 50]; "
         "  using var h: Array<int> := arr.ToArray(); "
-        "  return h.Length; "
+        "  return h.Count; "
         "end Main; end C;"), 5);
 }
 
@@ -71,7 +71,7 @@ BEZEL_TEST(inline_array_intrinsics_1342, to_array_string_length) {
         "module M; class C public static method Main(): int "
         "  var arr: [3]string := [\"a\", \"b\", \"c\"]; "
         "  using var h: Array<string> := arr.ToArray(); "
-        "  return h.Length; "
+        "  return h.Count; "
         "end Main; end C;"), 3);
 }
 

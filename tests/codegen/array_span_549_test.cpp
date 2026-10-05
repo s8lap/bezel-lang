@@ -316,7 +316,7 @@ BEZEL_TEST(array_span_549, ownedarray_linq_then_toarray_valid_1022) {
         "  using var a := new OwningArray<Cell>(); "
         "  a.Add(new Cell(7)); a.Add(new Cell(8)); a.Add(new Cell(9)); "
         "  using var e: Array<Cell> := a.Where(lambda(x) => x.V > 7).ToArray(); "
-        "  return e.Length; "  // 2 (8 and 9)
+        "  return e.Count; "  // 2 (8 and 9)
         "end Main; end C;", 2);
 }
 

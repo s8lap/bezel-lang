@@ -176,7 +176,7 @@ BEZEL_TEST(dict_literal_contexts_538, control_array_field_init_unaffected) {
         "class C "
         "  private _a: Array<int> := [10, 20, 30]; "
         "  public method Check(): int "
-        "    return int(_a.Length = 3 and _a.Get(0) = 10 and _a.Get(2) = 30); "
+        "    return int(_a.Count = 3 and _a.Get(0) = 10 and _a.Get(2) = 30); "
         "  end Check; "
         "  public static method Main(): int "
         "    using var c := new C(); "
@@ -195,7 +195,7 @@ BEZEL_TEST(dict_literal_contexts_538, control_array_return_unaffected) {
         "  end Make; "
         "  public static method Main(): int "
         "    using var a := C.Make(); "
-        "    return int(a.Length = 3 and a.Get(0) = 5 and a.Get(2) = 7); "
+        "    return int(a.Count = 3 and a.Get(0) = 5 and a.Get(2) = 7); "
         "  end Main; "
         "end C;"), 1);
 }

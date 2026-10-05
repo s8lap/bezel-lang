@@ -89,7 +89,7 @@ const char* kPlainCStringToBytes =
     "    var c: CString := CString.From(\"xyz\"); "
     "    while i < 20 do "
     "      var b := c.ToBytes(); "
-    "      if b.Length <> 3 then return 3; end; "
+    "      if b.Count <> 3 then return 3; end; "
     "      i := i + 1; "
     "    end; "
     "    return 0; "

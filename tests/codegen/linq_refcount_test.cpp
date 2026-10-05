@@ -274,7 +274,7 @@ const char* kLazyWhereToArrayChurn =
     "    var i: int := 0; var ok: int := 1; "
     "    while i < 100000 do "
     "      using var e: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
-    "      if e.Length <> 2 then ok := 0; end; "
+    "      if e.Count <> 2 then ok := 0; end; "
     "      i := i + 1; "
     "    end; "
     "    if ok = 1 then return 0; end; return 1; "
@@ -375,7 +375,7 @@ const char* kLazyZipNestedWhereToArrayChurn =
     "    while i < 50000 do "
     "      using var z: Array<int> := "
     "        a.Zip(b.Where(lambda(y) => y > 10), lambda(x: int, y: int) => x + y).ToArray(); "
-    "      if z.Length <> 3 then ok := 0; end; "
+    "      if z.Count <> 3 then ok := 0; end; "
     "      i := i + 1; "
     "    end; "
     "    if ok = 1 then return 0; end; return 1; "
@@ -395,7 +395,7 @@ const char* kBorrowedPredicateLazyReuse =
     "    var pred: (int) -> bool := lambda(x: int) => x > 2; "
     "    using var e1: Array<int> := a.Where(pred).ToArray(); "
     "    using var e2: Array<int> := a.Where(pred).ToArray(); "
-    "    if e1.Length = 2 and e2.Length = 2 then return 0; end; return 1; "
+    "    if e1.Count = 2 and e2.Count = 2 then return 0; end; return 1; "
     "  end Main; "
     "end C;";
 
@@ -542,7 +542,7 @@ const char* kLazyThenByToArrayChurn =
     "      using var r: Array<Point> := a.OrderBy(lambda(p) => p.x)"
     "                                    .ThenBy(lambda(p) => p.y)"
     "                                    .ToArray(); "
-    "      if r.Length <> 4 then ok := 0; end; "
+    "      if r.Count <> 4 then ok := 0; end; "
     "      if r.Get(0).y <> 3 then ok := 0; end; "  // (1,3) first
     "      i := i + 1; "
     "    end; "
@@ -569,7 +569,7 @@ const char* kLazyThenByBorrowedKey =
     "                                   .ThenBy(secKey).ToArray(); "
     "    using var r2: Array<Point> := a.OrderBy(lambda(p) => p.x)"
     "                                   .ThenBy(secKey).ToArray(); "
-    "    if r1.Length = 4 and r2.Length = 4 then return 0; end; return 1; "
+    "    if r1.Count = 4 and r2.Count = 4 then return 0; end; return 1; "
     "  end Main; "
     "end C;";
 
@@ -590,7 +590,7 @@ const char* kLazyUnionToArrayChurn =
     "    var i: int := 0; var ok: int := 1; "
     "    while i < 100000 do "
     "      using var r: Array<int> := a.Union(b).ToArray(); "
-    "      if r.Length <> 4 then ok := 0; end; "
+    "      if r.Count <> 4 then ok := 0; end; "
     "      i := i + 1; "
     "    end; "
     "    if ok = 1 then return 0; end; return 1; "
@@ -624,7 +624,7 @@ const char* kPlainTwoToArray =
     "    src.Add(1); src.Add(2); src.Add(3); "
     "    var a1 := src.Where(lambda(n) => n > 0).ToArray(); "
     "    var a2 := src.Where(lambda(n) => n > 0).ToArray(); "
-    "    return a1.Length + a2.Length; "
+    "    return a1.Count + a2.Count; "
     "  end Main; "
     "end C;";
 
@@ -642,7 +642,7 @@ const char* kPlainThreeToArray =
     "    var a1 := src.Where(lambda(n) => n > 0).ToArray(); "
     "    var a2 := src.Where(lambda(n) => n > 0).ToArray(); "
     "    var a3 := src.Where(lambda(n) => n > 0).ToArray(); "
-    "    return a1.Length + a2.Length + a3.Length; "
+    "    return a1.Count + a2.Count + a3.Count; "
     "  end Main; "
     "end C;";
 
@@ -661,7 +661,7 @@ const char* kPlainToArrayPlusForIn =
     "    var a := src.Where(lambda(n) => n > 0).ToArray(); "
     "    var total := 0; "
     "    for var x in src do total := total + x; end; "
-    "    return a.Length + total; "
+    "    return a.Count + total; "
     "  end Main; "
     "end C;";
 
@@ -680,7 +680,7 @@ const char* kPlainTwoToArrayString =
     "    src.Add(\"aa\"); src.Add(\"bbb\"); "
     "    var a := src.Where(lambda(s) => s.Length > 0).ToArray(); "
     "    var b := src.Where(lambda(s) => s.Length > 0).ToArray(); "
-    "    return a.Length + b.Length; "
+    "    return a.Count + b.Count; "
     "  end Main; "
     "end C;";
 
@@ -703,7 +703,7 @@ const char* kReturnedToArrayLocal =
     "  end MakeArr; "
     "  public static method Main(): int "
     "    using var r := C.MakeArr(); "
-    "    return r.Length; "
+    "    return r.Count; "
     "  end Main; "
     "end C;";
 
@@ -721,7 +721,7 @@ const char* kUsingVarToArrayUntouched =
     "    src.Add(1); src.Add(2); src.Add(3); "
     "    using var a := src.Where(lambda(n) => n > 0).ToArray(); "
     "    using var b := src.Where(lambda(n) => n > 0).ToArray(); "
-    "    return a.Length + b.Length; "
+    "    return a.Count + b.Count; "
     "  end Main; "
     "end C;";
 
@@ -819,7 +819,7 @@ const char* kChainToArraySorted =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var a := s.Where(lambda(n) => n > 0).ToArray().Sorted(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -835,7 +835,7 @@ const char* kChainToArrayReversed =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var a := s.Where(lambda(n) => n > 0).ToArray().Reversed(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -853,7 +853,7 @@ const char* kChainDoubleSortedReversed =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var a := s.ToArray().Sorted().Reversed(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -869,7 +869,7 @@ const char* kChainToArraySortedComparer =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var a := s.ToArray().Sorted(lambda(x, y) => x - y); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -887,7 +887,7 @@ const char* kChainToArraySortedString =
     "    using var s := new Array<string>(); "
     "    s.Add(\"banana\"); s.Add(\"apple\"); s.Add(\"cherry\"); "
     "    var a := s.Where(lambda(x) => x.Length > 0).ToArray().Sorted(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -907,7 +907,7 @@ const char* kNamedLocalInputSorted =
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var t := s.Where(lambda(n) => n > 0).ToArray(); "
     "    var a := t.Sorted(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -925,7 +925,7 @@ const char* kPlainNamedReceiverSorted =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var a := s.Sorted(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -943,7 +943,7 @@ const char* kUsingVarChainSorted =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    using var a := s.ToArray().Sorted(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end C;";
 
@@ -985,7 +985,7 @@ const char* kOwnedFoldSorted =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var a := P.Fold(s).Sorted(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end P;";
 
@@ -1003,7 +1003,7 @@ const char* kOwnedFoldReversed =
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    var a := P.Fold(s).Reversed(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end P;";
 
@@ -1022,7 +1022,7 @@ const char* kOwnedFoldLength =
     "  public static method Main(): int "
     "    using var s := new Array<int>(); "
     "    s.Add(3); s.Add(1); s.Add(2); "
-    "    var n := P.Fold(s).Length; "
+    "    var n := P.Fold(s).Count; "
     "    return n; "
     "  end Main; "
     "end P;";
@@ -1074,7 +1074,7 @@ const char* kOwnedElemFoldReversed =
     "    using var view := new Array<Cell>(); "
     "    view.Add(owners.Get(0)); view.Add(owners.Get(1)); view.Add(owners.Get(2)); "
     "    using var rev := P.Fold(view).Reversed(); "
-    "    return rev.Length; "
+    "    return rev.Count; "
     "  end Run; "
     "  public static method Main(): int "
     "    var v := P.Run(); "
@@ -1100,7 +1100,7 @@ const char* kOwnedFoldBoundUsingVar =
     "    s.Add(3); s.Add(1); s.Add(2); "
     "    using var f := P.Fold(s); "
     "    var a := f.Sorted(); "
-    "    return a.Length; "
+    "    return a.Count; "
     "  end Main; "
     "end P;";
 

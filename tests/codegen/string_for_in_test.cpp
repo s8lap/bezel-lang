@@ -135,7 +135,7 @@ BEZEL_TEST(codegen_string_linq_1220, string_toarray_length) {
         "module M; class C public static method Main(): int "
         "  var s := \"ABC\"; "
         "  using var a := s.ToArray(); "
-        "  return a.Length; "
+        "  return a.Count; "
         "end Main; end C;"), 3);
 }
 

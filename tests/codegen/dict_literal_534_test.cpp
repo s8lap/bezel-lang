@@ -142,7 +142,7 @@ BEZEL_TEST(dict_literal_534, array_literal_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a: Array<int> := [10, 20, 30]; "
-        "  return int(a.Length = 3 and a.Get(0) = 10 and a.Get(2) = 30); "
+        "  return int(a.Count = 3 and a.Get(0) = 10 and a.Get(2) = 30); "
         "end Main; end C;"), 1);
 }
 
@@ -203,7 +203,7 @@ BEZEL_TEST(dict_literal_534, empty_array_literal_still_array_r39) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a: Array<int> := []; a.Add(9); "
-        "  return a.Get(0) + a.Length; "  // 9 + 1
+        "  return a.Get(0) + a.Count; "  // 9 + 1
         "end Main; end C;"), 10);
 }
 

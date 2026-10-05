@@ -184,7 +184,7 @@ BEZEL_TEST(codegen_encoding, utf8_getbytes_ascii_length_spec_3_2) {
         "module M; class C public static method Main(): int "
         "  var s := \"Hello\"; "
         "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;", 5);
 }
 
@@ -197,7 +197,7 @@ BEZEL_TEST(codegen_encoding, invalid_singleton_name_rejected_984) {
     BEZEL_EXPECT_TRUE(compileFails(
         "module M; class C public static method Main(): int "
         "  var b: Array<byte> := Encoding.Utf8.GetBytes(\"hi\"); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;"));
 }
 
@@ -207,7 +207,7 @@ BEZEL_TEST(codegen_encoding, valid_singleton_name_accepted_984) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  using var b: Array<byte> := Encoding.UTF8.GetBytes(\"hi\"); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;", 2);
 }
 
@@ -238,7 +238,7 @@ BEZEL_TEST(codegen_encoding, utf8_getbytes_empty_spec_3_2) {
         "module M; class C public static method Main(): int "
         "  var s := \"\"; "
         "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;", 0);
 }
 
@@ -249,7 +249,7 @@ BEZEL_TEST(codegen_encoding, utf8_getbytes_multibyte_length_spec_3_2) {
         "module M; class C public static method Main(): int "
         "  var s := \"caf\\u00e9\"; "
         "  using var b: Array<byte> := Encoding.UTF8.GetBytes(s); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;", 5);
 }
 

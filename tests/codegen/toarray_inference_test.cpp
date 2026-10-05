@@ -53,7 +53,7 @@ BEZEL_TEST(toarray_inference, int_elem_length_spec_14_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  using var b := a.Where(lambda(x) => x > 2).ToArray(); "
-        "  return b.Length; "  // 2 elements > 2: {3,4}
+        "  return b.Count; "  // 2 elements > 2: {3,4}
         "end Main; end C;"), 2);
 }
 
@@ -87,7 +87,7 @@ BEZEL_TEST(toarray_inference, record_elem_length_spec_14_5) {
         "  using var a := new Array<R>(); "
         "  a.Add(new R(1, 2)); a.Add(new R(3, 4)); a.Add(new R(5, 6)); "
         "  using var b := a.Where(lambda(r) => r.X > 1).ToArray(); "
-        "  return b.Length; "  // 2 elements: (3,4) and (5,6)
+        "  return b.Count; "  // 2 elements: (3,4) and (5,6)
         "end Main; end C;"), 2);
 }
 
@@ -122,7 +122,7 @@ BEZEL_TEST(toarray_inference, chain_skip_take_length_spec_14_5) {
         "  using var a := new Array<int>(); "
         "  a.Add(10); a.Add(20); a.Add(30); a.Add(40); a.Add(50); "
         "  using var b := a.Skip(1).Take(3).ToArray(); "
-        "  return b.Length; "  // 3 elements: 20,30,40
+        "  return b.Count; "  // 3 elements: 20,30,40
         "end Main; end C;"), 3);
 }
 
@@ -181,7 +181,7 @@ BEZEL_TEST(toarray_inference, string_elem_spec_14_5) {
         "  using var a := new Array<string>(); "
         "  a.Add(\"hello\"); a.Add(\"world\"); a.Add(\"hi\"); "
         "  using var b := a.Where(lambda(s) => s.Length > 3).ToArray(); "
-        "  return b.Length; "  // "hello" and "world" — 2 elements
+        "  return b.Count; "  // "hello" and "world" — 2 elements
         "end Main; end C;"), 2);
 }
 
