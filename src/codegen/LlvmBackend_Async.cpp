@@ -1936,6 +1936,13 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // ReturnStmt handlers (gated on smKind_ == Await) interrupt it to emit
         // the suspend transitions / task completion.
         builder_.SetInsertPoint(stateBBs[0]);
+        // fix-forward #5410 (§30.1 / §4.6 / §28.9, v0.313): release the borrowed
+        // string parameters at the START of resume, before any body statement can
+        // overwrite a frame field. Without this, `s := s + "-x"` clobbers the frame
+        // field before emitAsyncComplete/emitAsyncFaultBoundary runs, and the release
+        // reads the NEW string instead of the original borrowed value — one
+        // reference leaks per resume activation.
+        emitAsyncStringParamRelease(smSelf_);
         disposeStack_.emplace_back();
         bool term = lowerBody(*ci.stmts);
         // §28.3 / §30.1 (#938): on NORMAL fall-off, dispose the async body's
@@ -2671,6 +2678,10 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
 
         // Emit the body from state 0.
         builder_.SetInsertPoint(stateBBs[0]);
+        // fix-forward #5410 (§30.1 / §30.6 / §4.6 / §28.9, v0.313): same fix as
+        // the named async method: release borrowed string parameters at the START
+        // of resume, before any body statement can overwrite a frame field.
+        emitAsyncStringParamRelease(smSelf_);
         disposeStack_.emplace_back();
         if (lam.exprBody) {
             // §30.6: an expression-bodied async lambda's value completes the
@@ -4150,6 +4161,10 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         }
 
         builder_.SetInsertPoint(stateBBs[0]);
+        // fix-forward #5410 (§29.1 / §30.1 / §4.6 / §28.9, v0.313): same fix as
+        // the named async method: release borrowed string parameters at the START
+        // of resume, before any body statement can overwrite a frame field.
+        emitAsyncStringParamRelease(smSelf_);
         disposeStack_.emplace_back();
         bool term = lowerBody(*ci.stmts);
         if (!term && !builder_.GetInsertBlock()->getTerminator()) {
