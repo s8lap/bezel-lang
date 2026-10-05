@@ -1009,8 +1009,40 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // catch is still gated for the MOVED-FROM half — we just
             // removed the cross-check on the DISPOSED half which was an
             // over-rejection.
+            //
+            // fix #5427 (§28.3 K7.4 / K1.4, §28.3 *Auto-drop (affine)*,
+            // v0.313): the blanket rejection above is sound for a plain `var`
+            // LOCAL, whose slot is deliberately NOT nulled at a move (to keep
+            // borrow-after-move legal, e.g. `new T(move n, n)`), so a
+            // null-guarded drop cannot skip the moved path. It is NOT sound
+            // as a blanket rule for the `owned` PARAMETER consumed by an owned
+            // FIELD STORE, because codegen DOES null that slot at the store
+            // (#5218 / #5274's `nullTransferredOwnedLocalSlot`, gated on
+            // `isOwnedFieldStoreTarget`), and the method-end `dynamicDispose`
+            // auto-drop is itself null-guarded. K7.4 states the consequence
+            // for exactly this join: "owned ⊓ moved-from ... = **maybe-consumed**
+            // — unreadable after the join, no flow around a back edge into a
+            // use; **scope-end disposal per-path**", and §28.3 *Auto-drop*
+            // derives the mechanism: "a transferred value [is] in moved-from
+            // state so the scope-end disposal skips it". So the moved path
+            // skips and the un-moved path disposes — exactly once.
+            //
+            // The admission is deliberately NARROW — it requires the
+            // ownership pass to have recorded that this parameter's ONLY
+            // discharge shapes are slot-nulling ones
+            // (`ownedParamTransfersNullSlot`), a fact recorded at the
+            // owned-field store and at the `owned`-argument transfer. A
+            // parameter discharged by any shape that does NOT null the slot
+            // (a plain `move v` binding transfer, an explicit `.Dispose()`
+            // combination, a collection Add of a non-nulling form) fails that
+            // check and keeps the §28.3 reject, so the double-free the blanket
+            // rule was written to catch is still caught. The `local`-side gate
+            // is unchanged.
+            // // per §28.3 K7.4/K1.4, §28.8 K3.1, v0.313, #5427
+            const bool ownedParamPerPathAutoDrop =
+                ownedParamTransfersNullSlot(sym);
             if (!isAsync_ && !sawYield_ && !isDestructor_ &&
-                !st.maybeConsumed &&
+                (!st.maybeConsumed || ownedParamPerPathAutoDrop) &&
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {

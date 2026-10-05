@@ -1439,7 +1439,13 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                     if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
                         reportMissingOwnedMarker(id->name, id->span.begin,
                                                  /*withBang=*/argValue != a.value.get());
-                    markMovedByName(id->name, id->span.begin, id);
+                    // fix #5427 (§28.3 K7.4, v0.313): an `owned`-ARGUMENT transfer of a
+                    // bare owned parameter nulls the caller's slot (codegen #1918's
+                    // `transferredOwnedArgSlots` in buildOrderedArgs), so the same
+                    // per-path reading as the owned-field store applies. // per §28.3 K7.4, #5427
+                    markMovedByName(id->name, id->span.begin, id,
+                                    /*nullsSourceSlot=*/dynamic_cast<sema::ParameterSymbol*>(
+                                        ctx_.exprSymbol(*id)) != nullptr);
                     ++pos; continue;
                 }
                 if (exprIsOwnedFieldRead(*a.value)) {
@@ -1770,7 +1776,13 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
                 if (a.modifier != "owned" && isNamedOwnedBinding(*a.value))
                     reportMissingOwnedMarker(id->name, id->span.begin,
                                              /*withBang=*/argValue != a.value.get());
-                markMovedByName(id->name, id->span.begin, id);
+                // fix #5427 (§28.3 K7.4, v0.313): an `owned`-ARGUMENT transfer of a
+                    // bare owned parameter nulls the caller's slot (codegen #1918's
+                    // `transferredOwnedArgSlots` in buildOrderedArgs), so the same
+                    // per-path reading as the owned-field store applies. // per §28.3 K7.4, #5427
+                    markMovedByName(id->name, id->span.begin, id,
+                                    /*nullsSourceSlot=*/dynamic_cast<sema::ParameterSymbol*>(
+                                        ctx_.exprSymbol(*id)) != nullptr);
                 ++pos; continue;
             }
             if (exprIsOwnedFieldRead(*a.value)) {
@@ -13018,7 +13030,8 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
 }
 
 void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc,
-                                      const ast::IdentifierExpr* id) {
+                                      const ast::IdentifierExpr* id,
+                                      bool nullsSourceSlot) {
     // §28.14 (v0.175): a captured source frozen by a scoped-callback admission
     // may not be moved from until the bounding scope exits.
     checkScopedFreeze(name, loc, "move from", id ? ctx_.exprSymbol(*id) : nullptr);
@@ -13154,6 +13167,24 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc,
     // §29.8 (#945): record the discharge so the iterator owned-param auto-dispose
     // check skips a parameter the body moves out on some path.
     if (stKey) everDischarged_.insert(stKey);
+    // fix #5427 (§28.3 K7.4, v0.313): record, per owned PARAMETER, whether
+    // EVERY discharge shape seen for it nulls the source slot — the fact that
+    // makes the null-guarded §28.3 method-end auto-drop per-path (K7.4:
+    // "scope-end disposal per-path") rather than a double-free. `nullsSourceSlot`
+    // is the caller-side promise and is FALSE at every shape but the owned-field
+    // store and the `owned`-argument transfer (both null in codegen: #5218 /
+    // #5274's `nullTransferredOwnedLocalSlot` under `isOwnedFieldStoreTarget`,
+    // and #1918's `transferredOwnedArgSlots` in buildOrderedArgs). A single
+    // non-nulling shape permanently records the parameter in
+    // `ownedParamNonNullingTransferSyms_` — monotone, so fixpoint-safe — and
+    // the end-of-method gate then keeps the §28.3 reject for it.
+    // // per §28.3 K7.4, v0.313, #5427
+    if (stKey && dynamic_cast<sema::ParameterSymbol*>(stKey)) {
+        if (nullsSourceSlot)
+            ownedParamFieldStoreTransfers_.insert(stKey);
+        else
+            ownedParamNonNullingTransferSyms_.insert(stKey);
+    }
     // §28.3 (#1900): a move after a restore re-poisons — see the matching
     // comment in markDisposedByName above.
     if (stKey) definitelyRestoredLocals_.erase(stKey);
@@ -15909,12 +15940,25 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
     // A bare owned-LOCAL read moves out of the local, leaving it moved-from
     // (markMovedByName also correctly rejects moving out of a `using var`,
     // which is scope-bound). // per §28.8, K3.1, v0.313, #5326
-    sema::Symbol* sym = ctx_.exprSymbol(*id);
-    if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
-        markMovedByName(id->name, id->span.begin, id);
-    } else {
-        markMovedByName(id->name, id->span.begin, id);
-    }
+    //
+    // fix #5427 (§28.3 K7.4 / K1.4, §28.3 *Auto-drop (affine)*, v0.313): the
+    // third argument records that THIS transfer nulls the parameter's slot.
+    // Codegen does, at exactly this shape: #5218 / #5274's
+    // `nullTransferredOwnedLocalSlot` under `isOwnedFieldStoreTarget` (which
+    // covers every owned-field kind the disposer releases, including the
+    // vtable-less builtins #5274 added). K7.4 states the consequence of the
+    // conditional form verbatim — "owned ⊓ moved-from ... = maybe-consumed ...
+    // **scope-end disposal per-path**" — and §28.3 *Auto-drop* derives the
+    // mechanism: "a transferred value [is left] in moved-from state so the
+    // scope-end disposal skips it". So when the store sits on only SOME path,
+    // the moved path skips the null-guarded method-end drop and the un-moved
+    // path disposes it, exactly once. That is what the #5218 slot-null exists
+    // to make true, and it is why the end-of-method gate's blanket
+    // `!st.maybeConsumed` over-rejects this shape; see the gate's own comment.
+    // // per §28.8, K3.1, §28.3 K7.4/K1.4, v0.313, #5326, #5427
+    markMovedByName(id->name, id->span.begin, id,
+                    /*nullsSourceSlot=*/dynamic_cast<sema::ParameterSymbol*>(
+                        ctx_.exprSymbol(*id)) != nullptr);
 }
 
 // ===========================================================================

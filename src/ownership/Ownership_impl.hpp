@@ -919,6 +919,34 @@ private:
     // inner scope was popped before the outer throw unwinds) → leak. Monotone
     // (grows only) like `everDischarged_`, so it is fixpoint-safe.
     std::unordered_set<sema::Symbol*> everOwnedPlainLocals_;
+    // fix #5427 (§28.3 K7.4 / K1.4, §28.3 *Auto-drop (affine)*, v0.313): the
+    // `owned` PARAMETERS whose discharge shapes have ALL been recorded as
+    // SLOT-NULLING transfers, and those that have NOT. A bare owned parameter
+    // stored into an `owned` field is K3.1's transfer; codegen nulls the
+    // parameter's slot at that store (#5218 / #5274's
+    // `nullTransferredOwnedLocalSlot`, gated on `isOwnedFieldStoreTarget`), and
+    // an `owned` ARGUMENT transfer nulls it too (#1918's
+    // `transferredOwnedArgSlots` in buildOrderedArgs). Each is therefore exactly
+    // the case K7.4 admits: "owned ⊓ moved-from ... = maybe-consumed ...
+    // **scope-end disposal per-path**" — the null-guarded method-end
+    // `dynamicDispose` skips the moved path and disposes the un-moved one.
+    //
+    // DENY BY DEFAULT (the reason `ownedParamTransfersNullSlot` is a pair and
+    // not a single set): any discharge shape that does NOT null the slot must
+    // record the parameter in `ownedParamNonNullingTransferSyms_`, so a
+    // parameter with a mixed discharge history keeps the §28.3 reject rather
+    // than being admitted on the strength of one nulling store. Monotone (grows
+    // only), so it is fixpoint-safe under the O3b suppress/re-diagnose passes.
+    std::unordered_set<sema::Symbol*> ownedParamFieldStoreTransfers_;
+    std::unordered_set<sema::Symbol*> ownedParamNonNullingTransferSyms_;
+    // The gate read by the end-of-method auto-drop. True only for an `owned`
+    // parameter with at least one slot-nulling transfer recorded AND none
+    // recorded as non-nulling — the exact precondition under which the
+    // null-guarded per-path disposal is exactly-once.
+    bool ownedParamTransfersNullSlot(sema::Symbol* sym) const {
+        if (ownedParamNonNullingTransferSyms_.count(sym)) return false;
+        return ownedParamFieldStoreTransfers_.count(sym) != 0;
+    }
     // §29.2 / §28.3 v0.157 (#1329): every owned iteration variable seeded by
     // seedOwnedIterVar for the CURRENT method. Used by the post-endState
     // break-body check: a seeded iter var absent from endState AND never
@@ -4313,8 +4341,21 @@ private:
     void markExplicitDisposeReclaimIfReassignedBorrow(
         const ast::IdentifierExpr& id);
 
+    // `nullsSourceSlot` (fix #5427, §28.3 K7.4, v0.313) is the caller-side
+    // promise that codegen NULLS the source's slot at this transfer, which is
+    // what makes the null-guarded §28.3 method-end auto-drop per-path (K7.4:
+    // "scope-end disposal per-path") instead of a double-free. Only two shapes
+    // may pass true — the owned-FIELD store
+    // (handleOwnedFieldAssignment, #5218 / #5274's
+    // `nullTransferredOwnedLocalSlot` under `isOwnedFieldStoreTarget`) and the
+    // `owned`-ARGUMENT transfer (#1918's `transferredOwnedArgSlots` in
+    // buildOrderedArgs). It only matters for a PARAMETER source; a local's
+    // K7.4 treatment is unchanged. DENY BY DEFAULT: every other call site leaves
+    // it false, so a parameter with any non-nulling discharge keeps the §28.3
+    // reject rather than being admitted on the strength of one nulling store.
     void markMovedByName(std::string_view name, SourceLocation loc,
-                         const ast::IdentifierExpr* id = nullptr);
+                         const ast::IdentifierExpr* id = nullptr,
+                         bool nullsSourceSlot = false);
 
     // §22.3 (v0.169, #1348): true when `e` is a NAMED OWNED BINDING — a bare
     // identifier (other than `this`/`base`) resolving to a tracked owned local
