@@ -29,7 +29,8 @@
 #              only, see scripts/pick_issues.sh). FLAG: banked >= --target.
 #   lanes      active lane count from scripts/lane_status.sh.
 #   stale      dry-run count of stale dev processes/waiters (scripts/reap_stale.sh).
-#              INFO, never FLAG: a non-zero count just means "reap_stale.sh --kill".
+#              INFO, never FLAG and never an ACTION line: a non-zero count is
+#              NORMAL between sweeps and just means "reap_stale.sh --kill".
 #
 # Env overrides (for tests and other machines):
 #   BEZEL_GATE_PIDFILE, BEZEL_GATE_DONEFILE   gate markers (as gate_and_push.sh)
@@ -187,11 +188,16 @@ probe_stale() {
   local st="INFO"
   # A live gate makes every long process legitimate; the row is noise then.
   [ "$GATE_RUNNING" = 1 ] && { row stale INFO "gate running — reaping suppressed"; return 0; }
-  if [ "$n" -gt 0 ]; then
-    st="INFO"
-    ACTIONS+=("stale: $n stale dev process(es) — scripts/reap_stale.sh --kill (dry-run is the default; PID-only, never name-based)")
-  fi
-  row stale "$st" "$n stale dev process(es) (scripts/reap_stale.sh --kill to reap)"
+  # INFO means INFO: the row REPORTS a non-zero count and deliberately does not
+  # push an ACTION. A stale-process count is expected between sweeps — it means
+  # "run reap_stale.sh --kill", not "something is wrong" — so escalating it to
+  # an ACTION would put a line in every heartbeat's output on any machine that
+  # happens to have a long build running. scripts/gate/tests/test_run_status.py's
+  # `test_quiet_sandbox_prints_ok_gate_row_and_no_actions` pins exactly that: a
+  # quiet sandbox prints no `ACTION:` line, and this row was the one that broke
+  # it. What IS worth acting on is a count that GROWS across two consecutive
+  # heartbeats, which is why this is a count and not a boolean.
+  row stale "$st" "$n stale dev process(es) (scripts/reap_stale.sh --kill to reap; dry-run is the default, PID-only, never while a gate is live)"
 }
 
 echo "run_status $(date '+%F %T')"
