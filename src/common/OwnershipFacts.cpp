@@ -629,6 +629,11 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
     // isOutOwnedArgPosition, already wired for OwningSet.TryTake.
     if (nm == "Take" && rcn == "OwningSet")
         return true;
+    // fix #5361 / stdlib §4.10 (v0.259): OwningSet<T>.Pop — same as Take
+    // (renamed per stdlib §4.10). Kept alongside Take until #5362's sema
+    // rejection of Take lands in this branch.
+    if (nm == "Pop" && rcn == "OwningSet")
+        return true;
     return false;
 }
 

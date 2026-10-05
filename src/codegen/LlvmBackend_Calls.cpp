@@ -6686,6 +6686,128 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                  ? recvTy->genericArgs[0] : nullptr);
             return phi2;
         }
+        // fix #5361 / stdlib §4.10 (v0.259): OwningSet<T>.Pop(query: T): owned T
+        // — same lowering as Take above (stdlib §4.10 renamed Take to Pop).
+        // NOTE: the pre-rename Take handler is kept above for backward compatibility
+        // until #5362's sema rejection lands in this branch.
+        if (m == "Pop" && call.args.size() == 1 && call.args[0].value &&
+            isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
+            llvm::Value* query = lowerExpr(*call.args[0].value);
+            if (!query) return nullptr;
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "pop.len");
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "pop.c", currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "pop.b", currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "pop.f", currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "pop.n", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "pop.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot, "pop.i");
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* ep = builder_.CreateCall(
+                ptrFn, {recv, idx, builder_.getInt64(esz)}, "pop.ep");
+            llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "pop.ex");
+            llvm::Value* eq = emitRemoveElementEquality(
+                existing, query, recvTy->genericArgs[0], /*elemIsClass=*/true);
+            if (!eq) return nullptr;
+            builder_.CreateCondBr(eq, foundBB, nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(foundBB);
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            auto* foundPhi = builder_.CreatePHI(i1(), 2, "pop.found");
+            foundPhi->addIncoming(builder_.getTrue(), foundBB);
+            foundPhi->addIncoming(builder_.getFalse(), condBB);
+            auto* idxPhi = builder_.CreatePHI(i64(), 2, "pop.idxphi");
+            idxPhi->addIncoming(idx, foundBB);
+            idxPhi->addIncoming(builder_.getInt64(0), condBB);
+            auto* valPhi = builder_.CreatePHI(ptrTy(), 2, "pop.val");
+            valPhi->addIncoming(existing, foundBB);
+            valPhi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), condBB);
+            llvm::Value* notFound = builder_.CreateNot(foundPhi, "pop.notfound");
+            emitGuardThrow(notFound, "InvalidOperationException");
+            auto* rmFn = declareC("bz_array_remove_at",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), i64()});
+            builder_.CreateCall(rmFn, {recv, idxPhi, builder_.getInt64(esz)});
+            return valPhi;
+        }
+        // fix #5361 / stdlib §4.10 (v0.259): OwningSet<T>.TryPop(query: T, out owned
+        // removed: T?): bool — same lowering as TryTake above (renamed per stdlib §4.10).
+        // NOTE: the pre-rename TryTake handler is kept above for backward compatibility
+        // until #5362's sema rejection lands in this branch.
+        if (m == "TryPop" && call.args.size() == 2 &&
+            call.args[0].value &&
+            (call.args[1].value || call.args[1].isDiscard) &&
+            isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
+            llvm::Value* query = lowerExpr(*call.args[0].value);
+            if (!query) return nullptr;
+            llvm::Type* outTy = nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveBuiltinOutArg(
+                call.args[1], ptrTy(), outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
+            storeTryOutNull(outAddr, outTy);
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv}, "tryp.len");
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB  = llvm::BasicBlock::Create(llvm_, "tryp.c",    currentFn_);
+            auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "tryp.b",    currentFn_);
+            auto* foundBB = llvm::BasicBlock::Create(llvm_, "tryp.f",    currentFn_);
+            auto* nextBB  = llvm::BasicBlock::Create(llvm_, "tryp.next", currentFn_);
+            auto* endBB   = llvm::BasicBlock::Create(llvm_, "tryp.end",  currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot, "tryp.i");
+            builder_.CreateCondBr(
+                builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* ep = builder_.CreateCall(
+                ptrFn, {recv, idx, builder_.getInt64(esz)}, "tryp.ep");
+            llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "tryp.ex");
+            llvm::Value* eq = emitRemoveElementEquality(
+                existing, query, recvTy->genericArgs[0], /*elemIsClass=*/true);
+            if (!eq) return nullptr;
+            builder_.CreateCondBr(eq, foundBB, nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(foundBB);
+            {
+                auto* rmFn = declareC("bz_array_remove_at",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), i64()});
+                builder_.CreateCall(rmFn, {recv, idx, builder_.getInt64(esz)});
+                storeTryOutValue(outAddr, outTy, existing, /*isValTy=*/false);
+            }
+            llvm::BasicBlock* foundEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+            auto* phi2 = builder_.CreatePHI(i1(), 2, "tryp.r");
+            phi2->addIncoming(builder_.getTrue(), foundEnd);
+            phi2->addIncoming(builder_.getFalse(), condBB);
+            if (call.args[1].isDiscard)
+                disposeDiscardedOwnedOut(
+                    outAddr, recvTy && !recvTy->genericArgs.empty()
+                                 ? recvTy->genericArgs[0] : nullptr);
+            return phi2;
+        }
         // per §4.5: .Insert(index, item) — insert at index, shifting up. For an
         // OwningArray<T> the item is `owned` (already moved in by the caller);
         // there is no element to dispose (a fresh slot is created, not a

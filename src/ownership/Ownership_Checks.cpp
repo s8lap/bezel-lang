@@ -13622,6 +13622,10 @@ bool MethodOwnership::builtinOutOwnedArg(const ast::Expr* callee,
         (m == "TryPopFirst" || m == "TryPopLast")) return argPos == 0;
     // OwningSet<T>.TryTake(query, out owned removed: T?) — out-owned at arg 1.
     if (cn == "OwningSet"    && m == "TryTake")     return argPos == 1;
+    // fix #5361 / stdlib §4.10 (v0.259): OwningSet<T>.TryPop — same as TryTake
+    // (renamed per stdlib §4.10). Kept alongside TryTake until #5362's sema
+    // rejection of TryTake lands in this branch.
+    if (cn == "OwningSet"    && m == "TryPop")     return argPos == 1;
     // OwningDictionary<K,V>.TryPopValue(key, out owned value: V) — arg 1.
     if (cn == "OwningDictionary" && m == "TryPopValue") return argPos == 1;
     // Weak<T>.TryUpgrade(out owned s: Shared<T>?) — arg 0 (stdlib §2.16). The
