@@ -25,5 +25,18 @@
 # gtest programs are NOT measured (JitResult::diagnostics is
 # REJECT-only; see scripts/check_vacuous_tests.py for the same
 # coverage caveat, and feedback-run-aot-discards-stderr-on-
-# success for the gtest blind spot).
-total_internal_lines = 82
+# success for the gtest blind spot).#
+# 2026-10-06 banking 82 -> 86 (R27, integrator). NOT a new silent-wrong-code
+# emitter: the +4 is entirely NEW LIT COVERAGE of #2961's PRE-EXISTING pair of
+# assignment-RHS degrade sites. Commit 5d7e6313 ("fix-forward #5327:
+# re-record the #2961 degrades the diagnostic split into four") added the
+# companion file tests/lit/assignment_rhs_lowering_fallback_permissive_2961.bzl,
+# which pins the `else` (undecorated) arm of #5327's split that previously had
+# no lit file of its own. That file emits exactly 4 `internal:` lines; it is the
+# ONLY file added across the 19 commits since the count was banked at 82, and
+# 82 + 4 = 86. The emit sites are pre-existing -- #5327's `else` branch keeps
+# #2961's ORIGINAL text verbatim. What changed is that a branch of an existing
+# emitter is now MEASURED, which is the ratchet working as intended: the split
+# could previously have lost its `else` arm silently.
+
+total_internal_lines = 86
