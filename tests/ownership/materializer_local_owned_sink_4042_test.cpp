@@ -149,7 +149,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    seq.Add(3); seq.Add(1); seq.Add(2); "
         "    using var w := new W(); "
         "    using var r := w.Sort(seq); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end Main;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -172,7 +172,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    seq.Add(3); seq.Add(1); seq.Add(2); "
         "    using var w := new W(); "
         "    using var r := w.Sort(seq); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end Main;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -203,7 +203,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    var total := 0; "
         "    for var i in 0..300 do "
         "      using var r := F(seq); "
-        "      total := total + r.Length; "
+        "      total := total + r.Count; "
         "    end for; "
         "    return total mod 251; "
         "  end Main; "
@@ -228,7 +228,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    var total := 0; "
         "    for var i in 0..300 do "
         "      using var r := F(seq); "
-        "      total := total + r.Length; "
+        "      total := total + r.Count; "
         "    end for; "
         "    return total mod 251; "
         "  end Main; "
@@ -257,7 +257,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    var total := 0; "
         "    for var i in 0..300 do "
         "      using var h := new Holder(seq); "
-        "      total := total + h.Data.Length; "
+        "      total := total + h.Data.Count; "
         "    end for; "
         "    return total mod 251; "
         "  end Main; "
@@ -274,7 +274,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "class Sink "
         "  public static method Consume(owned x: Array<int>): int "
         "    using var x2 := owned x; "
-        "    return x2.Length; "
+        "    return x2.Count; "
         "  end Consume; "
         "end Sink; "
         "class C "
@@ -356,7 +356,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042, grid_split_return_stdlib_9_6) {
         "  end F; "
         "  public static method Main(): int "
         "    using var r := F(\"a,b,c\"); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -373,7 +373,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042, grid_getbytes_return_stdlib_7) {
         "  end F; "
         "  public static method Main(): int "
         "    using var r := F(\"abc\"); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -406,7 +406,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "  end F; "
         "  public static method Main(): int "
         "    using var r := F(\"abc\"); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -434,7 +434,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    using var seq := new Array<Elem>(); "
         "    seq.Add(e1); seq.Add(e2); "
         "    using var r := F(seq); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -459,7 +459,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    using var seq := new Array<Elem>(); "
         "    seq.Add(e1); seq.Add(e2); "
         "    using var r := F(seq); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -494,7 +494,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    using var seq := new Array<int>(); "
         "    seq.Add(3); seq.Add(1); seq.Add(2); "
         "    using var r := F(seq); "
-        "    return r.Length; "
+        "    return r.Count; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(jr.ran);
@@ -694,7 +694,7 @@ BEZEL_TEST(materializer_local_owned_sink_4042,
         "    var total := 0; "
         "    for var i in 0..300 do "
         "      using var h := new Holder(seq); "
-        "      total := total + h.Data.Length + h.Other.Length; "
+        "      total := total + h.Data.Count + h.Other.Count; "
         "    end for; "
         "    return total mod 251; "
         "  end Main; "
