@@ -7606,6 +7606,28 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // non-producer arg, a non-empty modifier, or a non-function-typed formal
         // skips the release and the +1 simply leaks (the safe direction).
         std::vector<llvm::Value*> callBoundedClosures;
+        // fix #5347 (§27.6 / §28.3 / §28.9, v0.313): a bound-method thunk
+        // takes no borrowed-argument pin. The closure-call path builds its own
+        // argument list via direct `lowerExpr` calls and emits the call directly —
+        // it does NOT route through `buildOrderedArgs` and therefore never calls
+        // `emitBorrowedStringArgPins`. A borrowed `string` argument passed to
+        // such a call is UNPINNED: the callee's borrowed parameter receives a
+        // bare pointer with no retained reference to keep the caller's string
+        // alive. When the callee stores the borrowed param into a field and then
+        // displaces that field with a fresh string (orphaning the original), the
+        // caller's string is freed while the field still references it. A later
+        // read of that field's value hands a dangling pointer to
+        // `bz_string_to_utf8z` — a use-after-free confirmed at 200/200
+        // iterations on the issue's own repro.
+        //
+        // Emit the retain IMMEDIATELY after `lowerExpr` returns, BEFORE any
+        // `boxForTarget` coercion that may replace `v` with a boxed copy.  The
+        // retain must be on the pre-box value — the string the callee actually
+        // receives.  Pins are collected in `closureStringPins` in argument order
+        // (env_ptr at args[0], then user params at args[1+pi]), matching how
+        // `releaseBorrowedStringArgPins` releases them.  The post-call release is
+        // installed below after the `CreateCall`.
+        std::vector<llvm::Value*> closureStringPins;
         for (std::size_t pi = 0; pi < call.args.size(); ++pi) {
             const auto& a = call.args[pi];
             if (!a.value) return nullptr;
@@ -7645,6 +7667,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 }
             }
             llvm::Value* v = lowerExpr(*a.value);
+            // fix #5347: emit the borrowed-string pin BEFORE the unit rescue
+            // and boxing.  The retain must be on the value `lowerExpr` returned —
+            // `boxForTarget` may replace `v` with a boxed copy; the retain is
+            // still needed on the original string, which is what the callee receives
+            // when the formal is `string` (no boxing for string→string) or what
+            // is stored INSIDE the box when the formal is `object` (the box holds
+            // a +1 retain on the original, and our retain is the second reference).
+            if (pi < rt->funcParams.size() && rt->funcParams[pi].modifier.empty()) {
+                const auto& fp = rt->funcParams[pi];
+                const sema::TypeRef* pty = resolveTypeParamRef(fp.type);
+                if (isStringPinFormalType(pty)) {
+                    // Skip if the argument is a +1 producer or a string literal:
+                    // a +1 producer's own retain already covers the caller's
+                    // borrowed reference; a literal is static and needs no pin.
+                    if (!dynamic_cast<const ast::StringLiteralExpr*>(a.value.get()) &&
+                        !isPlusOneStringProducer(a.value.get())) {
+                        emitStringRetain(v);
+                        // Reserve a slot: post-call release walks closureStringPins
+                        // in order and matches by args position.  The actual
+                        // retained value (which may differ from args[1+pi] after
+                        // boxForTarget) is stored in closureStringPins so the
+                        // release hits the correct pointer.
+                        closureStringPins.push_back(v);
+                    }
+                }
+            }
             // fix #3137 / §4.7 / §27.1: the function-VALUE invoke path builds
             // its arguments in its own loop — NOT through `buildOrderedArgs`,
             // so it never reaches the `unitValueForTarget` / placeholder-byte
@@ -7979,6 +8027,15 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
         auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
         if (args.size() != allArgTys.size()) return nullptr;
+        // fix #5347: install the throw-path cleanup BEFORE `emitPendingCheck`.
+        // `emitPendingCheck` calls `unwindBB()` to set `call.unwind`'s branch
+        // target. By setting `unwindTarget_` to the cleanup block first,
+        // `call.unwind` will branch to cleanup, which releases pins then branches
+        // to the saved original `unwindTarget_`. This integrates the pin release
+        // INTO the throw chain rather than creating a parallel path.
+        llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
+        if (!closureStringPins.empty())
+            unwindTarget_ = stringPinArgUnwindCleanup(closureStringPins);
         // #719: a lambda body can `throw`; like a normal method call, propagate a
         // pending exception after the call instead of silently continuing with the
         // (default) result. Without this, `var fn := () => throw E(); var v := fn();`
@@ -7986,6 +8043,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // path when the exception slot is set; non-throwing calls just fall through.
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
         emitPendingCheck();
+        unwindTarget_ = savedClArgUnwind;
+        // fix-forward #5347: the normal-return release for the string pins.
+        // The throw-path release is emitted by `stringPinArgUnwindCleanup` via the
+        // throw chain (installed above).
+        if (!diverged_)
+            releaseBorrowedStringArgPins(closureStringPins);
         // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): drop the producer's +1
         // for every call-bounded closure argument on the NORMAL return edge.
         // Gated on `!diverged_` (mirror #429's `!diverged_` discipline at line
