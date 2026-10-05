@@ -11,6 +11,22 @@
 // program failed at compile time with a §7.11 diagnostic naming the
 // §7.4 / `??` / `!` remedies). The same fix-for-fix notes (issue numbers,
 // narrowing treatment) live in the individual block comments below.
+//
+// WHICH narrowing admits an operator (v0.315, #4930). §7.11 reads the
+// operand's STATIC type, and admits the ordinary operator only where §7.4
+// has narrowed the operand non-null. Two kinds of narrowing exist and only
+// ONE of them reaches this gate:
+//   • NULL-TEST narrowing (`if a <> null then a < b … end if`) ADMITS.
+//   • INIT-NARROWING (`var a: int? := 5;` — §6.6's definite-initialiser
+//     rule) does NOT. It proves a local non-null for MEMBER ACCESS only.
+// So `var a: int? := 3; a + 1` is a §7.11 compile error even though the
+// initialiser is a non-null literal, and rows written that way are stale.
+// Where a row exists to pin a CODEGEN lowering (a payload width, a decimal
+// runtime route, an unsigned compare) rather than the lift itself, the
+// spec-correct conversion is (a): respell with the null-test narrowing and
+// keep the row POSITIVE with its value asserted, so the lowering stays
+// covered. Conversion (b) — a REJECTION row — is used where the row's
+// subject IS the rule.
 
 
 #include "support/aot_support.hpp"
@@ -655,15 +671,28 @@ BEZEL_TEST(codegen_lifted_ops_486, int_eq_both_nonnull_unchanged_spec_8_4) {
         "var a: int? := 5; var b: int? := 5; return int(a = b);"), 1);
 }
 
-// #1044 / §5.1 / §7.11: lifted arithmetic and `??` on a SUB-i32 nullable
+// #1044 / §5.1 / §7.11: arithmetic and `??` on a SUB-i32 nullable
 // (byte?/sbyte?/short?/ushort?) crashed codegen — the payload (i8/i16) and the
 // int operand/default (i32) mismatched the result struct width (`insertvalue
 // i32 into {i8,i8}`) / the coalesce PHI. `byte? + int` promotes to `int?`
 // (§5.1), and a shift follows the left operand (`byte? << 1` → `byte?`); both
-// now build the right-width result. The null branch still propagates null.
+// now build the right-width result.
+//
+// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled as lifted
+// operators on a local initialised with a non-null literal
+// (`var a: byte? := 3; a + 1`), which is the RETIRED v0.130/v0.267 behaviour:
+// §7.11, v0.267 admits nothing at the operator, and #4930 established that
+// init-narrowing (§6.6) proves a local non-null for MEMBER ACCESS but not for
+// the §7.11 operator gate. Only NULL-TEST narrowing admits operators. The rows
+// are therefore respelled with the §7.4 null-test narrowing `if a <> null
+// then …` (the spec's own named remedy), which keeps them POSITIVE value rows
+// still exercising the same sub-i32 payload/result-width lowering — the defect
+// #1044 is about — while compiling under the current rule.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_plus_int_promotes_to_int) {
     BEZEL_EXPECT_EQ(run(
-        "var a: byte? := 3; var r: int? := a + 1; return int(r ?? 0);"), 4);
+        "var a: byte? := 3; var r: int? := 0; "
+        "if a <> null then r := a + 1; end if; "
+        "return int(r ?? 0);"), 4);
 }
 BEZEL_TEST(codegen_1044_subint_nullable, byte_coalesce_int_default) {
     BEZEL_EXPECT_TRUE(runs("var a: byte? := 3; return int(a ?? 9);"));
@@ -671,22 +700,39 @@ BEZEL_TEST(codegen_1044_subint_nullable, byte_coalesce_int_default) {
 BEZEL_TEST(codegen_1044_subint_nullable, byte_null_coalesce_int_default) {
     BEZEL_EXPECT_TRUE(runs("var a: byte? := null; return int(a ?? 9);"));
 }
+// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
+// see the suite header above.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_shl_follows_left) {
-    BEZEL_EXPECT_TRUE(runs("var a: byte? := 5; return int((a << 1) ?? 99);"));
+    BEZEL_EXPECT_TRUE(runs(
+        "var a: byte? := 5; var c: byte? := null; "
+        "if a <> null then c := a << 1; end if; "
+        "return int(c ?? 99);"));
 }
+// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
+// see the suite header above. `short * int` widens to `int` (§5.1), so the
+// narrowed result local is `int?`, which is the promotion #1044 pinned.
 BEZEL_TEST(codegen_1044_subint_nullable, short_mul_via_coalesce) {
-    BEZEL_EXPECT_TRUE(runs("var a: short? := 3; return int((a * 2) ?? 99);"));
+    BEZEL_EXPECT_TRUE(runs(
+        "var a: short? := 3; var c: int? := null; "
+        "if a <> null then c := a * 2; end if; "
+        "return int(c ?? 99);"));
 }
 // §7.11 (v0.286, #3298) — REJECTION: `a` is initialised with `null`, so §7.4
 // narrows nothing and the operand is genuinely nullable. Its siblings in this
-// suite keep their acceptance because a non-null literal initialiser DOES
-// narrow — which is the distinction the whole suite now turns on.
+// suite are respelled with an explicit null-test narrowing, which DOES admit
+// the operator (fix #4930, v0.315) — that is the distinction this suite turns
+// on. An initialiser alone, null or not, admits nothing.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_null_arith_rejected_3298) {
     BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: byte? := null; return int((a + 1) ?? 99);"));
 }
+// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
+// see the suite header above.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_bitand_via_coalesce) {
-    BEZEL_EXPECT_TRUE(runs("var a: byte? := 5; return int((a & 3) ?? 99);"));
+    BEZEL_EXPECT_TRUE(runs(
+        "var a: byte? := 5; var c: int? := null; "
+        "if a <> null then c := a & 3; end if; "
+        "return int(c ?? 99);"));
 }
 BEZEL_TEST(codegen_1044_subint_nullable, long_coalesce_int_default) {
     BEZEL_EXPECT_TRUE(runs("var a: long? := null; return int(a ?? 5);"));
@@ -721,53 +767,97 @@ BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_variable_int_default_null) {
         "var a: decimal? := null; var d: int := 7; return int(a ?? d);"));
 }
 
-// #1047 / §5.1 / §7.11: lifted decimal arithmetic with a mixed INTEGER operand
+// #1047 / §5.1 / §7.11: decimal arithmetic with a mixed INTEGER operand
 // (decimal? + int, or int + decimal?) must promote the int to a decimal struct
 // before the bz_decimal_* call. Previously the i32 was stored raw into a decimal
 // slot → a garbage decimal that faulted/overflowed at runtime (threw instead of
 // computing). decimal? + decimal? and the non-nullable decimal + int were fine.
+//
+// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled as lifted
+// operators on a local initialised with a non-null literal, which is the
+// RETIRED v0.130/v0.267 behaviour (§7.11, v0.267 admits nothing at the
+// operator; #4930 established that init-narrowing does not admit it either).
+// They are respelled with the §7.4 null-test narrowing `if a <> null then …` —
+// the spec's own named remedy — so they stay POSITIVE rows still exercising
+// the §4.4 decimal runtime route that #1047 is about, including the operand
+// order that decides which side promotes.
 BEZEL_TEST(codegen_1047_decimal_nullable, decimal_plus_int_present) {
-    BEZEL_EXPECT_TRUE(runs("var a: decimal? := 5; return int((a + 1) ?? 99);"));
+    BEZEL_EXPECT_TRUE(runs(
+        "var a: decimal? := 5; var c: decimal? := null; "
+        "if a <> null then c := a + 1; end if; "
+        "return int(c ?? 99);"));
 }
 BEZEL_TEST(codegen_1047_decimal_nullable, decimal_times_int) {
-    BEZEL_EXPECT_TRUE(runs("var a: decimal? := 5; return int((a * 2) ?? 99);"));
+    BEZEL_EXPECT_TRUE(runs(
+        "var a: decimal? := 5; var c: decimal? := null; "
+        "if a <> null then c := a * 2; end if; "
+        "return int(c ?? 99);"));
 }
 BEZEL_TEST(codegen_1047_decimal_nullable, decimal_minus_int) {
-    BEZEL_EXPECT_TRUE(runs("var a: decimal? := 5; return int((a - 1) ?? 99);"));
+    BEZEL_EXPECT_TRUE(runs(
+        "var a: decimal? := 5; var c: decimal? := null; "
+        "if a <> null then c := a - 1; end if; "
+        "return int(c ?? 99);"));
 }
 BEZEL_TEST(codegen_1047_decimal_nullable, int_plus_decimal_operand_order) {
-    BEZEL_EXPECT_TRUE(runs("var a: decimal? := 5; return int((1 + a) ?? 99);"));
+    BEZEL_EXPECT_TRUE(runs(
+        "var a: decimal? := 5; var c: decimal? := null; "
+        "if a <> null then c := 1 + a; end if; "
+        "return int(c ?? 99);"));
 }
 // §7.11 (v0.286, #3298) — REJECTION, same distinction as the `byte?` row
-// above. The other five rows in this suite keep their acceptance and are what
-// pins the §4.4 decimal RUNTIME ROUTING for a §7.4-narrowed `decimal?`: a
-// draft of #3298 read the operand's DECLARED `decimal?` type in codegen's
-// decimal block, skipped it, and emitted `add %bz.decimal, i32` (exit 141).
+// above. The other five rows in this suite keep their acceptance (respelled
+// with an explicit §7.4 null-test narrowing) and are what pins the §4.4
+// decimal RUNTIME ROUTING for a narrowed `decimal?`: a draft of #3298 read the
+// operand's DECLARED `decimal?` type in codegen's decimal block, skipped it,
+// and emitted `add %bz.decimal, i32` (exit 141).
 BEZEL_TEST(codegen_1047_decimal_nullable, decimal_null_plus_int_rejected_3298) {
     BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: decimal? := null; return int((a + 1) ?? 99);"));
 }
+// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
+// see the suite header above. Both operands are narrowed, so the `decimal? +
+// decimal?` route is still exercised and still observed as a VALUE.
 BEZEL_TEST(codegen_1047_decimal_nullable, decimal_nullable_both_unchanged) {
-    BEZEL_EXPECT_TRUE(runs(
-        "var a: decimal? := 5; var b: decimal? := 3; return int((a + b) ?? 99);"));
+    BEZEL_EXPECT_EQ(run(
+        "var a: decimal? := 5; var b: decimal? := 3; var c: decimal? := null; "
+        "if a <> null and b <> null then c := a + b; end if; "
+        "return int(c ?? 99);"), 8);
 }
 
-// #1045 / §7.11 / §17.1: a lifted relational comparison is a definite `bool`
-// ("false when either operand is null"), so `(int? < 5) ?? false` is `??` on a
-// non-nullable value — the left can never be null and the result is always the
-// left. lowerCoalesce returned nullptr for a non-pointer non-nullable LHS, so
-// the whole `??` lowered to null → false; it now returns the left operand.
+// #1045 / §7.7 / §17.1: `??` whose LEFT operand is a non-nullable `bool` —
+// lowerCoalesce returned nullptr for a non-pointer non-nullable LHS, so the
+// whole `??` lowered to null → false; it now returns the left operand.
+//
+// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled `(int? < 5) ??
+// false`, which asserted the RETIRED v0.130/v0.267 lift: that a lifted
+// relational is "a definite `bool` (`false` when either operand is null)". §7.11
+// (v0.267) retired that outright — "`null` is not less than, equal to, or
+// greater than a value, and answering `false` would assert two definite claims
+// at once" — and #4930 established that init-narrowing does not admit the
+// operator either. The header comment above this block is therefore CORRECTED:
+// the definite-`bool` claim is not part of the current language.
+//
+// The two rows are kept POSITIVE (conversion (a)) rather than turned into
+// rejections, because the coverage #1045 is about is `??` over a non-nullable
+// `bool` LHS, which is still exactly what they exercise once the nullable
+// operand is given the §7.7 remedy `??` BEFORE the comparison. The
+// `nullable_cmp_null_operand_is_false` row below is the REJECTION that pins
+// the v0.267 rule for the same shape.
 BEZEL_TEST(codegen_1045_coalesce_nonnull, nullable_cmp_true_via_coalesce) {
-    BEZEL_EXPECT_TRUE(runs(
-        "var a: int? := 3; return (if ((a < 5) ?? false) then 1 else 0);"));
+    BEZEL_EXPECT_EQ(run(
+        "var a: int? := 3; return (if ((a ?? 0) < 5 ?? false) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1045_coalesce_nonnull, nullable_cmp_false_via_coalesce) {
-    BEZEL_EXPECT_TRUE(runs(
-        "var a: int? := 3; return (if ((a > 5) ?? false) then 1 else 0);"));
+    BEZEL_EXPECT_EQ(run(
+        "var a: int? := 3; return (if ((a ?? 0) > 5 ?? false) then 1 else 0);"), 0);
 }
 BEZEL_TEST(codegen_1045_coalesce_nonnull, nullable_cmp_null_operand_is_false) {
-    // null < 5 is the definite bool `false` (§7.11), so `?? false` is false.
-    BEZEL_EXPECT_FALSE(runs(
+    // §7.11 (v0.267) — REJECTION, and the control for the two rows above: with
+    // a genuinely-nullable operand there is NO "definite false" to fall back
+    // on, because a nullable operand at `<` is a compile error and not a value.
+    // Under the retired v0.130 lift this row asserted a runtime `false`.
+    BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: int? := null; return (if ((a < 5) ?? false) then 1 else 0);"));
 }
 BEZEL_TEST(codegen_1045_coalesce_nonnull, nonnull_bool_coalesce_returns_left_true) {

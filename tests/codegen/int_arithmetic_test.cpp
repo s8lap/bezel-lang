@@ -130,43 +130,51 @@ BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
         "var u: uint := 5; return (if (u > 1000) then 1 else 0);"), 0);
 }
 
-// #1050 / §5.1: the LIFTED (nullable) relational comparison had the same
+// #1050 / §5.1: the (nullable) relational comparison had the same
 // unsigned-vs-non-negative-constant signedness bug as #1049 (the non-nullable
-// site) — `uint? 3e9 > 1000` was signed-compared and returned false. (Observed
-// through a `bool?` local, which correctly wraps the lifted i1 result; the
-// inline `(cmp) ?? false` form is a separate consumption bug, #1045.)
-// §7.11 (v0.286, #3298): each `u`/`i` below is a LOCAL initialised with a
-// non-null literal, which §7.4 narrows at the initialiser — so §7.11 reads it
-// at the non-nullable type and "the ordinary operator applies to it
-// unchanged". #1050's original value assertions therefore stand, and they are
-// the stronger oracle: they pin the UNSIGNED comparison, which is what #1050
-// was about. (A draft of #3298 flipped all five to "expect rejection", which
-// would have deleted that coverage AND was wrong for four of them — the
-// `:= null` row is the only genuinely nullable operand here.)
+// site) — `uint 3e9 > 1000` was signed-compared and returned false.
+//
+// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled against a
+// LIFTED relational (`var u: uint? := 3000000000; u > 1000` through a `bool?`
+// local). That is the retired v0.130/v0.267 behaviour and does not compile:
+// §7.11 (v0.267) admits nothing at the operator, and #4930 established that
+// INIT-NARROWING does not admit it either — a local initialised with a
+// non-null literal is not narrowed for this gate. The block comment above
+// previously claimed "§7.4 narrows at the initialiser … the ordinary operator
+// applies to it unchanged"; that claim is FALSE and is what left these rows
+// stale.
+//
+// The four value rows are kept POSITIVE (conversion (a)) with the §7.4
+// NULL-TEST narrowing applied explicitly, because the UNSIGNED comparison is
+// what #1050 is about and these rows are the only oracle for it.
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_high_bit_gt_literal) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: uint? := 3000000000; var r: bool? := u > 1000; "
-        "return (if (r ?? false) then 1 else 0);"), 1);
+        "var u: uint? := 3000000000; var r: bool := false; "
+        "if u <> null then r := u > 1000; end if; "
+        "return (if r then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, ulong_nullable_high_bit_gt_literal) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: ulong? := 18000000000000000000; var r: bool? := u > 1000; "
-        "return (if (r ?? false) then 1 else 0);"), 1);
+        "var u: ulong? := 18000000000000000000; var r: bool := false; "
+        "if u <> null then r := u > 1000; end if; "
+        "return (if r then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_lt_literal_false) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: uint? := 3000000000; var r: bool? := u < 1000; "
-        "return (if (r ?? false) then 1 else 0);"), 0);
+        "var u: uint? := 3000000000; var r: bool := false; "
+        "if u <> null then r := u < 1000; end if; "
+        "return (if r then 1 else 0);"), 0);
 }
 // No-regression: signed nullable unchanged.
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, int_nullable_signed_compare_unchanged) {
     BEZEL_EXPECT_EQ(runBody(
-        "var i: int? := 0 - 5; var r: bool? := i < 1000; "
-        "return (if (r ?? false) then 1 else 0);"), 1);
+        "var i: int? := 0 - 5; var r: bool := false; "
+        "if i <> null then r := i < 1000; end if; "
+        "return (if r then 1 else 0);"), 1);
 }
-// …and the UN-narrowed operand — initialised with `null` — is the §7.11
-// rejection. This row is the control that keeps the four above honest: they
-// pass because §7.4 narrowed, not because the gate is absent.
+// …and the operand NO narrowing reaches — initialised with `null` — is the
+// §7.11 rejection. This row is the control that keeps the four above honest:
+// they pass because §7.4's null-TEST narrowed, not because the gate is absent.
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_null_rejected_3298) {
     BEZEL_EXPECT_FALSE(runsBody(
         "var u: uint? := null; var r: bool? := u > 1000; "

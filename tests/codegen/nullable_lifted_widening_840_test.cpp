@@ -73,22 +73,32 @@ BEZEL_TEST(nullable_lifted_widening_840, same_type_regression) {
 // wrap. (The nullable operand is proven non-null here, so §7.11/#914 types the
 // result as the non-nullable `long`; the result must still hold the full value.)
 
-// §7.11 (v0.286, #3298): each `a` below is a LOCAL initialized with a non-null
-// literal, so §7.4 narrows it at the initializer and §7.11 reads it at the
-// non-nullable `int` — "an operand that §7.4 has narrowed non-null is a
-// non-nullable operand and the ordinary operator applies to it unchanged". So
-// these keep #1117's ORIGINAL value assertions: the operator is admitted, and
-// what is being pinned is that it computes in the PROMOTED width. (A draft of
-// #3298 flipped all three to "expect rejection" — wrong on the spec, and it
-// would have deleted #1117's coverage of the width. The `param_*` row below is
-// the un-narrowed control: a PARAMETER `a: int?` is not narrowed and IS
-// rejected.)
+// §7.11 (v0.286, #3298) / BEHAVIOR FLIP (fix #4930, v0.315): each `a` below is
+// a LOCAL initialized with a non-null literal, and the previous text here
+// claimed that §7.4 therefore "narrows it at the initializer" so §7.11 reads
+// it at the non-nullable `int`. THAT CLAIM IS FALSE and is exactly what left
+// these three rows stale: #4930 established that INIT-NARROWING (§6.6's
+// definite-initialiser rule) proves a local non-null for MEMBER ACCESS only —
+// it does NOT admit the §7.11 operator — and §7.11 (v0.267) retired the lift
+// outright, so `int? + long` does not compile as written. The three rows are
+// respelled with an explicit §7.4 NULL-TEST narrowing (`if a <> null then`),
+// which does admit the operator, keeping #1117's value assertions: what is
+// pinned is that the sum computes in the PROMOTED width. The `param_*` rows
+// below remain the un-narrowed control: a PARAMETER `a: int?` is not narrowed
+// and IS rejected.
 
 // int? + long: 2e9 + 2e9 = 4e9 must NOT wrap to a 32-bit value.
+// BEHAVIOR FLIP (fix #4930, v0.315): respelled with the §7.4 NULL-TEST
+// narrowing. The block comment above claimed a local initialised with a
+// non-null literal is "narrowed-non-null" for this gate; that is FALSE
+// (init-narrowing reaches member access, not the §7.11 operator gate), and
+// §7.11 (v0.267) admits no lift at all. The WIDTH is what #1117 pins, so
+// these stay POSITIVE with their values asserted.
 BEZEL_TEST(nullable_lifted_widening_840, int_q_plus_long_no_wrap_1117) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var a: int? := 2000000000; var b: long := 2000000000L; "
-        "var c: long? := a + b; "
+        "var c: long? := null; "
+        "if a <> null then c := a + b; end if; "
         "if (c ?? 0L) = 4000000000L then return 1; else return 0; end;")), 1);
 }
 
@@ -96,7 +106,8 @@ BEZEL_TEST(nullable_lifted_widening_840, int_q_plus_long_no_wrap_1117) {
 BEZEL_TEST(nullable_lifted_widening_840, int_q_times_long_wide_1117) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var a: int? := 100000; var b: long := 100000L; "
-        "var c: long? := a * b; "
+        "var c: long? := null; "
+        "if a <> null then c := a * b; end if; "
         "if (c ?? 0L) = 10000000000L then return 1; else return 0; end;")), 1);
 }
 
@@ -105,7 +116,8 @@ BEZEL_TEST(nullable_lifted_widening_840, int_q_times_long_wide_1117) {
 BEZEL_TEST(nullable_lifted_widening_840, nested_int_q_plus_long_no_irfail_1117) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var a: int? := 1; var b: long := 2L; "
-        "var c: long? := a + b + b; "
+        "var c: long? := null; "
+        "if a <> null then c := a + b + b; end if; "
         "return int(c ?? 0L);")), 5);
 }
 

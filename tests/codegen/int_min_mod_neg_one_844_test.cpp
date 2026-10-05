@@ -78,13 +78,24 @@ BEZEL_TEST(int_min_mod_neg_one_844, ordinary_signed_mod_unaffected) {
         "end Main; end C;"), 98);
 }
 
-// Lifted/nullable path (§7.11): int? mod -1 at int.MinValue also returns 0,
-// exercising the sibling codegen site (LlvmBackend_Exprs.cpp ~L4064).
+// Narrowed/nullable path (§7.4 / §7.11): int? mod -1 at int.MinValue also
+// returns 0, exercising the sibling codegen site (LlvmBackend_Exprs.cpp
+// ~L4064).
+//
+// BEHAVIOR FLIP (fix #4930, v0.315): this row was spelled as a LIFTED `mod`
+// (`var a: int? := int.MinValue; var b: int? := -1; a mod b`), which is the
+// retired v0.130/v0.267 behaviour and does not compile — §7.11 (v0.267) admits
+// nothing at the operator, and #4930 established that init-narrowing does not
+// admit it either. Respelled with the §7.4 null-test narrowing so the
+// nullable-payload `mod` lowering this row exists for stays covered. `mod` at
+// int.MinValue by -1 is 0 and does NOT raise (§6.1) — the DIVISION sibling
+// above is the one that overflows.
 BEZEL_TEST(int_min_mod_neg_one_844, nullable_int_min_mod_neg_one_is_zero) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
-        "  var a: int? := int.MinValue; var b: int? := -1; "
-        "  try var c: int? := a mod b; "
+        "  var a: int? := int.MinValue; var c: int? := null; "
+        "  try "
+        "    if a <> null then c := a mod -1; end if; "
         "    if c = 0 then return 42; end; return 0; "
         "  catch OverflowException => return 43; end; "
         "end Main; end C;"), 42);
