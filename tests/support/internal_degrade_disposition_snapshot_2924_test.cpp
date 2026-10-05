@@ -100,7 +100,10 @@ struct Entry {
 // The WARNING-severity `internal:` degrades (sixteen as of v0.240; #3079 added
 // at v0.249; the two #3157 alarms and #3437's representation guard at v0.283;
 // #4045's AssignmentStmt generic-arm null-address exit at v0.294; #5032's
-// interpolation-part and case-arm dead-template-body degrades at v0.307),
+// interpolation-part and case-arm dead-template-body degrades at v0.307;
+// #5327's split of the two #2961 assignment-RHS sites at v0.315 — two entries
+// became four, all WrongValue, because the split added report CALLS without
+// adding dispositions),
 // each with the judgement #2924 asks for.  Ordered by file, then by the tag.
 // The live count is `kN`, derived from this array — the prose above is a
 // changelog, not the number the test asserts.
@@ -243,21 +246,63 @@ const Entry kWarningDegrades[] = {
      "exemption; a built-in member call that demanded a value is #2935's "
      "Error) without changing what it substitutes when it does fire"},
 
+    // FOUR #2961 entries, not two, as of #5327 (v0.315). #5327 split each of
+    // the two `if (!rhs) { … return false; }` sites into an if/else that
+    // reports the SAME degrade with one of two TEXTS, so the file now holds
+    // four distinct `Severity::Warning` report calls carrying `#2961` and each
+    // needs its own entry (the matcher is one-shot per entry). All four are
+    // the same judgement: NONE of them substitutes anything — every branch
+    // reports and then hits the shared `return false`, so the target keeps
+    // whatever was in its slot before. The split chose a MESSAGE, not a
+    // disposition, and the two texts differ only in whether the offending
+    // built-in callee is named.
+    //
+    // These entries are listed in SOURCE order (localSlot named, localSlot
+    // fallback, generic-arm named, generic-arm fallback) because the matcher
+    // pairs the k-th site of a {file, tag} group with the k-th entry of that
+    // group: the pairing is positional, not semantic, so the order is what
+    // makes each reason below land on the site it describes.
     {"src/codegen/LlvmBackend_Stmts.cpp", "#2961",
      Disposition::WrongValue,
-     "the AssignmentStmt localSlot arm: `if (!rhs) return false;` keeps the "
+     "the AssignmentStmt localSlot arm, #5327's built-in-NAMED branch: "
+     "`if (!rhs)` where `builtinReceiverOfMemberCall` resolved a built-in "
+     "receiver, so the message reads \"… — ChannelSender.Send produces no "
+     "value here (#2961)\". The branch only chooses that text; it reports and "
+     "falls into the same `return false` as its twin below, keeping the "
      "target's PREVIOUS value rather than substituting `getNullValue`. A wrong "
      "value (the slot keeps stale state) is bounded to the assignment's "
-     "target — no null pointer escapes, no dereference site is fed garbage. "
-     "Mirror of #2961's twin below at the generic lvalueAddr arm."},
+     "target — no null pointer escapes, no dereference site is fed garbage."},
+
+    {"src/codegen/LlvmBackend_Stmts.cpp", "#2961",
+     Disposition::WrongValue,
+     "the AssignmentStmt localSlot arm, #5327's FALLBACK branch — the "
+     "`else` taken when the RHS is not a built-in member call, and the site "
+     "this entry described before #5327 split it. Identical disposition and "
+     "identical substitution (none): it reports the undecorated \"— #2961\" "
+     "text and returns false, leaving the stale slot. The permissive-acceptance "
+     "face — an unknown member on an Object-typed receiver — lands here, and "
+     "the message is deliberately left undecorated because there is no callee "
+     "name to give."},
 
     {"src/codegen/LlvmBackend_Stmts.cpp", "#2961",
      Disposition::WrongValue,
      "the AssignmentStmt generic lvalueAddr arm (the `this.f := <expr>` and "
-     "indexer-set cases): same `if (!rhs) return false;` keep-previous-value "
-     "shape as the localSlot arm above. The retained value is whatever was "
-     "stored there before; no null-pointer substitution, no UAF. The hazard "
-     "is a stale field/indexer slot — bounded, observable, and now diagnosed."},
+     "indexer-set cases), #5327's built-in-NAMED branch: same "
+     "`if (!rhs) { … return false; }` keep-previous-value shape as the "
+     "localSlot arm above, reached when the target is not a local slot. The "
+     "retained value is whatever was stored in the field/indexer before; no "
+     "null-pointer substitution, no UAF. The hazard is a stale field/indexer "
+     "slot — bounded, observable, and now diagnosed."},
+
+    {"src/codegen/LlvmBackend_Stmts.cpp", "#2961",
+     Disposition::WrongValue,
+     "the AssignmentStmt generic lvalueAddr arm, #5327's FALLBACK branch — "
+     "the `else` of the pair above, and the site this entry's twin described "
+     "before #5327 split it. Same judgement for the same reason: it "
+     "manufactures and substitutes nothing, reports, and returns false with "
+     "the field/indexer slot still holding its previous value. Recorded "
+     "separately because the one-shot matcher cannot tell these two apart on "
+     "{file, tag} alone, not because their dispositions differ."},
 
     {"src/codegen/LlvmBackend_Stmts.cpp", "#4045",
      Disposition::WrongValue,
@@ -329,14 +374,17 @@ const Entry kWarningDegrades[] = {
 
 // How many of these can hand a user a memory-unsafe binary. Pinned as its own
 // number so that changing a disposition is a deliberate edit in two places.
-// The two #2961 and two #3025 entries are WrongValue (no null pointer is
+// The #2961 and two #3025 entries are WrongValue (no null pointer is
 // substituted), so this count was unchanged at 9 from the twelve-degrade
 // population; #3079 (v0.249) is likewise WrongValue — it substitutes nothing
 // at all, it declines the site — so the count stays 9. #4045 (v0.294) is the
 // AssignmentStmt generic-arm null-address exit, also WrongValue (no value is
 // ever substituted; the site returns before evaluating the RHS or invoking any
 // store, so the bounded harm is a stale slot, not a manufactured pointer) —
-// so the count stays 9.
+// so the count stays 9. #5327 (v0.315) turned the two #2961 entries into four
+// by splitting each site's single report into a built-in-named branch and a
+// fallback; all four still `return false` without substituting, so the count
+// stays 9.
 //
 // #4790 (v0.307) is judged here but deliberately has NO entry above: its
 // lowerNew site in src/codegen/LlvmBackend_Exprs2.cpp ("codegen selected no
