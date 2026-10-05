@@ -8877,10 +8877,19 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     ip->isIndexer ? classIndexerImplementing(ts, ip)
                                   : classPropertyByName(ts, ip->name);
                 if (!pimpl || !pimpl->parent) continue;
-                if (instanceLayoutDiffersFromErasedTemplate(pimpl->parent)) {
-                    needsSpecItable = true;
-                    break;
-                }
+                // fix #5343 (§14.1 / §23.2, v0.313): per #4966's reasoning for
+                // vtable slots, `instanceLayoutDiffersFromErasedTemplate` is not
+                // the right guard here.  A generic class whose INSTANCE storage
+                // is layout-equal across substitutions can still have a generic
+                // accessor whose body is NOT — `Rec: T` reads `T`-typed storage,
+                // so a `BoxM<int>` itable slot that points to the T->i32
+                // template body is just as broken as a vtable slot with that
+                // body.  Every interface property slot of a generic class that
+                // overrides a generic ancestor needs re-lowering under the active
+                // substitution; the signature-ABI guard (concFnTy comparison) is
+                // the one that stays.
+                needsSpecItable = true;
+                break;
             }
             if (needsSpecItable) break;
         }
@@ -9356,8 +9365,6 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     ip->isIndexer ? classIndexerImplementing(ts, ip)
                                   : classPropertyByName(ts, ip->name);
                 if (!pimpl || !pimpl->parent) continue;
-                if (!instanceLayoutDiffersFromErasedTemplate(pimpl->parent))
-                    continue;
                 auto patchSlot = [&](bool isSet, unsigned si) {
                     if (si >= newItabElems.size()) return;
                     llvm::Function* canon = templateAccessorFn(pimpl, isSet);
@@ -9472,19 +9479,60 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     // `classStruct(...)` under THIS substitution rather than the erased template
     // struct.
     //
-    // A slot whose specialization could not be built, or whose built signature
-    // does not match the slot's fixed ABI (`virtual property Item: T` moves the
-    // getter's return type, and the indirect call at the receiver's static type
-    // would mistype it), is LEFT ALONE — falling back to exactly today's
-    // (template) content rather than installing a function the call would
-    // mistype.
+    // fix #5343 (§14.1 "Generic declarations" / §23.2 / §2.8.3 rule 4, v0.313):
+    // the `specFn->getFunctionType() != canon->getFunctionType()` guard is
+    // removed. It compared the specialization against the ERASED TEMPLATE's
+    // signature, which is the wrong reference for the question it was asking.
+    //
+    // MEASURED on `class BoxM<T> : IRecM` with a recursive
+    // `override property Rec: T` and ONE `BoxM<long>` instantiation: the slot
+    // held the template, and the program died with exit 139 in
+    // `bz$BoxM$Rec$propget`. The vtable relocations differ from the working
+    // `BoxM<int>` build in exactly one word — slot 6, the `Rec` getter:
+    //
+    //   BoxM<int>   slot 6 -> .text+0x10e0  bz$BoxM$Rec$propget$spec1
+    //   BoxM<long>  slot 6 -> .text+0x0780  bz$BoxM$Rec$propget   (TEMPLATE)
+    //
+    // The template's `T` erases to the i32 placeholder, so its return type is
+    // i32; the `BoxM<long>` specialization returns i64. The guard saw the
+    // mismatch and `continue`d, leaving the erased body in a slot the read site
+    // calls as i64. This is a SINGLE instantiation — the discriminator is NOT
+    // instantiation count (the same source with only `BoxM<int>` exits 0).
+    // It is: the property's type is the type parameter itself, so the
+    // specialization's return type differs from the erasure.
+    //
+    // WHY THE SLOT'S ABI IS NOT THE TEMPLATE'S — the reason the guard existed.
+    // It assumed a vtable slot's ABI is fixed by the shared template. It is
+    // not: `elems` above is a FRESH per-instantiation clone of the shared
+    // vtable, and every call site that reaches it types the indirect call from
+    // the receiver's OWN static property type — which for `BoxM<long>.Rec` is
+    // i64. Two measured facts make the specialization the correctly-typed
+    // occupant rather than a mistyped one:
+    //
+    //   1. Type arguments are INVARIANT (§14.1/§5.1): `var b: B<int> :=
+    //      new B<long>(5L)` is rejected, so a `B<int>` receiver can never carry
+    //      a `B<long>` object and reach this slot under the wrong ABI. Each
+    //      instantiation's objects are only ever read at that instantiation's
+    //      own property type.
+    //   2. A covariant override is REJECTED (§12.1): `class D<T> : Base`
+    //      with `Base.V: int` and `override property V: T` is a compile error,
+    //      so a non-generic base can never pin the slot to a different return
+    //      type than the generic subclass's own substitution produces.
+    //
+    // With both, the only function whose return type matches the call the read
+    // site emits IS the specialization, and the template is precisely the
+    // mistyped occupant. §5.1's no-implicit-conversion rule is what makes (2)
+    // hold: a covariant property override would be a widening return, and
+    // Bezel admits none.
+    //
+    // A slot whose specialization could not be built is still LEFT ALONE,
+    // falling back to exactly today's (template) content.
     for (const auto& as : accessorSlotsToSpec) {
         llvm::Function* canon = templateAccessorFn(as.impl, as.isSet);
         if (!canon) continue;
         llvm::Function* specFn =
             buildSpecializedAccessorFn(ts, as.impl, as.isSet);
         if (!specFn) continue;
-        if (specFn->getFunctionType() != canon->getFunctionType()) continue;
         // fix #4952 (§4.6/§28.3/§28.9, v0.307): normalize the specialized
         // getter's ownership the same way canon's own installation site did
         // (the thunk shares `fn`'s FunctionType exactly, so this cannot
