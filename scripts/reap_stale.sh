@@ -288,7 +288,7 @@ fi
 # a few hundred wasted NVMe bytes, the cost of a false reap is a dead lane.
 # ---------------------------------------------------------------------------
 sleep "$SETTLE"
-declare -a K_PID=() K_TIER=() K_AGE=() K_CMD=()
+declare -a K_PID=() K_TIER=() K_AGE=() K_CMD=() K_D=()
 working=0
 for i in "${!C_PID[@]}"; do
   pid=${C_PID[$i]}
@@ -303,10 +303,29 @@ for i in "${!C_PID[@]}"; do
       "$pid" "${C_AGE[$i]}" "$dcpu" "$dio" "$(printf '%s' "${C_CMD[$i]}" | cut -c1-80)"
     continue
   fi
+  # D state is an EXEMPTION, not a reap target. A process in uninterruptible sleep
+  # is by definition blocked on real I/O, so "no progress" is the expected
+  # condition and carries no information about whether it is wedged. Signalling
+  # it is also futile: SIGTERM and SIGKILL both land in the kernel's pending
+  # set and it stays put until the I/O completes. R27 measured a btrfs-transaction
+  # kernel thread sitting in D for 185841 s (51 h) — reporting that as a failed
+  # reap would be a false claim, and reaping it would be theatre.
+  #
+  # This is the io-throttled case the progress probe cannot separate: a genuinely
+  # working build under heavy btrfs throttle shows dcpu=0 AND dio=0, exactly like
+  # a stuck waiter. D state is the only reliable discriminator, so it exempts.
+  if [ "$(state_of "$pid")" = "D" ]; then
+    K_D+=("$pid")
+    printf 'BLOCKED pid=%s age=%ss state=D wchan=%s — io-throttled, NOT reapable\n' \
+      "$pid" "${C_AGE[$i]}" "$(cat "/proc/$pid/wchan" 2>/dev/null || echo '?')"
+    continue
+  fi
   K_PID+=("$pid"); K_TIER+=("${C_TIER[$i]}"); K_AGE+=("${C_AGE[$i]}"); K_CMD+=("${C_CMD[$i]}")
 done
 
-echo "candidates: ${#C_PID[@]}  |  working (exempt): $working  |  stale: ${#K_PID[@]}"
+echo "candidates: ${#C_PID[@]}  |  working (exempt): $working  |  io-blocked (exempt): ${#K_D[@]}  |  stale: ${#K_PID[@]}"
+[ "${#K_D[@]}" -gt 0 ] && \
+  echo "  io-blocked need FILESYSTEM relief (btrfs writeback), not a signal — see feedback-btrfs-d-state-starves-test-harness"
 [ "$working" -gt 0 ] && [ "$LIST_WORKING" = 0 ] && \
   echo "  ($working skipped as genuinely in progress — use --no-exclude-working to see them)"
 
