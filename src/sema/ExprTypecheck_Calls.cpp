@@ -23493,10 +23493,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // of built-in heap types that no path above types. Left untyped, the
         // read reaches `checkAssignable` with a null source and §5.1 is
         // skipped outright, so `var b: bool := a.Length;` compiled clean.
-        //   - `Length` on Stack/Queue (and Owning twins): the structural
-        //     Count alias that codegen lowers through the same runtime length
-        //     call (see the #2459 exemption `isLengthAlias` below); typed
-        //     exactly as `Count` above.
+        //   - `Length` on Stack/Queue (and Owning twins): REJECTED per fix
+        //     #5416 (§4.11, v0.315) — these four declare Count (via
+        //     IReadOnlyCollection<T>), not Length; explicit diagnostics
+        //     added above after the #4811 Array/OwningArray precedent.
         //   - `Length` on StringBuilder (stdlib §3.1), OwningBuffer<T>
         //     (stdlib §4.14) and FrozenArray<T> (stdlib §4.19; the
         //     annotation shape only — the `From(...)` result carries a
@@ -23561,6 +23561,38 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `OwningArray<T>`: use `Count` "
                         "(stdlib \\S4.5)");
+                    return;
+                }
+                // fix #5416 (§4.11, v0.315): `Stack<T>`/`OwningStack<T>`/
+                // `Queue<T>`/`OwningQueue<T>` declare `Count` (via
+                // IReadOnlyCollection<T>), not `Length` — the Count-vs-Length
+                // convention (§4.4 p.74) applies to resizable collections.
+                if (ma.member == "Length" && cn == "Stack") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "no member `Length` on `Stack<T>`: use `Count` "
+                        "(stdlib \\S4.11)");
+                    return;
+                }
+                if (ma.member == "Length" && cn == "OwningStack") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "no member `Length` on `OwningStack<T>`: use `Count` "
+                        "(stdlib \\S4.11)");
+                    return;
+                }
+                if (ma.member == "Length" && cn == "Queue") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "no member `Length` on `Queue<T>`: use `Count` "
+                        "(stdlib \\S4.11)");
+                    return;
+                }
+                if (ma.member == "Length" && cn == "OwningQueue") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "no member `Length` on `OwningQueue<T>`: use `Count` "
+                        "(stdlib \\S4.11)");
                     return;
                 }
             }

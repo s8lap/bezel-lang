@@ -849,12 +849,10 @@ constexpr std::array<std::string_view, 5> kLazyReverseDirectReceiverHeads = {
 // fix #4811 (§4.4, v0.315): remove Array/OwningArray from this set. The
 // Count-vs-Length convention (stdlib §4.4 p.74) gives resizable Array<T>
 // `Count` ONLY — "which is why the resizable Array<T> says Count where .NET's
-// fixed array says Length". Length remains correct for the other types below:
-// StringBuilder (§3.1), OwningBuffer (§4.14), FrozenArray (§4.19), and the
-// Stack/Queue families (§4.6) whose convention classification is separate.
-constexpr std::array<std::string_view, 7> kBuiltinIntLengthPropertyHeads = {
-    "Stack", "OwningStack",
-    "Queue", "OwningQueue",
+// fixed array says Length". fix #5416 (§4.11, v0.315): also removes
+// Stack/Queue/OwningStack/OwningQueue — these four declare Count (via
+// IReadOnlyCollection<T>), not Length, per stdlib §4.11.
+constexpr std::array<std::string_view, 3> kBuiltinIntLengthPropertyHeads = {
     "StringBuilder",
     "OwningBuffer",
     "FrozenArray",

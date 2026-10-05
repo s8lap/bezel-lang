@@ -21,12 +21,12 @@
 // Per-member disposition (verified against docs/Bezel_Standard_Library.md
 // §4.11/§4.1/§4.12/§5, not inferred from what the compiler special-cases):
 //   - `Count`: already typed by a pre-existing property handler (shared with
-//     Array/Set/Dictionary/LinkedList).
-//   - `.Length`: NOT in stdlib's documented surface (only `Count`, via
-//     `IReadOnlyCollection<T>`, is) but a real, WORKING, tested alias for
-//     `.Count` — the same `isCollectionTypeName`/`kArrayBackedCollections`
-//     structural dispatch slice 1 found for Array. Exempted, not
-//     implemented (needed no new implementation).
+//     Array/Set/Dictionary/LinkedList); the sole member for element counting.
+//   - `.Length`: REJECTED per fix #5416 (stdlib §4.11, v0.315). Before the
+//     fix, accepted as an undocumented alias for `Count` (same
+//     `isCollectionTypeName`/`kArrayBackedCollections` structural dispatch
+//     that gave Array its `.Length` before #4811). Fix removes it from the
+//     allow-list so the stdlib's declared `Count` is the only accepted name.
 //   - `.Reverse()`: NOT declared for Stack/Queue in stdlib §4.11 either (only
 //     `Array<T>`'s own §4.4 declares an in-place `Reverse()`), but a second
 //     undocumented-but-real structural alias found by THIS slice's own
@@ -34,7 +34,7 @@
 //     (LlvmBackend_Calls.cpp ~3160) implements it for ANY
 //     `isCollectionTypeName` receiver with no per-type exclusion. Verified
 //     VALUE-correct below (mutates the physical backing storage), not just
-//     "doesn't crash" — exempted for the same reason `.Length` is.
+//     "doesn't crash" — exempted, not implemented.
 //   - Every declared method (stdlib §4.11) and §5 LINQ operator: a CALL is
 //     exempted via `calleeOfCallCtx_`; language spec §27.6 also sanctions a
 //     BARE reference (`var f := s.Push;`), exempted via an explicit name
@@ -202,25 +202,25 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, compareto_call_no_longer_double_r
 
 // ── Legitimate members keep working, VALUE-correct ──────────────────────
 
-// `.Length` — the undocumented-but-real, working alias for `.Count`.
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_length_alias_stack_value_correct) {
+// `.Count` — the declared member per stdlib §4.11 (fix #5416).
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_count_member_stack_value_correct) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
         "  var s := new Stack<int>(); "
         "  s.Push(7); s.Push(8); s.Push(9); "
-        "  return s.Length; "
+        "  return s.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 3);
 }
 
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_length_alias_queue_value_correct) {
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_count_member_queue_value_correct) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
         "  var q := new Queue<int>(); "
         "  q.Enqueue(7); q.Enqueue(8); q.Enqueue(9); "
-        "  return q.Length; "
+        "  return q.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 3);
 }
@@ -541,7 +541,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_call_form_methods_stack_val
         "  if not found then return 1; end; "
         "  if top <> 3 then return 2; end; "
         "  if popped <> 3 then return 3; end; "
-        "  if s.Length <> 0 then return 4; end; "
+        "  if s.Count <> 0 then return 4; end; "
         "  return 42; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
@@ -560,7 +560,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_call_form_methods_queue_val
         "  if not found then return 1; end; "
         "  if front <> 1 then return 2; end; "
         "  if dequeued <> 1 then return 3; end; "
-        "  if q.Length <> 0 then return 4; end; "
+        "  if q.Count <> 0 then return 4; end; "
         "  return 42; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
