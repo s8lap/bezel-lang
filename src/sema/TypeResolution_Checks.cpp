@@ -9797,21 +9797,56 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                     }
                     if (!typeRefEqual(bArg, tArg)) {
                         // fix #5424 (§14.2 rule 1, v0.315): inherited conformance.
-                        // When the inherited interface's type argument (tArg, e.g. GBase)
-                        // doesn't match the bare-parameter-substituted bound argument
-                        // (bArg, e.g. Derived), check if the candidate's declaration
-                        // is a subtype of tArg's declaration. If so, the inherited
-                        // conformance is valid (the candidate inherits from a class that
-                        // conforms to the interface).
+                        // When the inherited interface's type argument (tArg, e.g.
+                        // GBase) doesn't match the bare-parameter-substituted bound
+                        // argument (bArg, e.g. Derived), check whether the candidate's
+                        // declaration INHERITS FROM tArg's declaration — the candidate
+                        // then conforms by inheriting from a class that conforms to
+                        // the interface, which is exactly what rule 1 admits.
+                        //
+                        // Two guards, both load-bearing:
+                        //
+                        // (a) NULLABILITY IS NOT INHERITED. §14.2: "A type-bound
+                        // constraint — naming a class or interface — implies non-null
+                        // T ... nullable types `MyClass?` and `IFoo?` are distinct from
+                        // their non-nullable forms (§7.1) and do not themselves
+                        // implement the interfaces of their non-nullable counterparts:
+                        // a `null` value satisfies no interface contract" (v0.315).
+                        // This walk compares DECLARATIONS, which are blind to the
+                        // `nullable` flag that `typeRefEqual` compares first — so
+                        // without this guard `Ord?` against `Ord` "matches" and a
+                        // nullable element silently satisfies a constraint it fails,
+                        // losing the §14.2 rejection that `checkOneConstraint`'s own
+                        // `arg->nullable` arm exists to report
+                        // (sorted_set_class_element_3428
+                        // .nullable_class_element_diagnoses_nullability).
+                        //
+                        // (b) THE WALK MUST START BELOW THE CANDIDATE. Rule 1 is about
+                        // INHERITANCE; when `argDecl == tArgDecl` there is nothing to
+                        // inherit — that is the direct-listing case, already decided by
+                        // the `typeRefEqual` above, and its failure is real (the
+                        // instantiations differ). Seeding the frontier with `argDecl`
+                        // itself made that failure vacuous: the first loop iteration
+                        // tests `cur == tArgDecl` against the seed and succeeds
+                        // unconditionally, so EVERY same-declaration mismatch — the
+                        // nullable one above included — was accepted. Seeding with the
+                        // candidate's BASES keeps the arm meaning what the spec says:
+                        // "inherits from a class which conforms to I".
                         bool isSubtypeMatch = false;
-                        if (tArg && tArg->kind == TypeRef::Kind::Named &&
+                        if (!bArg->nullable && !tArg->nullable &&
+                            tArg && tArg->kind == TypeRef::Kind::Named &&
                             tArg->declaration &&
                             tArg->declaration->kind == ast::TypeDeclKind::Class) {
-                            // Walk up the base chain to check if argDecl is a subtype of tArgDecl
+                            // Walk up the base chain to check whether argDecl is a
+                            // strict subtype of tArgDecl.
                             TypeSymbol* argDecl = arg->declaration;
                             TypeSymbol* tArgDecl = tArg->declaration;
-                            std::vector<TypeSymbol*> subFrontier{argDecl};
-                            std::unordered_set<TypeSymbol*> subSeen{argDecl};
+                            std::vector<TypeSymbol*> subFrontier;
+                            std::unordered_set<TypeSymbol*> subSeen;
+                            for (TypeSymbol* base : argDecl->baseTypes) {
+                                if (base && subSeen.insert(base).second)
+                                    subFrontier.push_back(base);
+                            }
                             std::size_t si = 0;
                             while (si < subFrontier.size()) {
                                 TypeSymbol* cur = subFrontier[si++];
