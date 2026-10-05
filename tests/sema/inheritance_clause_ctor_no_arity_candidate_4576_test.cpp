@@ -273,14 +273,12 @@ BEZEL_TEST(inheritance_clause_ctor_no_arity_candidate_4576,
 // NO-REGRESSION 4 — #4878 reports only when NO candidate binds. Here the
 // exact-arity candidate `(a, b)` cannot bind `x`, but the defaulted sibling
 // `(x, y := 0, z := 0)` can, so the clause is valid and must NOT be rejected.
-// The row asserts acceptance only: the constructed VALUES are wrong today
-// (`n=0 s=0` where `n=40 s=90` is right — measured on b83afbe3 and 7dd479cf,
-// independent of #4878), tracked as #4879; its fix should strengthen this row
-// to the exact stdout.
+// The fix (#4879) publishes the binding so the sibling constructor is called,
+// producing `n=40 s=90` (not the pre-fix `n=0 s=0`).
 // ---------------------------------------------------------------------------
-// per §22.5 / §22.10 (v0.307), fix #4878 — no-regression control (see #4879)
+// per §22.5 / §22.10 (v0.307), fix #4878 / #4879 — no-regression control
 BEZEL_TEST(inheritance_clause_ctor_no_arity_candidate_4576,
-           overload_set_named_clause_binding_a_sibling_is_not_rejected_4878) {
+           overload_set_named_clause_binding_a_sibling_calls_it) {
     auto r = runAot(
         "module M; "
         "class B "
@@ -311,4 +309,5 @@ BEZEL_TEST(inheritance_clause_ctor_no_arity_candidate_4576,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("n=40 s=90\n"));
 }

@@ -15148,35 +15148,58 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     // Only a clause NO candidate binds is reported, so no
                     // clause a sibling can bind changes disposition. §5.1
                     // assignability (#4576 gap (c)) is still not checked.
-                    if (!cb.ok && !emitClauseCtorBinding &&
-                        !clauseBindsPrimaryList) {
+                    if (!cb.ok && !clauseBindsPrimaryList) {
+                        // Check the primary FIRST: if it can bind, route to the
+                        // primary binding path (clauseCtor = nullptr). Only if
+                        // the primary cannot bind do we check explicit ctors.
+                        // This ordering is correct because the primary is not
+                        // a member constructor — it is a parameter list that
+                        // chains to whichever explicit constructor the primary
+                        // list's own `this(...)` call routes to (§11.1).
                         bool anyBinds = false;
-                        for (Symbol* m : baseTs->members) {
-                            auto* other = dynamic_cast<ConstructorSymbol*>(m);
-                            if (!other || other->isStatic) continue;
-                            if (bindArgsToParams(
-                                    sema::FormalsView::of(*other),
-                                    td->primaryBaseCtorArgs,
-                                    td->primaryBaseCtorArgs[0]
-                                        .value->span.begin,
-                                    desc, /*emit=*/false)
-                                    .ok) {
-                                anyBinds = true;
-                                break;
-                            }
-                        }
-                        if (!anyBinds && baseTs->hasPositionalFields) {
+                        if (baseTs->hasPositionalFields) {
                             const std::vector<const Symbol*> pf =
                                 recordPositionalFieldSymbols(baseTs);
-                            if (!pf.empty() &&
-                                bindArgsToParams(
+                            if (!pf.empty()) {
+                                BindResult primaryCb = bindArgsToParams(
                                     sema::FormalsView::of(pf),
                                     td->primaryBaseCtorArgs,
                                     td->primaryBaseCtorArgs[0]
                                         .value->span.begin,
-                                    desc, /*emit=*/false)
-                                    .ok)
-                                anyBinds = true;
+                                    desc, /*emit=*/false);
+                                if (primaryCb.ok) {
+                                    anyBinds = true;
+                                    clauseCtor =
+                                        nullptr;  // route to primary path
+                                    cb = primaryCb;  // use primary's binding
+                                    ctx_.setInheritanceClauseCtorBinding(
+                                        &td->primaryBaseCtorArgs, nullptr,
+                                        cb.paramToArg);
+                                }
+                            }
+                        }
+                        if (!anyBinds) {
+                            for (Symbol* m : baseTs->members) {
+                                auto* other =
+                                    dynamic_cast<ConstructorSymbol*>(m);
+                                if (!other || other->isStatic) continue;
+                                BindResult siblingCb = bindArgsToParams(
+                                    sema::FormalsView::of(*other),
+                                    td->primaryBaseCtorArgs,
+                                    td->primaryBaseCtorArgs[0]
+                                        .value->span.begin,
+                                    desc, /*emit=*/false);
+                                if (siblingCb.ok) {
+                                    anyBinds = true;
+                                    clauseCtor =
+                                        other;  // update to binding sibling
+                                    cb = siblingCb;  // use sibling's binding
+                                    ctx_.setInheritanceClauseCtorBinding(
+                                        &td->primaryBaseCtorArgs, clauseCtor,
+                                        cb.paramToArg);
+                                    break;
+                                }
+                            }
                         }
                         if (!anyBinds)
                             (void)bindArgsToParams(
@@ -15184,6 +15207,29 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                                 td->primaryBaseCtorArgs,
                                 td->primaryBaseCtorArgs[0].value->span.begin,
                                 desc, /*emit=*/true);
+                    }
+                    // fix #4903: after gap (a), if clauseCtor is set (explicit
+                    // ctor of this arity was found) but cb.ok is false (it
+                    // couldn't bind the clause names), AND the primary CAN
+                    // bind the clause, recompute the binding against the
+                    // primary and route to the primary binding path. gap (a)
+                    // above found anyBinds = true (so no error is emitted)
+                    // but clauseCtor was not updated because the primary was
+                    // excluded by !explicitCtorOfThisArity.
+                    if (clauseCtor && !cb.ok && baseTs->hasPositionalFields) {
+                        const std::vector<const Symbol*> pf =
+                            recordPositionalFieldSymbols(baseTs);
+                        if (!pf.empty()) {
+                            BindResult primaryCb = bindArgsToParams(
+                                sema::FormalsView::of(pf),
+                                td->primaryBaseCtorArgs,
+                                td->primaryBaseCtorArgs[0].value->span.begin,
+                                desc, /*emit=*/false);
+                            if (primaryCb.ok) {
+                                clauseCtor = nullptr;
+                                cb = primaryCb;
+                            }
+                        }
                     }
                 }
             }
