@@ -10668,6 +10668,19 @@ llvm::Value* Emitter::lowerDecimalToInteger(sema::PrimitiveType target,
         // #4785 via a dedicated `bz_decimal_to_uint64` helper — this is
         // the same defect shape at the 32-bit-or-smaller codegen dispatch.
         //
+        // fix #5345 (§5.2, v0.315): the lower-bound check was also wrong
+        // for unsigned targets.  The signed arm uses `v64 < INT32_MIN`
+        // which correctly catches negatives for `int`/`sbyte`/`short`
+        // targets.  For `uint` (and `ushort`/`byte` which reach this arm
+        // before the roundtrip sub-range check below), a negative source
+        // value should raise OverflowException — but `v64 < INT32_MIN`
+        // does NOT fire on, e.g., `-1` (since `-1 < INT32_MIN` is false).
+        // The guard therefore passed, the i64 `-1` was Trunc'd to i32,
+        // and the result was 4294967295 (the unsigned interpretation of
+        // all-ones) — a silent wrong value, not an exception.  The fix
+        // mirrors the upper-bound pattern: use `0` as the lower bound
+        // for unsigned targets, and INT32_MIN only for signed targets.
+        //
         // For the other unsigned narrower targets (ushort, byte) the
         // existing trunc + roundtrip check (ZExt then compare back to
         // the i32 value) already correctly bounds at USHRT_MAX /
@@ -10679,7 +10692,7 @@ llvm::Value* Emitter::lowerDecimalToInteger(sema::PrimitiveType target,
                               ? (int64_t)(uint64_t)UINT32_MAX
                               : (int64_t)INT32_MAX;
         llvm::Value* lo = builder_.CreateICmpSLT(
-            v64, llvm::ConstantInt::get(i64(), (int64_t)INT32_MIN), "dec.ilo");
+            v64, llvm::ConstantInt::get(i64(), (int64_t)(dstUns ? 0 : INT32_MIN)), "dec.ilo");
         llvm::Value* hi = builder_.CreateICmpSGT(
             v64, llvm::ConstantInt::get(i64(), hiBound), "dec.ihi");
         emitGuardThrow(builder_.CreateOr(lo, hi), "OverflowException");

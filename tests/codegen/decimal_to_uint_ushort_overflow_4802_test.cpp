@@ -305,3 +305,87 @@ BEZEL_TEST(decimal_to_uint_ushort_4802, int_from_decimal_at_int_max_succeeds_reg
         "  end Main; "
         "end C;"), 1);
 }
+
+// ─── uint(negative decimal) — #5345 regression rows ─────────────────────────
+
+// fix #5345 (§5.2, v0.315): `uint(decimal)` of a negative value was
+// returning UINT32_MAX-ish instead of raising OverflowException.  The codegen
+// lower-bound check used INT32_MIN for ALL targets including unsigned ones;
+// for `uint`, a negative source (e.g. -1) does NOT satisfy `v64 < INT32_MIN`
+// (since -1 < -2147483648 is false), so the guard passed and the i64 -1
+// was Trunc'd to i32, yielding 4294967295.  The fix uses `0` as the lower
+// bound for unsigned targets (mirroring the #4802 UINT32_MAX upper-bound fix
+// and the #4785 ulong pattern).
+
+// §5.2 / #5345: uint(-1m) — negative constant, compile error per §17.14
+// so this row tests the non-constant runtime path.
+BEZEL_TEST(decimal_to_uint_ushort_4802, uint_from_negative_decimal_raises) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d: decimal := -1m; "
+        "    try var v: uint := uint(d); return 201; "
+        "    catch OverflowException => return 42; end; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §5.2 / #5345: non-constant negative decimal (the actual bug scenario).
+BEZEL_TEST(decimal_to_uint_ushort_4802, uint_from_negative_runtime_decimal_raises) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var neg: decimal := 0m - 1m; "   // runtime negative decimal
+        "    try var v: uint := uint(neg); return 201; "
+        "    catch OverflowException => return 42; end; "
+        "  end Main; "
+        "end C;"), 42);
+}
+
+// §5.2 / #5345: boundary — uint(0m) must still succeed.
+BEZEL_TEST(decimal_to_uint_ushort_4802, uint_from_zero_decimal_succeeds) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d: decimal := 0m; "
+        "    try "
+        "      var v: uint := uint(d); "
+        "      if v = 0U then return 1; end; "
+        "      return 201; "
+        "    catch OverflowException => return 202; "
+        "    end; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §5.2 / #5345: boundary — uint(1m) must still succeed.
+BEZEL_TEST(decimal_to_uint_ushort_4802, uint_from_one_decimal_succeeds) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d: decimal := 1m; "
+        "    try "
+        "      var v: uint := uint(d); "
+        "      if v = 1U then return 1; end; "
+        "      return 201; "
+        "    catch OverflowException => return 202; "
+        "    end; "
+        "  end Main; "
+        "end C;"), 1);
+}
+
+// §5.2 / #5345: boundary — uint(uint.MaxValue) must still succeed.
+BEZEL_TEST(decimal_to_uint_ushort_4802, uint_from_uint_max_decimal_succeeds) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var d: decimal := 4294967295m; "
+        "    try "
+        "      var v: uint := uint(d); "
+        "      if v = 4294967295U then return 1; end; "
+        "      return 201; "
+        "    catch OverflowException => return 202; "
+        "    end; "
+        "  end Main; "
+        "end C;"), 1);
+}
