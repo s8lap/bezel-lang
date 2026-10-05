@@ -148,7 +148,22 @@ std::vector<Symbol*> collectParams(const std::vector<ast::Param>& params,
                                    SemaContext& ctx, ScopeId scope) {
     std::vector<Symbol*> out;
     out.reserve(params.size());
+    // fix #5367 (§22.1, v0.314): the names in one parameter list are distinct.
+    // Track seen names and report an error at the second occurrence.  The symbol
+    // is still registered so later passes have a well-formed type to resolve
+    // against; the diagnostic makes the program a compile error.
+    std::unordered_set<std::string_view> seenNames;
     for (const auto& p : params) {
+        if (!p.name.empty() && p.name != "_") {
+            if (seenNames.count(p.name) > 0) {
+                ctx.diagnostics().report(
+                    Severity::Error, p.loc,
+                    "duplicate parameter name `" + std::string(p.name) +
+                        "` in this parameter list (§22.1, v0.314)");
+            } else {
+                seenNames.insert(p.name);
+            }
+        }
         auto* sym = ctx.makeSymbol<ParameterSymbol>();
         sym->name = p.name;
         sym->modifier = p.modifier;

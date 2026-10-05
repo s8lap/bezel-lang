@@ -2819,12 +2819,12 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                 currentOuterType_->enclosingTypePath) +
                             "` \xe2\x80\x94 a nested type may not use "
                             "the enclosing type's type parameters "
-                            "(\xc2\xa7""11.6 / \xc2\xa7""14.1, v0.286; "
-                            "see issue #3584). Move `Tag` to module "
-                            "scope, declare `Tag` as its own generic "
-                            "(`class Tag<U>`) and pass `T` through, or "
-                            "make the enclosing class carry the field "
-                            "instead of the nested type");
+                            "(\xc2\xa7""11.6 / \xc2\xa7""14.1, v0.314). "
+                            "Declare `Tag` as its own generic "
+                            "(`class Tag<U>` and use `U` instead of `T`), "
+                            "move `Tag` to module scope, or make the "
+                            "enclosing class carry the field instead "
+                            "of the nested type");
                     ref.kind = TypeRef::Kind::Error;
                     return;
                 }
