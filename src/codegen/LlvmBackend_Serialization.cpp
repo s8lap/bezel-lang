@@ -1732,7 +1732,18 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
                                 llvm::Type::getDoubleTy(llvm_), {ptrTy()});
             llvm::Value* d = builder_.CreateCall(fn, {derPtr}, "deser.dbl");
             emitPendingCheck();  // fix #2378 — see the Byte case above.
-            return builder_.CreateFPTrunc(d, llvm::Type::getFloatTy(llvm_), "deser.f");
+            // stdlib §2.15 (v0.314, #5399): a float field whose double value
+            // is finite but overflows float (e.g. 3.5e38) raises
+            // SerializationException.  CreateFPTrunc silently produces inf,
+            // so truncate first and check if the result is infinite.
+            auto* fltTy = llvm::Type::getFloatTy(llvm_);
+            llvm::Value* f = builder_.CreateFPTrunc(d, fltTy, "deser.f");
+            llvm::Value* isInf = builder_.CreateOr(
+                builder_.CreateFCmpOEQ(f, llvm::ConstantFP::getInfinity(fltTy, false)),
+                builder_.CreateFCmpOEQ(f, llvm::ConstantFP::getInfinity(fltTy, true)),
+                "deser.f.isinf");
+            emitGuardThrow(isInf, "SerializationException");
+            return f;
         }
         case sema::PrimitiveType::Double: {
             auto* fn = declareC("bz_binder_read_float",
