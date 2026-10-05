@@ -5261,6 +5261,25 @@ llvm::Value* Emitter::decodeChannelItemWord(llvm::Value* rawPtr,
     // and the same TypeRef the encoder and the element disposer use.
     if (sema::isAggregateChannelElement(elemTy)) {
         llvm::Value* v = builder_.CreateLoad(valTy, rawPtr, prefix + ".val");
+        // fix #5413 / §30.14 / §30.15 / §28.11: before freeing the heap cell
+        // that holds an aggregate channel element, release every owned string
+        // field reachable from the element's type — the sender's scope-end
+        // disposal did not run on the transferred value (§30.15: Send consumes the
+        // value in the sending domain), so the receiver is the value's sole
+        // owner and must dispose its string fields. Records and choices may own
+        // string fields; inline arrays may carry string elements; decimal has no
+        // string fields and needs no disposal here.
+        if (elemTy->kind == sema::TypeRef::Kind::Named &&
+            elemTy->declaration) {
+            if (elemTy->declaration->kind == ast::TypeDeclKind::Record) {
+                emitRecordStringFieldReleases(rawPtr, elemTy);
+            } else if (elemTy->declaration->kind == ast::TypeDeclKind::Choice) {
+                emitChoiceStringFieldReleases(rawPtr, elemTy->declaration);
+            }
+        } else if (elemTy->kind == sema::TypeRef::Kind::InlineArray) {
+            emitInlineArrayStringReleases(rawPtr, elemTy);
+        }
+        // else: decimal or nullable non-record/choice — no string fields to release
         builder_.CreateCall(declareC("free", llvm::Type::getVoidTy(llvm_),
                                      {ptrTy()}),
                             {rawPtr});
