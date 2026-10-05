@@ -27,33 +27,6 @@ namespace {
 
 // §5: parse an integer literal's magnitude (ignoring base prefix,
 // underscores, and any type suffix). Returns true and the value via `out`
-// when it parses; saturates large hex/decimal in the rare overflow case
-// (which still exceeds int and is reported). Mirrors the codegen parser.
-bool intLiteralMagnitude(std::string_view text, unsigned long long& out) {
-    int base = 10;
-    std::size_t i = 0;
-    if (text.size() >= 2 && text[0] == '0') {
-        char b = text[1];
-        if (b == 'x' || b == 'X') { base = 16; i = 2; }
-        else if (b == 'b' || b == 'B') { base = 2; i = 2; }
-        else if (b == 'o' || b == 'O') { base = 8; i = 2; }
-    }
-    std::string digits;
-    for (; i < text.size(); ++i) {
-        char c = text[i];
-        if (c == '_') continue;
-        bool isDigit = (c >= '0' && c <= '9');
-        bool isHex =
-            isDigit || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-        if (base == 16 ? !isHex : !isDigit) break;  // stop at suffix letters
-        digits.push_back(c);
-    }
-    if (digits.empty()) return false;
-    errno = 0;
-    out = std::strtoull(digits.c_str(), nullptr, base);
-    return true;
-}
-
 // §4.3/§4.4 (v0.190, #1781): true iff the `m`/`M`-suffixed decimal literal
 // `text` denotes a value outside `decimal`'s range. Parses at compile time via
 // the runtime's `bz_decimal_parse_cstr` — the identical parser codegen uses

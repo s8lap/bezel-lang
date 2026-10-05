@@ -53,6 +53,34 @@ bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 // on underflow, and §4.3 (v0.313) errors only on a non-finite rounding, so
 // `5e-324` / `1e-400` / `1e-50f` (subnormal or zero) are in range.
 // The `double` overload is provided for callers that need a double result.
+
+// Parses an integer literal (decimal, hex 0x, octal 0o, binary 0b) and returns
+// its magnitude. Used to check exit-code overflow (§33.3) for Main(): int.
+inline bool intLiteralMagnitude(std::string_view text, unsigned long long& out) {
+    int base = 10;
+    std::size_t i = 0;
+    if (text.size() >= 2 && text[0] == '0') {
+        char b = text[1];
+        if (b == 'x' || b == 'X') { base = 16; i = 2; }
+        else if (b == 'b' || b == 'B') { base = 2; i = 2; }
+        else if (b == 'o' || b == 'O') { base = 8; i = 2; }
+    }
+    std::string digits;
+    for (; i < text.size(); ++i) {
+        char c = text[i];
+        if (c == '_') continue;
+        bool isDigit = (c >= '0' && c <= '9');
+        bool isHex =
+            isDigit || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (base == 16 ? !isHex : !isDigit) break;  // stop at suffix letters
+        digits.push_back(c);
+    }
+    if (digits.empty()) return false;
+    errno = 0;
+    out = std::strtoull(digits.c_str(), nullptr, base);
+    return true;
+}
+
 struct FloatLiteralResult {
     float       value;
     bool        overflow;

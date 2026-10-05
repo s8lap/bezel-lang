@@ -4011,6 +4011,27 @@ void ExprTC::checkReturnForm(const ast::ReturnStmt& rs) {
                     "this callable has a return type — `return;` "
                     "must provide a value (§21.7)");
             }
+            // fix #4641 (§33.3, v0.315): Main(): int return values exceeding
+            // 255 are truncated to 8 bits by the OS exit-status mechanism. Reject
+            // at compile time so the programmer's intent is preserved.
+            if (currentMethodDecl_ &&
+                currentMethodDecl_->name == "Main" &&
+                currentReturnType_ &&
+                currentReturnType_->kind == TypeRef::Kind::Primitive &&
+                currentReturnType_->primitive == PrimitiveType::Int &&
+                rs.value) {
+                if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(rs.value.get())) {
+                    unsigned long long mag = 0;
+                    if (intLiteralMagnitude(il->text, mag) && mag > 255) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, rs.span.begin,
+                            "Main(): int return value " + std::to_string(static_cast<unsigned long long>(mag)) +
+                            " exceeds the 8-bit process exit-code range (0-255); "
+                            "the OS truncates this to " + std::to_string(static_cast<unsigned>(mag & 0xFF)) +
+                            " (§33.3)");
+                    }
+                }
+            }
             return;
         case ReturnCtx::VoidMethod:
             // Iterator returns are rejected up front (§29.5); here only the
