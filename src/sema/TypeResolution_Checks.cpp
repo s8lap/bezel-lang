@@ -9796,8 +9796,40 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                         tArg = sema::substituteGenericArgs(const_cast<TypeRef*>(tArg), sa);
                     }
                     if (!typeRefEqual(bArg, tArg)) {
-                        allMatch = false;
-                        break;
+                        // fix #5424 (§14.2 rule 1, v0.315): inherited conformance.
+                        // When the inherited interface's type argument (tArg, e.g. GBase)
+                        // doesn't match the bare-parameter-substituted bound argument
+                        // (bArg, e.g. Derived), check if the candidate's declaration
+                        // is a subtype of tArg's declaration. If so, the inherited
+                        // conformance is valid (the candidate inherits from a class that
+                        // conforms to the interface).
+                        bool isSubtypeMatch = false;
+                        if (tArg && tArg->kind == TypeRef::Kind::Named &&
+                            tArg->declaration &&
+                            tArg->declaration->kind == ast::TypeDeclKind::Class) {
+                            // Walk up the base chain to check if argDecl is a subtype of tArgDecl
+                            TypeSymbol* argDecl = arg->declaration;
+                            TypeSymbol* tArgDecl = tArg->declaration;
+                            std::vector<TypeSymbol*> subFrontier{argDecl};
+                            std::unordered_set<TypeSymbol*> subSeen{argDecl};
+                            std::size_t si = 0;
+                            while (si < subFrontier.size()) {
+                                TypeSymbol* cur = subFrontier[si++];
+                                if (cur == tArgDecl) {
+                                    isSubtypeMatch = true;
+                                    break;
+                                }
+                                for (TypeSymbol* base : cur->baseTypes) {
+                                    if (base && subSeen.insert(base).second) {
+                                        subFrontier.push_back(base);
+                                    }
+                                }
+                            }
+                        }
+                        if (!isSubtypeMatch) {
+                            allMatch = false;
+                            break;
+                        }
                     }
                 } else if (!typeRefEqual(bArg, tRef->genericArgs[j])) {
                     allMatch = false;
