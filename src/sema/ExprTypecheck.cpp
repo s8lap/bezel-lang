@@ -5313,6 +5313,23 @@ void ExprTC::checkAssignable(
                                           to->primitive));
         return;
     }
+    // fix #4793 (stdlib §6.5, v0.307): SharedEventSource<T> deliberately does
+    // not implement IEvent<T> — an upcast would launder the capture-free
+    // requirement through IEvent<T>.Subscribe's capture-admitting `scoped`
+    // signature. Placed before the Named-Named block below since that block
+    // requires both declarations to be non-null, but both SharedEventSource
+    // and IEvent are builtins with null declarations.
+    if (from->kind == TypeRef::Kind::Named &&
+        to->kind == TypeRef::Kind::Named &&
+        from->headName() == "SharedEventSource" &&
+        to->headName() == "IEvent") {
+        reportNotConvertible(
+            "`SharedEventSource<T>` does not implement `IEvent<T>` "
+            "per stdlib §6.5 (v0.307): an upcast would launder the "
+            "capture-free requirement through `IEvent<T>.Subscribe`'s "
+            "capture-admitting `scoped` signature");
+        return;
+    }
     if (from->kind == TypeRef::Kind::Named &&
         to->kind == TypeRef::Kind::Named &&
         from->declaration && to->declaration) {
