@@ -10,10 +10,12 @@
 // a codegen truncation or a missed disposal in the field (the #1390 / #1406 /
 // v0.168-rename bug family this stage exists to kill).
 //
-// Each `kSnapshot*` array below is the EXACT set as it stood before the
-// migration; the negatives are near-neighbours from adjacent sets that must
-// stay out.  If a real stdlib addition changes a set, update BOTH the registry
-// table and the matching snapshot here in the same commit — that is the point.
+// Each `kSnapshot*` array below pins a registry table's CURRENT membership;
+// the negatives are near-neighbours from adjacent sets that must stay out, plus
+// — since the R27 gate cycle — every name a later pick REMOVED, each annotated
+// with the pick that removed it.  If a real stdlib addition changes a set,
+// update BOTH the registry table and the matching snapshot here in the same
+// commit — that is the point.
 
 #include "test_harness.hpp"
 
@@ -23,6 +25,45 @@
 #include <string_view>
 
 using namespace bezel::common;
+
+// A snapshot row is a bare builtin name, but `BEZEL_EXPECT_TRUE` reports only
+// the source LINE — so a name that had left its registry set surfaced as
+// "assertion failed: isHeapPointerReferenceBuiltin(n) (...:517)", with nothing
+// naming WHICH builtin had drifted and no way to tell a 73-row set's one
+// changed row from a wholesale table corruption. This wrapper evaluates the
+// membership claim ONCE, names the offending row, and fails the test exactly
+// as the bare macro does. It adds no tolerance: the claim itself is still
+// spelled out by hand, both directions, on every row.
+//
+// A REGISTRY CHANGE IS A TEST CHANGE. Every pick that adds, drops or renames a
+// name in src/common/BuiltinRegistry.cpp must edit the matching `kSnapshot*`
+// in the SAME commit — and a name that is REMOVED is pinned as an explicit
+// negative, naming the pick that removed it, rather than deleted. A deletion
+// makes the test pass and leaves nothing recording the decision: the next
+// pick to re-add the name is caught by the negative, not by a green test that
+// says the name was never there. That asymmetry is the whole reason the four
+// sets below drifted (three picks, one gate cycle) while every assertion in
+// this file was still "correct" against its own stale array.
+#define SNAPSHOT_MEMBERSHIP(pred, n)                                            \
+    do {                                                                       \
+        if (!(pred(n))) {                                                      \
+            ::bezel::test::currentTestFailed() = true;                         \
+            std::cout << "    snapshot row drifted: " #pred "(\"" << (n)      \
+                      << "\") is false\n";                                     \
+        }                                                                      \
+    } while (false)
+
+// The negative direction, for the same reason: a name that has wrongly JOINED a
+// set is as much a drift as one that has wrongly left it, and the two must be
+// reported the same legibly.
+#define SNAPSHOT_NON_MEMBERSHIP(pred, n)                                        \
+    do {                                                                       \
+        if ((pred(n))) {                                                       \
+            ::bezel::test::currentTestFailed() = true;                         \
+            std::cout << "    snapshot row drifted: " #pred "(\"" << (n)      \
+                      << "\") is true but must stay out\n";                    \
+        }                                                                      \
+    } while (false)
 
 // --- isOwningCollectionHead (§28.6/§5.11) : the element-owning collections ---
 BEZEL_TEST(builtin_registry_snapshot, owning_collection_head_set) {
@@ -502,7 +543,12 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         "ISharedEvent", "SharedEventSource",
         "Mutex", "Lock", "Semaphore", "SemaphoreToken",
         "TaskCompletionSource", "OwningTaskCompletionSource",
-        "Atomic", "AtomicInteger", "Buffer",
+        // fix #5390 (§2.3, v0.314) renamed the builtin `Buffer<T>` to the
+        // internal-only `__Buffer<T>`: §2.3's always-available table does not
+        // list Buffer, so no stdlib module declares it and `builtinTypeArity`
+        // answered 1 for an impl-ahead-of-spec intrinsic. The heap row is the
+        // same bz_array_t* rep either way, so the row is RENAMED, not dropped.
+        "Atomic", "AtomicInteger", "__Buffer",
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
         "BinarySerializer", "BinaryDeserializer", "JsonSerializer",
         "JsonDeserializer",
@@ -514,7 +560,7 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         // through to the i32 default instead of ptr.
         "IDisposable", "IAsyncDisposable", "IFormattable",
     };
-    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isHeapPointerReferenceBuiltin(n));
+    for (auto n : kSnapshot) SNAPSHOT_MEMBERSHIP(isHeapPointerReferenceBuiltin, n);
     // The site-local deltas must NOT be in the shared set. (OwningBuffer was
     // historically here; fix #1740 promoted it to the heap table since it IS a
     // heap-owning collection — see the OwningArray twin directly above.)
@@ -526,6 +572,20 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
                                "ReadOnlySpan", "ArraySpan", "ReadOnlyStringSpan",
                                "JsonOptions", "Boolean", ""})
         BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
+    // REMOVED by fix #5390 (§2.3, v0.314) — pinned rather than deleted. The
+    // user-spellable `Buffer` is no longer a builtin at all: `builtinTypeArity`
+    // answers kNotBuiltin for it and `Buffer<int>` in user source is an
+    // unresolved type, so it cannot lower to the shared ptr rep either. Only
+    // the internal-only `__Buffer` spelling (pinned above) is a member. Without
+    // this row a later pick could re-add `Buffer` and the positive-only loop
+    // would stay green, which is precisely how the three R27 picks that broke
+    // this file were able to land unnoticed.
+    for (std::string_view n : {"Buffer"})
+        BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
+    // Every heap row is a RESERVED name (the heap half IS the first clause of
+    // `isReservedBuiltinTypeName`) — the reverse half of the derivation the
+    // non-heap snapshot checks below, so the two halves cannot drift apart.
+    for (auto n : kSnapshot) SNAPSHOT_MEMBERSHIP(isReservedBuiltinTypeName, n);
 }
 
 // --- isReservedBuiltinTypeName (#2757 / §7.1 / §14.1): the COMPLETE reserved
@@ -565,7 +625,7 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
         "ExceptionInfo",
     };
     for (auto n : kNonHeapSnapshot) {
-        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+        SNAPSHOT_MEMBERSHIP(isReservedBuiltinTypeName, n);
         // ...and each is genuinely OUTSIDE the heap table (no redundancy: if one
         // of these were also in the heap set, the split would be meaningless).
         BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
@@ -583,7 +643,7 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
                                "BinaryDeserializer", "JsonSerializer",
                                "JsonDeserializer",
                                "Array", "Dictionary", "Task", "Shared",
-                               "Mutex", "Buffer", "IGrouping",
+                               "Mutex", "__Buffer", "IGrouping",
                                // #4178: IOrderedEnumerable<T> joined the heap
                                // table alongside its sibling IGrouping above.
                                "IOrderedEnumerable"})
@@ -607,6 +667,26 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
     // which is not a duplicated name list and so cannot drift from a table.
     for (std::string_view n : {"Exception", "ArgumentException", "IOException"})
         BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+    // (f) OUT since fix #5390 (§2.3, v0.314): the user-spellable `Buffer` is
+    // no longer a builtin type name — §2.3's always-available table does not
+    // list it, so it is reserved only under the internal-only `__Buffer`
+    // spelling (pinned in (b) above). Pinned as a negative so the rename is a
+    // recorded fact rather than a silent disappearance from (b).
+    for (std::string_view n : {"Buffer"})
+        BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+    // (g) The reserved set is exactly the DISJOINT union of the two halves, so
+    // the reserved set is DERIVED from them rather than hand-kept a third time.
+    // Both directions are load-bearing and both are pinned:
+    //   - (a) already asserts every non-heap row is reserved and NOT a heap
+    //     pointer — i.e. nonHeap ∩ heap = ∅, which is the whole disjointness
+    //     claim (it is symmetric, so no second direction is needed here);
+    //   - the heap snapshot's own test asserts every one of its 73 rows is
+    //     reserved, i.e. heap ⊆ reserved.
+    // What neither can give is the reverse — a name reserved through NEITHER
+    // half is invisible to a positive-only snapshot. See the note on
+    // `SNAPSHOT_MEMBERSHIP` at the top of this file: closing that gap needs an
+    // enumeration API on BuiltinRegistry.hpp, which is a compiler change and
+    // not a test change.
 }
 
 // --- isVtableLessBuiltinClassName (#2921 / #2923; spec §8.1 / §8.5 / §28.2 /
@@ -656,12 +736,16 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
                                "Mutex", "Lock", "Semaphore", "SemaphoreToken",
                                "TaskCompletionSource",
                                "OwningTaskCompletionSource",
-                               "Atomic", "AtomicInteger", "Buffer",
+                               // fix #5390 (§2.3, v0.314): `Buffer` renamed to
+                               // the internal-only `__Buffer`; same bz_array_t*
+                               // rep, so the same vtable-less treatment. The
+                               // user-spellable `Buffer` is pinned OUT in (e).
+                               "Atomic", "AtomicInteger", "__Buffer",
                                "OwningBuffer", "BinarySerializer",
                                "BinaryDeserializer", "JsonSerializer",
                                "JsonDeserializer", "CString", "WString",
                                "RawBytes"})
-        BEZEL_EXPECT_TRUE(isVtableLessBuiltinClassName(n));
+        SNAPSHOT_MEMBERSHIP(isVtableLessBuiltinClassName, n);
     // (b) OUT: every reserved INTERFACE head — the receivers that may hold a
     // user class and must keep dispatching through its vtable. This is the
     // whole content of the subtraction, so it is pinned name-for-name.
@@ -697,6 +781,12 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
     // that reason, which this pins.
     for (std::string_view n : {"Exception", "ArgumentException", "IOException",
                                "DisposedAccessException"})
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+    // (e) OUT since fix #5390 (§2.3, v0.314): the user-spellable `Buffer` is
+    // no longer a builtin type name, so it is not a reserved name and cannot
+    // be a reserved built-in class. Pinned as a negative so the rename is
+    // recorded rather than being a silent drop from (a) above.
+    for (std::string_view n : {"Buffer"})
         BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
 }
 
@@ -764,7 +854,8 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
                                "Mutex", "Lock", "Semaphore", "SemaphoreToken",
                                "TaskCompletionSource",
                                "OwningTaskCompletionSource",
-                               "Atomic", "AtomicInteger", "Buffer",
+                               // fix #5390 (§2.3, v0.314): `Buffer` -> `__Buffer`.
+                               "Atomic", "AtomicInteger", "__Buffer",
                                "OwningBuffer", "BinarySerializer",
                                "BinaryDeserializer", "JsonSerializer",
                                "JsonDeserializer", "CString", "WString",
@@ -1059,21 +1150,35 @@ BEZEL_TEST(builtin_registry_snapshot,
 //     and that the narrow #4766 typing arm in `ExprTypecheck_Calls.cpp`
 //     `resolveMemberAccess` answers for. Transcribed verbatim from the inline
 //     name list the #4833 consolidation removed; the negatives are heads that
-//     the UPPER arm at ~20867 handles (Set/OwningSet/LinkedList/OwningLinkedList/
-//     Dictionary/OwningDictionary declare `Count`, not `Length`), plus the
-//     builtins the property-type axis intentionally excludes (Channel, the
-//     §2.x value records, the task family, the FFI/value types). ---
+//     the UPPER arm at ~20867 handles (they declare `Count`, not `Length`),
+//     plus the builtins the property-type axis intentionally excludes (Channel,
+//     the §2.x value records, the task family, the FFI/value types).
+//
+//     SHRUNK from 9 rows to 3 by two R27 picks, both spec rulings that stand:
+//       - fix #4811 (ba980cfa, stdlib §4.4, v0.315) removed Array/OwningArray.
+//         The Count-vs-Length convention (stdlib §4.4 p.74) gives resizable
+//         Array<T> `Count` ONLY — "which is why the resizable Array<T> says
+//         Count where .NET's fixed array says Length" — so `Array<T>.Length` is
+//         an error, not a typed read.
+//       - fix #5416 (393cd85f, stdlib §4.11, v0.315) removed Stack/OwningStack
+//         and Queue/OwningQueue for the same reason: those four declare `Count`
+//         (via IReadOnlyCollection<T>), not `Length`.
+//     Both groups MOVED rather than vanished: they are still builtin collection
+//     heads, and `.Count` on them is typed by the UPPER arm — which is why they
+//     are pinned as negatives below instead of being dropped, and why they also
+//     appear as negatives in `isBuiltinIntCountPropertyHead` below. What is left
+//     is the three heads that genuinely declare `Length`. ---
 BEZEL_TEST(builtin_registry_snapshot, builtin_int_length_property_head_set) {
-    static constexpr std::array<std::string_view, 9> kSnapshot = {
-        "Array", "OwningArray",
-        "Stack", "OwningStack",
-        "Queue", "OwningQueue",
+    static constexpr std::array<std::string_view, 3> kSnapshot = {
+        // §3.1 StringBuilder
         "StringBuilder",
+        // §4.14 OwningBuffer<T>
         "OwningBuffer",
+        // §4.19 FrozenArray<T> (annotation shape only)
         "FrozenArray",
     };
     for (auto n : kSnapshot)
-        BEZEL_EXPECT_TRUE(isBuiltinIntLengthPropertyHead(n));
+        SNAPSHOT_MEMBERSHIP(isBuiltinIntLengthPropertyHead, n);
     // Heads that declare `Count` (not `Length`) — handled by the upper arm
     // and/or by `isBuiltinIntCountPropertyHead` below — must stay OUT.
     for (std::string_view n : {"Set", "OwningSet", "LinkedList",
@@ -1082,6 +1187,31 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_int_length_property_head_set) {
                                "SortedSet", "Channel", "CString", "WString",
                                "RawBytes", "string", "int", "Task", ""})
         BEZEL_EXPECT_FALSE(isBuiltinIntLengthPropertyHead(n));
+    // MOVED OUT, pinned as negatives (see the header):
+    //   - fix #4811 (ba980cfa, stdlib §4.4, v0.315) — Array<T> is resizable
+    //     and says `Count`, never `Length`.
+    //   - fix #5416 (393cd85f, stdlib §4.11, v0.315) — Stack<T>/Queue<T> and
+    //     their Owning* forms declare `Count` via IReadOnlyCollection<T>.
+    // These are the two picks that made `Array<T>.Length` / `Stack<T>.Length` /
+    // `Queue<T>.Length` compile errors, so the registry must NOT grow a `Length`
+    // arm for them again without a spec change that reverses the ruling.
+    for (std::string_view n : {"Array", "OwningArray", "Stack", "OwningStack",
+                               "Queue", "OwningQueue"})
+        BEZEL_EXPECT_FALSE(isBuiltinIntLengthPropertyHead(n));
+    // DERIVED, not hand-listed: `Length` and `Count` are the two answers to one
+    // question, and a builtin head declares exactly one of them. Asserting the
+    // two snapshots are disjoint turns that into a mechanical fact — a later
+    // pick that adds a head to one table while editing only that table's
+    // snapshot is caught here, at the pair, rather than by whichever test
+    // happens to mention the name.
+    static constexpr std::array<std::string_view, 3> kCountHeads = {
+        "SortedDictionary", "SortedSet", "Channel",
+    };
+    for (auto n : kSnapshot) SNAPSHOT_NON_MEMBERSHIP(isBuiltinIntCountPropertyHead, n);
+    for (auto n : kCountHeads) SNAPSHOT_NON_MEMBERSHIP(isBuiltinIntLengthPropertyHead, n);
+    // ...and each `Count` row is a real member, so the exclusion above is a
+    // genuine two-way split and not a pair of empty lists.
+    for (auto n : kCountHeads) SNAPSHOT_MEMBERSHIP(isBuiltinIntCountPropertyHead, n);
 }
 
 // --- isBuiltinIntCountPropertyHead (fix #4766 / #4833, §5.1, v0.307): the
