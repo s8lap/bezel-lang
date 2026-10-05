@@ -104,7 +104,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "  using var b := new Box(); "
         "  const t := b.ToArray(); "
         "  const s := b.Sorted(); "
-        "  return t.Length + s.Length; "
+        "  return t.Count + s.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 2);
 }
@@ -125,7 +125,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "class C public static method Main(): int "
         "  using var b := new Box(); "
         "  const t := b.ToArray(); "
-        "  return t.Length; "
+        "  return t.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 1);
 }
@@ -170,7 +170,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "  using var b := new Box(); "
         "  const s := b.Sorted(); "
         "  const r := b.Reversed(); "
-        "  return s.Length + r.Length; "
+        "  return s.Count + r.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 4);
 }
@@ -192,7 +192,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "class C public static method Main(): int "
         "  using var d := new Doc(); "
         "  const p := d.Split(\",\"); "
-        "  return p.Length; "
+        "  return p.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 2);
 }
@@ -287,7 +287,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "  var total := 0; "
         "  for var i in 0..300 do "
         "    var t := m.ToArray(); "
-        "    total := total + t.Length; "
+        "    total := total + t.Count; "
         "  end for; "
         "  return total mod 251; "
         "end Main; end C;";
@@ -323,7 +323,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "  using var src := new Src(); "
         "  using var cfg := new Cfg(); "
         "  const p := cfg.Split(src); "
-        "  return p.Length; "
+        "  return p.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 2);
 }
@@ -353,7 +353,7 @@ BEZEL_TEST(codegen_user_method_shadows_materializer_name_double_free_4653,
         "class C public static method Main(): int "
         "  using var s := new Src(); "
         "  var t := s.GroupBy(1).ToArray(); "
-        "  return t.Length; "
+        "  return t.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 1);
 }

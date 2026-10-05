@@ -57,7 +57,7 @@ BEZEL_TEST(substitute_generic_args_unified_walker_4212,
         "    var d := new Derived4212(); "
         "    var a := d.Get(); "
         "    if a = null then return 0; end; "
-        "    return a.Length; "
+        "    return a.Count; "
         "  end Main; "
         "end C;";
     auto r = runAot(prog);
@@ -78,7 +78,7 @@ BEZEL_TEST(substitute_generic_args_unified_walker_4212,
         "public static class C "
         "  public static method Main(): int "
         "    var b := new Box4212<int>(); "
-        "    return b.V.Length; "
+        "    return b.V.Count; "
         "  end Main; "
         "end C;";
     auto r = runAot(prog);
