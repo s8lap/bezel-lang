@@ -24444,6 +24444,14 @@ void Emitter::collectMoveOnlyArrayTransferred(
 // keeps the producer/consumer balance entirely inside codegen.
 bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     if (!init) return false;
+    // fix #5321 / §23.3 / §28.9: sentinel returned by inlinedGetterBody
+    // for a multi-statement block getter where ALL return statements are
+    // +1 string producers. The sentinel is a non-null, non-dereferenceable
+    // pointer (reinterpret_cast<const Expr*>(1)) that signals "treat this
+    // as a producer" without needing to return a real Expr*.
+    static const ast::Expr* const kMultiStmtProducerSentinel =
+        reinterpret_cast<const ast::Expr*>(1);
+    if (init == kMultiStmtProducerSentinel) return true;
     if (dynamic_cast<const ast::InterpolatedStringExpr*>(init)) return true;
     // fix #1934 / §19.2 / §28.3 (producers arm-meet, v0.184) / §28.9: an
     // expression-position `case`/`when` whose result is a non-nullable owned
@@ -25386,7 +25394,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // lowerPropertyRead / the `?.` read lower in place (#2304 / #2704); null
     // when there is none to inspect (an imported or auto property).
     auto inlinedGetterBody =
-        [](const sema::PropertySymbol* ps) -> const ast::Expr* {
+        [this](const sema::PropertySymbol* ps) -> const ast::Expr* {
         // Inline the predicate that computedGetterOf keys on
         // (isPlusOneStringProducer is `const`, but computedGetterOf
         // is not — duplicating the small constant-time check here
@@ -25438,14 +25446,61 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // getter classifies as false here and the
                     // call site retains at bind / releases at
                     // scope end as today.
+                    // fix #5321 / §23.3 / §28.9: extend to also
+                    // handle MULTI-STATEMENT block getters where
+                    // ALL return statements return +1 string
+                    // producers. In that case, every path through
+                    // the getter hands back +1 (not a borrow), so
+                    // the getter as a whole is a producer. (When
+                    // not all returns are producers, conservatively
+                    // stay in the borrow path.)
                     if (!acc.isSet &&
                         acc.bodyKind ==
                             ast::PropertyAccessorBodyKind::Block &&
-                        acc.stmts.size() == 1) {
-                        auto* rs = dynamic_cast<const ast::ReturnStmt*>(
-                            acc.stmts[0].get());
-                        if (rs && rs->value)
-                            getter = rs->value.get();
+                        !acc.stmts.empty()) {
+                        // fix #5321 / §23.3 / §28.9: recursively collect ALL
+                        // ReturnStmt nodes from the statement tree (if/elif/else,
+                        // while, for, do-end, try/catch/finally, case). A return
+                        // inside a nested branch IS a return path of the getter.
+                        std::vector<const ast::ReturnStmt*> allReturns;
+                        std::function<void(const ast::Stmt*)> collectReturns =
+                            [&](const ast::Stmt* s) {
+                                if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                                    allReturns.push_back(rs);
+                                } else if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                                    for (auto& b : is->ifBranch.body) collectReturns(b.get());
+                                    for (auto& br : is->elifBranches)
+                                        for (auto& b : br.body) collectReturns(b.get());
+                                    for (auto& b : is->elseBody) collectReturns(b.get());
+                                } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                                    for (auto& b : ws->body) collectReturns(b.get());
+                                } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                                    for (auto& b : fs->body) collectReturns(b.get());
+                                } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                                    for (auto& b : d->body) collectReturns(b.get());
+                                } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                                    for (auto& b : ts->body) collectReturns(b.get());
+                                    for (auto& c : ts->catches) collectReturns(c.body.get());
+                                    for (auto& b : ts->finallyBody) collectReturns(b.get());
+                                } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                                    for (auto& arm : cs->arms)
+                                        for (auto& a : arm.stmts) collectReturns(a.get());
+                                }
+                            };
+                        for (const auto& stmt : acc.stmts) collectReturns(stmt.get());
+                        bool allReturnsAreProducers = true;
+                        for (const ast::ReturnStmt* rs : allReturns) {
+                            if (!rs->value || !isPlusOneStringProducer(rs->value.get())) {
+                                allReturnsAreProducers = false;
+                                break;
+                            }
+                        }
+                        if (allReturnsAreProducers && !allReturns.empty()) {
+                            getter = reinterpret_cast<const ast::Expr*>(1);  // sentinel: non-null, never dereferenced
+                            break;
+                        }
+                        // Multi-statement body where not all returns are producers
+                        // (or there are no returns at all): stay in borrow path.
                         break;
                     }
                 }
@@ -25711,6 +25766,21 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     tElem->primitive == sema::PrimitiveType::String &&
                     !tElem->nullable)
                     return true;
+            }
+        }
+        // fix #5321 / §23.3 / §28.9: a string-returning PROPERTY READ
+        // (MemberAccessExpr) where the getter is a block-bodied multi-statement
+        // body and ALL return statements return +1 string producers. The
+        // blockGetterOf path in LlvmBackend_Exprs.cpp checks
+        // isPlusOneStringProducer on the MemberAccessExpr to decide whether
+        // to arm the string refcount on the getter call result.
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+        if (ps && !ps->isIndexer) {
+            const sema::TypeRef* ty = ctx_.exprType(*ma);
+            if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
+                ty->primitive == sema::PrimitiveType::String) {
+                const ast::Expr* getter = inlinedGetterBody(ps);
+                if (getter && isPlusOneStringProducer(getter)) return true;
             }
         }
     }
