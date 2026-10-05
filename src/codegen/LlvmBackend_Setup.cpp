@@ -25704,6 +25704,73 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #5324 (§23.2 / §28.9, v0.313): a BARE identifier inside an instance
+    // method that resolves to a computed `string` property was NOT handled by
+    // isPlusOneStringProducer's MemberAccessExpr arm — that arm covers `k.P`
+    // (explicit receiver) but not the bare `Fr` form where the receiver is
+    // implicit `this`. A bare identifier `Fr` inside `BareFr()` resolves to
+    // the property `Fr: string => "w" + _f` via the symbol table, but the
+    // result is an IdentifierExpr, not a MemberAccessExpr — so the arm below
+    // never fires. The getter body `"w" + _f` IS a +1 string producer
+    // (recognized by the binary `+` arm), but without a dedicated IdentifierExpr
+    // arm the whole expression is conservatively classified as a borrow. The
+    // consumer (a `var x := Fr` local) retains it at bind (adding an extra +1)
+    // and releases it at scope end (dropping only the consumer's retain) — the
+    // producer's original +1 is never discharged, leaking 7490 B / 400 allocs
+    // on 200 iterations.
+    //
+    // THE FIX. Added this IdentifierExpr arm that mirrors the MemberAccessExpr
+    // arm's logic for a non-virtual, non-interface, non-imported string
+    // property: extract the inlined getter body and, if that body is itself
+    // a +1 string producer, admit the bare identifier read as a +1 producer
+    // too. This allows the consumer to transfer the reference without an extra
+    // retain, and the scope-end release correctly drops exactly one reference.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(init)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            if (!ps->isIndexer) {
+                bool isStatic = std::any_of(ps->modifiers.begin(),
+                                            ps->modifiers.end(),
+                                            [](const auto& m){ return m == "static"; });
+                if (!isStatic) {
+                    const sema::TypeRef* ty = ctx_.exprType(*id);
+                    if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
+                        ty->primitive == sema::PrimitiveType::String) {
+                        // Inline inlinedGetterBody(ps) — same predicate as the
+                        // MemberAccessExpr arm's lambda (duplicated here because
+                        // this arm is added after that lambda's scope ends).
+                        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                        const ast::Expr* getter = nullptr;
+                        if (pd && !pd->isIndexer) {
+                            if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+                                getter = pd->exprBody.get();
+                            else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                                for (const auto& acc : pd->accessors) {
+                                    if (!acc.isSet &&
+                                        acc.bodyKind ==
+                                            ast::PropertyAccessorBodyKind::Expression) {
+                                        getter = acc.exprBody.get();
+                                        break;
+                                    }
+                                    if (!acc.isSet &&
+                                        acc.bodyKind ==
+                                            ast::PropertyAccessorBodyKind::Block &&
+                                        acc.stmts.size() == 1) {
+                                        auto* rs = dynamic_cast<const ast::ReturnStmt*>(
+                                            acc.stmts[0].get());
+                                        if (rs && rs->value)
+                                            getter = rs->value.get();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (getter && isPlusOneStringProducer(getter)) return true;
+                    }
+                }
+            }
+        }
+    }
     return false;
 }
 
