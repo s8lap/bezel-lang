@@ -10993,6 +10993,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "Directory") {
                         if (m == "Exists")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // §7.4: GetFiles / GetDirectories → owned Array<string>.
+                        else if (m == "GetFiles" || m == "GetDirectories")
+                            ctx_.setExprType(
+                                &ce, makeConcreteCollectionResult(
+                                    "Array", ctx_.primitiveTypeRef(P::String)));
+                    }
+                    // §2.4 Environment static methods.
+                    if (colName == "Environment") {
+                        // Variables() → owned Dictionary<string, string>.
+                        if (m == "Variables")
+                            ctx_.setExprType(
+                                &ce, makeDictResult(
+                                    ctx_.primitiveTypeRef(P::String),
+                                    ctx_.primitiveTypeRef(P::String)));
                     }
                     // §2.5: DateTime/TimeSpan static properties/methods. Scalar
                     // i64 value types; builtinClassSym carries the name so later
