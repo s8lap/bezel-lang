@@ -9544,6 +9544,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // Only check base types if the element has a declaration
                             // (primitives have no declaration and are handled by the
                             // primitive check above; they never reach this loop).
+                            bool baseTypeRefsHasIComparableEntry = false;
                             if (elemTy472->declaration) {
                                 for (const TypeRef* bt :
                                          elemTy472->declaration->baseTypeRefs) {
@@ -9552,6 +9553,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         bt->declaration != icomparableSym ||
                                         bt->genericArgs.size() != 1)
                                         continue;
+                                    baseTypeRefsHasIComparableEntry = true;
                                     // Substitute the base type's generic arg with the
                                     // element type's substitution map, then compare
                                     // against the concrete element type.
@@ -9563,6 +9565,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         break;
                                     }
                                 }
+                            }
+                            // fix #3139 (§2.5, family F1 of #3152, v0.276):
+                            // fallback for IMPORTED classes where `baseTypeRefs`
+                            // may not carry the synthesized IComparable entry
+                            // (which lives in `baseTypes` on the symbol, readable
+                            // via `declaresBuiltinInterface`).  This fallback ONLY
+                            // fires when `baseTypeRefs` is genuinely absent of
+                            // IComparable entries — if the loop above ran and found
+                            // IComparable but with a mismatched type argument, the
+                            // class is correctly rejected (the #2772 item 2 strict
+                            // check).  The fallback is the conservative #3139 position
+                            // for the imported-side case where we cannot verify the
+                            // type argument; it is intentionally less precise than
+                            // the local-class strict path.
+                            if (!isComparableElem && elemTy472 &&
+                                elemTy472->kind == TypeRef::Kind::Named &&
+                                elemTy472->declaration &&
+                                !baseTypeRefsHasIComparableEntry &&
+                                declaresBuiltinInterface(elemTy472->declaration,
+                                                        "IComparable")) {
+                                isComparableElem = true;
                             }
                             // fix #2768 (stdlib §4.4 / §2.8, spec §14.2,
                             // v0.240): (c) an INTERFACE element that names
