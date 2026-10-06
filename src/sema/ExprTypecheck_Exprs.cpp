@@ -2715,6 +2715,25 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // resolveMemberAccess sees the chain-head stamp and
                 // produces the primitive dispatch result rather than the
                 // "unresolved" failure path.
+            } else if (isStaticCtxInstanceMemberOfEnclosingType(id->name)) {
+                // §2.7 (v0.315), *Through nesting*: the name is NOT undefined —
+                // it is an accessible instance member of the enclosing type,
+                // reached by bare name from a body that is static, and a static
+                // body has no `this` to reach it through. `lookupName` already
+                // declined it (its static-context filter), so this is the SAME
+                // rejection `lookupName` produces today; only the wording
+                // changes, to name the rule the spec says it must name
+                // ("a compile error naming this rule") rather than implying the
+                // member does not exist. Every other unresolved bare name still
+                // falls to the generic message below.
+                //
+                // The remedy is the one §2.7 gives: reach it through an
+                // instance (`o.M()`), or make it `static`.
+                ctx_.diagnostics().report(
+                    Severity::Error, id->span.begin,
+                    std::string("`") + std::string(id->name) +
+                    "` is an instance member of the enclosing type; a static "
+                    "body has no `this` to reach it through \xC2\xA7""2.7");
             } else {
                 ctx_.diagnostics().report(
                     Severity::Error, id->span.begin,

@@ -2372,6 +2372,26 @@ private:
     // interfaces is a separate slice.
     Symbol* lookupMember(TypeSymbol* type, std::string_view name) const;
 
+    // §2.7 (v0.315): is `name` an accessible INSTANCE member of the current
+    // enclosing type (its own or an inherited one) reached from a STATIC body?
+    //
+    // This is the §2.7 *Through nesting* rule the compiler already ENFORCES:
+    // `lookupName` returns nullptr for exactly this case (see its two
+    // `inStaticMember_` filters), which is what turns the bare name into a
+    // compile error. The predicate exists so the diagnostic can NAME that case
+    // instead of reporting the name as undefined — the name is not undefined,
+    // it is an instance member a static body has no `this` to reach it through.
+    //
+    // §22.10 (v0.315) primary-constructor parameters are EXCLUDED: a capture
+    // field is not a member (§22.10's own words), so a bare `count` in a static
+    // body is a §22.10 rejection and keeps its existing wording. Only plain
+    // instance FIELDS are in scope here — the static-context filter in
+    // `lookupName` never declines an instance method or property (they resolve
+    // and are diagnosed elsewhere), so widening this to them would change a
+    // verdict this lane must not change.
+    bool isStaticCtxInstanceMemberOfEnclosingType(
+        std::string_view name) const;
+
     // §26.5: extension-member lookup. Consulted ONLY when no instance member
     // matches (instance members win — an extension never shadows a real
     // member). Searches the module's ExtensionSymbols for one whose target

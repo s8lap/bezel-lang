@@ -11837,6 +11837,37 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
     return nullptr;
 }
 
+// §2.7 (v0.315), *Through nesting*: "A bare reference to an enclosing type's
+// **instance** member is a compile error naming this rule, for the reason a
+// static body cannot make one: the nested type's body has no instance of the
+// enclosing type." `lookupName` above already ENFORCES the static-context half
+// of that sentence for instance fields (its two `inStaticMember_` filters
+// return nullptr). This predicate re-derives the same question so the
+// diagnostic can NAME the rule instead of calling a perfectly well-declared
+// member "unresolved".
+//
+// It deliberately mirrors `lookupName`'s filter rather than widening it:
+//   - only a FieldSymbol (an instance method/property resolves normally and
+//     is diagnosed on its own path — this lane changes no verdict);
+//   - not a §22.10 primary-constructor capture field (`posParam`): §22.10 says
+//     outright that "a capture field is not a member", so that case is a §22.10
+//     rejection and keeps its existing wording;
+//   - not `static` — a static field in a static body is legal (§2.7 admits
+//     static members by bare name).
+// So a true result always co-occurs with a name `lookupName` declines: this
+// re-labels an existing rejection, it never creates or removes one.
+bool ExprTC::isStaticCtxInstanceMemberOfEnclosingType(
+    std::string_view name) const {
+    if (!inStaticMember_ || !currentType_) return false;
+    Symbol* m = lookupMember(currentType_, name);
+    auto* fs = dynamic_cast<FieldSymbol*>(m);
+    if (!fs) return false;
+    if (fs->posParam) return false;   // §22.10 — a capture field is not a member
+    for (auto mod : fs->modifiers)
+        if (mod == "static") return false;   // §2.7 — static members are admitted
+    return true;
+}
+
 // §31.1 / §31.2.1 (v0.243, proposal 0080, #3046): is `ty` the built-in
 // `Exception` or a CLASS deriving from it? This is the ONE predicate the
 // throw-operand rule (§31.1) and the catch-arm-type rule (§31.2.1) both ask,
