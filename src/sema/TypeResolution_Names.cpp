@@ -3403,14 +3403,33 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             // A bare marker is Named with declaration=nullptr;
                             // argSatisfiesTypeBound identifies it by kind+decl,
                             // not by name.
-                            TypeRef bareMarker;
-                            bareMarker.kind = TypeRef::Kind::Named;
-                            bareMarker.declaration = nullptr;
-                            TypeRef iComparableBound;
-                            iComparableBound.kind = TypeRef::Kind::Named;
-                            iComparableBound.declaration =
+                            //
+                            // fix-forward #5424: both TypeRefs are allocated
+                            // from the context, NOT on the stack. The Named
+                            // arm DEFERS the failure below (the key class may
+                            // be declared after this use, so its base list is
+                            // still empty here), and the deferred entry keeps a
+                            // raw `bound` pointer that recheckDeferredTypeBounds
+                            // dereferences after this frame is long gone. Stack
+                            // storage made that a dangling read: the recheck saw
+                            // a recycled stack slot, so `genericArgs` came back
+                            // as garbage (MEASURED: 1 element at defer time,
+                            // 17590550462694 at recheck) and the recheck
+                            // reported the very §14.2 violation the deferral
+                            // exists to re-adjudicate — the declaration-order
+                            // dependence #5424 names. makeTypeRef storage is
+                            // stable for the context's lifetime, which is what
+                            // DeferredTypeBoundFailure's `arg`/`bound` pointers
+                            // already assume.
+                            TypeRef* bareMarker = ctx_.makeTypeRef();
+                            bareMarker->kind = TypeRef::Kind::Named;
+                            bareMarker->declaration = nullptr;
+                            TypeRef* iComparableBound = ctx_.makeTypeRef();
+                            iComparableBound->kind = TypeRef::Kind::Named;
+                            iComparableBound->declaration =
                                 ctx_.builtinInterfaceSym("IComparable");
-                            iComparableBound.genericArgs.push_back(&bareMarker);
+                            iComparableBound->genericArgs.push_back(
+                                bareMarker);
                             std::string argName = "<type>";
                             if (arg && arg->kind == TypeRef::Kind::Named) {
                                 argName = std::string(arg->headName());
@@ -3422,7 +3441,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                             if (arg && arg->kind == TypeRef::Kind::Primitive) {
                                 if (primitiveConformsToBuiltinInstanceIface(
                                         arg->primitive, "IComparable",
-                                        iComparableBound.genericArgs) ==
+                                        iComparableBound->genericArgs) ==
                                     PrimBuiltinIfaceConformance::Rejects) {
                                     ctx_.diagnostics().report(
                                         Severity::Error, t.span.begin,
@@ -3437,7 +3456,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                 }
                             } else if (arg && arg->declaration) {
                                 if (!argSatisfiesTypeBound(
-                                        arg, &iComparableBound, &ctx_)) {
+                                        arg, iComparableBound, &ctx_)) {
                                     // Defer: same as checkOneConstraint's type
                                     // arm for unresolved base lists.
                                     deferredTypeBoundFailures_.push_back(
@@ -3447,7 +3466,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                             "IComparable",
                                             argName,
                                             arg,
-                                            &iComparableBound});
+                                            iComparableBound});
                                 }
                             }
                         }
