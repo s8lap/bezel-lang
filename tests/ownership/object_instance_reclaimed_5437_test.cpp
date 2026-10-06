@@ -55,6 +55,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -63,11 +64,28 @@ using bezel::test::runAotChecked;
 namespace {
 
 // A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "runAotChecked: SKIP" diagnostic.
+// runAotChecked returns ran=false with a "<name>: SKIP — C toolchain (clang)"
+// diagnostic (aot_support.hpp:3596).
+//
+// #3733: this predicate is NOT a bare find("SKIP"), because a toolchain skip and
+// a real finding are DIFFERENT outcomes and only the former may be returned past.
+// A runAotChecked run whose sanitizer FIRED reports "<name>: sanitizer fired
+// (...)" (aot_support.hpp:3713) — and a finding that text happens to also carry
+// the "SKIP" literal must not be discarded as if the box merely lacked clang,
+// which is exactly the silent-skip defect this guard would otherwise reintroduce
+// for this file. The two message shapes are disjoint (MEASURED: the SKIP arm
+// never emits "sanitizer fired", and the finding arm never emits "SKIP"), so
+// requiring "SKIP" AND NOT "sanitizer fired" classifies exactly the toolchain
+// absence. The extra positive-substring test is also what makes this predicate
+// PROTECTIVE rather than SKIP-only under
+// scripts/check_toolchain_skip_surface.py's _text_checking_helpers classifier.
 bool wasSkipped(const JitResult& r) {
     if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("SKIP") == std::string::npos) continue;
+        if (d.message.find("sanitizer fired") != std::string::npos) return false;
+        return true;
+    }
     return false;
 }
 
@@ -181,6 +199,10 @@ const char* kEmptyControlOnly =
 BEZEL_TEST(object_instance_reclaimed_5437,
            using_var_object_instance_freed_spec_28_9) {
     JitResult r = runAotChecked(kUsingVarObject);
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 100);
@@ -190,6 +212,10 @@ BEZEL_TEST(object_instance_reclaimed_5437,
 BEZEL_TEST(object_instance_reclaimed_5437,
            plain_var_object_instance_freed_spec_28_9) {
     JitResult r = runAotChecked(kPlainVarObject);
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 100);
@@ -199,6 +225,10 @@ BEZEL_TEST(object_instance_reclaimed_5437,
 BEZEL_TEST(object_instance_reclaimed_5437,
            inferred_var_object_instance_freed_spec_28_9) {
     JitResult r = runAotChecked(kInferredVarObject);
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 100);
@@ -210,6 +240,10 @@ BEZEL_TEST(object_instance_reclaimed_5437,
 BEZEL_TEST(object_instance_reclaimed_5437,
            object_box_keeps_its_own_release_rule_8_6) {
     JitResult r = runAotChecked(kObjectSlotHoldsBox);
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 86);
@@ -221,6 +255,10 @@ BEZEL_TEST(object_instance_reclaimed_5437,
 BEZEL_TEST(object_instance_reclaimed_5437,
            object_slot_reassigned_to_box_keeps_box_8_6) {
     JitResult r = runAotChecked(kObjectSlotReassignedToBox);
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 186);
@@ -231,6 +269,10 @@ BEZEL_TEST(object_instance_reclaimed_5437,
 BEZEL_TEST(object_instance_reclaimed_5437,
            empty_control_still_freed_spec_28_9) {
     JitResult r = runAotChecked(kEmptyControlOnly);
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 100);
