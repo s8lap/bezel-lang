@@ -2324,6 +2324,24 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(
                            a.value.get())) {
                 if (un->op == "move") {
+                    // fix #4721 / §22.3 (v0.307): a `move`-wrapped fresh producer
+                    // (NewExpr / CallExpr) at an owned parameter position is a
+                    // redundant marker — the spec says "no live binding is
+                    // invalidated, so there is nothing to announce". Reject before
+                    // falling through to the PostfixBangExpr/IdentifierExpr/
+                    // MemberAccessExpr branches that handle owned locals/borrows
+                    // and would silently accept a fresh-producer operand.
+                    if (ownedSink && discFormals.valid() &&
+                        (dynamic_cast<const ast::NewExpr*>(un->operand.get()) ||
+                         dynamic_cast<const ast::CallExpr*>(un->operand.get()))) {
+                        report(Severity::Error, un->span.begin,
+                               "the `move` call-site marker is not written on a "
+                               "fresh producer (a `new` expression or a call "
+                               "returning an owned result) — no live binding is "
+                               "invalidated, so there is nothing to announce; "
+                               "remove `move` (§22.3, v0.307)");
+                        consumed = true;
+                    }
                     // §28.8.1 / §17.4 (#1986): `move x!` — a `move` of a PLACE
                     // force-unwrap — consumes the underlying place, exactly as
                     // `move x` does. Its operand is a `PostfixBangExpr`, not a
@@ -2755,6 +2773,20 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
                 if (un->op == "move") {
+                    // fix #4721 / §22.3 (v0.307): same fresh-producer check as
+                    // the CallExpr arm above — a `move`-wrapped NewExpr/CallExpr
+                    // at an owned ctor formal is redundant; reject it.
+                    if (ctorFormalMod == "owned" &&
+                        (dynamic_cast<const ast::NewExpr*>(un->operand.get()) ||
+                         dynamic_cast<const ast::CallExpr*>(un->operand.get()))) {
+                        report(Severity::Error, un->span.begin,
+                               "the `move` call-site marker is not written on a "
+                               "fresh producer (a `new` expression or a call "
+                               "returning an owned result) — no live binding is "
+                               "invalidated, so there is nothing to announce; "
+                               "remove `move` (§22.3, v0.307)");
+                        consumed = true;
+                    }
                     // §28.8.1 / §17.4 (#1986): `move x!` into an owned ctor
                     // argument — a `move` of a PLACE force-unwrap consumes the
                     // underlying place. Its operand is a `PostfixBangExpr`, not a
