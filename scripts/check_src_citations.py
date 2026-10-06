@@ -45,6 +45,15 @@ CLAUSE_CITE = re.compile(
     re.IGNORECASE)
 SRC_EXT = ('.cpp', '.hpp', '.h', '.cc')
 
+# Narrow allowlist for clause citations that are imprecise but whose behaviour
+# is correct.  Each entry is a (file, line, section, kind, n) -> reason map.
+# Only the exact citation string is allowlisted -- a different citation from
+# the same line would still be checked.
+# Format: section, kind, n are all strings (kind is lowercased).
+_IMPRECISE_ALLOWLIST = {
+    # (empty -- kept as mechanism for future narrow suppressions)
+}
+
 def defined_sections(root='.'):
     out = set()
     for doc in DOCS:
@@ -114,13 +123,19 @@ def scan(root='.'):
                 for m in CLAUSE_CITE.finditer(ln):
                     sec = m.group(1)
                     kind = m.group(2).lower()
-                    n = int(m.group(3))
+                    n_str = m.group(3)
+                    n = int(n_str)
+                    rel = os.path.relpath(p, root)
+                    # Check allowlist first
+                    key = (rel, str(i), sec, kind, n_str)
+                    if key in _IMPRECISE_ALLOWLIST:
+                        continue
                     # Only check clauses for sections that have numbered items
                     if sec in section_items:
                         max_n = section_items[sec]
                         if n > max_n:
                             bad.append(
-                                f"  {os.path.relpath(p, root)}:{i}: "
+                                f"  {rel}:{i}: "
                                 f"§{sec} has no {kind} {n} (highest: {max_n})")
     return bad
 
@@ -146,6 +161,18 @@ def selftest():
             "1. **The build supplies the transitive closure.**\n"
             "2. **Use without import.**\n"
             "3. **Program-wide type identity.**\n\n"
+            "### 2.8.3 Transitive closure\n\n"
+            "1. Build supplies closure.\n"
+            "2. Use without import.\n"
+            "3. Program-wide type identity.\n"
+            "4. Staleness error.\n\n"
+            "### 2.8.4 Program assembly\n\n"
+            "1. Artifact kind by build.\n"
+            "2. Main module defined.\n"
+            "3. Entry-point search scope.\n"
+            "4. Dependency is library.\n"
+            "5. One copy per process.\n"
+            "6. Static init across artifacts.\n\n"
             "### 32.13 Foreign-memory\n\n"
             "   1. First sub-item\n"
             "   2. Second sub-item\n"
@@ -207,6 +234,22 @@ def selftest():
         )
         bad = scan(d)
         assert len(bad) == 1 and 'no clause 20' in bad[0], bad
+
+        # Test 8: the bug-class this found — adjacent-section item N (#5439).
+        # §2.8.3 has rules 1-4; §2.8.4 has rules 1-6 including rule 5.
+        # Citing "§2.8.3 rule 5" should fail (rule 5 is in §2.8.4, not §2.8.3).
+        io.open(src, 'w', encoding='utf-8').write(
+            "// §2.8.3 rule 5 out-of-range (rule 5 is in §2.8.4)\n"
+        )
+        bad = scan(d)
+        assert len(bad) == 1 and 'no rule 5' in bad[0] and '§2.8.3' in bad[0], bad
+
+        # And the corrected form (§2.8.4 rule 5) should pass.
+        io.open(src, 'w', encoding='utf-8').write(
+            "// §2.8.4 rule 5 ok\n"
+        )
+        bad = scan(d)
+        assert bad == [], f"expected [] for §2.8.4 rule 5, got {bad}"
 
     print("check_src_citations: self-test OK")
 

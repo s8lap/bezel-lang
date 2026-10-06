@@ -5225,7 +5225,7 @@ void Emitter::declareVtables() {
         bool exportedDesc = ts->visibility == ast::Visibility::Public &&
                             (ts->genericParams.empty() ||
                              ts->kind == ast::TypeDeclKind::Interface);
-        // fix #2776 (spec §2.8.3 rule 5, §2.5, v0.240): a SYNTHESIZED BUILTIN
+        // fix #2776 (spec §2.8.4 rule 5, §2.5, v0.240): a SYNTHESIZED BUILTIN
         // interface's descriptor is emitted by EVERY module that mentions it —
         // the symbol is compiler-provided, not owned by any one artifact — so a
         // strong definition collides at link time ("multiple definition of
@@ -5234,7 +5234,7 @@ void Emitter::declareVtables() {
         // occurrence to the same builtin symbol (the #2776 identity fix), which
         // makes the consumer emit its own copy alongside the dependency's.
         //
-        // linkonce_odr is what §2.8.3 rule 5 actually asks for: "a process
+        // linkonce_odr is what §2.8.4 rule 5 actually asks for: "a process
         // contains exactly one copy of each module's code and, for each type …
         // exactly one static state and one RUNTIME IDENTITY, regardless of link
         // mode". Merging duplicate identical definitions is precisely that
@@ -5245,7 +5245,7 @@ void Emitter::declareVtables() {
         // Detected by IDENTITY against builtinInterfaceSym (#1867's convention),
         // never by name, so a USER interface that happens to be called
         // `IComparable` keeps ordinary external linkage.
-        // fix #3023 (§11.2 / §14.1 / §2.8.3 rule 5, v0.240): use the non-creating
+        // fix #3023 (§11.2 / §14.1 / §2.8.4 rule 5, v0.240): use the non-creating
         // lookup — `builtinInterfaceSym` mints and push_backs into `symbols_`
         // on a cache miss, which can reallocate the vector and invalidate the
         // `ctx_.symbols()` iterators this loop is walking. With a user-

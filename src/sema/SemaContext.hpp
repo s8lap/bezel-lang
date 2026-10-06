@@ -1136,7 +1136,7 @@ public:
     //   IEqualityComparer: Equals(a: T, b: T): bool; GetHashCode(value: T): int
     // Returns nullptr for any non-builtin-interface name.
     TypeSymbol* builtinInterfaceSym(std::string_view name);
-    // fix #3023 (§11.2 / §14.1 / §2.8.3 rule 5, v0.240): a non-creating
+    // fix #3023 (§11.2 / §14.1 / §2.8.4 rule 5, v0.240): a non-creating
     // lookup for the synthesized builtin interface symbol. Returns the cached
     // TypeSymbol or `nullptr` if none has been minted yet — never mints one,
     // which `builtinInterfaceSym` does as a side effect and which mutates

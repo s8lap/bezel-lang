@@ -12048,7 +12048,7 @@ llvm::Value* Emitter::buildRecordValue(
                     callArgs.push_back(dv);
                 }
                 builder_.CreateCall(ctorFn, callArgs);
-                // §22.8 step 4 / §28: an imported ctor may throw. The
+                // §22.9 / §28: an imported ctor may throw. The
                 // record value lives in the entry-block slot, not a heap
                 // block, so there is nothing to reclaim here — only the
                 // exception slot to surface, exactly as the local inline
