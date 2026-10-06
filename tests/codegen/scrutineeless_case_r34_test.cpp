@@ -10,6 +10,11 @@
 // clean "not yet implemented" diagnostic (b92974b), then implemented (#727):
 // lowerCaseExpr/lowerCaseStmt compute each arm's test from the condition, with
 // name-resolution + typecheck visiting the condition expressions.
+//
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression and statement are retired. All rows now verify rejection of the
+// retired form; `case_with_scrutinee_still_works` verifies the normal `case`
+// with scrutinee remains functional.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
@@ -24,22 +29,22 @@ int run(const std::string& src) {
 }
 }  // namespace
 
-// #727: scrutinee-less case EXPRESSION with a literal condition — the first
-// true arm wins (was garbage). `true => 42` → 42.
+// v0.289 (§19, §22.4): the `(when …)` expression is retired.
 BEZEL_TEST(scrutineeless_case_727, case_expr_literal_condition) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var r := (when\n"
         "    true => 42,\n"
         "    _ => 0\n"
         "  ); "
         "  return r; "
-        "end Main; end C;"), 42);
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
 }
 
-// #727: a chain of variable conditions, ordered first-match. x=7 → second arm.
+// v0.289 (§19, §22.4): the `(when …)` expression is retired.
 BEZEL_TEST(scrutineeless_case_727, case_expr_variable_condition_chain) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 7; "
         "  var r := (when\n"
@@ -47,13 +52,14 @@ BEZEL_TEST(scrutineeless_case_727, case_expr_variable_condition_chain) {
         "    x > 5 => 2,\n"
         "    _ => 3\n"
         "  ); "
-        "  return r; "  // 2
-        "end Main; end C;"), 2);
+        "  return r; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
 }
 
-// #727: FIRST matching arm wins even when a later condition is also true.
+// v0.289 (§19, §22.4): the `(when …)` expression is retired.
 BEZEL_TEST(scrutineeless_case_727, case_expr_first_match_wins) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 100; "
         "  var r := (when\n"
@@ -61,13 +67,14 @@ BEZEL_TEST(scrutineeless_case_727, case_expr_first_match_wins) {
         "    x > 50 => 2,\n"
         "    _ => 3\n"
         "  ); "
-        "  return r; "  // 1 (x>5 matches first)
-        "end Main; end C;"), 1);
+        "  return r; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
 }
 
-// #727: scrutinee-less case STATEMENT form (was: silently skipped all arms).
+// v0.289 (§19, §22.4): the `when … end;` statement is retired.
 BEZEL_TEST(scrutineeless_case_727, case_stmt_variable_condition) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var x := 3; var r := 0; "
         "  when\n"
@@ -75,8 +82,9 @@ BEZEL_TEST(scrutineeless_case_727, case_stmt_variable_condition) {
         "    x = 3 => do r := 30; end,\n"
         "    _ => do r := 99; end,\n"
         "  end; "
-        "  return r; "  // 30
-        "end Main; end C;"), 30);
+        "  return r; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `when … end;` statement is retired
 }
 
 // Regression: a normal `case` WITH a scrutinee still compiles and runs.
