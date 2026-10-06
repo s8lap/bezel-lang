@@ -504,8 +504,11 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                     "expected ';' after enum constants");
             }
             // EnumMember* after the constants list. Sema restricts the
-            // valid member kinds to MethodDecl, ExpressionPropertyDecl,
-            // StaticReadonlyDecl, and StaticConstDecl (A.3 EnumMember).
+            // valid member kinds per §10.4's exhaustive list (v0.288):
+            // instance methods, expression-bodied read-only instance properties,
+            // static methods, `static readonly` fields, `const` members, and
+            // operator overloads — mutable static fields, static constructors,
+            // and static properties of any kind are rejected (fix #3840).
             // We accept the full Member grammar at the parse level and let
             // sema filter — keeps the dispatch shared with class/record.
             while (!isKeyword("end") &&
@@ -582,8 +585,12 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
             }
             // §A.3 ChoiceMember* — identical grammar to EnumMember; parse
             // through the shared Member grammar and let sema filter the
-            // admissible kinds (MethodDecl, ExpressionPropertyDecl,
-            // StaticReadonlyDecl, StaticConstDecl, OperatorDecl).
+            // admissible kinds per §35.2's exhaustive list (v0.288), which
+            // is the same list §10.4 defines for enum (instance methods,
+            // expression-bodied read-only instance properties, static methods,
+            // `static readonly` fields, `const` members, and operator overloads;
+            // mutable static fields, static constructors, and static properties
+            // are rejected — fix #3840).
             while (!isKeyword("end") &&
                    current_.kind != TokenKind::EndOfFile) {
                 auto m = parseMember();

@@ -1226,10 +1226,34 @@ void Resolver::checkEnumRestrictions() {
             }
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
                 if (!hasMod(fs, "static")) bad("an instance field");
+                // fix #3840 (§10.4 / §35.2, v0.288): a `static` field that is
+                // not `readonly` (or is `scoped`) is not part of §10.4's
+                // exhaustive admitted-member list — it is admitted only with
+                // §22.12's declaration-site warning on a class/record body; an
+                // enum/choice has no storage for a mutable static and no
+                // mechanism to confine its writes to one domain (§10.5 has no
+                // such rule at all). §35.2 carries the same list verbatim.
+                // MEASURED on this HEAD (pre-fix): `enum E A, B; public static
+                // _x: int := 0; end E;` compiled at exit 0, zero diagnostics.
+                if (hasMod(fs, "static") &&
+                    !hasMod(fs, "readonly") && !hasMod(fs, "scoped")) {
+                    bad("a mutable static field");
+                }
                 continue;
             }
             if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
-                if (!cs->isStatic) bad("a constructor");
+                // fix #3840 (§10.4 / §35.2, v0.288): a static constructor is
+                // not part of §10.4's exhaustive admitted-member list (the list
+                // names no constructor form; §22.7's static-constructor rule
+                // belongs to class/record, not enum/choice). §35.2 carries the
+                // same list verbatim. An enum has no per-instance state to
+                // initialize and no inheritance hierarchy; a choice has no
+                // user-visible constructor at all (§35.3 construction is
+                // synthetic). MEASURED on this HEAD (pre-fix): `enum E A, B;
+                // public static constructor() end; end E;` compiled at exit 0,
+                // zero diagnostics.
+                if (cs->isStatic) bad("a static constructor");
+                else bad("a constructor");
                 continue;
             }
             if (dynamic_cast<NestedTypeSymbol*>(m)) {
@@ -1238,6 +1262,16 @@ void Resolver::checkEnumRestrictions() {
             }
             if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
                 if (ps->isIndexer) { bad("an indexer"); continue; }
+                // fix #3840 (§10.4 / §35.2, v0.288): a `static` property of
+                // any body kind is not part of §10.4's exhaustive admitted-
+                // member list — the list names only instance properties
+                // (expression-bodied read-only form); static members on an
+                // enum/choice belong in the static tier (static methods,
+                // `static readonly` fields, `const` members, operators), not
+                // mixed into the instance-member tier. MEASURED on this HEAD
+                // (pre-fix): `enum E A, B; public static property P: int =>
+                // 0; end E;` compiled at exit 0, zero diagnostics.
+                if (hasMod(ps, "static")) { bad("a static property"); continue; }
                 // fix #2499 (§10.5): "Block-form properties or properties
                 // with backing storage" are forbidden on an enum. §10.4
                 // permits only the expression-bodied READ-ONLY form
@@ -1623,9 +1657,10 @@ void Resolver::checkChoiceDispatchModifiers() {
 // MODIFIER-correctness gap identical to enum's (a mutable or non-`readonly`
 // static field, a static constructor, and a `static` property of any body
 // kind — including Expression — are still admitted here exactly as
-// checkEnumRestrictions itself still admits them for enums; #3840 tracks
-// fixing BOTH sides together, not this fix, which only closes the
-// admissible-KIND gap #3869 describes). An `invariant` member is likewise
+// checkEnumRestrictions itself still admits them for enums; #3840 fixes
+// BOTH sides together, not this fix, which only closes the
+// admissible-KIND gap #3869 describes). [FIXME #3840: this comment is now
+// stale — both sides are fixed; delete the stale-part on fix #3840.] An `invariant` member is likewise
 // NOT covered here — `t->members` never carries one (it is a distinct
 // AST/side-table construct, `TypeSymbol::invariantContracts`, not a
 // `Symbol` subclass at all), so neither this walk nor checkEnumRestrictions's
@@ -1653,10 +1688,19 @@ void Resolver::checkChoiceRestrictions() {
             }
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
                 if (!hasMod(fs, "static")) bad("an instance field");
+                // fix #3840 (§10.4 / §35.2, v0.288): same check as
+                // checkEnumRestrictions's mutable-static-field arm above.
+                if (hasMod(fs, "static") &&
+                    !hasMod(fs, "readonly") && !hasMod(fs, "scoped")) {
+                    bad("a mutable static field");
+                }
                 continue;
             }
             if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
-                if (!cs->isStatic) bad("a constructor");
+                // fix #3840 (§10.4 / §35.2, v0.288): same check as
+                // checkEnumRestrictions's static-constructor arm above.
+                if (cs->isStatic) bad("a static constructor");
+                else bad("a constructor");
                 continue;
             }
             if (dynamic_cast<NestedTypeSymbol*>(m)) {
@@ -1665,6 +1709,9 @@ void Resolver::checkChoiceRestrictions() {
             }
             if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
                 if (ps->isIndexer) { bad("an indexer"); continue; }
+                // fix #3840 (§10.4 / §35.2, v0.288): same check as
+                // checkEnumRestrictions's static-property arm above.
+                if (hasMod(ps, "static")) { bad("a static property"); continue; }
                 // SEAM-ACCESSOR: `ps` is a member of the locally-declared
                 // choice `t` (forEachTypeAndNested, #3574) — this §35.2
                 // property-form check never sees an imported member
