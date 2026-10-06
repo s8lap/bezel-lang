@@ -232,3 +232,51 @@ BEZEL_TEST(float_parse_oob, infinity_spelling_still_accepted) {
     expectExitChecked("var x := double.Parse(\"Infinity\"); "
                       "return (if x > 1.0e308 then 1 else 0); ", 1);
 }
+
+// ── Regression: #5443 — span-Parse throw-path leak ──────────────────────────
+//
+// WHAT THE DEFECT IS:
+//   double.Parse(span) / float.Parse(span) on invalid input (e.g. "abc") raises
+//   FormatException but leaks the materialized window from bz_str_slice_cp.
+//   The leak is 33-36 bytes per call — the owned window buffer.  §28.3 (v0.303)
+//   requires every owned temporary to be discharged on every exit path.
+//
+// PRE-FIX MEASURED (r23-c28 @ 3fa8d57c, runAotChecked, 200 iterations):
+//   LeakSanitizer: detected 6600 bytes leaked in 200 allocation(s)
+//   Without the loop the one-shot repro would often pass (below LSan's threshold
+//   for solo allocations), so the row loops 200x (50-500x as specified).
+//
+// THE FIX:
+//   Release the window before emitGuardThrow rather than after it, so that both
+//   the FormatException and OverflowException throwing paths release it before
+//   branching to the error block.
+
+BEZEL_TEST(float_parse_oob, double_parse_span_throw_path_no_leak) {
+    // 200 iterations of double.Parse(span) with invalid input, each catching
+    // FormatException.  On the pre-fix compiler LSan reports ~6600 bytes leaked.
+    // On the fixed compiler: zero leaks, exit 0.
+    expectExitChecked(
+        "var sp := \"abc\".AsSpan(0, 3); "
+        "var r := 0; "
+        "for var i in 0..199 do "
+        "    try var x := double.Parse(sp); r := 0; "
+        "    catch FormatException => r := 1; "
+        "    end try; "
+        "end for; "
+        "return r; ",
+        1);
+}
+
+BEZEL_TEST(float_parse_oob, float_parse_span_throw_path_no_leak) {
+    // Same for float.Parse(span).
+    expectExitChecked(
+        "var sp := \"abc\".AsSpan(0, 3); "
+        "var r := 0; "
+        "for var i in 0..199 do "
+        "    try var x := float.Parse(sp); r := 0; "
+        "    catch FormatException => r := 1; "
+        "    end try; "
+        "end for; "
+        "return r; ",
+        1);
+}

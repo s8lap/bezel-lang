@@ -2034,11 +2034,22 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateNot(badLastChar)),
                     builder_.CreateNot(isHexFloatF),
                     "parse.vfmtF");
-                emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
-                               "FormatException");
-                emitGuardThrow(emitFloatParseOverflow(win.data, dVal),
-                               "OverflowException");
+                // §28.3 (v0.303): the owned window from bz_str_slice_cp must be
+                // released on every exit path.  emitGuardThrow branches to an
+                // error block, so the release must precede the guards.
+                //
+                // BOTH guards read values derived from win.data.  LLVM may defer
+                // the actual load until the instruction that uses the value, so we
+                // must force all win.data-dependent loads to materialise BEFORE the
+                // release.  We do that by calling emitFloatParseOverflow here
+                // (forcing its win.data read) and also by forcing the validF use
+                // here, before the release.  The results are stored in SSA values
+                // and the release cannot invalidate them.
+                llvm::Value* ovfF = emitFloatParseOverflow(win.data, dVal);
+                llvm::Value* fmtBadF = builder_.CreateNot(validF, "parse.fmtbadF");
                 if (win.owned) emitStringRelease(win.owned);
+                emitGuardThrow(fmtBadF, "FormatException");
+                emitGuardThrow(ovfF, "OverflowException");
                 return dVal;
             }
         }
