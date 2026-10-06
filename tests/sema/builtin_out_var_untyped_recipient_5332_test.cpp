@@ -42,17 +42,25 @@
 // the table arm, not an accident.
 //
 // NOT FIXED HERE (codegen, a different slot — filed as a follow-up).
-// `OwningSet<T>.Pop` and `OwningSet<T>.TryPop` have NO codegen handler at all:
-// LlvmBackend_Calls.cpp lowers the PRE-RENAME `OwningSet<T>.Take` /
-// `.TryTake` (stdlib §4.10 renamed the pair to `Pop` / `TryPop`), and nothing
-// dispatches the new names.  MEASURED with a pre-declared recipient —
-// `var b: R? := null; Console.WriteLine(oset.TryPop(new R(9), out b));` —
-// which bypasses this lane's arm entirely and still reports
-// `internal: the argument of this Console.WriteLine failed to lower to a
-// value`.  So the issue's stated post-fix expectation (stdout `9`) is NOT
-// reachable from a sema-only change, and the `OwningSet` AOT rows below pin
-// what the CALL-SITE typing fix actually delivers — the call-site warnings
-// are gone and nothing crashes or leaks — not a fabricated `9`.
+// `OwningSet<T>.Pop` and `OwningSet<T>.TryPop` had NO codegen handler when this
+// file was written: LlvmBackend_Calls.cpp lowered the PRE-RENAME
+// `OwningSet<T>.Take` / `.TryTake` (stdlib §4.10 renamed the pair to `Pop` /
+// `TryPop`), and nothing dispatched the new names.  MEASURED at the time with
+// a pre-declared recipient — `var b: R? := null; Console.WriteLine(oset.TryPop
+// (new R(9), out b));` — which bypasses this lane's arm entirely and still
+// reported `internal: the argument of this Console.WriteLine failed to lower to
+// a value`.  So the issue's stated post-fix expectation (stdout `9`) was NOT
+// reachable from a sema-only change, and the `OwningSet` AOT rows below pinned
+// what the CALL-SITE typing fix actually delivered.
+//
+// THAT FOLLOW-UP HAS LANDED: `7dff597d fix #5361: add OwningSet<T>.Pop /
+// TryPop codegen lowering (stdlib §4.10, v0.259)` is on r23-c28.  MEASURED
+// again on this base with `scripts/agent_check.sh --probe --asan`: the issue's
+// repro now prints `9` and exits 0, and the `internal: … failed to lower`
+// warning is gone.  The two `owningset_trypop_*_200x_no_leak` rows keep their
+// narrower claim (they pin the loop's own allocations being released, NOT that
+// the set was drained), and the issue-repro row's `want` has been corrected to
+// the measured `9` — see the row for why the old `""` was an inverted pin.
 
 #include <string>
 
@@ -348,15 +356,33 @@ BEZEL_TEST(builtin_out_var_untyped_recipient_5332,
 }
 
 // The issue's own repro, verbatim.  It compiles and runs clean (the
-// `internal: … failed to lower` warning is gone, exit 0, no leak) — but it
-// prints nothing, because the CALL has no codegen handler yet (see the
-// header).  This row is a no-crash control, NOT the issue's expected `9`.
+// `internal: … failed to lower` warning is gone, exit 0) AND prints the
+// element's `X` — the issue's stated expectation.
+//
+// The `want` was MEASURED, not reasoned: `scripts/agent_check.sh --probe
+// --asan` on this exact program prints `9` (and runs the #5361 codegen
+// handler added on r23-c28, `7dff597d fix #5361: add OwningSet<T>.Pop /
+// TryPop codegen lowering`).  The previous `want` was `""` — the value the
+// PRE-#5361 state produced — so the row would have passed before that fix
+// and failed after it: an inverted pin, vacuous with respect to the #5332
+// call-site typing fix it is named for.
+//
+// NON-VACUOUS in both directions, which the empty-string pin was not:
+//   * If the #5332 arm regresses, the recipient is UNTYPED again, the
+//     `Console.WriteLine(b11.X)` argument fails to lower and the statement
+//     emits nothing (the pre-#5332 symptom this file's header records), so
+//     stdout is `""` — the row FAILS.
+//   * If the #5361 lowering regresses the same way, stdout is `""` again —
+//     the row FAILS.
+// Asserting the element's own value (not merely "ran") is what makes it
+// bite: an empty-string expectation is satisfied by the very breakage it is
+// supposed to detect.
 BEZEL_TEST(builtin_out_var_untyped_recipient_5332,
            owningset_trypop_issue_repro_runs_clean) {
     expect(setProgram("out using var b11",
                       "  if oset.TryPop(new R(9), out using var b11) "
                       "    then Console.WriteLine(b11.X); end; "),
-           "");
+           "9\n");
 }
 
 }  // namespace
