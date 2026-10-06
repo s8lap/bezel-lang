@@ -109,7 +109,7 @@ BEZEL_TEST(codegen_json_int_read_5400, int_overflow_erange_raises_spec_2_15) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; import System.Serialization; ") +
         "record R(X: int): ISerializable, IDeserializable; "
-        "  // LLONG_MAX = 9223372036854775807, so LLONG_MAX+1 = 9223372036854775808"
+        "  // LLONG_MAX = 9223372036854775807, so LLONG_MAX+1 = 9223372036854775808\n"
         "class C public static method Main(): int "
         "  using var d := new JsonDeserializer(\"{\\\"X\\\":9223372036854775808}\"); "
         "  try "
@@ -126,7 +126,7 @@ BEZEL_TEST(codegen_json_int_read_5400, uint_overflow_erange_raises_spec_2_15) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; import System.Serialization; ") +
         "record R(X: uint): ISerializable, IDeserializable; "
-        "  // ULONG_MAX = 18446744073709551615, so ULONG_MAX+1 = 18446744073709551616"
+        "  // ULONG_MAX = 18446744073709551615, so ULONG_MAX+1 = 18446744073709551616\n"
         "class C public static method Main(): int "
         "  using var d := new JsonDeserializer(\"{\\\"X\\\":18446744073709551616}\"); "
         "  try "
