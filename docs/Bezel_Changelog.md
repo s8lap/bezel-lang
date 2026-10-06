@@ -9,7 +9,7 @@ Entries are pinned history — each was written at its revision and is not retro
 <a id="sec-reconstructed-early-history"></a>
 ### Early history, v0.4 to v0.52 (reconstructed)
 
-The entries in this section were reconstructed in 2026-10 from archived snapshots of the specification, which predate the per-revision changelog that begins at v0.52 to v0.53 below. Each is a summary of what changed between two surviving snapshots, not a complete migration record. No snapshot survives for v0.1–v0.3, v0.6, v0.19, v0.22, v0.23 or v0.25–v0.51; where a span skips a missing revision, its entry covers the span and says so.
+The entries in this section were reconstructed in 2026-10 from archived snapshots of the specification, which predate the per-revision changelog that begins at v0.52 to v0.53 below (v0.6 rests on a contemporary design discussion that records its full text). Each is a summary of what changed between two surviving snapshots, not a complete migration record. No snapshot survives for v0.1–v0.3, v0.19, v0.22, v0.23 or v0.25–v0.51; where a span skips a missing revision, its entry covers the span and says so.
 
 <a id="sec-v0-4-baseline"></a>
 ### v0.4 baseline (reconstructed)
@@ -34,13 +34,18 @@ The entries in this section were reconstructed in 2026-10 from archived snapshot
 - Explicit property accessor blocks now close with `end PropertyName;`, and the named `end Name;` form is "strongly encouraged" for members.
 - Rules removed from the "locked-in" list: the expression-bodied method rule and the "header terminator" rule. The examples still use both.
 
-<a id="sec-v0-5-to-v0-7-changelog"></a>
-### v0.5 to v0.7 changelog (reconstructed)
+<a id="sec-v0-5-to-v0-6-changelog"></a>
+### v0.5 to v0.6 changelog (reconstructed)
 
-- Gap note: no v0.6 snapshot survives, so the changes below cannot be attributed to v0.6 or v0.7 individually. A design discussion from the time (a secondary source, not a spec snapshot) proposed interfaces as the v0.6 addition, with the same member rules but declared through a separate `implements` keyword (`class BankAccount implements IBankAccount`). By v0.7 the colon list below had taken its place; whether v0.6 shipped `implements` is not recorded.
-
+- Source: no v0.6 spec file survives; this entry rests on the full v0.6 text as recorded in a design discussion from the time.
 - Added **interfaces**: `interface IName … end IName;`. Members are signatures only and implicitly public, with no fields, constructors or bodies. Interface names start with `I`.
-- Added an **inheritance/implementation list** after the class name: `class SavingsAccount: BankAccount, IAuditable, IDisposable`. The base class comes first, then the interfaces, with no semicolon after the list. Implementation is implicit, meaning a class satisfies an interface by declaring matching public members. The `BankAccount` example now implements `IBankAccount`.
+- Added an **inheritance/implementation list** after the class name: `class SavingsAccount: BankAccount, IAuditable, IDisposable`. The base class comes first, then the interfaces, with no semicolon after the list. Implementation is implicit: a class satisfies an interface by declaring matching public members. The `BankAccount` example now implements `IBankAccount`.
+- Considered and declined: a separate `implements` keyword (the first proposal, judged wordy next to the rest of the syntax) and Pascal-style parentheses (`class SavingsAccount(BankAccount, IAuditable)`, which overlap visually with parameter lists). The colon reuses the `Name: Type` punctuation the language already had.
+- Deferred: C#-style primary (default) constructors, judged less important than the fundamentals at this stage.
+
+<a id="sec-v0-6-to-v0-7-changelog"></a>
+### v0.6 to v0.7 changelog (reconstructed)
+
 - Added **records** as value types with copy-by-value semantics. The positional form is `record Point(x: int; y: int);` and is strictly immutable. It generates a primary constructor, PascalCase read-only properties, and value equality/`GetHashCode`. The full form is `record … end Name;`, with immutability encouraged.
 - Records may implement interfaces (`record Point: IComparable<Point>`), which is the first generic type syntax to appear in the spec. Records cannot inherit from one another.
 - Objects are created with `new` (`new Point(10; 20)`, with arguments separated by `;`), and locals are declared with `var x := …`.
