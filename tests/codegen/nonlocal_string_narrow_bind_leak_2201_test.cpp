@@ -1,9 +1,10 @@
 // Codegen + runtime — a `string?` local narrowed into a NEW non-nullable
-// `string` local via `var t: string := s!` (the issue's exact shape) or
-// `var s := s!` (the rebind shape) must release BOTH the source's +1 (the
-// producer) and the new local's +1 (the borrow's retain) at scope end —
-// otherwise the producer's +1 leaks (LSan-confirmed: 32-byte bz_string_t
-// header + N-byte buffer per evaluation). The bug (#2201) was that the
+// `string` local via `var t: string := s!` (the issue's exact shape) or a
+// new binding that shadows the source (the rebind shape) must release BOTH
+// the source's +1 (the producer) and the new local's +1 (the borrow's
+// retain) at scope end — otherwise the producer's +1 leaks (LSan-confirmed:
+// 32-byte bz_string_t header + N-byte buffer per evaluation). The bug
+// (#2201) was that the
 // StringEscapeWalker treated `s!` in a LocalDecl's initializer as inheriting
 // the parent's unsafe position (the new local may itself be returned/stored)
 // and therefore marked `s` as ESCAPING, suppressing its scope-end release.
@@ -91,9 +92,20 @@ BEZEL_TEST(nonlocal_string_narrow_bind_leak_2201,
     BEZEL_EXPECT_EQ(r.exitCode, 55);
 }
 
-// Spec §17.8 / §28.9: the REBIND shape — `var s := s!` shadows the source
-// with a new non-nullable local. Same soundness argument: the new local is
-// a borrow of `s`, so `s` is not consumed. Pre-fix: leak; post-fix: clean.
+// Spec §17.8 / §28.9: the REBIND shape — a new non-nullable local bound
+// from `s!` SHADOWS the source. Same soundness argument: the new local is a
+// borrow of `s`, so `s` is not consumed. Pre-fix: leak; post-fix: clean.
+//
+// The shadowing binding now sits in an inner `do … end` rather than
+// directly in the loop body. §21.1's *Local names* rule (v0.314, #5370)
+// rejects a local that redeclares a name of its OWN scope ("a local named
+// `s` is already declared in this scope"), and the compiler now enforces
+// it — the same-block spelling no longer compiles. That ruling landed only
+// its same-scope half; whether a local may shadow a name of an ENCLOSING
+// scope was left open and the compiler admits it (see the v0.314 changelog
+// entry for #5370), so the nested block keeps the row's subject — a new
+// binding that shadows the source and is initialised from it — while
+// sitting in a scope the rule does not reach.
 BEZEL_TEST(nonlocal_string_narrow_bind_leak_2201,
            rebind_new_local_disposes_source_spec_17_8) {
     std::string src =
@@ -102,8 +114,10 @@ BEZEL_TEST(nonlocal_string_narrow_bind_leak_2201,
         "    var total := 0; var i := 0; "
         "    while i < 5 do "
         "      var s: string? := \"hello\" + \" world\"; "
-        "      var s := s!; "
-        "      total := total + s.Length; "
+        "      do "
+        "        var s := s!; "
+        "        total := total + s.Length; "
+        "      end; "
         "      i := i + 1; "
         "    end; "
         "    return total; "
