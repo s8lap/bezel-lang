@@ -4,7 +4,245 @@
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
-Entries are pinned history — each was written at its revision and is not retroactively edited. Links inside historical entries were written against the documents as they stood at that revision: filenames of the form `Bezel_Language_Spec_0_98.md` refer to archived revisions in git history, and section numbers cited by old entries refer to the numbering of their era.
+Entries are pinned history — each was written at its revision and is not retroactively edited. The entries before v0.52 to v0.53 are the exception: they were reconstructed later from archived snapshots and are marked as such. Links inside historical entries were written against the documents as they stood at that revision: filenames of the form `Bezel_Language_Spec_0_98.md` refer to archived revisions in git history, and section numbers cited by old entries refer to the numbering of their era.
+
+<a id="sec-reconstructed-early-history"></a>
+### Early history, v0.4 to v0.52 (reconstructed)
+
+The entries in this section were reconstructed in 2026-10 from archived snapshots of the specification, which predate the per-revision changelog that begins at v0.52 to v0.53 below. Each is a summary of what changed between two surviving snapshots, not a complete migration record. No snapshot survives for v0.1–v0.3, v0.6, v0.19, v0.22, v0.23 or v0.25–v0.51; where a span skips a missing revision, its entry covers the span and says so.
+
+<a id="sec-v0-4-baseline"></a>
+### v0.4 baseline (reconstructed)
+
+- The language is a C#-flavoured object model written with Pascal-family block syntax (no `begin`; blocks close with `end`). The v0.4 snapshot is a short sketch (about 100 lines) centred on one `BankAccount` class example.
+- Core philosophy: keywords are lowercase only. Blocks need no `begin` and run until the matching `end`. Naming follows C# conventions (PascalCase types and members, `_camelCase` private fields). All code is written inline in classes, with no header/implementation split.
+- Memory is managed manually through the **Dispose pattern**: a class supplies a `public method Dispose();`. There is no ownership model yet.
+- Operators: assignment `:=`, equality `=`, inequality `<>`. Logical operators are spelled as words (`and`).
+- Class members are fields (`private _name: Type;`), constructors (`public constructor(params);` … `end constructor;`), methods (`public method Name(params);` … `end;`/`end Name;`, plus the expression-bodied form `=> expr;`), and properties. Property forms are auto read-write, auto with `private set`, `readonly property`, expression-bodied read-only, and explicit `get`/`set` accessor blocks.
+- Block endings: members end with `end;` or `end Name;`; a class must end with `end ClassName;`; control structures always end with a plain `end;`. A method or constructor header that has a body ends with `;`.
+- Member access is written with an explicit `this.` throughout the example.
+- Listed as future work: modules/imports, interfaces, generics, constructor field initializers, records/structs, arrays/pointers, Dispose details.
+
+<a id="sec-v0-4-to-v0-5-changelog"></a>
+### v0.4 to v0.5 changelog (reconstructed)
+
+- Added **modules and imports**, both file-scoped. `module Name;` declares a file-scoped namespace (like a C# file-scoped namespace), and `import X.Y;` works like C# `using`. A module-level Hello World (`class Program` with `Main`) was added.
+- `this.` became optional when accessing members inside classes, and the examples dropped it.
+- Statement termination was made explicit: every statement, control structures included, ends with `;`.
+- Added a **built-in types** section. Primitives are lowercase keywords (`string`, `decimal`, `int`, `bool`, `char`, `byte`, `real`, …), and the namespaced forms (`System.String`, …) are also accepted and meant to become canonical later.
+- The stdlib calls in the examples changed from snake_case `console.write_line` to C#-style `Console.WriteLine`.
+- Explicit property accessor blocks now close with `end PropertyName;`, and the named `end Name;` form is "strongly encouraged" for members.
+- Rules removed from the "locked-in" list: the expression-bodied method rule and the "header terminator" rule. The examples still use both.
+
+<a id="sec-v0-5-to-v0-7-changelog"></a>
+### v0.5 to v0.7 changelog (reconstructed)
+
+- Gap note: no v0.6 snapshot survives, so the changes below cannot be attributed to v0.6 or v0.7 individually.
+
+- Added **interfaces**: `interface IName … end IName;`. Members are signatures only and implicitly public, with no fields, constructors or bodies. Interface names start with `I`.
+- Added an **inheritance/implementation list** after the class name: `class SavingsAccount: BankAccount, IAuditable, IDisposable`. The base class comes first, then the interfaces, with no semicolon after the list. Implementation is implicit, meaning a class satisfies an interface by declaring matching public members. The `BankAccount` example now implements `IBankAccount`.
+- Added **records** as value types with copy-by-value semantics. The positional form is `record Point(x: int; y: int);` and is strictly immutable. It generates a primary constructor, PascalCase read-only properties, and value equality/`GetHashCode`. The full form is `record … end Name;`, with immutability encouraged.
+- Records may implement interfaces (`record Point: IComparable<Point>`), which is the first generic type syntax to appear in the spec. Records cannot inherit from one another.
+- Objects are created with `new` (`new Point(10; 20)`, with arguments separated by `;`), and locals are declared with `var x := …`.
+
+<a id="sec-v0-7-to-v0-8-changelog"></a>
+### v0.7 to v0.8 changelog (reconstructed)
+
+- Added a **control structures** section. All of them use the `end`-terminated block style (no `begin`), close with a plain `end;`, and count as one statement.
+- `if … then … elif … then … else … end;`
+- `while cond do … end;`
+- The counting loop is `for var i := a to b [step N] do … end;`, and the step may be negative.
+- `foreach var x in xs do … end;`. The loop variable must be declared with `var` and is scoped to the loop body.
+- Added `break;` and `continue;`. The future-work list notes "switch/case can be added later".
+
+<a id="sec-v0-8-to-v0-9-changelog"></a>
+### v0.8 to v0.9 changelog (reconstructed)
+
+- **Method and constructor headers no longer end with `;`**. `public method Deposit(amount: decimal);` became `public method Deposit(amount: decimal)`, followed by the body. The member-rule summaries were updated to match.
+- Nothing else changed.
+
+<a id="sec-v0-9-to-v0-10-changelog"></a>
+### v0.9 to v0.10 changelog (reconstructed)
+
+- Placement note: the surviving v0.10 snapshot is mislabeled "v0.9" in its own header. It is placed here from its content: it is a strict superset of the true v0.9 and a strict subset of v0.11.
+
+- Added the **`case` statement**, a multi-way branch like C# `switch` written in block style: `case expr … end;`. Each arm is `pattern:` … `end;`, with `default:` as the fallback and no fall-through.
+- Patterns supported by `case`:
+  - constants and comma-separated lists of constants;
+  - ranges (`90..100:`, `..50:`, `100..:`);
+  - relational patterns (`> 70:`, `< 50:`);
+  - type patterns (`string:`, `var s as string:`);
+  - var patterns with `when` guards (`var t when t > 30:`);
+  - the discard `_:`.
+- The "Next steps" future-work list was removed from the end of the document.
+
+<a id="sec-v0-10-to-v0-11-changelog"></a>
+### v0.10 to v0.11 changelog (reconstructed)
+
+- Added **if-expressions** in Python's ternary style, `a if cond else b`. They can be used anywhere an expression can, may be nested, and may span lines.
+- Chaining is written `x if c1 else y if c2 else z`. The heading and one rule also say "`elif` is supported for chaining", but no example uses `elif` inside an expression.
+
+<a id="sec-v0-11-to-v0-12-changelog"></a>
+### v0.11 to v0.12 changelog (reconstructed)
+
+- Added **case expressions**, the expression form of `case`: `case expr pattern => value, … _ => default;`. Arms are separated by commas, and the trailing comma is optional.
+- Case expressions accept exactly the same patterns as the `case` statement: constants, ranges, relational, type, `var x as T`, `var x when cond`, and `_`.
+- The if-expression heading "Chained conditions (with `elif`)" was retitled "Chained conditions". The rule bullet that claims `elif` support stayed.
+
+<a id="sec-v0-12-to-v0-13-changelog"></a>
+### v0.12 to v0.13 changelog (reconstructed)
+
+- Added **arrays**, both reference types. `T[]` is fixed-size, with the length set at creation (`new int[100]`), and has multi-dimensional forms (`double[,]`, `new double[10, 10]`). `Array<T>` is dynamic and resizable, and is preferred for most uses (`new Array<string>()`).
+- Added **collection expressions** `[1, 2, 3]` that initialize either kind of array, including nested forms for multi-dimensional arrays. The explicit form `new int[] ([…])` is also allowed.
+- Typed local declarations appear: `var x: T;` and `var x: T := …`.
+- The spec states that stack-allocating small fixed arrays is an implementation detail and not part of the language.
+
+<a id="sec-v0-13-to-v0-14-changelog"></a>
+### v0.13 to v0.14 changelog (reconstructed)
+
+- The spec moves from bold-heading plain text to Markdown with a table of contents, and sections are reordered: built-in types and arrays come first, then generics, records, classes and interfaces, member rules, control structures, case statements and expressions, and if-expressions.
+- **Generics added** (new section). It covers generic classes (`class Array<T>`), interfaces (`IComparable<T>`), records (`record Pair<TFirst, TSecond>(…)`) and methods (`method Swap<T>(…)`), plus `where` constraints including `class`, interface bounds and `new()` (`where T: class, IDisposable, new()`).
+- The `ref` parameter modifier first appears, in the generic `Swap<T>(ref a: T; ref b: T)` example. It is not yet given rules of its own.
+- The classes section drops the long annotated `BankAccount` example. The property forms it showed remain listed under "Locked-in member rules", and the interface prose is trimmed to the declaration, the inheritance list and the rules.
+- If-expressions: the rule "`elif` is supported for chaining" is replaced by "chained conditions … by repeating `else <condition> if …`", and the multi-line example is removed. The case-expression section drops its type-pattern and var/guard examples, but still says it supports the same patterns as the case statement.
+
+<a id="sec-v0-14-to-v0-15-changelog"></a>
+### v0.14 to v0.15 changelog (reconstructed)
+
+- New section **Expressions, Operators, and Precedence**, appended at the end. The table of contents does not list it.
+- **Operator overloading** on records and classes is added, as `public static method operator <sym>(…)` with the block ending `end operator <sym>;`. Overloadable operators are unary `+ - ! ~ ++ --`, binary `+ - * / % & | ^ << >>`, and the comparisons `= <> < > <= >=`.
+- Overloading rules: at least one parameter must be the enclosing type. Comparison operators should be overloaded as a consistent group. Records keep their automatic `=`/`<>` unless overridden. A style rule discourages overloads with non-obvious meaning.
+- A **13-level precedence table** is introduced: primary, unary, multiplicative, additive, shift, relational, equality, `&`, `^`, `|`, `and`, `or`, assignment. `and`/`or` short-circuit.
+- **Compound assignment operators** (`+= -= *= /= %= &= |= ^= <<= >>=`) appear for the first time, as right-associative assignment operators. Increment and decrement (`++`, `--`) appear as unary operators.
+
+<a id="sec-v0-15-to-v0-16-changelog"></a>
+### v0.15 to v0.16 changelog (reconstructed)
+
+- **Call-site argument separator changes from `;` to `,`**: `new Point(10, 20)` replaces `new Point(10; 20)` in every example. Parameter declarations still use `;` (`record Point(x: int; y: int)`).
+- New section **Literals and String Handling**:
+  - integer literals in hex `0x`, binary `0b` and with `_` digit separators;
+  - suffixes `L`/`U`/`UL` (integers) and `f`/`m` (reals), case-insensitive;
+  - default literal types: `int` for whole numbers, `real` for numbers with a point or exponent;
+  - `true`/`false`, `null`, and character literals with `\u`/`\U`/`\x` escapes.
+- Strings: escape sequences are processed in regular strings, there are interpolated `$"…{expr}…"`, verbatim `@"…"` (only `""` is special) and interpolated verbatim `$@"…"` forms, and a full escape-sequence table is given. Raw `"""` strings are mentioned as a possible future addition.
+- The literals rules mention compile-time constant folding of literal expressions.
+- New section **Comments and Documentation**: `//`, `/* … */` (whether they nest is left to the implementation) and `///` XML doc comments in the C# style, which bind to the declaration that immediately follows.
+- The comments example uses `throw new ArgumentException(…, nameof(amount))`, before either `throw` or `nameof` is specified.
+
+<a id="sec-v0-16-to-v0-17-changelog"></a>
+### v0.16 to v0.17 changelog (reconstructed)
+
+- New section **Declarations and Scoping**, appended at the end. Locals are declared as `var name: Type`, `var name: Type := expr` or with inference (`var name := expr`).
+- **`const` declarations** (`const Pi: real := 3.14159;`, type optionally inferred) are added. They must be initialized with constant expressions.
+- **Field initializers** (`private _x: T := expr;`) are added. They run before the constructor body, in source order.
+- Block scoping is spelled out: locals are visible from their declaration to the end of the block, `foreach` variables are scoped to the loop body, and shadowing is allowed but discouraged.
+- **Definite assignment** is made a compiler-enforced rule, with static flow analysis rejecting reads of possibly-unassigned locals. Fields default to `null` (reference types) or the zero value (value types).
+
+<a id="sec-v0-17-to-v0-18-changelog"></a>
+### v0.17 to v0.18 changelog (reconstructed)
+
+- New section **Methods and Constructors**. The table of contents now also lists Declarations and Scoping, but still not the Expressions or Literals sections.
+- Methods are declared as `visibility method Name(params): ReturnType`, with the return type omitted for void methods. Expression-bodied methods use `=> expr` and may not contain statements.
+- **Constructor chaining** with `this(...)` and `base(...)` is added.
+- **Parameter modifiers `ref` and `out`** are formalized: the caller repeats the modifier, as in `out var num` and `Utils.Normalize(ref vec)`. These are the only two modifiers, and there is explicitly no `params` (use `Array<T>` with collection literals instead).
+- **Optional parameters** (`level: string = "INFO"`) and **named arguments** (`timestamp := false`) are added. Note that defaults use `=` while named arguments use `:=`.
+- **Overloading** of methods and constructors is added, with C#-style overload resolution that also considers `ref`/`out`.
+- **`static` members** are added, including parameterless static constructors.
+
+<a id="sec-v0-18-to-v0-20-changelog"></a>
+### v0.18 to v0.20 changelog (reconstructed)
+
+- Gap note: The v0.19 snapshot is missing, so these changes cannot be attributed to a single revision.
+
+- New section **Resource Management**. It states that there is **no garbage collector** and that all cleanup is deterministic and manual, built on the `IDisposable` interface (`method Dispose();`).
+- The C#-style **Dispose pattern** is prescribed:
+  - a non-virtual public `Dispose()` guarded by a `_disposed` flag;
+  - a `protected virtual Dispose(disposing: bool)` that derived classes `override`, always calling `base.Dispose(disposing)` last.
+- **`using var` declarations** are added. They dispose at the end of the enclosing block, even when an exception is thrown, without opening a block of their own. Use after dispose is undefined behaviour.
+- **`scope … end;` blocks** are added: anonymous inner scopes for early disposal, which dispose their `using var` locals in reverse declaration order.
+- **Exception handling** is added: `try` / `catch` / `finally` / `throw`, with `catch Type then` (short form) and `catch ex: Type then` (long form). A `when` guard is allowed only on the long form, catches match first-to-last, and bare `throw;` rethrows. All exceptions derive from `Exception`.
+- Records "almost never" implement `IDisposable`. A base `Object` class is promised for later.
+
+<a id="sec-v0-20-to-v0-21-changelog"></a>
+### v0.20 to v0.21 changelog (reconstructed)
+
+- The resource-management section is rewritten around **manual heap ownership**. It adds "no automatic reference counting", except in rare documented cases such as `string`. Every `class` instance is heap-allocated by `new`, and `Dispose()` is the only way to free it.
+- **Every class implicitly derives from `Object : IDisposable`**, and every instance must be disposed exactly once. `Object`'s own `Dispose(bool)` frees the heap block, so `base.Dispose(disposing)` is now explicitly what deallocates memory.
+- The public `Dispose()` is described as idempotent, while the rules also say it must be called exactly once.
+- **`Array<T>` implements `IDisposable`** and frees its buffer. Fixed-size `T[]` arrays need no disposal.
+- New **Ownership Conventions** (by convention only, not checked by the compiler):
+  - whoever calls `new` owns the result;
+  - storing an object in another object's field or collection makes the container the owner, which must dispose it in `Dispose(bool)`;
+  - passing an object does not transfer ownership.
+- Forgetting to dispose is stated to leak until the process exits. Records never require disposal.
+- The `using var` text gains an `Array<byte>` example. Explicit `try`/`finally { x.Dispose(); }` is shown, and `scope` is presented as a way to dispose early.
+
+<a id="sec-v0-21-to-v0-24-changelog"></a>
+### v0.21 to v0.24 changelog (reconstructed)
+
+- Gap note: The v0.22 and v0.23 snapshots are missing, so these changes cannot be attributed to a single revision.
+
+- **Compiler-checked ownership replaces the hand-written Dispose pattern.** A class declares at most one `public destructor … end destructor;`, and the compiler generates an idempotent `Dispose()`. That `Dispose()` runs the destructor, disposes `owned` fields in reverse declaration order, chains to the base destructor and frees the heap block. `Dispose(bool)`, the `disposing` flag, `_disposed` and manual `base.Dispose` calls are removed, and "no finalizers" is added.
+- **`owned` modifier** added for class-type fields:
+  - Automatic disposal, with a null check for nullable fields.
+  - Local leak-prevention checks: an owned field's value may not be returned except as `owned`, and may not be stored in another class's non-owned field. Passing it as an argument is a borrow.
+  - Reassigning an owned field does not dispose the old value; doing that is the programmer's job.
+  - `owned` is not allowed on locals or value-type fields.
+- **Ownership transfer** uses `owned` parameters and `owned` return types. Ordinary parameters are borrows. A `new` expression yields an owned value that must reach an owned field, a `using var`, a transfer or an explicit `Dispose()` in the same method, and the compiler warns when such a result is discarded.
+- **Nullability** section added. Reference types are non-nullable by default and `T?` marks nullable, with `T` a subtype of `T?`. Value types can be wrapped as optionals (`int?`). Other rules:
+  - flow-sensitive narrowing after `<> null` checks and early returns;
+  - `?.`, `??`, `??=`, and a postfix `!` that throws `NullReferenceException`;
+  - non-nullable fields must be assigned in every constructor or have an initializer.
+- **Enums** added (`enum Priority Low, Medium, High; end Priority;`):
+  - explicit `:=` values, and an optional integer underlying type (`enum X: byte`);
+  - instance methods, expression-bodied computed properties, and static methods and readonly fields, but no instance fields, constructors, nesting, inheritance or interfaces;
+  - no implicit integer conversion; explicit `int(p)` and `Priority(1)` casts are used instead;
+  - the enum prefix may be omitted in `case` arms.
+- **Lambdas, function types and type aliases** added:
+  - the unit type `()`;
+  - function types `(int, int) -> int`, with optional documentation-only parameter names and nullable form `((…) -> T)?`;
+  - lambdas `(x) => expr` and `(x) => do … end`, with parameter types inferred from the target, by-reference closures, and a fresh `foreach` binding per iteration;
+  - method references and null-conditional calls `f?(…)`;
+  - `type Name = T;` aliases, which are pure synonyms (single-field records are recommended for distinct types).
+- **Parameter separator in declarations changes from `;` to `,`** (`record Point(x: int, y: int)`, `method Add(a: int, b: int)`), matching the call-site change in v0.16.
+- Primitive type **`real` replaced by `double`** in the built-in types list, the literals section and the examples.
+- Records gain a **combined syntax**: a positional header followed by a body (`record Vector2(x: double, y: double) … end Vector2;`).
+
+<a id="sec-v0-24-to-v0-52-changelog"></a>
+### v0.24 to v0.52 changelog (reconstructed, span)
+
+No snapshot survives for any revision between v0.24 and v0.60, so none of these changes can be attributed to a single revision. This entry compares the v0.24 snapshot with the v0.60 spec and rationale snapshots, leaving out everything the v0.52→v0.60 entries (below) record as changed after v0.52. What remains describes the language as of v0.52. Where the v0.53 entry states v0.52's behavior directly, that statement is used.
+
+**Syntax and statements**
+
+- **One `case` construct.** v0.24 had two forms: a `case` statement whose arms were `pattern: … end;` with a `default:` arm, and a separate `case` expression whose arms were `pattern => value`. By v0.52 there is a single `case … end` expression (it discards its value in statement position) with `pattern => expr` arms and `_` as the fallback. It adds a scrutinee-less form whose arms are boolean tests, record destructuring patterns (`Point(x, y)`), typed bindings `var n: T` (which replace `var x as T`), `when` guards, and exhaustiveness checking.
+- **Loops rebuilt on ranges and `IEnumerable<T>`.** The counting `for var i := 1 to 10 step N` loop and `foreach … in` are gone. In their place is one `for var x in source do … end;` over any `IEnumerable<T>`. First-class range expressions (`a..b`, `a..<b`, open-ended forms, `step`, a `Range<T>` type) supply the counting case. Iterator methods (`yield`) are specified.
+- **`scope … end;` is replaced by `do … end`.** The block that limits local and `using var` lifetimes, and that serves as a multi-statement body wherever one statement is expected, is now `do … end`.
+- **Word operators.** Logical negation is `not` (prefix `!` is gone; `!` survives only as the postfix null-forgiving operator), and remainder is `mod` instead of `%`. `++`/`--` are postfix and statement-only. Integer arithmetic is checked and raises `OverflowException`. New operators appear: `in`, `is`/`is not`/`as`, `typeof`, `default`, `throw` as an expression, and the discard `_`. The precedence table gained levels for range, `??` and the conditional/`case` expression. Where the bitwise and `??` levels sat at v0.52 cannot be recovered, because v0.53 reshuffled them.
+
+**Types, classes and members**
+
+- **A fuller class model.** Members are non-virtual by default, with `virtual`/`override`/`abstract`/`sealed`. Member hiding is forbidden. `base.Member`, generic variance, and four visibility levels (`public`, `internal`, `protected`, `private`) with accessor visibility are specified. None of these appears in v0.24. `Object` is now a defined root type (`GetType`, `Equals`, `GetHashCode`, `ToString`, `ReferenceEquals`) with boxing. `=` invokes `Equals`, and overriding `Equals` requires overriding `GetHashCode`.
+- **Records extended.** Records now have positional, body and combined forms, non-destructive update with `with`, primary constructors and object-initializer blocks. Properties gain block-form accessors and indexers. Primitive keywords are defined as aliases for `System.*` types (in v0.52 the stdlib still declared them as `class int`, `class string`, … until v0.53).
+- **Dispose moved off `Object`.** In v0.24 every class derived from an `Object` that implemented `IDisposable`. By v0.52 disposal is class-only: the compiler generates `IDisposable` on classes, and records, enums and primitives have no `Dispose`.
+
+**Ownership and memory**
+
+- **Runtime-managed types and inferred local ownership.** `string`, boxed values and function values are runtime-managed and exempt from manual disposal. A local's ownership state (owned or borrowed) is inferred from how it was introduced, never annotated. The v0.53 entry notes that this local-ownership and borrow model "was load-bearing throughout v0.52 but never written down". Collections do not own their elements (`DisposeElements()`). Asynchronous disposal exists.
+
+**New feature areas (absent from v0.24)**
+
+- **Async.** `async`/`await`, `Task`/`Task<T>`, cancellation tokens, async iterators, async lambdas and thread synchronization. In v0.52 the result-ownership rule was syntax-directed ("Pattern A vs Pattern B"); `Task<owned T>` and `out owned` were not yet legal.
+- **Events.** Events are declared as members and raised with the C#-style `event?.Invoke(args)`. `IEvent`/`EventSource` were not yet explicit stdlib types.
+- **Extension blocks, FFI and the entry point.** Module-level `extension` blocks were added. The FFI uses `extern` blocks, calling conventions, `CString`/`WString`/`RawBytes` marshalling, `IntPtr` and callbacks. The `Main` entry point now has defined signatures and exit-code rules.
+- **Standard library at v0.52.** It includes a doubly linked `List<T>` (renamed `LinkedList<T>` in v0.53) and LINQ-style queries with `ToList()` and `Map`. Strings are specified as UTF-32 (made adaptive in v0.53), and float `=` follows IEEE semantics (made reflexive in v0.53).
+
+**Datable decisions in the span** (only those whose version a source states explicitly)
+
+- **v0.40: inline fixed-size value-type array fields rejected** (C#-`fixed`-style inline arrays in classes). The current rationale §17.6 cites "the v0.40-v0.97 rejection rationale", and `docs/proposals/DECLINED.md` records it as "rejected v0.40–v0.97, shipped v0.98". The v0.60 rationale snapshot already carries the rejection (§17.6).
+- No other revision from v0.25 to v0.51 is named in any source searched: the v0.60 spec and rationale snapshots, the v0.62 and v0.63 patch sets, the v0.93 spec snapshot, the current `docs/*.md` and `docs/proposals/*.md`. The other changes above can only be dated to "after v0.24, at or before v0.52".
+
+---
 
 <a id="sec-v0-52-to-v0-53-changelog"></a>
 ### v0.52 to v0.53 changelog
