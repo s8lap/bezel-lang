@@ -132,11 +132,19 @@ BEZEL_TEST(own_escape, return_value_method_on_using_var_clean) {
 // escape. Sema types `Length`/`Count` only on the *call* form, so the bare
 // property access reaches the ownership pass untyped; the value-typed
 // fallback (returnedExprMayBorrow) must still recognize it as a copy.
+//
+// The receiver is a `StringBuilder` because stdlib §1's Count-vs-Length
+// convention gives the resizable `Array<T>` a `Count` and NOT a `Length`
+// (`a.Length` on an `Array<int>` is an error, #4811) — `Length` belongs to
+// the *fixed/contiguous extent* types (text, buffers, spans). `StringBuilder`
+// is one of those, it is on the fallback's own receiver list in
+// Ownership_Checks.cpp, and it keeps this row on the `Length` name path that
+// its sibling `return_count_on_using_var_collection_clean` does not cover.
 BEZEL_TEST(own_escape, return_length_on_using_var_collection_clean) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
         "  public static method Main(): int "
-        "    using var a := new Array<int>(); a.Add(1); "
+        "    using var a := new StringBuilder(); a.Append(\"x\"); "
         "    return a.Length; "
         "  end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

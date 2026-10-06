@@ -144,7 +144,7 @@ BEZEL_TEST(vacuous_lint_cstring_to_bytes_2826,
         "class C "
         "  public static method N(c: CString): int "
         "    using var b := c.ToBytes(); "
-        "    return b.Length; "
+        "    return b.Count; "
         "  end N; "
         "  public static method Main(): int return 0; end Main; "
         "end C;");
@@ -175,7 +175,7 @@ BEZEL_TEST(vacuous_lint_cstring_to_bytes_2826,
         "  public static method M(): int "
         "    using var c := CString.From(\"abcd\"); "
         "    using var b := c.ToBytes(); "
-        "    return b.Length; "
+        "    return b.Count; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "
         "end C;");
@@ -204,7 +204,7 @@ BEZEL_TEST(vacuous_lint_cstring_to_bytes_2826,
         "  public static method M(): int "
         "    using var c := CString.From(\"abcd\"); "
         "    const b := c.ToBytes(); "
-        "    return b.Length; "
+        "    return b.Count; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "
         "end C;");
@@ -239,7 +239,7 @@ BEZEL_TEST(vacuous_lint_cstring_to_bytes_2826,
         "class C public static method Main(): int "
         "  using var h := new Holder(); "
         "  const b := h.ToBytes(); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasConstMaterializerError(r, "b"));
@@ -273,7 +273,7 @@ BEZEL_TEST(vacuous_lint_cstring_to_bytes_2826,
         "class C public static method Main(): int "
         "  using var cfg := new Cfg(); "
         "  const b := cfg.ToBytes(); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasConstMaterializerError(r, "b"));

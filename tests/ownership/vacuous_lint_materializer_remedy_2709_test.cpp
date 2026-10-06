@@ -245,7 +245,7 @@ BEZEL_TEST(vacuous_lint_materializer_2709,
         "  using var b := new Box(); "
         "  const t := b.ToArray(); "
         "  const s := b.Sorted(); "
-        "  return t.Length + s.Length; "
+        "  return t.Count + s.Count; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasConstMaterializerError(r, "t"));
@@ -286,7 +286,7 @@ BEZEL_TEST(vacuous_lint_materializer_2709,
         "class C public static method Main(): int "
         "  using var cfg := new Cfg(); "
         "  const parts := cfg.Split(\"a,b\"); "
-        "  return parts.Length; "
+        "  return parts.Count; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasConstMaterializerError(r, "parts"));
@@ -402,15 +402,15 @@ BEZEL_TEST(vacuous_lint_materializer_2709,
         "    using var m6 := \"a,b,c\".Split(\",\"); "
         "    using var m7 := a.Slice(0..<2); "
         "    using var m8 := Encoding.UTF8.GetBytes(\"hello\"); "
-        "    return m1.Length + m2.Count + m3.Count + m4.Length + m5.Length "
-        "         + m6.Length + m7.Length + m8.Length; "
+        "    return m1.Count + m2.Count + m3.Count + m4.Count + m5.Count "
+        "         + m6.Count + m7.Count + m8.Count; "
         "  end U; "
         "  public static method V(a: Array<int>): int "
         "    var m1 := a.Where(lambda(x) => x > 0).ToArray(); "
         "    var m4 := a.Sorted(); "
         "    var m5 := a.Reversed(); "
         "    var m6 := \"a,b,c\".Split(\",\"); "
-        "    return m1.Length + m4.Length + m5.Length + m6.Length; "
+        "    return m1.Count + m4.Count + m5.Count + m6.Count; "
         "  end V; "
         "  public static method Main(): int "
         "    using var a := new Array<int>(); "

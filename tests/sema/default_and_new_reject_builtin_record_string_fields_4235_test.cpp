@@ -289,7 +289,7 @@ BEZEL_TEST(default_and_new_reject_builtin_record_string_fields_4235,
         "class ProgArr4235g "
         "  public static method Main(): int "
         "    var b := HolderArr4235g<Array<int>>.Make(); "
-        "    return b.Length; "
+        "    return b.Count; "
         "  end Main; "
         "end ProgArr4235g;");
     BEZEL_EXPECT_TRUE(r.ran);

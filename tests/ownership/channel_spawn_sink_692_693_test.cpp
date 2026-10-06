@@ -98,11 +98,19 @@ BEZEL_TEST(channel_spawn_sink_692_693,
 
 // §30.15 POSITIVE boundary: ChannelSender<T> with class-typed T and a `new`
 // expression (an owned value) must still be accepted.
+//
+// `Report` is `sealed` so the element type argument is SENDABLE: §30.14 makes
+// a class type sendable iff it is transfer-closed (`sealed`), so an unsealed
+// `Report` is now rejected at the `ChannelSender<Report>` type argument with
+// §14.2's `does not satisfy the constraint where T: sendable` — a DIFFERENT
+// rule from the one this row pins. Sealing leaves the row's subject intact:
+// T is still a class type, `new Report()` is still an owned value, and the
+// boundary still tested is owned-vs-borrow at the `Send` call site.
 BEZEL_TEST(channel_spawn_sink_692_693,
            channel_send_class_new_expr_accepted_6_9_30_15) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class Report end Report; "
+        "sealed class Report end Report; "
         "class W "
         "  public static method P(owned tx: ChannelSender<Report>) "
         "    using var s := tx; "
