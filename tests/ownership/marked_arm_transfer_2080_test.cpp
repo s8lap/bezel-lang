@@ -20,6 +20,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"  // parseAndCheckOwnership / hasErrorMessage — §3591 const-target question below
 #include "test_harness.hpp"
 
@@ -31,10 +32,32 @@ using bezel::test::runAotChecked;
 
 namespace {
 
+// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
+// runAotChecked returns ran=false with a "<name>: SKIP — C toolchain (clang)"
+// diagnostic (aot_support.hpp:3597).
+//
+// #3733: this predicate is NOT a bare find("SKIP"), because a toolchain skip and
+// a real finding are DIFFERENT outcomes and only the former may be returned
+// past. A runAotChecked run whose sanitizer FIRED reports "<name>: sanitizer
+// fired (...)" (aot_support.hpp:3713) — and a finding whose text happened to
+// also carry the "SKIP" literal must not be discarded as if the box merely
+// lacked clang, which is exactly the silent-skip defect this guard would
+// otherwise reintroduce for this file. The two message shapes are disjoint
+// (MEASURED: the SKIP arm is the fixed literal "<name>: SKIP — C toolchain
+// (clang) unavailable for the ASan link", which never contains "sanitizer
+// fired"; the finding arm is built as "<name>: sanitizer fired (...)" plus an
+// optional sanitizer report, and never contains "SKIP"), so requiring "SKIP"
+// AND NOT "sanitizer fired" classifies exactly the toolchain absence. The
+// extra positive-substring test is also what makes this predicate PROTECTIVE
+// rather than SKIP-only under scripts/check_toolchain_skip_surface.py's
+// _text_checking_helpers classifier (check_ambiguous_ran_false.py:560).
 bool wasSkipped(const JitResult& r) {
     if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("SKIP") == std::string::npos) continue;
+        if (d.message.find("sanitizer fired") != std::string::npos) return false;
+        return true;
+    }
     return false;
 }
 
@@ -111,6 +134,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_case_arm_results_both_ways) {
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -138,6 +165,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_when_arm_results) {
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -175,6 +206,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_shadowed_binding_resolves_inner) 
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -204,6 +239,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_same_binding_both_arms) {
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -276,6 +315,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_7_7_move_spelled_coalesce_both_paths_4
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -333,6 +376,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_pattern2_move_spelled_coalesce_bo
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -369,6 +416,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_pattern2_move_spelled_coalesce_us
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -402,6 +453,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_pattern2_move_spelled_coalesce_re
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -432,6 +487,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_case_three_arm_move_mixed_with_fr
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -463,6 +522,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_case_arm_results_move_spelled_bot
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -490,6 +553,10 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_28_3_same_binding_move_spelled_both_ar
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -532,6 +599,10 @@ BEZEL_TEST(marked_arm_transfer_2080,
         "    return 0; "
         "  end Main; "
         "end C;");
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is LOUD, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
