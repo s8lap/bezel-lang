@@ -120,16 +120,38 @@ std::string localDisposeCall() {
         "end Main; end C;");
 }
 
+// fix #5447: the original `paramNameAccess` called `Use(d)` from static Main as
+// a bare name, which is a §2.7 violation (Use was an instance method of the
+// enclosing type). The test was about `d.Name.Length` on a Domain parameter, not
+// about the §2.7 violation. Making `Use` a static method removes the incidental
+// violation while preserving the test's subject. The new control row below
+// (`instanceMethodNameAccess`) pins the same question directly in an instance
+// method, proving §2.7 does not apply there.
 std::string paramNameAccess() {
     return std::string(
         "module M; "
         "class C "
-        "  public method Use(d: Domain): int "
+        "  public static method Use(d: Domain): int "
         "    return d.Name.Length; "
         "  end Use; "
         "  public static method Main(): int "
         "    var d: Domain := default(Domain); "
         "    return Use(d); "
+        "  end Main; "
+        "end C;");
+}
+
+std::string instanceMethodNameAccess() {
+    return std::string(
+        "module M; "
+        "class C "
+        "  public method InstanceName(d: Domain): int "
+        "    return d.Name.Length; "
+        "  end InstanceName; "
+        "  public static method Main(): int "
+        "    var c := new C(); "
+        "    var d: Domain := default(Domain); "
+        "    return c.InstanceName(d); "
         "  end Main; "
         "end C;");
 }
@@ -239,9 +261,23 @@ BEZEL_TEST(builtin_static_class_member_2993,
     // apply; the post-fix shape is the same compile-and-run (degrade) as
     // the local form. Pinned separately to keep the member-on-parameter
     // narrowing visible if a future change touches it.
+    //
+    // fix #5447: `Use` is now a static method to avoid the incidental §2.7
+    // violation (bare name `Use` was an instance method called from static
+    // Main). The test's subject is `d.Name.Length`, unaffected by #5447.
     auto r = runAot(paramNameAccess());
     BEZEL_EXPECT_TRUE(r.ran);                 // compiles (no IR mismatch)
     BEZEL_EXPECT_TRUE(r.stdoutText.find("Use") == std::string::npos);
+}
+
+// Control: d.Name inside an INSTANCE method is fine — §2.7 applies only to
+// bare references from a STATIC body. This is the shape the original row
+// was really about (d.Name on a Domain parameter), without the incidental
+// §2.7 violation from the bare-name instance-method call.
+BEZEL_TEST(builtin_static_class_member_2993,
+           d_name_in_instance_method_on_domain_parameter_is_fine_spec_11_7_stdlib_6_8) {
+    auto r = runAot(instanceMethodNameAccess());
+    BEZEL_EXPECT_TRUE(r.ran);
 }
 
 BEZEL_TEST(builtin_static_class_member_2993,
