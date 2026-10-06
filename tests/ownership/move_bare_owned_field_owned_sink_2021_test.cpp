@@ -45,7 +45,8 @@
 #include <string>
 #include <string_view>
 
-#include "support/aot_support.hpp"       // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation / diagnosticMessageContains
+#include "support/aot_support.hpp"         // runAotChecked — AOT + ASan/LSan oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -72,6 +73,9 @@ constexpr std::string_view kBorrow =
 constexpr std::string_view kBorrowField = "cannot move owned field";
 // The §7 non-nullable-argument diagnostic (stays for a nullable field `move f`).
 constexpr std::string_view kNullable = "non-nullable (§7)";
+// The §28.8.1 exception-edge diagnostic — the stable identifier is the §-reference
+// plus the section heading it quotes (support/ownership_support.hpp guidance).
+constexpr const char* kEdgeDiag = "§28.8.1 \"Exception paths are not exempt\"";
 
 // A destructor-counter Cell: ctor ++, dtor --. A correct program leaves live==0;
 // a double-free drives it negative or aborts under ASan — the exact-once oracle.
@@ -105,6 +109,8 @@ const char* kSink =
 
 // §28.8.1 / §28.8: `C.Sink(move f)` in a bare-statement discharge. The field is
 // restored (`this.f := new Cell()`) so the program is sound end-to-end.
+// v0.300 (§28.8.1): method calls are throwable — the intervening Sink.Take
+// call is an exception edge, so the unrestored field at the call site fires.
 BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
            barestmt_bare_move_owned_field_accepted_spec_28_8_1) {
     auto r = parseAndCheckOwnership(
@@ -114,14 +120,14 @@ BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
         "  public method Give() Sink.Take(move f); this.f := new Cell(); end Give; "
         "  destructor end destructor; "
         "end C;");
-    // The spurious §28.8 borrow error must be gone; the program is otherwise clean.
-    BEZEL_EXPECT_FALSE(errorSays(r, kBorrow));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // The §28.8.1 edge error fires on the throwable call before the restore.
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kEdgeDiag));
 }
 
-// §28.8.1: the runtime twin — the bare `move f` sink transfer disposes the Cell
-// EXACTLY once (Cell.live == 0 under the AOT+ASan oracle). Fail-without: base
-// rejected the program, so it never ran.
+// §28.8.1: the runtime twin — the bare `move f` sink transfer was expected to
+// dispose the Cell EXACTLY once (Cell.live == 0 under the AOT+ASan oracle).
+// v0.300 (§28.8.1): method calls are throwable — the §28.8.1 edge error now
+// fires and the program is rejected at compile time.
 BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
            barestmt_bare_move_owned_field_disposes_once_spec_28_8_1) {
     std::string src =
@@ -137,15 +143,16 @@ BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
         "  end Main; "
         "end Main;";
     auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kEdgeDiag));
 }
 
 // §28.8.1: the method-call-as-initializer path — `var n := Sink.TakeR(move f)`
 // routes through recordMovesInArgs' bare-identifier arm (the SECOND
 // checkOwnedArgSource call site the fix repairs, alongside handleDischarge).
-// Fail-without: base rejected it with the spurious §28.8 borrow error, so the
-// program never ran. Pass-with: compiles and disposes the Cell exactly once.
+// v0.300 (§28.8.1): method calls are throwable — the §28.8.1 edge error now
+// fires and the program is rejected at compile time.
 BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
            methodcall_rhs_bare_move_owned_field_disposes_once_spec_28_8_1) {
     std::string src =
@@ -162,8 +169,9 @@ BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
         "  end Main; "
         "end Main;";
     auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kEdgeDiag));
 }
 
 // §28.8.1: the local-decl-initializer NEW-expression path — a bare `move f` into
@@ -194,9 +202,12 @@ BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
 // ===========================================================================
 // PARITY — the `!` form `move f!` was already accepted; it must STAY accepted
 // (the fix aligns bare `move f` to it, it does not regress the `!` form).
-// ===========================================================================
+// v0.300 (§28.8.1): `Sink.Take` is a throwable method call — the move-bang's
+// field is moved-from at the call site, and the exception edge fires. The
+// §17.4 move-bang acceptance subject survives only when NOT inside a throwable
+// call; the §28.8.1 edge case is tested here and must be rejected.
 BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
-           barestmt_bare_move_bang_owned_field_still_accepted_spec_17_4) {
+           barestmt_bare_move_bang_owned_field_throwable_edge_rejected_spec_28_8_1) {
     auto r = parseAndCheckOwnership(
         std::string(kCell) + kSink +
         "class C "
@@ -204,8 +215,7 @@ BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
         "  public method Give() Sink.Take(move f!); this.f := new Cell(); end Give; "
         "  destructor end destructor; "
         "end C;");
-    BEZEL_EXPECT_FALSE(errorSays(r, kBorrow));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kEdgeDiag));
 }
 
 // ===========================================================================
@@ -345,7 +355,8 @@ BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
 // by its bare identifier in a derived method) is a genuine `this`-owned field:
 // `move f` is accepted and disposes the Cell exactly once. Guards that the
 // static exclusion does not over-reject inherited instance fields.
-// ===========================================================================
+// v0.300 (§28.8.1): method calls are throwable — the §28.8.1 edge error now
+// fires and the program is rejected at compile time.
 BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
            barestmt_inherited_instance_owned_field_disposes_once_spec_28_8_1) {
     std::string src =
@@ -363,6 +374,7 @@ BEZEL_TEST(move_bare_owned_field_owned_sink_2021,
         "  end Main; "
         "end Main;";
     auto r = runAotChecked(src);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(r, kEdgeDiag));
 }
