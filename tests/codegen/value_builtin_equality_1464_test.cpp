@@ -93,11 +93,13 @@ BEZEL_TEST(value_builtin_eq_1464, dict_guid_distinct_keys) {
 
 BEZEL_TEST(value_builtin_eq_1464, dict_guid_contains_key) {
     // ContainsKey: hit on an equal key, miss on a fresh one → 5.
+    // v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `(when …)`
+    // expression is retired — replaced with the equivalent `(if … then … else …)`.
     BEZEL_EXPECT_EQ(run(
         "using var d := new Dictionary<Guid, int>(); "
         "d.Add(Guid.Empty, 1); "
-        "var hit  := (when d.ContainsKey(Guid.Empty)   => 5,   _ => 0); "
-        "var miss := (when d.ContainsKey(Guid.NewGuid()) => 100, _ => 0); "
+        "var hit  := (if d.ContainsKey(Guid.Empty)   then 5   else 0); "
+        "var miss := (if d.ContainsKey(Guid.NewGuid()) then 100 else 0); "
         "return hit + miss;"), 5);
 }
 

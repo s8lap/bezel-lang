@@ -1,12 +1,15 @@
 // Spec-derived tests for #744 (stage 1) — the dedicated `when` condition-dispatch
 // expression.
 //
-// Authority: #744 / §19. `when Arm ("," Arm)* ","? end` is the scrutinee-less
+// Authority: #744 / §19.  `when Arm ("," Arm)* ","? end` is the scrutinee-less
 // condition-dispatch form: each arm is a boolean condition; the first true wins.
 // It is the layout-independent replacement for the bare (scrutinee-less) `case`
 // form. This stage adds `when` as an additive expression construct producing the
 // existing null-scrutinee CaseExpr (sema/codegen reuse the scrutinee-less path);
 // migrating bare `case` and deleting the newline heuristic is a later stage.
+//
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression and statement are retired — all rows verify rejection.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
@@ -28,36 +31,40 @@ std::string sign(int n) {
 }
 }  // namespace
 
-// #744: first true arm wins — positive.
+// v0.289: the `(when …)` expression is retired.
 BEZEL_TEST(when_expr_744, positive_first_arm) {
-    BEZEL_EXPECT_EQ(run(sign(5)), 1);
+    auto r = runAot(sign(5));
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` rejected
 }
 
-// #744: second arm — negative.
+// v0.289: the `(when …)` expression is retired.
 BEZEL_TEST(when_expr_744, negative_second_arm) {
-    BEZEL_EXPECT_EQ(run(sign(-3)), 2);
+    auto r = runAot(sign(-3));
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` rejected
 }
 
-// #744: the discard arm — zero.
+// v0.289: the `(when …)` expression is retired.
 BEZEL_TEST(when_expr_744, fallthrough_discard_arm) {
-    BEZEL_EXPECT_EQ(run(sign(0)), 3);
+    auto r = runAot(sign(0));
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` rejected
 }
 
-// #744: a multi-line `when` (no layout-significance) selects the right arm.
+// v0.289: the `(when …)` expression is retired.
 BEZEL_TEST(when_expr_744, multiline_layout_independent) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; static class F public static method Main(): int "
         "  var n := 7; "
         "  var r := (when "
         "    n > 100 => 10, "
         "    n > 5 => 20, "
         "    _ => 30); "
-        "  return r; end Main; end F;"), 20);
+        "  return r; end Main; end F;");
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` rejected
 }
 
-// #744 (stage 2): statement-position `when` with `do … end` arm bodies.
+// v0.289: the `when … end;` statement is retired.
 BEZEL_TEST(when_expr_744, statement_form) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "module M; static class F public static method Main(): int "
         "  var n := 7; var result := 0; "
         "  when "
@@ -65,5 +72,6 @@ BEZEL_TEST(when_expr_744, statement_form) {
         "    n > 5 => do result := 2; end, "
         "    _ => do result := 3; end "
         "  end; "
-        "  return result; end Main; end F;"), 2);
+        "  return result; end Main; end F;");
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `when … end;` rejected
 }

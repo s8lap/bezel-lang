@@ -171,12 +171,12 @@ BEZEL_TEST(case_expr_string_result_leak_1934,
 
 // =====================================================================
 // (D) The scrutinee-less `when` sibling — same arm-meet rule, same clean result.
-// §19.1 / §19.2 / §28.3.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired — this test now verifies rejection.
 // =====================================================================
 BEZEL_TEST(case_expr_string_result_leak_1934,
            return_when_producer_arm_lsan_clean_spec_19_1) {
     JitResult r = runAotChecked(kWhenProducerArm);
     if (wasSkipped(r)) return;
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 2);
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
 }

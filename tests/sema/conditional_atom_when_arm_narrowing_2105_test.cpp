@@ -128,12 +128,15 @@ BEZEL_TEST(conditional_atom_narrow_2105, if_atom_eq_null_narrows_else_spec_7_4) 
 // §7.4 (v0.210, #2105): the first arm's condition narrows the first
 // arm's body. `(when s <> null => s.Length, _ => 0)` — `s.Length` in the
 // first arm is accepted without a further guard.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `(when …)`
+// expression is retired — rewritten as an equivalent `(if … then … else …)`
+// to preserve the narrowing subject.
 BEZEL_TEST(when_arm_narrow_2105, when_expr_first_arm_condition_narrows_body_spec_7_4) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
         "  public static method Run(s: string?): int "
-        "    return (when s <> null => s.Length, _ => 0); "
+        "    return (if s <> null then s.Length else 0); "
         "  end Run; "
         "  public static method Main(): int "
         "    return C.Run(\"hi\"); "
@@ -166,6 +169,10 @@ BEZEL_TEST(when_arm_narrow_2105, when_expr_second_arm_unnarrowed_spec_7_4) {
 // produces a CaseStmt (not CaseExpr) for this surface, so this case
 // pins the CaseStmt scrutinee-less handler in ExprTypecheck.cpp
 // (the expression counterpart is pinned above).
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when … end;`
+// statement is retired — converted to rejection (no equivalent statement form
+// preserves the arm-narrowing semantics; the narrowing subject is covered by
+// the `(if …)` expression form in `conditional_atom_narrow_2105`).
 BEZEL_TEST(when_arm_narrow_2105, when_stmt_first_arm_condition_narrows_body_spec_7_4) {
     auto r = parseSemaAll(
         "module M; "
@@ -181,7 +188,7 @@ BEZEL_TEST(when_arm_narrow_2105, when_stmt_first_arm_condition_narrows_body_spec
         "    return C.Run(\"hi\"); "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());  // v0.289: `when … end;` retired
 }
 
 // §7.4 / §19.1 / statement-position (control, #2105): the discard

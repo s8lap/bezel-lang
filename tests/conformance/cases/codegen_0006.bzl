@@ -37,7 +37,7 @@ case delta of
   _       => Log("up")
 end case;
 
-when  score >= 90 => Console.WriteLine("A"),  _ => Console.WriteLine("F")  end when;
+if score >= 90 then Console.WriteLine("A") else Console.WriteLine("F") end if;
 
 // return / throw / break / continue / yield
 return;

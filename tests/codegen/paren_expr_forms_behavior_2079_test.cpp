@@ -84,8 +84,10 @@ BEZEL_TEST(paren_forms_2079, spec_20_if_atom_throw_branch) {
         "end Main; end C;"), 0);
 }
 
-// §19.1 v0.208 (the spec's own grade examples): the case atom and the when
-// atom produce the selected arm's value.
+// §19.1 v0.208 (the spec's own grade examples): the case atom produces the
+// selected arm's value.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `(when …)`
+// expression is retired — the when atom is removed; the case atom remains.
 BEZEL_TEST(paren_forms_2079, spec_19_1_case_and_when_atoms) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -93,10 +95,8 @@ BEZEL_TEST(paren_forms_2079, spec_19_1_case_and_when_atoms) {
         "var g1 := (case score of 90..100 => 1, 80..89 => 2, 70..<80 => 3, "
         "_ => 4); "
         "if g1 <> 2 then return 1; end; "
-        "var g2 := (when score >= 90 => 1, score >= 80 => 2, _ => 4); "
-        "if g2 <> 2 then return 2; end; "
-        "return 0; "
-        "end Main; end C;"), 0);
+        "return 2; "  // was: check g2, return 0 — g2 retired at v0.289
+        "end Main; end C;"), 2);
 }
 
 // §19.7 v0.208: in call-argument position the atom's parentheses are its own
@@ -112,13 +112,14 @@ BEZEL_TEST(paren_forms_2079, spec_19_7_atom_in_argument) {
 
 // §19 v0.208: the statement forms are unchanged — `end`-closed, statement
 // arm bodies, value discarded per §21.9.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when … end when;`
+// statement is retired — removed; the case statement arm remains as the subject.
 BEZEL_TEST(paren_forms_2079, spec_19_7_statement_forms_run) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "var total := 0; "
         "case 2 of 1 => total := 1;, 2 => do total := 40; total := total + 2; "
         "end, _ => total := 9; end case; "
-        "when total > 41 => total := total + 0;, _ => total := 0; end when; "
         "return total; "
         "end Main; end C;"), 42);
 }

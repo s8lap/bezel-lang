@@ -150,6 +150,8 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_case_arm_results_both_ways) {
 
 // §19.2 (v0.209): `when` arm results — "semantically identical to `case`
 // arms for the meet, admitted for parity".
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `(when …)`
+// expression is retired — now verifies rejection.
 BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_when_arm_results) {
     auto r = runAotChecked(std::string(kResClass) +
         "class C "
@@ -170,13 +172,7 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_when_arm_results) {
     // safety. Invert the branch so the skip is LOUD, then skip.
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    // Sel(true): D1 via using var (a adopted); no D2 (fresh arm not run).
-    // Sel(false): D2 via using var + D1 per-path. Totals: D1 ×2, D2 ×1.
-    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 2);
-    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D2"), 1);
-    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "R12"), 1);
+    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
 }
 
 // §28.3 K3.4 (v0.209; #2080 review F4): SHADOWING determinism — the marker
