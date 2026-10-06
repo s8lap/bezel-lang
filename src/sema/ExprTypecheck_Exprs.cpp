@@ -7115,9 +7115,10 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 // known non-null even though exprType keeps the nullable flag
                 // (null-narrowing does not rewrite exprType). This is the same
                 // question §7.11's own gates ask, so it is the same predicate
-                // (#3298) rather than a fifth copy of the lookup. initNarrow=false
-                // excludes init-narrowing: only null-test narrowing admits the operator.
-                return !isNarrowedNonNullRead(operand, false);
+                // (#3298) rather than a fifth copy of the lookup. It admits both
+                // narrowing kinds — a null test and a declaration initializer
+                // (§7.4, v0.309 / #4718) — for the reason §7.11 gives.
+                return !isNarrowedNonNullRead(operand);
             };
             if (nullableStringOperand(be.left.get()) ||
                 nullableStringOperand(be.right.get())) {
@@ -7517,12 +7518,17 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             };
             // §7.11 reads the operand's STATIC type at this program point, so a
             // §7.4-narrowed operand is a non-nullable operand here — the ONE
-            // narrowing predicate (#3298), not a local copy of it. initNarrow=false
-            // excludes init-narrowing: only null-test narrowing admits the operator.
+            // narrowing predicate (#3298), not a local copy of it.
+            // BOTH narrowing kinds admit the operator: a null test AND a
+            // declaration initializer (`var a: int? := 3;`), which §7.4 lists as
+            // "a declaration whose initializer is such an `expr`" establishing
+            // the fact "which is the declaration's assignment" (v0.309 / #4718).
+            // §7.11: "an operand that §7.4 has narrowed non-null is a non-nullable
+            // operand and the ordinary operator applies to it unchanged".
             bool lNull = isNullableValueOperand(ltN) &&
-                         !isNarrowedNonNullRead(be.left.get(), false);
+                         !isNarrowedNonNullRead(be.left.get());
             bool rNull = isNullableValueOperand(rtN) &&
-                         !isNarrowedNonNullRead(be.right.get(), false);
+                         !isNarrowedNonNullRead(be.right.get());
             if (lNull || rNull) {
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
@@ -7589,7 +7595,7 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         if (inLt && inLt->nullable && inRt &&
             inRt->kind == TypeRef::Kind::Named &&
             inRt->declaration == ctx_.builtinClassSym("Range") &&
-            !isNarrowedNonNullRead(be.left.get(), false)) {
+            !isNarrowedNonNullRead(be.left.get())) {
             ctx_.diagnostics().report(
                 Severity::Error, be.span.begin,
                 "the left operand of `in` over a range is nullable \xE2\x80\x94 "
@@ -7957,13 +7963,14 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             // at this program point even though exprType keeps the nullable
             // flag; `isNarrowedNonNullRead` is the ONE predicate that decides
             // that (#3298) — mutable fields and properties never narrow (§7.4),
-            // and `this`/`base` are not narrowable operands. initNarrow=false
-            // excludes init-narrowing (the §6.6 worked example): only null-test
-            // narrowing (e.g. `if a <> null`) admits the §7.11 operator.
+            // and `this`/`base` are not narrowable operands. Both narrowing kinds
+            // admit the §7.11 operator: a null test (e.g. `if a <> null`) and a
+            // declaration initializer (`var a: int? := 3;`), the latter being
+            // "the declaration's assignment" per §7.4 (v0.309 / #4718).
             bool lNull = isNullablePrim(lt) &&
-                         !isNarrowedNonNullRead(be.left.get(), false);
+                         !isNarrowedNonNullRead(be.left.get());
             bool rNull = isNullablePrim(rt) &&
-                         !isNarrowedNonNullRead(be.right.get(), false);
+                         !isNarrowedNonNullRead(be.right.get());
             // Per §3.5 only the §7.11-gated operator families are subject to
             // this rule. Equality (`=`/`<>`) is excluded above. User-declared
             // operators on a nullable user-type operand are rejected at the
@@ -8774,9 +8781,9 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // lookup-time narrowing analysis, #914) is a non-nullable operand here
         // and the ordinary unary operator applies. Mirror the §7.11 binary
         // operator's narrower rejection family so the diagnostic matches.
-        // initNarrow=false excludes init-narrowing: only null-test narrowing admits.
+        // A declaration initializer narrows too (§7.4, v0.309 / #4718).
         if (ot && ot->kind == TypeRef::Kind::Primitive && ot->nullable) {
-            if (!isNarrowedNonNullRead(ue.operand.get(), false)) {
+            if (!isNarrowedNonNullRead(ue.operand.get())) {
                 const char* opWord =
                     (op == "~") ? "bitwise complement (`~`)" :
                     (op == "-") ? "negation (unary `-`)" :

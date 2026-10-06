@@ -1328,14 +1328,20 @@ BEZEL_TEST(lifted_operators_rejected_3298,
 // differently for the two at identical shapes, decided by the operand's width.
 // ---------------------------------------------------------------------------
 
-// fix #4930 (v0.315): init-narrowing (§6.6) proves a local non-null for
-// member access but NOT for the §7.11 operator non-lift gate. Only null-test
-// narrowing (§7.4, `if a <> null then`) admits arithmetic/relational operators
-// on nullable operands. The test below was pinning the OLD behavior.
-// BEHAVIOR FLIP: was EXPECT_FALSE (init-narrowing admitted op), now
-// EXPECT_TRUE (init-narrowing does NOT admit operators, only null-test narrowing does).
+// fix #4718 (v0.309): a declaration's initializer DOES establish §7.4
+// narrowing — `var a: T? := expr;` "is the declaration's assignment" (§7.4) —
+// so the ordinary operator is admitted at every width. The row below had been
+// flipped to EXPECT_TRUE by `9b20de2e` ("fix #4930 (v0.315)"), a revision that
+// decided #5380/#5381/#5383/#5384/#5385 and never #4930; the #4930 issue's own
+// lane comment had already recommended gating on #4718 and, on a YES ruling,
+// changing "not a compiler fix". #4718 ruled YES, so the admitted behaviour
+// stands and this row is restored.
+// BEHAVIOR FLIP: `init_narrowing_does_not_admit_arithmetic_on_nullable_4930`
+// asserted EXPECT_TRUE (rejected); it is renamed back to
+// `literal_initializer_narrows_at_every_width` and asserts EXPECT_FALSE
+// (admitted) — the §7.4 / v0.309 / #4718 answer.
 BEZEL_TEST(lifted_operators_rejected_3298,
-           init_narrowing_does_not_admit_arithmetic_on_nullable_4930) {
+           literal_initializer_narrows_at_every_width) {
     const char* widths[] = {"byte", "sbyte", "short", "ushort",
                             "int", "long", "double", "float", "decimal"};
     for (const char* w : widths) {
@@ -1345,8 +1351,9 @@ BEZEL_TEST(lifted_operators_rejected_3298,
             "  var b := a + a; "
             "  return 0; "
             "end Main; end C;");
-        // §7.11 (v0.315, #4930): init-narrowing does NOT admit operators.
-        BEZEL_EXPECT_TRUE(hasNullableOpError(r));
+        // §7.4 (v0.309, #4718) + §7.11: the initializer narrows `a`, so the
+        // operand is non-nullable here and the ordinary operator applies.
+        BEZEL_EXPECT_FALSE(hasNullableOpError(r));
     }
 }
 
