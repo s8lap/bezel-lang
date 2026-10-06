@@ -1201,11 +1201,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 builder_.CreateSub(fcD, llvm::ConstantInt::get(i8TyD, '0')),
                 llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
         // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float form).
-        llvm::Value* secondCharD = builder_.CreateLoad(i8TyD,
-            builder_.CreateGEP(i8TyD, strData,
-                builder_.getInt64(1), "tryp.scptr"), "tryp.sc");
         llvm::Value* isLeadingZeroD = builder_.CreateICmpEQ(
             fcD, llvm::ConstantInt::get(i8TyD, '0'), "tryp.lzeroD");
+        // stdlib §9.2: read data[1] only when the first byte is '0' (see the
+        // Convert.ToDouble arm in LlvmBackend_Calls.cpp for why an
+        // unconditional read is out of bounds on the empty string).
+        llvm::Value* secondCharD = builder_.CreateLoad(i8TyD,
+            builder_.CreateGEP(i8TyD, strData,
+                builder_.CreateSelect(isLeadingZeroD,
+                    builder_.getInt64(1),
+                    builder_.getInt64(0), "tryp.scoffD"),
+                "tryp.scptr"), "tryp.sc");
         llvm::Value* isHexIndicatorD = builder_.CreateOr(
             builder_.CreateICmpEQ(secondCharD,
                 llvm::ConstantInt::get(i8TyD, 'x')),
@@ -1220,8 +1226,11 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* consumedBytesD = builder_.CreateSub(
             builder_.CreatePtrToInt(endPtrD, i64tD),
             builder_.CreatePtrToInt(strData, i64tD), "tryp.cb");
-        llvm::Value* lastCharOffD = builder_.CreateSub(
-            consumedBytesD, builder_.getInt64(1), "tryp.lco");
+        llvm::Value* lastCharOffD = builder_.CreateSelect(
+            advD,
+            builder_.CreateSub(consumedBytesD,
+                builder_.getInt64(1), "tryp.lco"),
+            builder_.getInt64(0), "tryp.lco2");
         llvm::Value* lastCharPtrD = builder_.CreateGEP(
             i8TyD, strData, lastCharOffD, "tryp.lcp");
         llvm::Value* lastCharD = builder_.CreateLoad(i8TyD, lastCharPtrD, "tryp.lc");
@@ -1772,11 +1781,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 // admit a hexadecimal float form ("0x1p3").  strtod accepts it
                 // (returns 8.0, finite).  Detect: first char is '0' and second
                 // char is 'x' or 'X' (after optional sign).
-                llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
-                    builder_.CreateGEP(i8TyF, data,
-                        builder_.getInt64(1), "parse.scptr"), "parse.sc");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
+                // stdlib §9.2: read data[1] only when the first byte is '0'
+                // (see the Convert.ToDouble arm in LlvmBackend_Calls.cpp for
+                // why an unconditional read is out of bounds on the empty
+                // string, whose buffer is the 1-byte NUL terminator alone).
+                llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
+                    builder_.CreateGEP(i8TyF, data,
+                        builder_.CreateSelect(isLeadingZeroF,
+                            builder_.getInt64(1),
+                            builder_.getInt64(0), "parse.scoff"),
+                        "parse.scptr"), "parse.sc");
                 llvm::Value* isHexIndicatorF = builder_.CreateOr(
                     builder_.CreateICmpEQ(secondCharF,
                         llvm::ConstantInt::get(i8TyF, 'x')),
@@ -1787,13 +1803,19 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 // stdlib §9.2 (v0.314, #5199/#5368): strtod accepts "5." and
                 // "1e" (consumes "5" and "1", stops at '.' and 'e').  Check
                 // the last character strtod consumed: it must not be '.', 'e',
-                // 'E', '+', or '-'.
+                // 'E', '+', or '-'.  When strtod consumed nothing (endptr ==
+                // data) there is no such character and `consumed - 1` would
+                // under-read index -1; the offset degrades to 0 (in bounds),
+                // and `advF` already forces that input invalid.
                 auto* i64t = llvm::Type::getInt64Ty(llvm_);
                 llvm::Value* consumedBytes = builder_.CreateSub(
                     builder_.CreatePtrToInt(endPtrF, i64t),
                     builder_.CreatePtrToInt(data, i64t), "parse.cb");
-                llvm::Value* lastCharOff = builder_.CreateSub(
-                    consumedBytes, builder_.getInt64(1), "parse.lco");
+                llvm::Value* lastCharOff = builder_.CreateSelect(
+                    advF,
+                    builder_.CreateSub(consumedBytes,
+                        builder_.getInt64(1), "parse.lco"),
+                    builder_.getInt64(0), "parse.lco2");
                 llvm::Value* lastCharPtr = builder_.CreateGEP(
                     i8TyF, data, lastCharOff, "parse.lcp");
                 llvm::Value* lastChar = builder_.CreateLoad(i8TyF, lastCharPtr, "parse.lc");
@@ -1955,11 +1977,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 // stdlib §9.2 (v0.314, #5199/#5368): strtod accepts a hexadecimal
                 // float form ("0x1p3").  Detect: first char is '0' and second char
                 // is 'x' or 'X' (after optional sign).
-                llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
-                    builder_.CreateGEP(i8TyF, win.data,
-                        builder_.getInt64(1), "parse.scptr"), "parse.sc");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
+                // stdlib §9.2: read window[1] only when the first byte is '0'
+                // (see the Convert.ToDouble arm in LlvmBackend_Calls.cpp).  An
+                // empty span window is the 1-byte NUL terminator alone, so an
+                // unconditional index-1 read over-reads it.
+                llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
+                    builder_.CreateGEP(i8TyF, win.data,
+                        builder_.CreateSelect(isLeadingZeroF,
+                            builder_.getInt64(1),
+                            builder_.getInt64(0), "parse.scoff"),
+                        "parse.scptr"), "parse.sc");
                 llvm::Value* isHexIndicatorF = builder_.CreateOr(
                     builder_.CreateICmpEQ(secondCharF,
                         llvm::ConstantInt::get(i8TyF, 'x')),
@@ -1970,8 +1999,13 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* consumedBytes = builder_.CreateSub(
                     builder_.CreatePtrToInt(endPtrF, i64t),
                     builder_.CreatePtrToInt(win.data, i64t), "parse.cb");
-                llvm::Value* lastCharOff = builder_.CreateSub(
-                    consumedBytes, builder_.getInt64(1), "parse.lco");
+                // See the string-form Parse arm above: `consumed - 1` under-reads
+                // index -1 when strtod consumed nothing; degrade to 0.
+                llvm::Value* lastCharOff = builder_.CreateSelect(
+                    advF,
+                    builder_.CreateSub(consumedBytes,
+                        builder_.getInt64(1), "parse.lco"),
+                    builder_.getInt64(0), "parse.lco2");
                 llvm::Value* lastCharPtr = builder_.CreateGEP(
                     i8TyF, win.data, lastCharOff, "parse.lcp");
                 llvm::Value* lastChar = builder_.CreateLoad(i8TyF, lastCharPtr, "parse.lc");

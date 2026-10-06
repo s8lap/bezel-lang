@@ -11129,11 +11129,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         builder_.CreateSub(fcCd, llvm::ConstantInt::get(i8Cd, '0')),
                         llvm::ConstantInt::get(i8Cd, 10)), "cvtd.ndig");
                 // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float).
-                llvm::Value* secondCharCd = builder_.CreateLoad(i8Cd,
-                    builder_.CreateGEP(i8Cd, data,
-                        builder_.getInt64(1), "cvtd.scptr"), "cvtd.sc");
                 llvm::Value* isLeadingZeroCd = builder_.CreateICmpEQ(
                     fcCd, llvm::ConstantInt::get(i8Cd, '0'), "cvtd.lzero");
+                // stdlib §9.2: `data[1]` is read ONLY when the first byte is
+                // '0'.  On any other first byte the hex form cannot match
+                // (the test ANDs with isLeadingZeroCd), so the byte is read
+                // from index 0 instead — always in bounds.  Reading index 1
+                // unconditionally over-reads the empty string, whose buffer
+                // is exactly the 1-byte NUL terminator.
+                llvm::Value* secondCharCd = builder_.CreateLoad(i8Cd,
+                    builder_.CreateGEP(i8Cd, data,
+                        builder_.CreateSelect(isLeadingZeroCd,
+                            builder_.getInt64(1),
+                            builder_.getInt64(0), "cvtd.scoff"),
+                        "cvtd.scptr"), "cvtd.sc");
                 llvm::Value* isHexIndicatorCd = builder_.CreateOr(
                     builder_.CreateICmpEQ(secondCharCd,
                         llvm::ConstantInt::get(i8Cd, 'x')),
@@ -11142,13 +11151,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 llvm::Value* isHexFloatCd = builder_.CreateAnd(
                     isLeadingZeroCd, isHexIndicatorCd, "cvtd.hfloat");
                 // stdlib §9.2 (v0.314, #5199/#5368): the last character strtod
-                // consumed must not be '.', 'e', 'E', '+', or '-'.
+                // consumed must not be '.', 'e', 'E', '+', or '-'.  When
+                // strtod consumed nothing (endptr == data, e.g. "abc" or ""),
+                // there IS no last consumed character and `consumed - 1`
+                // under-reads index -1; the offset degrades to 0 instead.
+                // That byte's value is immaterial: `advCd` already forces the
+                // input invalid, and data[0] is in bounds either way.
                 auto* i64tCd = llvm::Type::getInt64Ty(llvm_);
                 llvm::Value* consumedBytesCd = builder_.CreateSub(
                     builder_.CreatePtrToInt(epCd, i64tCd),
                     builder_.CreatePtrToInt(data, i64tCd), "cvtd.cb");
-                llvm::Value* lastCharOffCd = builder_.CreateSub(
-                    consumedBytesCd, builder_.getInt64(1), "cvtd.lco");
+                llvm::Value* lastCharOffCd = builder_.CreateSelect(
+                    advCd,
+                    builder_.CreateSub(consumedBytesCd,
+                        builder_.getInt64(1), "cvtd.lco"),
+                    builder_.getInt64(0), "cvtd.lco2");
                 llvm::Value* lastCharPtrCd = builder_.CreateGEP(
                     i8Cd, data, lastCharOffCd, "cvtd.lcp");
                 llvm::Value* lastCharCd = builder_.CreateLoad(i8Cd, lastCharPtrCd, "cvtd.lc");
@@ -11392,11 +11409,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     builder_.CreateSub(fcTd, llvm::ConstantInt::get(i8td, '0')),
                     llvm::ConstantInt::get(i8td, 10)), "tryd.ndig");
             // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float).
-            llvm::Value* secondCharTd = builder_.CreateLoad(i8td,
-                builder_.CreateGEP(i8td, strData,
-                    builder_.getInt64(1), "tryd.scptr"), "tryd.sc");
             llvm::Value* isLeadingZeroTd = builder_.CreateICmpEQ(
                 fcTd, llvm::ConstantInt::get(i8td, '0'), "tryd.lzero");
+            // stdlib §9.2: read data[1] only when the first byte is '0' (see
+            // the Convert.ToDouble arm for why an unconditional read is OOB).
+            llvm::Value* secondCharTd = builder_.CreateLoad(i8td,
+                builder_.CreateGEP(i8td, strData,
+                    builder_.CreateSelect(isLeadingZeroTd,
+                        builder_.getInt64(1),
+                        builder_.getInt64(0), "tryd.scoff"),
+                    "tryd.scptr"), "tryd.sc");
             llvm::Value* isHexIndicatorTd = builder_.CreateOr(
                 builder_.CreateICmpEQ(secondCharTd,
                     llvm::ConstantInt::get(i8td, 'x')),
@@ -11411,8 +11433,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* consumedBytesTd = builder_.CreateSub(
                 builder_.CreatePtrToInt(endPtrTd, i64tTd),
                 builder_.CreatePtrToInt(strData, i64tTd), "tryd.cb");
-            llvm::Value* lastCharOffTd = builder_.CreateSub(
-                consumedBytesTd, builder_.getInt64(1), "tryd.lco");
+            llvm::Value* lastCharOffTd = builder_.CreateSelect(
+                advTd,
+                builder_.CreateSub(consumedBytesTd,
+                    builder_.getInt64(1), "tryd.lco"),
+                builder_.getInt64(0), "tryd.lco2");
             llvm::Value* lastCharPtrTd = builder_.CreateGEP(
                 i8td, strData, lastCharOffTd, "tryd.lcp");
             llvm::Value* lastCharTd = builder_.CreateLoad(i8td, lastCharPtrTd, "tryd.lc");
