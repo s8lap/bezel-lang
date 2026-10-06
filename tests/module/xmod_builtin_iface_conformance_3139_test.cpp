@@ -62,10 +62,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <errno.h>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 #include "driver/Driver.hpp"
@@ -145,6 +148,73 @@ int compileImportAndRun3139(const std::string& libSrc,
                                                : kRanAbnormally3139;
 }
 
+// Captures stderr from the importer compile.  Returns a pair: the exit status
+// (kCompileRejected3139 if the importer rejected, kDepFailed3139 if the
+// exporter failed, kRanAbnormally3139 if it ran abnormally) and the captured
+// stderr text (empty if the compile succeeded or the exporter failed).
+// This allows a reject row to assert the SPECIFIC diagnostic text, not just
+// that the compilation failed.
+std::pair<int, std::string> compileImportAndGetDiag3139(
+    const std::string& libSrc,
+    const std::string& appSrc) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = unique_stem("bz3139_");
+    TempFile3139 lSrc((dir / (stem + "_lib.bzl")).string());
+    TempFile3139 lObj((dir / (stem + "_lib.o")).string());
+    writeSource3139(lSrc.path, libSrc);
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(lSrc.path, lObj.path).success)
+            return {kDepFailed3139, {}};
+    }
+    if (!std::ifstream(lObj.path).good()) return {kDepFailed3139, {}};
+
+    TempFile3139 aSrc((dir / (stem + "_app.bzl")).string());
+    TempFile3139 aExe((dir / stem).string());
+    writeSource3139(aSrc.path, appSrc);
+
+    // Capture stderr from the importer compile.  The driver prints diagnostics
+    // to stderr, so we redirect it to a pipe and read the diagnostic text.
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return {kRanAbnormally3139, {}};
+    std::fflush(nullptr);
+    int savedStderr = dup(STDERR_FILENO);
+    if (savedStderr < 0) { close(pipefd[0]); close(pipefd[1]); return {kRanAbnormally3139, {}}; }
+    if (dup2(pipefd[1], STDERR_FILENO) < 0) {
+        close(savedStderr); close(pipefd[0]); close(pipefd[1]);
+        return {kRanAbnormally3139, {}};
+    }
+    close(pipefd[1]);  // close write end in parent
+
+    bezel::Driver driver;
+    bezel::Dependency dep;
+    dep.metadataPath = lObj.path;
+    dep.objectPath = lObj.path;
+    std::vector<bezel::Dependency> deps{dep};
+    bool compileOk = bezel::test::compileFileForTest(
+        driver, aSrc.path, aExe.path, deps).success;
+
+    // Restore stderr
+    dup2(savedStderr, STDERR_FILENO);
+    close(savedStderr);
+
+    // Read captured stderr
+    std::string diag;
+    char buf[256];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        diag += buf;
+    }
+    close(pipefd[0]);
+
+    if (!compileOk) return {kCompileRejected3139, diag};
+    int status = std::system(aExe.path.c_str());
+    return {(status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status)
+                                                : kRanAbnormally3139, {}};
+}
+
 // The LOCAL twin: one module, same program text, same verdict encoding.
 int compileAndRun3139(const std::string& src) {
     namespace fs = std::filesystem;
@@ -159,6 +229,47 @@ int compileAndRun3139(const std::string& src) {
     int status = std::system(aExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status)
                                                : kRanAbnormally3139;
+}
+
+// Local twin with diagnostic capture.  Returns {exit_status, captured_stderr}.
+std::pair<int, std::string> compileLocalAndGetDiag3139(const std::string& src) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = unique_stem("bz3139l_");
+    TempFile3139 aSrc((dir / (stem + ".bzl")).string());
+    TempFile3139 aExe((dir / stem).string());
+    writeSource3139(aSrc.path, src);
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return {kRanAbnormally3139, {}};
+    std::fflush(nullptr);
+    int savedStderr = dup(STDERR_FILENO);
+    if (savedStderr < 0) { close(pipefd[0]); close(pipefd[1]); return {kRanAbnormally3139, {}}; }
+    if (dup2(pipefd[1], STDERR_FILENO) < 0) {
+        close(savedStderr); close(pipefd[0]); close(pipefd[1]);
+        return {kRanAbnormally3139, {}};
+    }
+    close(pipefd[1]);
+
+    bezel::Driver driver;
+    bool compileOk = bezel::test::compileFileForTest(driver, aSrc.path, aExe.path).success;
+
+    dup2(savedStderr, STDERR_FILENO);
+    close(savedStderr);
+
+    std::string diag;
+    char buf[256];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        diag += buf;
+    }
+    close(pipefd[0]);
+
+    if (!compileOk) return {kCompileRejected3139, diag};
+    int status = std::system(aExe.path.c_str());
+    return {(status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status)
+                                                : kRanAbnormally3139, {}};
 }
 
 // The dependency. Every declaration here names a built-in interface that has no
@@ -495,16 +606,27 @@ BEZEL_TEST(xmod_builtin_iface_conformance_3139, control_local_serialization_roun
 //   3. the CORRECT-arg imported class (Rank3139, from kLib3139 above) is
 //      STILL ACCEPTED (the #3139 fallback is not disturbed)
 //
-// The imported wrong-arg case is the residual hole the first revision of this
-// file left open: the #3139 fallback admitted any class that declared
-// IComparable via the symbol when baseTypeRefs was empty, but the #2772 item 2
-// fix only fires when baseTypeRefs was populated.  With
-// baseTypeRefsHasIComparableEntry tracking the presence of an IComparable entry
-// in baseTypeRefs, the fallback now fires only when baseTypeRefs is genuinely
-// absent — and the imported wrong-arg case has baseTypeRefs populated with the
-// IComparable<Other3139> entry, so the substitution check fires and rejects.
+// MECHANISM (confirmed by tracing src/module/ModuleLoader.cpp L862-878):
+// IComparable has a synthesized TypeSymbol (it is NOT in builtinInterfaceBases,
+// which is only for interfaces with NO TypeSymbol — ISerializable, IFormattable,
+// IEnumerable<T>, etc.).  On the import side, the class's base
+// IComparable<Other3139> goes through td.baseTypes → convert() (L862-865):
+// convert() resolves the base's declaration to the synthesized IComparable
+// TypeSymbol (L413-416: "ref->declaration =
+// ctx.builtinInterfaceSym(mt.namedName)" for synthesized interface names),
+// so it passes the "Named && declaration" guard and is pushed to BOTH
+// baseTypeRefs AND baseTypes.  Therefore baseTypeRefsHasIComparableEntry is
+// true, the declaresBuiltinInterface fallback is NOT consulted, and the
+// substitution check fires: IComparable<Other3139> (substituted with the
+// empty class-level map) vs Wrong3139 → not equal → REJECTED.
+//
+// The ModuleLoader comment at L847 ("builtinInterfaceBases ... populated from
+// their own MetaType fields, NOT from the baseTypes array") refers to the
+// nonSymbolBaseRefs channel for interfaces WITHOUT a TypeSymbol; IComparable
+// has a TypeSymbol so it rides the td.baseTypes path.
 
 // LOCAL CONTROL: a local wrong-arg class is correctly rejected (the #2772 fix).
+// Asserts the specific §14.2 diagnostic, not just the exit code.
 BEZEL_TEST(xmod_builtin_iface_conformance_3139,
            sort_local_wrong_icomp_type_arg_rejected_spec_14_2) {
     const char* src =
@@ -525,19 +647,25 @@ BEZEL_TEST(xmod_builtin_iface_conformance_3139,
         "  arr.Sort(); "
         "  return 7; "
         "end Main; end C; ";
-    BEZEL_EXPECT_EQ(compileAndRun3139(src), kCompileRejected3139);
+    auto [status, diag] = compileLocalAndGetDiag3139(src);
+    BEZEL_EXPECT_EQ(status, kCompileRejected3139);
+    BEZEL_EXPECT_TRUE(diag.find("Sort() requires T: IComparable<T>") != std::string::npos);
+    BEZEL_EXPECT_TRUE(diag.find("WrongWL does not implement IComparable<WrongWL>") != std::string::npos);
 }
 
 // IMPORTED: an imported wrong-arg class is rejected via the substitution check
-// (baseTypeRefs is populated with IComparable<Other3139>, the substituted
-// comparison IComparable<Other3139> vs Wrong3139 fails, and
-// declaresBuiltinInterface is not consulted because baseTypeRefsHasIComparableEntry
-// is true).
+// (IComparable has a synthesized TypeSymbol, so it goes through td.baseTypes
+// and is in baseTypeRefs on the import side; baseTypeRefsHasIComparableEntry
+// is true; declaresBuiltinInterface fallback is NOT consulted; substitution
+// check fires: IComparable<Other3139> != Wrong3139 → REJECTED).
+// Asserts the specific §14.2 diagnostic, not just the exit code.
 BEZEL_TEST(xmod_builtin_iface_conformance_3139,
            sort_imported_wrong_icomp_type_arg_rejected_spec_14_2) {
-    BEZEL_EXPECT_EQ(
-        compileImportAndRun3139(kLib3139, importer3139(kSortWrongArgBody3139)),
-        kCompileRejected3139);
+    auto [status, diag] = compileImportAndGetDiag3139(
+        kLib3139, importer3139(kSortWrongArgBody3139));
+    BEZEL_EXPECT_EQ(status, kCompileRejected3139);
+    BEZEL_EXPECT_TRUE(diag.find("Sort() requires T: IComparable<T>") != std::string::npos);
+    BEZEL_EXPECT_TRUE(diag.find("Wrong3139 does not implement IComparable<Wrong3139>") != std::string::npos);
 }
 
 // IMPORTED CORRECT-ARG CONTROL: the existing #3139 guard — an imported class
