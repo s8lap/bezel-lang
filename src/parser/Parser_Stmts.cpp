@@ -194,8 +194,8 @@ std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
     advance(); // past `case`
     auto cs = std::make_unique<ast::CaseStmt>();
     // §19.1 / A.7 CaseExpr (v0.166, #1370): `case Expression "of" ...`. `case`
-    // ALWAYS takes a scrutinee (scrutinee-less dispatch is `when`,
-    // parseWhenStmt). The `of` delimiter terminates the scrutinee, so the
+    // ALWAYS takes a scrutinee; the condition-dispatch form formerly spelled
+    // `when` is retired (v0.289, proposal 0122 L1). The `of` delimiter terminates the scrutinee, so the
     // scrutinee is a FULL Expression — no precedence restriction and no
     // parenthesization rule (mirrors parseCaseExpr). The old multiplicative-
     // level restriction (#1233/#1320) that served the missing boundary is
@@ -217,30 +217,6 @@ std::unique_ptr<ast::Stmt> Parser::parseCaseStmt() {
     if (!consumePunctuator(";")) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of case statement");
-    }
-    return std::unique_ptr<ast::Stmt>(cs.release());
-}
-
-// #744 / §19: statement-position `when … end;` — the scrutinee-less
-// condition-dispatch form. Produces a null-scrutinee CaseStmt (sema/codegen
-// reuse the existing scrutinee-less path); no layout-significant disambiguation.
-std::unique_ptr<ast::Stmt> Parser::parseWhenStmt() {
-    advance();  // past `when`
-    auto cs = std::make_unique<ast::CaseStmt>();
-    // Scrutinee stays null: `when` is always the condition-dispatch form.
-    cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/true));
-    while (consumePunctuator(",")) {
-        if (isKeyword("end")) break;  // trailing `,?`
-        cs->arms.push_back(parseCaseStmtArm(/*scrutineeLess=*/true));
-    }
-    if (!consumeKeyword("end")) {
-        diagnostics_.report(Severity::Error, current_.location,
-                            "expected 'end' to close `when` statement");
-    }
-    consumeOptionalEndKeyword("when"); // §1.6 / v0.170 (#1374)
-    if (!consumePunctuator(";")) {
-        diagnostics_.report(Severity::Error, current_.location,
-                            "expected ';' after 'end' of `when` statement");
     }
     return std::unique_ptr<ast::Stmt>(cs.release());
 }
@@ -451,9 +427,18 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
     if (isKeyword("case")) {
         return parseCaseStmt();
     }
-    // #744 / §19: statement-position `when` (scrutinee-less condition dispatch).
+    // v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+    // statement is retired — `when` remains reserved and appears in two positions
+    // only: the arm guard (§19.4) and the out-null postcondition clause (§22.4);
+    // both are still valid. A `when`-led statement is a syntax error naming the
+    // replacement (the if/elif/else statement).
     if (isKeyword("when")) {
-        return parseWhenStmt();
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "a `when`-led statement is retired (\xc2\xa7""19 / \xc2\xa7""22.4, "
+            "v0.289) \xe2\x80\x94 use the `if`/`elif`/`else` statement "
+            "(`if c1 then \xe2\x80\xa6 elif c2 then \xe2\x80\xa6 else \xe2\x80\xa6 end;`)");
+        return nullptr;
     }
 
     // IfStmt (A.6).

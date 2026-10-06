@@ -176,17 +176,23 @@ BEZEL_TEST(parser_uniform_closer_1374, end_case_expr_label_parses_same_as_bare) 
 
 // ── 7. `end when;` ───────────────────────────────────────────────────────────
 
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// statement is retired — the replacement is the `if`/`elif`/`else` statement.
+// This test previously verified the when statement; now verifies rejection.
 BEZEL_TEST(parser_uniform_closer_1374, end_when_stmt_label_accepted) {
-    // §1.6 / v0.170: `end when;` as labeled closer for statement-position when.
     auto r = parseAll(
         wrapMethod("when x > 0 => return 1;, _ => return 0; end when;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): both bare and labeled
+// `when` statement forms are retired. This test previously verified that both parse
+// to the same AST; now verifies that both produce errors.
 BEZEL_TEST(parser_uniform_closer_1374, end_when_stmt_label_parses_same_as_bare) {
     auto bare    = parseMethodBody("when x > 0 => return 1;, _ => return 0; end;");
     auto labeled = parseMethodBody("when x > 0 => return 1;, _ => return 0; end when;");
-    BEZEL_EXPECT_EQ(labeled, bare);
+    BEZEL_EXPECT_EQ(bare, "<error>");
+    BEZEL_EXPECT_EQ(labeled, "<error>");
 }
 
 BEZEL_TEST(parser_uniform_closer_1374, end_when_stmt_wrong_keyword_is_error) {
@@ -195,11 +201,13 @@ BEZEL_TEST(parser_uniform_closer_1374, end_when_stmt_wrong_keyword_is_error) {
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired — the replacement is the parenthesized if-expression.
+// This test previously verified the when expression; now verifies rejection.
 BEZEL_TEST(parser_uniform_closer_1374, end_when_expr_label_accepted) {
-    // §1.6 / v0.170: `end when` in expression position.
     auto r = parseAll(
         wrapMethod("var y := (when x > 0 => 1, _ => 0);"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(parser_uniform_closer_1374, end_when_expr_label_parses_same_as_bare) {
@@ -216,12 +224,15 @@ BEZEL_TEST(parser_uniform_closer_1374, end_extension_label_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified the when expression parses
+// correctly in an extension method; now verifies rejection.
 BEZEL_TEST(parser_uniform_closer_1374, end_extension_label_with_member) {
     auto r = parseAll(
         "module M; extension int "
         "public method Abs(): int => (when this >= 0 => this, _ => -this); "
         "end extension;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 BEZEL_TEST(parser_uniform_closer_1374, end_extension_wrong_keyword_is_error) {
@@ -332,27 +343,29 @@ BEZEL_TEST(parser_uniform_closer_1374, nested_try_if_each_matches_own) {
 // after `end` even without a trailing `;`.  This covers the case where a
 // `when` expression is used as a case-arm body (terminated by `,`).
 
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified that `(when ...)` parses
+// correctly as a case arm body; now verifies rejection.
 BEZEL_TEST(parser_uniform_closer_1374, expr_when_inside_case_arm_with_label) {
-    // `when cond => val end when` as an expression-position arm body (arm
-    // separated by `,`).  The `end when` is the WhenExpr's labeled closer;
-    // the `,` is the outer CaseStmt arm separator.
     auto r = parseAll(
         wrapMethod(
             "var y := (case x of "
             "  1 => (when x > 0 => 10, _ => 20), "
             "  _ => 0);"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified that a case expression
+// parses correctly inside a when arm body; now verifies rejection of the
+// outer when expression.
 BEZEL_TEST(parser_uniform_closer_1374, expr_case_inside_when_arm_with_label) {
-    // Symmetric: `case ... end case` as an expression-position arm body inside
-    // a `when` expression.
     auto r = parseAll(
         wrapMethod(
             "var y := (when x > 0 => "
             "  (case x of 1 => 10, _ => 0), "
             "  _ => -1);"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // ── 13. `end when;` guard-keyword context-sensitivity ────────────────────────
@@ -360,12 +373,13 @@ BEZEL_TEST(parser_uniform_closer_1374, expr_case_inside_when_arm_with_label) {
 // `when` inside `catch` arms is a GUARD keyword (not a WhenExpr) — the labeled
 // closer `end when;` must NOT be confused with the guard keyword.
 
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// statement is retired — the replacement is the `if`/`elif`/`else` statement.
+// This test previously verified the when statement parsing; now verifies rejection.
 BEZEL_TEST(parser_uniform_closer_1374, end_when_in_when_stmt_not_guard) {
-    // This is `when ... end when;` (the WhenStmt with its labeled closer).
-    // The `when` after `end` is the statement-level closer, not a guard.
     auto r = parseAll(
         wrapMethod("when x > 0 => return 1;, _ => return 0; end when;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // ── 14. Existing named-end forms unchanged (regression guard) ─────────────────

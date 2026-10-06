@@ -55,16 +55,19 @@ BEZEL_TEST(parser_marked_transfer_2080, spec_28_3_if_branch_marker) {
         std::string("(if useFresh then fresh else (owned cached))"));
 }
 
-// §19.2 v0.209: the marker as an expression-`case` and `when` ARM RESULT.
+// §19.2 v0.209: the marker as an expression-`case` ARM RESULT. The `when` arm
+// is retired (v0.289, proposal 0122 L1) and is tested separately.
 BEZEL_TEST(parser_marked_transfer_2080, spec_19_2_case_when_arm_marker) {
     BEZEL_EXPECT_EQ(
         exprFromStmt("(case n of 1 => owned a, _ => owned b)"),
         std::string(
             "case n of { 1 => (owned a) | _ => (owned b) } end"));
-    BEZEL_EXPECT_TRUE(parsesClean(
+    // v0.289: the `(when c => owned a, _ => owned b)` expression is retired.
+    auto r = parseAll(
         "module M; class C public method M(c: bool) "
         "_ := (when c => owned a, _ => owned b); "
-        "end M; end C;"));
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // A.7 v0.209: `owned` requires an identifier — a field path is `move x.f`

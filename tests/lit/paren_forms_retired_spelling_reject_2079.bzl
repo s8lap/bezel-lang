@@ -29,9 +29,9 @@ class C
 
   public static method D(): int
     var w := when true => 1, _ => 2 end;
-    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: an expression-position `when
-    // CHECK-SAME: wrap it and drop `end`
-    // CHECK-SAME: (§19.1/§19.7, v0.208)
+    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: a `when`-led expression is retired (§19 / §22.4, v0.289)
+    // CHECK-SAME: use the parenthesized conditional expression
+    // CHECK-SAME: (`(if c1 then a elif c2 then b else z)`)
     return 0;
   end D;
 

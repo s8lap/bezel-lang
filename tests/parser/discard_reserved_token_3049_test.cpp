@@ -163,10 +163,14 @@ BEZEL_TEST(discard_reserved_3049, wildcard_destructuring_slot_spec_19_3) {
         6);
 }
 
-// §19.1 / A.7 WhenArm: the `_` catch-all is "the same wildcard reading".
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired — the replacement is the parenthesized if-expression
+// (`(if c then a elif c2 then b else z)`). This test previously verified the
+// when expression's result; now verifies that the retired form is rejected.
 BEZEL_TEST(discard_reserved_3049, when_catch_all_spec_19_1) {
-    BEZEL_EXPECT_EQ(run(prog("var x := 1; return (when x > 4 => 2, _ => 5);")),
-                    5);
+    BEZEL_EXPECT_TRUE(
+        rejects(prog("var x := 1; return (when x > 4 => 2, _ => 5);"),
+                "a `when`-led expression is retired"));
 }
 
 // §17.13 "Ignore forms" / §27.3: a lambda parameter may be `_`; "because

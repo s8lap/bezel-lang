@@ -655,6 +655,11 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
     if (isKeyword("case")) {
         return parseCaseExpr(/*parenAtom=*/false);
     }
+    // v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+    // expression is retired — `when` remains reserved and appears in two positions
+    // only: the arm guard (§19.4) and the out-null postcondition clause (§22.4);
+    // both are still valid. A `when`-led expression is a syntax error naming the
+    // replacement (the parenthesized if-expression).
     if (isKeyword("when")) {
         return parseWhenExpr(/*parenAtom=*/false);
     }
@@ -825,6 +830,9 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
             return parseCaseExpr(/*parenAtom=*/true);
         }
         if (isKeyword("when")) {
+            // v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the
+            // parenthesized `when` expression is retired — call parseWhenExpr
+            // which reports the error and continues parsing for recovery.
             return parseWhenExpr(/*parenAtom=*/true);
         }
         // §17.15 / A.7 BindExpr (v0.216, #2098): "(" followed by the reserved
@@ -1694,9 +1702,10 @@ ast::CaseArm Parser::parseCaseArm(bool scrutineeLess) {
 }
 
 // #744 / §19: the scrutinee-less bare-`case` detection (isScruntineeLessCase)
-// has been deleted — the scrutinee-less condition-dispatch form is now spelled
-// `when` (parseWhenExpr / parseWhenStmt), so `case` is unconditionally
-// scrutinee'd and the parser no longer consults source line numbers anywhere.
+// has been deleted — the condition-dispatch form formerly spelled `when`
+// (parseWhenExpr / parseWhenStmt) is retired (v0.289, proposal 0122 L1) and
+// `case` is unconditionally scrutinee'd; the parser no longer consults source
+// line numbers anywhere.
 
 // §19.1 / A.7 CaseExpr (v0.166, #1370): the `of` delimiter separates the case
 // scrutinee from the first arm. `of` is a CONTEXTUAL keyword — Appendix B does
@@ -1731,8 +1740,8 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr(bool parenAtom) {
     auto ce = std::make_unique<ast::CaseExpr>();
 
     // §19.1 / A.7 CaseExpr (v0.166, #1370): `case Expression "of" ...`. `case`
-    // ALWAYS takes a scrutinee; the scrutinee-less condition-dispatch form is
-    // spelled `when` (parseWhenExpr). The `of` delimiter terminates the
+    // ALWAYS takes a scrutinee; the condition-dispatch form formerly spelled
+    // `when` is retired (v0.289, proposal 0122 L1). The `of` delimiter terminates the
     // scrutinee, so the scrutinee is a FULL Expression — no precedence
     // restriction and no parenthesization rule. The old multiplicative-level
     // restriction (`parseBinaryExpression(14)`) that existed only to serve the
@@ -1769,24 +1778,28 @@ std::unique_ptr<ast::Expr> Parser::parseCaseExpr(bool parenAtom) {
     return std::unique_ptr<ast::Expr>(ce.release());
 }
 
-// #744 / §19: `when Arm ("," Arm)* ","? end` — the dedicated scrutinee-less
-// condition-dispatch form. Each arm's "pattern" is a full boolean expression;
-// the first whose condition is true is taken. It produces the same
-// null-scrutinee CaseExpr the bare-`case` form does today (sema/codegen's
-// scrutinee-less path is reused), but with NO layout-significant disambiguation
-// — `when` is unambiguous. (Migrating bare `case` → `when` and deleting the
-// heuristic is a later stage.)
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired — `when` remains reserved and appears in two positions
+// only: the arm guard (§19.4) and the out-null postcondition clause (§22.4).
+// The admission tables call this function to report the error and continue
+// parsing for recovery.
 std::unique_ptr<ast::Expr> Parser::parseWhenExpr(bool parenAtom) {
     if (!parenAtom) {
-        // v0.208 cutover (§19.7, #2079): the retired `end`-closed expression
-        // spelling — see parseCaseExpr.
+        // v0.289 cutover: the bare `when` expression (no parens) is retired.
         diagnostics_.report(
             Severity::Error, current_.location,
-            "an expression-position `when \xe2\x80\xa6 end` is the retired "
-            "pre-v0.208 spelling \xe2\x80\x94 the expression form is the "
-            "parenthesized atom: wrap it and drop `end` "
-            "(`(when arm, \xe2\x80\xa6)`) "
-            "(\xc2\xa7""19.1/\xc2\xa7""19.7, v0.208)");
+            "a `when`-led expression is retired (\xc2\xa7""19 / \xc2\xa7""22.4, "
+            "v0.289) \xe2\x80\x94 use the parenthesized conditional expression: "
+            "wrap it and replace `when`/`end` with `if`/`elif`/`else` "
+            "(`(if c1 then a elif c2 then b else z)`)");
+    } else {
+        // v0.289 cutover: the parenthesized `(when …)` expression is retired.
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "a `when`-led expression is retired (\xc2\xa7""19 / \xc2\xa7""22.4, "
+            "v0.289) \xe2\x80\x94 use the parenthesized conditional expression: "
+            "wrap it and replace `when`/`end` with `if`/`elif`/`else` "
+            "(`(if c1 then a elif c2 then b else z)`)");
     }
     advance();  // past `when`
     auto ce = std::make_unique<ast::CaseExpr>();

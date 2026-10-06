@@ -253,8 +253,10 @@ BEZEL_TEST(parser_case_of, trailing_comma_still_allowed_spec_19_1) {
         std::string("case x of { 1 => \"a\" | 2 => \"b\" } end"));
 }
 
-// §19.1: `when` (the scrutinee-less sibling) takes NO `of` and is unaffected;
-// requiring `of` after a `case` scrutinee must not perturb `when`.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified that the `when` expression
+// form is unaffected by `case`'s `of` requirement — now it verifies that `when`
+// is correctly rejected.
 BEZEL_TEST(parser_case_of, when_construct_unaffected_by_of_spec_19_1) {
     auto r = parseAll(
         "module M; class C public method M(score: int): string "
@@ -263,7 +265,7 @@ BEZEL_TEST(parser_case_of, when_construct_unaffected_by_of_spec_19_1) {
         "    score >= 80 => \"B\", "
         "    _ => \"F\"); "
         "end M; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §B (contextual): `of` is not a reserved word, so it still works as an

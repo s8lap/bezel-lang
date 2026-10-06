@@ -40,8 +40,9 @@ namespace {
 // that adding a statement kind without deciding its iterator-classification
 // behaviour is a visible omission rather than a silent exemption. The previous
 // six-arm list was missing `ast::CaseStmt`, which is BOTH the `case` and the
-// `when` statement (Parser_Stmts.cpp::parseWhenStmt builds the same node with a
-// null scrutinee), so an iterator whose only `yield` sat in a `case`/`when` arm
+// `when` statement (Parser_Stmts.cpp::parseWhenStmt built the same node with a
+// null scrutinee; retired in v0.289, proposal 0122 L1), so an iterator whose only
+// `yield` sat in a `case`/`when` arm
 // was analysed here as an ordinary method while codegen's `Emitter::
 // containsYield` still lowered it to a state machine — the §29.8 owned-parameter
 // frame auto-dispose never fired and the parameter leaked (#3148).

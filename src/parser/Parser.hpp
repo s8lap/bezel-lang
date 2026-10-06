@@ -241,10 +241,9 @@ private:
     // recognized only in this position; identifiers named `of` elsewhere are
     // unaffected. Returns true when the delimiter was present.
     bool expectOfDelimiter();
-    // #744 / §19: `when` is the dedicated scrutinee-less condition-dispatch
-    // construct (arms are boolean conditions; the first true wins). It reuses
-    // the null-scrutinee CaseExpr representation. `parenAtom` as for
-    // parseCaseExpr (v0.208, #2079).
+    // v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+    // expression is retired. Calls parseWhenExpr which reports the error and
+    // continues parsing for recovery.
     std::unique_ptr<ast::Expr> parseWhenExpr(bool parenAtom);
     // §20 / A.7 IfExpr (v0.208, #2079): the conditional atom
     // `(if c then a elif c2 then b else d)`. The caller consumed the opening
@@ -286,8 +285,6 @@ private:
     // Slice 39: statement-position `case` (A.6). Sibling of parseCaseExpr;
     // arms have Expression-form, Statement-form, or `do … end` bodies.
     std::unique_ptr<ast::Stmt> parseCaseStmt();
-    // #744 / §19: statement-position `when` (scrutinee-less condition dispatch).
-    std::unique_ptr<ast::Stmt> parseWhenStmt();
     ast::CaseArm parseCaseStmtArm(bool scrutineeLess = false);
     // Slice 41: parse `serialized ( "skip" | StringLiteral? "optional"? )`
     // (A.4 SerializedClause). The caller checks `isSerializedClauseStart()`

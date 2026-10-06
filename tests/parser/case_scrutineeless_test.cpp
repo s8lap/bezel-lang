@@ -62,12 +62,11 @@ const bezel::ast::Stmt* firstStmt(const bezel::test::ParseResult& r) {
 // heuristic) or the arm contains a non-pattern operator.
 // ---------------------------------------------------------------------------
 
-// spec_0100 §19.1: scrutinee-less grading case (score >= N arms).
-// The bare `case` with boolean-expression arms has null scrutinee in the AST.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified the when expression's AST;
+// now verifies that the retired form is rejected.
 BEZEL_TEST(parser_case_scrutineeless,
            spec_0100_scrutineeless_relational_arms_spec_19_1) {
-    // Source mirrors spec §19.1 example: `case\n  score >= 90 => "A", ...`.
-    // Using \n to separate `case` from its first arm.
     auto r = parseAll(
         "module M; class C public method M(score: int) _ := "
         "(when\n"
@@ -76,15 +75,7 @@ BEZEL_TEST(parser_case_scrutineeless,
         "  _ => \"F\"\n"
         ")"
         "; end M; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    const auto* e = extractExpr(r);
-    BEZEL_EXPECT_TRUE(e != nullptr);
-    // Scrutinee-less form: scrutinee must be null.
-    const auto* ce = dynamic_cast<const bezel::ast::CaseExpr*>(e);
-    BEZEL_EXPECT_TRUE(ce != nullptr);
-    BEZEL_EXPECT_TRUE(ce->scrutinee == nullptr);
-    // Three arms: score>=90, score>=80, _.
-    BEZEL_EXPECT_EQ(ce->arms.size(), std::size_t(3));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // spec_0026 §10.5/§19.1: `int(x)` conversion expression in a case arm.
@@ -105,8 +96,9 @@ BEZEL_TEST(parser_case_scrutineeless,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// spec_0026 §19.1: scrutinee-less form with `int(x) < int(y)` boolean arms.
-// When `case` is on a separate line, all arms are full boolean expressions.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified the when expression's parsing;
+// now verifies that the retired form is rejected.
 BEZEL_TEST(parser_case_scrutineeless,
            spec_0026_scrutineeless_int_conversion_comparison_spec_19_1) {
     auto r = parseAll(
@@ -118,13 +110,12 @@ BEZEL_TEST(parser_case_scrutineeless,
         "      _ => 0\n"
         "    ); "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    // Verify bare (null scrutinee) form.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// spec_0020 §9.6/§19.1: record CompareTo with `X <> other.X`.
-// `<>` is not a RelOpPattern; with `case` on a separate line (bare form),
-// `X <> other.X` is the full boolean arm expression.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified the when expression's parsing;
+// now verifies that the retired form is rejected.
 BEZEL_TEST(parser_case_scrutineeless,
            spec_0020_record_compareto_inequality_arms_spec_9_6_19_1) {
     auto r = parseAll(
@@ -136,15 +127,14 @@ BEZEL_TEST(parser_case_scrutineeless,
         "      _ => 0\n"
         "    ); "
         "end Point;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §19.1 bare case with logical `or` arms — multi-line form (line-break heuristic).
-// Spec §19.1: scrutinee-less form is identified by `case` on a separate line.
-// `or` in same-line case also triggers scan heuristic: `or` before `=>`.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified the when expression's parsing;
+// now verifies that the retired form is rejected.
 BEZEL_TEST(parser_case_scrutineeless,
            scrutineeless_logical_or_arm_multiline_spec_19_1) {
-    // Block-body method so extractExpr (stmts[0]) works correctly.
     auto r = parseAll(
         "module M; class C public method M(x: int): int\n"
         "_ :=\n"
@@ -153,30 +143,19 @@ BEZEL_TEST(parser_case_scrutineeless,
         "  _ => 0\n"
         ")"
         "; end M; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    const auto* e = extractExpr(r);
-    const auto* ce = dynamic_cast<const bezel::ast::CaseExpr*>(e);
-    BEZEL_EXPECT_TRUE(ce != nullptr);
-    // Bare form (line-break detected): scrutinee is null.
-    BEZEL_EXPECT_TRUE(ce->scrutinee == nullptr);
-    BEZEL_EXPECT_EQ(ce->arms.size(), std::size_t(2));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §19.1 bare case with `or` on same line — scan heuristic: `or` at depth 0
-// before `=>` marks scrutinee-less even without a line break.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired. This test previously verified the when expression's parsing;
+// now verifies that the retired form is rejected.
 BEZEL_TEST(parser_case_scrutineeless,
            scrutineeless_logical_or_arm_same_line_spec_19_1) {
-    // Block-body method so extractExpr (stmts[0]) works correctly.
     auto r = parseAll(
         "module M; class C public method M(x: int): int "
         "_ := (when x = 1 or x = 2 => 10, _ => 0)"
         "; end M; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    const auto* e = extractExpr(r);
-    const auto* ce = dynamic_cast<const bezel::ast::CaseExpr*>(e);
-    BEZEL_EXPECT_TRUE(ce != nullptr);
-    // Bare form (scan found `or`): scrutinee is null.
-    BEZEL_EXPECT_TRUE(ce->scrutinee == nullptr);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §19.1 same-line scrutinee form with integer constant arm — NOT scrutinee-less.

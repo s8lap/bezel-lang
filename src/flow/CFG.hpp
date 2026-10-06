@@ -164,8 +164,9 @@ struct CFGBlock {
     // (#4116's own commit message names this as the reason the per-method
     // CaseStmt walker had to walk the scrutinee by hand). Null for every
     // non-case-statement block, and for a case statement whose scrutinee
-    // is omitted (the `when` statement form, parseWhenStmt in
-    // Parser_Stmts.cpp, parses into CaseStmt with a null scrutinee).
+    // is omitted — the `when` statement form (formerly parseWhenStmt in
+    // Parser_Stmts.cpp, which built CaseStmt with a null scrutinee) is retired
+    // (v0.289, proposal 0122 L1); a `case` statement always has a scrutinee.
     // Additive; populated only by the CFG builder's `visitCase`.
     const ast::Expr* caseScrutinee = nullptr;
 

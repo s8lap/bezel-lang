@@ -95,51 +95,66 @@ BEZEL_TEST(parser_paren_forms_2079, spec_19_1_case_atom) {
         std::string("case score of { (90 .. 100) => \"A\" | _ => \"F\" } end"));
 }
 
-// §19.1 v0.208: the expression-position when atom.
+// v0.289 (§19, §22.4, Appendix A.6/A.7, proposal 0122 L1): the `when`-led
+// expression is retired — the replacement is the parenthesized if-expression.
+// This test previously verified the when expression's AST; now verifies rejection.
 BEZEL_TEST(parser_paren_forms_2079, spec_19_1_when_atom) {
-    BEZEL_EXPECT_EQ(
-        exprFromStmt("(when score >= 90 => \"A\", _ => \"F\")"),
-        std::string(
-            "case <bare> of { (score >= 90) => \"A\" | _ => \"F\" } end"));
+    auto r = parseAll(
+        "module M; class C public method M(score: int): string "
+        "  return (when score >= 90 => \"A\", _ => \"F\"); "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §19.7 v0.208: trailing comma before the atom's closer (§1.6).
+// §19.7 v0.208: trailing comma before the atom's closer (§1.6). The `when` form
+// is retired (v0.289, proposal 0122 L1) — test the case form and expect an error
+// for the when form.
 BEZEL_TEST(parser_paren_forms_2079, spec_19_7_atom_trailing_comma) {
     BEZEL_EXPECT_TRUE(parsesClean(
         "module M; class C public method M(x: int): int "
         "return (case x of 1 => 10, _ => 20,); "
         "end M; end C;"));
-    BEZEL_EXPECT_TRUE(parsesClean(
+    // v0.289: the `(when x > 0 => 1, _ => 0,)` expression is retired.
+    auto r = parseAll(
         "module M; class C public method M(x: int): int "
         "return (when x > 0 => 1, _ => 0,); "
-        "end M; end C;"));
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §19.7 v0.208: the atom composes as another arm's body and in argument
-// position (`f((case x of 1 => a, 2 => b), y)`).
+// position (`f((case x of 1 => a, 2 => b), y)`). The `when` form is retired
+// (v0.289, proposal 0122 L1) — test the case form and expect an error for the
+// when-in-case-arm form.
 BEZEL_TEST(parser_paren_forms_2079, spec_19_7_atom_composes) {
     BEZEL_EXPECT_TRUE(parsesClean(
         "module M; class C public method F(a: int, b: int): int return a; "
         "end F; public method M(x: int): int "
         "return F((case x of 1 => 10, _ => 20), x); "
         "end M; end C;"));
-    BEZEL_EXPECT_TRUE(parsesClean(
+    // v0.289: the `(when x > 0 => 1, _ => 0)` arm body is retired.
+    auto r = parseAll(
         "module M; class C public method M(x: int): int "
         "return (case x of 1 => (when x > 0 => 1, _ => 0), _ => 3); "
-        "end M; end C;"));
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// §19 v0.208: statement-position case/when are UNCHANGED — `end case?;` /
-// `end when?;` with statement arm bodies (A.6 CaseStmt/WhenStmt).
+// §19 v0.208: statement-position case is UNCHANGED — `end case?;` with
+// statement arm bodies (A.6 CaseStmt). The `when` statement form is retired
+// (v0.289, proposal 0122 L1) — test the case form and expect an error for
+// the when form.
 BEZEL_TEST(parser_paren_forms_2079, spec_19_7_statement_forms_unchanged) {
     BEZEL_EXPECT_TRUE(parsesClean(
         "module M; class C public method M(x: int) "
         "case x of 1 => Console.WriteLine(\"one\"), _ => do end end case; "
         "end M; end C;"));
-    BEZEL_EXPECT_TRUE(parsesClean(
+    // v0.289: the `when x > 0 => ... end when;` statement is retired.
+    auto r = parseAll(
         "module M; class C public method M(x: int) "
         "when x > 0 => Console.WriteLine(\"pos\"), _ => do end end when; "
-        "end M; end C;"));
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // §9.5 v0.208: the record update suffix with keyword-attached parentheses,
