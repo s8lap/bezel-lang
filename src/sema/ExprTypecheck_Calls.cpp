@@ -9498,14 +9498,59 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // document-admissible cross-module element was
                             // rejected while the identical local declaration
                             // was accepted.
+                            //
+                            // fix #2772 item 2 (spec §14.2, stdlib §4.4, v0.240):
+                            // the class arm must also check the TYPE ARGUMENT of
+                            // IComparable<T> — the conformance requirement is
+                            // T: IComparable<T>, not just T: IComparable<Any>.
+                            // A class `X: IComparable<Other>` is NOT comparable
+                            // by X's own identity; only X: IComparable<X> satisfies
+                            // the self-recurrence.  Iterate over the class's
+                            // baseTypeRefs to find the IComparable entry and
+                            // verify its generic argument equals the element type
+                            // via typeRefEqual.
+                            //
+                            // Note: generic classes (`Box<T>: IComparable<Box<T>>`)
+                            // are accepted unconditionally in this arm: the
+                            // baseTypeRef contains the unsubstituted generic form
+                            // (Box<T>), and comparing against the instantiated
+                            // element type (Box<long>) fails for the wrong reason
+                            // (T vs long).  Generic classes were accepted before
+                            // this fix and codegen handles them correctly, so we
+                            // skip the strict check for them.  The fix applies
+                            // only to non-generic classes where the comparison is
+                            // exact.
                             if (!isComparableElem && elemTy472 &&
                                 elemTy472->kind == TypeRef::Kind::Named &&
                                 elemTy472->declaration &&
                                 elemTy472->declaration->kind ==
                                     ast::TypeDeclKind::Class &&
-                                declaresBuiltinInterface(
-                                    elemTy472->declaration, "IComparable")) {
+                                !elemTy472->declaration->genericParams.empty()) {
+                                // Generic class: accept unconditionally.
+                                // (Box<T>: IComparable<Box<T>> with any T is valid)
                                 isComparableElem = true;
+                            }
+                            if (!isComparableElem && elemTy472 &&
+                                elemTy472->kind == TypeRef::Kind::Named &&
+                                elemTy472->declaration &&
+                                elemTy472->declaration->kind ==
+                                    ast::TypeDeclKind::Class &&
+                                elemTy472->declaration->genericParams.empty()) {
+                                auto* icomparableSym =
+                                    ctx_.builtinInterfaceSym("IComparable");
+                                for (const TypeRef* bt :
+                                         elemTy472->declaration->baseTypeRefs) {
+                                    if (!bt || bt->nullable ||
+                                        bt->kind != TypeRef::Kind::Named ||
+                                        bt->declaration != icomparableSym ||
+                                        bt->genericArgs.size() != 1)
+                                        continue;
+                                    if (typeRefEqual(bt->genericArgs[0],
+                                                     elemTy472)) {
+                                        isComparableElem = true;
+                                        break;
+                                    }
+                                }
                             }
                             // fix #2768 (stdlib §4.4 / §2.8, spec §14.2,
                             // v0.240): (c) an INTERFACE element that names
