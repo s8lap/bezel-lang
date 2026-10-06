@@ -411,6 +411,184 @@ class EnvTest(unittest.TestCase):
         self.assertEqual(kind, "env-error")
 
 
+class InstanceBodyWrapTest(unittest.TestCase):
+    """§2.7: a bare name reaching an enclosing type's INSTANCE member is a
+    compile error in a static body — "a static body has no `this`". The gate-4
+    conformance sweep failed `codegen_0070` (spec §7.4) and `guide2_0003`
+    (Guide 2 §1) with `unresolved identifier _field`, because env.bzl splices
+    `_field` as an instance FIELD into `class W` while the statement wrap had
+    put the fragment's statements in `static method Main`. The rows were right;
+    the harness shape was not."""
+
+    CAT = ("//@ member _field\n"
+           "// spec §7.4 — compared with `null`, so nullable.\n"
+           "  private _field: string? := null;\n"
+           "\n"
+           "//@ member Use\n"
+           "// Same fragments — `Use(local)` inside the narrowed region.\n"
+           "  private static method Use(x: string) end Use;\n"
+           "\n"
+           "//@ local score\n"
+           "var score: int := 85;\n"
+           "\n"
+           "//@ member Width\n"
+           "  private Width: decimal := 2m;\n"
+           "\n"
+           "//@ member Log\n"
+           "  private static method Log(message: string) end Log;\n")
+
+    def setUp(self):
+        self.env = cf.parse_env(self.CAT)
+        self.fragment = "var local := _field;\nif local <> null then Use(local); end;\n"
+
+    # --- the classifier -------------------------------------------------
+
+    def test_instance_field_is_classified_instance(self):
+        self.assertTrue(cf.env_binds_instance_member(["_field"], self.env))
+
+    def test_static_method_is_not_classified_instance(self):
+        # `Use` is declared `//@ member` yet spelled `private static method`:
+        # the `member` kind says WHERE the entry is spliced, not whether it
+        # has a receiver.
+        self.assertFalse(cf.env_binds_instance_member(["Use"], self.env))
+
+    def test_static_and_instance_members_mixed_still_yields_true(self):
+        # `env_names` sorts alphabetically, so `_field` (instance) is examined
+        # AFTER `Use` (static) on this exact case. A classifier that decided on
+        # the FIRST member entry would answer False and silently leave the §2.7
+        # error in place — the regression this pins.
+        self.assertEqual(cf.env_names("env:Use,_field"), ["Use", "_field"])
+        self.assertTrue(cf.env_binds_instance_member(
+            cf.env_names("env:Use,_field"), self.env))
+
+    def test_local_and_type_entries_never_force_the_instance_body(self):
+        self.assertFalse(cf.env_binds_instance_member(["score"], self.env))
+
+    def test_derivation_prose_mentioning_static_does_not_decide(self):
+        cat = ("//@ member Q\n"
+               "// A `static` word appears in this derivation prose.\n"
+               "  private _q: int := 0;\n")
+        self.assertTrue(cf.env_binds_instance_member(["Q"], cf.parse_env(cat)))
+
+    def test_unknown_name_is_not_this_predicate_s_to_fail(self):
+        # splice_env raises EnvError for it (loudly); this predicate must not
+        # invent a second, different failure.
+        self.assertFalse(cf.env_binds_instance_member(["absent"], self.env))
+
+    # --- the wrap shape -------------------------------------------------
+
+    def test_statement_body_moves_into_an_instance_method(self):
+        mode, wrapped = cf.classify_wrap(self.fragment, instance_body=True)
+        self.assertEqual(mode, cf.WRAP_STMT)
+        self.assertIn("public method %s()" % cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+        self.assertIn("    var local := _field;", wrapped)
+        # the fragment's statements are NOT in the static body any more
+        main_at = wrapped.index("public static method Main()")
+        self.assertLess(wrapped.index("var local := _field;"), main_at)
+
+    def test_main_still_exists_and_constructs_and_calls(self):
+        # Entry point preserved. Spelling copied from the PASSING lit row
+        # tests/lit/arrow_body_declared_unit_return_no_degrade_note_3434.bzl
+        # (RUN asserts NODIAG): `using var c := new Counter(); c.Once();`.
+        _, wrapped = cf.classify_wrap(self.fragment, instance_body=True)
+        self.assertIn("  public static method Main()\n", wrapped)
+        self.assertIn("    using var w := new W();\n", wrapped)
+        self.assertIn("    w.%s();\n" % cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+        self.assertLess(main_at(wrapped), wrapped.index("using var w := new W();"))
+
+    def test_await_promotes_both_the_carrier_and_its_caller(self):
+        # §33.2's four accepted entry-point signatures admit
+        # `public static async method Main(): Task`; the carrier an `await`
+        # body needs is async, and Main must await it (not merely call it).
+        body = "await Load();\nvar local := _field;\n"
+        out = cf.stmt_body(body, instance_body=True)
+        self.assertIn("public async method %s(): Task" % cf.ENV_INSTANCE_BODY_METHOD, out)
+        self.assertIn("public static async method Main(): Task", out)
+        self.assertIn("    await w.%s();\n" % cf.ENV_INSTANCE_BODY_METHOD, out)
+
+    def test_local_env_binding_lands_in_the_carrier_not_in_main(self):
+        # A `local` must bind where the statements that READ it are.
+        mode, wrapped = cf.classify_wrap("var g := score;\n", instance_body=True)
+        self.assertEqual(mode, cf.WRAP_STMT)
+        wrapped = cf.splice_env(wrapped, ["score", "_field"], self.env)
+        carrier = wrapped.index("public method %s()" % cf.ENV_INSTANCE_BODY_METHOD)
+        main_at = wrapped.index("public static method Main()")
+        self.assertLess(carrier, wrapped.index("var score: int := 85;"))
+        self.assertLess(wrapped.index("var score: int := 85;"), main_at)
+
+    def test_mixed_wrap_moves_only_the_statement_group(self):
+        code = ("public property Name: string\n"
+                "  get => _name;\n"
+                "end Name;\n"
+                "\n"
+                "var g := score;\n")
+        _, wrapped = cf.wrap_mixed(code, instance_body=True)
+        # the fragment's own member stays a member of class W
+        self.assertLess(wrapped.index("class W\n"),
+                        wrapped.index("public property Name: string"))
+        # its statements move into the carrier
+        self.assertLess(wrapped.index("public method %s()" % cf.ENV_INSTANCE_BODY_METHOD),
+                        wrapped.index("var g := score;"))
+        self.assertLess(wrapped.index("var g := score;"),
+                        wrapped.index("public static method Main()"))
+
+    def test_mixed_wrap_with_no_statements_keeps_the_old_shape(self):
+        # spec_0059/spec_0166 are property DECLARATIONS: their instance-field
+        # reads are already inside an instance property of class W, so the
+        # instance carrier would only add scaffolding to a row that passes.
+        code = "public property Name: string\n  get => _name;\nend Name;\n"
+        _, wrapped = cf.wrap_mixed(code, instance_body=True)
+        self.assertNotIn(cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+
+    def test_default_shape_is_unchanged_without_the_flag(self):
+        # The flag is opt-in per case; a row whose env binds no instance member
+        # must wrap byte-identically to before it existed.
+        mode, wrapped = cf.classify_wrap(self.fragment)
+        self.assertEqual(mode, cf.WRAP_STMT)
+        self.assertNotIn(cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+        self.assertIn("  public static method Main()\n", wrapped)
+
+    def test_lib_wrap_ignores_the_flag(self):
+        # A member DECLARATION fragment is already inside class W; there is no
+        # synthesized static body to fix, and adding a carrier would change a
+        # passing row.
+        code = "public method Area(): decimal => Width * Height;\n"
+        mode, wrapped = cf.classify_wrap(code, instance_body=True)
+        self.assertEqual(mode, cf.WRAP_LIB)
+        self.assertNotIn(cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+
+    def test_run_case_routes_the_flag_from_the_manifest_notes(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        cases = os.path.join(tmp, "cases")
+        os.makedirs(cases)
+        with open(os.path.join(cases, "z.bzl"), "w") as f:
+            f.write(self.fragment)
+        case = {"case_id": "z", "doc": "d", "section": "S", "cls": "fragment",
+                "expectation": "compiles", "notes": "env:Use,_field"}
+        seen = {}
+
+        def fake_run(cmd, cwd=None):
+            # the LAST bezelc invocation is the program run; capture the wrapped
+            # source the harness wrote rather than its result
+            if cmd[-1].endswith(".bzl"):
+                with open(cmd[-1]) as f:
+                    seen["src"] = f.read()
+            return (0, "")
+
+        status, kind, _ = cf.run_case(
+            case, "/bin/true", cases, tmp, None, run=fake_run,
+            env_entries=self.env)
+        self.assertEqual(status, "PASS")
+        self.assertEqual(kind, "")
+        self.assertIn("public method %s()" % cf.ENV_INSTANCE_BODY_METHOD,
+                      seen["src"])
+
+
+def main_at(text):
+    return text.index("public static method Main()")
+
+
 class NoteTokensTest(unittest.TestCase):
     def test_semicolon_separated_tokens(self):
         self.assertEqual(cf.note_tokens("wrap:mixed; preamble"),

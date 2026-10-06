@@ -310,10 +310,89 @@ def main_header(body, indent="  "):
     return indent + "public static method Main()\n"
 
 
-def classify_wrap(code):
+# -----------------------------------------------------------------------
+# The instance-body variant of the statement wrap.
+#
+# WHY: §2.7's *Enclosing-type members* rule admits a bare reference to an
+# enclosing type's member, but under the static-context restriction — a static
+# body has no `this`. So a bare name naming an INSTANCE member is a compile
+# error in a static body, and legal in an instance one. env.bzl's `//@ member`
+# entries are the enclosing-type members a fragment assumes; when one of them is
+# an instance field, splicing it beside a fragment whose statements the stmt wrap
+# has placed in `static method Main` produces a program §2.7 rejects — the
+# harness's own scaffolding, not the document's block, was what made it ill
+# formed. Measured: `codegen_0070` (spec §7.4) and `guide2_0003` (Guide 2 §1),
+# the same `var local := _field; … Use(local);` fragment from three documents.
+#
+# So when a case opts into an INSTANCE member, the statements move into a
+# synthesized INSTANCE method beside `Main`, which constructs a `W` and calls it
+# — the same shape the documents write them in, and the same entry point the
+# program had before. Enclosing scaffolding in exactly the sense `main_header`
+# and `wrap_mixed` already are: no token of the document is added, rewritten,
+# reordered, or dropped.
+#
+# `RunFragment` is the instance method's name. It is spelled with a collision
+# check, not by taste: `Run` is ALREADY an env.bzl entry (`//@ member Run`,
+# spec §22.13), and `Main` is the entry point. `RunFragment` appears nowhere in
+# cases/, env.bzl, or preamble.bzl.
+#
+# The invocation spelling is copied from a PASSING lit row,
+# `tests/lit/arrow_body_declared_unit_return_no_degrade_note_3434.bzl` (its
+# RUN line asserts `NODIAG` — no error, no warning): a static `Main` that binds
+# `using var c := new Counter();` and calls an instance method on it, `c.Once();`.
+# -----------------------------------------------------------------------
+
+ENV_INSTANCE_BODY_METHOD = "RunFragment"
+
+
+def instance_method_header(body, indent="  "):
+    """The synthesized INSTANCE method that carries a statement body which must
+    reach an instance member by bare name. Mirrors main_header's §33.2 promotion:
+    a body containing a top-level `await` needs an `async` method."""
+    if needs_async_main(body):
+        return indent + "public async method %s(): Task\n" % ENV_INSTANCE_BODY_METHOD
+    return indent + "public method %s()\n" % ENV_INSTANCE_BODY_METHOD
+
+
+def instance_main_call(body):
+    """The synthesized `Main` body that constructs a `W` and calls the instance
+    method on it. `await`ed exactly when the method it calls is `async`."""
+    if needs_async_main(body):
+        return ("    using var w := new W();\n"
+                "    await w.%s();\n" % ENV_INSTANCE_BODY_METHOD)
+    return ("    using var w := new W();\n"
+            "    w.%s();\n" % ENV_INSTANCE_BODY_METHOD)
+
+
+def stmt_body(body, instance_body=False):
+    """The method scaffolding that carries a statement body: by default the
+    synthesized `static method Main()`; with `instance_body` set, an instance
+    method holding the statements beside a `Main` that constructs a `W` and
+    calls it. In both shapes the method carrying the statements is emitted
+    BEFORE any other method, so `splice_env`'s `local` anchor lands the ambient
+    locals beside the statements that read them."""
+    if not instance_body:
+        # An empty body indents to four spaces, which would replace the blank
+        # line the pre-§2.7 template emitted; skip it so a case with no
+        # statement group wraps byte-identically to before.
+        return (main_header(body) + (_indent_four(body) if body else "")
+                + "\n  end Main;\n")
+    return (instance_method_header(body) + _indent_four(body)
+            + "\n  end %s;\n" % ENV_INSTANCE_BODY_METHOD
+            + "\n" + main_header(body) + instance_main_call(body)
+            + "  end Main;\n")
+
+
+def classify_wrap(code, instance_body=False):
     """Return (wrap_mode, wrapped_src) for a fragment body. A pure translation
     of run_conformance.sh wrap_fragment()'s heuristic cascade; the wrapped_src
-    concatenations mirror the bash printf/cat templates exactly."""
+    concatenations mirror the bash printf/cat templates exactly.
+
+    `instance_body` is the §2.7 flag from `stmt_body`: set when the case's env
+    binds an instance member, so the statement wrap hosts the fragment's
+    statements in an instance method rather than a static one. It is consulted
+    only by the statement wrap — every other mode puts the block inside a type
+    or leaves the document's own scaffolding alone."""
     fn = first_nonblank_line(code)
 
     # 1. Already has a module declaration?
@@ -357,7 +436,7 @@ def classify_wrap(code):
             return (WRAP_STMT,
                     "module Conf;\n" + code
                     + "\nclass W\n  public static method Main() end Main;\nend W;\n")
-        mode, wrapped_rest = classify_wrap(rest)
+        mode, wrapped_rest = classify_wrap(rest, instance_body)
         # insert the import block right after the synthesized module line
         rl = wrapped_rest.splitlines(keepends=True)
         for j, line in enumerate(rl):
@@ -378,10 +457,11 @@ def classify_wrap(code):
                 "module Conf;\nclass W\n" + code
                 + "\n  public static method Main() end Main;\nend W;\n")
 
-    # 7. Default: treat as statements in Main.
+    # 7. Default: treat as statements in Main — or, when the case's env binds an
+    # instance member, in a synthesized instance method (§2.7; see stmt_body).
     return (WRAP_STMT,
-            "module Conf;\nclass W\n" + main_header(code)
-            + _indent_four(code) + "\n  end Main;\nend W;\n")
+            "module Conf;\nclass W\n" + stmt_body(code, instance_body)
+            + "end W;\n")
 
 
 # -----------------------------------------------------------------------
@@ -493,20 +573,30 @@ def classify_top_level_item(item):
     return "stmt"
 
 
-def wrap_mixed(code):
+def wrap_mixed(code, instance_body=False):
     """The composite wrap. Always yields a `Main`, so the case is an executable
-    program (WRAP_STMT) and its run phase is checked like any other."""
+    program (WRAP_STMT) and its run phase is checked like any other.
+
+    `instance_body` carries the same §2.7 flag as classify_wrap: the statement
+    group goes into an instance method beside `Main` when the case's env binds
+    an instance member. The `member` group is unaffected — it is already inside
+    `class W`, where an instance member is in scope for an instance method."""
     groups = {"import": [], "moddecl": [], "member": [], "stmt": []}
     for item in split_top_level_items(code):
         groups[classify_top_level_item(item)].append(item)
+    stmts = "".join(groups["stmt"])
+    # An empty statement group leaves nothing in the static body for §2.7 to
+    # object to (spec_0059/spec_0166 are property DECLARATIONS — their
+    # instance-field reads are already inside an instance property of class W),
+    # so the instance carrier would only add scaffolding. Keep the old shape.
+    instance_body = instance_body and bool(stmts.strip())
     out = ["module Conf;\n"]
     out += groups["import"]
     out += groups["moddecl"]
     out.append("\nclass W\n")
     out += groups["member"]
-    out.append(main_header("".join(groups["stmt"])))
-    out += [_indent_four(item) for item in groups["stmt"]]
-    out.append("\n  end Main;\nend W;\n")
+    out.append(stmt_body(stmts, instance_body))
+    out.append("end W;\n")
     return WRAP_STMT, "".join(out)
 
 
@@ -550,9 +640,51 @@ _ENV_HEADER_RE = re.compile(r'^//@\s+(local|member|type)\s+(\S+)\s*$')
 # `async … : Task` promotion (see main_header). A `local` env binding anchors on
 # whichever one the wrap emitted; before the promotion existed this regex saw
 # only the plain form, and an async-promoted case would have failed `env-error`.
+#
+# The second alternative is the instance carrier method of `stmt_body`'s §2.7
+# variant, with the same two spellings. A `local` must bind in the method that
+# HOLDS THE FRAGMENT'S STATEMENTS, which under that variant is `RunFragment`,
+# not `Main`. `stmt_body` emits the carrier before `Main`, and `splice_env`
+# splices at the FIRST match, so listing both here puts the locals in the
+# carrier without any ordering assumption inside splice_env.
 _ENV_MAIN_ANCHOR_RE = re.compile(
-    r'^(\s*)public static (?:async )?method Main\(\)(?:\s*:\s*Task)?\s*$')
+    r'^(\s*)public static (?:async )?method Main\(\)(?:\s*:\s*Task)?\s*$'
+    r'|^(\s*)public (?:async )?method %s\(\)(?:\s*:\s*Task)?\s*$'
+    % re.escape(ENV_INSTANCE_BODY_METHOD))
 _ENV_CLASS_ANCHOR_RE = re.compile(r'^class W\s*$')
+
+# A `member` entry is an INSTANCE member unless its declaration carries the
+# `static` modifier. `env.bzl` declares both under the same `//@ member` kind:
+# `Use` is `private static method Use(x: string) end Use;` while `_field` is
+# `private _field: string? := null;`. Both are read by the same kind of modifier
+# prefix (`_ITEM_MEMBER_RE` / `_ITEM_FIELD_RE`), so one regex over the
+# visibility+modifier run classifies both declaration forms, and the `static`
+# token anywhere in that run is the discriminator.
+_ENV_STATIC_MEMBER_RE = re.compile(
+    r'^\s*(?:(?:public|private|internal|protected)\s+)?'
+    r'(?:(?:static|virtual|override|abstract|async|pure|sealed|readonly|owned'
+    r'|scoped)\s+)*static\s+')
+
+
+def env_binds_instance_member(names, entries):
+    """True when any of the named `member` entries declares an INSTANCE member of
+    the synthesized class — the §2.7 condition that forces the statement wrap
+    into an instance body. `local` and `type` entries are excluded: a local is a
+    statement in the carrier itself, and a type is a module-level declaration."""
+    for n in names:
+        if n not in entries:
+            continue  # splice_env raises EnvError for it; not this predicate's job
+        kind, body = entries[n]
+        if kind != ENV_MEMBER:
+            continue
+        for line in body.splitlines():
+            s = line.strip()
+            if not s or s.startswith("//"):
+                continue  # the derivation prose is not the declaration
+            if not _ENV_STATIC_MEMBER_RE.match(line):
+                return True
+            break  # this entry IS static; a later one may still be an instance
+    return False
 
 
 class EnvError(Exception):
@@ -836,13 +968,17 @@ def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run,
         code = f.read()
 
     tokens = note_tokens(case.get("notes"))
+    names = env_names(case.get("notes"))
+    # §2.7: a bare name reaching an enclosing type's INSTANCE member is a compile
+    # error in a static body. When the case's env binds one, the statement wrap
+    # hosts the fragment in an instance method instead (see stmt_body).
+    instance_body = env_binds_instance_member(names, env_entries or {})
     if "wrap:mixed" in tokens:
-        wrap_mode, wrapped = wrap_mixed(code)
+        wrap_mode, wrapped = wrap_mixed(code, instance_body)
     else:
-        wrap_mode, wrapped = classify_wrap(code)
+        wrap_mode, wrapped = classify_wrap(code, instance_body)
     if "preamble" in tokens and preamble_text is not None:
         wrapped = splice_preamble(wrapped, preamble_text)
-    names = env_names(case.get("notes"))
     if names:
         try:
             wrapped = splice_env(wrapped, names, env_entries or {})
