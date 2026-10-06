@@ -186,7 +186,7 @@ BEZEL_TEST(codegen_ffi_temp_call_2809, cstring_param_tobytes_lowers_spec_10_1) {
         "module M; class C "
         "  public static method N(c: CString): int "
         "    using var b := c.ToBytes(); "
-        "    return b.Length; "
+        "    return b.Count; "
         "  end N; "
         "  public static method Main(): int "
         "    var t: int := 0; var i: int := 0; "

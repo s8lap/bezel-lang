@@ -472,7 +472,7 @@ BEZEL_TEST(codegen_encoding, utf16_getbytes_ascii_length_spec_3_2) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  using var b: Array<byte> := Encoding.UTF16.GetBytes(\"AB\"); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;", 4);
 }
 
@@ -509,7 +509,7 @@ BEZEL_TEST(codegen_encoding, utf16_getbytes_no_bom_spec_3_2) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  using var b: Array<byte> := Encoding.UTF16.GetBytes(\"H\"); "
-        "  return (if int(b.Get(0)) = 72 and b.Length = 2 then 1 else 0); "
+        "  return (if int(b.Get(0)) = 72 and b.Count = 2 then 1 else 0); "
         "end Main; end C;", 1);
 }
 
@@ -592,7 +592,7 @@ BEZEL_TEST(codegen_encoding, utf32_getbytes_ascii_length_spec_3_2) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  using var b: Array<byte> := Encoding.UTF32.GetBytes(\"A\"); "
-        "  return b.Length; "
+        "  return b.Count; "
         "end Main; end C;", 4);
 }
 
@@ -622,7 +622,7 @@ BEZEL_TEST(codegen_encoding, utf32_getbytes_no_bom_spec_3_2) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  using var b: Array<byte> := Encoding.UTF32.GetBytes(\"A\"); "
-        "  return (if int(b.Get(0)) = 65 and b.Length = 4 then 1 else 0); "
+        "  return (if int(b.Get(0)) = 65 and b.Count = 4 then 1 else 0); "
         "end Main; end C;", 1);
 }
 
@@ -674,7 +674,7 @@ BEZEL_TEST(codegen_encoding, ascii_getbytes_ascii_string_spec_3_2) {
     expectValueAndLeakFree(
         "module M; class C public static method Main(): int "
         "  using var b: Array<byte> := Encoding.ASCII.GetBytes(\"Hi\"); "
-        "  var ok := b.Length = 2 and int(b.Get(0)) = 72 and int(b.Get(1)) = 105; "
+        "  var ok := b.Count = 2 and int(b.Get(0)) = 72 and int(b.Get(1)) = 105; "
         "  return (if ok then 1 else 0); "
         "end Main; end C;", 1);
 }

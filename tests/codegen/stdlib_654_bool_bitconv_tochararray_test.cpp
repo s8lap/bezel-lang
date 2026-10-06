@@ -414,7 +414,7 @@ BEZEL_TEST(codegen_string_from_747, three_arg_array_still_builds_1145) {
         "class C public static method Main(): int "
         "  using var arr := new Array<char>(); "
         "  arr.Add('h'); arr.Add('i'); "
-        "  var t := String.From(arr, 0, arr.Length); "
+        "  var t := String.From(arr, 0, arr.Count); "
         "  return t.Length; "                           // 2
         "end Main; end C;"), 2);
 }

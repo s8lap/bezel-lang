@@ -328,7 +328,7 @@ BEZEL_TEST(codegen_string_methods_535, split_by_space_in_mixed_count_is_3) {
     BEZEL_EXPECT_EQ(runBody(
         std::string("var s := \"") + kHelloJapanWorld + "\"; "
         "var parts := s.Split(' '); "
-        "return parts.Length;"), 3);
+        "return parts.Count;"), 3);
 }
 
 // "Hello 日本 World".Split(' ')[0] must be "Hello" (Length 5).
@@ -367,11 +367,11 @@ BEZEL_TEST(codegen_string_methods_535, split_by_space_second_is_japan) {
 // ASCII control: "a b c".Split(' ') must still yield 3 parts.
 BEZEL_TEST(codegen_string_methods_535, split_ascii_control_count_is_3) {
     BEZEL_EXPECT_EQ(runBody(
-        "var s := \"a b c\"; var parts := s.Split(' '); return parts.Length;"), 3);
+        "var s := \"a b c\"; var parts := s.Split(' '); return parts.Count;"), 3);
 }
 
 // ASCII control: "hello".Split('l') must yield 3 parts ("he","","o").
 BEZEL_TEST(codegen_string_methods_535, split_ascii_repeated_sep) {
     BEZEL_EXPECT_EQ(runBody(
-        "var s := \"hello\"; var parts := s.Split('l'); return parts.Length;"), 3);
+        "var s := \"hello\"; var parts := s.Split('l'); return parts.Count;"), 3);
 }

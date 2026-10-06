@@ -377,7 +377,7 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
         "    catch "
         "      var e: Exception => do "
         "        var churn: string := \"c\" + i.ToString(); "
-        "        t := t + e.Message.Length + e.CauseChain.Length "
+        "        t := t + e.Message.Length + e.CauseChain.Count "
         "               + churn.Length; "
         "      end "
         "    end; "
