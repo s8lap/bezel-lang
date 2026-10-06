@@ -296,13 +296,50 @@ BEZEL_TEST(sorted_set_class_element_3428, nullable_interface_element_diagnoses_n
 // — so `selfComparableIfaceCompareTo` finds no match and this shape stays in
 // the residual rejection, distinguishing "is an interface" from "is a
 // SELF-comparable interface" (the actual §4.18 constraint).
+//
+// THE TWO HALVES OF THE MESSAGE, AND WHY THE OFFENDING ARGUMENT IS SPELLED
+// `IComparable` AND NOT `IComparable<Ord>` (fix-forward of #5423). The
+// diagnostic is built in two independent pieces, and they are spelled by two
+// different helpers that were never the same helper:
+//
+//   * the OFFENDING ARGUMENT comes from `arg->headName()`
+//     (TypeResolution_Names.cpp:3435, the kNullDeclSelfRefConstraints arm),
+//     and `TypeRef::headName()` returns `astNode->name->parts[0]` — the HEAD
+//     NAME ONLY, generic arguments dropped. The same is true of the general
+//     `where`-constraint emitter `argSpelling` (TypeResolution_Checks.cpp:
+//     10921), which joins `name->parts` and appends `?` for nullability and
+//     likewise never renders `genericArgs`. MEASURED on a second shape
+//     (`SortedSet<IOther<IOther>>`) the argument is likewise named `IOther`.
+//   * the CONSTRAINT comes from `d.boundName`, which #5423 correctly changed
+//     from the bare `IComparable` to `IComparable<T>` — matching stdlib
+//     §4.18's declared `where T: IComparable<T>`.
+//
+// So the complete message on this revision is, verbatim:
+//
+//   type argument `IComparable` does not satisfy the constraint
+//   `where T: IComparable<T>` (§14.2)
+//
+// and this row now pins that WHOLE message. That is STRICTLY STRONGER than
+// `constraintNeedle("IComparable<Ord>")`: the earlier form asserted a
+// substring the compiler never emits on any input (it asked for the head name
+// to be followed by `<Ord>`), so it could only ever fail; it pinned neither
+// half. `constraintNeedle` above deliberately stops before the `where ` text,
+// which is why it cannot express the constraint half — hence the full needle.
+//
+// This is NOT a rejection→acceptance flip: `rejectsWith` still requires
+// `!r.ran`, so the program must still be REJECTED, and it is (MEASURED, the
+// only diagnostic is the one quoted above). The soundness question this row
+// exists to ask — whether satisfying the type-BOUND is being wrongly treated
+// as equivalent to discharging the interface's METHOD obligation — resolves
+// NEGATIVE: `argSatisfiesTypeBound` returns false here (trace in the handback),
+// so `IComparable<Ord>` is correctly NOT admitted as satisfying
+// `IComparable<IComparable<Ord>>`, exactly as this row's comment above states.
 BEZEL_TEST(sorted_set_class_element_3428, non_self_comparable_interface_still_diagnosed) {
     BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  using var b := new SortedSet<IComparable<Ord>>(); "
         "  return b.Count; "),
-        // per spec §4.18 / §14.2 (v0.315): spell the bound as IComparable<T>, not bare
-        // IComparable (issue #5423, fix-forward)
-        constraintNeedle("IComparable<Ord>")));
+        "type argument `IComparable` does not satisfy the constraint "
+        "`where T: IComparable<T>` (§14.2)"));
 }
 
 // per stdlib §4.18 (v0.286), fix #2773 (B1): `Object` is a Primitive-kind
