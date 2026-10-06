@@ -1,7 +1,7 @@
 // Regression tests for #2772 item 2 — the class arm of the `Array<T>.Sort()`
 // IComparable gate ignores the type argument in `IComparable<TypeArg>`.
 //
-// SPEC SOURCE.  stdlib §4.4 (v0.240, the governing document at filing)
+// SPEC SOURCE.  stdlib §4.4 (v0.276, the governing document at filing)
 // declares `Sort()` only inside `where T: IComparable<T>`, so the admissibility
 // condition is exactly `T: IComparable<T>` — spec §14.2's conformance rule, with
 // the self-recurrence: T must conform to `IComparable<T>`, not `IComparable<Any>`.
@@ -14,10 +14,12 @@
 // the `bz$classcmp$X` thunk with two `X` pointers where the declared parameter is
 // `Other` — a type-confused call, not merely a wrong ordering.
 //
-// THE FIX.  The class arm now iterates the class's `baseTypeRefs` (parallel to
-// `baseTypes` but carrying the TypeRef with generic arguments) to find the
-// IComparable entry and verifies its type argument equals Self via `typeRefEqual`,
-// the same predicate the interface arm uses.
+// THE FIX.  The class arm now iterates the class's `baseTypeRefs` and
+// SUBSTITUTES the element type's generic arguments (e.g., T -> int for
+// Box<int>) before comparing the IComparable type argument against the
+// concrete element type.  This correctly handles both non-generic classes
+// (where the base type argument is already concrete) and generic classes
+// (where the base type argument contains unsubstituted generic parameters).
 //
 // ROOT CAUSE WAS CONFIRMED MECHANICALLY on r23-c28: `class X: IComparable<Other>`
 // compiled to exit 0 then SEGV'd at runtime.  After the fix it is rejected at
@@ -68,6 +70,34 @@ const char* kCorrectArg =
     "  public constructor(v: int) _v := v; end constructor; "
     "  public method V(): int => _v; "
     "  public method CompareTo(other: Box): int => _v - other.V(); "
+    "end Box; ";
+
+// GENERIC CLASS FIXTURES — the same three shapes as above but with a type
+// parameter.  These test that the IComparable<T> gate applies to GENERIC
+// classes correctly (the previous fix admitted ALL generic classes
+// unconditionally, which was a soundness hole).
+//
+// A generic class that implements IComparable<Other>, NOT IComparable<Self>.
+// The wrong type argument means Box<int> does NOT implement IComparable<Box<int>>.
+const char* kGenericWrongArg =
+    "module M; "
+    "class Other "
+    "  public constructor() end constructor; "
+    "end Other; "
+    "class Box<T>: IComparable<Other> "
+    "  private _v: T; "
+    "  public constructor(v: T) _v := v; end constructor; "
+    "  public method V(): T => _v; "
+    "  public method CompareTo(other: Other): int => 0; "
+    "end Box; ";
+
+// A generic class with no IComparable conformance at all.
+const char* kGenericNoIComparable =
+    "module M; "
+    "class Box<T> "
+    "  private _v: T; "
+    "  public constructor(v: T) _v := v; end constructor; "
+    "  public method V(): T => _v; "
     "end Box; ";
 
 std::string main_(const char* preamble, const std::string& body) {
@@ -138,4 +168,85 @@ BEZEL_TEST(array_sort_wrong_icomp_arg_2772,
         "    arr.Sort(); "
         "    return 7; "),
         "OwningArray<X>.Sort() requires T: IComparable<T>"));
+}
+
+// GENERIC CLASS REGRESSION TESTS.  The original fix (#2772 item 2) admitted
+// ALL generic classes unconditionally in the class arm of the IComparable gate,
+// because comparing the unsubstituted base type argument (Box<T>) against the
+// instantiated element type (Box<int>) failed for the wrong reason (T vs int).
+// The unconditional admit was a soundness hole: Box<T>: IComparable<Other>
+// compiled and SEGV'd at runtime, and Box<T> (no IComparable) compiled and
+// SEGV'd at runtime.  The substitution-based check closes both holes.
+
+// GENERIC REGRESSION — Box<T>: IComparable<Other> with Array<Box<int>>.Sort()
+// is now correctly rejected.  Before the fix: compiled, wrong sort result.
+// After the fix: rejected with the standard gate diagnostic naming Box<int>
+// and the IComparable<Box<int>> self-conformance requirement.
+BEZEL_TEST(array_sort_wrong_icomp_arg_2772,
+           generic_wrong_icomp_type_arg_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(main_(kGenericWrongArg,
+        "    using var a := new Box<int>(3); "
+        "    using var b := new Box<int>(1); "
+        "    var arr: Array<Box<int>> := [a, b]; "
+        "    arr.Sort(); "
+        "    return 7; "),
+        "Array<Box<int>>.Sort() requires T: IComparable<T>"));
+    BEZEL_EXPECT_TRUE(rejectsWith(main_(kGenericWrongArg,
+        "    using var a := new Box<int>(3); "
+        "    using var b := new Box<int>(1); "
+        "    var arr: Array<Box<int>> := [a, b]; "
+        "    arr.Sort(); "
+        "    return 7; "),
+        "Box<int> does not implement IComparable<Box<int>>"));
+}
+
+// GENERIC REGRESSION — Box<T> with no IComparable at all, with
+// Array<Box<int>>.Sort(), is now correctly rejected.  Before the fix:
+// compiled and SEGV'd at runtime (codegen found no CompareTo and called
+// through a null or garbage function pointer).  After the fix: rejected
+// with the standard gate diagnostic.
+BEZEL_TEST(array_sort_wrong_icomp_arg_2772,
+           generic_no_icomp_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(main_(kGenericNoIComparable,
+        "    using var a := new Box<int>(3); "
+        "    using var b := new Box<int>(1); "
+        "    var arr: Array<Box<int>> := [a, b]; "
+        "    arr.Sort(); "
+        "    return 7; "),
+        "Array<Box<int>>.Sort() requires T: IComparable<T>"));
+    BEZEL_EXPECT_TRUE(rejectsWith(main_(kGenericNoIComparable,
+        "    using var a := new Box<int>(3); "
+        "    using var b := new Box<int>(1); "
+        "    var arr: Array<Box<int>> := [a, b]; "
+        "    arr.Sort(); "
+        "    return 7; "),
+        "Box<int> does not implement IComparable<Box<int>>"));
+}
+
+// GENERIC CONTROL — a generic class that DOES implement IComparable<Box<T>>
+// correctly must still sort correctly.  3,1,2 sorted ascending is 1,2,3:
+// 1*16 + 2*4 + 3 = 27.  CompareTo is implemented as _v - other.V() so the
+// ordering is correct and the return-value check verifies it.
+BEZEL_TEST(array_sort_wrong_icomp_arg_2772,
+           generic_correct_icomp_self_sorts) {
+    // Inline the class here to give it a working CompareTo.
+    const char* program =
+        "module M; "
+        "class Box<T>: IComparable<Box<T>> "
+        "  private _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method V(): int => _v; "
+        "  public method CompareTo(other: Box<T>): int => _v - other.V(); "
+        "end Box; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var a := new Box<int>(3); "
+        "    using var b := new Box<int>(1); "
+        "    using var c := new Box<int>(2); "
+        "    var arr: Array<Box<int>> := [a, b, c]; "
+        "    arr.Sort(); "
+        "    return arr[0].V() * 16 + arr[1].V() * 4 + arr[2].V(); "
+        "  end Main; "
+        "end C; ";
+    BEZEL_EXPECT_EQ(runChecked(std::string(program)), 27);
 }

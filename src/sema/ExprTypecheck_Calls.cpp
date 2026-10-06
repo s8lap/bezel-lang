@@ -13,6 +13,7 @@
 #include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 overload table (name + arity + where)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
+#include "sema/SubstArgs.hpp"       // sema::substituteGenericArgs — generic class IComparable check
 
 // fix #4724 / #4801 (§4.4, §5.2, §6.4, v0.307): the compile-time float and
 // decimal folds reuse the runtime's decimal entry points — the SAME ops codegen
@@ -9499,7 +9500,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // rejected while the identical local declaration
                             // was accepted.
                             //
-                            // fix #2772 item 2 (spec §14.2, stdlib §4.4, v0.240):
+                            // fix #2772 item 2 (spec §14.2, stdlib §4.4, v0.276):
                             // the class arm must also check the TYPE ARGUMENT of
                             // IComparable<T> — the conformance requirement is
                             // T: IComparable<T>, not just T: IComparable<Any>.
@@ -9511,33 +9512,39 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // via typeRefEqual.
                             //
                             // Note: generic classes (`Box<T>: IComparable<Box<T>>`)
-                            // are accepted unconditionally in this arm: the
-                            // baseTypeRef contains the unsubstituted generic form
-                            // (Box<T>), and comparing against the instantiated
-                            // element type (Box<long>) fails for the wrong reason
-                            // (T vs long).  Generic classes were accepted before
-                            // this fix and codegen handles them correctly, so we
-                            // skip the strict check for them.  The fix applies
-                            // only to non-generic classes where the comparison is
-                            // exact.
-                            if (!isComparableElem && elemTy472 &&
-                                elemTy472->kind == TypeRef::Kind::Named &&
-                                elemTy472->declaration &&
-                                elemTy472->declaration->kind ==
-                                    ast::TypeDeclKind::Class &&
+                            // need the same strict check as non-generic classes,
+                            // but the baseTypeRef contains the UNSUBSTITUTED generic
+                            // form (Box<T>), so we must SUBSTITUTE the element type's
+                            // generic arguments before comparing.  For Box<int>:
+                            //   - build subst {T -> int}
+                            //   - substitute into IComparable<Box<T>> -> IComparable<Box<int>>
+                            //   - check if equals IComparable<Box<int>> -> YES
+                            // For Box<T>: IComparable<Other> with Box<int>:
+                            //   - substitute into IComparable<Other> -> IComparable<Other>
+                            //   - check if equals IComparable<Box<int>> -> NO
+                            auto* icomparableSym =
+                                ctx_.builtinInterfaceSym("IComparable");
+                            // Build substitution: each generic param of the class
+                            // declaration maps to the corresponding type argument
+                            // in the instantiated element type (e.g., T -> int
+                            // for Box<int>).  Empty for non-generic classes.
+                            std::unordered_map<std::string_view, TypeRef*> subst;
+                            if (elemTy472->declaration &&
                                 !elemTy472->declaration->genericParams.empty()) {
-                                // Generic class: accept unconditionally.
-                                // (Box<T>: IComparable<Box<T>> with any T is valid)
-                                isComparableElem = true;
+                                for (std::size_t i = 0;
+                                     i < elemTy472->declaration->genericParams.size() &&
+                                     i < elemTy472->genericArgs.size();
+                                     ++i) {
+                                    if (auto* gp = dynamic_cast<GenericParamSymbol*>(
+                                            elemTy472->declaration->genericParams[i])) {
+                                        subst[gp->name] = elemTy472->genericArgs[i];
+                                    }
+                                }
                             }
-                            if (!isComparableElem && elemTy472 &&
-                                elemTy472->kind == TypeRef::Kind::Named &&
-                                elemTy472->declaration &&
-                                elemTy472->declaration->kind ==
-                                    ast::TypeDeclKind::Class &&
-                                elemTy472->declaration->genericParams.empty()) {
-                                auto* icomparableSym =
-                                    ctx_.builtinInterfaceSym("IComparable");
+                            // Only check base types if the element has a declaration
+                            // (primitives have no declaration and are handled by the
+                            // primitive check above; they never reach this loop).
+                            if (elemTy472->declaration) {
                                 for (const TypeRef* bt :
                                          elemTy472->declaration->baseTypeRefs) {
                                     if (!bt || bt->nullable ||
@@ -9545,8 +9552,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         bt->declaration != icomparableSym ||
                                         bt->genericArgs.size() != 1)
                                         continue;
-                                    if (typeRefEqual(bt->genericArgs[0],
-                                                     elemTy472)) {
+                                    // Substitute the base type's generic arg with the
+                                    // element type's substitution map, then compare
+                                    // against the concrete element type.
+                                    TypeRef* btArgSubst = sema::substituteGenericArgs(
+                                        bt->genericArgs[0],
+                                        sema::SubstArgs{ctx_, subst});
+                                    if (typeRefEqual(btArgSubst, elemTy472)) {
                                         isComparableElem = true;
                                         break;
                                     }
