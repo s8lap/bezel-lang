@@ -166,7 +166,7 @@ bool isNonNullableReferenceType(const TypeRef* t) {
             // or a bare generic parameter, both of which follow the
             // non-nullable-reference rule (§7.10).
             if (!t->declaration) return true;
-            // fix #3462 (v0.320): builtinClassSym mints value types (Range, Ptr)
+            // fix #3462 (v0.315): builtinClassSym mints value types (Range, Ptr)
             // with kind=Class. Distinguish them by their empty moduleName (they
             // have no real module, per Symbol.hpp's moduleName comment).
             if (t->declaration->moduleName.empty()) return false;

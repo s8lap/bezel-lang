@@ -1,4 +1,4 @@
-// fix #3462 (v0.320) — spec §8.6, §9.8, §22.3, §22.4.
+// fix #3462 (v0.315) — spec §8.6, §9.8, §22.3, §22.4.
 //
 // THE DEFECT. `isNonNullableReferenceType` decided "is this a non-nullable
 // reference type" for a Named type by testing `kind == Class ||
