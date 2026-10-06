@@ -9519,6 +9519,11 @@ private:
     static const std::vector<std::pair<const char*, const char*>>&
     builtinExceptionHierarchy();
 
+    // §31.4 / §33.3 (v0.315): is `name` a built-in EXCEPTION type, i.e. does it
+    // carry the §31.4 exception-instance layout (message@8, CauseChain@24)?
+    // The gate for the two published exception tables — see the definition.
+    static bool isBuiltinExceptionName(const std::string& name);
+
     // CG22: build descriptor + vtable globals for the built-in exception
     // types (which have no user TypeSymbol). A type's descriptor lists its
     // own and all ancestor descriptors so `catch Ancestor` matches.

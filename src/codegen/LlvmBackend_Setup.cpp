@@ -5983,6 +5983,25 @@ Emitter::builtinExceptionHierarchy() {
 }
 
 
+// §31.4 / §33.3 (v0.315): is `name` one of the built-in EXCEPTION types — i.e.
+// does it have the §31.4 exception-instance layout (message@8, CauseChain@24)?
+//
+// This is the gate for the two published built-in exception tables
+// (builtinExcVtableTablePtr / builtinExcDescTablePtr), whose ENTIRE purpose is
+// to tell the runtime which objects may be read at those offsets. It became
+// necessary when #5340 put `Object` into `builtinVtable_`: that map is the set
+// of built-in types that get a COMPILER-BUILT vtable, which after #5340 is
+// strictly LARGER than the set of exceptions. Membership in the §31.4
+// hierarchy is the fact those offsets actually depend on, so it is what the
+// gate reads — a `name != "Object"` spelling would keep passing until the next
+// non-exception builtin vtable arrived, and would be wrong for the same reason.
+bool Emitter::isBuiltinExceptionName(const std::string& name) {
+    for (const auto& [excName, par] : builtinExceptionHierarchy())
+        if (name == excName) return true;
+    return false;
+}
+
+
 void Emitter::setupBuiltinExceptions() {
     const auto& hier = builtinExceptionHierarchy();
     std::unordered_map<std::string, std::string> parent;
@@ -45594,9 +45613,39 @@ void Emitter::finalizeVtableTable() {
 // reads (message@8, CauseChain@24) to objects that actually have that layout.
 llvm::Value* Emitter::builtinExcVtableTablePtr() {
     if (excVtableTableGV_) return excVtableTableGV_;
+    // fix #5340 follow-up (§31.4 / §33.3 / §8.1 / §28.9, v0.315): the table is
+    // the set of built-in EXCEPTION vtables, and `builtinVtable_` is no longer
+    // that set — #5340 added `Object` to it (setupBuiltinObject, the root
+    // class of §2.8.3), so iterating the map verbatim published `bvt$Object`
+    // here as if it were an exception.
+    //
+    // That is a LAYOUT lie, and this table's only job is to gate §31.4 field
+    // reads on objects that HAVE that layout. `bz_exc_reclaim_causechain`
+    // (bezel_runtime_itable.cpp) matches obj's vtable against this table and,
+    // on a hit, reads the CauseChain snapshot at BZ_EXC_CAUSE_OFFSET = 24 — a
+    // §31.4 exception-instance field. A `new Object()` instance is EIGHT bytes
+    // (lowerNew's `calloc(1, 8)`: the vtable pointer and nothing else — §8.1
+    // gives Object no fields and no base), so that read runs 16 bytes past the
+    // end of the allocation and dereferences heap garbage. MEASURED on
+    // `var o := new Object(); Console.WriteLine(o.ToString());`: SIGSEGV
+    // inside bz_exc_reclaim_causechain (backtrace frame #0), at the
+    // `mov 0x18(%rdi),%rbx` — i.e. offset 24 — reached from #5437's
+    // objectReclaim reclaim.
+    //
+    // `Object` is NOT exempt from disposal (§28.9's runtime-managed list is
+    // exactly string / Type / boxed value types / function values), so #5437's
+    // free is correct and stays; what is wrong is only this table ADVERTISING
+    // an 8-byte object as carrying the §31.4 exception header. Excluding the
+    // non-exception keys restores the table's meaning without touching the
+    // reclaim.
     std::vector<llvm::Constant*> entries;
-    for (const auto& [name, gv] : builtinVtable_)
+    for (const auto& [name, gv] : builtinVtable_) {
+        // Membership in the §31.4 hierarchy, not `name != "Object"`: the
+        // discriminator is "does this type HAVE the exception-instance
+        // layout", so it must be read off the hierarchy that defines it.
+        if (!isBuiltinExceptionName(name)) continue;
         entries.push_back(llvm::ConstantExpr::getPointerCast(gv, ptrTy()));
+    }
     entries.push_back(llvm::ConstantPointerNull::get(ptrTy()));  // terminator
     auto* arrTy = llvm::ArrayType::get(ptrTy(), entries.size());
     excVtableTableGV_ = new llvm::GlobalVariable(
@@ -45619,6 +45668,15 @@ llvm::Value* Emitter::builtinExcDescTablePtr() {
     if (excDescTableGV_) return excDescTableGV_;
     std::vector<llvm::Constant*> entries;
     for (const auto& [name, gv] : builtinVtable_) {
+        // Same §31.4-layout gate as builtinExcVtableTablePtr above, and for the
+        // same reason: `Object`'s descriptor `btd$Object` is not an EXCEPTION
+        // descriptor. It matters independently of the vtable table, because
+        // bz_exc_reclaim_causechain falls back to THIS table when the vtable
+        // misses — it walks obj's vtable[0] descriptor chain against these
+        // entries to recognise a user exception subclass (§31.4 / #2989). An
+        // `Object` instance reaching that walk would match on `btd$Object` and
+        // read the same out-of-bounds offset-24 field.
+        if (!isBuiltinExceptionName(name)) continue;
         auto it = builtinDesc_.find(name);
         if (it != builtinDesc_.end())
             entries.push_back(llvm::ConstantExpr::getPointerCast(it->second,
