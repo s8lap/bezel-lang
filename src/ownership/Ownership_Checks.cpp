@@ -19217,7 +19217,74 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
     std::vector<std::string_view> moved;
     for (const auto& [name, isMoved] : fieldMovedFrom_)
         if (isMoved) moved.push_back(name);
-    if (moved.empty()) return;
+    if (moved.empty()) {
+        // No fields moved at entry. Still check for argument-position field moves
+        // in a throwable call (fix #4707 §28.8.1, v0.300) — those are set by
+        // `recordFieldMove` inside `handleDischarge`, which runs AFTER this check,
+        // so they are never in `fieldMovedFrom_` at this point.
+        const ast::Expr* throwable = nullptr;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+            if (auto* t = assignmentIs28_8_1ThrowableByOverwrite(*as)) {
+                throwable = t;
+            }
+        }
+        if (!throwable) {
+            visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
+                if (!throwable) throwable = findThrowable28_8_1(&e);
+            });
+        }
+        if (!throwable) return;
+        // Collect argument field moves from the throwable (see full comment below).
+        // fix #4707 (§28.8.1, v0.300): the argument-position field-move case.
+        // `fieldMovedFrom_` holds fields moved at THIS statement's entry — it does
+        // NOT yet contain fields moved by the throwable's OWN arguments (those are
+        // set by `recordFieldMove` inside `handleDischarge`, which runs AFTER this
+        // check). On the exception edge of the throwable call, argument evaluation
+        // has already happened, so any field moved by an argument is unrestored.
+        // Collect those fields and add them to `moved` so the diagnostic fires.
+        // Mirrors the `recordMovesInArgs` / `recordMovesIn` / `recordFieldMove`
+        // chain that records the move during `handleDischarge`. // per §28.8.1
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(throwable)) {
+            const CalleeFormals formals = calleeOrChainFormals(call->callee.get(), call->args);
+            std::size_t pos = 0;
+            for (const auto& a : call->args) {
+                if (a.value) {
+                    const bool ownedSink =
+                        a.modifier == "owned" ||
+                        (formals.valid() &&
+                         boundParamIndex(call->args, pos, formals) < formals.size() &&
+                         formals.modifier(boundParamIndex(call->args, pos, formals)) == "owned") ||
+                        builtinOwnedSinkArg(call->callee.get(), pos);
+                    if (ownedSink) {
+                        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
+                            if (un->op == "move") {
+                                const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
+                                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
+                                    if (exprIsOwnedFieldRead(*mop)) {
+                                        moved.push_back(id->name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ++pos;
+            }
+        }
+        if (moved.empty()) return;
+        std::sort(moved.begin(), moved.end());
+        for (std::string_view name : moved) {
+            report(Severity::Error, throwable->span.begin,
+                   std::string("owned field `") + std::string(name) +
+                       "` is moved-from here and this expression can raise, so the "
+                       "exception edge is an exit path on which the field is never "
+                       "restored (§28.8.1 \"Exception paths are not exempt\") — "
+                       "build the replacement and restore `" + std::string(name) +
+                       "` BEFORE the throwable expression (`build before take`), or "
+                       "move the `move` after it");
+        }
+        return;
+    }
     std::sort(moved.begin(), moved.end());
     // A `case` STATEMENT is skipped whole. The CFG appends a CaseStmt as a single
     // OPAQUE node (flow/CFG.cpp visitStmt has no case handler — see the matching
@@ -19305,8 +19372,41 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
             });
         }
         if (!throwable) return;
-        pendingThrowableInTryChecks_.push_back(
-            {enclosing, throwable, moved});
+        // fix #4707 (§28.8.1, v0.300): collect argument field moves (mirrors
+        // the non-deferred path addition above). Add them to `moved` so
+        // `fireAllPendingInTryChecks` checks catch-arm restoration for them.
+        if (auto* call = dynamic_cast<const ast::CallExpr*>(throwable)) {
+            const CalleeFormals formals = calleeOrChainFormals(call->callee.get(), call->args);
+            std::size_t pos = 0;
+            for (const auto& a : call->args) {
+                if (a.value) {
+                    const bool ownedSink =
+                        a.modifier == "owned" ||
+                        (formals.valid() &&
+                         boundParamIndex(call->args, pos, formals) < formals.size() &&
+                         formals.modifier(boundParamIndex(call->args, pos, formals)) == "owned") ||
+                        builtinOwnedSinkArg(call->callee.get(), pos);
+                    if (ownedSink) {
+                        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
+                            if (un->op == "move") {
+                                const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
+                                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
+                                    if (exprIsOwnedFieldRead(*mop)) {
+                                        bool found = false;
+                                        for (auto v : moved) { if (v == id->name) { found = true; break; } }
+                                        if (!found) moved.push_back(id->name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                ++pos;
+            }
+        }
+        if (!moved.empty())
+            pendingThrowableInTryChecks_.push_back(
+                {enclosing, throwable, moved});
         return;
     }
     const ast::Expr* throwable = nullptr;
@@ -19333,6 +19433,46 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
         });
     }
     if (!throwable) return;
+    // fix #4707 (§28.8.1, v0.300): the argument-position field-move case.
+    // `fieldMovedFrom_` holds fields moved at THIS statement's entry — it does
+    // NOT yet contain fields moved by the throwable's OWN arguments (those are
+    // set by `recordFieldMove` inside `handleDischarge`, which runs AFTER this
+    // check). On the exception edge of the throwable call, argument evaluation
+    // has already happened, so any field moved by an argument is unrestored.
+    // Collect those fields and add them to `moved` so the diagnostic fires.
+    // Mirrors the `recordMovesInArgs` / `recordMovesIn` / `recordFieldMove`
+    // chain that records the move during `handleDischarge`. // per §28.8.1
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(throwable)) {
+        const CalleeFormals formals = calleeOrChainFormals(call->callee.get(), call->args);
+        std::size_t pos = 0;
+        for (const auto& a : call->args) {
+            if (a.value) {
+                const bool ownedSink =
+                    a.modifier == "owned" ||
+                    (formals.valid() &&
+                     boundParamIndex(call->args, pos, formals) < formals.size() &&
+                     formals.modifier(boundParamIndex(call->args, pos, formals)) == "owned") ||
+                    builtinOwnedSinkArg(call->callee.get(), pos);
+                if (ownedSink) {
+                    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(a.value.get())) {
+                        if (un->op == "move") {
+                            const ast::Expr* mop = lookThroughForceUnwrap(un->operand.get());
+                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(mop)) {
+                                if (exprIsOwnedFieldRead(*mop)) {
+                                    bool found = false;
+                                    for (auto v : moved) { if (v == id->name) { found = true; break; } }
+                                    if (!found) moved.push_back(id->name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ++pos;
+        }
+    }
+    if (moved.empty()) return;
+    std::sort(moved.begin(), moved.end());
     // Report at the throwable expression the walk actually found — the node whose
     // exception edge is the unrestored exit — never at a synthesized location.
     for (std::string_view name : moved) {
