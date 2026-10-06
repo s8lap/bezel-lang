@@ -1503,6 +1503,14 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                 long long moSize = 0;
                 if (isMoveOnlyInlineArrayType(pt, moSize))
                     noteMoveOnlyArrayWholeMoveRead(*a.value);
+                // fix #5436 (§15.3 *Parameter passing*, v0.314): the choice
+                // twin of the line above, on the same reasoning — §15.3's
+                // bullet is stated over "a move-only V" and the ctor call is a
+                // parameter passing like any other. Not memory-unsafe here
+                // (MEASURED: the ctor path's own store disposes correctly),
+                // but the argument must still read as moved-from afterward.
+                // // per §15.3 *Parameter passing*
+                if (pt) noteOwningChoiceWholeMoveRead(*a.value);
             }
             // fix #5388 (§22.3, v0.314): a `move x` call-site marker is valid
             // ONLY on an argument to an `owned` parameter. At any other
@@ -1857,6 +1865,18 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
             long long moSize = 0;
             if (isMoveOnlyInlineArrayType(pt, moSize))
                 noteMoveOnlyArrayWholeMoveRead(*a.value);
+            // fix #5436 (§15.3 *Parameter passing*, v0.314): the gate above
+            // admitted only the INLINE-ARRAY move-only kind, leaving the
+            // OTHER move-only kind (§35.4's owning-classified choice)
+            // unmarked — so `var d := Pass(b);` left `b` fully live after the
+            // call, its scope-end active-case pass disposed the payload `d`
+            // now owns, and the pair double-freed. §15.3's bullet is stated
+            // over "a move-only V" and names no kind, so both kinds take it.
+            // `noteOwningChoiceWholeMoveRead` is the choice twin of the
+            // primitive above (#4587), and no-ops for every non-choice /
+            // non-bare-identifier argument, so widening the gate here is
+            // narrow. // per §15.3 *Parameter passing*
+            if (pt) noteOwningChoiceWholeMoveRead(*a.value);
         }
         // fix #5388 (§22.3, v0.314): a `move x` call-site marker is valid ONLY
         // on an argument to an `owned` parameter. At any other position the

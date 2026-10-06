@@ -6802,6 +6802,40 @@ void Emitter::markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
 void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
                                              const ast::Expr* srcExpr) {
     if (!targetLd || !srcExpr) return;
+    markOwningChoiceMovedFromCore(targetLd, srcExpr);
+}
+
+// fix #5436 (§15.3 *Parameter passing*, v0.314): a call ARGUMENT whose formal
+// is a by-value-move parameter. §15.3: "A parameter declared `(x: V)` for an
+// ordinary V is by value (copy); for a move-only V, it is by value-move
+// (transfer ownership). The caller's argument expression is in moved-from
+// state after the call." §35.4: "parameter passing is by value-move".
+//
+// The overloads above both require a TARGET local, because #4566's
+// local-to-local shape needs the target's identity to reject the self-
+// assignment `b := b;`. A call argument has no such target: the recipient is
+// the callee's formal, a PARAMETER, which is exactly the shape #4566's SCOPE
+// note declined ("a parameter at either end"). The recipient being a
+// parameter is not a reason to withhold the mark, though — the thing the mark
+// suppresses is the SOURCE's scope-end disposal, and the source is a plain
+// local in both cases. So this form passes a null target: no self-assignment
+// to exclude, the same zero-store otherwise.
+//
+// MEASURED at `r23-c28` (6f341713) on
+// `var b := Bundle.Ready(new Resource("b")); var d := Host.Pass(b);`:
+// `moved` / `dispose b` / then SIGSEGV, and `AddressSanitizer:
+// heap-use-after-free ... READ of size 8` under `--sanitize=address`. The
+// sema half (Ownership_Checks' `noteOwningChoiceWholeMoveRead` call, the
+// choice twin of #4677's inline-array arm) makes the program REJECT a later
+// read, but the runtime double free is here.
+void Emitter::markOwningChoiceArgMovedFrom(const ast::Expr* srcExpr) {
+    if (!srcExpr) return;
+    markOwningChoiceMovedFromCore(/*targetLd=*/nullptr, srcExpr);
+}
+
+void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
+                                            const ast::Expr* srcExpr) {
+    if (!srcExpr) return;
     if (emittingDisposerBody_) return;  // disposer locals: field pass owns them
     // THE SOURCE must be a bare identifier naming a DIFFERENT local. A bare
     // identifier is the only shape §15.3 bullet 1 moves; `b.f`, `b[i]` and
@@ -6823,8 +6857,9 @@ void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
                        // the scope-end pass, so neither has a disposal to
                        // suppress (§21.1 does not admit an owned production
                        // at a `const` binding at all).
-    if (sld == targetLd) return;  // `b := b;` — §15.3's *Whole-value
-                                  // reassignment* bullet makes self-assignment
+    if (targetLd && sld == targetLd)
+        return;  // `b := b;` — §15.3's *Whole-value
+                  // reassignment* bullet makes self-assignment
                                   // "a no-op"; zeroing here would destroy the
                                   // value the store just wrote back.
     // The declared type decides, resolved in the SAME order

@@ -189,14 +189,33 @@ BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
 BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
            spec_28_7_moved_from_owning_choice_local_stores_without_disposal) {
     // §28.7: "A moved-from or null location therefore stores without
-    // disposal." `b := Pass(move b);` hands the value out and takes it back
+    // disposal." `b := Pass(b);` hands the value out and takes it back
     // through the same slot, so the location is moved-from AT the store and
     // the displaced-value pass must not run — otherwise the value the callee
-    // just returned is freed under the store.
+    // just returned is freed under the store. §15.3's *Whole-value
+    // reassignment* names this shape verbatim: "A reassignment whose RHS
+    // consumes the LHS — self-assignment `arr := arr;`, `arr := f(arr)` (a
+    // by-value-move parameter, this section's *Parameter passing* bullet) …
+    // the RHS move leaves the location moved-from before the pass runs".
+    //
+    // The argument is written UNMARKED, and that is the load-bearing spelling:
+    // §15.3's *Parameter passing* bullet says a move-only V's argument "is
+    // written unmarked — `Take(arr)`, not `Take(move arr)` — including where
+    // it is a named binding the call leaves moved-from … so `move` at such an
+    // argument is rejected as at any marker-free position". A `move` marker
+    // here is the §22.3 error the first version of this row carried (it was
+    // authored 2026-10-02, before #5388's v0.314 gate landed the diagnostic
+    // that rejects it) — the compiler is right to reject it and the ROW was
+    // wrong. MEASURED pre-fix on the corrected spelling: the call left the
+    // caller's `b` live, so `b`'s scope-end active-case pass disposed the
+    // payload the returned value already owned — `dispose b` / `rewrapped` /
+    // then SIGSEGV, and `AddressSanitizer: heap-use-after-free ... READ of
+    // size 8` under `--sanitize=address`. One disposal, at scope end, on the
+    // value `b` holds when the construct exits.
     BEZEL_EXPECT_EQ(
         runOut(kNamedResourceDecls,
                "var b := Bundle.Ready(new Resource(\"b\")); "
-               "b := Host.Pass(move b); "
+               "b := Host.Pass(b); "
                "Console.WriteLine(\"rewrapped\");",
                "public static method Pass(v: Bundle): Bundle => v;"),
         std::string("rewrapped\ndispose b\n"));

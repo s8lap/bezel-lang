@@ -19545,6 +19545,27 @@ private:
     // the target — so the declaration site calls this form directly.
     void markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
                                         const ast::Expr* srcExpr);
+    // fix #5436 (§15.3 *Parameter passing*, v0.314): the SOURCE-ONLY mark, for
+    // a call argument whose formal is a by-value-move parameter. There is no
+    // target local to check — the callee's formal is the recipient, and it is
+    // a PARAMETER, so the "both ends must be plain locals" scope note on the
+    // overloads above does not apply; what the mark needs is only that the
+    // source slot stops being walked, and §15.3's bullet says the caller's
+    // argument "is in moved-from state after the call". Reuses the same
+    // zero-store core below; `targetLd == nullptr` means "no target to
+    // suppress a self-assignment against".
+    void markOwningChoiceArgMovedFrom(const ast::Expr* srcExpr);
+    // The zero-store core both forms above reach. `targetLd == nullptr` means
+    // "no target local" (the call-argument form), which skips only the
+    // self-assignment exclusion. // per §15.3, §28.7
+    void markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
+                                       const ast::Expr* srcExpr);
+    // fix #5436 (§15.3 *Parameter passing*, v0.314): the call-argument sweep —
+    // every argument whose bound FORMAL is a by-value-move parameter of an
+    // owning-classified choice. Driven off the formal, not the argument (§22.6).
+    // Called from `lowerCall` AFTER `lowerCallDispatch`, so the value each call
+    // read out of its argument slot is already in the callee's frame.
+    void markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call);
 
     // fix #4552 / §35.5 *The owning match* (v0.306): is `e`, of static type
     // `rt`, an UNBOUND owned temporary of owning-choice type — §35.5's

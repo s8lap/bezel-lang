@@ -6589,6 +6589,81 @@ static bool importedMemberTypeAdmitsClosureDispatch(
 // `try*Call` arms plus several hand-written `return nullptr; // unit result`
 // exits (`tryLowerConsoleCall`, the serialization void calls, #2967's built-in
 // Dispose chain), and a nineteenth arm added tomorrow participates for free.
+// fix #5436 (§15.3 *Parameter passing* + §35.4, v0.314): mark each argument
+// whose FORMAL is a by-value-move parameter of an owning-classified CHOICE as
+// moved-from.
+//
+// §15.3: "A parameter declared `(x: V)` for an ordinary V is by value (copy);
+// for a move-only V, it is by value-move (transfer ownership). The caller's
+// argument expression is in moved-from state after the call." §35.4: an owning
+// choice is a move-only value type and "parameter passing is by value-move", so
+// the bullet reaches it — and the argument is written UNMARKED ("the argument
+// is written unmarked — `Take(arr)`, not `Take(move arr)`"), which is why there
+// is no `move` for this lowering to key on. The inline-array twin of this rule
+// is handled by `MoveOnlyArrayTransferWalker` (#747/#4677), which collects
+// transferred arrays over the whole body; this is the choice half.
+//
+// WHY THE ARGUMENT'S OWN TYPE IS NOT THE GATE: §15.3 decides the transfer off
+// the FORMAL — the same reason `recordMovesInArgs` asks the bound formal, not
+// the source position (§22.6 overload resolution). A `Bundle`-valued parameter
+// makes its argument a move whether the argument is spelled `b` or is a
+// fresh producer, and a non-choice formal never does. So: resolve the callee,
+// map each argument to its bound formal (§22.5's named arguments included), and
+// ask that formal's type.
+//
+// MEASURED at `r23-c28` (6f341713) on
+// `var b := Bundle.Ready(new Resource("b")); var d := Host.Pass(b);`:
+// `moved` / `dispose b` / then SIGSEGV, and `AddressSanitizer:
+// heap-use-after-free ... READ of size 8` under `--sanitize=address`.
+void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call) {
+    if (!call.callee) return;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+    if (!ms || ms->params.empty()) return;
+    for (std::size_t i = 0; i < call.args.size(); ++i) {
+        const ast::CallArgument& a = call.args[i];
+        if (!a.value) continue;
+        // §22.3: `ref` / `out` alias the caller's location rather than taking
+        // ownership, so the source keeps its value and must not be marked.
+        // A `scoped` formal lends too. Only a by-value-move formal — `""` or
+        // the (admitted-but-redundant, §15.3) `owned` spelling — transfers.
+        std::size_t pi = 0;
+        if (a.name.empty()) {
+            pi = i;  // positional: positionals precede named args (§22.5)
+        } else {
+            pi = ms->params.size();  // sentinel: no formal of that name
+            for (std::size_t j = 0; j < ms->params.size(); ++j)
+                if (ms->params[j] && ms->params[j]->name == a.name) { pi = j; break; }
+            if (pi >= ms->params.size()) continue;
+        }
+        if (pi >= ms->params.size()) continue;
+        const sema::ParameterSymbol* ps =
+            dynamic_cast<const sema::ParameterSymbol*>(ms->params[pi]);
+        if (!ps) continue;
+        if (ps->modifier == "ref" || ps->modifier == "out" ||
+            ps->modifier == "out owned" || ps->modifier == "scoped")
+            continue;
+        const sema::TypeRef* pt = ps->resolvedDeclType;
+        if (!pt && ps->declType) pt = ctx_.resolvedType(*ps->declType);
+        if (!pt) continue;
+        // SEAM-ACCESSOR: symbol-side `resolvedDeclType` is read first, the AST
+        // cast is the local-path fallback when it was not populated — the same
+        // two-step `refFormalWriteVerdict` uses for an imported callee.
+        pt = resolveTypeParamRef(pt);
+        if (!pt || pt->kind != sema::TypeRef::Kind::Named || !pt->declaration)
+            continue;
+        if (pt->declaration->kind != ast::TypeDeclKind::Choice) continue;
+        // §3.6 rule 2 + §35.4: classification is per-instantiation, so a
+        // VALUE-LIKE or borrow-bearing choice never reaches the mark.
+        auto verdict = common::classifyChoiceType(pt, ctx_);
+        if (!verdict || *verdict != common::ChoiceClassification::Owning) continue;
+        // The argument must be a bare identifier naming a plain local — the
+        // same source shape the local-to-local mark takes. A `b.f`, `b[i]` or
+        // `b.M()` borrows, and a fresh producer owns nothing to give up;
+        // `markOwningChoiceMovedFromCore` declines both.
+        markOwningChoiceArgMovedFrom(a.value.get());
+    }
+}
+
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     const IrFootprint before = irFootprint();
     // fix #5009: scoped call-site location for emitInlineGenericMethod's
@@ -6601,6 +6676,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         ~CallSiteLocScope() { slot = saved; }
     } callSiteLocScope(callSiteLoc_, call.span.begin);
     llvm::Value* v = lowerCallDispatch(call);
+    // fix #5436 (§15.3 *Parameter passing*, v0.314): emitted AFTER
+    // `lowerCallDispatch`, so the value the call read out of each argument slot
+    // is already in the callee's frame — the same ordering #4566's two sites
+    // use ("Emitted AFTER the store, so the value the store read out of the
+    // source slot is already in the target's"). Before the dispatch the
+    // zero-store would hand the callee a zeroed choice instead of the value.
+    markMoveOnlyChoiceArgsMovedFrom(call);
     // fix #3421 (§4.7, v0.283): a void-typed result IS "no value" — LLVM `void`
     // has no size and no alignment, so nothing can be done with the `CallInst`
     // except discard it. Normalising it HERE, before the classification below,
