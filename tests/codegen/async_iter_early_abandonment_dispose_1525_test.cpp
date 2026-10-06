@@ -121,6 +121,17 @@ BEZEL_TEST(async_iter_early_abandonment_dispose_1525,
 // iterator identically to `break` — same synchronous-fallback disposal — AND
 // the original exception is NOT lost/swallowed by the disposal (the outer
 // catch still observes it).
+//
+// The `return` after the `await for` is the loop's normal-exit path, reached
+// only if the `throw` never fires. Its value is a sentinel, and it has to be
+// representable: the OS exit-status mechanism is 8 bits, so §33.3's "the
+// returned value becomes the process exit code" silently truncates anything
+// above 255, and the compiler now rejects a literal `Main(): int` return past
+// that bound at the return site ("Main(): int return value 999 exceeds the 8-bit
+// process exit-code range (0-255); the OS truncates this to 231 (§33.3)").
+// `99` keeps the sentinel distinct from every value the reachable paths can
+// produce (0, 100, 101), so a stray fall-through still fails the row rather
+// than passing as success.
 BEZEL_TEST(async_iter_early_abandonment_dispose_1525,
            exception_from_loop_body_disposes_and_preserves_the_exception) {
     auto r = runAotChecked(
@@ -136,7 +147,7 @@ BEZEL_TEST(async_iter_early_abandonment_dispose_1525,
         "        sum := sum + x; "
         "        if x = 1 then throw new Boom(); end; "
         "      end; "
-        "      return 999; "  // unreachable
+        "      return 99; "  // unreachable; must be an 8-bit-representable sentinel
         "    catch var ex: Boom => do "
         "      if sum <> 1 then return 100; end; "
         "      if AsyncRes.disposed <> 1 then return 101; end; "
