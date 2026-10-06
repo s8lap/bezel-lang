@@ -109,6 +109,13 @@ BEZEL_TEST(move_field_enclosing_type_param_receiver_2014,
 // §14 / §28.8.1: same shape but U = a CLASS type (reference). The `first: T` field
 // lowers to a pointer either way, but the enclosing-type-param substitution path is
 // the same; pins that the fix is not primitive-specific. Disposed exactly once.
+//
+// The call site is `C.Run<Payload>(p!)` — `Run<U>(u: U)` declares `u` PLAIN, not
+// `owned`, so §22.3 (v0.314, #5388) admits no `move` call-site marker there and
+// rejects the marked form ("the `move` call-site marker is only valid on an argument
+// to an `owned` parameter"). The marker was dropped; the row's subject — the
+// specialized-layout field GEP through an enclosing-type-param receiver — is
+// untouched by that spelling.
 BEZEL_TEST(move_field_enclosing_type_param_receiver_2014,
            value_field_before_owned_class_arg_disposes_once_spec_14) {
     std::string src =
@@ -128,7 +135,7 @@ BEZEL_TEST(move_field_enclosing_type_param_receiver_2014,
         "  end Run; "
         "  public static method Main(): int "
         "    var p: Payload? := new Payload(); "
-        "    C.Run<Payload>(move p!); "
+        "    C.Run<Payload>(p!); "
         "    return Cell.live; "
         "  end Main; "
         "end C;";
