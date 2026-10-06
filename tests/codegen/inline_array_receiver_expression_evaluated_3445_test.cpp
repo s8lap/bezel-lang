@@ -75,8 +75,11 @@
 // would see it.
 
 #include <string>
+#include <cstdlib>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
+#include "support/force_sanitize.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -117,7 +120,11 @@ constexpr const char* kDecls =
     "    c.N := c.N + 1; "
     "    var a: [2]int := [1, 2]; "
     "    return a; "
-    "  end Bump; ";
+    "  end Bump; "
+    "  public static method MakeOwned(): [2 owned]R "
+    "    var a: [2 owned]R := [new R(1), new R(2)]; "
+    "    return a; "
+    "  end MakeOwned; ";
 
 std::string prog(const std::string& body) {
     return std::string(kDecls) +
@@ -281,4 +288,42 @@ BEZEL_TEST(codegen_inline_array_receiver_expression_evaluated_3445,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("[2 owned]R\n1\n2\n"));
+}
+
+// ── T10 — fix #3465 (§28.2 / §28.3 / §15.3, v0.283): an OWNING-INLINE-ARRAY
+// temporary used as a call receiver is never disposed.
+// T9 (above) is the CONTROL: a LOCAL receiver is disposed correctly at scope end.
+// This row uses a CALL receiver (C.MakeOwned().GetHashCode()) and verifies no
+// leak under ASan/LSan with strict leak detection. Loop-amplified 200x per the
+// vacuous-oracle rule (a one-shot row can pass on both sides while the allocation
+// is still stack-reachable at exit).
+BEZEL_TEST(codegen_inline_array_receiver_expression_evaluated_3445,
+           owned_inline_array_call_receiver_no_leak_spec_28_2_28_3_15_3) {
+    // Save/restore BEZEL_AOT_DETECT_LEAKS around the row (mirrors aot_leak_detection_4638_test.cpp).
+    const char* prev = std::getenv("BEZEL_AOT_DETECT_LEAKS");
+    std::string prevStr = prev ? prev : "";
+    bool hadPrev = !prevStr.empty();
+    if (hadPrev) ::setenv("BEZEL_AOT_DETECT_LEAKS", prevStr.c_str(), 1);
+    else ::unsetenv("BEZEL_AOT_DETECT_LEAKS");
+    ::setenv("BEZEL_AOT_DETECT_LEAKS", "strict", 1);
+
+    bezel::test::aot_detail::LeakExpectation exp;
+    bezel::codegen::CodegenOptions opts{};
+    opts.sanitizeAddress = true;
+    auto r = runAot(prog(
+        "    var i: int := 0; "
+        "    while i < 200 do "
+        "      Console.WriteLine(C.MakeOwned().GetHashCode().ToString()); "
+        "      i := i + 1; "
+        "    end while; "), opts);
+
+    if (hadPrev) ::setenv("BEZEL_AOT_DETECT_LEAKS", prevStr.c_str(), 1);
+    else ::unsetenv("BEZEL_AOT_DETECT_LEAKS");
+
+    // With strict leak detection, the row fails if any leak is detected.
+    // exp.count == 0 means no leak was detected.
+    if (bezel::test::diagnosticMessageContains(r, "SKIP")) return;
+    BEZEL_EXPECT_EQ(exp.count, std::size_t{0});
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

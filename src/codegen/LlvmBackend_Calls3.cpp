@@ -7278,6 +7278,18 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         builder_.CreateStore(v, tmp);
         arrAddr = tmp;
         arrSlotTy = at;
+        // fix #3465 / §28.2 / §28.3 / §15.3 (v0.283): when the receiver is an
+        // owning inline array, the spilled temporary holds owned class elements
+        // that must be disposed at scope end. Register the disposal here — the
+        // normal path (lowerCall's disposeFreshNewReceiverTemp) is bypassed
+        // because tryLowerInlineArrayCall returns early for ToString/ToArray/
+        // Contains/Equals/GetHashCode without reaching emitMethodCall.
+        if (recvTy->arrayOwned && !disposeStack_.empty()) {
+            Disposal d{tmp, nullptr};
+            d.inlineOwnedArray = true;
+            d.inlineSlotCount = static_cast<unsigned>(N);
+            disposeStack_.back().push_back(d);
+        }
     }
     auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(arrSlotTy);
     if (!arrTy) return nullptr;
