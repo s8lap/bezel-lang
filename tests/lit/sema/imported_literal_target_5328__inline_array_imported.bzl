@@ -1,38 +1,34 @@
 // RUN: %bezelc -c -o %t.lib.o %S/imported_literal_target_5328__lib.bzl
-// RUN: %not %bezelc -c %s --import %t.lib.o 2>&1 | FileCheck %s
+// RUN: %bezelc -c %s --import %t.lib.o
+// RUN: %bezelc -c %s --import %t.lib.o 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 //
-// Issue #5328 / spec §15.4 (v0.313) — CONTROL ROW: an INLINE-ARRAY `[3]int`
+// Issue #5328 / spec §15.4 (v0.313) — FIX ROW: an INLINE-ARRAY `[3]int`
 // formal, imported, with a matching 3-element literal.
 //
 // §15.4's first bullet on the closed target list is "Inline arrays `[N]T`,
 // `[N]T?`, `[N owned]T`, `[N owned]T?` (the literal must have exactly N
 // elements)", and the section's own worked example is `ProcessBuffer([1, 2,
 // 3]); // type from parameter`. An inline-array formal is a first-class
-// §15.4 target, so sema MUST NOT reject `Inl([1, 2, 3])` at `Inl(a: [3]int)`.
+// §15.4 target, so `Inl([1, 2, 3])` at `Inl(a: [3]int)` MUST compile.
 //
-// This row pins that boundary, and it is the row that caught the over-reach:
-// the first form of this lane's fix extended the local arm's whole #3031
-// `isCollectionLiteralAdmissibleTarget` gate across the module boundary, and
-// that predicate identifies a builtin head through `t->astNode` — null on an
-// imported formal, whose TypeRef carries its name on `importedName` (the
-// #2648 point-1 blind spot this issue's item 4 also names). MEASURED: it
-// false-rejected this very program with "cannot target the type `[3]int`",
-// a §15.4-admitted target. The shipped fix gates on
-// `isCollectionLiteralInterfaceTarget` only, which matches by simple name
-// through `importedName` and is therefore correct across the boundary.
+// Before the fix: codegen's `lowerCallDispatch` imported-argument arm called
+// `materializeCollectionLiteralForArg` which returns null for InlineArray
+// formals (it only handles heap collections), causing the "cannot target the
+// imported parameter type here" false reject. The sema-side fix (e84fc8ad)
+// added the §15.4 interface-target check on the imported channel but did NOT
+// fix this codegen gap.
 //
-// The `%not` + `CHECK` combination is deliberate. This program is STILL
-// rejected — by codegen's `lowerCallDispatch` imported-argument arm, whose
-// message ("cannot target the imported parameter type here") contradicts
-// itself by listing an inline array among the admissible targets. That
-// residual false-reject is issue #5328's item 2 and belongs to the SEPARATE
-// CODEGEN arm (`buildOrderedArgs`' inline-array path is local-only); this
-// lane is the sema side and does not touch it. So the row asserts exactly
-// the sema-side fact and refuses to assert the codegen arm's outcome:
-// the diagnostic still present is the CODEGEN one, and the SEMANTIC
-// "cannot target" rejections are absent. A future codegen lane that admits
-// this correctly will make the `%not` fail, and that is the intended signal
-// to revisit this row — not a silent drift.
+// Fix (item 2): add an InlineArray arm to `lowerCallDispatch`'s imported-
+// argument branch, mirroring `buildOrderedArgs`'s inline-array path
+// (Assign.cpp lines ~14707-14772). An imported formal's TypeRef has
+// kind==InlineArray with a non-null arraySizeValue (the folded extent), so
+// `lowerTypeRef` produces the llvm::ArrayType and the element-by-element
+// materialization proceeds correctly.
+//
+// This row was previously a %not row pinning the false reject. The test
+// comment said "A future codegen lane that admits this correctly will make
+// the `%not` fail, and that is the intended signal to revisit this row".
+// This is that signal — the row now asserts the correct behavior.
 module App5328Inl;
 
 import Lib5328;
@@ -44,10 +40,7 @@ public class Program
   end Main;
 end Program;
 
-// The residual rejection is codegen's, not sema's.
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the imported parameter type here
-// …and sema stayed silent on the inline-array target §15.4 admits.
-// CHECK-NOT: cannot target the interface type
-// CHECK-NOT: cannot target the type
-// CHECK-NOT: cannot target the inline array
-// CHECK-NOT: internal:
+// NODIAG-NOT: error
+// NODIAG-NOT: cannot target
+// NODIAG-NOT: §15.4
+// NODIAG-NOT: internal:

@@ -13206,7 +13206,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     return nullptr;
                 }
                 bool byRef = isByRefMod(a.modifier) || isByRefMod(formalMod);
-                llvm::Value* v;
+                llvm::Value* v = nullptr;
                 if (byRef) {
                     llvm::Type* et = nullptr;
                     v = lvalueAddr(*a.value, et);
@@ -13240,6 +13240,51 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                dynamic_cast<const ast::CollectionLiteralExpr*>(
                                    a.value.get());
                            argLit && formalTy) {
+                    // fix #5328 item 2 / §15.4 / §15.1: an INLINE-ARRAY
+                    // parameter `[N]T` receiving a collection literal
+                    // `[e1, …, eN]`. materializeCollectionLiteralForArg only
+                    // handles heap collections; for an inline array it returns
+                    // null and emits the "cannot target the imported parameter
+                    // type" error — but §15.4 explicitly lists inline arrays as
+                    // admissible targets, so this is a false reject. Mirror the
+                    // inline-array materialization from buildOrderedArgs
+                    // (Assign.cpp lines ~14707-14772).
+                    if (formalTy->kind == sema::TypeRef::Kind::InlineArray &&
+                        !argLit->isDict) {
+                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                lowerTypeRef(formalTy))) {
+                            llvm::AllocaInst* slot = entryAlloca(aty);
+                            builder_.CreateStore(
+                                llvm::ConstantAggregateZero::get(aty), slot);
+                            llvm::Type* elemTy = aty->getElementType();
+                            for (std::size_t k = 0;
+                                 k < argLit->elements.size() &&
+                                 k < aty->getNumElements(); ++k) {
+                                if (!argLit->elements[k]) continue;
+                                llvm::Value* ev =
+                                    lowerExpr(*argLit->elements[k]);
+                                if (!ev) continue;
+                                if (ev->getType() != elemTy &&
+                                    ev->getType()->isIntegerTy() &&
+                                    elemTy->isIntegerTy()) {
+                                    unsigned eb =
+                                        ev->getType()->getIntegerBitWidth();
+                                    unsigned db =
+                                        elemTy->getIntegerBitWidth();
+                                    ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                                 : builder_.CreateTrunc(
+                                                       ev, elemTy);
+                                }
+                                builder_.CreateStore(
+                                    ev, builder_.CreateGEP(aty, slot,
+                                                          {builder_.getInt32(0),
+                                                           builder_.getInt32(
+                                                               static_cast<unsigned>(
+                                                                   k))}));
+                            }
+                            v = builder_.CreateLoad(aty, slot);
+                        }
+                    }
                     // fix #5309 / §15.4, §28.3 *Unbound owned temporaries*
                     // (v0.313): the IMPORTED-callee twin of buildOrderedArgs'
                     // collection-literal arm. `lowerExpr` returns null for a
@@ -13251,7 +13296,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     // dispose the temp per the parameter's mode: an `owned`
                     // formal takes ownership; a borrow formal borrows it, so
                     // the temp is disposed once at scope exit.
-                    v = materializeCollectionLiteralForArg(argLit, formalTy);
+                    if (!v)
+                        v = materializeCollectionLiteralForArg(argLit, formalTy);
                     if (v) {
                         llvm::AllocaInst* litSlot = entryAlloca(v->getType());
                         builder_.CreateStore(v, litSlot);
