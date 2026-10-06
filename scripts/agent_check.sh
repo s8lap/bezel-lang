@@ -333,6 +333,17 @@ if [ "${1:-}" = "--select" ]; then
   exit 0
 fi
 
+# Per-invocation timeout for gtest binary runs (#5450). A full-area codegen
+# binary (~17,800 tests) can run 70+ minutes wall when genuinely wedged (the
+# process stays alive holding a lane slot indefinitely). Four lanes were killed
+# by a 600s external timeout and all reported tests passing — confirming that a
+# timeout must be set ABOVE the 10-minute mark to avoid false-killing a
+# contended-but-valid run. 3600s (1 hour) is comfortably above that while still
+# catching a genuine hang.
+# Exposed as an env var so lanes can override it (e.g. BEZEL_GTEST_TIMEOUT=600
+# for a quick probe). The probe path (--probe) has its own separate 20s limit.
+: "${BEZEL_GTEST_TIMEOUT:=3600}"
+
 # --- targeted test run (the default) ------------------------------------------
 # --no-lit and --area were already consumed above (composing in either
 # order); anything left here must be either a real gtest filter or a mistake.
@@ -408,9 +419,18 @@ for f in "$@"; do
     [ -n "$bin" ] || continue
     echo "-- $(basename "$bin"): $want matching test(s) --"
     blog="$SCRATCH/test_${f//[^A-Za-z0-9_.]/_}.$(basename "$bin").log"
-    # dev_heavy suite runs in the shared slice; env is passed explicitly.
-    "$DH" suite env BEZEL_TEST_FILTER="$f" "$bin" 2>&1 | tee "$blog"
-    [ "${PIPESTATUS[0]}" -ne 0 ] && f_rc=1
+    # timeout wraps env so timeout(1) is the direct child of systemd-run and can
+    # monitor + signal the whole process tree (env forks the actual binary).
+    # Exit 124 = timeout fired; the n<want check below also catches this case
+    # but the explicit 124 check gives a clearer message (#5450).
+    "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env BEZEL_TEST_FILTER="$f" "$bin" 2>&1 | tee "$blog"
+    rc=${PIPESTATUS[0]}
+    if [ "$rc" -eq 124 ]; then
+      echo "agent_check: $(basename "$bin") timed out after ${BEZEL_GTEST_TIMEOUT}s (exit 124) — likely a hang; see $blog"
+      f_rc=1
+    elif [ "$rc" -ne 0 ]; then
+      f_rc=1
+    fi
     cat "$blog" >> "$log"
     summ="$(grep -a -oE '[0-9]+ passed, [0-9]+ failed' "$blog" | tail -1)"
     n="$(printf '%s' "$summ" | awk '{print $1 + $3}')"   # passed + failed
