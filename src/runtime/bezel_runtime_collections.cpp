@@ -3436,7 +3436,11 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
                 int64_t kl = s->len;
                 int8_t  kw = s->width;
                 if (bz_dict_contains_str(dict, kd, kl, kw)) {
-                    // Duplicate: allocate and throw ArgumentException.
+                    // fix #4693 / #5421: the partially-built dict must be freed
+                    // before throwing. The assignment to `d` never completes (the
+                    // pending-check branches to catch before the result is stored),
+                    // so the dict is unreachable once we return.
+                    bz_dict_free(dict, nullptr);
                     if (arg_exc_vtable) {
                         void* exc = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
                         if (exc) {
@@ -3453,7 +3457,9 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
         } else {
             memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
             if (bz_dict_contains_gen(dict, key_buf)) {
-                // Duplicate: allocate and throw ArgumentException.
+                // fix #4693 / #5421: the partially-built dict must be freed
+                // before throwing. Same rationale as the string-key path above.
+                bz_dict_free(dict, nullptr);
                 if (arg_exc_vtable) {
                     void* exc = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
                     if (exc) {
