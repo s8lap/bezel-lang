@@ -2853,13 +2853,18 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         bool valInline = hasValueSel || (valTy && !valTy->isStructTy());
         auto* toDict = declareC("bz_lazy_to_dict", ptrTy(),
             {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), i64(),
-             ptrTy(), ptrTy(), i64()});
+             ptrTy(), ptrTy(), i64(), ptrTy()});
+        auto argExcVit = builtinVtable_.find("ArgumentException");
+        llvm::Value* argExcVtable = argExcVit != builtinVtable_.end()
+            ? (llvm::Value*)argExcVit->second
+            : (llvm::Value*)llvm::ConstantPointerNull::get(ptrTy());
         llvm::Value* result = builder_.CreateCall(toDict,
             {lazy, builder_.getInt64(valEsz), builder_.getInt64(keyEsz),
              keyTramp, keyClosure, hashTrampV, eqTrampV,
              builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure,
-             builder_.getInt64(keyIsString ? 1 : 0)},
+             builder_.getInt64(keyIsString ? 1 : 0), argExcVtable},
             "linq.todict");
+        emitPendingCheck();
         // #2263 / stdlib §5 / §4.12 / #2151: when the value type is `string`
         // (single-selector `ToDictionary(key)` over an `Array<string>` /
         // `string.Split(...)` source — `hasValueSel` false, `valInline` true),

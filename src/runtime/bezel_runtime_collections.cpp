@@ -3384,11 +3384,19 @@ extern "C" void* bz_lazy_to_set_arraybacked(void* lazy, int64_t esz, void* eqfn)
 // string mode — bz_dict_alloc()'s string path hashes/compares by content
 // itself, like any other Dictionary<string,V>).
 // The element T bytes are copied into a fresh heap block and stored as the value.
+// fix #4693 / stdlib §5 (v0.303): ToDictionary raises ArgumentException on
+// duplicate key. Before inserting each key-value pair, probe the dict for the
+// key using bz_dict_contains_str / bz_dict_contains_gen. If the key is present,
+// allocate an ArgumentException object (using the arg_exc_vtable passed from
+// codegen) and store it in bz_exc so emitPendingCheck() in the generated code
+// branches to the catch handler. The lazy enumerator is disposed and NULL is
+// returned so the generated code's assign-to-dest-dict slot is not written.
 extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
                                  void* keyfn, void* closure,
                                  void* hashfn, void* eqfn, int64_t val_inline,
                                  void* valfn, void* valclosure,
-                                 int64_t key_is_string) {
+                                 int64_t key_is_string,
+                                 void* arg_exc_vtable) {
     auto* e = (bz_lazy_t*)lazy;
     // The dict is keyed by TKey (key_esz bytes) in generic mode, or by string
     // content in string mode. #738: the VALUE must use the same generic-dict
@@ -3420,6 +3428,43 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
         // bz_string*; for a scalar TKey it is the (possibly sign-extended)
         // scalar key value.
         int64_t k = ((kfn_t)keyfn)(closure, elem);
+        // fix #4693 / stdlib §5: check for duplicate key BEFORE insertion.
+        if (key_is_string) {
+            auto* s = (bz_string_struct*)(intptr_t)k;
+            if (s) {
+                const char* kd = (const char*)s->data;
+                int64_t kl = s->len;
+                int8_t  kw = s->width;
+                if (bz_dict_contains_str(dict, kd, kl, kw)) {
+                    // Duplicate: allocate and throw ArgumentException.
+                    if (arg_exc_vtable) {
+                        void* exc = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+                        if (exc) {
+                            *(void**)exc = arg_exc_vtable;
+                            bz_exc = exc;  // emitPendingCheck() branches to catch
+                        }
+                    }
+                    bz_lazy_dispose(e);
+                    return nullptr;
+                }
+                // Not a duplicate: pack key bytes for the set call below.
+                memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
+            }
+        } else {
+            memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
+            if (bz_dict_contains_gen(dict, key_buf)) {
+                // Duplicate: allocate and throw ArgumentException.
+                if (arg_exc_vtable) {
+                    void* exc = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+                    if (exc) {
+                        *(void**)exc = arg_exc_vtable;
+                        bz_exc = exc;  // emitPendingCheck() branches to catch
+                    }
+                }
+                bz_lazy_dispose(e);
+                return nullptr;
+            }
+        }
         void* val;
         if (valfn) {
             // Two-selector ToDictionary(key, value): apply the value selector to
@@ -3446,7 +3491,6 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
             int8_t  kw = s ? s->width : (int8_t)1;   // fix #4499
             bz_dict_set_str(dict, kd, kl, kw, val);
         } else {
-            memcpy(key_buf, &k, (size_t)(key_esz < 8 ? key_esz : 8));
             bz_dict_set_gen(dict, key_buf, val);
         }
     }
