@@ -1903,6 +1903,27 @@ private:
         // exactly like the `cls`-set path but without needing a TypeSymbol in
         // disposerFns_. `cls` is null for these.
         bool dynamicDispose = false;
+        // fix #5437 (§28.9 / §28.2 / §8.1, v0.314): a holder of a `new Object()`
+        // instance — a trivial-dispose class (§28.9's definition: no destructor,
+        // no `owned` fields, no owning-inline-array fields, trivial-dispose base
+        // — `Object` has no base at all), so §28.9's "the compiler frees the
+        // undischarged value at its owner's release point" applies to its
+        // instances exactly as to any other trivial-dispose class. The INSTANCE
+        // is reclaimed; the vtable Dispose slot stays the shared no-op (§8.7 /
+        // §28.2: "`Dispose()` is not on `Object`"), so `builtinDisposeFn_` is
+        // NOT widened — a §8.6 box keeps its own runtime-managed release rule.
+        //
+        // NOT `dynamicDispose`: that arm emits `emitDisposeAndReclaim`, whose
+        // `emitDynamicDispose` reads word 0 as a vtable and calls slot 2 —
+        // correct for an `Object` (the no-op), but it also reclaims
+        // UNCONDITIONALLY, and an `Object`-typed slot may hold a §8.6 BOX
+        // instead (MEASURED: `var o: Object := 42;` allocates a 24-byte box, and
+        // `o = <box>` stores one into the slot). This arm therefore guards the
+        // reclaim on the value's RUNTIME vtable identity (§5.1 makes `Object` the
+        // universal reference type, so the STATIC type cannot discriminate), so a
+        // box in the slot is left to its own rule and only a real `Object`
+        // instance is freed.
+        bool objectReclaim = false;
         // #383 / §31.1: the in-flight exception object caught by a catch arm.
         // Freed (via the object's vtable — destructor + base chain + free) on a
         // NORMAL handled exit of the arm (fall-through, return, break,

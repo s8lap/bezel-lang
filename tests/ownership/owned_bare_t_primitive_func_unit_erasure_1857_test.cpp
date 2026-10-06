@@ -148,29 +148,35 @@ BEZEL_TEST(owned_bare_t_primitive_func_unit_erasure_1857,
 // surfaced as ASan/LSan-detected misbehavior (run=false) on a stricter
 // runtime; with the fix the erased result carries no obligation.
 //
-// ── KNOWN BLOCKER (#5437) — this row is RED for a reason UNRELATED to #1857 ──
+// ── RESOLVED (#5437) — green as written; no assertion was touched ──
 //
 // MEASURED with `--sanitize=address` on generated code: every `new Object()`
-// leaks its 8-byte instance, in EVERY context — a plain `var x: Object := new
+// leaked its 8-byte instance, in EVERY context — a plain `var x: Object := new
 // Object();`, a `using var`, and this generic row alike. The discriminator:
-// `using var a := new Empty(); using var b := new Object();` leaks EXACTLY ONE
-// 8-byte object for two allocations (the equally-trivial-dispose user class is
-// freed, `Object` is not), and the identical `Factory<Object>` whose `Make()`
-// returns `default(T)` — no allocation — is clean at exit 0. So the leak tracks
-// the `new Object()` allocation itself, NOT the `owned`-marker erasure this row
-// and its three siblings are about, and NOT the generic substitution.
+// `using var a := new Empty(); using var b := new Object();` leaked EXACTLY ONE
+// 8-byte object for two allocations (the equally-trivial-dispose user class was
+// freed, `Object` was not), and the identical `Factory<Object>` whose `Make()`
+// returns `default(T)` — no allocation — was clean at exit 0. So the leak
+// tracked the `new Object()` allocation itself, NOT the `owned`-marker erasure
+// this row and its three siblings are about, and NOT the generic substitution.
 //
-// The oracle here (`r.ran` / exitCode 0) cannot distinguish "the erasure is
+// The oracle here (`r.ran` / exitCode 0) could not distinguish "the erasure is
 // correct" from "`Object` leaks", because both present as an LSan report. The
 // erasure limb of this row IS covered independently and passes: the
 // `parseAndCheckOwnership` sibling
 // `object_substitution_erased_no_auto_drop` (row 1) asserts the same predicate
 // on the same substituted type, and the function/unit runtime siblings use
-// `default(T)` and pass. #5437 carries the reclaim fix and the non-generic
+// `default(T)` and pass. #5437 carried the reclaim fix and the non-generic
 // regression pin.
 //
-// Deliberately NOT weakened to go green: no assertion is touched, no
-// DISABLED_, nothing deleted. The row goes green when #5437 lands.
+// #5437 landed the fix (a `new Object()` instance's reclaim, guarded by a
+// RUNTIME vtable-identity test so §8.6 boxes keep their own release rule) and
+// the non-generic pin in `object_instance_reclaimed_5437_test.cpp`, which
+// carries the `new Empty()` control above as its own row. This row then went
+// green with no edit to any assertion — not `r.ran`, not `exitCode`, not the
+// "done" lookup, no `DISABLED_`, nothing deleted. Its LSan report before the
+// fix named the site directly: `Direct leak of 8 byte(s) … #1 Factory$Make$spec`
+// — the `new Object()` inside `Make`, exactly as the diagnosis predicted.
 // ===========================================================================
 BEZEL_TEST(owned_bare_t_primitive_func_unit_erasure_1857,
            object_substitution_runs_clean) {

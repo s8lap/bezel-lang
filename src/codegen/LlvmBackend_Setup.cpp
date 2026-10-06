@@ -22329,6 +22329,67 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         }
     }
 
+    // fix #5437 (§28.9 / §28.2 / §8.1 / §8.7, v0.314): a holder of a
+    // `new Object()` INSTANCE. `Object` is a trivial-dispose class — §8.1
+    // declares no destructor and no fields, §3.4 makes it a class, and §28.9's
+    // trivial-dispose definition ("no destructor, no `owned` fields of
+    // non-trivial-dispose type, no owning-inline-array fields, trivial-dispose
+    // base") is met clause by clause (it has no base at all). §28.9 then says
+    // the compiler "inserts a free … at that holder's release point", and
+    // stdlib §1 says the same. Nothing exempts `Object`: §28.9's
+    // runtime-managed list is exactly `string`, `Type`, boxed value types, and
+    // function values (§22.8 separately bars an `owned` `Type` FIELD, and
+    // `Type` tokens are interned per type, which is a different case from a
+    // user allocation of an ordinary class).
+    //
+    // WHY NO ARM CLAIMED IT. `Object` is a `sema::PrimitiveType`
+    // (TypeResolution.cpp maps the name to `PrimitiveType::Object`), so EVERY
+    // arm above missed it for the same reason: `classOfLocal` returns a symbol
+    // only for `Kind::Named`, `usingVarOwnsClassObjectDynamically`'s
+    // `isClassOrInterfaceRef` requires `rt->declaration` on a Named, and
+    // `usingVarBuiltinHeadName`/`builtinTypeName` answer only for Named. The
+    // #2992 end-of-chain guard below did not fire either — its predicate is
+    // `common::isVtableLessBuiltinClassName`, and `Object` is neither
+    // vtable-less (it carries `bvt$Object`) nor a named head. So the holder
+    // registered NOTHING and the instance was freed by nobody: MEASURED 8 bytes
+    // per allocation, in every spelling (plain `var`, `using var`, typed or
+    // inferred), against a `new Empty()` control that was freed correctly — an
+    // equally trivial-dispose USER class, which is what makes the gap specific
+    // to `Object` rather than to trivial-dispose.
+    //
+    // WHY A NEW Disposal FLAG, NOT `dynamicDispose`. The `dynamicDispose` arm
+    // emits `emitDisposeAndReclaim`, which reclaims UNCONDITIONALLY. An
+    // `Object`-typed slot does not necessarily hold an `Object` instance: §5.1
+    // makes `any type to Object` an implicit reference conversion, value types
+    // by BOXING (§8.6), and MEASURED `var o: Object := 42;` allocates a 24-byte
+    // box — as does a later `o = 42;` into an `Object`-typed slot. Boxes are
+    // runtime-managed (§28.9) and are reclaimed by their own rule; freeing one
+    // here would be a soundness regression, strictly worse than the leak. So
+    // `objectReclaim` reclaims under a RUNTIME vtable-identity test instead —
+    // see the arm in emitDisposals for why the test is runtime rather than
+    // static.
+    //
+    // Placement: after every arm above, so each of those keeps its shape. It
+    // cannot double-register with them — each arm returns, and this one is
+    // reached only when all of them declined.
+    {
+        // Read the EFFECTIVE type: the declared type, else the initializer's.
+        // `using var o := new Object()` declares no type and infers `Object`,
+        // and an inferred local must reach the same release point as a typed
+        // one — the two spellings differ by the annotation alone.
+        const sema::TypeRef* objTy = nullptr;
+        if (ld->type) objTy = ctx_.resolvedType(*ld->type);
+        if (!objTy && ld->initializer)
+            objTy = ctx_.exprType(*ld->initializer);
+        if (objTy && objTy->kind == sema::TypeRef::Kind::Primitive &&
+            objTy->primitive == sema::PrimitiveType::Object) {
+            Disposal d{it->second, nullptr};
+            d.objectReclaim = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
+
     // fix #2992 (§28.3 / §28.9, v0.240): END-OF-CHAIN GUARD. Every arm above
     // tried and none claimed this `using var` local. If the local's type is a
     // built-in CLASS that owns heap (a vtable-less builtin that is NOT a value

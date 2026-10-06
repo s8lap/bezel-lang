@@ -9187,6 +9187,84 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
+        if (it->objectReclaim) {
+            // fix #5437 (§28.9 / §28.2 / §8.1, v0.314). `Object` is a
+            // trivial-dispose CLASS (§8.1 declares no destructor and no fields),
+            // so §28.9's rule — "the compiler frees the undischarged value at
+            // its owner's release point" — applies to `new Object()` instances.
+            // What was missing is the RECLAIM: `Object`'s vtable Dispose slot
+            // holds the shared no-op `bz$exDispose` (correct — §8.7 / §28.2 put
+            // no `Dispose()` on `Object`), so the instance never reached
+            // `emitReclaimBlock` and its 8 bytes leaked at every holder.
+            //
+            // The guard is the crux, and it is a RUNTIME test on purpose. §5.1
+            // makes `Object` the universal reference type ("any type to
+            // `Object` … value types … by boxing (§8.6)"), so an `Object`-typed
+            // slot can hold a §8.6 BOX as well as an `Object` instance —
+            // MEASURED: `var o: Object := 42;` allocates a 24-byte box, and
+            // `o = <box>` stores one into an `Object` slot. Boxes are
+            // runtime-managed (§28.9) and are reclaimed by their OWN rule; a
+            // static type test cannot tell the two apart, and freeing a box here
+            // would be a soundness regression, not a leak fix. So: reclaim iff
+            // word 0 is the `Object` vtable this module built.
+            //
+            // The vtable comparison is exact rather than "not a box" for two
+            // reasons. (1) It fails SAFE in the direction that matters: an
+            // unrecognized value is left alone, i.e. a bounded leak, never a
+            // free of memory the runtime still owns. (2) It keeps §8.6 boxes,
+            // and any other vtable-bearing value an `Object` slot can hold, on
+            // their own release rules — this arm changes the `Object`
+            // instance's fate ONLY.
+            //
+            // The disposition itself is `emitReclaimBlock` alone, not
+            // `emitDisposeAndReclaim`: §8.1 gives `Object` no destructor and no
+            // owned fields, so there is no logical-disposal step to run, and
+            // calling the vtable's slot 2 would re-enter the very shared no-op
+            // this fix deliberately does not touch.
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto objVtable = builtinVtable_.find("Object");
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "obj.reclaim",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "obj.reclaim.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, dispBB);
+            builder_.SetInsertPoint(dispBB);
+            if (objVtable != builtinVtable_.end()) {
+                // Word 0 of the object is its vtable pointer. Compare it against
+                // the `Object` vtable by ADDRESS: the vtable is a module-local
+                // constant array (`bvt$Object`, InternalLinkage), so the address
+                // identity is the type identity, exactly as `emitIsA`'s vtable
+                // dispatch and `bz_exc_reclaim_causechain`'s vtable-table gate
+                // already rely on.
+                llvm::Value* word0 = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateBitCast(
+                        obj, llvm::PointerType::get(ptrTy(), 0)));
+                llvm::Value* isObj = builder_.CreateICmpEQ(
+                    word0, llvm::cast<llvm::Constant>(objVtable->second));
+                auto* reclaimBB = llvm::BasicBlock::Create(
+                    llvm_, "obj.reclaim.free", currentFn_);
+                auto* skipBB = llvm::BasicBlock::Create(
+                    llvm_, "obj.reclaim.skip", currentFn_);
+                builder_.CreateCondBr(isObj, reclaimBB, skipBB);
+                builder_.SetInsertPoint(reclaimBB);
+                emitReclaimBlock(obj);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(skipBB);
+                builder_.CreateBr(contBB);
+            } else {
+                // No `Object` vtable in this module means nothing in it ever
+                // allocated one, so the slot cannot hold an instance; skip the
+                // reclaim rather than guess.
+                builder_.CreateBr(contBB);
+            }
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         if (disposerFns_.find(it->cls) == disposerFns_.end()) continue;
         // CG18 / §28.2: dispatch Dispose dynamically through the object's vtable
         // (idempotent) and reclaim the block once, so a `using var` bound to a

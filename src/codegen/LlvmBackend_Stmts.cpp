@@ -389,6 +389,58 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 disposeStack_.back().push_back(d);
             }
         }
+        // fix #5437 (§28.9 / §28.2 / §28.1 / §8.1, v0.314): a plain `var` that
+        // RECEIVES an `owned` transfer whose substituted type is `Object`.
+        //
+        // This is the shape the #1857 row pins — `class Factory<T> method
+        // Make(): owned T` instantiated at `T = Object`, whose body allocates
+        // `var x: Object := new Object(); return x;`. The `owned` marker ERSES
+        // at the substitution (§28.1: `owned` is inadmissible over a primitive,
+        // and §28.2's "`Dispose()` is not on `Object`" leaves the instance with
+        // no user-visible obligation), so no earlier arm claims the receiver:
+        // `autoDropAtScopeEnd` is false, so the branch above never runs, and the
+        // instance escapes with nobody to free it (MEASURED: 8 bytes per call).
+        //
+        // It is still an OWNED TRANSFER, and §28.9's trivial-dispose free rides
+        // on the INSTANCE, not on the marker: K1.6 spells the two apart —
+        // "any undischarged trivial-dispose value is freed silently by the
+        // compiler at its owner's release point — no warning (the ceremony
+        // exemption), no user code". So the receiver frees it SILENTLY, which
+        // is why no §28.3 auto-drop WARNING is warranted or emitted (the #1857
+        // row `object_substitution_erased_no_auto_drop` asserts its absence, and
+        // that assertion is unchanged by this).
+        //
+        // GATED ON AN `owned`-RETURNING CALL, which is the whole discriminator:
+        // §28.10 gives a BORROW return no disposal obligation, and freeing a
+        // borrowed `Object` here would be a use-after-free, not a leak fix.
+        // MEASURED both twins: `method Make(): owned T` at `T = Object` needs
+        // this arm, while `method Make(): Object` (same body, marker dropped)
+        // must NOT take it — that program compiles today and borrows.
+        //
+        // A bare-identifier initializer (`var c: Object := a;`) is deliberately
+        // NOT covered: it is an ALIAS, and the source local is the owner
+        // (it carries the auto-drop). Registering both would double-free.
+        else if (const auto* ce =
+                     dynamic_cast<const ast::CallExpr*>(
+                         ld->initializer.get())) {
+            const sema::TypeRef* rt = ctx_.exprType(*ld->initializer);
+            const sema::TypeRef* dty = ld->type ? ctx_.resolvedType(*ld->type)
+                                                 : nullptr;
+            const sema::TypeRef* eff = dty ? dty : rt;
+            bool ownedObjectTransfer = false;
+            if (eff && eff->kind == sema::TypeRef::Kind::Primitive &&
+                eff->primitive == sema::PrimitiveType::Object && ce->callee) {
+                if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(
+                        ctx_.exprSymbol(*ce->callee))) {
+                    ownedObjectTransfer = sema::methodReturnsOwned(*ms, ctx_);
+                }
+            }
+            if (ownedObjectTransfer) {
+                registerUsingDisposal(ld);
+                return false;
+            }
+            registerUnwindOwnedLocal(ld);
+        }
         // §28.3: a plain `var` owned local NOT flagged for auto-drop (it is
         // discharged on some path) is auto-disposed only on the exception-
         // unwind path (an `unwindOnly` Disposal); its normal-exit discharge is
