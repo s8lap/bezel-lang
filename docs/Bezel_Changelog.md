@@ -37,7 +37,7 @@ The entries in this section were reconstructed in 2026-10 from archived snapshot
 <a id="sec-v0-5-to-v0-7-changelog"></a>
 ### v0.5 to v0.7 changelog (reconstructed)
 
-- Gap note: no v0.6 snapshot survives, so the changes below cannot be attributed to v0.6 or v0.7 individually.
+- Gap note: no v0.6 snapshot survives, so the changes below cannot be attributed to v0.6 or v0.7 individually. A design discussion from the time (a secondary source, not a spec snapshot) proposed interfaces as the v0.6 addition, with the same member rules but declared through a separate `implements` keyword (`class BankAccount implements IBankAccount`). By v0.7 the colon list below had taken its place; whether v0.6 shipped `implements` is not recorded.
 
 - Added **interfaces**: `interface IName … end IName;`. Members are signatures only and implicitly public, with no fields, constructors or bodies. Interface names start with `I`.
 - Added an **inheritance/implementation list** after the class name: `class SavingsAccount: BankAccount, IAuditable, IDisposable`. The base class comes first, then the interfaces, with no semicolon after the list. Implementation is implicit, meaning a class satisfies an interface by declaring matching public members. The `BankAccount` example now implements `IBankAccount`.
