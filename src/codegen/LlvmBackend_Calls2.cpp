@@ -1225,17 +1225,23 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             builder_.CreateICmpUGE(
                 builder_.CreateSub(fcD, llvm::ConstantInt::get(i8TyD, '0')),
                 llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
-        // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float form).
+        // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
+        // per emitFloatParseOverflow: skip the optional sign before checking
+        // for the hex form.  off = 0 if no sign, 1 if sign present.
+        llvm::Value* offD = builder_.CreateZExt(isSignD, i64(), "tryp.offD");
+        llvm::Value* fcOffD = builder_.CreateLoad(i8TyD,
+            builder_.CreateGEP(i8TyD, strData, offD, "tryp.fcptr"), "tryp.fcOffD");
         llvm::Value* isLeadingZeroD = builder_.CreateICmpEQ(
-            fcD, llvm::ConstantInt::get(i8TyD, '0'), "tryp.lzeroD");
-        // stdlib §9.2: read data[1] only when the first byte is '0' (see the
-        // Convert.ToDouble arm in LlvmBackend_Calls.cpp for why an
-        // unconditional read is out of bounds on the empty string).
+            fcOffD, llvm::ConstantInt::get(i8TyD, '0'), "tryp.lzeroD");
+        // stdlib §9.2: the second character is read at position `off+1` when
+        // the byte at `off` is '0' (potential hex form), otherwise at `off`
+        // (always in bounds; reading `off+1` unconditionally over-reads the
+        // empty string, whose buffer is the 1-byte NUL terminator alone).
         llvm::Value* secondCharD = builder_.CreateLoad(i8TyD,
             builder_.CreateGEP(i8TyD, strData,
                 builder_.CreateSelect(isLeadingZeroD,
-                    builder_.getInt64(1),
-                    builder_.getInt64(0), "tryp.scoffD"),
+                    builder_.CreateAdd(offD, builder_.getInt64(1), "tryp.scoffD"),
+                    offD, "tryp.scoffD"),
                 "tryp.scptr"), "tryp.sc");
         llvm::Value* isHexIndicatorD = builder_.CreateOr(
             builder_.CreateICmpEQ(secondCharD,
@@ -1802,21 +1808,23 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                     builder_.CreateICmpUGE(
                         builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
                         llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
-                // stdlib §9.2 (v0.314, #5199/#5368): the grammar does not
-                // admit a hexadecimal float form ("0x1p3").  strtod accepts it
-                // (returns 8.0, finite).  Detect: first char is '0' and second
-                // char is 'x' or 'X' (after optional sign).
+                // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
+                // per emitFloatParseOverflow: skip the optional sign before checking
+                // for the hex form.  off = 0 if no sign, 1 if sign present.
+                llvm::Value* offF = builder_.CreateZExt(isSignF, i64(), "parse.offF");
+                llvm::Value* fcOffF = builder_.CreateLoad(i8TyF,
+                    builder_.CreateGEP(i8TyF, data, offF, "parse.fcptr"), "parse.fcOffF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
-                    fcF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
-                // stdlib §9.2: read data[1] only when the first byte is '0'
-                // (see the Convert.ToDouble arm in LlvmBackend_Calls.cpp for
-                // why an unconditional read is out of bounds on the empty
-                // string, whose buffer is the 1-byte NUL terminator alone).
+                    fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
+                // stdlib §9.2: the second character is read at position `off+1` when
+                // the byte at `off` is '0' (potential hex form), otherwise at `off`
+                // (always in bounds; reading `off+1` unconditionally over-reads the
+                // empty string, whose buffer is the 1-byte NUL terminator alone).
                 llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
                     builder_.CreateGEP(i8TyF, data,
                         builder_.CreateSelect(isLeadingZeroF,
-                            builder_.getInt64(1),
-                            builder_.getInt64(0), "parse.scoff"),
+                            builder_.CreateAdd(offF, builder_.getInt64(1), "parse.scoff"),
+                            offF, "parse.scoff"),
                         "parse.scptr"), "parse.sc");
                 llvm::Value* isHexIndicatorF = builder_.CreateOr(
                     builder_.CreateICmpEQ(secondCharF,
@@ -1999,20 +2007,23 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
                         llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 auto* i64t = llvm::Type::getInt64Ty(llvm_);
-                // stdlib §9.2 (v0.314, #5199/#5368): strtod accepts a hexadecimal
-                // float form ("0x1p3").  Detect: first char is '0' and second char
-                // is 'x' or 'X' (after optional sign).
+                // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
+                // per emitFloatParseOverflow: skip the optional sign before checking
+                // for the hex form.  off = 0 if no sign, 1 if sign present.
+                llvm::Value* offF = builder_.CreateZExt(isSignF, i64(), "parse.offF");
+                llvm::Value* fcOffF = builder_.CreateLoad(i8TyF,
+                    builder_.CreateGEP(i8TyF, win.data, offF, "parse.fcptr"), "parse.fcOffF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
-                    fcF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
-                // stdlib §9.2: read window[1] only when the first byte is '0'
-                // (see the Convert.ToDouble arm in LlvmBackend_Calls.cpp).  An
-                // empty span window is the 1-byte NUL terminator alone, so an
-                // unconditional index-1 read over-reads it.
+                    fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
+                // stdlib §9.2: the second character is read at position `off+1` when
+                // the byte at `off` is '0' (potential hex form), otherwise at `off`
+                // (always in bounds; reading `off+1` unconditionally over-reads the
+                // empty span window, whose buffer is the 1-byte NUL terminator alone).
                 llvm::Value* secondCharF = builder_.CreateLoad(i8TyF,
                     builder_.CreateGEP(i8TyF, win.data,
                         builder_.CreateSelect(isLeadingZeroF,
-                            builder_.getInt64(1),
-                            builder_.getInt64(0), "parse.scoff"),
+                            builder_.CreateAdd(offF, builder_.getInt64(1), "parse.scoff"),
+                            offF, "parse.scoff"),
                         "parse.scptr"), "parse.sc");
                 llvm::Value* isHexIndicatorF = builder_.CreateOr(
                     builder_.CreateICmpEQ(secondCharF,

@@ -68,6 +68,13 @@ BEZEL_TEST(float_parse_grammar_5399, double_parse_digit_separator_rejected) {
 BEZEL_TEST(float_parse_grammar_5399, double_parse_hex_float_rejected) {
     BEZEL_EXPECT_EQ(out(guarded("double.Parse(\"0x1p3\")")), "FMT");
 }
+// §9.2 (v0.314, #5444): signed hex float also rejected.
+BEZEL_TEST(float_parse_grammar_5399, double_parse_signed_hex_float_minus_rejected) {
+    BEZEL_EXPECT_EQ(out(guarded("double.Parse(\"-0x1p3\")")), "FMT");
+}
+BEZEL_TEST(float_parse_grammar_5399, double_parse_signed_hex_float_plus_rejected) {
+    BEZEL_EXPECT_EQ(out(guarded("double.Parse(\"+0x10\")")), "FMT");
+}
 
 // ---- float.Parse -----------------------------------------------------------
 BEZEL_TEST(float_parse_grammar_5399, float_parse_bare_point_rejected) {
@@ -78,6 +85,10 @@ BEZEL_TEST(float_parse_grammar_5399, float_parse_trailing_point_rejected) {
 }
 BEZEL_TEST(float_parse_grammar_5399, float_parse_incomplete_exponent_rejected) {
     BEZEL_EXPECT_EQ(out(guarded("float.Parse(\"1e\")")), "FMT");
+}
+// §9.2 (v0.314, #5444): signed hex float also rejected.
+BEZEL_TEST(float_parse_grammar_5399, float_parse_signed_hex_float_minus_rejected) {
+    BEZEL_EXPECT_EQ(out(guarded("float.Parse(\"-0x1p3\")")), "FMT");
 }
 
 // ===========================================================================
@@ -107,6 +118,19 @@ BEZEL_TEST(float_parse_grammar_5399, double_tryparse_hex_float_false) {
         "Console.WriteLine(ok); Console.WriteLine(v = 0.0); "),
         "False\nTrue");
 }
+// §9.2 (v0.314, #5444): signed hex float also returns false.
+BEZEL_TEST(float_parse_grammar_5399, double_tryparse_signed_hex_float_minus_false) {
+    BEZEL_EXPECT_EQ(out(
+        "var v := 7.0; var ok := double.TryParse(\"-0x1p3\", out v); "
+        "Console.WriteLine(ok); Console.WriteLine(v = 0.0); "),
+        "False\nTrue");
+}
+BEZEL_TEST(float_parse_grammar_5399, float_tryparse_signed_hex_float_minus_false) {
+    BEZEL_EXPECT_EQ(out(
+        "var v := 7.0f; var ok := float.TryParse(\"-0x1p3\", out v); "
+        "Console.WriteLine(ok); Console.WriteLine(v = 0.0f); "),
+        "False\nTrue");
+}
 
 // ===========================================================================
 // §2.3 / §9.2: Convert.ToDouble rejects invalid grammar forms
@@ -119,6 +143,13 @@ BEZEL_TEST(float_parse_grammar_5399, convert_todouble_trailing_point_rejected) {
 }
 BEZEL_TEST(float_parse_grammar_5399, convert_todouble_incomplete_exponent_rejected) {
     BEZEL_EXPECT_EQ(out(guarded("Convert.ToDouble(\"1e\")")), "FMT");
+}
+// §9.2 (v0.314, #5444): signed hex float also rejected.
+BEZEL_TEST(float_parse_grammar_5399, convert_todouble_signed_hex_float_minus_rejected) {
+    BEZEL_EXPECT_EQ(out(guarded("Convert.ToDouble(\"-0x1p3\")")), "FMT");
+}
+BEZEL_TEST(float_parse_grammar_5399, convert_todouble_signed_hex_float_plus_rejected) {
+    BEZEL_EXPECT_EQ(out(guarded("Convert.ToDouble(\"+0x10\")")), "FMT");
 }
 
 // ===========================================================================
@@ -133,6 +164,13 @@ BEZEL_TEST(float_parse_grammar_5399, convert_trytodouble_bare_point_false) {
 BEZEL_TEST(float_parse_grammar_5399, convert_trytodouble_trailing_point_false) {
     BEZEL_EXPECT_EQ(out(
         "var v := 7.0; var ok := Convert.TryToDouble(\"5.\", out v); "
+        "Console.WriteLine(ok); Console.WriteLine(v = 0.0); "),
+        "False\nTrue");
+}
+// §9.2 (v0.314, #5444): signed hex float also returns false.
+BEZEL_TEST(float_parse_grammar_5399, convert_trytodouble_signed_hex_float_minus_false) {
+    BEZEL_EXPECT_EQ(out(
+        "var v := 7.0; var ok := Convert.TryToDouble(\"-0x1p3\", out v); "
         "Console.WriteLine(ok); Console.WriteLine(v = 0.0); "),
         "False\nTrue");
 }

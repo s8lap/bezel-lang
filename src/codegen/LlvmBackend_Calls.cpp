@@ -11152,20 +11152,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     builder_.CreateICmpUGE(
                         builder_.CreateSub(fcCd, llvm::ConstantInt::get(i8Cd, '0')),
                         llvm::ConstantInt::get(i8Cd, 10)), "cvtd.ndig");
-                // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float).
+                // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
+                // per emitFloatParseOverflow: skip the optional sign before checking
+                // for the hex form.  off = 0 if no sign, 1 if sign present.
+                llvm::Value* offCd = builder_.CreateZExt(isSignCd, i64(), "cvtd.off");
+                llvm::Value* fcOffCd = builder_.CreateLoad(i8Cd,
+                    builder_.CreateGEP(i8Cd, data, offCd, "cvtd.fcptr"), "cvtd.fcOff");
                 llvm::Value* isLeadingZeroCd = builder_.CreateICmpEQ(
-                    fcCd, llvm::ConstantInt::get(i8Cd, '0'), "cvtd.lzero");
-                // stdlib §9.2: `data[1]` is read ONLY when the first byte is
-                // '0'.  On any other first byte the hex form cannot match
-                // (the test ANDs with isLeadingZeroCd), so the byte is read
-                // from index 0 instead — always in bounds.  Reading index 1
-                // unconditionally over-reads the empty string, whose buffer
-                // is exactly the 1-byte NUL terminator.
+                    fcOffCd, llvm::ConstantInt::get(i8Cd, '0'), "cvtd.lzero");
+                // stdlib §9.2: the second character is read at position `off+1` when
+                // the byte at `off` is '0' (potential hex form), otherwise at `off`
+                // (always in bounds; reading `off+1` unconditionally over-reads the
+                // empty string, whose buffer is the 1-byte NUL terminator alone).
                 llvm::Value* secondCharCd = builder_.CreateLoad(i8Cd,
                     builder_.CreateGEP(i8Cd, data,
                         builder_.CreateSelect(isLeadingZeroCd,
-                            builder_.getInt64(1),
-                            builder_.getInt64(0), "cvtd.scoff"),
+                            builder_.CreateAdd(offCd, builder_.getInt64(1), "cvtd.scoff"),
+                            offCd, "cvtd.scoff"),
                         "cvtd.scptr"), "cvtd.sc");
                 llvm::Value* isHexIndicatorCd = builder_.CreateOr(
                     builder_.CreateICmpEQ(secondCharCd,
@@ -11432,16 +11435,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 builder_.CreateICmpUGE(
                     builder_.CreateSub(fcTd, llvm::ConstantInt::get(i8td, '0')),
                     llvm::ConstantInt::get(i8td, 10)), "tryd.ndig");
-            // stdlib §9.2 (v0.314, #5199/#5368): reject "0x1p3" (hex float).
+            // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
+            // per emitFloatParseOverflow: skip the optional sign before checking
+            // for the hex form.  off = 0 if no sign, 1 if sign present.
+            llvm::Value* offTd = builder_.CreateZExt(isSignTd, i64(), "tryd.off");
+            llvm::Value* fcOffTd = builder_.CreateLoad(i8td,
+                builder_.CreateGEP(i8td, strData, offTd, "tryd.fcptr"), "tryd.fcOff");
             llvm::Value* isLeadingZeroTd = builder_.CreateICmpEQ(
-                fcTd, llvm::ConstantInt::get(i8td, '0'), "tryd.lzero");
-            // stdlib §9.2: read data[1] only when the first byte is '0' (see
-            // the Convert.ToDouble arm for why an unconditional read is OOB).
+                fcOffTd, llvm::ConstantInt::get(i8td, '0'), "tryd.lzero");
+            // stdlib §9.2: the second character is read at position `off+1` when
+            // the byte at `off` is '0' (potential hex form), otherwise at `off`
+            // (always in bounds; reading `off+1` unconditionally over-reads the
+            // empty string, whose buffer is the 1-byte NUL terminator alone).
             llvm::Value* secondCharTd = builder_.CreateLoad(i8td,
                 builder_.CreateGEP(i8td, strData,
                     builder_.CreateSelect(isLeadingZeroTd,
-                        builder_.getInt64(1),
-                        builder_.getInt64(0), "tryd.scoff"),
+                        builder_.CreateAdd(offTd, builder_.getInt64(1), "tryd.scoff"),
+                        offTd, "tryd.scoff"),
                     "tryd.scptr"), "tryd.sc");
             llvm::Value* isHexIndicatorTd = builder_.CreateOr(
                 builder_.CreateICmpEQ(secondCharTd,
