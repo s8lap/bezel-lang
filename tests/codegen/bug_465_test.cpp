@@ -238,7 +238,7 @@ BEZEL_TEST(bug465_heap_array_literal, nested_array_array_int_literal_465) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var a: Array<Array<int>> := [[1, 2], [3, 4, 5]]; "
-        "  return a[0].Length + a[1].Length; "   // 2 + 3 = 5
+        "  return a[0].Count + a[1].Count; "   // 2 + 3 = 5
         "end Main; end C;"), 5);
 }
 

@@ -519,7 +519,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_toarray_call_form_value_cor
         "  using var s := new Stack<int>(); "
         "  s.Push(1); s.Push(2); "
         "  using var a := s.ToArray(); "
-        "  return a.Length; "
+        "  return a.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 2);
 }
