@@ -3449,6 +3449,13 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
                         }
                     }
                     bz_lazy_dispose(e);
+                    // fix #5421: release the key/value closures. On the normal
+                    // (non-throw) path the caller's codegen releases them after
+                    // bz_lazy_to_dict returns; on this throw path we never return
+                    // to the caller so those releases are skipped. The closures are
+                    // inline-lambda +1 refs (owned), so bz_closure_release is safe.
+                    bz_closure_release(closure);
+                    bz_closure_release(valclosure);
                     return nullptr;
                 }
                 // Not a duplicate: pack key bytes for the set call below.
@@ -3468,6 +3475,10 @@ extern "C" void* bz_lazy_to_dict(void* lazy, int64_t val_esz, int64_t key_esz,
                     }
                 }
                 bz_lazy_dispose(e);
+                // fix #5421: release the key/value closures (same rationale as
+                // the string-key path above).
+                bz_closure_release(closure);
+                bz_closure_release(valclosure);
                 return nullptr;
             }
         }
