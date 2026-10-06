@@ -82,11 +82,16 @@ BEZEL_TEST(int_min_mod_neg_one_844, ordinary_signed_mod_unaffected) {
 // returns 0, exercising the sibling codegen site (LlvmBackend_Exprs.cpp
 // ~L4064).
 //
-// BEHAVIOR FLIP (fix #4930, v0.315): this row was spelled as a LIFTED `mod`
+// BEHAVIOR FLIP (§7.4, spec:1061, read through §7.11, spec:1177; #4718 ruled
+// YES, v0.309): this row was spelled as a LIFTED `mod`
 // (`var a: int? := int.MinValue; var b: int? := -1; a mod b`), which is the
-// retired v0.130/v0.267 behaviour and does not compile — §7.11 (v0.267) admits
-// nothing at the operator, and #4930 established that init-narrowing does not
-// admit it either. Respelled with the §7.4 null-test narrowing so the
+// retired v0.130/v0.267 behaviour and does not compile — §7.11 (v0.267) opens
+// "No operator **lifts** to a nullable type". The previous version of this
+// comment gave a second, wrong reason as well, claiming init-narrowing "does
+// not admit it either". It does admit it: §7.4 names "`var x: T? := expr;` …
+// which is the declaration's assignment", so both initializers above narrow
+// their locals non-null and `a mod b` is an ordinary `int` operation. Respelled
+// with the §7.4 null-test narrowing — ADMISSIBLE, not required — so the
 // nullable-payload `mod` lowering this row exists for stays covered. `mod` at
 // int.MinValue by -1 is 0 and does NOT raise (§6.1) — the DIVISION sibling
 // above is the one that overflows.

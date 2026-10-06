@@ -73,27 +73,30 @@ BEZEL_TEST(nullable_lifted_widening_840, same_type_regression) {
 // wrap. (The nullable operand is proven non-null here, so §7.11/#914 types the
 // result as the non-nullable `long`; the result must still hold the full value.)
 
-// §7.11 (v0.286, #3298) / BEHAVIOR FLIP (fix #4930, v0.315): each `a` below is
-// a LOCAL initialized with a non-null literal, and the previous text here
-// claimed that §7.4 therefore "narrows it at the initializer" so §7.11 reads
-// it at the non-nullable `int`. THAT CLAIM IS FALSE and is exactly what left
-// these three rows stale: #4930 established that INIT-NARROWING (§6.6's
-// definite-initialiser rule) proves a local non-null for MEMBER ACCESS only —
-// it does NOT admit the §7.11 operator — and §7.11 (v0.267) retired the lift
-// outright, so `int? + long` does not compile as written. The three rows are
-// respelled with an explicit §7.4 NULL-TEST narrowing (`if a <> null then`),
-// which does admit the operator, keeping #1117's value assertions: what is
-// pinned is that the sum computes in the PROMOTED width. The `param_*` rows
-// below remain the un-narrowed control: a PARAMETER `a: int?` is not narrowed
-// and IS rejected.
+// §7.11 (v0.286, #3298) / BEHAVIOR FLIP (§7.4, spec:1061, read through §7.11,
+// spec:1177; #4718 ruled YES, v0.309): each `a` below is a LOCAL initialized
+// with a non-null literal, and the previous text here claimed that §7.4
+// therefore "narrows it at the initializer" so §7.11 reads it at the
+// non-nullable `int` — then called that claim FALSE and said init-narrowing
+// "does NOT admit the §7.11 operator". That verdict was itself wrong, and the
+// claim it rejected is correct: §7.4's establishment list names the
+// declaration form ("`var x: T? := expr;` … which is the declaration's
+// assignment"), so a non-null initializer DOES narrow, and §7.11 — which
+// "reads the operand's static type" — then admits the ordinary operator
+// unchanged. `int? + long` with `a` initialized to 2e9 compiles.
+// The three rows are nevertheless respelled with an explicit §7.4 NULL-TEST
+// narrowing (`if a <> null then`). That spelling is ADMISSIBLE, not required;
+// it is kept because it keeps #1117's value assertions intact: what is pinned
+// is that the sum computes in the PROMOTED width. The `param_*` rows below
+// remain the control, and their reason is a GENUINELY nullable operand — a
+// nullable PARAMETER `a: int?` that §7.4 narrows nothing for, so it IS
+// rejected.
 
 // int? + long: 2e9 + 2e9 = 4e9 must NOT wrap to a 32-bit value.
-// BEHAVIOR FLIP (fix #4930, v0.315): respelled with the §7.4 NULL-TEST
-// narrowing. The block comment above claimed a local initialised with a
-// non-null literal is "narrowed-non-null" for this gate; that is FALSE
-// (init-narrowing reaches member access, not the §7.11 operator gate), and
-// §7.11 (v0.267) admits no lift at all. The WIDTH is what #1117 pins, so
-// these stay POSITIVE with their values asserted.
+// BEHAVIOR FLIP (§7.4, spec:1061 + §7.11, spec:1177; #4718 / v0.309):
+// respelled with the §7.4 NULL-TEST narrowing — ADMISSIBLE, not required,
+// since a non-null initializer narrows at this gate too. The WIDTH is what
+// #1117 pins, so these stay POSITIVE with their values asserted.
 BEZEL_TEST(nullable_lifted_widening_840, int_q_plus_long_no_wrap_1117) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var a: int? := 2000000000; var b: long := 2000000000L; "

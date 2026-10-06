@@ -387,12 +387,16 @@ BEZEL_TEST(codegen_cg_1094, int_shl_same_width_count_32_raises) {
 // `0..7` domain, so a runtime count of 9 raises on the both-present branch.
 // WAS: `byte?(1) << int(9)` == 2 (9 & 7 == 1).
 //
-// BEHAVIOR FLIP (fix #4930, v0.315): this row was spelled as a LIFTED shift
-// (`var a: byte? := 1; a << n`), which is the retired v0.130/v0.267 behaviour
-// and does not compile — §7.11 (v0.267) admits nothing at the operator, and
-// #4930 established that init-narrowing does not admit it either. Respelled
-// with the §7.4 null-test narrowing so the §6.5 COUNT DOMAIN — what #1094 is
-// about — stays covered and observed.
+// BEHAVIOR FLIP (§7.4, spec:1061, read through §7.11, spec:1177; #4718 ruled
+// YES, v0.309): this row was spelled as a LIFTED shift (`var a: byte? := 1;
+// a << n`), which is the retired v0.130/v0.267 behaviour and does not compile
+// — §7.11 (v0.267) opens "No operator **lifts** to a nullable type". The
+// previous version of this comment gave the wrong reason as well, adding that
+// init-narrowing "does not admit it either": it does. §7.4 names "`var x: T?
+// := expr;` … which is the declaration's assignment", so `a` initialized to 1
+// is a non-nullable operand at `<<` and the ordinary shift applies unchanged.
+// Respelled with the §7.4 null-test narrowing — ADMISSIBLE, not required — so
+// the §6.5 COUNT DOMAIN, what #1094 is about, stays covered and observed.
 BEZEL_TEST(codegen_cg_1094, nullable_byte_shl_int_count_9_raises_byte_domain) {
     BEZEL_EXPECT_EQ(throwsOverflow(
         "var a: byte? := 1; var n: int := 9; var c: byte? := null; "
@@ -401,8 +405,9 @@ BEZEL_TEST(codegen_cg_1094, nullable_byte_shl_int_count_9_raises_byte_domain) {
 
 // byte(128) >> int(1) on a narrowed operand: logical >> → 64 (a signed AShr
 // regressed it to -64 once the left payload was narrowed to i8). IN DOMAIN —
-// unchanged by v0.242. Respelled with the §7.4 null-test narrowing (#4930,
-// v0.315) — the `!` reads the narrowed result.
+// unchanged by v0.242. Respelled with the §7.4 null-test narrowing (§7.4,
+// spec:1061 + §7.11, spec:1177; #4718 / v0.309 — ADMISSIBLE, not required, as
+// a non-null initializer narrows too) — the `!` reads the narrowed result.
 BEZEL_TEST(codegen_cg_1094, nullable_byte_shr_logical) {
     BEZEL_EXPECT_EQ(run(
         "var a: byte? := 128; var n: int := 1; var c: byte? := null; "

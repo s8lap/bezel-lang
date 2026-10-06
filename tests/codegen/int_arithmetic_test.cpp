@@ -134,19 +134,27 @@ BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
 // unsigned-vs-non-negative-constant signedness bug as #1049 (the non-nullable
 // site) — `uint 3e9 > 1000` was signed-compared and returned false.
 //
-// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled against a
-// LIFTED relational (`var u: uint? := 3000000000; u > 1000` through a `bool?`
-// local). That is the retired v0.130/v0.267 behaviour and does not compile:
-// §7.11 (v0.267) admits nothing at the operator, and #4930 established that
-// INIT-NARROWING does not admit it either — a local initialised with a
-// non-null literal is not narrowed for this gate. The block comment above
-// previously claimed "§7.4 narrows at the initialiser … the ordinary operator
-// applies to it unchanged"; that claim is FALSE and is what left these rows
-// stale.
+// BEHAVIOR FLIP (§7.4, spec:1061, read through §7.11, spec:1177; #4718 ruled
+// YES, v0.309): these rows were spelled against a LIFTED relational
+// (`var u: uint? := 3000000000; u > 1000` through a `bool?` local). The LIFT
+// is genuinely retired — §7.11 (v0.267) opens "No operator **lifts** to a
+// nullable type", so a relational over a nullable operand is not a `bool?`
+// value at all — but NOT for the reason this comment previously gave. That
+// text claimed init-narrowing does not admit the operator ("a local
+// initialised with a non-null literal is not narrowed for this gate") and
+// called the block comment's "§7.4 narrows at the initialiser … the ordinary
+// operator applies to it unchanged" FALSE. That claim is not FALSE: it is the
+// current rule. §7.4's establishment list names the declaration form —
+// "`var x: T? := expr;` … which is the declaration's assignment" — so
+// `var u: uint? := 3000000000; u > 1000` reads `u` at its non-nullable type
+// and yields an ordinary `bool`, never a `bool?`. The `bool?` typing the old
+// rows asserted is what the retired lift supplied, and the lift is gone.
 //
 // The four value rows are kept POSITIVE (conversion (a)) with the §7.4
 // NULL-TEST narrowing applied explicitly, because the UNSIGNED comparison is
-// what #1050 is about and these rows are the only oracle for it.
+// what #1050 is about and these rows are the only oracle for it. The
+// null-test spelling is ADMISSIBLE, not REQUIRED — an initializer with a
+// non-null value reaches this gate too.
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_high_bit_gt_literal) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: uint? := 3000000000; var r: bool := false; "

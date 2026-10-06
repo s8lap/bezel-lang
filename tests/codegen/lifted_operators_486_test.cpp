@@ -12,21 +12,31 @@
 // §7.4 / `??` / `!` remedies). The same fix-for-fix notes (issue numbers,
 // narrowing treatment) live in the individual block comments below.
 //
-// WHICH narrowing admits an operator (v0.315, #4930). §7.11 reads the
-// operand's STATIC type, and admits the ordinary operator only where §7.4
-// has narrowed the operand non-null. Two kinds of narrowing exist and only
-// ONE of them reaches this gate:
+// WHICH narrowing admits an operator (§7.4, spec:1061, read through §7.11,
+// spec:1177; #4718 ruled YES and v0.309 ships it). §7.11 reads the operand's
+// STATIC type and admits the ordinary operator wherever §7.4 has narrowed the
+// operand non-null: "an operand that §7.4 has narrowed non-null is a
+// non-nullable operand and the ordinary operator applies to it unchanged; no
+// separate rule is needed for that case". §7.4's establishment list names a
+// declaration's initializer explicitly — "`var x: T? := expr;` … which is the
+// declaration's assignment" — so BOTH narrowing kinds reach this gate:
 //   • NULL-TEST narrowing (`if a <> null then a < b … end if`) ADMITS.
-//   • INIT-NARROWING (`var a: int? := 5;` — §6.6's definite-initialiser
-//     rule) does NOT. It proves a local non-null for MEMBER ACCESS only.
-// So `var a: int? := 3; a + 1` is a §7.11 compile error even though the
-// initialiser is a non-null literal, and rows written that way are stale.
+//   • INIT-NARROWING (`var a: int? := 5;` — §7.4's declaration-assignment
+//     bullet) ADMITS EQUALLY. `var a: int? := 3; a + 1` compiles.
+// The rows below use the null-test spelling throughout. That spelling is
+// ADMISSIBLE, not REQUIRED: it is not the only way to reach a non-nullable
+// operand, and nothing here turns on init-narrowing being refused. What these
+// rows turn on is the operand being GENUINELY nullable — a `:= null`
+// initializer, a nullable parameter, or an unnarrowed second operand — since
+// that is the case §7.4 narrows nothing for and §7.11 must reject.
+// BOUNDARY (do not overclaim): the `and`/`or`/`not` boolean gates and the
+// `bool?` `if`/`while` condition gates still read the DECLARED type and ignore
+// §7.4 narrowing — a pre-existing v0.288 delta, tracked as #5137.
 // Where a row exists to pin a CODEGEN lowering (a payload width, a decimal
 // runtime route, an unsigned compare) rather than the lift itself, the
-// spec-correct conversion is (a): respell with the null-test narrowing and
-// keep the row POSITIVE with its value asserted, so the lowering stays
-// covered. Conversion (b) — a REJECTION row — is used where the row's
-// subject IS the rule.
+// spec-correct conversion is (a): keep the row POSITIVE with its value
+// asserted, so the lowering stays covered. Conversion (b) — a REJECTION row —
+// is used where the row's subject IS the rule.
 
 
 #include "support/aot_support.hpp"
@@ -665,16 +675,23 @@ BEZEL_TEST(codegen_lifted_ops_486, int_eq_both_nonnull_unchanged_spec_8_4) {
 // (§5.1), and a shift follows the left operand (`byte? << 1` → `byte?`); both
 // now build the right-width result.
 //
-// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled as lifted
-// operators on a local initialised with a non-null literal
-// (`var a: byte? := 3; a + 1`), which is the RETIRED v0.130/v0.267 behaviour:
-// §7.11, v0.267 admits nothing at the operator, and #4930 established that
-// init-narrowing (§6.6) proves a local non-null for MEMBER ACCESS but not for
-// the §7.11 operator gate. Only NULL-TEST narrowing admits operators. The rows
-// are therefore respelled with the §7.4 null-test narrowing `if a <> null
-// then …` (the spec's own named remedy), which keeps them POSITIVE value rows
-// still exercising the same sub-i32 payload/result-width lowering — the defect
-// #1044 is about — while compiling under the current rule.
+// BEHAVIOR FLIP (§7.4, spec:1061, read through §7.11, spec:1177; #4718 ruled
+// YES, v0.309): these rows were spelled as LIFTED operators on a local
+// initialised with a non-null literal (`var a: byte? := 3; a + 1`). The LIFT
+// is genuinely retired — §7.11, v0.267 opens "No operator **lifts** to a
+// nullable type" — but the previous version of this comment gave the wrong
+// reason for it, claiming init-narrowing "proves a local non-null for MEMBER
+// ACCESS but not for the §7.11 operator gate" and that "only NULL-TEST
+// narrowing admits operators". That is not the rule. A declaration initializer
+// DOES establish §7.4 narrowing (§7.4 names "`var x: T? := expr;` … which is
+// the declaration's assignment"), so `a` above is a non-nullable operand at `+`
+// and the ordinary operator applies to it unchanged. What the old rows wrongly
+// needed was the lift's `int?`/`byte?`-valued RESULT, not admission to the
+// operator.
+// The rows are therefore respelled with the §7.4 null-test narrowing
+// `if a <> null then …` (the spec's own named remedy) — ADMISSIBLE, not
+// required — which keeps them POSITIVE value rows still exercising the same
+// sub-i32 payload/result-width lowering, the defect #1044 is about.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_plus_int_promotes_to_int) {
     BEZEL_EXPECT_EQ(run(
         "var a: byte? := 3; var r: int? := 0; "
@@ -687,16 +704,19 @@ BEZEL_TEST(codegen_1044_subint_nullable, byte_coalesce_int_default) {
 BEZEL_TEST(codegen_1044_subint_nullable, byte_null_coalesce_int_default) {
     BEZEL_EXPECT_TRUE(runs("var a: byte? := null; return int(a ?? 9);"));
 }
-// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
-// see the suite header above.
+// BEHAVIOR FLIP (§7.4, spec:1061 + §7.11, spec:1177; #4718 / v0.309):
+// respelled with the §7.4 null-test narrowing — ADMISSIBLE, not required,
+// since a non-null initializer narrows too; see the suite header above.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_shl_follows_left) {
     BEZEL_EXPECT_TRUE(runs(
         "var a: byte? := 5; var c: byte? := null; "
         "if a <> null then c := a << 1; end if; "
         "return int(c ?? 99);"));
 }
-// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
-// see the suite header above. `short * int` widens to `int` (§5.1), so the
+// BEHAVIOR FLIP (§7.4, spec:1061 + §7.11, spec:1177; #4718 / v0.309):
+// respelled with the §7.4 null-test narrowing — ADMISSIBLE, not required,
+// since a non-null initializer narrows too; see the suite header above.
+// `short * int` widens to `int` (§5.1), so the
 // narrowed result local is `int?`, which is the promotion #1044 pinned.
 BEZEL_TEST(codegen_1044_subint_nullable, short_mul_via_coalesce) {
     BEZEL_EXPECT_TRUE(runs(
@@ -705,16 +725,19 @@ BEZEL_TEST(codegen_1044_subint_nullable, short_mul_via_coalesce) {
         "return int(c ?? 99);"));
 }
 // §7.11 (v0.286, #3298) — REJECTION: `a` is initialised with `null`, so §7.4
-// narrows nothing and the operand is genuinely nullable. Its siblings in this
-// suite are respelled with an explicit null-test narrowing, which DOES admit
-// the operator (fix #4930, v0.315) — that is the distinction this suite turns
-// on. An initialiser alone, null or not, admits nothing.
+// narrows nothing and the operand is genuinely nullable. That — a `:= null`
+// initializer — is the distinction this suite turns on, not which KIND of
+// narrowing was applied: an initializer holding a non-null value reaches this
+// gate too (§7.4, spec:1061; §7.11, spec:1177; #4718 / v0.309). Its siblings
+// in this suite spell the non-null operand with an explicit null-test
+// narrowing, which admits the operator.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_null_arith_rejected_3298) {
     BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: byte? := null; return int((a + 1) ?? 99);"));
 }
-// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
-// see the suite header above.
+// BEHAVIOR FLIP (§7.4, spec:1061 + §7.11, spec:1177; #4718 / v0.309):
+// respelled with the §7.4 null-test narrowing — ADMISSIBLE, not required,
+// since a non-null initializer narrows too; see the suite header above.
 BEZEL_TEST(codegen_1044_subint_nullable, byte_bitand_via_coalesce) {
     BEZEL_EXPECT_TRUE(runs(
         "var a: byte? := 5; var c: int? := null; "
@@ -760,14 +783,18 @@ BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_variable_int_default_null) {
 // slot → a garbage decimal that faulted/overflowed at runtime (threw instead of
 // computing). decimal? + decimal? and the non-nullable decimal + int were fine.
 //
-// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled as lifted
-// operators on a local initialised with a non-null literal, which is the
-// RETIRED v0.130/v0.267 behaviour (§7.11, v0.267 admits nothing at the
-// operator; #4930 established that init-narrowing does not admit it either).
+// BEHAVIOR FLIP (§7.4, spec:1061, read through §7.11, spec:1177; #4718 ruled
+// YES, v0.309): these rows were spelled as LIFTED operators on a local
+// initialised with a non-null literal. The LIFT is genuinely retired — §7.11,
+// v0.267 opens "No operator **lifts** to a nullable type" — but the previous
+// version of this comment gave the wrong reason, adding that init-narrowing
+// "does not admit it either". It does: §7.4 names "`var x: T? := expr;` …
+// which is the declaration's assignment", so a non-null initializer leaves
+// the operand non-nullable and the ordinary operator applies unchanged.
 // They are respelled with the §7.4 null-test narrowing `if a <> null then …` —
-// the spec's own named remedy — so they stay POSITIVE rows still exercising
-// the §4.4 decimal runtime route that #1047 is about, including the operand
-// order that decides which side promotes.
+// the spec's own named remedy, ADMISSIBLE and not required — so they stay
+// POSITIVE rows still exercising the §4.4 decimal runtime route that #1047 is
+// about, including the operand order that decides which side promotes.
 BEZEL_TEST(codegen_1047_decimal_nullable, decimal_plus_int_present) {
     BEZEL_EXPECT_TRUE(runs(
         "var a: decimal? := 5; var c: decimal? := null; "
@@ -802,8 +829,10 @@ BEZEL_TEST(codegen_1047_decimal_nullable, decimal_null_plus_int_rejected_3298) {
     BEZEL_EXPECT_TRUE(rejectedBy_7_11(
         "var a: decimal? := null; return int((a + 1) ?? 99);"));
 }
-// BEHAVIOR FLIP (fix #4930, v0.315): respelled with §7.4 null-test narrowing —
-// see the suite header above. Both operands are narrowed, so the `decimal? +
+// BEHAVIOR FLIP (§7.4, spec:1061 + §7.11, spec:1177; #4718 / v0.309):
+// respelled with the §7.4 null-test narrowing — ADMISSIBLE, not required,
+// since a non-null initializer narrows too; see the suite header above.
+// Both operands are narrowed, so the `decimal? +
 // decimal?` route is still exercised and still observed as a VALUE.
 BEZEL_TEST(codegen_1047_decimal_nullable, decimal_nullable_both_unchanged) {
     BEZEL_EXPECT_EQ(run(
@@ -816,21 +845,29 @@ BEZEL_TEST(codegen_1047_decimal_nullable, decimal_nullable_both_unchanged) {
 // lowerCoalesce returned nullptr for a non-pointer non-nullable LHS, so the
 // whole `??` lowered to null → false; it now returns the left operand.
 //
-// BEHAVIOR FLIP (fix #4930, v0.315): these rows were spelled `(int? < 5) ??
-// false`, which asserted the RETIRED v0.130/v0.267 lift: that a lifted
-// relational is "a definite `bool` (`false` when either operand is null)". §7.11
-// (v0.267) retired that outright — "`null` is not less than, equal to, or
-// greater than a value, and answering `false` would assert two definite claims
-// at once" — and #4930 established that init-narrowing does not admit the
-// operator either. The header comment above this block is therefore CORRECTED:
-// the definite-`bool` claim is not part of the current language.
+// BEHAVIOR FLIP (§7.4, spec:1061, read through §7.11, spec:1177; #4718 ruled
+// YES, v0.309): these rows were spelled `(int? < 5) ?? false`, which asserted
+// the RETIRED v0.130/v0.267 lift: that a lifted relational is "a definite
+// `bool` (`false` when either operand is null)". That retirement is real and
+// stands — §7.11 (v0.267) retired it outright, "`null` is not less than,
+// equal to, or greater than a value, and answering `false` would assert two
+// definite claims at once" — and the header comment above this block remains
+// CORRECTED: the definite-`bool` claim is not part of the current language.
+// What is NOT part of the rule is the clause this comment previously tacked
+// on, that init-narrowing "does not admit the operator either". A declaration
+// initializer DOES narrow here (§7.4: "`var x: T? := expr;` … which is the
+// declaration's assignment"), and §7.11 then reads the operand's static type
+// — so an initializer holding a non-null value admits the operator unchanged.
+// The rows below use the §7.7 `??` remedy BEFORE the comparison instead,
+// which is a separate and equally admissible route to a non-nullable operand.
 //
 // The two rows are kept POSITIVE (conversion (a)) rather than turned into
 // rejections, because the coverage #1045 is about is `??` over a non-nullable
 // `bool` LHS, which is still exactly what they exercise once the nullable
 // operand is given the §7.7 remedy `??` BEFORE the comparison. The
 // `nullable_cmp_null_operand_is_false` row below is the REJECTION that pins
-// the v0.267 rule for the same shape.
+// the v0.267 rule for the same shape — there the operand really is nullable
+// (`:= null`), which is what §7.4 narrows nothing for.
 BEZEL_TEST(codegen_1045_coalesce_nonnull, nullable_cmp_true_via_coalesce) {
     BEZEL_EXPECT_EQ(run(
         "var a: int? := 3; return (if ((a ?? 0) < 5 ?? false) then 1 else 0);"), 1);
