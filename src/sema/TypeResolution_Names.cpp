@@ -3459,11 +3459,14 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                         arg, iComparableBound, &ctx_)) {
                                     // Defer: same as checkOneConstraint's type
                                     // arm for unresolved base lists.
+                                    // per spec §4.18 / §14.2 (v0.315): spell the
+                                    // bound as IComparable<paramName>, not the bare
+                                    // "IComparable" (issue #5423).
                                     deferredTypeBoundFailures_.push_back(
                                         DeferredTypeBoundFailure{
                                             t.span.begin,
                                             std::string(c.paramName),
-                                            "IComparable",
+                                            "IComparable<" + std::string(c.paramName) + ">",
                                             argName,
                                             arg,
                                             iComparableBound});

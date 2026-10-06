@@ -468,8 +468,10 @@ BEZEL_TEST(sortedset_isarrlike_3730,
     auto r = rejectNonComparable(
         "    using var ss := new SortedSet<NC>();\n"
         "    return 0;");
+    // per spec §4.18 / §14.2 (v0.315): spell the bound as IComparable<T>, not bare
+    // IComparable (issue #5423, fix-forward)
     BEZEL_EXPECT_TRUE(
-        hasErrorContaining(r, "does not satisfy the constraint `where T: IComparable"));
+        hasErrorContaining(r, "does not satisfy the constraint `where T: IComparable<T>"));
     BEZEL_EXPECT_TRUE(hasErrorContaining(r, "(\xC2\xA7""14.2)"));
 }
 

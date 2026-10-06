@@ -300,7 +300,9 @@ BEZEL_TEST(sorted_set_class_element_3428, non_self_comparable_interface_still_di
     BEZEL_EXPECT_TRUE(rejectsWith(prog(
         "  using var b := new SortedSet<IComparable<Ord>>(); "
         "  return b.Count; "),
-        constraintNeedle("IComparable")));
+        // per spec §4.18 / §14.2 (v0.315): spell the bound as IComparable<T>, not bare
+        // IComparable (issue #5423, fix-forward)
+        constraintNeedle("IComparable<Ord>")));
 }
 
 // per stdlib §4.18 (v0.286), fix #2773 (B1): `Object` is a Primitive-kind

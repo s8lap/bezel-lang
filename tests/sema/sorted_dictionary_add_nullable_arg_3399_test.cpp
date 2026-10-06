@@ -293,7 +293,9 @@ BEZEL_TEST(sema_sorted_dictionary_add_nullable_3399,
         "    return 0; "
         "  end Main; "
         "end P;");
-    BEZEL_EXPECT_TRUE(hasError(r, "does not satisfy the constraint `where K: IComparable"));
+    // per spec §4.17 / §14.2 (v0.315): spell the bound as IComparable<K>, not bare
+    // IComparable (issue #5423, fix-forward)
+    BEZEL_EXPECT_TRUE(hasError(r, "does not satisfy the constraint `where K: IComparable<K>"));
     BEZEL_EXPECT_TRUE(hasError(r, "(\xC2\xA7""14.2)"));
 }
 
