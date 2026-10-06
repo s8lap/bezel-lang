@@ -104,6 +104,13 @@ int run(const std::string& src) {
 // release their +1 copies, the outer retain is skipped for this
 // vtable-backed shape, and result.Dispose releases the SOLE ownership →
 // rc 0 → no leak. Length 3 + content equality.
+//
+// The materialized `Array<string>` is read through `.Count`, not `.Length`:
+// stdlib §4.4's Count-vs-Length convention gives a resizable collection
+// `Count` and reserves `Length` for a fixed or contiguous extent, so
+// `Array<T>.Length` is rejected ("no member `Length` on `Array<T>`: use
+// `Count`"). The `s.Length` reads in the rows below are a different
+// receiver — a `string` element — and `Length` is correct there.
 // ============================================================================
 BEZEL_TEST(yield_return_runtime_managed_leak_2738,
            toarray_of_fresh_interpolation_strings_leak_free_29_2) {
@@ -118,7 +125,7 @@ BEZEL_TEST(yield_return_runtime_managed_leak_2738,
         "  public static method Main(): int "
         "    do "
         "      using var t: Array<string> := Gen(1).ToArray(); "
-        "      if t.Length <> 3 then return 1; end; "
+        "      if t.Count <> 3 then return 1; end; "  // Array<T> says Count (stdlib §4.4)
         "      if t[0] <> \"g-1\" then return 2; end; "
         "      if t[1] <> \"g-2\" then return 3; end; "
         "      if t[2] <> \"g-3\" then return 4; end; "
@@ -255,7 +262,7 @@ BEZEL_TEST(yield_return_runtime_managed_leak_2738,
 // +1 refs for its strings for the result's lifetime, and the outer
 // retain remains. The ToArray returns a snapshot, the source's
 // using-scope release pairs with the result's release. Length 3, content
-// order preserved.
+// order preserved (`t.Count` — an `Array<T>` receiver, stdlib §4.4).
 // ============================================================================
 BEZEL_TEST(yield_return_runtime_managed_leak_2738,
            array_to_array_outer_retain_still_applies_602_control) {
@@ -269,7 +276,7 @@ BEZEL_TEST(yield_return_runtime_managed_leak_2738,
         "      src.Add(\"world\"); "
         "      src.Add(\"foo\"); "
         "      using var t: Array<string> := src.ToArray(); "
-        "      if t.Length <> 3 then return 1; end; "
+        "      if t.Count <> 3 then return 1; end; "  // Array<T> says Count (stdlib §4.4)
         "      if t[0] <> \"hello\" then return 2; end; "
         "      if t[1] <> \"world\" then return 3; end; "
         "      if t[2] <> \"foo\" then return 4; end; "
