@@ -136,12 +136,19 @@ bool hasConstMaterializerError(const OwnershipResult& r,
     return false;
 }
 
-// §21.1's OTHER deferred-activation rejection (#2146's `Drain()` arm) — pinned
-// so folding it into the shared predicate did not lose it.
+// §21.1's const rejection for Drain.  fix #4795 (§28.3 row 2, v0.307)
+// updated the diagnostic text check: with Drain classified as Owned (mints
+// fresh frame, per stdlib §4.5 / §4.13 v0.307), the error is the
+// "owned production" form; the v0.195 "deferred-activation producer" form
+// was based on the now-superseded "Drain returns the array itself" premise.
+// Both error texts correctly reject the const binding; this helper accepts
+// either. // per §21.1, §28.3, #4795
 bool hasConstDrainError(const OwnershipResult& r, const std::string& name) {
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.severity != bezel::Severity::Error) continue;
         if (d.message.find("must not take a deferred-activation producer") ==
+            std::string::npos &&
+            d.message.find("must not take an owned production") ==
             std::string::npos)
             continue;
         if (d.message.find("`" + name + "`") == std::string::npos) continue;
@@ -351,7 +358,10 @@ BEZEL_TEST(vacuous_lint_materializer_2709,
 // =====================================================================
 // (5) LEG 1 — #2146's `Drain()` arm, now reached through the SHARED predicate
 // rather than a separately maintained copy on the lint side. Both directions
-// must be exactly as before: the const rejection fires, the pin stays silent.
+// must be exactly as before: the const rejection fires (diagnostic text updated:
+// fix #4795 makes Drain Owned per stdlib §4.5 v0.307, so the error is the
+// "owned production" form, not the v0.195 "deferred-activation" form), and
+// the pin stays silent. // per §21.1, §28.3, #4795
 // =====================================================================
 BEZEL_TEST(vacuous_lint_materializer_2709,
            drain_const_rejection_and_pin_silence_preserved_spec_29_11) {

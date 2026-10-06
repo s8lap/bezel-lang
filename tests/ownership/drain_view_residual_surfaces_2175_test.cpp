@@ -195,19 +195,21 @@ BEZEL_TEST(drain_view_return_site_2175,
 }
 
 // ===========================================================================
-// (b) §28.10 / stdlib §4.5 — a user getter returning `_items.Drain()` over
-// a `this`-rooted chain: ADMITTED as a borrow-pin getter. The caller-side
-// `using var q := h.Q;` is a §28.10 borrow-pin (no scope-end dispose
-// registered; `h`'s cascade is the single disposal). The probe confirms
-// the live-counter returns to 0 — the caller's adoption does not double-
-// dispose. Pre-fix, the caller's typed `using var` adopted and double-
-// freed (heap-use-after-free under ASan, the #2146 family). // per
-// §28.10, stdlib §4.5 v0.195, #2175
+// (b) Stdlib §4.5 / §4.13 (v0.307): a property getter returning
+// `_items.Drain()` is REJECTED at compile time. `Drain()` on an owning
+// collection "mints a fresh drain-view frame" (§4.13) — a caller-owned
+// owned frame per §28.3 row 2 — so the getter body produces an Owned
+// value.  Per §28.6: "a property or indexer getter may not return a
+// freshly-produced owned value — a getter is a borrow-producing position".
+// The v0.195 comment ("borrow-pin getter") reflected the old (buggy)
+// Borrowed classification of `Drain()`.  Under correct spec, the shape
+// is invalid; the fix-forward is to use a method instead:
+//   public method Q(): IOwningEnumerable<R> return _items.Drain(); end
+// per §28.6 guidance: "expose the factory as a method returning `owned T`".
 // ===========================================================================
 BEZEL_TEST(drain_view_getter_2175,
-           getter_drain_over_this_field_pins_spec_28_10) {
-    JitResult r = runAotChecked(
-        std::string(kR) +
+           getter_drain_over_this_field_rejected_spec_28_6) {
+    auto src = std::string(kR) +
         "class Holder "
         "  private owned _items: OwningArray<R>; "
         "  public constructor() _items := new OwningArray<R>(); end constructor; "
@@ -217,18 +219,24 @@ BEZEL_TEST(drain_view_getter_2175,
         "  public static method Run(): int "
         "    using var h := new Holder(); "
         "    using var view: IOwningEnumerable<R> := h.Q; "
-        "    return R.live; "                // 0 — disposed once, by `h`'s cascade
+        "    return R.live; "
         "  end Run; "
         "  public static method Main(): int "
         "    var r := P.Run(); "
         "    return r; "
         "  end Main; "
-        "end P;");
-    if (!r.ran) {
-        BEZEL_EXPECT_TRUE(r.ran);   // pre-fix: ASan UAF on double-free
-        return;
+        "end P;";
+    auto r = parseAndCheckOwnership(src);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool hasOwnedValueErr = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("freshly-produced owned value") != std::string::npos) {
+            hasOwnedValueErr = true;
+            break;
+        }
     }
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(hasOwnedValueErr);
 }
 
 // ===========================================================================

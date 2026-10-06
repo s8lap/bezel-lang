@@ -5621,25 +5621,6 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // (Shared<T>), `var sender := ch.NewSender()` (ChannelSender<T>),
         // `var cts := CancellationTokenSource.New()`, etc. // per §28.13, §30.14
         //
-        // §28.10 / §28.11 / stdlib §4.5 (v0.195) (#2146): carve the builtin
-        // owning-collection `recv.Drain()` over a STABLE NAMED receiver out of
-        // the IOwningEnumerable head fallback below. Stdlib §4.5: "`Drain()`
-        // on `OwningArray<T>` returns the array itself at that static type —
-        // no separate enumerable object" — the call mints NOTHING; the view
-        // ALIASES the receiver, whose owner keeps the one container obligation
-        // (§28.11 "ownership out" transfers elements, never the container).
-        // Classifying it Owned made the binding a second owner of the same
-        // object — a double-dispose (SEGV via the iterator-format disposal on
-        // a bz_array). Per §28.10's borrow-call row ("a method call without an
-        // `owned` return … is a borrow") it is BORROWED (source: the
-        // receiver). A user yield-iterator returning IOwningEnumerable<T> is a
-        // genuine fresh-frame factory (resolved MethodSymbol → excluded by the
-        // recognizer) and keeps the Owned fallback; the §21.1 `const`
-        // rejection of a Drain initializer is re-established at the
-        // LocalConstDecl site (visitStmt) since it no longer falls out of the
-        // Owned verdict here. // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
-        if (common::isOwningCollectionDrainAliasCall(*ce, ctx_))
-            return OwnershipState::Borrowed;
         // fix #5351 (§28.3, stdlib §7.3, v0.313): builtin static factory calls
         // (File.ReadAllLines / File.ReadAllBytes / Directory.GetFiles /
         // GetDirectories / FrozenArray<T>.From / Stopwatch.StartNew /
@@ -5657,6 +5638,21 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // double-free. // per §28.3, §21.1, stdlib §7.3, #5284, #5351
         if (!calleeMs && common::isBuiltinOwnedStaticFactoryCall(*ce, ctx_))
             return OwnershipState::Owned;
+        // Stdlib §4.5 / §4.13 (v0.307): `Drain()` on an owning collection
+        // "mints a **fresh drain-view frame** over the array — a small
+        // caller-owned enumerable, never the array itself" — it is an
+        // ordinary minting iterable-family production per §28.3 row 2
+        // (Owned frame — calls mint).  The v0.195 / #2146 carve that
+        // classified a named-receiver Drain as Borrowed is superseded: the
+        // current spec's "fresh frame" semantics mean Drain produces an
+        // Owned frame with its own disposal obligation; the drain view's
+        // Dispose does NOT dispose the source collection (stdlib §4.5
+        // "Disposing the drain view does not dispose the array"), so there
+        // is no double-dispose risk from the source being disposed by its
+        // owning binding.  The alias fact remains for codegen's
+        // registerUsingDisposal and for the §21.1 const-rejection and the
+        // borrow-pin in usingVarSourceIsBorrow — those are unaffected.
+        // // per §28.3 row 2, stdlib §4.5 / §4.13 v0.307, #4795
         if (const sema::TypeRef* retTy = ctx_.exprType(e)) {
             if (retTy->kind == sema::TypeRef::Kind::Named &&
                 retTy->astNode && retTy->astNode->name &&

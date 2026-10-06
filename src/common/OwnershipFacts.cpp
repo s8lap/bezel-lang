@@ -656,7 +656,7 @@ static std::pair<const ast::Expr*, std::string_view> builtinInstanceCallee(
 
 bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
                                       const sema::SemaContext& ctx) {
-    // See the header contract. // per §28.10, §28.11, stdlib §4.5 v0.195,
+    // See the header contract. // per §28.10, §28.11, stdlib §4.5 v0.307,
     // #2146, #2767
     if (!call.args.empty()) return false;
     // fix #2767: the callee is EITHER `recv.M(..)` (MemberAccessExpr) OR
