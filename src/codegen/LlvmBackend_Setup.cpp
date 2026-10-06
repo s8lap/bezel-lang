@@ -16785,8 +16785,29 @@ llvm::Value* Emitter::lowerCollectionLiteralElementOrUnitNull(
 // hundred lines below; it is the §15.4 "name the source first" shape
 // (s15_4_0007) that is a borrow, and the §15.4 fresh-literal shape
 // (array_class_element_literal_disposal_leak_5414) that is fresh.
+//
+// An EMPTY literal is NOT "all fresh": the loop below has nothing to admit, so
+// the vacuous answer `true` used to reach the caller. That stamped a
+// class-element disposer on a BORROWING `Array<T>` (`var a: Array<C> := [];`),
+// which §28.11 forbids — a borrowing collection's Dispose leaves elements
+// untouched, the holder keeps the obligation. The array then became a SECOND
+// disposer of every element a later `.Add(...)` put in, and since each `Add`
+// argument is a fresh unbound owned temporary the §28.3 K8 boundary already
+// reclaims, the scope-end `bz_array_free(arr, elemDispose)` walked freed
+// pointers. MEASURED (single module, no import): `var arr: Array<Cell> := [];
+// arr.Add(Cell.MakeIt(1));` → heap-use-after-free, READ of size 8 in
+// `bz$elemDispose` <- `bz_array_free` (bezel_runtime_collections.cpp:348);
+// exit 1, no leak traded for it. The same program with `new Array<Cell>()` in
+// place of the `[]` literal is CLEAN (exit 0) — isolating the stamp to the
+// literal path. Elements reach the array only through `.Add`, which stores
+// BORROWS (§28.11), so there is never anything for the header to own.
+//
+// `lit->elements.empty()` is therefore rejected outright. The non-empty
+// all-fresh literal keeps its stamp (#5414's 168 B/3-alloc leak stays closed).
 static bool collectionLiteralElementsAllFresh(const ast::CollectionLiteralExpr* lit) {
     if (!lit || lit->isDict) return false;
+    // Vacuous truth is not freshness: see the UAF note above.
+    if (lit->elements.empty()) return false;
     for (const auto& el : lit->elements) {
         const ast::Expr* x = el.get();
         if (!x) return false;
