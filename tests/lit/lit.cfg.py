@@ -94,7 +94,16 @@ config.substitutions.append(("FileCheck", filecheck))
 # infinite hang, which ANY finite bound catches, whereas a bound set too low
 # would fail the gate on a merely slow row.  A false positive here costs a
 # gate cycle; a false negative costs the whole cycle.
-config.maxIndividualTestTime = 300
+#
+# IT MUST BE `lit_config`, NOT `config` — the two are different objects with
+# no attribute delegation.  `config` here is the per-suite `TestingConfig`;
+# `lit_config` is lit's own `LitConfig`, and it is the latter that
+# `executeScriptInternal` reads (TestRunner.py:1075,
+# `timeout=litConfig.maxIndividualTestTime`).  Setting the attribute on
+# `config` parses, lints, and does nothing at all.  Measured on lit 18.1.8
+# against a 3-second sleep: `lit_config.… = 1` reports `TIMEOUT` after 1 s;
+# `config.… = 1` reports `PASSED` after 3.19 s.
+lit_config.maxIndividualTestTime = 300
 
 # A minimal, hermetic environment is fine: `bezelc -c` neither reads config
 # files nor needs a populated PATH.  Keep HOME/TMPDIR so tmp-file creation
