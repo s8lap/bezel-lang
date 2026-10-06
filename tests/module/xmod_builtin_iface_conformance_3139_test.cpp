@@ -186,7 +186,22 @@ const char* kLib3139 =
     "  private _v: int; "
     "  public constructor(v: int) _v := v; end constructor; "
     "  public method V(): int => _v; "
-    "end Plain3139; ";
+    "end Plain3139; "
+    // fix #2772 item 2: a class that IMPORTS `IComparable<Other>` with a
+    // wrong type argument.  #3139's symbol-side fallback admits any class
+    // declaring IComparable when baseTypeRefs is empty on the import side;
+    // this library entry provides a baseTypeRefs entry with a MISMATCHED
+    // argument so the strict substitution check can fire even when the symbol
+    // would admit via declaresBuiltinInterface.
+    "public class Other3139 "
+    "  public constructor() end constructor; "
+    "end Other3139; "
+    "public class Wrong3139: IComparable<Other3139> "
+    "  private _v: int; "
+    "  public constructor(v: int) _v := v; end constructor; "
+    "  public method V(): int => _v; "
+    "  public method CompareTo(other: Other3139): int => 0; "
+    "end Wrong3139; ";
 
 // The same three declarations, for the local twin.
 const char* kLocalDecls3139 =
@@ -245,6 +260,17 @@ const char* kBadMinBody3139 =
     "    using var b := new Plain3139(3); "
     "    var arr: Array<Plain3139> := [a, b]; "
     "    return arr.Min().V(); ";
+
+// fix #2772 item 2: `Sort()` on an IMPORTED class whose baseTypeRefs carries
+// an IComparable base with a WRONG type argument.  With the #3139 fallback
+// guarding against empty baseTypeRefs, the #2772 substitution check fires for
+// this case and rejects correctly.
+const char* kSortWrongArgBody3139 =
+    "    using var a := new Wrong3139(3); "
+    "    using var b := new Wrong3139(1); "
+    "    var arr: Array<Wrong3139> := [a, b]; "
+    "    arr.Sort(); "
+    "    return 7; ";
 
 }  // namespace
 
@@ -449,6 +475,79 @@ BEZEL_TEST(xmod_builtin_iface_conformance_3139, control_local_serialization_roun
         "  return p2.X * 10 + p2.Y; "
         "end Main; end C3139; ";
     BEZEL_EXPECT_EQ(compileAndRun3139(src), 34);
+}
+
+// ===========================================================================
+// §14.2 — imported class with WRONG IComparable type argument (#2772 item 2)
+// ===========================================================================
+
+// fix #2772 item 2 (spec §14.2, stdlib §4.4, v0.276): the class arm of the
+// IComparable gate must also check the TYPE ARGUMENT — the conformance
+// requirement is T: IComparable<T>, not just T: IComparable<Any>.  An
+// imported `class Wrong3139: IComparable<Other3139>` is NOT comparable by
+// Wrong3139's own identity; only Wrong3139: IComparable<Wrong3139> satisfies
+// the self-recurrence.
+//
+// Three directions are pinned:
+//   1. the LOCAL wrong-arg class is REJECTED (the #2772 item 2 fix)
+//   2. the IMPORTED wrong-arg class is REJECTED (the substitution check
+//      fires via baseTypeRefs even when declaresBuiltinInterface would admit)
+//   3. the CORRECT-arg imported class (Rank3139, from kLib3139 above) is
+//      STILL ACCEPTED (the #3139 fallback is not disturbed)
+//
+// The imported wrong-arg case is the residual hole the first revision of this
+// file left open: the #3139 fallback admitted any class that declared
+// IComparable via the symbol when baseTypeRefs was empty, but the #2772 item 2
+// fix only fires when baseTypeRefs was populated.  With
+// baseTypeRefsHasIComparableEntry tracking the presence of an IComparable entry
+// in baseTypeRefs, the fallback now fires only when baseTypeRefs is genuinely
+// absent — and the imported wrong-arg case has baseTypeRefs populated with the
+// IComparable<Other3139> entry, so the substitution check fires and rejects.
+
+// LOCAL CONTROL: a local wrong-arg class is correctly rejected (the #2772 fix).
+BEZEL_TEST(xmod_builtin_iface_conformance_3139,
+           sort_local_wrong_icomp_type_arg_rejected_spec_14_2) {
+    const char* src =
+        "module AppWL; "
+        "class OtherWL "
+        "  public constructor() end constructor; "
+        "end OtherWL; "
+        "class WrongWL: IComparable<OtherWL> "
+        "  private _v: int; "
+        "  public constructor(v: int) _v := v; end constructor; "
+        "  public method V(): int => _v; "
+        "  public method CompareTo(other: OtherWL): int => 0; "
+        "end WrongWL; "
+        "class C public static method Main(): int "
+        "  using var a := new WrongWL(3); "
+        "  using var b := new WrongWL(1); "
+        "  var arr: Array<WrongWL> := [a, b]; "
+        "  arr.Sort(); "
+        "  return 7; "
+        "end Main; end C; ";
+    BEZEL_EXPECT_EQ(compileAndRun3139(src), kCompileRejected3139);
+}
+
+// IMPORTED: an imported wrong-arg class is rejected via the substitution check
+// (baseTypeRefs is populated with IComparable<Other3139>, the substituted
+// comparison IComparable<Other3139> vs Wrong3139 fails, and
+// declaresBuiltinInterface is not consulted because baseTypeRefsHasIComparableEntry
+// is true).
+BEZEL_TEST(xmod_builtin_iface_conformance_3139,
+           sort_imported_wrong_icomp_type_arg_rejected_spec_14_2) {
+    BEZEL_EXPECT_EQ(
+        compileImportAndRun3139(kLib3139, importer3139(kSortWrongArgBody3139)),
+        kCompileRejected3139);
+}
+
+// IMPORTED CORRECT-ARG CONTROL: the existing #3139 guard — an imported class
+// that DOES implement IComparable<Self> correctly must still be ACCEPTED.
+// This is the headline row from this file: the first test added in the
+// pre-regression version of this branch, pinned at value 27.
+BEZEL_TEST(xmod_builtin_iface_conformance_3139,
+           sort_imported_correct_icomp_still_sorts_spec_14_2) {
+    BEZEL_EXPECT_EQ(
+        compileImportAndRun3139(kLib3139, importer3139(kSortBody3139)), 27);
 }
 
 }  // namespace bezel::module
