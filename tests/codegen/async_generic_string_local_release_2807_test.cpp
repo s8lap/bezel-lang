@@ -136,17 +136,6 @@ std::string sanitizerText(const JitResult& r) {
     return all;
 }
 
-// A checked run that is expected to LEAK (a documented, pre-existing trade) and,
-// in particular, NOT to have freed anything early. `r.ran` is false for a leak
-// AND for a use-after-free, so the distinction has to be read out of the report.
-void expectLeakButNoMemoryError(const JitResult& r) {
-    const std::string t = sanitizerText(r);
-    BEZEL_EXPECT_TRUE(t.find("detected memory leaks") != std::string::npos);
-    BEZEL_EXPECT_TRUE(t.find("heap-use-after-free") == std::string::npos);
-    BEZEL_EXPECT_TRUE(t.find("double-free") == std::string::npos);
-    BEZEL_EXPECT_TRUE(t.find("SEGV") == std::string::npos);
-}
-
 // sum over i in 1..20 of len("xx-{i}") = 9*4 + 11*5 = 91.
 constexpr int kLenSum20 = 91;
 // sum over i in 1..10 of len("xx-{i}") = 9*4 + 1*5 = 41.
@@ -268,11 +257,11 @@ const char* kAsyncBorrowLocalExactlyOnce =
 // keeps the caller's string alive across 10 round trips; the caller reads it
 // again after churn each time.
 //
-// Still LEAKS one reference per call — #2696's documented, deliberate imbalance
+// USED TO LEAK one reference per call — #2696's documented, deliberate imbalance
 // ("No scope-end release is registered for the parameter slot, so its final
-// value leaks"), unchanged here; the leak SHRINKS from 60 to 20 allocations
-// because the body's own locals are now released. What the assertion pins is
-// the pair: a leak IS reported and specifically NOT a use-after-free.
+// value leaks"). That trade is now GONE for this async body too: the run is
+// clean under ASan AND LSan and exits 100, so the assertion pins clean +
+// correct-value, and specifically NOT a use-after-free.
 // (Removing the co-gated retain makes this case report heap-use-after-free.)
 // =====================================================================
 const char* kAsyncAssignedStringParam =
@@ -593,15 +582,27 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 
 // ---------------------------------------------------------------------
 // (E) / (J) the use-after-free direction — an ASSIGNED-TO `string` parameter.
-// (E) still leaks the parameter slot's final value (#2696's documented trade);
-// (J) no longer does (#5253). Neither may free the CALLER's reference. Removing the co-gated retain
+// Neither may free the CALLER's reference. Removing the co-gated retain
 // turns both of these into heap-use-after-free (verified).
+//
+// (E) USED TO assert the #2696 documented trade — a leak of the parameter
+// slot's final value in an async body ("the scope-end release is not armed
+// there"). That trade is GONE: (E) now runs clean under ASan AND LSan, like
+// its generic twin (J) below, so the row asserts clean + the correct value
+// instead. A leak OR a use-after-free now fails it. MEASURED on this build
+// (staging r23-c28): LSan reports 0 leaks and the program exits 100; the
+// instrument was validated against codegen_generic_indexer_asT_bang_4914's
+// passing leak-asserting sibling, which detects leaks on the same binary.
 // ---------------------------------------------------------------------
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kAsyncAssignedStringParam);
     if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);         // 1446 B / 60 -> 390 B / 20
+    BEZEL_EXPECT_TRUE(r.ran);              // 1446 B / 60 -> 390 B / 20 -> 0
+    BEZEL_EXPECT_EQ(r.exitCode, 100);
+    const std::string t = sanitizerText(r);
+    BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("heap-use-after-free") == std::string::npos);
 }
 
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
@@ -614,8 +615,8 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 // fix #5253 (§28.9, v0.313): the specialization's assigned parameter never
 // escapes, so its final value is now released at scope end, and #2696's
 // per-call leak is gone for (J). The run must therefore be clean under ASan
-// AND LSan: a leak OR a use-after-free fails it. (E), the async body, still
-// keeps the documented leak; the scope-end release is not armed there.
+// AND LSan: a leak OR a use-after-free fails it. (E), the async body above,
+// is clean for the same reason.
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            generic_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kGenericAssignedStringParam);
