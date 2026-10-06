@@ -13124,6 +13124,64 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             for (std::size_t ai = 0; ai < call.args.size(); ++ai) {
                 const ast::CallArgument& a = call.args[ai];
                 const int fj = argToFormal[ai];
+                // Determine the formal parameter's ref/out modifier from the
+                // imported ParameterSymbol; also honour the call-site modifier
+                // (a.modifier carries "ref"/"out" written at the call site).
+                // Compute this BEFORE the `!a.value` bail so the discard path
+                // (a.value == nullptr, a.isDiscard == true) can use it.
+                const std::size_t pi = static_cast<std::size_t>(fj);
+                std::string_view formalMod;
+                const sema::TypeRef* formalTy = nullptr;
+                if (pi < ms->params.size()) {
+                    if (auto* ps =
+                            dynamic_cast<sema::ParameterSymbol*>(ms->params[pi])) {
+                        formalMod = ps->modifier;
+                        formalTy = ps->resolvedDeclType;
+                    }
+                }
+                // fix #5338 (§22.6, v0.313): `out _` against an IMPORTED
+                // `out owned` formal was abandoned here (a.value is null for a
+                // discard, so `!a.value` was true and the call returned nullptr).
+                // Mirrors buildOrderedArgs' discard handling (LlvmBackend_Assign
+                // :14452-14538): allocate a scratch slot and use it for the
+                // call; for `out owned` class/interface also register for
+                // disposal (§28.3).  Sema already admitted the discard against
+                // this formal, so formalMod is "out" or "out owned".
+                if (a.isDiscard) {
+                    llvm::Type* slotTy =
+                        formalTy ? lowerTypeRef(formalTy) : nullptr;
+                    if (!slotTy) slotTy = i32();
+                    llvm::AllocaInst* scratch = entryAlloca(slotTy);
+                    // fix #5292 / §28.3 *Unbound owned temporaries* rule 1
+                    // (v0.313): `out _` against `out owned` class/interface.
+                    // Null-init the scratch (the callee will write the owned
+                    // value) and register for post-call disposal.
+                    if (formalMod == "out owned" &&
+                        slotTy == ptrTy() && formalTy &&
+                        formalTy->kind == sema::TypeRef::Kind::Named &&
+                        formalTy->declaration) {
+                        const ast::TypeDeclKind tk =
+                            formalTy->declaration->kind;
+                        if (tk == ast::TypeDeclKind::Class ||
+                            tk == ast::TypeDeclKind::Interface) {
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()), scratch);
+                            if (smStateStruct_)
+                                asyncHandlerSpillSlots_.push_back(scratch);
+                            discardOwnedOutSlots_.push_back(scratch);
+                            // #1833 (a) / §22.4 / §28.3: unwind-only disposal
+                            // if the callee writes the scratch then throws.
+                            if (!disposeStack_.empty()) {
+                                Disposal d{scratch, nullptr};
+                                d.unwindOnly = true;
+                                d.dynamicDispose = true;
+                                disposeStack_.back().push_back(d);
+                            }
+                        }
+                    }
+                    ordered[pi] = scratch;
+                    continue;
+                }
                 if (!a.value || fj < 0) {
                     if (didPrePass) {
                         genericSubst_ = std::move(preSavedSubst);
@@ -13135,19 +13193,6 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     emitAccessorRefArgWriteBacks(accessorRefArgs,
                                                  /*emit=*/false);
                     return nullptr;
-                }
-                // Determine the formal parameter's ref/out modifier from the
-                // imported ParameterSymbol; also honour the call-site modifier
-                // (a.modifier carries "ref"/"out" written at the call site).
-                const std::size_t pi = static_cast<std::size_t>(fj);
-                std::string_view formalMod;
-                const sema::TypeRef* formalTy = nullptr;
-                if (pi < ms->params.size()) {
-                    if (auto* ps =
-                            dynamic_cast<sema::ParameterSymbol*>(ms->params[pi])) {
-                        formalMod = ps->modifier;
-                        formalTy = ps->resolvedDeclType;
-                    }
                 }
                 bool byRef = isByRefMod(a.modifier) || isByRefMod(formalMod);
                 llvm::Value* v;
