@@ -7356,8 +7356,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 } else {
                     recvName = std::string(recvTy->headName());
                 }
+                // fix #2433 (§14.2, v0.237): promote to Error when the
+                // substitution is known (genericSubstSemaTy_ non-empty).
+                // At a substitution site, the substituted concrete type IS
+                // known and the absent member IS a definitive wrong-code
+                // bug — compiling silently with a zero/null value. The
+                // existing #2445 fieldAddr diagnostic handles field reads
+                // by name; this backstop handles non-field member reads
+                // (method calls) that bypass fieldAddr.
                 ctx_.diagnostics().report(
-                    Severity::Warning, ma->span.begin,
+                    !genericSubstSemaTy_.empty()
+                        ? Severity::Error
+                        : Severity::Warning,
+                    ma->span.begin,
                     "internal: codegen cannot read member '" +
                     std::string(ma->member) + "' on receiver of type '" +
                     recvName + "': permissive acceptance (spec §3 / "

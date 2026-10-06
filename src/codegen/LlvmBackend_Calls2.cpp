@@ -12106,8 +12106,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // `receiverName` lambda, not two copies (#2924's
                         // four-way-mirror finding).
                         std::string recvName = receiverName();
+                        // fix #2433 (§14.2, v0.237): promote to Error when
+                        // the substitution is known (genericSubstSemaTy_
+                        // non-empty). At a substitution site, the substituted
+                        // concrete type IS known and the absent member IS a
+                        // definitive wrong-code bug — compiling silently with
+                        // a zero/null value. The existing #2445 fieldAddr
+                        // diagnostic handles field reads by name; this
+                        // backstop handles non-field member accesses (method
+                        // calls) that bypass fieldAddr.
                         ctx_.diagnostics().report(
-                            Severity::Warning, call.span.begin,
+                            !genericSubstSemaTy_.empty()
+                                ? Severity::Error
+                                : Severity::Warning,
+                            call.span.begin,
                             "internal: codegen cannot dispatch member '" +
                             std::string(ma->member) + "' on receiver of type '" +
                             recvName + "': permissive acceptance (spec #3 / "
