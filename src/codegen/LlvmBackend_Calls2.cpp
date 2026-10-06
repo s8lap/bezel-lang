@@ -8028,25 +8028,78 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         }
         auto* fnTy = llvm::FunctionType::get(retTy, allArgTys, false);
         if (args.size() != allArgTys.size()) return nullptr;
-        // fix-forward #5281 (§4.6 / §28.9, v0.313): compute the borrowed-string pins
-        // for the closure-call path using the dedicated helper (operates on
-        // function-type funcParams instead of ParameterSymbol list). The throw-path
-        // release is handled by `stringPinArgUnwindCleanup` below; the normal-path
-        // release is at the `releaseBorrowedStringArgPins(stringPinArgs)` call.
+        // fix #5438 (§4.6 / §28.9 / §28.3, v0.313): release the borrowed-string
+        // pins this function's OWN argument loop took.
+        //
+        // `closureStringPins` (declared above, in the argument loop) is the
+        // #5347 pin: `emitStringRetain(v)` per borrowed by-value `string` /
+        // `string?` formal, collected in argument order. MEASURED before this
+        // fix (issue #5438): the retain fired but NOTHING discharged it — the
+        // release had been swapped for a SECOND, independent pin vector
+        // (`stringPinArgs`, from `emitBorrowedStringArgPinsForClosure`) that
+        // covers a disjoint argument set, so neither pin's reference was
+        // dropped on the normal-return edge and one string leaked per closure
+        // call that passes a borrowed string. LSan on the issue's repro:
+        // 731 bytes / 40 allocations over 20 iterations; a two-argument
+        // closure call leaked 72 bytes / 4 allocations (both arguments).
+        // `BEZEL_DUMP_IR` on the same program shows the retained value with no
+        // matching `bz_string_release` anywhere in the callee.
+        //
+        // The discharge must cover BOTH vectors, because the two pin sites are
+        // not alternatives — they fire on overlapping argument sets and each
+        // retain needs its own matching release:
+        //
+        //   * `closureStringPins`  — #5347, emitted inside the argument loop on
+        //     the pre-boxing `v`, keyed on `rt->funcParams[pi]`.
+        //   * `stringPinArgs`      — #5281, computed AFTER the loop from the
+        //     finished `args` vector, keyed on `args[fi + 1]` (args[0] is the
+        //     ENV pointer, not a user argument).
+        //
+        // Releasing only one leaves the other's retain unreleased, so the fix
+        // releases both, in the same argument order they were taken.
+        //
+        // WHY IT CANNOT OVER-RELEASE. Every entry in either vector is a
+        // `bz_string_retain` this same function emitted for a borrowed formal;
+        // the pin exists precisely so the callee's borrowed parameter has a
+        // live reference for the duration of the call (§4.6 — a parameter
+        // naming a `string` keeps reading that value for the whole call). The
+        // callee holds NO ownership of a by-value parameter (only a parameter
+        // the body ASSIGNS to is retained), so once the call returns the
+        // reference is the caller's again and dropping it is the matching
+        // discharge, not a free of something still borrowed. The vectors are
+        // empty unless a pin actually fired, and each pin appears exactly once
+        // in exactly one vector, so the retain/release counts stay paired.
+        //
+        // The throw edge is handled by `stringPinArgUnwindCleanup` below
+        // (§28.3 "Exception-path discharge" — exceptions do not produce
+        // leaks); the normal-return edge is discharged here, gated on
+        // `!diverged_` exactly as the `callBoundedClosures` release beside it
+        // is, so no release is emitted into unreachable IR.
+        //
+        // fix-forward #5281 (§4.6 / §28.9, v0.313): `emitBorrowedStringArgPinsForClosure`
+        // operates on function-type `funcParams` (a closure call carries no
+        // ParameterSymbol list). Its pins are the second vector.
         std::vector<const ast::Expr*> argExprs;
         argExprs.reserve(call.args.size());
         for (const auto& a : call.args) argExprs.push_back(a.value.get());
         const std::vector<llvm::Value*> stringPinArgs =
             emitBorrowedStringArgPinsForClosure(args, &argExprs, rt->funcParams);
-        // fix #5347: install the throw-path cleanup BEFORE `emitPendingCheck`.
-        // `emitPendingCheck` calls `unwindBB()` to set `call.unwind`'s branch
-        // target. By setting `unwindTarget_` to the cleanup block first,
-        // `call.unwind` will branch to cleanup, which releases pins then branches
-        // to the saved original `unwindTarget_`. This integrates the pin release
-        // INTO the throw chain rather than creating a parallel path.
+        // fix #5347 / #5438: install the throw-path cleanup BEFORE
+        // `emitPendingCheck`. `emitPendingCheck` calls `unwindBB()` to set
+        // `call.unwind`'s branch target. By setting `unwindTarget_` to the
+        // cleanup block first, `call.unwind` will branch to cleanup, which
+        // releases the pins then branches to the saved original
+        // `unwindTarget_`. This integrates the pin release INTO the throw
+        // chain rather than creating a parallel path. #5438: the cleanup must
+        // cover `closureStringPins` too — `stringPinArgUnwindCleanup` is handed
+        // ONE vector, so the two are concatenated into `allStringPins` and the
+        // cleanup drains both, in the order they were taken.
+        std::vector<llvm::Value*> allStringPins = closureStringPins;
+        allStringPins.insert(allStringPins.end(),
+                             stringPinArgs.begin(), stringPinArgs.end());
         llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
-        if (!stringPinArgs.empty())
-            unwindTarget_ = stringPinArgUnwindCleanup(stringPinArgs);
+        if (!allStringPins.empty())
+            unwindTarget_ = stringPinArgUnwindCleanup(allStringPins);
         // #719: a lambda body can `throw`; like a normal method call, propagate a
         // pending exception after the call instead of silently continuing with the
         // (default) result. Without this, `var fn := () => throw E(); var v := fn();`
@@ -8068,10 +8121,15 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // double-free).
         if (!diverged_) {
             for (llvm::Value* cl : callBoundedClosures) emitClosureRelease(cl);
-            // fix-forward #5281: release the borrowed-string-argument pins on the
-            // normal-return edge. The unwind path is handled by stringPinArgUnwind-
-            // Cleanup above, per §28.3's Exception-path discharge.
-            releaseBorrowedStringArgPins(stringPinArgs);
+            // fix #5438: discharge BOTH borrowed-string pin vectors on the
+            // normal-return edge — `closureStringPins` (#5347, taken in the
+            // argument loop) and `stringPinArgs` (#5281, computed after it).
+            // Before this the only release was of `stringPinArgs`, so every
+            // retain in `closureStringPins` leaked one string per call. The
+            // throw path is handled by the `stringPinArgUnwindCleanup` above,
+            // per §28.3's Exception-path discharge; see the rationale for why
+            // this cannot over-release at the `allStringPins` construction.
+            releaseBorrowedStringArgPins(allStringPins);
         }
         return retTy->isVoidTy() ? nullptr : r;
     };
