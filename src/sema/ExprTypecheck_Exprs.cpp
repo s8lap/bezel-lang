@@ -1541,50 +1541,45 @@ void ExprTC::checkBuiltinCtorNamedArgs(const ast::NewExpr& ne,
     if (!bindBuiltinCandidates(cands, ne.args, ne.span.begin, desc, bb))
         return;  // the helper reported; no cascade
 
-    // Limitation 2 (the #3398 discipline): codegen's `lowerNew` lowers a
-    // built-in construction by argument POSITION (`ne.args[i]`), so a binding
-    // that is not the identity permutation would be honoured by sema and
-    // ignored by codegen — the silent field permutation this fix exists to
-    // remove. §22.5's *Evaluation order* rules out buying the reorder by
-    // permuting the argument list here ("A call's supplied argument
-    // expressions are evaluated in call-site textual order"), so the call is
-    // rejected until codegen can consume the binding (#3423).
+    // fix #3423 (§22.5, v0.283): same fix as checkBuiltinNamedArgs. Codegen
+    // lowers a builtin construction by argument POSITION (`ne.args[i]`), so a
+    // non-identity binding was honoured by sema and ignored by codegen — the
+    // silent wrong value this fix removes. Publish the binding and let codegen
+    // pre-evaluate args in textual order; §22.5 evaluation order is honoured.
     //
-    // The exception is the two record-shaped heads whose `lowerNew` arm
-    // already resolves each argument to its field slot BY NAME (#3098): for
-    // those the reorder is honoured end to end and must stay admitted.
+    // The exception is the two record-shaped heads whose `lowerNew` arm already
+    // resolves each argument to its field slot BY NAME (#3098): for those the
+    // reorder is honoured end to end and is handled by isBuiltinCtorLoweredByName.
     if (common::isBuiltinCtorLoweredByName(head)) return;
-    const std::vector<std::string_view>& names = bb.names;
-    for (std::size_t j = 0; j < names.size(); ++j) {
-        if (bb.bind.paramToArg[j] == static_cast<int>(j)) continue;
-        if (bb.bind.paramToArg[j] < 0) {
-            // A §22.5 optional parameter left to its default. Beyond the
-            // supplied count that is exactly what positional lowering does
-            // with a trailing omitted argument; WITHIN it, it is a genuine
-            // permutation codegen would get wrong.
-            if (j >= ne.args.size()) continue;
-            ctx_.diagnostics().report(
-                Severity::Error, ne.span.begin,
-                desc + ": a named argument that binds to a parameter other "
-                       "than its own position is not supported on a built-in "
-                       "constructor — `" + std::string(names[j]) +
-                    "` is parameter " + std::to_string(j + 1) +
-                    " but is left to its default while a later argument is "
-                    "supplied (\xC2\xA7""22.5, #3425). Pass the arguments in "
-                    "declaration order, or positionally.");
-            return;
+    if (!bb.bind.ok) return;  // binding failed; already diagnosed
+    bool nonIdentity = false;
+    for (std::size_t j = 0; j < bb.names.size(); ++j) {
+        if (bb.bind.paramToArg[j] != static_cast<int>(j)) {
+            nonIdentity = true;
+            break;
         }
-        const std::size_t ai = static_cast<std::size_t>(bb.bind.paramToArg[j]);
-        ctx_.diagnostics().report(
-            Severity::Error, ne.span.begin,
-            desc + ": a named argument that binds to a parameter other than "
-                   "its own position is not supported on a built-in "
-                   "constructor — `" + std::string(names[j]) +
-                "` is parameter " + std::to_string(j + 1) +
-                " but is written as argument " + std::to_string(ai + 1) +
-                " (\xC2\xA7""22.5, #3425). Pass the arguments in declaration "
-                "order, or positionally.");
-        return;
+    }
+    if (nonIdentity) {
+        // Reject the skip-with-later-arg case: a required parameter is skipped
+        // while a later argument is supplied (codegen has no value for it).
+        for (std::size_t j = 0; j < bb.names.size(); ++j) {
+            if (bb.bind.paramToArg[j] < 0 && j < ne.args.size()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    desc + ": a named argument that binds to a parameter other "
+                           "than its own position is not supported on a built-in "
+                           "constructor — `" + std::string(bb.names[j]) +
+                        "` is parameter " + std::to_string(j + 1) +
+                        " but is left to its default while a later argument is "
+                        "supplied (\xC2\xA7""22.5, #3425). Pass the arguments "
+                        "in declaration order, or positionally.");
+                return;
+            }
+        }
+        // Publish the binding: codegen will pre-evaluate args in textual order
+        // and pin each result, then dispatch the builtin arm with the binding
+        // applied so each parameter receives the correct source argument value.
+        ctx_.setBuiltinCallBinding(&ne, bb.bind.paramToArg);
     }
 }
 

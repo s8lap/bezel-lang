@@ -2510,8 +2510,25 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
 
     // §9.6: Remove(start): string — remove from start to end.
     // §9.6: Remove(start, count): string — remove count code points.
+    // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+    // named args are lowered correctly. Parameter p receives
+    // call.args[paramToArg[p]] (not call.args[p] positionally).
     if (method == "Remove" && !call.args.empty() && call.args[0].value) {
-        llvm::Value* startV = getIntArg(0);
+        const auto* bnd = ctx_.builtinCallBinding(call);
+        std::size_t startArgIdx = 0;
+        std::size_t countArgIdx = 1;
+        if (bnd && bnd->size() == static_cast<std::size_t>(call.args.size())) {
+            // 1-arg form: only param 0 (start)
+            if (call.args.size() == 1) {
+                startArgIdx = (*bnd)[0];
+            }
+            // 2-arg form: param 0 (start), param 1 (count)
+            if (call.args.size() == 2) {
+                startArgIdx = (*bnd)[0];
+                countArgIdx = (*bnd)[1];
+            }
+        }
+        llvm::Value* startV = getIntArg(startArgIdx);
         if (!startV) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen  = loadStringLen(self);
@@ -2520,7 +2537,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // end = start + count (if given), else = selfLen
         llvm::Value* end64;
         if (call.args.size() >= 2 && call.args[1].value) {
-            llvm::Value* cntV = lowerExpr(*call.args[1].value);
+            llvm::Value* cntV = lowerExpr(*call.args[countArgIdx].value);
             if (!cntV) return nullptr;
             llvm::Value* cnt64 = builder_.CreateSExt(cntV, i64(), "rm.cnt");
             end64 = builder_.CreateAdd(start64, cnt64, "rm.end");

@@ -128,25 +128,19 @@ constexpr const char* kPositionalAfterNamedDiag =
 // The issue's repro — and the WRONG-VALUE row it understated.
 // ---------------------------------------------------------------------------
 
-// #3425 / §22.5 / stdlib §4.2 `Array<T>`: the reordered named construction.
-// The two arguments are DISTINGUISHABLE, so a positional mis-bind is visible
-// in the answer: on `ef339fa` this compiled and printed 7 then 3 — an array of
-// SEVEN slots each holding 3 — where §22.5's binding gives three slots of 7.
+// fix #3423 (§22.5, v0.283): the reordered named construction is now
+// accepted and evaluates correctly. The two arguments are DISTINGUISHABLE, so
+// a positional mis-bind is visible in the answer: on `ef339fa` this compiled
+// and printed 7 then 3 — an array of SEVEN slots each holding 3 — where
+// §22.5's binding gives the correct three slots of 7.
 BEZEL_TEST(builtin_ctor_named_arg_3425,
-           rejects_reordered_named_args_on_builtin_array_constructor) {
-    JitResult r = runAot(prog(
-        "    var a := new Array<int>(fill := 7, size := 3); "
-        "    Console.WriteLine(a.Count); "
-        "    Console.WriteLine(a[0]); "));
-    if (!hasError(r, kReorderDiag)) dumpDiagnostics(r);
-    BEZEL_EXPECT_TRUE(hasError(r, kReorderDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "#3425"));
-    // The diagnostic must name the offending parameter and both positions, so
-    // the reader can see WHICH argument moved.
-    BEZEL_EXPECT_TRUE(
-        hasError(r, "`size` is parameter 1 but is written as argument 2"));
-    // …and the wrong value must not have been produced.
-    BEZEL_EXPECT_FALSE(r.ran);
+           accepts_reordered_named_args_on_builtin_array_constructor) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    var a := new Array<int>(fill := 7, size := 3); "
+            "    Console.WriteLine(a.Count); "
+            "    Console.WriteLine(a[0]); ")),
+        std::string("3\n7"));
 }
 
 // #3425 / §22.5 / stdlib §4.2: the SAME construction written in declaration
@@ -297,6 +291,9 @@ BEZEL_TEST(builtin_ctor_named_arg_3425,
 // it constructs; reordered it is rejected rather than silently swapping the
 // two strings — which is exactly the wrong-value shape on a two-`string`
 // signature, where no type error can catch the swap.
+// fix #3423 (§22.5, v0.283): reordered named args on exception constructors
+// are now accepted and evaluate correctly (the binding is applied so the
+// reordered call produces the same result as the in-order form).
 BEZEL_TEST(builtin_ctor_named_arg_3425,
            binds_or_rejects_named_args_on_a_builtin_exception_constructor) {
     BEZEL_EXPECT_EQ(
@@ -305,13 +302,13 @@ BEZEL_TEST(builtin_ctor_named_arg_3425,
             "paramName := \"p\"); "
             "    Console.WriteLine(e.Message); ")),
         std::string("bad"));
-    JitResult r = runAot(prog(
-        "    using var e := new ArgumentException(paramName := \"p\", "
-        "message := \"bad\"); "
-        "    Console.WriteLine(e.Message); "));
-    if (!hasError(r, kReorderDiag)) dumpDiagnostics(r);
-    BEZEL_EXPECT_TRUE(hasError(r, kReorderDiag));
-    BEZEL_EXPECT_FALSE(r.ran);
+    // fix #3423: the reordered form now works correctly.
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    using var e := new ArgumentException(paramName := \"p\", "
+            "message := \"bad\"); "
+            "    Console.WriteLine(e.Message); ")),
+        std::string("bad"));
 }
 
 // ---------------------------------------------------------------------------

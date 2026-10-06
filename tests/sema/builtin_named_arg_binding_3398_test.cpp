@@ -143,23 +143,19 @@ constexpr const char* kPositionalAfterNamedDiag =
 // The issue's repro — the WRONG-ANSWER row.
 // ---------------------------------------------------------------------------
 
-// #3398 / §22.5: the reordered named call on a built-in. On the pre-fix tree
-// this compiled and printed "hello " (i.e. it evaluated `Remove(6, 5)`); the
+// fix #3423 (§22.5, v0.283): the reordered named call on a built-in is now
+// accepted and evaluates correctly. On the pre-fix tree this compiled and
+// printed "hello " (i.e. it evaluated `Remove(6, 5)` by position); the
 // identical call on a user-declared `Remove(startIndex, length)` prints
-// "hello". The value must never again be produced silently.
+// "hello". With the binding published to codegen and applied before the
+// builtin arm, the result is now "hello" — the correct value.
 BEZEL_TEST(builtin_named_arg_3398,
-           rejects_reordered_named_args_on_builtin_string_remove) {
-    JitResult r = runAot(prog(
-        "    var s := \"hello world\"; "
-        "    Console.WriteLine(s.Remove(length := 6, startIndex := 5)); "));
-    if (!hasError(r, kReorderDiag)) dumpDiagnostics(r);
-    BEZEL_EXPECT_TRUE(hasError(r, kReorderDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "#3398"));
-    // The diagnostic must name the offending parameter and both positions, so
-    // the reader can see WHICH argument moved. The loop reports the FIRST
-    // formal whose binding is not the identity, i.e. parameter 1.
-    BEZEL_EXPECT_TRUE(hasError(r, "`startIndex` is parameter 1 but is written "
-                                  "as argument 2"));
+           accepts_reordered_named_args_on_builtin_string_remove) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    var s := \"hello world\"; "
+            "    Console.WriteLine(s.Remove(length := 6, startIndex := 5)); ")),
+        std::string("hello"));
 }
 
 // #3398 / §22.5: nonsense parameter names on a built-in were accepted and
@@ -411,22 +407,20 @@ BEZEL_TEST(builtin_named_arg_3398,
         std::string("2"));
 }
 
-// #3398 / stdlib §3.2 / §1: the reordered form. On the pre-fix tree the
+// fix #3423 (§22.5, v0.283): the reordered form. On the pre-fix tree the
 // GetString analogue of this row did not merely mis-evaluate — the arguments
 // were passed in WRITTEN order, so codegen emitted malformed IR ("SExt only
 // operates on integer", "Call parameter type does not match function
-// signature"). §22.5's rejection replaces a codegen ICE with a diagnostic
-// that names the problem.
+// signature"). With the binding published and applied, the result is now "2".
 BEZEL_TEST(builtin_named_arg_3398,
-           rejects_reordered_named_args_on_encoding_getbytes) {
-    JitResult r = runAot(prog(
-        "    using var dst := new Array<byte>(4, 0); "
-        "    var n := Encoding.UTF8.GetBytes(destination := dst.AsSpan(), "
-        "s := \"Hi\"); "
-        "    Console.WriteLine(n); "));
-    if (!hasError(r, kReorderDiag)) dumpDiagnostics(r);
-    BEZEL_EXPECT_TRUE(hasError(r, kReorderDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "`Encoding.GetBytes`"));
+           accepts_reordered_named_args_on_encoding_getbytes) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    using var dst := new Array<byte>(4, 0); "
+            "    var n := Encoding.UTF8.GetBytes(destination := dst.AsSpan(), "
+            "s := \"Hi\"); "
+            "    Console.WriteLine(n); ")),
+        std::string("2"));
 }
 
 // #3398 / stdlib §3.2: the issue's own `Encoding` row — nonsense names were
@@ -496,15 +490,17 @@ BEZEL_TEST(builtin_named_arg_3398,
     BEZEL_EXPECT_TRUE(hasError(r, "`String.From`"));
 }
 
-// #3398: the static reorder.
+// fix #3423 (§22.5, v0.283): the static reorder. With the binding published
+// and applied, the reordered call produces the same result as the in-order
+// form: "bc".
 BEZEL_TEST(builtin_named_arg_3398,
-           rejects_reordered_named_args_on_static_string_from) {
-    JitResult r = runAot(prog(
-        "    var buf: Array<char> := ['a', 'b', 'c']; "
-        "    Console.WriteLine(String.From(length := 2, start := 1, "
-        "buffer := buf)); "));
-    if (!hasError(r, kReorderDiag)) dumpDiagnostics(r);
-    BEZEL_EXPECT_TRUE(hasError(r, kReorderDiag));
+           accepts_reordered_named_args_on_static_string_from) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    var buf: Array<char> := ['a', 'b', 'c']; "
+            "    Console.WriteLine(String.From(length := 2, start := 1, "
+            "buffer := buf)); ")),
+        std::string("bc"));
 }
 
 // ---------------------------------------------------------------------------

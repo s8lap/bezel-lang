@@ -89,10 +89,16 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     // GetBytes(s, destination: Span<byte>): int — v0.165 (#1355) 2-arg overload.
     // Encodes `s` into an existing writable byte span; returns bytes written.
     // IndexOutOfRangeException if the span is shorter than the encoded length.
+    // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+    // named args are lowered correctly. Parameter p receives
+    // call.args[paramToArg[p]] (not call.args[p] positionally).
     if (m == "GetBytes" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* strPtr  = lowerExpr(*call.args[0].value);
-        llvm::Value* spanVal = lowerExpr(*call.args[1].value);
+        const auto* bnd = ctx_.builtinCallBinding(call);
+        std::size_t strArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+        std::size_t spanArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+        llvm::Value* strPtr  = lowerExpr(*call.args[strArgIdx].value);
+        llvm::Value* spanVal = lowerExpr(*call.args[spanArgIdx].value);
         if (!strPtr || !spanVal) return nullptr;
         // Count bytes needed.
         std::string cntFnName = "bz_encoding_" +
@@ -895,11 +901,24 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // bz_str_from_char_array (the inverse of ToCharArray). Out-of-range start /
     // count raise IndexOutOfRangeException (the §4.6 / stdlib bounds convention),
     // checked here against the array's Count before the runtime call.
+    // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+    // named args are lowered correctly. Parameter p receives
+    // call.args[paramToArg[p]] (not call.args[p] positionally).
     if (pt == P::String && m == "From" && call.args.size() == 3 &&
         call.args[0].value && call.args[1].value && call.args[2].value) {
-        llvm::Value* arr   = lowerExpr(*call.args[0].value);
-        llvm::Value* start = lowerExpr(*call.args[1].value);
-        llvm::Value* count = lowerExpr(*call.args[2].value);
+        const auto* bnd = ctx_.builtinCallBinding(call);
+        // Determine which arg fills each parameter (apply binding permutation).
+        std::size_t argForParam[3];
+        if (bnd && bnd->size() == 3) {
+            argForParam[0] = (*bnd)[0];
+            argForParam[1] = (*bnd)[1];
+            argForParam[2] = (*bnd)[2];
+        } else {
+            argForParam[0] = 0; argForParam[1] = 1; argForParam[2] = 2;
+        }
+        llvm::Value* arr = lowerExpr(*call.args[argForParam[0]].value);
+        llvm::Value* start = lowerExpr(*call.args[argForParam[1]].value);
+        llvm::Value* count = lowerExpr(*call.args[argForParam[2]].value);
         if (!arr || !start || !count) return nullptr;
         llvm::Value* start64 = builder_.CreateSExt(start, i64(), "from.start");
         llvm::Value* count64 = builder_.CreateSExt(count, i64(), "from.count");
@@ -1001,10 +1020,16 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // since fix #4487; `bz_string_compare` before it).
     // §9.6 (static): string.Repeat(c: char, count: int): string — a `count`-long
     // string of the single code point `c`. Width-1 byte mode (ASCII fast path).
+    // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+    // named args are lowered correctly. Parameter p receives
+    // call.args[paramToArg[p]] (not call.args[p] positionally).
     if (pt == P::String && m == "Repeat" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* ch  = lowerExpr(*call.args[0].value);
-        llvm::Value* cnt = lowerExpr(*call.args[1].value);
+        const auto* bnd = ctx_.builtinCallBinding(call);
+        std::size_t cArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+        std::size_t cntArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+        llvm::Value* ch  = lowerExpr(*call.args[cArgIdx].value);
+        llvm::Value* cnt = lowerExpr(*call.args[cntArgIdx].value);
         if (!ch || !cnt) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* count64 = cnt->getType()->isIntegerTy(64)
@@ -7092,6 +7117,46 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (auto* v = tryLowerTcsCall(call)) return v;
     // §6.4 / issue #647: Atomic<T> / AtomicInteger<T> instance methods.
     if (auto* v = tryLowerAtomicCall(call)) return v;
+    // fix #3423 (§22.5, v0.283): a non-identity builtin call binding (published
+    // by sema's checkBuiltinNamedArgs) means one or more named arguments bind to
+    // different parameter positions. Codegen's builtin arms consume args[i] by
+    // PARAMETER position, so the binding must be applied. Pre-evaluate every
+    // supplied argument expression in TEXTUAL order and pin each result in
+    // exprValueOverride_: when the builtin arm calls lowerExpr on any arg
+    // expression, it hits the pin and receives the value already computed.
+    // §22.5's evaluation order is honoured: expressions run once, in source
+    // order. The binding tells the builtin arm which source argument feeds
+    // which parameter slot.
+    if (const auto* bnd = ctx_.builtinCallBinding(call)) {
+        // Check for non-identity (a reorder is pending).
+        bool isNonIdentity = false;
+        for (std::size_t j = 0; j < bnd->size(); ++j) {
+            if ((*bnd)[j] != static_cast<int>(j)) { isNonIdentity = true; break; }
+        }
+        if (isNonIdentity) {
+            // Pre-evaluate every supplied argument expression in textual order,
+            // pinning each result. Lowering is best-effort: if any argument
+            // fails to lower, the builtin arm will see nullptr and return.
+            for (const auto& arg : call.args) {
+                if (arg.value) {
+                    // Skip args that are not plain value expressions (ref/out
+                    // modifiers, discards). These are positional-only and always
+                    // sit in the identity prefix of any binding.
+                    if (arg.isDiscard || !arg.modifier.empty()) continue;
+                    (void)lowerExpr(*arg.value);
+                    // If lowerExpr returned nullptr, the builtin arm will also
+                    // return nullptr; leave the partial pins in place (they
+                    // belong to this call and no other call's expressions can
+                    // collide with them).
+                }
+            }
+            // The pinned values are in exprValueOverride_; the builtin arm's
+            // lowerExpr calls will find them and use the pre-computed values.
+            // exprValueOverride_ is not cleared here — entries from a single
+            // call's pre-pass do not collide with later calls (each call has
+            // unique expression pointers).
+        }
+    }
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
     if (auto* v = tryLowerBuiltinClassCall(call)) return v;
     // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a

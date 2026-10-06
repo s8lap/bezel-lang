@@ -9516,10 +9516,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         }
         // §3.1: Insert(index: int, value: string): StringBuilder — flatten,
         // insert, reset to one part (runtime helper). Returns this for chaining.
+        // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+        // named args are lowered correctly. Parameter p receives
+        // call.args[paramToArg[p]] (not call.args[p] positionally).
         if (m == "Insert" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* idx = lowerExpr(*call.args[0].value);
-            llvm::Value* val = lowerExpr(*call.args[1].value);
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            std::size_t idxArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+            std::size_t valArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+            llvm::Value* idx = lowerExpr(*call.args[idxArgIdx].value);
+            llvm::Value* val = lowerExpr(*call.args[valArgIdx].value);
             if (!idx || !val) return nullptr;
             llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
                 ? idx : builder_.CreateSExt(idx, i64());
@@ -9529,10 +9535,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return recv;
         }
         // §3.1: Remove(startIndex: int, length: int): StringBuilder.
+        // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+        // named args are lowered correctly. Parameter p receives
+        // call.args[paramToArg[p]] (not call.args[p] positionally).
         if (m == "Remove" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* start = lowerExpr(*call.args[0].value);
-            llvm::Value* len   = lowerExpr(*call.args[1].value);
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            std::size_t startArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+            std::size_t lenArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+            llvm::Value* start = lowerExpr(*call.args[startArgIdx].value);
+            llvm::Value* len   = lowerExpr(*call.args[lenArgIdx].value);
             if (!start || !len) return nullptr;
             llvm::Value* start64 = start->getType()->isIntegerTy(64)
                 ? start : builder_.CreateSExt(start, i64());
@@ -9544,10 +9556,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return recv;
         }
         // §3.1: Replace(oldValue: string, newValue: string): StringBuilder.
+        // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+        // named args are lowered correctly. Parameter p receives
+        // call.args[paramToArg[p]] (not call.args[p] positionally).
         if (m == "Replace" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* oldV = lowerExpr(*call.args[0].value);
-            llvm::Value* newV = lowerExpr(*call.args[1].value);
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            std::size_t oldArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+            std::size_t newArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+            llvm::Value* oldV = lowerExpr(*call.args[oldArgIdx].value);
+            llvm::Value* newV = lowerExpr(*call.args[newArgIdx].value);
             if (!oldV || !newV) return nullptr;
             auto* fn = declareC("bz_sb_replace", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});
@@ -9558,10 +9576,16 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Substitutes {N} placeholders with args[N].ToString() and appends the
         // result (bz_sb_append_format runtime helper). fix #1179: previously
         // this had no dispatch case and the call fell through as a silent no-op.
+        // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
+        // named args are lowered correctly. Parameter p receives
+        // call.args[paramToArg[p]] (not call.args[p] positionally).
         if (m == "AppendFormat" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* fmtV  = lowerExpr(*call.args[0].value);
-            llvm::Value* argsV = lowerExpr(*call.args[1].value);
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            std::size_t fmtArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+            std::size_t argsArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+            llvm::Value* fmtV  = lowerExpr(*call.args[fmtArgIdx].value);
+            llvm::Value* argsV = lowerExpr(*call.args[argsArgIdx].value);
             if (!fmtV || !argsV) return nullptr;
             auto* fn = declareC("bz_sb_append_format", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});

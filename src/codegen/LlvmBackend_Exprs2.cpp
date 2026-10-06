@@ -6279,6 +6279,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // value the constructor wrote (the call-site analogue of ensureOutVarSlots).
     ensureCtorOutVarSlots(ne, rt);
     if (!rt->declaration) {
+        // fix #3423 (§22.5, v0.283): same pre-pass as lowerCallDispatch.
+        // A non-identity builtin ctor binding (published by sema's
+        // checkBuiltinCtorNamedArgs) means named args bind to different parameter
+        // positions. Pre-evaluate every supplied argument expression in TEXTUAL order,
+        // pinning each result in exprValueOverride_: when the builtin ctor arm
+        // calls lowerExpr on any ne.args[i].value expression, it hits the pin
+        // and receives the already-computed value. §22.5 evaluation order is
+        // honoured: expressions run once, in source order.
+        if (const auto* bnd = ctx_.builtinCallBinding(ne)) {
+            bool isNonIdentity = false;
+            for (std::size_t j = 0; j < bnd->size(); ++j) {
+                if ((*bnd)[j] != static_cast<int>(j)) { isNonIdentity = true; break; }
+            }
+            if (isNonIdentity) {
+                for (const auto& arg : ne.args) {
+                    if (arg.value) {
+                        if (arg.isDiscard || !arg.modifier.empty()) continue;
+                        (void)lowerExpr(*arg.value);
+                    }
+                }
+            }
+        }
         // §6.5 / §24 (#1646): user construction of a producer-side event source
         // — `new EventSource<T>()` / `new AsyncEventSource<T>()` (the constructors
         // are public as of stdlib §6.5, v0.187). These have no user TypeSymbol
@@ -6323,9 +6345,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
                 builder_.CreateStore(vit->second, obj);
                 auto* i8Ty2 = llvm::Type::getInt8Ty(llvm_);
+                // fix #3423 (§22.5, v0.283): apply the binding permutation so
+                // reordered named args are lowered correctly. Parameter p receives
+                // ne.args[paramToArg[p]] (not ne.args[p] positionally).
+                const auto* bnd = ctx_.builtinCallBinding(ne);
+                std::size_t msgArgIdx = 0;
+                std::size_t pnArgIdx = 1;
+                if (bnd && bnd->size() == ne.args.size()) {
+                    msgArgIdx = (*bnd)[0];
+                    if (ne.args.size() >= 2) pnArgIdx = (*bnd)[1];
+                }
                 // arg0 = message (string).
-                if (!ne.args.empty() && ne.args[0].value) {
-                    llvm::Value* msgStr = lowerExpr(*ne.args[0].value);
+                if (!ne.args.empty() && ne.args[msgArgIdx].value) {
+                    llvm::Value* msgStr = lowerExpr(*ne.args[msgArgIdx].value);
                     if (msgStr) {
                         // §31.1 / §28.9 (#1033): the exception OWNS its Message.
                         // A +1 producer (interpolation / `+` / slice / ToString)
@@ -6336,7 +6368,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // released by the built-in exception disposer
                         // (bz$exDisposeMsg) on disposal; before this the +1
                         // from `new Exception($"...")` leaked (#1033).
-                        if (!isPlusOneStringProducer(ne.args[0].value.get()))
+                        if (!isPlusOneStringProducer(ne.args[msgArgIdx].value.get()))
                             emitStringRetain(msgStr);
                         llvm::Value* msgSlot = builder_.CreateGEP(
                             i8Ty2, obj, builder_.getInt64(kExcMsgOffset));
@@ -6347,18 +6379,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // (§31.4): a `string` second argument is ArgumentException's
                 // paramName (→ ParamName@32); anything else is the (message,
                 // cause) overload's cause, snapshotted into CauseChain@24 (#811).
-                if (ne.args.size() >= 2 && ne.args[1].value) {
-                    const sema::TypeRef* a1ty = ctx_.exprType(*ne.args[1].value);
+                if (ne.args.size() >= 2 && ne.args[pnArgIdx].value) {
+                    const sema::TypeRef* a1ty = ctx_.exprType(*ne.args[pnArgIdx].value);
                     bool argIsString = a1ty &&
                         a1ty->kind == sema::TypeRef::Kind::Primitive &&
                         a1ty->primitive == sema::PrimitiveType::String;
                     if (argIsString) {
-                        llvm::Value* pn = lowerExpr(*ne.args[1].value);
+                        llvm::Value* pn = lowerExpr(*ne.args[pnArgIdx].value);
                         if (pn) {
                             // §31.1 / §28.9 (#1033): ParamName is an owned
                             // string slot, same retain/transfer model as the
                             // Message above (released by bz$exDisposeMsg).
-                            if (!isPlusOneStringProducer(ne.args[1].value.get()))
+                            if (!isPlusOneStringProducer(ne.args[pnArgIdx].value.get()))
                                 emitStringRetain(pn);
                             llvm::Value* pnSlot = builder_.CreateGEP(
                                 i8Ty2, obj, builder_.getInt64(kExcParamOffset));
@@ -6366,7 +6398,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         }
                     } else {
                         // (message, cause): snapshot the borrowed cause (#811).
-                        llvm::Value* cause = lowerExpr(*ne.args[1].value);
+                        llvm::Value* cause = lowerExpr(*ne.args[pnArgIdx].value);
                         if (cause) {
                             // §31.4: a USER exception subclass also carries
                             // the full built-in header (classStruct), so its
@@ -7110,9 +7142,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // Value types (byte, int, …) are stored by copy; class/interface
                 // elements are stored as borrowed references (Array<T> is always
                 // a borrowing collection — §4.4 — so aliasing is fine).
+                // fix #3423 (§22.5, v0.283): apply the binding permutation so
+                // reordered named args are lowered correctly.
                 if (colName == "Array" && ne.args.size() == 2 &&
                     ne.args[0].value && ne.args[1].value) {
-                    llvm::Value* sizeArg = lowerExpr(*ne.args[0].value);
+                    const auto* bnd = ctx_.builtinCallBinding(ne);
+                    std::size_t sizeArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+                    std::size_t fillArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+                    llvm::Value* sizeArg = lowerExpr(*ne.args[sizeArgIdx].value);
                     if (!sizeArg) return nullptr;
                     if (!sizeArg->getType()->isIntegerTy(64))
                         sizeArg = builder_.CreateSExt(sizeArg, i64());
@@ -7133,7 +7170,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (!rt->genericArgs.empty() && rt->genericArgs[0])
                         if (auto* et = lowerTypeRef(rt->genericArgs[0]))
                             elemLlvmTy = et;
-                    llvm::Value* fillVal = lowerExpr(*ne.args[1].value);
+                    llvm::Value* fillVal = lowerExpr(*ne.args[fillArgIdx].value);
                     if (fillVal) {
                         // Spill fill value into an alloca so bz_array_set
                         // can read it via a pointer (matching OwningBuffer init

@@ -16542,47 +16542,48 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
     const std::vector<std::string_view>& names = bb.names;
     const BindResult& b = bb.bind;
 
-    // Limitation 2 (see the header): codegen lowers a built-in call by
-    // argument POSITION (`call.args[i]`), so a binding that is not the
-    // identity permutation would be honoured by sema and ignored by codegen —
-    // the wrong answer this fix exists to remove. §22.5's *Evaluation order*
-    // rules out buying the reorder by permuting the argument list here
-    // ("supplied argument expressions are evaluated in call-site textual
-    // order"), so the call is rejected until codegen can consume the binding
-    // (#3423).
+    // fix #3423 (§22.5, v0.283): codegen lowers a built-in call by argument
+    // POSITION (`call.args[i]`), so a binding that is not the identity
+    // permutation was honoured by sema and ignored by codegen — the wrong
+    // answer #3398 removed. The fix is to publish the binding to SemaContext
+    // and consume it in codegen: pre-evaluate every supplied argument
+    // expression in TEXTUAL order, pin each result, then dispatch the builtin
+    // arm (which reads args by parameter position). §22.5's evaluation order
+    // is honoured because the expressions run exactly once, in source order.
+    //
+    // The skip-with-later-arg case is still rejected: when a required
+    // parameter is skipped (paramToArg[j] = -1 within the supplied range),
+    // codegen has no value to pass for it.
+    if (!b.ok) return;  // binding failed (e.g. unknown name); already diagnosed
+    // Check whether any parameter is reordered (non-identity) or skipped.
+    bool nonIdentity = false;
     for (std::size_t j = 0; j < names.size(); ++j) {
-        if (b.paramToArg[j] == static_cast<int>(j)) continue;
-        // fix #3424: a registry row may now carry §22.5 OPTIONAL parameters,
-        // so a formal beyond the supplied count is legitimately unbound (-1) —
-        // and that is exactly what positional lowering already does with a
-        // trailing omitted argument. A -1 WITHIN the supplied range is a
-        // genuine permutation (`M(a, c := 3)` skipping `b`), which codegen's
-        // by-position lowering would get wrong, so it falls through to the
-        // rejection below with the parameter named.
-        if (b.paramToArg[j] < 0) {
-            if (j >= ce.args.size()) continue;
-            ctx_.diagnostics().report(
-                Severity::Error, ce.span.begin,
-                desc + ": a named argument that binds to a parameter other "
-                       "than its own position is not supported on a built-in "
-                       "member — `" + std::string(names[j]) + "` is parameter " +
-                    std::to_string(j + 1) +
-                    " but is left to its default while a later argument is "
-                    "supplied (\xC2\xA7""22.5, #3398). Pass the arguments in "
-                    "declaration order, or positionally.");
-            return;
+        if (b.paramToArg[j] != static_cast<int>(j)) {
+            nonIdentity = true;
+            break;
         }
-        const std::size_t ai = static_cast<std::size_t>(b.paramToArg[j]);
-        ctx_.diagnostics().report(
-            Severity::Error, ce.span.begin,
-            desc + ": a named argument that binds to a parameter other than "
-                   "its own position is not supported on a built-in member — "
-                   "`" + std::string(names[j]) + "` is parameter " +
-                std::to_string(j + 1) + " but is written as argument " +
-                std::to_string(ai + 1) +
-                " (§22.5, #3398). Pass the arguments in declaration order, or "
-                "positionally.");
-        return;
+    }
+    if (nonIdentity) {
+        // Reject the skip-with-later-arg case: a required parameter is skipped
+        // while a later argument is supplied (codegen has no value for it).
+        for (std::size_t j = 0; j < names.size(); ++j) {
+            if (b.paramToArg[j] < 0 && j < ce.args.size()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    desc + ": a named argument that binds to a parameter other "
+                           "than its own position is not supported on a built-in "
+                           "member — `" + std::string(names[j]) + "` is parameter " +
+                        std::to_string(j + 1) +
+                        " but is left to its default while a later argument is "
+                        "supplied (\xC2\xA7""22.5, #3398). Pass the arguments "
+                        "in declaration order, or positionally.");
+                return;
+            }
+        }
+        // Publish the binding: codegen will pre-evaluate args in textual order
+        // and pin each result, then dispatch the builtin arm with the binding
+        // applied so each parameter receives the correct source argument value.
+        ctx_.setBuiltinCallBinding(&ce, b.paramToArg);
     }
 }
 

@@ -293,6 +293,20 @@ public:
         const ast::NewExpr& ne) const {
         return positionalBinding(ne);
     }
+    // fix #3423 (§22.5, v0.283): the §22.5 binding of a NAMED ARGUMENT on a
+    // BUILTIN member or constructor call. Sema computes `paramToArg` in
+    // `checkBuiltinNamedArgs` / `checkBuiltinCtorNamedArgs` but discarded it;
+    // publishing it here lets codegen pre-evaluate arguments in textual order,
+    // pin each result, and dispatch the builtin arm with a parameter-ordered
+    // view of the call — so §22.5's evaluation-order rule is honoured without
+    // permuting the AST.
+    void setBuiltinCallBinding(const ast::Expr* site, std::vector<int> binding) {
+        builtinCallBindings_[site] = std::move(binding);
+    }
+    const std::vector<int>* builtinCallBinding(const ast::Expr& site) const {
+        auto it = builtinCallBindings_.find(&site);
+        return it == builtinCallBindings_.end() ? nullptr : &it->second;
+    }
     // fix #4491 (§22.5 "Optional parameters and named arguments" / §22.8
     // step 0 / §22.10, v0.306): the §22.10 INHERITANCE-CLAUSE twin of the
     // table above — the §22.5 binding of `class D(v: int) : B(s := "c",
@@ -1215,6 +1229,11 @@ private:
     // has two call sites, one binder).
     std::unordered_map<const ast::Expr*, std::vector<int>>
         newExprPositionalBindings_;
+    // fix #3423 (§22.5, v0.283): see `setBuiltinCallBinding` / `builtinCallBinding`
+    // accessors above for the rationale. Local-only — never copied by ModuleLoader's
+    // body-reconstruction remap (builtin calls have no cross-module surface).
+    std::unordered_map<const ast::Expr*, std::vector<int>>
+        builtinCallBindings_;
     // fix #4491 (§22.5 / §22.8 step 0 / §22.10, v0.306): the §22.10
     // inheritance clause's §22.5 argument binding, keyed on the ADDRESS of
     // the clause's own `ast::TypeDecl::primaryBaseCtorArgs` vector — the
