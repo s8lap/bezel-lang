@@ -73,6 +73,29 @@ config.substitutions.append(("%not", not_tool))
 config.substitutions.append(("%FileCheck", filecheck))
 config.substitutions.append(("FileCheck", filecheck))
 
+# WHY a per-test timeout (#5431).  lit's default for this is 0, which means
+# UNLIMITED (lit/LitConfig.py:37 sets `maxIndividualTestTime=0`, and
+# TestRunner.py:1075 passes it straight through as the `executeShCmd` timeout).
+# So a single wedged `bezelc` — an infinite loop, or a process blocked on a
+# dead pipe — stalls the whole lit track for the entire gate cycle with no
+# bound and no diagnostic.  That is the gate's worst failure mode: a cycle that
+# never returns rather than a cycle that fails.
+#
+# lit only *reports* a timeout when the value is > 0
+# (TestRunner.py:1152: `if maxIndividualTestTime > 0 and
+# result.timeoutReached`), and TimeoutHelper kills the child's process group,
+# so the hang becomes a clean `Test.TIMEOUT` and the cycle proceeds.
+#
+# 300 s, deliberately generous.  Every lit row here is compile-only
+# (`bezelc -c` feeding FileCheck — no link, no execute, no ASan runtime), and
+# the whole 2439-row track completes in seconds of wall time across 20
+# workers, so 300 s is orders of magnitude above any legitimate row.  Erring
+# high is deliberate: the failure we are buying insurance against is an
+# infinite hang, which ANY finite bound catches, whereas a bound set too low
+# would fail the gate on a merely slow row.  A false positive here costs a
+# gate cycle; a false negative costs the whole cycle.
+config.maxIndividualTestTime = 300
+
 # A minimal, hermetic environment is fine: `bezelc -c` neither reads config
 # files nor needs a populated PATH.  Keep HOME/TMPDIR so tmp-file creation
 # behaves, and put the LLVM tools directory (FileCheck/`not`) on PATH so a bare
