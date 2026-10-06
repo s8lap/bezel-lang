@@ -28701,6 +28701,18 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
 // expression's type, so member access chains (`a?.b?.c`) resolve.
 void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     if (!nm.target) return;
+    // fix #5452 (§7.5, v0.315): `TypeName?.member` — the null-conditional `?.`
+    // requires a nullable RECEIVER VALUE. A type name (a static receiver) is not
+    // a value and is never null, so `?.` on a type name is undefined by §7.5
+    // and must be rejected. Static member access uses `Type.member`, not
+    // `Type?.member`.
+    if (auto* ts = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*nm.target))) {
+        ctx_.diagnostics().report(
+            Severity::Error, nm.span.begin,
+            "the null-conditional operator `?.` cannot be applied to a type name "
+            "(`" + std::string(ts->name) + "`); use `." + std::string(nm.member) + "` for static member access (§7.5)");
+        return;
+    }
     TypeSymbol* targetType = memberTargetType(nm.target.get());
     Symbol* member = targetType ? lookupMember(targetType, nm.member) : nullptr;
     const TypeRef* recvTyForDiag = nm.target ? ctx_.exprType(*nm.target) : nullptr;
