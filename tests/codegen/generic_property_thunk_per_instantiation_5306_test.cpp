@@ -1024,3 +1024,55 @@ BEZEL_TEST(generic_property_thunk_per_instantiation_5306,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\nTrue\n21\n"));
 }
+
+// fix #5318 (§27.6 / §28.6, v0.315): a BARE (implicit-`this`) property
+// reference in function-value position (`return n;` where `n` is an `int`
+// auto-property and the method returns `() -> int`) leaked its closure cell
+// per call. The return statement's emitClosureRetain was firing because
+// isPlusOneClosureProducer did not recognise a bare IdentifierExpr property
+// reference as a +1 closure-cell producer (it only checked MemberAccessExpr).
+// The extra retain raised the cell's rc to 2; one release at scope-end
+// left rc=1 and the cell + env leaked (~56 bytes per call). The qualified
+// `this.n` form (MemberAccessExpr) was already covered by the existing
+// MemberAccessExpr branch.
+//
+// REGRESSION ORACLE: runAotChecked forces ASan + LSan on the generated
+// program; a leak of even 1 byte makes r.ran=false.
+constexpr const char* k_bare_name_property_thunk_leak = R"(
+module M;
+class C
+  public property n: int;
+  public constructor(k: int) n := k; end constructor;
+  public method RefBare(): () -> int
+    return n;
+  end RefBare;
+  public method RefThis(): () -> int
+    return this.n;
+  end RefThis;
+end C;
+class Program
+  public static method Main(): int
+    var c := new C(7);
+    var total := 0;
+    for var i in 0..<100 do
+      var fb := c.RefBare();
+      var ft := c.RefThis();
+      total := total + fb();
+      total := total + ft();
+    end;
+    Console.WriteLine(total);
+    return 0;
+  end Main;
+end Program;
+)";
+
+// Pre-fix: ~11200 bytes leaked (100 × 56 × 2 = 11200: 100 calls each
+// for RefBare and RefThis, 56 bytes per closure cell + env).
+// Post-fix: no leak.
+BEZEL_TEST(generic_property_thunk_per_instantiation_5306,
+           bare_name_property_thunk_no_leak_5318) {
+    JitResult r = runAotChecked(k_bare_name_property_thunk_leak);
+    BEZEL_EXPECT_TRUE(r.ran);   // no ASan/LSan finding
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("1400\n"));  // 100×(7+7)
+}

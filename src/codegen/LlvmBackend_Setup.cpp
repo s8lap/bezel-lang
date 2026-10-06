@@ -30225,6 +30225,35 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
             if (!declaredFunc) return true;
         }
     }
+    // fix #5318 (§27.6 / §28.6, v0.315): the BARE (implicit-`this`) sibling
+    // of the MemberAccessExpr branch above. A bare property identifier `n` in
+    // function-value position (e.g. `return n;` in a method `RefBare():
+    // () -> int`) is lowered by codegen's makePropertyThunk to a fresh rc=1
+    // closure cell, exactly as the qualified `this.n` form does. The
+    // MemberAccessExpr branch missed this case ("only MemberAccessExpr reaches
+    // makePropertyThunk" — superseded: the bare-identifier function-value
+    // position check at LlvmBackend_Exprs.cpp:6328 also calls makePropertyThunk
+    // with receiverVal = currentThis_), so a bare property reference was not
+    // recognised as a +1 producer and emitReturn emitted an extra retain →
+    // rc=2 on return, stored into the caller's local without an additional
+    // retain → one excess release at scope-end → the cell leaks.
+    // Mirror the MemberAccessExpr branch exactly for the bare identifier case.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(init)) {
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*init))) {
+            const sema::TypeRef* et = ctx_.exprType(*init);
+            if (!et || et->kind != sema::TypeRef::Kind::Function) return false;
+            if (ps->isIndexer) return false;
+            bool declaredFunc = false;
+            if (const auto* pd =
+                    dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                declaredFunc =
+                    pd->type && pd->type->kind == ast::TypeKind::Function;
+            } else if (sema::TypeRef* tr = ctx_.importedMemberType(ps)) {
+                declaredFunc = tr->kind == sema::TypeRef::Kind::Function;
+            }
+            if (!declaredFunc) return true;
+        }
+    }
     // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
     // method (`int.Parse`, `char.IsDigit`, …) ALSO lowers to a fresh calloc'd
     // rc=1 closure cell — via makePrimIntrinsicThunk (the CG60 path,
