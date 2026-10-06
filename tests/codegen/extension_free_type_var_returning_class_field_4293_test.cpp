@@ -194,14 +194,23 @@ BEZEL_TEST(extension_free_type_var_returning_class_field_4293,
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
 
-// CONTROL — extension return type spelled concretely (`int`) on `Box<int>`
-// already works on the unfixed tree (the field's declared type is `U`,
-// substituted via `genericSubst_[U] = i32()` by the existing class-method
-// call-site binding at LlvmBackend_Calls2.cpp ~L10939, which the extension
-// path used to inherit indirectly). The fix is ADDITIVE — it adds a binding
-// for the receiver class's free var where there was none before; a working
-// path must keep working. Asserting the exit code is the cleanest oracle:
-// an int return makes the program observable without leaning on stdout text.
+// CONTROL — the VALUE-TYPE binding (`Box<int>`) already works on the unfixed
+// tree (the field's declared type is `U`, substituted via
+// `genericSubst_[U] = i32()` by the existing class-method call-site binding at
+// LlvmBackend_Calls2.cpp ~L10939, which the extension path used to inherit
+// indirectly). The fix is ADDITIVE — it adds a binding for the receiver class's
+// free var where there was none before; a working path must keep working.
+// Asserting the exit code is the cleanest oracle: an int return makes the
+// program observable without leaning on stdout text.
+//
+// The return is spelled `W`, the extension's own free variable, and the `int`
+// is taken at the CALL SITE by an explicit §5.2 conversion. It cannot be
+// spelled `Peek(): int => this._v`: §5.1 admits a type-parameter value only to
+// `Object` and to the classes and interfaces its constraints guarantee, and `U`
+// is unconstrained, so returning it as `int` is correctly a compile error
+// ("`U` is a type parameter ... never to a primitive", §5.1 / §14.2). The
+// row's subject is the int BINDING surviving the additive fix, which the
+// `W` + `int(...)` spelling observes at the same substitution.
 BEZEL_TEST(extension_free_type_var_returning_class_field_4293,
            class_int_returning_free_var_value_case_still_works_4293) {
     auto r = runAot(
@@ -211,12 +220,12 @@ BEZEL_TEST(extension_free_type_var_returning_class_field_4293,
         "  public constructor(v: U) _v := v; end; "
         "end Box; "
         "extension Box<W> "
-        "  public method Peek(): int => this._v; "
+        "  public method Peek(): W => this._v; "
         "end; "
         "class C "
         "  public static method Main(): int "
         "    using var b := new Box<int>(42); "
-        "    return b.Peek(); "
+        "    return int(b.Peek()); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);
