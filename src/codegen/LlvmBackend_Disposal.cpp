@@ -1096,6 +1096,14 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // can dispatch to the correct runtime free function.  Empty = not a
         // vtableless builtin field.
         std::string vtablelessBuiltin = {};
+        // fix #5440 / §35.4 (v0.315): true for an `owned` choice field
+        // (Owning classification per classifyChoiceType). The disposal is via
+        // emitOwningChoiceLocationDisposal, NOT the class-vtable path.
+        bool owningChoiceField = false;
+        // The resolved TypeRef for the owning choice field, passed to
+        // emitOwningChoiceLocationDisposal so it can resolve the choice's
+        // case declarations and per-case payload types under any substitution.
+        const sema::TypeRef* owningChoiceRef = nullptr;
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -1261,6 +1269,19 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 OwnedField of{fs, nullptr};
                 if (isWeak) of.weakField = true;
                 else        of.sharedField = true;
+                owned.push_back(of);
+            }
+            // fix #5440 / §35.4 (v0.315): an `owned` CHOICE field (Owning
+            // classification per classifyChoiceType). All the branches above
+            // (isOwnedReferenceField, taskFamilyTypeFromField, etc.) explicitly
+            // reject Choice declarations, so this arm is needed to actually
+            // dispose owning choice fields at scope end. The disposal is via
+            // emitOwningChoiceLocationDisposal (the per-tag switch), NOT the
+            // class-vtable path.
+            if (const sema::TypeRef* choiceRef = owningChoiceFieldType(fs)) {
+                OwnedField of{fs, nullptr};
+                of.owningChoiceField = true;
+                of.owningChoiceRef = choiceRef;
                 owned.push_back(of);
             }
         }
@@ -1556,6 +1577,21 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(vbContBB);
             builder_.SetInsertPoint(vbContBB);
+            continue;
+        }
+        // fix #5440 / §35.4 (v0.315): an `owned` choice field (Owning
+        // classification). All existing branches above handle class/interface,
+        // collection, task, iterator, event, FFI buffer, shared, and vtableless
+        // builtin fields; none of them handle choice types (the class/interface
+        // branch explicitly returns false for non-Class/Interface declarations).
+        // The disposal is via emitOwningChoiceLocationDisposal — the per-tag
+        // switch that reads the runtime tag and disposes only the active case's
+        // owned payloads — NOT the class-vtable path below. No null-guard or
+        // null-after is needed for a bare (non-nullable) choice: the switch arm
+        // for a payload-free case is a no-op, and a moved-from choice holds
+        // tag 0 which is also a no-op arm.
+        if (it->owningChoiceField) {
+            emitOwningChoiceLocationDisposal(addr, it->owningChoiceRef);
             continue;
         }
         llvm::Value* isNull = builder_.CreateICmpEQ(

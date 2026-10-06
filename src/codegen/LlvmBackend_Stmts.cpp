@@ -1943,6 +1943,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // local helper (which only fires for plain locals).
                 if (!handled)
                     handled = lowerOwnedTaskFieldStore(*as->target, addr, rhs);
+                // fix #5440 (identity guard) / §35.4 (v0.315): drop-on-overwrite for an owning
+                // CHOICE FIELD — the field analog of disposeDisplacedOwningChoiceLocal.
+                // None of the field helpers above handle a choice-typed field
+                // (isOwnedClassFieldLvalue / isOwnedTaskField check for class/Task
+                // types), and disposeDisplacedOwningChoiceLocal bails on non-local
+                // targets. Without this, reassigning an owning-choice field leaks
+                // the displaced value entirely. Comes after all other field helpers
+                // (which handle class/Task/collection types) and before the local
+                // helpers (which only apply to plain locals / parameters).
+                if (!handled)
+                    handled = lowerOwnedChoiceFieldStore(*as->target, addr, rhs);
                 if (!handled) {
                     // fix #2960 / §8.6 / §28.9 (v0.240): drop-on-overwrite
                     // for a managed Object/interface LOCAL. The pre-pass admits

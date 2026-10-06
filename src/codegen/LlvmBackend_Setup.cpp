@@ -31445,6 +31445,200 @@ bool Emitter::lowerOwnedClassFieldStore(const ast::Expr& target,
 }
 
 
+// fix #5440 (identity guard) / §35.4 (v0.315): is `target` an `owned` Choice instance-field
+// lvalue? Mirrors isOwnedClassFieldLvalue's shape and scope guards. Records are
+// excluded because they have no §28.4-step-2 auto-dispose (same reason
+// isOwnedClassFieldLvalue excludes them). The field must be classified as
+// Owning by classifyChoiceType — value-like / borrow-bearing choices are
+// excluded, exactly as the local form is.
+bool Emitter::isOwnedChoiceFieldLvalue(const ast::Expr& target) {
+    if (localSlot(target)) return false;
+    {
+        llvm::Type* dummy = nullptr;
+        if (refParamAddr(target, dummy)) return false;
+    }
+    if (staticFieldGlobal(target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (!fs) return false;
+    // Must be a CLASS instance field (not a record — no §28.4-step-2
+    // auto-dispose, §9.7). Mirrors isOwnedClassFieldLvalue.
+    if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class) return false;
+    // Resolve the declared type: for an imported field (fs->decl == nullptr)
+    // use ctx_.importedMemberType; otherwise use fs->decl->type.
+    const sema::TypeRef* rt = nullptr;
+    if (!fs->decl) {
+        rt = ctx_.importedMemberType(fs);
+    } else {
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return false;
+        rt = ctx_.resolvedType(*fd->type);
+    }
+    if (!rt) return false;
+    const sema::TypeRef* res = resolveTypeParamRef(rt);
+    if (!res || res->kind != sema::TypeRef::Kind::Named || !res->declaration)
+        return false;
+    if (res->declaration->kind != ast::TypeDeclKind::Choice) return false;
+    // §3.6 rule 2 + §35.4: classification is per-instantiation.
+    auto verdict = common::classifyChoiceType(res, ctx_);
+    return verdict && *verdict == common::ChoiceClassification::Owning;
+}
+
+const sema::TypeRef* Emitter::owningChoiceFieldType(
+        const sema::FieldSymbol* fs) {
+    if (fs->posParam) {
+        // A captured `owned` primary-ctor parameter (§22.10). Mirrors the
+        // posParam arms in isOwnedReferenceField and taskFamilyTypeFromField.
+        const sema::TypeRef* pt = capturedOwnedPrimaryParamType(fs);
+        if (!pt || pt->kind != sema::TypeRef::Kind::Named || !pt->declaration)
+            return nullptr;
+        if (pt->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+        auto verdict = common::classifyChoiceType(pt, ctx_);
+        if (!verdict || *verdict != common::ChoiceClassification::Owning)
+            return nullptr;
+        return pt;
+    }
+    // For a choice-typed field, the ownership obligation comes from the choice
+    // TYPE's classification (§35.4: any case with an `owned` payload makes the
+    // whole choice Owning), NOT the field's own `owned` modifier. This mirrors
+    // how `classifyChoiceType` determines ownership for local declarations.
+    const sema::TypeRef* rt = nullptr;
+    if (!fs->decl) {
+        rt = ctx_.importedMemberType(fs);
+    } else {
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return nullptr;
+        rt = ctx_.resolvedType(*fd->type);
+    }
+    if (!rt) return nullptr;
+    const sema::TypeRef* res = resolveTypeParamRef(rt);
+    if (!res || res->kind != sema::TypeRef::Kind::Named || !res->declaration)
+        return nullptr;
+    if (res->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+    auto verdict = common::classifyChoiceType(res, ctx_);
+    if (!verdict || *verdict != common::ChoiceClassification::Owning)
+        return nullptr;
+    return res;
+}
+
+
+// fix #5440 (identity guard) / §35.4 / §28.7 (v0.315): dispose the prior value of an owning
+// CHOICE field before storing the new owner — the field analog of
+// disposeDisplacedOwningChoiceLocal. Order: load-old → null-guard
+// (moved-from / never-assigned slot) → identity-guard (self-assign
+// `this._o := this._o` must NOT dispose) → emitOwningChoiceLocationDisposal
+// (handles both bare `C` and nullable `C?`) → caller stores the new value.
+// Constructor first-time assignments are safe: the object is calloc-zeroed
+// (null → null-guard skips). Unlike the class-field sibling, no
+// lhsMovedFromAtStore check is needed here: a moved-from choice field holds
+// zeroed bytes; loading tag 0 and taking the no-op switch arm is safe.
+bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
+                                        llvm::Value* fieldAddr,
+                                        llvm::Value* newVal) {
+    if (!isOwnedChoiceFieldLvalue(target)) return false;
+    if (!fieldAddr || !newVal) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
+    if (!fs) return false;
+    // Re-derive the resolved TypeRef (same path as isOwnedChoiceFieldLvalue).
+    const sema::TypeRef* rt = nullptr;
+    if (!fs->decl) {
+        rt = ctx_.importedMemberType(fs);
+    } else {
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+        if (!fd || !fd->type) return false;
+        rt = ctx_.resolvedType(*fd->type);
+    }
+    if (!rt) return false;
+    const sema::TypeRef* res = resolveTypeParamRef(rt);
+    if (!res || res->kind != sema::TypeRef::Kind::Named || !res->declaration)
+        return false;
+    // Compute the LLVM type of the field value from the sema type reference.
+    llvm::Type* fieldTy = nullptr;
+    if (res->nullable) {
+        fieldTy = nullableValueStructTy(res);
+    } else {
+        RecordSubstGuard subst(this, res);
+        fieldTy = choiceStruct(res->declaration);
+    }
+    if (!fieldTy) return false;
+    // Null-guard AND identity-guard: for a nullable field, check hasValue != 0
+    // (a null nullable holds no payloads to dispose) AND the payload pointers are
+    // not identical (self-assign `h._o := h._o` on a non-null nullable would
+    // otherwise dispose the payload that is being stored back). For a non-nullable
+    // field, always proceed to the disposal block, but AND with the identity check
+    // so self-assignment `h._o := h._o` is skipped — the switch arm's no-op
+    // coverage is only for choice cases with no owned payloads, not for the
+    // self-assignment double-dispose path.
+    llvm::Value* doDispose = nullptr;
+    if (res->nullable) {
+        // For nullable: hv != 0 (null guard) AND identity check (same hv, same tag,
+        // same payload pointer = self-assign, skip). The nullable wrapper is
+        // { i8 hasValue, <choice struct> inner }.
+        llvm::StructType* st = llvm::cast<llvm::StructType>(fieldTy);
+        llvm::Value* oldNV = builder_.CreateLoad(st, fieldAddr, "ocfs.oldNV");
+        llvm::Value* hvOld = builder_.CreateExtractValue(oldNV, {0u}, "ocfs.hvOld");
+        llvm::Value* hvNew = builder_.CreateExtractValue(newVal, {0u}, "ocfs.hvNew");
+        llvm::Value* innerOld = builder_.CreateExtractValue(oldNV, {1u}, "ocfs.innerOld");
+        llvm::Value* innerNew = builder_.CreateExtractValue(newVal, {1u}, "ocfs.innerNew");
+        // Old must be non-null to have anything to dispose.
+        llvm::Value* hvOldNonNull = builder_.CreateICmpNE(
+            hvOld, llvm::ConstantInt::get(nullablePrimHasValTy(), 0), "ocfs.oldNonNull");
+        // Identity guard: same hasValue AND same tag AND same payload pointer.
+        llvm::Value* hvSame = builder_.CreateICmpEQ(hvOld, hvNew, "ocfs.hvSame");
+        llvm::Value* tagOld = builder_.CreateExtractValue(innerOld, {0u}, "ocfs.tagOld");
+        llvm::Value* tagNew = builder_.CreateExtractValue(innerNew, {0u}, "ocfs.tagNew");
+        llvm::Value* tagSame = builder_.CreateICmpEQ(tagOld, tagNew, "ocfs.tagSame");
+        // Payload pointer comparison: only valid when tags match (same case).
+        // Extract field 1 (payload) from inner, then field 0 (the owned ptr).
+        // For an owning choice case, the payload at field 1 is always a {ptr} struct.
+        llvm::Value* payloadOld = builder_.CreateExtractValue(innerOld, {1u}, "ocfs.payloadOld");
+        llvm::Value* payloadNew = builder_.CreateExtractValue(innerNew, {1u}, "ocfs.payloadNew");
+        llvm::Value* ptrOld = builder_.CreateExtractValue(payloadOld, {0u}, "ocfs.ptrOld");
+        llvm::Value* ptrNew = builder_.CreateExtractValue(payloadNew, {0u}, "ocfs.ptrNew");
+        llvm::Value* ptrSame = builder_.CreateICmpEQ(ptrOld, ptrNew, "ocfs.ptrSame");
+        llvm::Value* identitySame = builder_.CreateAnd(
+            builder_.CreateAnd(hvSame, tagSame, "ocfs.hvTagSame"), ptrSame, "ocfs.identitySame");
+        // Dispose: old is non-null AND NOT identity-same.
+        doDispose = builder_.CreateAnd(hvOldNonNull, builder_.CreateNot(identitySame, "ocfs.notSame"), "ocfs.doDispose");
+    } else {
+        // fix #5440 (identity guard) / §35.4 / §28.7 (v0.315): AND with
+        // CreateICmpNE on the tag AND payload pointer so self-assignment
+        // `h._o := h._o` is skipped. The choice struct is { i32 tag, case0_payload, ... }.
+        // Identity = same tag AND same payload pointer. When tags differ (e.g. Ready→Empty),
+        // ptrSame is undefined but irrelevant since identitySame=false → doDispose=true.
+        llvm::Value* oldVal = builder_.CreateLoad(fieldTy, fieldAddr, "ocfs.old");
+        llvm::Value* tagOld = builder_.CreateExtractValue(oldVal, {0u}, "ocfs.tagOld");
+        llvm::Value* tagNew = builder_.CreateExtractValue(newVal, {0u}, "ocfs.tagNew");
+        llvm::Value* tagSame = builder_.CreateICmpEQ(tagOld, tagNew, "ocfs.tagSame");
+        // Payload pointer comparison: field 1 (payload struct), then field 0 (owned ptr).
+        // For the owning case (Ready(owned r: Resource)), the payload is { ptr }.
+        llvm::Value* payloadOld = builder_.CreateExtractValue(oldVal, {1u}, "ocfs.payloadOld");
+        llvm::Value* payloadNew = builder_.CreateExtractValue(newVal, {1u}, "ocfs.payloadNew");
+        llvm::Value* ptrOld = builder_.CreateExtractValue(payloadOld, {0u}, "ocfs.ptrOld");
+        llvm::Value* ptrNew = builder_.CreateExtractValue(payloadNew, {0u}, "ocfs.ptrNew");
+        llvm::Value* ptrSame = builder_.CreateICmpEQ(ptrOld, ptrNew, "ocfs.ptrSame");
+        llvm::Value* same = builder_.CreateAnd(tagSame, ptrSame, "ocfs.same");
+        doDispose = builder_.CreateNot(same, "ocfs.doDispose");
+    }
+    auto* dispBB = llvm::BasicBlock::Create(llvm_, "ocfs.dispose", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "ocfs.cont", currentFn_);
+    auto* joinBB = llvm::BasicBlock::Create(llvm_, "ocfs.join", currentFn_);
+    builder_.CreateCondBr(doDispose, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
+    emitOwningChoiceLocationDisposal(fieldAddr, res);
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+    // Store the new value. For non-nullable: always. For nullable: if we got
+    // here, either hasValue was 0 (skip dispose, store anyway) or dispose ran.
+    builder_.CreateStore(newVal, fieldAddr);
+    builder_.CreateBr(joinBB);
+    builder_.SetInsertPoint(joinBB);
+    return true;
+}
+
+
 // §28.7 / §30.5 (#2173): dispose the prior value of an owned Task-family
 // FIELD before storing the new owner — the field analog of the using-var
 // task path (it->task in LlvmBackend_Disposal.cpp's emitDisposals). The

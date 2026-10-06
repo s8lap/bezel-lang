@@ -18863,6 +18863,38 @@ private:
                                   llvm::Value* fieldAddr,
                                   llvm::Value* newVal);
 
+    // fix #5440 (identity guard) / §35.4 *Drop-on-overwrite is defined and automatic* (v0.315):
+    // is `target` an `owned` CHOICE instance-field lvalue that needs
+    // drop-on-overwrite? Mirrors isOwnedClassFieldLvalue's scope guards (exclude
+    // locals, ref params, static fields, records) and its classification approach
+    // (resolve the field's declared type, check it's a Choice, then
+    // classifyChoiceType under the substitution). Records are excluded because
+    // they have no §28.4-step-2 auto-dispose — same reason isOwnedClassFieldLvalue
+    // excludes them.
+    bool isOwnedChoiceFieldLvalue(const ast::Expr& target);
+
+    // fix #5440 (identity guard) / §35.4 / §28.7 (v0.315): dispose the prior value of an owning
+    // CHOICE field before storing the new owner — the field analog of
+    // disposeDisplacedOwningChoiceLocal. Order: load-old → null-guard
+    // (moved-from / never-assigned slot) → identity-guard (self-assign
+    // `this._o := this._o` must NOT dispose) → emitOwningChoiceLocationDisposal
+    // → store-new. Constructor first-time assignments are safe: the object is
+    // calloc-zeroed so the null-guard skips disposal. The new value is stored
+    // by the caller after this returns.
+    bool lowerOwnedChoiceFieldStore(const ast::Expr& target,
+                                   llvm::Value* fieldAddr,
+                                   llvm::Value* newVal);
+
+    // fix #5440 / §35.4 (v0.315): recover the resolved TypeRef for an OWNING
+    // CHOICE field. Mirrors the type-resolution shape of taskFamilyTypeFromField
+    // and isOwnedChoiceFieldLvalue's classification (hasOwnedModifier, Named
+    // Choice, classifyChoiceType == Owning). Returns the resolved TypeRef (or
+    // nullptr) so emitOwnedFieldDisposals can pass it to
+    // emitOwningChoiceLocationDisposal. Shares classification logic with
+    // isOwnedChoiceFieldLvalue so the store path and the disposal path cannot
+    // drift apart.
+    const sema::TypeRef* owningChoiceFieldType(const sema::FieldSymbol* fs);
+
     // §28.7 / §15.3 (#1385): drop-on-overwrite for a WHOLE-VALUE reassignment
     // of a move-only OWNING inline-array local or field (`[N owned]T` /
     // `[N owned]T?`). Disposes each non-null slot of the displaced value in

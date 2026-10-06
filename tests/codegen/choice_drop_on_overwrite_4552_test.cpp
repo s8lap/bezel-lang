@@ -220,3 +220,130 @@ BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
                "public static method Pass(v: Bundle): Bundle => v;"),
         std::string("rewrapped\ndispose b\n"));
 }
+
+// --- §35.4: owning-choice FIELD drop-on-overwrite (fix #5440) ----------------
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_4_reassign_owning_choice_field_disposes_displaced_at_store) {
+    // fix #5440 / §35.4 (v0.314): the owning-choice FIELD drop-on-overwrite is
+    // the mirror of the local test above. Pre-fix the field reassignment disposed
+    // nothing: the field helpers (lowerOwnedClassFieldStore, lowerOwnedTaskFieldStore)
+    // check for class/Task types only, and disposeDisplacedOwningChoiceLocal bails
+    // on non-local targets. The displaced "old" Widget was never disposed.
+    std::string actual = runOut(kNamedResourceDecls,
+                                "var h := new Host(); "
+                                "h._o := Bundle.Ready(new Resource(\"old\")); "
+                                "h._o := Bundle.Ready(new Resource(\"new\")); "
+                                "Console.WriteLine(\"reassigned\"); "
+                                "_ := h._o;",
+                                "private _o: Bundle;");
+    std::cerr << "ACTUAL: [" << actual << "]" << std::endl;
+    BEZEL_EXPECT_EQ(actual,
+                    std::string("dispose old\nreassigned\ndispose new\n"));
+}
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_4_reassign_owning_choice_field_to_payload_free_case_disposes) {
+    // fix #5440 / §35.4 (v0.314): same as the local sibling above, but for
+    // a field. The displaced `Ready(old)` is disposed even when the new value
+    // is the payload-free `Empty` case.
+    BEZEL_EXPECT_EQ(
+        runOut(kNamedResourceDecls,
+               "var h := new Host(); "
+               "h._o := Bundle.Ready(new Resource(\"old\")); "
+               "h._o := Bundle.Empty; "
+               "Console.WriteLine(\"reassigned\");",
+               "private _o: Bundle;"),
+        std::string("dispose old\nreassigned\n"));
+}
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_4_every_displaced_choice_field_value_in_a_loop_is_disposed) {
+    // fix #5440 / §35.4 (v0.314): loop-amplified leak oracle for the field
+    // form. Pre-fix the count was 1 (only the scope-end disposal of the final
+    // slot content ran). 501 = 500 displaced + 1 scope-end.
+    BEZEL_EXPECT_EQ(
+        runOut(kCountingResourceDecls,
+               "Host.Churn(); Console.WriteLine(Resource._n);",
+               "private _b: Bundle; "
+               "public static method Churn() "
+               "  var h := new Host(); "
+               "  h._b := Bundle.Ready(new Resource()); "
+               "  var i := 0; "
+               "  while i < 500 do "
+               "    h._b := Bundle.Ready(new Resource()); "
+               "    i := i + 1; "
+               "  end while; "
+               "end Churn;"),
+        std::string("501\n"));
+}
+
+// --- §35.9: nullable owning-choice FIELD drop-on-overwrite (fix #5440) -------
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_9_nullable_owning_choice_field_disposes_displaced) {
+    // fix #5440 / §35.9 (v0.314): the nullable choice field mirror of the
+    // bare choice field test above. `null` assignment into an owned-state
+    // `C?` field disposes the displaced value per §35.4.
+    BEZEL_EXPECT_EQ(
+        runOut("class Widget "
+               "  public constructor() end constructor; "
+               "  destructor Console.WriteLine(\"widget disposed\"); "
+               "  end destructor; "
+               "end Widget; "
+               "choice Outcome Fetched(owned w: Widget), Failed; end Outcome; ",
+               "var h := new Host(); "
+               "h._o := Outcome.Fetched(new Widget()); "
+               "h._o := null; "
+               "Console.WriteLine(\"nulled\");",
+               "private _o: Outcome?;"),
+        std::string("widget disposed\nnulled\n"));
+}
+
+// --- §35.4 / §28.7: owning-choice FIELD self-assignment (fix #5440 identity guard)
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_4_owning_choice_field_self_assign_disposes_once) {
+    // fix #5440 (identity guard) / §35.4 / §28.7 (v0.315): self-assignment
+    // `h._o := h._o` on an owning-choice NON-NULLABLE field must NOT dispose
+    // at store time (the payload is the same bytes being stored back), only at
+    // scope-end. Without the identity guard (CreateICmpNE), doDispose=true
+    // unconditionally and self-assignment double-disposes: store-time + scope-end.
+    // Mirror of the local form test at spec_28_7_self_assignment_of_owning_choice_
+    // local_disposes_once (which uses the syntactic identity guard in
+    // disposeDisplacedOwningChoiceLocal). This test uses a FIELD (the field form's
+    // lowerOwnedChoiceFieldStore) rather than a local.
+    BEZEL_EXPECT_EQ(
+        runOut(kNamedResourceDecls,
+               "var h := new Host(); "
+               "h._o := Bundle.Ready(new Resource(\"self\")); "
+               "h._o := h._o; "
+               "Console.WriteLine(\"self done\");",
+               "private _o: Bundle;"),
+        std::string("self done\ndispose self\n"));
+}
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_9_nullable_owning_choice_field_self_assign_non_null_disposes_once) {
+    // fix #5440 (identity guard) / §35.9 / §28.7 (v0.315): nullable self-assignment
+    // `h._o := h._o` where h._o holds a NON-NULL value must NOT dispose at store
+    // time (the payload is the same bytes being stored back), only at scope-end.
+    // The nullable path's `hasValue != 0` guard (doDispose = hv != 0) protects only
+    // null self-assignment (hv_old=0 → skips). For non-null self-assignment hv_old=1
+    // AND hv_new=1, so without the identity guard the hv check passes and the
+    // double-dispose fires: store-time + scope-end. The identity guard
+    // (CreateICmpNE oldVal newVal) excludes this case regardless of hv.
+    BEZEL_EXPECT_EQ(
+        runOut("class Widget "
+               "  public constructor() end constructor; "
+               "  destructor Console.WriteLine(\"widget disposed\"); "
+               "  end destructor; "
+               "end Widget; "
+               "choice Outcome Fetched(owned w: Widget), Failed; end Outcome; ",
+               "var h := new Host(); "
+               "h._o := Outcome.Fetched(new Widget()); "
+               "h._o := h._o; "
+               "Console.WriteLine(\"self done\");",
+               "private _o: Outcome?;"),
+        std::string("self done\nwidget disposed\n"));
+}
