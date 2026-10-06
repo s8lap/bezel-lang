@@ -823,10 +823,18 @@ constexpr std::array<std::string_view, 11> kLinqLazyPassthroughOperatorNames = {
 
 // fix #3763 (stdlib §5 / §4.6 / §4.7 / §4.10 / §4.18, v0.287): see the header
 // for the membership rule (stdlib §5's `Reverse` naming note read with spec
-// §26.5 rule 1) and for why the Stack/Queue, `OwningBuffer`, `FrozenArray` and
-// dictionary families are deliberately NOT here.
-constexpr std::array<std::string_view, 5> kLazyReverseDirectReceiverHeads = {
+// §26.5 rule 1) and for why the `OwningBuffer`, `FrozenArray` and dictionary
+// families are deliberately NOT here (see the header for the full note).
+//
+// fix #3825 (stdlib §5 / §4.11, v0.307): Stack/OwningStack/Queue/OwningQueue
+// declare no instance `Reverse()` per stdlib §4.11, so the §5 naming note says
+// the lazy operator applies — and does. Previously excluded here and dispatched
+// to the in-place `bz_array_*` mutator via the `isCollectionTypeName` structural
+// path; #3825 admitted them and updated the two pins that accepted the in-place
+// behaviour (`stack_reverse_is_lazy_not_in_place`, `queue_reverse_is_lazy_not_in_place`).
+constexpr std::array<std::string_view, 9> kLazyReverseDirectReceiverHeads = {
     "Set", "OwningSet", "SortedSet", "LinkedList", "OwningLinkedList",
+    "Stack", "OwningStack", "Queue", "OwningQueue",
 };
 
 // fix #4766 / #4833 (§5.1, v0.307): the builtin heap-type heads that declare

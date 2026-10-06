@@ -299,34 +299,69 @@ BEZEL_TEST(reverse_set_3763, owningarray_reverse_still_mutates_in_place) {
         "3,2,1");
 }
 
-// `Stack<T>` (§4.11) declares NO `Reverse()`, so stdlib §5's naming note says
-// the lazy operator SHOULD apply — but this compiler structurally dispatches
-// it to the in-place `bz_array_*` mutator, and #2457 slice 2 measured that
-// mutation VALUE-CORRECT and accepted it deliberately
-// (`stack_queue_unresolved_member_2457_test.cpp`'s
-// `legit_reverse_alias_stack_value_correct`). Retargeting it would change the
-// meaning of WORKING code, not repair a broken path, so #3763's predicate
-// excludes the Stack/Queue family and this row pins that it is unmoved:
-// Push 1,2,3 then Reverse() then Pop() yields the first-pushed element.
-BEZEL_TEST(reverse_set_3763, stack_reverse_still_in_place_unmoved) {
+// fix #3825 (stdlib §5 / §4.11, v0.307): Stack/OwningStack/Queue/OwningQueue
+// declare no instance `Reverse()` per stdlib §4.11, so the §5 naming note says
+// the lazy operator applies. The old in-place behaviour is replaced; these rows
+// pin the new lazy semantics. Stack pushes 1,2,3 (top=3): lazy Reverse()
+// yields 3 first, and the source is not mutated so Pop() also returns 3.
+BEZEL_TEST(reverse_set_3763, stack_reverse_is_lazy_not_in_place) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
             "    using var s := new Stack<int>();\n"
             "    s.Push(1); s.Push(2); s.Push(3);\n"
-            "    s.Reverse();\n"
-            "    Console.WriteLine(s.Pop().ToString());")),
-        "1");
+            "    Console.WriteLine($\"{s.Reverse().FirstOrNull()},{s.Pop()}\");")),
+        "3,3");
 }
 
-// The Queue twin of the row above.
-BEZEL_TEST(reverse_set_3763, queue_reverse_still_in_place_unmoved) {
+// Queue enqueues 1,2,3 (front=1, back=3): lazy Reverse() yields 3 first,
+// and the source is not mutated so Dequeue() returns the original front=1.
+BEZEL_TEST(reverse_set_3763, queue_reverse_is_lazy_not_in_place) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
             "    using var q := new Queue<int>();\n"
             "    q.Enqueue(1); q.Enqueue(2); q.Enqueue(3);\n"
-            "    q.Reverse();\n"
-            "    Console.WriteLine(q.Dequeue().ToString());")),
-        "3");
+            "    Console.WriteLine($\"{q.Reverse().FirstOrNull()},{q.Dequeue()}\");")),
+        "3,1");
+}
+
+// OwningStack twin with a class element (OwningStack rejects primitives).
+BEZEL_TEST(reverse_set_3763, owningstack_reverse_is_lazy_not_in_place) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(
+            "module M;\n"
+            "import System;\n"
+            "class Box public v: int; public constructor(x: int) v := x; end constructor; end Box;\n"
+            "class C\n"
+            "  public static method Main(): int\n"
+            "    using var s := new OwningStack<Box>();\n"
+            "    s.Push(new Box(1)); s.Push(new Box(2)); s.Push(new Box(3));\n"
+            "    var first := s.Reverse().FirstOrNull();\n"
+            "    var popped := s.Pop();\n"
+            "    Console.WriteLine($\"{first!.v},{popped.v}\");\n"
+            "    return 0;\n"
+            "  end Main;\n"
+            "end C;\n"),
+        "3,3");
+}
+
+// OwningQueue twin with a class element.
+BEZEL_TEST(reverse_set_3763, owningqueue_reverse_is_lazy_not_in_place) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(
+            "module M;\n"
+            "import System;\n"
+            "class Box public v: int; public constructor(x: int) v := x; end constructor; end Box;\n"
+            "class C\n"
+            "  public static method Main(): int\n"
+            "    using var q := new OwningQueue<Box>();\n"
+            "    q.Enqueue(new Box(1)); q.Enqueue(new Box(2)); q.Enqueue(new Box(3));\n"
+            "    var first := q.Reverse().FirstOrNull();\n"
+            "    var dequeued := q.Dequeue();\n"
+            "    Console.WriteLine($\"{first!.v},{dequeued.v}\");\n"
+            "    return 0;\n"
+            "  end Main;\n"
+            "end C;\n"),
+        "3,1");
 }
 
 // `OwningBuffer<T>` (§4.14) is `bz_array_t*`-backed and reaches the same

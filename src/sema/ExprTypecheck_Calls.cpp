@@ -25200,25 +25200,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // by #2470's bare-reference no-MethodSymbol concern
                         // (no function value is ever formed for it).
                         bool isUndocumentedWorkingAlias = mbr == "Length";
-                        // `.Reverse` — also undocumented for Stack/Queue in
-                        // stdlib §4.11 (only Array<T>/OwningArray<T>'s own
-                        // §4.4/§4.5 declares an in-place `Reverse()`), but
-                        // UNLIKE `.Length` this is a genuine CALLABLE method
-                        // (structurally dispatched in codegen via the same
-                        // isCollectionTypeName path Array's Reverse uses --
-                        // see legit_reverse_alias_stack_value_correct). It is
-                        // NOT one of stdlib §5's LINQ operators either: §5's
-                        // lazy `Reverse(): IEnumerable<T>` applies only where
-                        // the receiver's static type has no instance
-                        // `Reverse` (stdlib §5 naming note, v0.195), and
-                        // codegen commits to the in-place mutation here. The
-                        // CALL form (`s.Reverse()`) works; the BARE form
-                        // (`var f := s.Reverse;`) shares #2470's exact
-                        // no-MethodSymbol no-op (confirmed live: the local is
-                        // degraded to a zero-init i32 and `f()` emits no
-                        // code -- #2493), so it is folded into the same
-                        // #2470 reject below rather than left exempted by
-                        // isUndocumentedWorkingAlias.
+                        // `.Reverse` — fix #3825 (stdlib §5 / §4.11, v0.307)
+                        // ADMITTED Stack/Queue/OwningStack/OwningQueue to the
+                        // lazy §5 operator via isLazyReverseDirectReceiverHead,
+                        // so the CALL form `s.Reverse()` now goes through the
+                        // lazy LINQ path (not the in-place structural dispatch).
+                        // The bare form (`var f := s.Reverse;`) still hits the
+                        // same no-MethodSymbol no-op (#2470/#2493) and is still
+                        // rejected here: there is still no real MethodSymbol for
+                        // it, only the structural dispatch that handles the CALL
+                        // form. Before #3825 this was an undocumented alias
+                        // (structurally dispatched in-place for every
+                        // isCollectionTypeName receiver); that path is now
+                        // reserved for OwningBuffer/FrozenArray which are
+                        // excluded from isLazyReverseDirectReceiverHead.
                         bool isUndocumentedCallableAlias = mbr == "Reverse";
                         // stdlib §4.11's own declared methods, unioned across
                         // Stack/OwningStack/Queue/OwningQueue rather than
@@ -25298,18 +25293,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         //
                         // #2493: `isUndocumentedCallableAlias` (`.Reverse`)
                         // folds into this SAME reject for the identical
-                        // reason -- it is a real callable dispatched
-                        // structurally (the CALL form works, see
-                        // legit_reverse_alias_stack_value_correct), so a bare
-                        // reference to it hits the same no-MethodSymbol
-                        // no-op (#2434's zero-init degradation, confirmed
-                        // live: `var f := s.Reverse; f(); return s.Pop();`
-                        // returns 3 -- the silent no-op -- where a working
-                        // reverse returns 1). The CALL form (`s.Reverse()`,
-                        // `isCallForm` above) is unaffected: it is exempted
-                        // by `!isCallForm` here and by `!isCallForm` in the
-                        // "no member" reject below, so it still compiles and
-                        // codegen structurally dispatches it.
+                        // root cause as the other names in this block -- there
+                        // is no real MethodSymbol for `.Reverse` on Stack/Queue,
+                        // so a bare reference hits the same no-MethodSymbol
+                        // no-op (#2434/#2470). The CALL form (`s.Reverse()`)
+                        // IS exempted by `!isCallForm` here and by
+                        // `!isCallForm` in the "no member" reject below -- but
+                        // after fix #3825 it goes through the LAZY §5 LINQ path
+                        // (isLazyReverseDirectReceiverHead), not the in-place
+                        // structural dispatch that existed before that fix
+                        // (see stack_reverse_is_lazy_not_in_place /
+                        // queue_reverse_is_lazy_not_in_place).
                         //
                         // #2492 (stdlib §5; language spec §27.6):
                         // `isLinqOperator` folds into this SAME reject for the

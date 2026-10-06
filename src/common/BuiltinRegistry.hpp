@@ -836,26 +836,19 @@ bool isLinqLazyPassthroughOperatorName(std::string_view m);
 // list family (`LinkedList`/`OwningLinkedList` §4.6/§4.7) declare none, so §5
 // is all a call on them can mean.
 //
-// ⚠ EXCLUDES `Stack`/`OwningStack`/`Queue`/`OwningQueue` even though stdlib
-// §4.11 declares no `Reverse()` on them either, and the §5 naming note
-// therefore says the lazy operator SHOULD apply. It does not, today: this
-// compiler structurally dispatches those four to the in-place `bz_array_*`
-// mutator through `isCollectionTypeName`, and #2457 slice 2 measured that
-// mutation VALUE-CORRECT and accepted it deliberately (see
-// `tests/codegen/stack_queue_unresolved_member_2457_test.cpp`'s
-// `legit_reverse_alias_stack_value_correct` and its Queue twin, which pin it).
-// Admitting them here would silently retarget working code from an in-place
-// reverse to a lazy sequence — a behaviour change to a WORKING path, not the
-// repair of a broken one, and outside issue 3763's scope. Filed separately;
-// this table is the place to add them when that lands.
+// fix #3825 (stdlib §5 / §4.11, v0.307): Stack/OwningStack/Queue/OwningQueue
+// also declare no instance `Reverse()` per stdlib §4.11, and the §5 naming
+// note therefore says the lazy operator applies — admitted here in #3825,
+// replacing the earlier exclusion.
 //
-// ⚠ EXCLUDES `OwningBuffer` (§4.14) and `FrozenArray` (§4.19) for the same
-// reason as the Stack family (both are `bz_array_t*`-backed and reach the same
-// in-place mutator — `OwningBuffer<int>.Reverse()` measured mutating in place),
-// and `Dictionary`/`SortedDictionary` (§4.8/§4.17), whose §5 element type is a
+// ⚠ EXCLUDES `OwningBuffer` (§4.14) and `FrozenArray` (§4.19): both are
+// `bz_array_t*`-backed and reach the same in-place mutator
+// (`OwningBuffer<int>.Reverse()` measured mutating in place), and their lazy
+// Reverse codegen has a separate gap (tracked separately). Also excludes
+// `Dictionary`/`SortedDictionary` (§4.8/§4.17), whose §5 element type is a
 // `DictionaryEntry<K, V>` STRUCT rather than a plain element — a different
 // lazy-element lowering shape with no measured coverage here.
-// per §5 / §4.6 / §4.7 / §4.10 / §4.18, fix #3763
+// per §5 / §4.6 / §4.7 / §4.10 / §4.18, fix #3763; §4.11 admission fix #3825
 bool isLazyReverseDirectReceiverHead(std::string_view head);
 
 // fix #4766 / #4833 (§5.1, v0.307): the builtin heap-type HEADS that declare a

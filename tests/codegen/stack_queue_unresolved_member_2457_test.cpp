@@ -28,13 +28,17 @@
 //     that gave Array its `.Length` before #4811). Fix removes it from the
 //     allow-list so the stdlib's declared `Count` is the only accepted name.
 //   - `.Reverse()`: NOT declared for Stack/Queue in stdlib §4.11 either (only
-//     `Array<T>`'s own §4.4 declares an in-place `Reverse()`), but a second
-//     undocumented-but-real structural alias found by THIS slice's own
-//     adversarial pass: `tryLowerCollectionInstanceCall`
-//     (LlvmBackend_Calls.cpp ~3160) implements it for ANY
-//     `isCollectionTypeName` receiver with no per-type exclusion. Verified
-//     VALUE-correct below (mutates the physical backing storage), not just
-//     "doesn't crash" — exempted, not implemented.
+//     `Array<T>`'s own §4.4 declares an in-place `Reverse()`). Before fix
+//     #3825 this compiler dispatched it to the in-place `bz_array_*` mutator
+//     via the `isCollectionTypeName` structural path; fix #3825 (stdlib §5 /
+//     §4.11, v0.307) admits Stack/Queue/OwningStack/OwningQueue to the lazy
+//     §5 operator via `isLazyReverseDirectReceiverHead`, replacing the
+//     in-place behaviour with the correct lazy sequence. The two tests
+//     `stack_reverse_is_lazy_not_in_place` and `queue_reverse_is_lazy_not_in_place`
+//     pin the new semantics; the old in-place-pinning tests
+//     `legit_reverse_alias_stack_value_correct` and
+//     `legit_reverse_call_queue_value_correct_2493` are replaced in-place
+//     with the new semantics (lane rules §7: the old behaviour is gone).
 //   - Every declared method (stdlib §4.11) and §5 LINQ operator: a CALL is
 //     exempted via `calleeOfCallCtx_`; language spec §27.6 also sanctions a
 //     BARE reference (`var f := s.Push;`), exempted via an explicit name
@@ -225,14 +229,11 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_count_member_queue_value_co
     BEZEL_EXPECT_EQ(run(program), 3);
 }
 
-// `.Reverse()` — the second undocumented-but-real alias this slice found:
-// NOT in stdlib §4.11's declared surface, but a genuine, working in-place
-// mutator (the same generic isCollectionTypeName dispatch Array's own
-// Reverse uses). VALUE-correct: after pushing 1,2,3 (physical [1,2,3], top =
-// index 2 = 3), Reverse() physically flips the backing storage to [3,2,1],
-// so the next Pop() (which always reads index Count-1) returns the
-// ORIGINAL first-pushed element, 1 — proving real mutation, not a no-op.
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_reverse_alias_stack_value_correct) {
+// fix #3825 (stdlib §5 / §4.11, v0.307): Stack now takes the lazy §5
+// Reverse(), not the in-place mutator. After pushing 1,2,3 (top=3), lazy
+// Reverse() yields 3 first and does NOT mutate the source, so Pop() also
+// returns 3 — proving the source is untouched.
+BEZEL_TEST(stack_queue_unresolved_member_2457, stack_reverse_is_lazy_not_in_place) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -241,7 +242,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_reverse_alias_stack_value_c
         "  s.Reverse(); "
         "  return s.Pop(); "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 1);
+    BEZEL_EXPECT_EQ(run(program), 3);
 }
 
 // A bare (uncalled) method reference — language spec §27.6.
@@ -310,16 +311,13 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_tostring_reference_sta
 }
 
 // #2493 (stdlib §4.11; language spec §27.6): a BARE reference to `.Reverse`
-// on Stack/Queue shares #2470's exact no-MethodSymbol no-op — `.Reverse` is a
-// genuine callable on these receivers (an undocumented-but-working structural
-// alias dispatched in codegen via the same isCollectionTypeName path
-// Array<T>'s own §4.4 in-place Reverse uses, NOT one of stdlib §5's LINQ
-// operators — see the §5 naming note, v0.195: the lazy `Reverse(): IEnumerable<T>`
-// applies only where the receiver's static type has no instance `Reverse`, and
-// codegen commits to the in-place mutation here). The CALL form `s.Reverse()`
-// works (legit_reverse_alias_stack_value_correct above proves the real
-// in-place mutation); the BARE form `var f := s.Reverse;` was a SILENT NO-OP
-// — confirmed live on `origin/main` before this fix:
+// on Stack/Queue shares #2470's exact no-MethodSymbol no-op — `.Reverse` IS a
+// genuine stdlib §5 LINQ operator on these receivers (fix #3825 admitted them
+// to isLazyReverseDirectReceiverHead, replacing the prior in-place structural
+// dispatch). The CALL form `s.Reverse()` now goes through the lazy path (see
+// stack_reverse_is_lazy_not_in_place / queue_reverse_is_lazy_not_in_place);
+// the BARE form `var f := s.Reverse;` is still a SILENT NO-OP — confirmed
+// live on `origin/main` before fix #3825:
 //
 //   var s := new Stack<int>(); s.Push(1); s.Push(2); s.Push(3);
 //   var f := s.Reverse; f(); return s.Pop();
@@ -368,13 +366,11 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_reverse_reference_queu
         "27.6) is not yet supported on `Queue<T>`"));
 }
 
-// #2493 adversarial: the CALL form `s.Reverse()` MUST still compile and work
-// after the bare-reference reject (the reject is gated on `!isCallForm`).
-// Queue twin of legit_reverse_alias_stack_value_correct above: after
-// enqueuing 1,2,3 (front=1, back=3), the in-place Reverse() flips the
-// backing storage so Dequeue() (reads the front) returns the ORIGINAL back
-// element, 3 — proving the call form's real mutation survives the fix.
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_reverse_call_queue_value_correct_2493) {
+// fix #3825 (stdlib §5 / §4.11, v0.307): Queue now takes the lazy §5
+// Reverse(), not the in-place mutator. After enqueuing 1,2,3 (front=1, back=3),
+// lazy Reverse() yields 3 first and does NOT mutate the source, so Dequeue()
+// returns the original front element, 1 — proving the source is untouched.
+BEZEL_TEST(stack_queue_unresolved_member_2457, queue_reverse_is_lazy_not_in_place) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -383,7 +379,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_reverse_call_queue_value_co
         "  q.Reverse(); "
         "  return q.Dequeue(); "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 3);
+    BEZEL_EXPECT_EQ(run(program), 1);
 }
 
 // #2492 (stdlib §5; language spec §27.6): a BARE reference to a stdlib §5
