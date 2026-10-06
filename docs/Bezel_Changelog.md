@@ -12,10 +12,10 @@ Entries are pinned history — each was written at its revision and is not retro
 The entries in this section were reconstructed in 2026-10. They predate the per-revision changelog that begins at v0.52 to v0.53 below. Each one summarises what changed and is not a complete migration record. They rest on three kinds of source, and each entry names its own:
 
 - **Archived snapshots of the specification** (v0.4–v0.18, v0.20, v0.21, v0.24, v0.60). These are verbatim, and they are the strongest source.
-- **A record of the design conversation** that ran from v0.24 to v0.30. It dates each spec upload and the patches applied between uploads, but it summarises most of its turns instead of quoting the spec text. The entries for v0.24 to v0.30 rest on it.
+- **A record of the design conversation** that ran from v0.24 to v0.30. The conversation did not produce spec files: it drafted patches, the owner applied them to the spec by hand and periodically re-uploaded it. The drafted patches are therefore the record of what changed, and the uploads are the revision boundaries. The record summarises most of its turns instead of quoting the spec text. The entries for v0.24 to v0.30 rest on it, one entry per round of patches between two uploads.
 - **A later summary of the earliest design conversation**, covering v0.1–v0.3. It describes itself as "reconstructed progressive snapshots" and is not a verbatim spec, so it is the weakest source.
 
-v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.19, v0.22, v0.23 or v0.31–v0.51. v0.26 has a dated upload in the conversation record but its text is not reproduced. v0.27 and v0.28 cannot be tied to any content. Where an entry spans a missing revision, it covers the whole span and says so.
+v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.19, v0.22, v0.23 or v0.31–v0.51. v0.26 is known only as the label of one upload, and its text is not reproduced. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round instead. Where an entry spans a missing revision, it covers the whole span and says so.
 
 <a id="sec-v0-1-to-v0-2-changelog"></a>
 ### v0.1 to v0.2 changelog (reconstructed)
@@ -268,13 +268,14 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
 <a id="sec-v0-24-to-v0-25-changelog"></a>
 ### v0.24 to v0.25 changelog (reconstructed)
 
-- Source: the design-conversation record. The v0.24 text it reviews matches the archived v0.24 snapshot: `class Array<T>` is the Generics example, `scope … end;` is used, and the case statement has `default:` arms and a `_:` arm. The changes below were drafted and applied before the v0.25 upload, and the review of that upload confirms them.
+- Source: patches drafted in the design conversation and applied to the spec by hand by the owner, plus two fixes the owner made on their own. The boundaries are the conversation's opening upload, which the assistant's first review calls v0.24 (consistent with the archived v0.24 snapshot), and the second full upload, which its review calls "the v0.25 spec" and confirms the changes below. The owner also attached a v0.24-era excerpt of the case statement while it was being rewritten; that was not a full upload.
 - **Collections never own their elements.** A new subsection, Collections and Element Ownership, is added to Resource Management:
   - `Dispose()`, `Clear()`, `Add` and `Remove` on any collection never dispose elements;
   - a single `DisposeElements()` is declared on `ICollection<T>`. It disposes every class-typed element (for a dictionary, both the key and the value of every entry), then empties the collection, and it acts like `Clear()` for value-typed elements;
   - the recommended idiom is an `owned` collection field plus a destructor that calls `DisposeElements()`;
   - asymmetric ownership is handled by iterating and calling `Clear()`.
-- Considered and declined for collections: encoding element ownership in the type (`Array<owned T>`), and separate `DisposeKeys` / `DisposeValues` / `DisposeEntries` methods.
+  
+  Considered and declined: encoding element ownership in the type (`Array<owned T>`), and separate `DisposeKeys` / `DisposeValues` / `DisposeEntries` methods.
 - **`until` added to the counting loop** as an exclusive upper bound (`for var i := 0 until n do`), alongside the inclusive `to`. Both compose with `step`, and an empty range is a silent no-op.
 - **Case expressions close with `end`** (`case n … _ => "z" end`). This removes the termination ambiguity when a case expression is nested, used inside an interpolation or combined with an if-expression. A rule requiring parentheses was considered and declined.
 - **The case statement is rewritten:**
@@ -283,101 +284,121 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
   - the binding type pattern becomes `var s: string` (replacing `var s as string`), and a bare type pattern is `string =>`;
   - subtypes match type patterns, and `..` ranges are inclusive.
 - **`scope … end;` is removed and `do … end` becomes the single block construct.** It is used as a standalone block that disposes its `using var` locals, as a multi-statement lambda body and as a multi-statement case arm. A new Block Statements section frames each loop's `do` as introducing the same kind of body.
-- The Generics section's example class is renamed `MyArray<T>`, so it no longer collides with the library's `Array<T>`.
+- The Generics section's example class is renamed `MyArray<T>`, so it no longer collides with the library's `Array<T>`. This, and a fix to the field naming in the `Vector2` record example, are the owner's own edits; the record does not give the `Vector2` text.
 
 <a id="sec-v0-25-to-v0-26-changelog"></a>
 ### v0.25 to v0.26 changelog (reconstructed)
 
-- Source: the design-conversation record, between the v0.25 upload and the upload explicitly labelled v0.26. The patches in this span are recorded only as summaries.
+- Source: five patches drafted in the design conversation and applied by hand, each confirmed by the owner ("All done", "Done") except the last, whose text the next reviews quote. The boundaries are the v0.25 upload and the next full upload, which the conversation record labels v0.26. That label is the only evidence for the number; the text of v0.26 is not reproduced. From this point the owner re-uploaded the spec only every few topics, by agreement, so each later entry covers one application round.
 - **Inheritance and dispatch:**
   - members are non-virtual by default; the modifiers are `virtual`, `override`, `sealed override`, `sealed` (class) and `abstract` (class and member);
   - `base.Member` calls the base implementation, and `base(...)` must be the first statement of a constructor;
   - member hiding is a compile error;
   - modifier order is fixed and enforced;
-  - `is` and `as` operators are added.
-- **New `Object` section.** It declares:
-  - virtual `Equals(Object?)`, `GetHashCode()` and `ToString()`;
-  - a compiler-generated, non-overridable `Dispose()`;
-  - static `ReferenceEquals`.
-  
-  On classes, `=` / `<>` invoke `Equals`, a deliberate departure from C#. Overriding `Equals` requires overriding `GetHashCode`.
+  - `is` (boolean and pattern form, with a flow-narrowed binding) and `as` (checked cast with a nullable result) are added.
+- **New `Object` section.** It declares virtual `Equals(Object?)`, `GetHashCode()` and `ToString()`, a compiler-generated, non-overridable `Dispose()`, and static `ReferenceEquals`. On classes, `=` / `<>` invoke `Equals`, a deliberate departure from C#. Overriding `Equals` requires overriding `GetHashCode`. Destructors run from subclass to base without a `base.Dispose()` call.
 - **Property and indexer accessors:**
-  - block-form properties use `get => expr` / `get => do … end` and `set => …` with an implicit `value`;
+  - block-form properties use `get => expr` / `get => do … end` and `set => …` with an implicit `value`, and accessors may carry their own visibility;
   - indexers are written `property [i: int]: T`. They may take several parameters, may be overloaded, take part in virtual dispatch, and can be declared on interfaces as `readonly property [...]`;
   - there are no indexers on enums, no static indexers, and no `ref`/`out` indexer parameters.
 - **`return` is formalised.** It always exits the enclosing callable, never a `do … end` block, and `do … end` is never an expression. Definite return is checked. Constructors and destructors may only use `return;`, and `return` inside `finally` is an error.
 - **Small additions:**
-  - the `nameof` operator;
+  - the `nameof` operator, a compile-time string constant naming the rightmost identifier;
   - range expressions `a..b` and `a..<b` with open-ended forms, typed `Range<T>` and limited to integer types and `char`;
   - interface inheritance (`interface IFoo: IA, IB`);
   - `throw` as an expression with a bottom type.
 - **Visibility.** There are four levels: `public`, `internal`, `protected` and `private`.
   - `internal` means the same module, that is, all files that declare the same `module` name.
   - `protected` follows the C# meaning.
-  - Top-level types default to `internal`; class members must state their visibility; there are no combined levels.
+  - Top-level types default to `internal`; class members must state their visibility; interface members are implicitly `public`; there are no combined levels.
 - **Iteration protocol:**
   - `IEnumerable<T>` / `IEnumerator<T>` are added, with `IEnumerator<T>: IDisposable`;
   - `foreach` desugars to a `using var` enumerator, and changing a collection during iteration raises `InvalidOperationException`;
   - a `Dictionary` iterates `record DictionaryEntry<K, V>(Key: K, Value: V)` values and has `Keys` / `Values` views;
-  - `yield` and the `Map`/`Filter`/`SortBy` operations are deferred.
+  - `yield` is mentioned as a future direction, and the `Map`/`Filter`/`SortBy` operations are deferred to the library.
 
-<a id="sec-v0-26-to-v0-29-changelog"></a>
-### v0.26 to v0.29 changelog (reconstructed)
+<a id="sec-v0-26-to-v0-29-changelog-round-1"></a>
+### v0.26 to v0.29, round 1 (reconstructed; version number not recorded)
 
-- Source: the design-conversation record, between the v0.26 upload and the upload that preceded the v0.30 editorial pass. The conversation's later inventory labels that upload v0.29. Three other uploads in this span carry no version number, and the record names v0.28 once without any content, so none of these changes can be attributed to v0.27, v0.28 or v0.29 individually. The patches are recorded only as summaries.
-- **Editorial pass:**
-  - a Reserved Keywords appendix is added;
-  - comparison operators must be overloaded as complete groups;
+- Source: patches drafted in the design conversation and applied by hand. The boundaries are the v0.26 upload and the next upload, which carries no version number. Four uploads fall between v0.26 and v0.30, and the version note was not bumped at each of them (the review before v0.30 found it had not been bumped "through several patches"). So v0.27, v0.28 and v0.29 cannot be tied to any upload, and this entry and the next three are numbered by round instead.
+- **Editorial pass** (confirmed applied):
+  - a Reserved Keywords appendix is added, with `yield`, `async`, `await` and `extension` reserved for future use;
+  - comparison operators must be overloaded as complete groups, a compile-time rule;
   - one `++`/`--` overload serves both prefix and postfix;
   - `Array<T>` is a library class with compiler-recognised literal syntax, while `T[]` is intrinsic;
-  - an unannotated collection literal defaults to `T[]`;
-  - property references (`(T) -> P`) are added;
+  - an unannotated collection literal defaults to `T[]`, and an empty literal with no target type is an error;
+  - property references (`(T) -> P`) are added; indexers and setters cannot be referenced;
   - `/** */` is an ordinary comment;
   - static initialisation runs in textual order within a type and lazily across types.
-- **`not` is the only boolean negation.** Prefix `!` is removed, so `!` is only the postfix null-forgiving operator, and `operator not` is overloadable.
-- **Loops unified.** The counting `for … to/until … step` loop and `foreach` are removed, leaving `while` and `for var x in source do`. `step` moves onto range expressions (`0..100 step 2`). It may not be zero, and it is not allowed on open-ended ranges or in case patterns.
+- The same pass added `not` as a word-form operator alongside `!`.
+- **`not` becomes the only boolean negation.** Prefix `!` is removed, so `!` is only the postfix null-forgiving operator, and `operator not` is overloadable. This patch was drafted just before the upload, and the owner's message did not say it was applied; the review of the last upload before v0.30 confirms no prefix `!` remained.
+
+<a id="sec-v0-26-to-v0-29-changelog-round-2"></a>
+### v0.26 to v0.29, round 2 (reconstructed; version number not recorded)
+
+- Source: patches drafted in the design conversation (a simplification pass) and applied by hand. The boundary is the next upload, made with "all points addressed"; it carries no version number.
+- **Loops unified.** The counting `for … to/until … step` loop and `foreach` are removed, leaving `while` and `for var x in source do`. `step` moves onto range expressions (`0..100 step 2`, `100..0 step -10`). It may not be zero, and it is not allowed on open-ended ranges or in case patterns. `foreach`, `to` and `until` leave the keyword list.
 - **One `case` construct.** The separate statement and expression forms are merged:
   - arms are comma-separated `pattern => expression` and must end with `_ =>`, and `default` is dropped;
-  - in statement position the value is discarded;
+  - in statement position the value is discarded, and a multi-statement arm is a `do … end` block (the patch also suggested `do … return expr; end` for an arm value, an idiom v0.30 removes);
   - a value-producing case with no matching arm raises `MatchFailureException`, and the compiler warns when coverage is not provable.
-- **Withdrawn after drafting:** an `if … then … else … end` expression to replace `a if c else b`. The ternary form is kept and tightened (the branches must share a type). A proposal to forbid the getter-only block property was also dropped.
+- **Conditional expression kept.** An `if … then … else … end` expression was drafted to replace `a if c else b`, then withdrawn before the owner applied it. A cleanup patch instead tightens the existing form: the branches must share a type, the condition must be `bool`, chains are right-associative, and `case` is recommended for three or more branches.
+- **Property forms unchanged.** A proposal to forbid the getter-only block property was dropped without a patch.
 - **Records:**
   - one declaration form, with an optional positional list and an optional body;
-  - positional names are not re-cased, so PascalCase is only a convention and the examples were corrected;
-  - constructor and property conflicts are compile errors;
-  - records may not have `owned` fields, destructors or `IDisposable`.
+  - positional names are not re-cased, so PascalCase is only a convention and the examples were corrected (`record UserId(Value: int)`);
+  - constructor and property conflicts are compile errors.
+- **Records and disposal.** Records may not have `owned` fields, destructors or `IDisposable`; their reference-typed fields are always borrows, and a class should own the resources a record views.
+
+<a id="sec-v0-26-to-v0-29-changelog-round-3"></a>
+### v0.26 to v0.29, round 3 (reconstructed; version number not recorded)
+
+- Source: patches drafted in the design conversation and applied by hand. The boundary is the next upload, which carries no version number. The owner confirmed the iterator patch ("Done"). The review of this upload quotes the Iterator Methods and async sections, and the next reviews and library work assume the FFI types and the numeric exceptions, but the owner did not confirm those two patches in words.
 - **Primitive types and conversions:**
-  - the full integer, floating-point and `decimal` set is specified, with a 32-bit `char` and a code-point-based `string`;
+  - the full integer, floating-point and `decimal` set is specified, with a 32-bit `char` (a code point) and an immutable, code-point-based `string`;
   - implicit widening follows C#, and explicit `T(x)` casts raise `OverflowException` when narrowing;
-  - integer arithmetic is checked, for signed and unsigned types alike, with no unchecked blocks;
+  - integer arithmetic is checked, for signed and unsigned types alike, with no unchecked blocks (reserved for a future revision); integer division truncates toward zero;
   - an unsuffixed literal must fit in `int`, and `+` on strings requires two strings.
-- **Iterator methods.** `yield return` / `yield break` are added, with C#'s `try`/`catch`/`finally` restrictions. `yield` is not allowed in lambdas.
-- **FFI.** Declarations go in block-only `extern "lib" [convention "…"] … end;` blocks; an inline single-declaration form was dropped after a parse ambiguity. The FFI-compatible types include `IntPtr`/`UIntPtr` and `CString`/`WString`/`RawBytes`. Callbacks may be non-capturing methods only.
-- **Async:**
-  - `async`/`await` run on a thread pool, with `Task` / `Task<T>` as classes;
-  - cancellation uses `CancellationToken` (a record that borrows its source) and `CancellationTokenSource`;
-  - async lambdas, `IAsyncEnumerable<T>` with `await for`, opt-in `IAsyncDisposable` with `await using`, `TaskCompletionSource<T>` and `Task` helpers (`WhenAll`, `WhenAny`, `Delay`, `FromResult`) are added.
-  
-  A task owns a class-typed result, and `Task<owned T>` is forbidden. The result is either borrowed while the task is held (Pattern A) or transferred by `using var x := await …` (Pattern B), and a bare `var x := await …` of a class result is an error.
+- **Iterator methods.** `yield return` / `yield break` are added, with C#'s `try`/`catch`/`finally` restrictions. An iterator returns `IEnumerable<T>` or `IEnumerator<T>`, may take `owned` parameters and may not use `return`. `yield` is not allowed in lambdas.
+- **FFI.** Declarations go in block-only `extern "lib" [convention "…"] … end;` blocks; an inline single-declaration form was drafted and dropped before the upload, after a parse ambiguity. The FFI-compatible types include `IntPtr`/`UIntPtr` and `CString`/`WString`/`RawBytes`. Callbacks may be non-capturing methods only. No `unsafe` marker is required.
+- **Async, first version:**
+  - `async`/`await` run on a thread pool with no synchronisation contexts, and `Task` / `Task<T>` are classes;
+  - all awaiters of a task see the same result. A task owns a class-typed result and awaiters borrow it, and `Task<owned T>` is forbidden;
+  - cancellation uses `CancellationToken` (a record) and `CancellationTokenSource`;
+  - async lambdas, `IAsyncEnumerable<T>` with `await for`, and `IAsyncDisposable` with `await using` are added.
+
+<a id="sec-v0-26-to-v0-29-changelog-round-4"></a>
+### v0.26 to v0.29, round 4 (reconstructed; version number not established)
+
+- Source: two async patches drafted in the design conversation and applied by hand; the review of the next upload finds both in the text. That upload is the last one before v0.30. A later inventory in the conversation calls it v0.29, but the same inventory misplaces other features, and the review of this upload found the version note had not been bumped through several patches. So the number this revision carried is not established.
+- **Async consistency fixes:**
+  - a class-typed result is either borrowed while the task is held in `using var` (Pattern A) or transferred by `using var x := await …` (Pattern B), and a bare `var x := await …` of a class result is an error; a task whose result was transferred cannot be awaited again;
+  - a `CancellationToken` borrows its source, which must outlive it;
+  - `Task<T>.Result` and `Task.Wait()` block and re-raise; `Result` borrows a class-typed result;
+  - `IAsyncDisposable` is opt-in, unlike `IDisposable`;
+  - stale "future revision" references to `yield` and async iterators are replaced by cross-references.
+- **`TaskCompletionSource<T>`** is added. It owns the task state, must outlive its task, and faults the task if disposed first.
+- **`Task` helpers** are added: `FromResult`, `FromException`, `FromCancelled`, `Delay`, `WhenAll` and `WhenAny`.
+- **A Common Patterns subsection** closes the async section: sequential and parallel work, cancellation, async cleanup, fire-and-forget, and bridging events and callbacks through a `TaskCompletionSource`.
 
 <a id="sec-v0-29-to-v0-30-changelog"></a>
-### v0.29 to v0.30 changelog (reconstructed)
+### Last pre-v0.30 upload to v0.30 changelog (reconstructed)
 
-- Source: the design-conversation record. The patch set that bumped the version is listed in it, and the following upload confirms it was applied. This revision is editorial.
+- Source: patch sets A (editorial) and B (reorganisation) drafted in the design conversation and applied by hand. The boundary is the next upload, which the owner sent with "all the things you mentioned fixed". Patch A9 sets the version note to v0.30, and the two spec files left at the end of the conversation both read v0.30. This revision is editorial.
 - The case-arm idiom `do … return expr; end` is removed. It contradicted the rule that `return` exits the enclosing callable. A helper method is now the recommended way to compute an arm value with several statements.
-- The fire-and-forget example no longer uses the unspecified `Task.ContinueWith`.
-- The sentence saying the `Task` helpers are "specified with the rest of the standard library" is replaced by a cross-reference.
+- The fire-and-forget example no longer uses the unspecified `Task.ContinueWith`; it uses a background-worker class holding a `Queue` of tasks.
+- The sentence saying the `Task` helpers are "specified with the rest of the standard library" is replaced by a cross-reference, and a stale "case expression" comment now says "case".
 - Reorganisation:
   - Block Statements moves to just after Control Structures;
   - the orphaned top-level "Locked-in member rules" becomes a subsection of Classes and Interfaces;
-  - the async subsections are reordered so that semantics come first, then `TaskCompletionSource`, helpers, async iterators and `IAsyncDisposable`.
-- Table-of-contents fixes, and "Locked-in" subsection titles standardised to lowercase.
+  - the async subsections are reordered so that semantics come first (awaiters, result ownership, lifetime, cancellation, exceptions, async lambdas), then `TaskCompletionSource`, helpers, async iterators, `IAsyncDisposable`, the runtime model and the common patterns.
+- Table-of-contents fixes (a missing entry for Expressions, Operators, and Precedence, and a heading's capitalisation), and "Locked-in" subsection titles standardised to lowercase.
 - The version note, which had not been bumped through several patches, is set to v0.30.
 
 <a id="sec-stdlib-v0-1-to-v0-4-changelog"></a>
 #### Early standard library, v0.1 to v0.4 (reconstructed)
 
-- Source: the design-conversation record. The standard library document was split off from the specification after v0.30 and carried **its own revision numbers, 0.1 to 0.4, all produced while the spec stood at v0.30**. They are not spec revisions. By the time of the per-revision changelog, the library is revised in step with the specification and carries the spec's version.
+- Source: the design-conversation record. Unlike the specification, the standard library document was produced as a file by the conversation itself, created and then revised in place for each of its versions. It was split off from the specification after v0.30 and carried **its own revision numbers, 0.1 to 0.4, all produced while the spec stood at v0.30**. They are not spec revisions. By the time of the per-revision changelog, the library is revised in step with the specification and carries the spec's version.
 - **Library 0.1.** A separate document is created, modelled on .NET, with modules `System`, `System.Collections`, `System.IO`, `System.Threading`, `System.FFI` and `System.Linq`. It contains:
   - `Object` (restated) and an exception hierarchy (`ArgumentException` … `TimeoutException`, including `MatchFailureException`);
   - `string` members;
@@ -415,10 +436,10 @@ The specification also still had to adopt `OrderBy`. All four appear in later so
 
 **Syntax and statements**
 
-- **`case` grew beyond its v0.29 form.** It gained a scrutinee-less form whose arms are boolean tests, record destructuring patterns (`Point(x, y)`), and typed bindings `var n: T` usable in every pattern position. v0.29 only warned when coverage was not provable; v0.52 has exhaustiveness checking. Record destructuring was still listed as an open gap just after v0.30.
+- **`case` grew beyond its v0.30 form.** It gained a scrutinee-less form whose arms are boolean tests, record destructuring patterns (`Point(x, y)`), and typed bindings `var n: T` usable in every pattern position. v0.30 only warned when coverage was not provable; v0.52 has exhaustiveness checking. Record destructuring was still listed as an open gap just after v0.30.
 - **Word operators and new operators.**
-  - Remainder is `mod` instead of `%`. The conversation's v0.29 arithmetic summary already writes `-7 mod 3`, so `mod` may date from then.
-  - `++`/`--` become postfix and statement-only; at v0.29 they were still expression operators with one overload covering prefix and postfix.
+  - Remainder is `mod` instead of `%`. The conversation's arithmetic design before v0.30 already writes `-7 mod 3`, so `mod` may date from then.
+  - `++`/`--` become postfix and statement-only; at v0.30 they were still expression operators with one overload covering prefix and postfix.
   - New operators appear: `in` (membership), `typeof`, `default`, and the discard `_`.
   - The precedence table gained levels for range, `??` and the conditional/`case` expression. Where the bitwise and `??` levels sat at v0.52 cannot be recovered, because v0.53 reshuffled them.
 
@@ -426,12 +447,12 @@ The specification also still had to adopt `OrderBy`. All four appear in later so
 
 - **Class model additions.** Generic variance was still listed as an open gap after v0.30. `Object` gains `GetType`, and boxing is specified; how a record is held through an interface was raised at v0.25 and never resolved in the record.
 - **Records** gain non-destructive update with `with` and object-initializer blocks. Primitive keywords are defined as aliases for `System.*` types. In v0.52 the library still declared them as `class int`, `class string`, … until v0.53.
-- **Dispose moved off `Object`.** At v0.30, `Object` still carried a compiler-generated `Dispose()`, so every class was `IDisposable` through it. Records had already lost all disposal at v0.29. By v0.52 disposal is class-only: the compiler generates `IDisposable` on classes, and records, enums and primitives have no `Dispose`.
+- **Dispose moved off `Object`.** At v0.30, `Object` still carried a compiler-generated `Dispose()`, so every class was `IDisposable` through it. Records had already lost all disposal before v0.30. By v0.52 disposal is class-only: the compiler generates `IDisposable` on classes, and records, enums and primitives have no `Dispose`.
 
 **Ownership and memory**
 
 - **Runtime-managed types and inferred local ownership.**
-  - `string`, boxed values and function values are runtime-managed and exempt from manual disposal. At v0.29 strings were only noted as "safe in records".
+  - `string`, boxed values and function values are runtime-managed and exempt from manual disposal. At v0.30 strings were only noted as "safe in records".
   - A local's ownership state (owned or borrowed) is inferred from how it was introduced, never annotated. The v0.53 entry notes that this model "was load-bearing throughout v0.52 but never written down".
 
 **New feature areas (absent at v0.30)**
@@ -441,10 +462,10 @@ The specification also still had to adopt `OrderBy`. All four appear in later so
 - **Standard library at v0.52.**
   - It has a doubly linked `List<T>` (renamed `LinkedList<T>` in v0.53), which is absent from library 0.4.
   - LINQ-style queries have `ToList()`, where library 0.4 had only `ToArray`, and keep `Map` from library 0.1.
-  - Strings are specified as UTF-32, building on v0.29's 32-bit `char`, and were made adaptive in v0.53.
+  - Strings are specified as UTF-32, building on the 32-bit `char` of v0.30, and were made adaptive in v0.53.
   - Float `=` follows IEEE semantics (made reflexive in v0.53).
 
-**Cross-check.** The v0.53 entry's account of v0.52 async matches the v0.29 design recorded above: a syntax-directed "Pattern A vs Pattern B" rule, with `Task<owned T>` and `out owned` not yet legal. So that part of the async model was stable from v0.29 to v0.52.
+**Cross-check.** The v0.53 entry's account of v0.52 async matches the pre-v0.30 design recorded above: a syntax-directed "Pattern A vs Pattern B" rule, with `Task<owned T>` and `out owned` not yet legal. So that part of the async model was stable from v0.30 to v0.52.
 
 **Datable decisions in the span** (only those whose version a source states explicitly)
 
