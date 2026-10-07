@@ -17293,6 +17293,18 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
     }
 }
 
+// fix #5473 (§14.1 / §14.2, v0.315) — forward declaration of the base-chain
+// walk shared by `constraintReceiverSubst` (here) and `substituteMemberType`
+// (defined below it, next to its call site). The two callers differ only in
+// whether an INTERFACE base is traversable — a bare type parameter's surface is
+// established by its constraint interface and that interface's ancestors, while
+// a concrete receiver's class-level arguments reach an inherited member through
+// its base CLASS — so the walk itself must not be a second copy.
+static bool ancestorGenericSubst(
+    const TypeRef* recvTy, const TypeSymbol* derived,
+    const TypeSymbol* parent, bool throughInterfaces,
+    std::unordered_map<std::string_view, TypeRef*>& out);
+
 // fix-forward #5469 (§14.2 / §5.1, v0.315): the substitution map for a
 // member call whose RECEIVER is itself an unsubstituted type parameter.
 //
@@ -17349,9 +17361,37 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
 //     (a concrete `C2` receiver, an alias-qualified builtin, a null-literal,
 //     …) — those already resolve through `substituteMemberType`;
 //   * no `where`-clause bound resolves to a TypeRef whose DECLARATION is
-//     `memberParent`, or the arities disagree, or any position is null — an
-//     unverifiable binding stays unsubstituted, which is the conservative
-//     direction (the pre-existing check still runs).
+//     `memberParent`, no base-interface walk reaches `memberParent`, the
+//     arities disagree, or any position is null — an unverifiable binding
+//     stays unsubstituted, which is the conservative direction (the pre-existing
+//     check still runs).
+//
+// fix #5473 (§14.2 / §5.1, v0.315): the DECLARATION-match guard above was the
+// residual this issue names. The member a bare `T` reaches need not be declared
+// by the bound interface itself: `interface IBase<E> { method Take(x: E) }`,
+// `interface IDer<E> : IBase<E>`, `where T: IDer<Other>`, `a.Take(u)`. Here
+// `memberParent` is `IBase` (the member's OWNING type) while the bound's
+// declaration is `IDer`, so the direct match never fired, the slot kept `E`
+// unsubstituted, and `checkAssignable` — which cannot check a bare
+// declaration-less type parameter against a concrete class — silently admitted
+// an `Unrelated` argument straight into a `Other`-typed parameter. MEASURED on
+// `r23-c28`: the program COMPILES and LINKS, and the wrong argument is then
+// executed — `runAot` reports `terminated by signal 11`, and under
+// `scripts/agent_check.sh --probe --asan` the same program reports
+//   ERROR: AddressSanitizer: heap-buffer-overflow ... READ of size 8
+//     #0 bz$M.Other$Len #1 bz$M.CD$Take #2 main
+//   0 bytes after the 16-byte `Unrelated` allocation.
+// That is the soundness failure, and it is why the substitution is not optional:
+// §14.2 admits exactly the substitutions for which `T` conforms, and an
+// inherited member is part of the surface a conforming `T` exposes.
+//
+// The base walk is `ancestorGenericSubst` with `throughInterfaces=true` — the
+// SAME function `substituteMemberType` uses for a CONCRETE receiver, so both
+// receivers resolve an inherited generic member by one rule. The walk composes
+// each level's arguments (`IDer<Other> -> IBase<Other>`), and a chain that
+// does not reach `memberParent`, or whose generic link is unresolvable, leaves
+// the map EMPTY — the conservative direction, and the pre-existing check's
+// behaviour unchanged.
 std::unordered_map<std::string_view, TypeRef*>
 ExprTC::constraintReceiverSubst(const ast::Expr* receiver,
                                 TypeSymbol* memberParent) {
@@ -17374,24 +17414,47 @@ ExprTC::constraintReceiverSubst(const ast::Expr* receiver,
     // builtin (OwningArray, …), not a constrained type parameter — the same
     // distinction the #5449 guard makes at the member-access site.
     if (!isInScopeTypeParam(paramName)) return out;
-    // Find the `where`-clause bound whose DECLARATION is the member's owning
-    // type. `forEachConstraintBound` yields each resolved bound in §14.2 order
-    // (method clauses, then the enclosing type's, then the extension's),
-    // following `where T: U` chains. Requiring the declaration to MATCH is
-    // what makes this specific: a different bound (or an unrelated interface
-    // reached through the chain) must not supply the member's parameters.
+    // Find the `where`-clause bound that instantiates `memberParent`. Two ways
+    // it can, tried in §14.2 bound order (method clauses, then the enclosing
+    // type's, then the extension's — `forEachConstraintBound` also follows
+    // `where T: U` chains), and the FIRST bound that supplies a map wins:
+    //
+    //   (1) DIRECT: the bound's DECLARATION *is* `memberParent` and its argument
+    //       count matches, so the positional binding below is the instantiation.
+    //   (2) INHERITED (fix #5473): `memberParent` is reached by walking the
+    //       bound interface's own base chain with `throughInterfaces=true`, which
+    //       composes `IDer<Other> -> IBase<Other>`.
+    //
+    // Requiring the DECLARATION to match, or to reach `memberParent`, is what
+    // makes this specific: an unrelated bound must not supply the member's
+    // parameters.
     bool found = forEachConstraintBound(
         paramName, [&](TypeRef* bound) -> bool {
-            if (!bound || bound->declaration != memberParent) return false;
-            if (bound->genericArgs.size() != memberParent->genericParams.size())
-                return false;
-            for (std::size_t i = 0; i < memberParent->genericParams.size(); ++i) {
-                Symbol* gp = memberParent->genericParams[i];
-                if (!gp || gp->name.empty() || !bound->genericArgs[i])
+            if (!bound || !bound->declaration) return false;
+            if (bound->declaration == memberParent) {
+                if (bound->genericArgs.size() !=
+                    memberParent->genericParams.size())
                     return false;
-                out[gp->name] = bound->genericArgs[i];
+                for (std::size_t i = 0;
+                     i < memberParent->genericParams.size(); ++i) {
+                    Symbol* gp = memberParent->genericParams[i];
+                    if (!gp || gp->name.empty() || !bound->genericArgs[i])
+                        return false;
+                    out[gp->name] = bound->genericArgs[i];
+                }
+                return !out.empty();
             }
-            return true;
+            // (2): the bound is a DIFFERENT declaration from the member's owner.
+            // Reach `memberParent` through the bound's base chain — through
+            // INTERFACES, since a bare type parameter's surface is established
+            // by its constraint interface and its ancestors (there is no class
+            // on this chain at all). A walk that does not arrive leaves `out`
+            // untouched and this bound supplies nothing; the loop then offers
+            // the next bound, and if none supplies anything the caller sees the
+            // empty map and runs the pre-existing check unchanged.
+            return ancestorGenericSubst(
+                bound, bound->declaration, memberParent,
+                /*throughInterfaces=*/true, out);
         });
     if (!found) out.clear();
     return out;
@@ -19956,6 +20019,104 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
     return false;
 }
 
+// §14.1 / §14.2: compose the `parent`-parameter-name -> concrete-argument map
+// for a receiver whose DECLARATION is `derived`, walking `derived`'s base
+// chain up to `parent` when `derived != parent` (issue #5473). `recvTy`, when
+// it carries `derived`'s own instantiation, seeds the walk's first level
+// (`Child<int>` reached through `Mid: Box<T>`).
+//
+// `throughInterfaces` selects which base kinds a level may traverse. The
+// CONCRETE-receiver path (`substituteMemberType`) passes false, preserving its
+// class-only walk byte-for-byte — a class's generic arguments reach an inherited
+// member through its base CLASS. The UNSUBSTITUTED-receiver path
+// (`constraintReceiverSubst`) passes true: a bare type parameter's surface is
+// established by its `where`-bound INTERFACE, and the member may be inherited
+// from that interface's own base (`where T: IDer<Other>`, `Take` declared on
+// `IBase<E>`) — a chain no class-only walk can reach, because there is no class
+// anywhere in it.
+//
+// Returns false — leaving the caller's map empty, which is the conservative
+// answer in both directions — when `parent` is not on the chain, or when a
+// generic link is unresolvable (`Base<U>` with no `U` in scope to bind it).
+static bool ancestorGenericSubst(
+    const TypeRef* recvTy, const TypeSymbol* derived,
+    const TypeSymbol* parent, bool throughInterfaces,
+    std::unordered_map<std::string_view, TypeRef*>& out) {
+    if (!derived || !parent || derived == parent) return false;
+    out.clear();
+    // (derived, its bound args) frontier. A declaration is visited at most once:
+    // a hierarchy is consistent (§11.2), so every path to a shared ancestor
+    // composes the same arguments and a re-visit cannot yield a different map.
+    // The set also bounds the walk against the inheritance cycle rejected
+    // elsewhere (§12.10) — the same visited-set discipline
+    // `findConstraintStaticOperator`'s `scanClosure` uses for the identical
+    // "reach an ancestor through an interface chain" question.
+    std::vector<std::pair<const TypeSymbol*,
+                          std::unordered_map<std::string_view, TypeRef*>>> work;
+    std::unordered_map<std::string_view, TypeRef*> curArgs;
+    if (recvTy && recvTy->declaration == derived &&
+        !recvTy->genericArgs.empty() &&
+        derived->genericParams.size() == recvTy->genericArgs.size())
+        for (std::size_t gi = 0; gi < derived->genericParams.size(); ++gi)
+            if (derived->genericParams[gi])
+                curArgs[derived->genericParams[gi]->name] =
+                    recvTy->genericArgs[gi];
+    work.push_back({derived, std::move(curArgs)});
+    std::unordered_set<const TypeSymbol*> visited;
+    std::size_t i = 0;
+    while (i < work.size()) {
+        const TypeSymbol* cur = work[i].first;
+        std::unordered_map<std::string_view, TypeRef*> curArgsAt =
+            work[i].second;
+        ++i;
+        if (!cur || !visited.insert(cur).second) continue;
+        for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
+            const TypeSymbol* base = cur->baseTypes[bi];
+            if (!base) continue;
+            const bool isIface =
+                base->kind == ast::TypeDeclKind::Interface;
+            if (isIface && !throughInterfaces) continue;
+            if (!isIface && base->kind != ast::TypeDeclKind::Class) continue;
+            const TypeRef* baseRef =
+                (bi < cur->baseTypeRefs.size()) ? cur->baseTypeRefs[bi]
+                                                : nullptr;
+            std::unordered_map<std::string_view, TypeRef*> nextArgs;
+            if (!base->genericParams.empty()) {
+                if (!baseRef ||
+                    baseRef->genericArgs.size() != base->genericParams.size())
+                    return false;  // unresolvable generic link
+                for (std::size_t gi = 0; gi < base->genericParams.size();
+                     ++gi) {
+                    TypeRef* arg = baseRef->genericArgs[gi];
+                    // Resolve a bare generic-param ref (`T`, no declaration)
+                    // through this level's bindings; a concrete arg passes
+                    // through unchanged.
+                    if (arg && arg->kind == TypeRef::Kind::Named &&
+                        !arg->declaration && arg->astNode &&
+                        arg->astNode->name &&
+                        arg->astNode->name->parts.size() == 1) {
+                        auto it = curArgsAt.find(arg->headName());
+                        if (it != curArgsAt.end()) arg = it->second;
+                    }
+                    if (base->genericParams[gi])
+                        nextArgs[base->genericParams[gi]->name] = arg;
+                }
+            }
+            if (base == parent) {
+                for (const Symbol* gp : parent->genericParams) {
+                    auto it = nextArgs.find(gp->name);
+                    if (it != nextArgs.end() && it->second)
+                        out[gp->name] = it->second;
+                }
+                return true;
+            }
+            work.push_back({base, std::move(nextArgs)});
+        }
+    }
+    out.clear();
+    return false;
+}
+
 // per §14.1/§14.2: substitute a member's declared type against the receiver's
 // concrete generic arguments. A field/property declared `v: T` on a generic
 // type `Holder<T>`, accessed off `b: Holder<Inner>`, has type `Inner` — not
@@ -20063,61 +20224,15 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
         // 2+ levels and the inherited generic-T member typed as `?` (e.g. a
         // binary-operator operand rejected as "operator + not defined for `?`").
         // Mirrors the codegen base-substitution (computeAncestorGenericSubst).
-        const TypeSymbol* cur = derived;
-        // curArgs: cur's generic-param-name -> concrete TypeRef at this level.
-        // Seeded from the receiver's own bound args when the receiver itself is
-        // a generic instantiation (`Child<int>`); usually `derived` is the
-        // enclosing class with bare params, so curArgs starts empty.
-        std::unordered_map<std::string_view, TypeRef*> curArgs;
-        if (recvTy && recvTy->declaration == derived &&
-            !recvTy->genericArgs.empty() &&
-            derived->genericParams.size() == recvTy->genericArgs.size())
-            for (std::size_t gi = 0; gi < derived->genericParams.size(); ++gi)
-                if (derived->genericParams[gi])
-                    curArgs[derived->genericParams[gi]->name] =
-                        recvTy->genericArgs[gi];
-        while (cur && cur != parent) {
-            const TypeSymbol* base = nullptr;
-            TypeRef* baseRef = nullptr;
-            for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
-                if (cur->baseTypes[bi] &&
-                    cur->baseTypes[bi]->kind == ast::TypeDeclKind::Class) {
-                    base = cur->baseTypes[bi];
-                    baseRef = (bi < cur->baseTypeRefs.size())
-                                  ? cur->baseTypeRefs[bi] : nullptr;
-                    break;
-                }
-            }
-            if (!base) break;  // `parent` not on the class chain
-            std::unordered_map<std::string_view, TypeRef*> nextArgs;
-            if (!base->genericParams.empty()) {
-                if (!baseRef ||
-                    baseRef->genericArgs.size() != base->genericParams.size())
-                    return declared;  // unresolvable generic link
-                for (std::size_t gi = 0; gi < base->genericParams.size(); ++gi) {
-                    TypeRef* arg = baseRef->genericArgs[gi];
-                    // Resolve a bare generic-param ref (`T`, no declaration)
-                    // through this level's bindings; a concrete arg passes
-                    // through unchanged.
-                    if (arg && arg->kind == TypeRef::Kind::Named &&
-                        !arg->declaration && arg->astNode && arg->astNode->name &&
-                        arg->astNode->name->parts.size() == 1) {
-                        auto it = curArgs.find(arg->headName());
-                        if (it != curArgs.end()) arg = it->second;
-                    }
-                    if (base->genericParams[gi])
-                        nextArgs[base->genericParams[gi]->name] = arg;
-                }
-            }
-            cur = base;
-            curArgs = std::move(nextArgs);
-        }
-        if (cur != parent) return declared;  // ancestor not reached
-        for (const Symbol* gp : parent->genericParams) {
-            auto it = curArgs.find(gp->name);
-            if (it != curArgs.end() && it->second)
-                classSubst[gp->name] = it->second;
-        }
+        //
+        // fix #5473: the walk itself moved to `ancestorGenericSubst`, shared with
+        // `constraintReceiverSubst`. This call passes `throughInterfaces=false`,
+        // which reproduces the inline loop it replaces EXACTLY — only a Class
+        // base is traversable, and a class has at most one — so no program that
+        // compiled through this arm before compiles differently now.
+        if (!ancestorGenericSubst(recvTy, derived, parent,
+                                  /*throughInterfaces=*/false, classSubst))
+            return declared;  // ancestor not reached / unresolvable generic link
     }
     if (classSubst.empty()) return declared;
     // substituteReturnType handles both the bare-param case (with the `T?`
