@@ -6779,6 +6779,54 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // fix #5469 (§5.1, v0.315): a concrete CLASS or RECORD source
+    // assigned to a bare type parameter target. §5.1 lists no conversion
+    // from a concrete class/record to a type parameter — the only type
+    // parameter conversions are identity, boxing to Object, and conversions
+    // to interface/class bounds the constraints guarantee. A concrete
+    // class like `Cell` has no such conversion to an unconstrained `T`,
+    // so `method M<T>(): T => new Cell(7)` is rejected at the declaration
+    // (not at instantiation — the body is checked against T once, not per
+    // substitution). This is the CLASS/RECORD counterpart of #4810's
+    // primitive → type-parameter rejection, placed at the end of the
+    // function just before the catch-all so that Object → T (boxing),
+    // primitive → T (#4810), and type parameter → T (generic deferral)
+    // all take their existing paths first.
+    {
+        std::string_view toTpHead =
+            (to->kind == TypeRef::Kind::Named && !to->declaration &&
+             to->genericArgs.empty())
+                ? to->headName()
+                : std::string_view();
+        // toIsCalleeFreeParam: exclude a callee's unsubstituted type
+        // parameter (those are inference slots, not conversion targets).
+        bool toIsCalleeFreeParam =
+            freeTypeParamNames && !toTpHead.empty() &&
+            freeTypeParamNames->count(toTpHead);
+        if (!toTpHead.empty() && !toIsCalleeFreeParam &&
+            currentScopeGenericParamNames().count(toTpHead)) {
+            // A concrete class or record: has a declaration, is not Object.
+            bool fromIsConcreteClassRecord =
+                from->kind == TypeRef::Kind::Named &&
+                from->declaration &&
+                (from->declaration->kind == ast::TypeDeclKind::Class ||
+                 from->declaration->kind == ast::TypeDeclKind::Record) &&
+                from->headName() != "Object";
+            if (fromIsConcreteClassRecord) {
+                std::string fromName(from->headName());
+                reportNotConvertible(
+                    std::string("the type `") + fromName +
+                    "` is not implicitly convertible to the type parameter `" +
+                    std::string(toTpHead) +
+                    "` — §5.1 lists no conversion from a concrete class or "
+                    "record to a bare type parameter; constrain `" +
+                    std::string(toTpHead) +
+                    "` to the class or an interface it implements, "
+                    "or construct the target type directly");
+                return;
+            }
+        }
+    }
     // Mixed / generic-parameter / null-literal cases: skip.
 }
 
