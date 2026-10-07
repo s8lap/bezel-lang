@@ -30298,6 +30298,11 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
             if (ps->isIndexer) return false;
             bool declaredFunc = false;
             if (const auto* pd =
+                    // SEAM-ACCESSOR: both-sources carry — `ps->decl` is nullptr
+                    // for an IMPORTED property (#3671) and the importedMemberType
+                    // arm below is the symbol-side channel; an AST-only read
+                    // answers WRONG for every imported property and re-opens
+                    // #5318's leak. // per §27.6, §28.6, v0.315
                     dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
                 declaredFunc =
                     pd->type && pd->type->kind == ast::TypeKind::Function;
@@ -31593,6 +31598,10 @@ bool Emitter::isOwnedChoiceFieldLvalue(const ast::Expr& target) {
     if (!fs->decl) {
         rt = ctx_.importedMemberType(fs);
     } else {
+        // SEAM-ACCESSOR: both-sources carry — the `!fs->decl` arm above is the
+        // symbol-side channel for an IMPORTED field (#3671), this the local
+        // half; an AST-only read answers WRONG for every imported field and
+        // re-opens #5440's double-dispose. // per §35.4, §28.7, v0.315
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return false;
         rt = ctx_.resolvedType(*fd->type);
@@ -31629,6 +31638,12 @@ const sema::TypeRef* Emitter::owningChoiceFieldType(
     if (!fs->decl) {
         rt = ctx_.importedMemberType(fs);
     } else {
+        // SEAM-ACCESSOR: both-sources carry — the `!fs->decl` arm above is the
+        // symbol-side channel for an IMPORTED field (#3671), this cast is the
+        // local half. Same shape and same reason as the cast in
+        // isOwnedChoiceFieldLvalue immediately above; §35.4 classification must
+        // agree for an imported choice field or drop-on-overwrite would miss it.
+        // per §35.4, v0.315
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return nullptr;
         rt = ctx_.resolvedType(*fd->type);
@@ -31668,6 +31683,11 @@ bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
     if (!fs->decl) {
         rt = ctx_.importedMemberType(fs);
     } else {
+        // SEAM-ACCESSOR: both-sources carry — third arm of the same
+        // resolve-the-field-type idiom (see isOwnedChoiceFieldLvalue and
+        // owningChoiceFieldType); the `!fs->decl` arm above is the
+        // symbol-side channel for an IMPORTED field, this cast the local half.
+        // per §35.4, §28.7, v0.315
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return false;
         rt = ctx_.resolvedType(*fd->type);

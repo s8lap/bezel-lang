@@ -6631,6 +6631,13 @@ void Emitter::disposeDisplacedCollectionLocal(const ast::Expr* target,
     if (!id) return;  // field / index / static target — not a plain local
     auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
     if (!loc) return;
+    // LOCALDECL-ONLY: `target` is an ASSIGNMENT target — this helper's
+    // sole caller is the `:=` store sequence in lowerAssignStmt
+    // (LlvmBackend_Stmts.cpp:2102) — and §21.1 makes a `const` local a
+    // single-assignment binding, so sema rejects the store before codegen
+    // runs ("cannot assign to const local ...", ExprTypecheck.cpp). A
+    // LocalConstDecl cannot reach here. Same reason as the sibling class
+    // helper's site above. // per §21.1
     auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
     if (!ld) return;
     // Only collection types need this helper; plain class is handled by
