@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 11.6
 //! title: a nested type's qualified name includes the enclosing path
-//! rule: A nested type is referenced from outside as Outer.Nested, and the
-//!   enclosing path is part of its qualified name wherever one is rendered.
+//! rule: A nested type none of whose enclosing types is generic is referenced
+//!   from outside as Outer.Nested, and the enclosing path is part of its qualified name wherever one is rendered.
 //! cites: 11.6
 //! expect: run
 //! stdout: Conf.Parser.Token
