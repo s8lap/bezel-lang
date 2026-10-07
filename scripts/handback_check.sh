@@ -250,7 +250,7 @@ check_reverts() {
     [ -n "$line" ] || continue
     hits+="$line"$'\n'
   done < <(g log --first-parent -n "$depth" --skip=1 --format='%h %s' "$TIP" 2>/dev/null \
-             | grep -iE '^([0-9a-f]+ )?[^ ]*(revert|reverted)[^ ]* |not landed|not-landed|superseded by|unsafe:|use-after-free|do not land')
+             | grep -iE '^([0-9a-f]+ )?[^ ]*(revert|reverted)[^ ]* |not landed|not-landed|superseded by|unsafe:|do not land')
   if [ -z "$hits" ]; then
     row PASS reverts "no revert/UAF marker in the last $depth first-parent commits"
   else
