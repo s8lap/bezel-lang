@@ -216,13 +216,35 @@ check_named_tests() {
   else row WARN named-tests "named in a commit message but not found at the tip: $missing"; fi
 }
 
+check_reverts() {
+  # A lane that hits a wall records it and pushes on. A REVERT/UAF/NOT LANDED
+  # commit in the branch's own history is therefore a blocking finding the
+  # candidate diff cannot show: `git show <sha>` is three-way against <sha>^, so
+  # when the revert IS the parent, the candidate reads as a clean forward fix.
+  # R28: a reviewer returned PICK on a codegen commit whose own parent was
+  # "REVERT fix #NNNN: ... introduces a UAF" recording an ASan heap-use-after-free.
+  # Scan the branch's ancestry and make the lane answer why it was reverted.
+  local hits="" depth="${HANDBACK_REVERT_DEPTH:-12}"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    hits+="$line"$'\n'
+  done < <(g log --first-parent -n "$depth" --format='%h %s' "$TIP" 2>/dev/null \
+             | grep -iE '\b(revert|reverted|not landed|not-landed|superseded|unsafe|use-after-free|uaf|abandon(ed)?|do not land)\b')
+  if [ -z "$hits" ]; then
+    row PASS reverts "no revert/UAF marker in the last $depth first-parent commits"
+  else
+    row WARN reverts "ancestor records a revert or unsoundness — the candidate MUST explain why it is now landable:"
+    printf '%s' "$hits" | indent
+  fi
+}
+
 echo "handback_check: $BRANCH vs $BASE  (repo $REPO)"
 if check_branch; then
   check_reported
   check_base
   if check_commits; then
     check_trailers; check_author; check_files; check_grant
-    check_scripts; check_needles; check_named_tests
+    check_scripts; check_needles; check_named_tests; check_reverts
   fi
 fi
 if [ "$NFAIL" -gt 0 ]; then echo "VERDICT: FAIL ($NFAIL fail, $NWARN warn)"; exit 1; fi
