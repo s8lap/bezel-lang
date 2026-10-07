@@ -177,3 +177,75 @@ BEZEL_TEST(static_method_body_instance_member_5447,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 9);
 }
+
+// #5462 / §2.7 (v0.315): inherited instance field — a static method body of
+// Sub : Base bare-references an instance field declared on Base.
+// This case is rejected by fix #5404 (ab6405e), which predates #5447 (8f538ce).
+// Fix #5404's field rejection covers inherited fields via the same lookupMember
+// transitive walk. Row 8 (not this one) pins #5447. This row guards #5404's
+// inherited-field path against regression.
+// Expected: REJECTED with the §2.7 diagnostic.
+BEZEL_TEST(static_method_body_instance_member_5447,
+           inherited_instance_field_from_static_body_rejected_documents_5404) {
+    JitResult r = runAot(
+        "module M; "
+        "class Base "
+        "  public instanceField: int := 99; "
+        "end Base; "
+        "class Sub : Base "
+        "  public static method Main(): int "
+        "    var x := instanceField; "
+        "    return x; "
+        "  end Main; "
+        "end Sub;");
+    if (!hasStaticCtxInstanceMemberDiagnostic(r, "instanceField")) dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasStaticCtxInstanceMemberDiagnostic(r, "instanceField"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #5462 / §2.7 (v0.315): inherited instance method — a static method body of
+// Sub : Base bare-references an instance method declared on Base.
+// This is the row that PINs fix #5447 (8f538ce): the method rejection was
+// added by #5447, not by any prior fix. Without #5447, this test fails.
+// Expected: REJECTED with the §2.7 diagnostic.
+BEZEL_TEST(static_method_body_instance_member_5447,
+           inherited_instance_method_from_static_body_rejected_pins_5447) {
+    JitResult r = runAot(
+        "module M; "
+        "class Base "
+        "  public method GetVal(): int => 77; "
+        "end Base; "
+        "class Sub : Base "
+        "  public static method Main(): int "
+        "    var x := GetVal(); "
+        "    return x; "
+        "  end Main; "
+        "end Sub;");
+    if (!hasStaticCtxInstanceMemberDiagnostic(r, "GetVal")) dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasStaticCtxInstanceMemberDiagnostic(r, "GetVal"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// Control: #5462 / §2.7 (v0.315): inherited STATIC member — a static method
+// body of Sub : Base bare-references a static member declared on Base.
+// This is a control for #5447: static members are not affected by the fix.
+// It documents that inherited static members are correctly accessible (not
+// affected by #5404 either, since that covers instance fields only).
+// This MUST still compile and return the correct value (55).
+BEZEL_TEST(static_method_body_instance_member_5447,
+           inherited_static_member_from_static_body_accepted_control) {
+    JitResult r = runAot(
+        "module M; "
+        "class Base "
+        "  public static staticField: int := 55; "
+        "end Base; "
+        "class Sub : Base "
+        "  public static method Main(): int "
+        "    var x := staticField; "
+        "    return x; "
+        "  end Main; "
+        "end Sub;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 55);
+}
+
