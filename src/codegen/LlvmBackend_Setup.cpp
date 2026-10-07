@@ -1878,9 +1878,15 @@ llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
         // genericInstEnsureInitFn ensures this whole function's body executes
         // exactly once process-wide), so registration cannot double-fire.
         if (isOwnedReferenceField(fs2) || isOwnedBuiltinExceptionField(fs2)) {
+            // #5472: pass slot address. Phase A of bz_dispose_static_owned's
+            // two-phase drain nulls it BEFORE Phase B frees, breaking external
+            // reachability so a skipped disposal is a direct leak and visible to LSan.
             auto* regFn = declareC("bz_register_static_owned",
-                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(regFn, {val});
+                                   llvm::Type::getVoidTy(llvm_),
+                                   {ptrTy(), ptrTy()->getPointerTo()});
+            auto* slotAddr = builder_.CreatePointerCast(
+                instGV, ptrTy()->getPointerTo());
+            builder_.CreateCall(regFn, {val, slotAddr});
         }
     }
     builder_.CreateRetVoid();
@@ -11545,7 +11551,8 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                     llvm::Function* regFn = nullptr;
                     if (isOwnedInlineArr)
                         regFn = declareC("bz_register_static_owned",
-                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                                         llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy(), ptrTy()->getPointerTo()});
                     for (std::size_t i = 0; i < cl->elements.size(); ++i) {
                         if (!cl->elements[i]) continue;
                         llvm::Value* ev = lowerExpr(*cl->elements[i]);
@@ -11588,8 +11595,13 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                         // §22.13 (#1212): register each owned slot for atexit
                         // disposal (reverse init order). Only class-typed slots
                         // have a vtable and a bz_register_static_owned call.
-                        if (regFn && ev->getType()->isPointerTy())
-                            builder_.CreateCall(regFn, {ev});
+                        if (regFn && ev->getType()->isPointerTy()) {
+                            // #5472: pass slot address. Phase A of bz_dispose_static_owned's
+                            // two-phase drain nulls it BEFORE Phase B frees.
+                            auto* slotAddr = builder_.CreatePointerCast(
+                                gep, ptrTy()->getPointerTo());
+                            builder_.CreateCall(regFn, {ev, slotAddr});
+                        }
                     }
                     bumpProgress();  // #1553: inline-array field now assigned
                     continue;  // inline-array literal stored element-wise
@@ -11634,9 +11646,15 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             // vtable Dispose; collections, Shared/Weak, and Subscription fields
             // have separate runtime free paths and are excluded by the predicate.
             if (isOwnedReferenceField(fs) || isOwnedBuiltinExceptionField(fs)) {
+                // #5472: pass slot address. Phase A of bz_dispose_static_owned's
+                // two-phase drain nulls it BEFORE Phase B frees, breaking external
+                // reachability so a skipped disposal is a direct leak and visible to LSan.
                 auto* regFn = declareC("bz_register_static_owned",
-                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(regFn, {val});
+                                       llvm::Type::getVoidTy(llvm_),
+                                       {ptrTy(), ptrTy()->getPointerTo()});
+                auto* slotAddr = builder_.CreatePointerCast(
+                    gvIt->second, ptrTy()->getPointerTo());
+                builder_.CreateCall(regFn, {val, slotAddr});
             }
             // fix #709 / §22.12: also store into every per-instantiation global
             // for this field that was created lazily by staticFieldGlobal().

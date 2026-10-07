@@ -26,7 +26,8 @@
 // ---------------------------------------------------------------------------
 
 struct bz_static_owned_entry_t {
-    void* obj;  // static owned class/interface instance pointer
+    void* obj;       // static owned class/interface instance pointer
+    void** slotAddr; // address of the static field slot
 };
 
 static std::vector<bz_static_owned_entry_t>* g_static_owned = nullptr;
@@ -46,6 +47,23 @@ static void bz_dispose_static_owned(void) {
     // reverse order is guaranteed only among pre-exit initializations, exactly as
     // the spec states. The vector is deleted ONLY after the drain empties, so a
     // late push_back always lands in a live vector.
+    //
+    // #5472: TWO PHASE to make LSan-visible when disposal is skipped.
+    // Phase A (unregister, before any disposal): walk the registry and null every
+    // slotAddr. This breaks external reachability BEFORE Phase B runs, so if
+    // disposal is ever skipped (a future bug), the allocation is already
+    // unreachable and LSan reports it as a direct leak.
+    // Phase B (dispose): drain, dispose, free as today. Phase B's copy-then-pop
+    // discipline ensures a late push_back lands in the live vector.
+    // Phase A must precede Phase B: nulling slots after free (as the original
+    // fix did) is too late — if disposal is skipped, the free never runs and
+    // the nulling never happens, so the slot still holds the pointer.
+    for (auto& entry : *g_static_owned) {
+        if (entry.slotAddr) {
+            *entry.slotAddr = nullptr;
+        }
+    }
+    // Phase B: drain LIFO
     while (!g_static_owned->empty()) {
         // Copy-then-pop: hold NO reference into the vector across the Dispose call
         // below — Dispose may trigger a bz_register_static_owned push_back that
@@ -67,13 +85,13 @@ static void bz_dispose_static_owned(void) {
     g_static_owned = nullptr;
 }
 
-extern "C" void bz_register_static_owned(void* obj) {
+extern "C" void bz_register_static_owned(void* obj, void** slotAddr) {
     if (!obj) return;
     if (!g_static_owned) {
         g_static_owned = new std::vector<bz_static_owned_entry_t>();
         atexit(bz_dispose_static_owned);
     }
-    g_static_owned->push_back({obj});
+    g_static_owned->push_back({obj, slotAddr});
 }
 
 // Called by the in-process JIT test harness immediately after the JIT

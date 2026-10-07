@@ -362,4 +362,39 @@ BEZEL_TEST(codegen_enum_owned_1564, failed_init_owned_field_still_freed_no_leak_
     BEZEL_EXPECT_EQ(lsan, 0);
 }
 
+// =====================================================================
+// #5472: runtime-level slot-nulling test
+// Direct test of Phase A of bz_dispose_static_owned's two-phase drain.
+// Verifies that the static field slot is nulled after disposal, making
+// the allocation unreachable so LSan can detect a leak if disposal is skipped.
+// =====================================================================
+// The runtime exports bz_register_static_owned and bz_flush_static_owned
+// (linked via -Wl,--whole-archive, confirmed by nm -C on the test binary).
+// Six existing tests already call bz_flush_static_owned directly.
+extern "C" void bz_register_static_owned(void* obj, void** slotAddr);
+extern "C" void bz_flush_static_owned(void);
+
+// Fake vtable: {nullptr, nullptr, dispose_fn}
+// dispose_fn bumps a counter so we can verify disposal ran.
+static int g_disposeCount = 0;
+static void fake_dispose(void*) { ++g_disposeCount; }
+static void* g_slot = nullptr;  // Separate slot global, matching codegen's layout
+
+BEZEL_TEST(codegen_static_owned_disposal_1212, slot_nulled_after_disposal_phase_a_5472) {
+    // Arrange: fake vtable and separate slot global
+    void* vtable[3] = {nullptr, nullptr, (void*)&fake_dispose};
+    void* obj = malloc(16);  // payload + padding
+    *(void**)obj = vtable;   // vtable at offset 0
+    g_slot = obj;
+
+    // Act: register and flush (simulates atexit disposal)
+    bz_register_static_owned(obj, &g_slot);
+    g_disposeCount = 0;
+    bz_flush_static_owned();
+
+    // Assert: slot is nulled (Phase A) and disposal ran (Phase B)
+    BEZEL_EXPECT_EQ(g_slot, nullptr);
+    BEZEL_EXPECT_EQ(g_disposeCount, 1);
+}
+
 } // namespace
