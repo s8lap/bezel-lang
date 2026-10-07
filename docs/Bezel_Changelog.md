@@ -11,11 +11,11 @@ Entries are pinned history — each was written at its revision and is not retro
 
 The entries in this section were reconstructed in 2026-10. They predate the per-revision changelog that begins at v0.52 to v0.53 below. Each one summarises what changed and is not a complete migration record. They rest on three kinds of source, and each entry names its own:
 
-- **Archived snapshots of the specification** (v0.4–v0.18, v0.20, v0.21, v0.23, v0.24, v0.31, v0.60). These are verbatim, and they are the strongest source.
+- **Archived snapshots of the specification** (v0.4–v0.18, v0.20, v0.21, v0.23, v0.24, v0.31, v0.37–v0.42, v0.60). These are verbatim, and they are the strongest source.
 - **A record of the design conversation** that ran from v0.24 to v0.30. The conversation did not produce spec files: it drafted patches, the owner applied them to the spec by hand and periodically re-uploaded it. The drafted patches are therefore the record of what changed, and the uploads are the revision boundaries. The record summarises most of its turns instead of quoting the spec text. The entries for v0.24 to v0.30 rest on it, one entry per round of patches between two uploads, and have been checked against the v0.31 snapshot. Its last patches, drafted after the v0.30 upload, are matched against v0.31 in the v0.30 to v0.31 entry.
 - **A later summary of the earliest design conversation**, covering v0.1–v0.3. It describes itself as "reconstructed progressive snapshots" and is not a verbatim spec, so it is the weakest source.
 
-v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.32–v0.51, except one decision dated v0.40; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. No v0.22 text survives; its contents are placed by a change record written when v0.23 was drafted, as its entry explains. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
+v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.32–v0.36 or v0.43–v0.51; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. No v0.22 text survives; its contents are placed by a change record written when v0.23 was drafted, as its entry explains. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
 
 <a id="sec-v0-1-to-v0-2-changelog"></a>
 ### v0.1 to v0.2 changelog (reconstructed)
@@ -464,67 +464,146 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
   - extension methods can be used as method references.
 
   `extension` moves from the reserved-for-future-use keywords to the declaration keywords, which leaves no reserved-for-future-use keywords. The Iteration section now presents `Map`, `Filter`, `SortBy` and the other sequence operations as extension methods on `IEnumerable<T>` from `Collections.Linq`. Its locked-in rules still call them "reserved for future revisions", a sentence the patch did not reach.
-- **Not applied: `SortBy` → `OrderBy`.** The conversation agreed the rename and applied it to the standard library document (library 0.2), but v0.31 still writes `SortBy` throughout. The spec uses `OrderBy` by v0.60 (see the next entry).
+- **Not applied: `SortBy` → `OrderBy`.** The conversation agreed the rename and applied it to the standard library document (library 0.2), but v0.31 still writes `SortBy` throughout. The spec still writes `SortBy` in v0.42 and uses `OrderBy` by v0.60 (see the [v0.42 to v0.52 entry](#sec-v0-42-to-v0-52-changelog)).
 
-<a id="sec-v0-31-to-v0-52-changelog"></a>
-### v0.31 to v0.52 changelog (reconstructed, span)
+<a id="sec-v0-31-to-v0-37-changelog"></a>
+### v0.31 to v0.37 changelog (reconstructed, span)
 
-No source survives for any revision between v0.31 and v0.60, apart from the one decision dated below. So none of these changes can be attributed to a single revision. This entry lists differences between the v0.31 snapshot and the v0.60 spec and rationale snapshots, leaving out what the v0.52→v0.60 entries (below) record as changed after v0.52. What remains describes v0.52. Where the v0.53 entry states v0.52's behaviour directly, that statement is used. An item's absence from the v0.52→v0.60 entries is the only evidence that it predates v0.53, so an item could belong after v0.52 if one of those entries left it out.
+- Source: the v0.31 and v0.37 snapshots (verbatim, headed "v0.31 – April 2026" and "v0.37 – April 2026"). No text of v0.32–v0.36 survives, so none of these changes can be attributed to a single revision. Neither snapshot carries a changelog or revision notes. The v0.37 text gives no evidence of the order in which the v0.32–v0.36 changes were made: its new sections are inserted where their topic belongs rather than appended, and they cross-reference only material that v0.31 already had.
+- **Operators:**
+  - remainder is written `mod`, a reserved word-form operator, instead of `%`. `mod` has no compound form, so `%=` leaves the assignment row and `mod=` is not valid syntax;
+  - `++`/`--` become postfix-only and statement-only: `++c` is a parse error and `x := c++` a compile error. At v0.31 they were expression operators with one overload for prefix and postfix;
+  - a new **`in` membership operator**: `x in c` is sugar for `c.Contains(x)` (instance or extension method), sits at the relational level and cannot be overloaded;
+  - the precedence table gains a null-coalescing level (`??`, right-associative) and a primary level that now lists `?.` and, moved from the unary level, `++` and `--`. The assignment row gains `??=`.
+- **`case` gains a scrutinee-less form** whose arms are boolean expressions tested in order, with `_` as the final "otherwise" arm. It is presented as the preferred replacement for long `if`/`elif` chains. The enum examples are rewritten to the comma-separated `pattern => expression` arms that v0.31's rules already required.
+- **Nested types.** A class may declare nested classes, records, enums and interfaces with any visibility. A public nested type is named `Outer.Nested` from outside, its effective visibility is capped by the outer class's, and outer and nested types see each other's private members.
+- **Class-level constants.** `const` may appear in a class body. It is implicitly static (`static const` is an error), inlined at every use, usable in `case` patterns, and limited to primitive value types and `string`.
+- **Object initializer blocks** for classes: `new T(args) with Name := value, … end` assigns public settable properties or fields, in order, after the constructor returns, with no rollback if one throws. Only `Name := value` pairs are allowed, records are excluded, and `with` is contextual. The text points records to a `with`-copy expression "when available in a future revision", and recommends named optional constructor parameters as the preferred idiom.
+- **Events** (a new section). They are declared as `[visibility] [static] [async] event Name: HandlerType;`, where the handler type is a function type returning `()` or, for `async` events, `Task`.
+  - `+=`/`-=` subscribe and unsubscribe a handler. `.Subscribe(handler)` returns an owned, disposable `Subscription` that removes the handler when disposed, which is the mechanism for lambdas.
+  - Events are raised only inside the declaring class (or a derived class, for `protected` events) with `Event?.Invoke(args)`. Async handlers are awaited one by one in subscription order, and a faulting handler stops the rest.
+  - Event arguments are records, with no base `EventArgs` type. Events cannot appear in interfaces or be virtual, abstract, override or sealed. `event` becomes a declaration keyword.
+- **`async` and members.** The member modifier order gains `async` (`visibility static async abstract|virtual|override|sealed readonly`). `async abstract` is a compile error: an abstract member declares a `Task` return type, and `async` goes on the concrete override.
+- **Statements and definite assignment:**
+  - `break` and `continue` are specified: they affect only the innermost loop and are errors outside one. There are no labelled loops; multi-level exits use `return` from an extracted method or a flag;
+  - the callee must assign every `out` parameter on every exit path, or the method is rejected.
+- **Escape sequences.** `\uXXXX` covers only the BMP and `\UXXXXXXXX` the full range. An escape that resolves to a surrogate code point (U+D800–U+DFFF) is a compile error.
+- **Keyword lists.** `new` moves from the modifier keywords to the declaration keywords, `default` leaves the control-flow keywords, `mod` joins the operator keywords, and `with` is listed as contextual.
+- **Editorial condensing.** The records-and-disposal guidance, the async pattern catalogue (native-callback wrapping, timeouts, fire-and-forget and the rest, now one-line notes) and the disposal subsections are cut down. The closing worked example and the illustrative `Collections.Linq` module (`Map`, `Filter`, `SortBy`, …) are removed. Custom iterables now lead with `yield` iterator methods, which v0.31 already specified.
+
+<a id="sec-v0-37-to-v0-38-changelog"></a>
+### v0.37 to v0.38 changelog (reconstructed)
+
+- Source: the v0.37 and v0.38 snapshots (verbatim). The diff is small.
+- **`is` no longer binds a name.** The pattern form `x is Dog d` is removed: there is no `is Type name` syntax. A successful `is` test **flow-narrows the tested variable itself** inside the controlled block, and a reassignment ends the narrowing. Binding belongs to `case` patterns (`var d: Dog`) and to `as`.
+- **`is not` and `is null`.** `is not T` and `is not null` negate the test. `is not null` narrows to the non-nullable form, so the early-return guard narrows the rest of the method. `x is null` means `x = null`.
+- **`and`-chained `is` tests** short-circuit left to right, and all their narrowings hold in the combined true branch only. No narrowing is applied in the `else` branch.
+- `as` is now described as the way to introduce a new name, or to test an expression that is not a simple variable.
+- The `Equals` override idiom is rewritten to rely on narrowing (`if other is Money then … other.Amount …`).
+- `CancellationToken`/`CancellationTokenSource` are shown as a standard-library surface with method bodies instead of bodiless declarations.
+
+<a id="sec-v0-38-to-v0-39-changelog"></a>
+### v0.38 to v0.39 changelog (reconstructed)
+
+- Source: the v0.38 and v0.39 snapshots (verbatim). The diff is small.
+- **Bitwise operations** get their own subsection:
+  - `& | ^ << >> ~` are valid on every integer type and on nothing else (not `bool`, `char`, floating-point or `decimal`);
+  - `~` is the complement (`~x = -(x + 1)` on signed types) and is distinct from the boolean `not`;
+  - `<<` fills with zeros. `>>` is arithmetic on signed types and logical on unsigned ones. The shift count is reduced modulo the bit width;
+  - `&= |= ^= <<= >>=` are the compound forms, and there is no `~=`.
+- **A conditional precedence level.** The `if`-expression and the `case … end` expression get level 14, below `??` and above assignment (now 15). So `a ?? b if c else d` parses as `(a ?? b) if c else d`, and chained `if`-expressions associate to the right.
+- **Inline `out` declarations.** `out var name` declares the receiving variable at the call site. Its type is inferred from the parameter, and an explicit annotation is not allowed. It is in scope to the end of the enclosing block, both branches of a surrounding `if` included, and definitely assigned after the call.
+- **`out using var`** is the same form with scoped disposal, like `using var`. It is opt-in, and plain `out var` leaves disposal to the caller.
+
+<a id="sec-v0-39-to-v0-40-changelog"></a>
+### v0.39 to v0.40 changelog (reconstructed)
+
+- Source: the v0.39 and v0.40 snapshots (verbatim). The diff is small.
+- **Generic constraints and nullability are specified.** v0.39 still said such rules "will be specified in a future revision".
+  - The supported constraints are listed: `notnull`, `class`, `struct`, interface types and `new()`, comma-separated.
+  - `where T: notnull` admits only non-nullable types (value types or non-nullable references); `string?` or `int?` is rejected at the substitution site.
+  - `class` and `struct` both imply non-nullability. A summary table gives each constraint's accepted substitutions and how `T` is treated in the body.
+- **Unconstrained `T` becomes conservative.** Inside a generic body an unconstrained `T` is treated as possibly null, so a field that must accept any substitution is declared `T?`. In v0.39's example a `T` field was "non-nullable if T is non-nullable". `T?` always means the nullable form of `T`, even under `notnull`.
+- **`default(T)`** yields the zero value of `T` (`0`, `false`, the zero enum value, a zeroed record, or `null`). Assigning it to a non-nullable `T` location is an error unless the constraints prove it non-null. `notnull` and `default` become contextual keywords.
+- **`await for`** is listed among the control-structure rules as the async counterpart of `for`, valid only in async code, and `break`/`continue` are valid in its body. The async section already used it. The keyword appendix explains that `await for` is a compound of two reserved words, not a new keyword.
+- **The v0.40 decision on inline arrays is not visible in these snapshots.** A later rationale dates a rejection of inline fixed-size value-type array fields (C#-`fixed`-style inline arrays in classes) to v0.40: the current rationale §17.6 cites "the v0.40-v0.97 rejection rationale", and `docs/proposals/DECLINED.md` records "rejected v0.40–v0.97, shipped v0.98". Neither the v0.39 nor the v0.40 spec mentions inline array fields or C# `fixed` at all, and nothing between them touches arrays. The snapshots therefore neither confirm nor contradict the date. The decision left no trace in the spec text and was presumably recorded in a design rationale, which survives only from v0.60, where §17.6 already carries the rejection. It is placed here on the strength of those later citations alone.
+
+<a id="sec-v0-40-to-v0-41-changelog"></a>
+### v0.40 to v0.41 changelog (reconstructed)
+
+- Source: the v0.40 and v0.41 snapshots (verbatim). The diff is small.
+- **Automatically available names** (a new subsection of Modules and Imports):
+  - **tier 1** names are always in scope and cannot be imported or hidden: the primitives, `Object`, arrays, `IDisposable`, `IEnumerable<T>`/`IAsyncEnumerable<T>`, `Task`/`Task<T>` and the core exceptions;
+  - **tier 2** names are auto-imported and can be shadowed: `System` (`Console`, `Math`, `DateTime`, `Random`, …) and `System.Text` (`StringBuilder`);
+  - everything else, generic collections and I/O included, needs an explicit `import`. Imports are file-scoped. The namespace names are called placeholders, while the tier rules are locked in.
+- **`where T: struct` becomes `where T: value`** (value types: records, enums and primitives). `value` gains a second contextual role beside the setter parameter.
+- **`null` as a `case` pattern.** `null` is a constant pattern that matches a null nullable scrutinee, type patterns never match `null`, and a `null` pattern on a non-nullable scrutinee is an error.
+- **Static constructors take no access modifier.** `public static constructor()` and every other modified form are rejected, and the examples drop `public`.
+- **No `throws` clause.** Methods do not declare exceptions and callers are not forced to handle any. Expected exceptions are documented with the `<exception>` doc-comment tag.
+
+<a id="sec-v0-41-to-v0-42-changelog"></a>
+### v0.41 to v0.42 changelog (reconstructed)
+
+- Source: the v0.41 and v0.42 snapshots (verbatim). The diff is small.
+- **Records are implicitly sealed.** No class or record may derive from a record, and the compiler rejects `class Foo: SomeRecord` and `record Bar: SomeRecord`.
+- **Type patterns with guards.** A `case` arm may combine a type binding with a guard (`var r: Rectangle when r.Width = r.Height`). The guard runs only if the type test succeeds, and the bound name is in scope in it.
+- **Scientific notation** is stated as a rule: an `e`/`E` exponent with an optional sign is valid on `double`, `float` and `decimal` literals (`1.23e2m`), and fractional exponents are not allowed. v0.41's literal examples already used it.
+- **`nameof(T)` on a type parameter** returns the parameter's declared name (`"T"`), never the substituted type. The `nameof` examples now show their results.
+
+<a id="sec-v0-42-to-v0-52-changelog"></a>
+### v0.42 to v0.52 changelog (reconstructed, span)
+
+No source survives for any revision between v0.42 and v0.60, so none of these changes can be attributed to a single revision. This entry lists differences between the v0.42 snapshot and the v0.60 spec and rationale snapshots, leaving out what the v0.52→v0.60 entries (below) record as changed after v0.52. What remains describes v0.52. Where the v0.53 entry states v0.52's behaviour directly, that statement is used. An item's absence from the v0.52→v0.60 entries is the only evidence that it predates v0.53, so an item could belong after v0.52 if one of those entries left it out.
 
 **Document**
 
-- **The specification is restructured.** It is reorganised into numbered sections, from Lexical Structure to Program Entry Point, with three appendices: a complete grammar (A), reserved words (B) and compiler-enforced invariants (C). The per-section "Locked-in … rules" lists of v0.31 are gone, and Appendix C collects the enforced rules. The v0.53 to v0.54 entry revises Appendices A and C, and the v0.52 to v0.53 entry does not record adding them, so both are taken to exist at v0.52.
+- **The specification is restructured.** It is reorganised into numbered sections, from Lexical Structure to Program Entry Point, with three appendices: a complete grammar (A), reserved words (B) and compiler-enforced invariants (C). Up to v0.42 the only appendix is a reserved-keyword list, and every section still ends in a "Locked-in … rules" list. Those lists are gone by v0.60, and Appendix C collects the enforced rules. The v0.53 to v0.54 entry revises Appendices A and C, and the v0.52 to v0.53 entry does not record adding them, so both are taken to exist at v0.52.
 
 **Syntax and statements**
 
-- **`case` grows beyond its v0.31 form.** It gains:
-  - a scrutinee-less form whose arms are boolean tests;
-  - record destructuring patterns (`Point(x, y)`, with `_` for unwanted positions);
-  - an explicit `null` pattern, and the rule that type patterns never match `null`;
-  - compile-time exhaustiveness proofs for enum and `bool` scrutinees. Sealed hierarchies were added in v0.53. v0.31 only warned when coverage was not provable, without saying when it was.
-
-  Typed bindings (`var n: T`) were already in v0.31.
+- **`case` grows further.** It gains record destructuring patterns (`Point(x, y)`, with `_` for unwanted positions), and compile-time exhaustiveness proofs for enum and `bool` scrutinees. Sealed hierarchies were added in v0.53. v0.42 still only warns when coverage is not provable, without saying when it is.
 - **Operators:**
-  - remainder is written `mod` instead of `%`. v0.31 still specifies `%` in its arithmetic, overloading and precedence text, though two of its examples already write `x mod 2`;
-  - `++`/`--` become postfix and statement-only. At v0.31 they were still expression operators with one overload for prefix and postfix;
-  - new operators appear: `in` (membership), `is not`, `typeof`, `default` and the discard `_`. v0.31 mentions `typeof` only as a possible future feature;
-  - the precedence table gains levels for range, `??`, the type tests and the conditional/`case`/`throw` expressions, none of which appear in v0.31's table. Where the bitwise and `??` levels sat at v0.52 cannot be recovered, because v0.53 reshuffled them.
-- **Array slicing** (`arr[a..b]` and the open-ended forms) on one-dimensional `T[]` and `Array<T>`, returning a copy.
+  - `typeof` and the discard `_` as an expression appear. v0.42 mentions `typeof` only as a possible future feature, and uses `_` only as a pattern;
+  - the precedence table gains levels for range and the type tests, neither of which appears in v0.42's table. Where the bitwise and `??` levels sat at v0.52 cannot be recovered, because v0.53 reshuffled them.
+- **Array slicing** (`arr[a..b]` and the open-ended forms) on one-dimensional `T[]` and `Array<T>`, returning a copy. v0.42 still leaves slicing to the standard library's array specification.
 
 **Types, classes and members**
 
-- **Generics.** Interface type parameters can be marked variant (`out`/`in`). New constraints `where T: notnull` and `where T: value` are added; v0.31 deferred `notnull` to a future revision. The v0.53 change to `new()` is not part of this span.
-- **Classes** gain nested types; v0.31 does not mention them, and the conversation listed them as an open gap. `Object` gains `GetType`, and boxing is specified.
-- **Records** gain non-destructive update with `with` and object-initializer blocks. Primitive keywords are defined as aliases for `System.*` types; in v0.52 the library still declared them as `class int`, `class string`, … until v0.53.
-- **Dispose moves off `Object`.** In v0.31 `Object` still formally implements `IDisposable` and carries a compiler-generated `Dispose()`, so every class is disposable through it. Records had already lost all disposal before v0.30. By v0.52 disposal is class-only: the compiler generates `IDisposable` on classes, and records, enums and primitives have no `Dispose`.
+- **Generics.** Interface type parameters can be marked variant (`out`/`in`). The v0.53 change to `new()` is not part of this span.
+- **`Object` gains `GetType`, and boxing is specified.** Neither appears in v0.42.
+- **Records gain non-destructive update** with `with` (`recordExpr with Name := value, … end`), the "`with`-copy expression" v0.42 still defers. It shares its shape with the class-only object initializer block. In v0.52 the library still declared the primitive keywords as `class int`, `class string`, … until v0.53.
+- **Dispose moves off `Object`.** In v0.42 `Object` still formally implements `IDisposable` and carries a compiler-generated `Dispose()`, so every class is disposable through it. Records had already lost all disposal before v0.30. By v0.52 disposal is class-only: the compiler generates `IDisposable` on classes, and records, enums and primitives have no `Dispose`.
 
 **Ownership and memory**
 
 - **Runtime-managed types and inferred local ownership.**
-  - `string`, boxed values and function values are runtime-managed and exempt from manual disposal. In v0.31 strings are only noted as safe to hold in records.
+  - `string`, boxed values and function values are runtime-managed and exempt from manual disposal. In v0.42 strings are only noted as safe to hold in records.
   - A local's ownership state (owned or borrowed) is inferred from how it was introduced, never annotated. The v0.53 entry notes that this model "was load-bearing throughout v0.52 but never written down".
 
-**New feature areas (absent at v0.31)**
+**New feature areas (absent at v0.42)**
 
-- **Events.** Events are declared as members and raised with the C#-style `event?.Invoke(args)`. `IEvent`/`EventSource` were not yet explicit library types.
-- **Entry point and thread synchronisation.** The `Main` entry point has defined signatures and exit-code rules; v0.31 uses `Main` only in examples. A thread-synchronisation subsection (`Mutex`) joins the async section.
+- **Entry point and thread synchronisation.** The `Main` entry point has defined signatures and exit-code rules; v0.42 uses `Main` only in examples. A thread-synchronisation subsection (`Mutex`) joins the async section.
 - **Standard library at v0.52.**
   - It has a doubly linked `List<T>` (renamed `LinkedList<T>` in v0.53), which is absent from library 0.4.
   - LINQ-style queries have `ToList()`, where library 0.4 had only `ToArray`, and keep `Map` from library 0.1.
-  - The spec's sequence-operation examples move from v0.31's `Filter`/`SortBy` to `Where`/`OrderBy`. No later entry records either change, unlike `Map` → `Select` in v0.53.
+  - The spec's sequence-operation examples move from `Filter`/`SortBy`, still used in v0.42, to `Where`/`OrderBy`. No later entry records either change, unlike `Map` → `Select` in v0.53.
 
-**Cross-check.** v0.31 confirms the v0.53 entry's account of v0.52 async: Pattern A versus Pattern B is syntax-directed, and `Task<owned T>` is explicitly forbidden. So that part of the async model was stable from v0.31 to v0.52. Two v0.52 states that the v0.53 entry changes are also already present in v0.31: strings specified as UTF-32 (made adaptive in v0.53) and IEEE float equality (made reflexive in v0.53). An earlier version of this entry placed them in this span.
+**Cross-check.**
 
-**Datable decisions in the span** (only those whose version a source states explicitly)
+- **The async model was stable.** v0.31 and v0.37–v0.42 confirm the v0.53 entry's account of v0.52 async: Pattern A versus Pattern B is syntax-directed, and `Task<owned T>` is explicitly forbidden. So that part of the async model was stable from v0.31 to v0.52.
+- **Some v0.52 states predate the span.** Two v0.52 states that the v0.53 entry changes are already present in v0.31 and still in v0.42: strings specified as UTF-32 (made adaptive in v0.53) and IEEE float equality (made reflexive in v0.53). So is the rule that the full `System.*` names of the primitive types (`System.Int32`, `System.String`, …) name the same types as the keywords.
+- **Placement corrections.** An earlier version of this entry, built from v0.31 alone, placed all three of those states in this span. It also placed here changes that the v0.37–v0.42 snapshots now date earlier: `mod`, statement-only `++`/`--`, `in`, the scrutinee-less `case`, nested types, object initializer blocks and events (all by v0.37), `is not` (v0.38), the conditional precedence level (v0.39), `notnull` and `default(T)` (v0.40), and the `null` pattern and `where T: value` (v0.41). It also said object initializer blocks applied to records, but they are class-only in every snapshot that has them.
+- **Events at v0.52.** v0.53 replaced `event?.Invoke(args)` with `Raise`/`RaiseAsync` and made `IEvent`/`EventSource` explicit library types, so v0.52 still had the v0.37 shape of events.
 
-- **v0.40: inline fixed-size value-type array fields rejected** (C#-`fixed`-style inline arrays in classes). The current rationale §17.6 cites "the v0.40-v0.97 rejection rationale", and `docs/proposals/DECLINED.md` records it as "rejected v0.40–v0.97, shipped v0.98". The v0.60 rationale snapshot already carries the rejection (§17.6).
-- No other revision from v0.32 to v0.51 is named in any source searched. Those sources are:
+**Datable decisions in the span**
+
+- No revision from v0.43 to v0.51 is named in any source searched. Those sources are:
   - the design-conversation record, which ends at v0.30;
-  - the v0.31 snapshot, which has no revision notes;
+  - the v0.31 and v0.37–v0.42 snapshots, which have no revision notes;
   - the v0.60 spec and rationale snapshots, the v0.62 and v0.63 patch sets, and the v0.93 spec snapshot;
   - the current `docs/*.md` and `docs/proposals/*.md`.
 
-  The other changes above can only be dated to "after v0.31, at or before v0.52".
+  The one explicitly dated decision between v0.31 and v0.52, the v0.40 rejection of inline array fields, is discussed in the [v0.39 to v0.40 entry](#sec-v0-39-to-v0-40-changelog). The other changes above can only be dated to "after v0.42, at or before v0.52".
 
 ---
 
