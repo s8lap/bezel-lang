@@ -282,16 +282,17 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                             "initializes object state, and a by-reference "
                             "alias or caller-out slot has no meaning in that "
                             "role; parameter `" + std::string(p.name) + "`");
-                    } else if (p.modifier == "scoped") {
-                        diagnostics_.report(
-                            Severity::Error, primaryCtorParamListLoc,
-                            std::string("`scoped` is not permitted on a "
-                            "primary-constructor parameter (§22.10) — the "
-                            "scoped-storage contract (§28.14) needs an "
-                            "explicitly declared field; use a regular "
-                            "constructor instead; parameter `") +
-                            std::string(p.name) + "`");
                     }
+                    // §22.10 (v0.315): a function-typed `scoped` primary-ctor
+                    // parameter is rejected (its capture field would be a
+                    // `scoped` field, whose obligations §28.14 states over a
+                    // declared field); a class- or interface-typed `scoped`
+                    // parameter is admitted and captured as a non-owned private
+                    // field. The over-admit is the same pattern as ref/out
+                    // above; the rejection for function types is semantic.
+                    // The class/interface admission is checked in
+                    // resolveTypeDecl (TypeResolution_Names.cpp) via
+                    // checkScopedIsFunctionTyped.
                 }
             }
             if (!consumePunctuator(")")) {

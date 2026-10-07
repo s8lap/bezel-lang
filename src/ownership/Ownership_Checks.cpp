@@ -20844,14 +20844,17 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
         // replaced — that cast never matched a primary ctor, which has no
         // ConstructorDecl node — so without this the arm newly admits one.
         //
-        // It is inert TODAY only because §22.10 rejects `scoped` on a
-        // primary-ctor parameter at its declaration. That is not a safe thing
-        // to lean on: the spec labels that bound "Recorded v1 bound; liftable".
-        // If it is ever lifted this arm starts returning true for a primary-ctor
-        // positional, and at the call-bounded check a `true` SUPPRESSES the
-        // diagnostic — a silent soundness widening, arriving from a spec change
-        // nobody would think to re-audit here. // per §22.10, §28.14
-        if (formals.primaryCtor) return false;
+        // fix #4601 (§22.10, v0.315): §22.10 now ADMITS class/interface-typed
+        // `scoped` primary-ctor parameters, so the inertness justification is
+        // gone. The exclusion is removed so that:
+        // 1. class/interface-typed scoped primary-ctor args get the bounding-object
+        //    check (fresh-producer rejection, declared-before check, freeze)
+        // 2. function-typed scoped args still get the function-type rejection
+        //    (via checkScopedIsFunctionTyped in TypeResolution_Names.cpp).
+        // The call-bounded check in checkScopedAdmission fires only for
+        // function-typed call-bounded params (which TypeResolution_Names.cpp
+        // already rejects), so removing this exclusion does not widen any
+        // existing soundness gate. // per §22.10, §28.14
         // fix #3779: the BOUND formal. A `true` here SUPPRESSES the §28.14
         // call-bounded diagnostic at the caller, so a source-position read
         // could suppress it for the WRONG argument of a reordered named call.

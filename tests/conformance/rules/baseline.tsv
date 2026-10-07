@@ -925,15 +925,15 @@ s22_10_0007	pass
 s22_10_0008	pass	
 s22_10_0009	fail	divergence
 s22_10_0010	pass	
-s22_10_0011	fail	#4601
+s22_10_0011	pass	
 s22_10_0012	pass	
 s22_10_0013	pass	
 s22_10_0014	pass	
 s22_10_0015	pass	
 s22_10_0016	pass	
 s22_10_0017	pass	
-s22_10_0018	fail	#4601
-s22_10_0019	fail	#4601
+s22_10_0018	pass	
+s22_10_0019	pass	
 s22_11_0001	pass	
 s22_11_0002	pass	
 s22_11_0003	pass	

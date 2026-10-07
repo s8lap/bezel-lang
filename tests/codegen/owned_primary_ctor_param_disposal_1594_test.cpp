@@ -249,21 +249,44 @@ BEZEL_TEST(codegen_owned_primary_ctor_param_1594, out_primary_ctor_param_rejecte
     BEZEL_EXPECT_TRUE(diagContains(r, "§22.10"));
 }
 
-// §22.10 (v0.180): a `scoped` primary-constructor parameter is rejected in
-// this revision — the §28.14 scoped-storage contract needs an explicitly
+// fix #4601 (§22.10, v0.307): a class-typed `scoped` primary-constructor
+// parameter is admitted and captured as a non-owned private field.
+// This was the blanket v0.180 rejection; v0.307 admits the class/interface
+// form and keeps rejecting the function-typed form.
+BEZEL_TEST(codegen_owned_primary_ctor_param_1594, scoped_class_typed_primary_ctor_param_admitted_22_10) {
+    // per §22.10 (v0.315): class-typed scoped admitted; function-typed rejected.
+    // This test covers the admitted class-typed form; the function-typed control
+    // is scoped_function_typed_primary_ctor_param_rejected_22_10 below.
+    // The call site must use a declared local (not a fresh producer) as the
+    // scoped argument, per §28.14's bounding-object rule.
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kRes +
+        "class Holder(scoped r: Res) "
+        "  public method Use(): int => r.Id(); "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  do "
+        "    using var r := new Res(77); "
+        "    using var h := new Holder(scoped r); "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 0);
+}
+
+// fix #4601 (§22.10, v0.315): a function-typed `scoped` primary-constructor
+// parameter is rejected — the §28.14 scoped-storage contract needs an explicitly
 // declared field.
-BEZEL_TEST(codegen_owned_primary_ctor_param_1594, scoped_primary_ctor_param_rejected_22_10) {
-    // per §22.10 (v0.180)
+BEZEL_TEST(codegen_owned_primary_ctor_param_1594, scoped_function_typed_primary_ctor_param_rejected_22_10) {
+    // per §22.10 (v0.315)
     auto r = runAot(
         "module M; "
-        "class Res destructor end destructor; end Res; "
-        "class Holder(scoped r: Res) "
-        "  public method Get(): int => 0; "
+        "class Holder(scoped cb: () -> ()) "
+        "  public method Do(): int => 0; "
         "end Holder; "
         "class C public static method Main(): int return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(diagContains(r, "not permitted on a primary-constructor parameter"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "not permitted on a function-typed primary-constructor parameter"));
     BEZEL_EXPECT_TRUE(diagContains(r, "§22.10"));
 }
 

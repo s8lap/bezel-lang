@@ -1304,6 +1304,50 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
         // two are the header's only expression positions and they land
         // together.
         if (pf.defaultValue) resolveTypesInExpr(*pf.defaultValue, &typeScope);
+        // fix #4601 (§22.10, v0.315): a function-typed `scoped` primary-ctor
+        // parameter is rejected (§28.14 — its capture field would be a `scoped`
+        // field, whose obligations §28.14 states over a declared field); a class-
+        // or interface-typed `scoped` parameter is admitted and captured as a
+        // non-owned private field. The parser removed the v0.180 blanket
+        // rejection so class/interface types pass through; this branch checks
+        // whether the resolved type is function (reject), class/interface (admit),
+        // or other (reject with the standard scoped diagnostic).
+        // Records have no modifiers (parsePositionalFieldList) so this branch is
+        // a no-op for them.
+        // NOTE: checkScopedIsFunctionTyped does the OPPOSITE — it accepts
+        // function types — so we inline the type check directly here rather
+        // than reuse that function.
+        if (td.kind == ast::TypeDeclKind::Class &&
+            pf.modifier == "scoped" && pf.type) {
+            TypeRef* rt = ctx_.resolvedType(*pf.type);
+            if (!rt) rt = resolveType(*pf.type, &typeScope);
+            if (rt && rt->kind != TypeRef::Kind::Error) {
+                if (rt->kind == TypeRef::Kind::Function) {
+                    // Function type: rejected — use a regular constructor.
+                    ctx_.diagnostics().report(
+                        Severity::Error, pf.loc,
+                        std::string("`scoped` is not permitted on a function-typed "
+                                    "primary-constructor parameter (§22.10) — the "
+                                    "scoped-storage contract (§28.14) needs an "
+                                    "explicitly declared field; use a regular "
+                                    "constructor instead; parameter `") +
+                        std::string(pf.name) + std::string("`"));
+                } else if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                           !rt->declaration->isValueBuiltin &&
+                           (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                            rt->declaration->kind == ast::TypeDeclKind::Interface)) {
+                    // Class or interface type: admitted.
+                } else {
+                    // Any other type: rejected with the standard diagnostic.
+                    ctx_.diagnostics().report(
+                        Severity::Error, pf.loc,
+                        std::string("`scoped` is valid only on a function-typed, "
+                                    "class-typed, or interface-typed parameter "
+                                    "(§22.3, §28.14); `") +
+                        std::string(pf.name) + "` is none of those");
+                }
+            }
+        }
     }
     // fix #3742 (§22.10 "When a class with a primary constructor has a base
     // class, the base call appears in the inheritance clause" / §22.8 step 1
