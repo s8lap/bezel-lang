@@ -552,16 +552,21 @@ def split_top_level_items(code):
     return items
 
 
+def item_head_line(item):
+    """The item's first non-blank, non-comment line, or '' when it has none.
+    The line every top-level-item judgement below is made on."""
+    for line in item.splitlines():
+        s = line.strip()
+        if s and not s.startswith("//"):
+            return line
+    return ""
+
+
 def classify_top_level_item(item):
     """'import' | 'moddecl' | 'member' | 'stmt' for one top-level item. Judged
     on the item's first non-blank, non-comment line (comments and blank lines
     ride along with the item they precede)."""
-    head = ""
-    for line in item.splitlines():
-        s = line.strip()
-        if s and not s.startswith("//"):
-            head = line
-            break
+    head = item_head_line(item)
     if not head.strip():
         return "stmt"
     if _IMPORT_RE.match(head):
@@ -579,12 +584,20 @@ def wrap_mixed(code, instance_body=False):
 
     `instance_body` carries the same §2.7 flag as classify_wrap: the statement
     group goes into an instance method beside `Main` when the case's env binds
-    an instance member. The `member` group is unaffected — it is already inside
-    `class W`, where an instance member is in scope for an instance method."""
+    an instance member, OR when the case declares its OWN instance member and
+    bare-calls it (see `member_group_binds_instance_member`). The `member` group
+    is unaffected — it is already inside `class W`, where an instance member is
+    in scope for an instance method."""
     groups = {"import": [], "moddecl": [], "member": [], "stmt": []}
     for item in split_top_level_items(code):
         groups[classify_top_level_item(item)].append(item)
     stmts = "".join(groups["stmt"])
+    # §2.7 bites on the case's OWN `member` group exactly as on an env member: a
+    # fragment that declares an instance method and then calls it by bare name
+    # puts that call in the synthesized static `Main`, which has no `this` to
+    # reach through. The statements move to the instance carrier instead.
+    instance_body = (instance_body
+                     or member_group_binds_instance_member(groups["member"], stmts))
     # An empty statement group leaves nothing in the static body for §2.7 to
     # object to (spec_0059/spec_0166 are property DECLARATIONS — their
     # instance-field reads are already inside an instance property of class W),
@@ -684,6 +697,71 @@ def env_binds_instance_member(names, entries):
             if not _ENV_STATIC_MEMBER_RE.match(line):
                 return True
             break  # this entry IS static; a later one may still be an instance
+    return False
+
+
+# The same §2.7 question asked of the fragment's OWN `member` group rather than
+# of env.bzl. `_MEMBER_DECL_NAME_RE` captures the DECLARED NAME off a member or
+# field head (`_ITEM_MEMBER_RE` / `_ITEM_FIELD_RE` already discriminate the two
+# declaration forms); `_ENV_STATIC_MEMBER_RE` is reused verbatim as the
+# instance-vs-static discriminator, so a `static` method declared by the fragment
+# is excluded on exactly the terms env.bzl entries are.
+_MEMBER_DECL_NAME_RE = re.compile(
+    r'^\s*(?:(?:public|private|internal|protected)\s+)?'
+    r'(?:(?:static|virtual|override|abstract|async|pure|sealed|readonly|owned'
+    r'|scoped)\s+)*'
+    r'(?:method|property)\s+(\w+)')
+_ITEM_FIELD_NAME_RE = re.compile(
+    r'^\s*(?:public|private|internal|protected)\s+'
+    r'(?:(?:owned|readonly|static|scoped)\s+)*(_?\w+)\s*:\s*\S')
+
+
+def member_group_binds_instance_member(member_items, stmts):
+    """True when the fragment's OWN `member` group declares an instance member
+    that its `stmt` group then reaches by BARE NAME — the §2.7 condition that
+    forces those statements into an instance body (see stmt_body), the same
+    condition `env_binds_instance_member` asks of env.bzl.
+
+    WHY a second predicate, and why it needs the name. spec_0139 declares
+    `public method Log(...)` in its own member group and calls `Log(...)` from
+    its statements; `wrap:mixed` put those calls in the synthesized
+    `static method Main`, and §2.7 rejects them — the harness's scaffolding, not
+    the document's block, was what made the program ill formed. No `env:` entry
+    is involved, so the env predicate could not see it (and `//@ member Log`
+    would collide with the fragment's own declaration in `class W`).
+
+    The DECLARATION alone does not decide this — the CALL does. A fragment may
+    legitimately declare an instance member and never mention it from a
+    statement, and moving those statements into an instance carrier would add
+    scaffolding to a row that already passes: `codegen_0081` declares
+    `public method WithValue(...)` and its statements only do
+    `var p := new Port(8080); var opt: Port? := null;`. So the predicate tests
+    the reference, not the declaration. A `static` member is excluded both ways
+    (`_ENV_STATIC_MEMBER_RE`): a static body reaches a static member by bare name
+    without a `this`, so `spec_0116`'s `private static method Classify` must not
+    trigger it.
+
+    A member group that declares a TYPE never reaches here: `classify_top_level_item`
+    sorts `class`/`record`/`enum`/`interface`/`choice`/`extension`/`type`/`extern`
+    heads into `moddecl`, ahead of the member test, so `public record Port`
+    (codegen_0081) is a module-level declaration and not an enclosing-type member
+    at all. The `(?<![\\w.])` guard keeps a qualified `w.Log(...)` from counting as
+    the bare name §2.7 is about."""
+    if not stmts.strip():
+        return False  # nothing lands in the static body; nothing for §2.7 to reject
+    body = _strip_line_comments(stmts)
+    for item in member_items:
+        head = item_head_line(item)
+        if not head.strip():
+            continue
+        m = (_MEMBER_DECL_NAME_RE.match(head)
+             or _ITEM_FIELD_NAME_RE.match(head))
+        if not m:
+            continue  # a constructor/destructor/const head names no callable member
+        if _ENV_STATIC_MEMBER_RE.match(head):
+            continue  # static: reachable from a static body by bare name
+        if re.search(r'(?<![\w.])%s(?![\w])' % re.escape(m.group(1)), body):
+            return True
     return False
 
 

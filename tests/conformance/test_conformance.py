@@ -585,6 +585,90 @@ class InstanceBodyWrapTest(unittest.TestCase):
                       seen["src"])
 
 
+class MemberGroupBindsInstanceMemberTest(unittest.TestCase):
+    """§2.7 asked of the fragment's OWN `member` group — the second half of the
+    condition `env_binds_instance_member` covers from env.bzl. spec_0139 declares
+    `public method Log(...)` itself and bare-calls `Log(...)`, which §2.7 rejects
+    in the synthesized `static method Main`."""
+
+    def test_instance_method_bare_called_by_a_statement(self):
+        # spec_0139's own shape.
+        code = ("public method Log(message: string, level: string := \"INFO\","
+                " timestamp: bool := true)\n  // ...\nend Log;\n\n"
+                "Log(\"System started\", timestamp := false);\n")
+        groups = _groups(cf, code)
+        self.assertTrue(cf.member_group_binds_instance_member(
+            groups["member"], "".join(groups["stmt"])))
+        _, wrapped = cf.wrap_mixed(code)
+        self.assertIn("public method %s()" % cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+
+    def test_declaration_without_a_call_does_not_trigger_it(self):
+        # codegen_0081: declares `public method WithValue(...)`, and its
+        # statements only construct a Port. Moving those into an instance carrier
+        # would add scaffolding to a row that already passes.
+        code = ("public method WithValue(v: int): Port => new Port(v);\n\n"
+                "var p := new Port(8080);\nvar opt: Port? := null;\n")
+        groups = _groups(cf, code)
+        self.assertFalse(cf.member_group_binds_instance_member(
+            groups["member"], "".join(groups["stmt"])))
+        _, wrapped = cf.wrap_mixed(code)
+        self.assertNotIn(cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+
+    def test_a_static_member_is_reachable_from_a_static_body(self):
+        # spec_0116: `private static method Classify` is called by bare name from
+        # the statement group, but §2.7 admits it — no `this` is needed to reach a
+        # static member, so this must NOT add a carrier.
+        code = ("private static method Classify(score: int): string\n"
+                "  return \"failing\";\nend Classify;\n\n"
+                "var d := Classify(score);\n")
+        groups = _groups(cf, code)
+        self.assertFalse(cf.member_group_binds_instance_member(
+            groups["member"], "".join(groups["stmt"])))
+        _, wrapped = cf.wrap_mixed(code)
+        self.assertNotIn(cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+
+    def test_a_type_declaration_is_a_moddecl_not_an_enclosing_type_member(self):
+        # `public record Port` sorts into `moddecl` ahead of the member test, so
+        # it is a module-level declaration and never an instance member of `W`.
+        code = "public record Port\nend Port;\n\nvar p := new Port(8080);\n"
+        groups = _groups(cf, code)
+        self.assertEqual(groups["moddecl"] and len(groups["moddecl"]), 1)
+        self.assertFalse(cf.member_group_binds_instance_member(
+            groups["member"], "".join(groups["stmt"])))
+
+    def test_a_qualified_call_is_not_the_bare_name(self):
+        # `w.Log(...)` reaches the member THROUGH an instance, which is exactly
+        # what §2.7 permits; only a bare name is the compile error.
+        code = ("public method Log(message: string)\nend Log;\n\n"
+                "w.Log(\"done\");\n")
+        groups = _groups(cf, code)
+        self.assertFalse(cf.member_group_binds_instance_member(
+            groups["member"], "".join(groups["stmt"])))
+
+    def test_a_mention_in_a_comment_is_not_a_call(self):
+        code = ("public method Log(message: string)\nend Log;\n\n"
+                "// see Log(..) for the shape\nvar x := 1;\n")
+        groups = _groups(cf, code)
+        self.assertFalse(cf.member_group_binds_instance_member(
+            groups["member"], "".join(groups["stmt"])))
+
+    def test_no_statements_means_nothing_lands_in_the_static_body(self):
+        code = "public method Log(message: string)\nend Log;\n"
+        groups = _groups(cf, code)
+        self.assertFalse(cf.member_group_binds_instance_member(
+            groups["member"], "".join(groups["stmt"])))
+        _, wrapped = cf.wrap_mixed(code)
+        self.assertNotIn(cf.ENV_INSTANCE_BODY_METHOD, wrapped)
+
+
+def _groups(cf, code):
+    """The four top-level groups `wrap_mixed` sorts a fragment into."""
+    groups = {"import": [], "moddecl": [], "member": [], "stmt": []}
+    for item in cf.split_top_level_items(code):
+        groups[cf.classify_top_level_item(item)].append(item)
+    return groups
+
+
 def main_at(text):
     return text.index("public static method Main()")
 
