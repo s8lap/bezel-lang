@@ -3540,6 +3540,22 @@ private:
         const std::unordered_map<std::string_view, TypeRef*>* explicitSubst =
             nullptr);
 
+    // fix-forward #5469 (§14.2 / §5.1, v0.315): the CONSTRAINT's own
+    // substitution map for a receiver that is ITSELF an unsubstituted type
+    // parameter. `substituteMemberType` resolves a receiver CLASS's params
+    // from the receiver's concrete generic arguments; it cannot resolve them
+    // when the receiver is a bare `Kind::Named` type parameter with no
+    // declaration and no generic args (`a: T` in
+    // `F<T>(a: T) where T: IEquatable<Other>`), because there is nothing to
+    // map FROM. The binding for `IEquatable`'s own `T` is the CONSTRAINT's
+    // type argument (`Other`), reachable only through the receiver's
+    // `where`-clause. Returns the interface-param-name -> constraint-arg map
+    // for the constraint whose bound DECLARATION is `memberParent`, or an
+    // empty map when the receiver is not a constrained bare type parameter
+    // (in which case every caller keeps its existing behaviour).
+    std::unordered_map<std::string_view, TypeRef*>
+    constraintReceiverSubst(const ast::Expr* receiver, TypeSymbol* memberParent);
+
     // Slice T7: check `new T(args)` against T's sole constructor (if
     // any). Zero declared constructors → the implicit default ctor
     // takes no arguments. Multiple constructors → overload resolution

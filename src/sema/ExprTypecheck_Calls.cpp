@@ -17293,6 +17293,110 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
     }
 }
 
+// fix-forward #5469 (§14.2 / §5.1, v0.315): the substitution map for a
+// member call whose RECEIVER is itself an unsubstituted type parameter.
+//
+// THE GAP (#5469). `F<T>(a: T, o: Other) where T: IEquatable<Other> =>
+// a.Equals(o)`: the receiver `a` is a bare `Kind::Named` `T` — no
+// declaration, no generic args — so `substituteMemberType`'s "Direct" arm
+// (guarded on `recvTy->declaration == parent && !recvTy->genericArgs.empty()`)
+// cannot fire and its `derived` walk finds no base chain, leaving the
+// interface's OWN `T` unsubstituted in `Equals(other: T)`. #5469's
+// `checkAssignable` arm then matched that bare `T` against the ENCLOSING
+// method's `T` — a different declaration that merely shares the spelling —
+// and rejected the well-typed `a.Equals(o: Other)`. `forEachConstraintBound`
+// (the §14.2 member-surface walk `resolveMemberAccess` runs on such a
+// receiver) already resolves the bound `IEquatable<Other>` and hands its
+// FULL TypeRef to the caller, but `resolveMemberAccess`'s instance arm keeps
+// only `ctr->declaration` and discards `ctr->genericArgs`
+// (ExprTypecheck_Calls.cpp:23208) — so the binding that would resolve the
+// interface's `T` is available at the member-access site and simply not
+// threaded through to this one. The static sibling arm does keep it and even
+// re-stamps the receiver (`setExprType(ma.target.get(), boundWithMember)`,
+// ExprTypecheck_Calls.cpp:23331), which is why `T.Stat(...)` never showed
+// the defect.
+//
+// THE FIX. Build the map HERE, from the constraint itself: the receiver's
+// parameter name -> the `where`-clause bound whose DECLARATION is the member's
+// owning type (`memberParent`), positionally over that type's `genericParams`.
+// `substituteReturnType` then rewrites the interface's own parameters in the
+// member signature BEFORE `checkAssignable` runs, so both directions come out
+// right at once:
+//   * `a.Equals(o: Other)` under `T: IEquatable<Other>` — target becomes
+//     `Other`, the argument matches (§5.1 identity). MEASURED pre-fix: the
+//     3 §14.2 accept controls in
+//     tests/sema/constraint_iequatable_other_self_4863_test.cpp fail.
+//   * `a.Equals(u: Unrelated)` under `T: IEquatable<Other>` — target is the
+//     concrete `Other`, and `Unrelated` is not a subtype, so the call is
+//     REJECTED at compile time. MEASURED pre-fix: rejected only by the
+//     spelling-collision accident; MEASURED that the #5469 narrowing (which
+//     instead widened `classParent`'s params into the free set) ACCEPTED it,
+//     compiled, linked and ran, and ASan reported
+//     `heap-buffer-overflow READ of size 8 ... #0 bz$M.Other$Len
+//     #1 bz$M.C2$Equals` reading past the 16-byte `Unrelated` allocation.
+//
+// This is the SUBSTITUTION reading of §14.2 the issue text requires: "Inside
+// the generic body, T's surface includes IFoo's members, regardless of which
+// conformance category T belongs to" — the surface `T` exposes is `IFoo`'s
+// members AS INSTANTIATED at `IFoo<Other>`, not `IFoo`'s members at their own
+// declarations. A bare `T` receiver therefore resolves `Equals` to a member
+// whose signature is already specialized to the constraint.
+//
+// GUARDS, each of which keeps the map EMPTY (caller behaviour unchanged):
+//   * no receiver / no owning type / the owning type has no generic params —
+//     there is nothing to map;
+//   * the receiver's TypeRef is not a bare single-part in-scope type parameter
+//     (a concrete `C2` receiver, an alias-qualified builtin, a null-literal,
+//     …) — those already resolve through `substituteMemberType`;
+//   * no `where`-clause bound resolves to a TypeRef whose DECLARATION is
+//     `memberParent`, or the arities disagree, or any position is null — an
+//     unverifiable binding stays unsubstituted, which is the conservative
+//     direction (the pre-existing check still runs).
+std::unordered_map<std::string_view, TypeRef*>
+ExprTC::constraintReceiverSubst(const ast::Expr* receiver,
+                                TypeSymbol* memberParent) {
+    std::unordered_map<std::string_view, TypeRef*> out;
+    if (!receiver || !memberParent || memberParent->genericParams.empty())
+        return out;
+    TypeRef* recvTy = ctx_.exprType(*receiver);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration ||
+        !recvTy->genericArgs.empty())
+        return out;
+    // Same bare-parameter recognizer `substituteMemberType`'s callers use, and
+    // the same #4698 alias-qualified-builtin exclusion the sibling guard at
+    // :23249 applies: `D.Stopwatch` is single-part but never a type parameter.
+    if (!recvTy->astNode || !recvTy->astNode->name ||
+        recvTy->astNode->name->parts.size() != 1 ||
+        recvTy->astNode->aliasQualifiedBuiltin)
+        return out;
+    std::string_view paramName = recvTy->headName();
+    // A null-declaration Named whose name is not a DECLARED parameter is a
+    // builtin (OwningArray, …), not a constrained type parameter — the same
+    // distinction the #5449 guard makes at the member-access site.
+    if (!isInScopeTypeParam(paramName)) return out;
+    // Find the `where`-clause bound whose DECLARATION is the member's owning
+    // type. `forEachConstraintBound` yields each resolved bound in §14.2 order
+    // (method clauses, then the enclosing type's, then the extension's),
+    // following `where T: U` chains. Requiring the declaration to MATCH is
+    // what makes this specific: a different bound (or an unrelated interface
+    // reached through the chain) must not supply the member's parameters.
+    bool found = forEachConstraintBound(
+        paramName, [&](TypeRef* bound) -> bool {
+            if (!bound || bound->declaration != memberParent) return false;
+            if (bound->genericArgs.size() != memberParent->genericParams.size())
+                return false;
+            for (std::size_t i = 0; i < memberParent->genericParams.size(); ++i) {
+                Symbol* gp = memberParent->genericParams[i];
+                if (!gp || gp->name.empty() || !bound->genericArgs[i])
+                    return false;
+                out[gp->name] = bound->genericArgs[i];
+            }
+            return true;
+        });
+    if (!found) out.clear();
+    return out;
+}
+
 // Slices T5/T6/T7: shared check of an argument list against a parameter
 // list — §22.5 binding (positional then named, arity, no-duplicate,
 // required-supplied), then per-argument assignability over the bound
@@ -17453,6 +17557,18 @@ void ExprTC::checkArgsAgainstParams(
             if (rparamTy && classTarget && classParent)
                 rparamTy = substituteMemberType(rparamTy, classTarget,
                                                 classParent);
+            // fix-forward #5469 (§22.3 / §14.2, v0.315): the twin of the
+            // `ref`/`out` half's `substituteMemberType` above, for a receiver
+            // that is itself a bare type parameter. Without it the referent
+            // type keeps the interface's own parameter, the type-param-mention
+            // skip below sees it as still-unresolved, and the §22.3 exact-match
+            // check is silently deferred where it could have run.
+            if (rparamTy && classTarget && classParent) {
+                if (auto constraintSubst =
+                        constraintReceiverSubst(classTarget, classParent);
+                    !constraintSubst.empty())
+                    rparamTy = substituteReturnType(rparamTy, constraintSubst);
+            }
             // fix #4233 (§26.4/§26.5, v0.298): substitute the extension's
             // free var into the referent type BEFORE the type-param-mention
             // skip below, so a fully-bound referent (e.g. `W`->`int`) runs
@@ -17501,6 +17617,22 @@ void ExprTC::checkArgsAgainstParams(
         // the valid function-type identity case.
         if (paramTy && classTarget && classParent)
             paramTy = substituteMemberType(paramTy, classTarget, classParent);
+        // fix-forward #5469 (§14.2 / §5.1, v0.315): the receiver is ITSELF a
+        // bare type parameter (`a: T` under `where T: IEquatable<Other>`), so
+        // the line above substituted nothing — the interface's own `T` was
+        // still sitting in `paramTy` and #5469's `checkAssignable` arm matched
+        // it against the ENCLOSING method's `T` by spelling alone. Substitute
+        // the CONSTRAINT's own arguments for the member's owning type's
+        // parameters here, so the target is the real instantiated type. Runs
+        // AFTER `substituteMemberType` (a no-op for this receiver) and BEFORE
+        // the `extSubst` / `explicitSubst` lines, which address a different
+        // namespace (an extension's free var, a call-site type argument).
+        if (paramTy && classTarget && classParent) {
+            if (auto constraintSubst =
+                    constraintReceiverSubst(classTarget, classParent);
+                !constraintSubst.empty())
+                paramTy = substituteReturnType(paramTy, constraintSubst);
+        }
         // fix #4233 (§26.4/§26.5, v0.298): substitute the extension's own
         // free type variable (e.g. `W`->`int`) into the parameter type
         // before the assignability check below — see this function's
