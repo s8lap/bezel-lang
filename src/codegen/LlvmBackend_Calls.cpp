@@ -9966,6 +9966,64 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
     auto* phi = builder_.CreatePHI(resultSt, 2, "rescomb.phi");
     phi->addIncoming(okResult, okEnd);
     phi->addIncoming(errResult, errEnd);
+    // The combinator's callback is a PLAIN, hence call-bounded, parameter
+    // (spec §28.14: the callee may invoke the callback during the call but
+    // may not retain it past the call; stdlib §2.20 restates it for these four
+    // members -- "invoked during the call, never retained" -- and adds that
+    // "no disposal obligation arises anywhere in a combinator call"). That
+    // constraint binds the CALLEE; it does not discharge the PRODUCER's own
+    // +1 on the cell `lowerLambda` just calloc'd with rc := 1 (spec §28.9).
+    //
+    // This lowering is dispatched at LlvmBackend_Calls2.cpp:7132, BEFORE the
+    // method-symbol path, so it never reaches lowerCall's
+    // `callBoundedClosureArgs` collection and its #1073/#4078 normal-return
+    // `bz_closure_release`; nothing dropped the cell, and every combinator
+    // call carrying a lambda literal leaked 48 bytes
+    // ({fn, env, rc, envdtor, kind}). MEASURED under LSan on the Ok AND the
+    // Error arm alike -- so the pass-through payload is not the leaked object
+    // -- and at 12000 bytes in 250 allocations for a 250-iteration loop, i.e.
+    // exactly 48 x 250.
+    //
+    // WHY HERE: both arms have finished reading the cell by the merge (the Ok
+    // arm invokes it, the Error arm passes the payload through), and exactly
+    // one of them ran, so a single release covers both paths. It is emitted
+    // AFTER the PHI because a PHI node must lead its basic block.
+    //
+    // WHY `isPlusOneClosureProducer`: the same predicate lowerCall uses to arm
+    // `callBoundedClosureArgs`. Only a +1 PRODUCER -- a lambda literal, or the
+    // §17/§20 conditional-of-lambdas form -- mints a fresh reference whose
+    // producer owns the drop. An argument that is a closure-typed LOCAL is a
+    // borrow of that local's cell, which the local's own scope-end release
+    // owns; releasing here too would double-free. `UnwrapOr` returns above:
+    // its argument is an ordinary T VALUE (stdlib §2.20, "not a deferred
+    // computation"), never a closure cell.
+    //
+    // The throw edge is deliberately left undischarged, matching #4078's
+    // `!diverged_` discipline on the ordinary call path: a lambda body that
+    // throws diverts to `unwindBB` and never reaches this merge, and leaking
+    // on the unwind edge is the safe direction -- over-releasing is not.
+    const bool argIsPlusOneProducer =
+        isPlusOneClosureProducer(call.args[0].value.get());
+    if (argIsPlusOneProducer)
+        emitClosureRelease(argVal);
+    // fix #3498: the CAPTURE-CELL half of the release above.
+    // `bz_closure_release` drops the cell and its env, but the boxed capture
+    // cells the env points AT are a separate allocation that
+    // `collectCellFreeEligible` classifies as non-escaping at this
+    // call-bounded position, so `lowerLambda` recorded them in
+    // `lastLambdaCapturedCells_` -- and nothing consumed them here, so a
+    // CAPTURING callback leaked its box cell and env on top of the closure
+    // cell (MEASURED: 60 bytes in 3 allocations for a single
+    // `Map(lambda(x) => x * k)`; 14940 bytes in 747 allocations over 250
+    // iterations). Consumed AFTER the closure release, the order the ordinary
+    // call path uses, so the envdtor never runs against an already-freed
+    // cell. The helper re-runs each per-cell soundness check itself, so this
+    // adds the OPPORTUNITY to free, not an unconditional free. Nothing
+    // between the `lowerExpr` of the argument and here lowers a LambdaExpr
+    // (the arms are raw `CreateCall`s and `buildChoiceStructValue`), so the
+    // recorded set is still this call's own.
+    if (argIsPlusOneProducer)
+        consumeLastLambdaCapturedCells();
     return phi;
 }
 
