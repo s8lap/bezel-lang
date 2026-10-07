@@ -9843,6 +9843,82 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
         }
     }
 
+    // fix #4478 (§8.6 / §9.7, v0.315): a boxed borrow-bearing record stored in a
+    // field via a collection literal is not rejected. The existing §9.7 leg
+    // above (lines ~9736) checks the RHS expression's type directly — but for a
+    // collection literal `[new BorrowRec(w)]` the RHS type is `[1]IHolder` (inline
+    // array), which isBorrowBearingRecord never classifies. The element
+    // `new BorrowRec(w)` IS a borrow-bearing record, but the boxing the inline
+    // array's interface element type introduces makes the borrow invisible to the
+    // existing check.
+    //
+    // §8.6: "Storing a boxed borrow-bearing record in a field … is rejected by
+    // the same rules as the unboxed form." Boxing does not lift the §9.7
+    // constraint. When a borrow-bearing record is stored to a non-owning inline
+    // array field whose element type is Object or an interface, each element that
+    // is a NewExpr constructing a borrow-bearing record is boxed and escapes.
+    //
+    // Scoped to method/lambda-body scope (the §9.7 type rule has no lifetime
+    // dependence), and restricted to a class/interface field (storeTargetIsClassField
+    // — matching the existing §9.7 legs above).
+    if ((scope == EscapeScope::Method ||
+         scope == EscapeScope::LambdaBody) &&
+        dest == Dest::Field && storeTargetIsClassField(*as.target)) {
+        const auto* cl =
+            dynamic_cast<const ast::CollectionLiteralExpr*>(as.value.get());
+        if (cl) {
+            // Get the field's declared type to check if it's a non-owning
+            // inline array with a boxing element type.
+            const sema::TypeRef* fieldType = ctx_.exprType(*as.target);
+            if (fieldType &&
+                fieldType->kind == sema::TypeRef::Kind::InlineArray &&
+                !fieldType->arrayOwned) {
+                const sema::TypeRef* elemType = fieldType->arrayElement;
+                // Boxing occurs when the element type is Object or an interface
+                // (per isBoxingTargetType, ExprTypecheck.cpp:4434).
+                const bool isBoxingSlot =
+                    elemType &&
+                    ((elemType->kind == sema::TypeRef::Kind::Primitive &&
+                      elemType->primitive == sema::PrimitiveType::Object) ||
+                     (elemType->kind == sema::TypeRef::Kind::Named &&
+                      elemType->declaration &&
+                      elemType->declaration->kind ==
+                          ast::TypeDeclKind::Interface));
+                if (isBoxingSlot) {
+                    // Check each element: if any is a NewExpr constructing a
+                    // borrow-bearing record, this is a §8.6 / §9.7 violation.
+                    for (const auto& elem : cl->elements) {
+                        if (!elem) continue;
+                        if (const auto* ne =
+                                dynamic_cast<const ast::NewExpr*>(elem.get())) {
+                            const sema::TypeRef* elTy =
+                                ne->type ? ctx_.resolvedType(*ne->type)
+                                         : ctx_.exprType(*elem);
+                            if (elTy && isBorrowBearingRecord(elTy)) {
+                                report(
+                                    Severity::Error, elem->span.begin,
+                                    std::string(
+                                        "a borrow-bearing record may not be "
+                                        "stored in an instance field of a class "
+                                        "— a record-carried borrow can be "
+                                        "consumed through access paths with no "
+                                        "per-access disposed-flag check, so the "
+                                        "checked-mode trust regime that covers a "
+                                        "direct class-typed borrow field does not "
+                                        "apply here (§9.7; §8.6 — store the "
+                                        "borrow's source instead, e.g. an `owned` "
+                                        "field of the underlying class, or "
+                                        "re-derive the record view at the use "
+                                        "site)"));
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // §28.3 / §28.8 (issue #402): a BARE read of an owned LOCAL stored into an
     // OWNED field is a move-on-read into an owned slot ("Reading an owned local
     // x in a position that requires an owned value … transfers ownership out of
