@@ -313,3 +313,24 @@ BEZEL_TEST(todictionary_duplicate_key_raises_4693,
         "end while; "
         "return 0; ")), 0);
 }
+
+// fix #5421: LinkedList reassignment — the bz_llist_free arm.
+// The fix is general over bz_array_free / bz_dict_free / bz_llist_free;
+// LinkedList<T> is covered by the linked-list arm of disposeDisplacedCollectionLocal.
+// Like the array row, this uses a simple reassignment loop with no throw path:
+// the displaced LinkedList value must be dropped on every reassignment.
+// LinkedList<T> (borrowing form) is used; the `new` creates an owning
+// LinkedList instance, which is what the local's inferred type captures.
+// Pre-fix: the displaced LinkedList<int> value is leaked on every
+// reassignment.  Post-fix: each displaced value is freed via bz_llist_free.
+BEZEL_TEST(todictionary_duplicate_key_raises_4693,
+           linkedlist_reassign_drop_on_overwrite_5421) {
+    BEZEL_EXPECT_EQ(checkedExit(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  var ll := new LinkedList<int>(); "
+        "  ll := new LinkedList<int>(); "
+        "  i := i + 1; "
+        "end while; "
+        "return 0; ")), 0);
+}
