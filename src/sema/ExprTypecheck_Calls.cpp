@@ -1662,7 +1662,20 @@ bool refOutParamTypeMentionsTypeParam(
     const TypeRef* t,
     const std::unordered_set<std::string_view>& tpNames) {
     if (!t || tpNames.empty()) return false;
-    if (t->kind == TypeRef::Kind::Named && !t->declaration) {
+    // fix #5241 (§2.2, v0.313): an alias-qualified built-in (`D.Stopwatch`
+    // under `import System.Diagnostics as D;`) is NEVER a type parameter,
+    // whatever parameter shares its bare name — the alias is a qualifier, not
+    // a rename. Its TypeRef carries the same shape a parameter's does (`Named`,
+    // null declaration, no generic args), so without this the head-name lookup
+    // below captures it inside `class Box<Stopwatch>`. Only the HEAD match is
+    // skipped: a generic ARGUMENT of an alias-qualified builtin is still
+    // walked, so `G.Stack<T>` inside `class Box<T>` keeps reporting T.
+    // This is the leaf test BOTH `refMentionsTypeVariable` and
+    // `typeTestTargetMentionsTypeVariable` delegate to, so exempting the
+    // built-in here keeps every type-variable recognizer agreeing with the ten
+    // sites #5241's predecessor commit already guarded.
+    if (t->kind == TypeRef::Kind::Named && !t->declaration &&
+        !t->isAliasQualifiedBuiltin()) {
         std::string_view head = t->headName();
         if (!head.empty() && tpNames.count(head)) return true;
     }

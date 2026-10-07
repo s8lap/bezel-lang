@@ -84,6 +84,28 @@ struct TypeRef {
         return importedName;
     }
 
+    // fix #5241 (§2.2, v0.313): true when this TypeRef names a compiler-built-in
+    // that was spelled with an import alias as an extra QUALIFIER
+    // (`D.Stopwatch` under `import System.Diagnostics as D;`). §2.2: "The alias
+    // is an additional *qualifier*, not a rename", so such a type keeps naming
+    // the BUILT-IN and no same-named TYPE PARAMETER may capture it.
+    //
+    // This is the ONE reader of `astNode->aliasQualifiedBuiltin` for the
+    // "is this TypeRef possibly a type parameter?" question, and it reads the
+    // SAME field #4698 stamped and #5241's predecessor commit read inline at
+    // ten call sites (ExprTypecheck_Exprs.cpp:1804, ExprTypecheck_Calls.cpp:
+    // 6755/20009/20176/20312/23105, LlvmBackend_Layout.cpp:1032/2699,
+    // ModuleMetadataBuilder.cpp:189). A built-in reaches a type-parameter
+    // recognizer with the SAME shape a parameter does — `Kind::Named`, null
+    // `declaration`, no generic args (Slice S24 resolves the always-available
+    // builtins to exactly that shape) — so the head NAME is the only thing
+    // separating them, and `class Box<Stopwatch>` makes the names equal.
+    // Spelling the flag read in one place keeps a name-keyed recognizer from
+    // silently capturing the built-in a second time.
+    bool isAliasQualifiedBuiltin() const {
+        return astNode && astNode->aliasQualifiedBuiltin;
+    }
+
     // InlineArray:
     const ast::Expr* arraySize = nullptr;   // ConstIntExpr; sema later evaluates
     // #734: the folded compile-time size (>= 0) when arraySize is a literal or a

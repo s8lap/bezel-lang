@@ -6662,7 +6662,7 @@ void ExprTC::checkAssignable(
     {
         std::string_view tpHead =
             (from->kind == TypeRef::Kind::Named && !from->declaration &&
-             from->genericArgs.empty())
+             from->genericArgs.empty() && !from->isAliasQualifiedBuiltin())
                 ? from->headName()
                 : std::string_view();
         bool toConcretePrimitive = to->kind == TypeRef::Kind::Primitive &&
@@ -6720,7 +6720,7 @@ void ExprTC::checkAssignable(
     {
         std::string_view toTpHead =
             (to->kind == TypeRef::Kind::Named && !to->declaration &&
-             to->genericArgs.empty())
+             to->genericArgs.empty() && !to->isAliasQualifiedBuiltin())
                 ? to->headName()
                 : std::string_view();
         bool fromConcretePrimitive = from->kind == TypeRef::Kind::Primitive &&
@@ -6795,7 +6795,7 @@ void ExprTC::checkAssignable(
     {
         std::string_view toTpHead =
             (to->kind == TypeRef::Kind::Named && !to->declaration &&
-             to->genericArgs.empty())
+             to->genericArgs.empty() && !to->isAliasQualifiedBuiltin())
                 ? to->headName()
                 : std::string_view();
         // toIsCalleeFreeParam: exclude a callee's unsubstituted type
@@ -17627,6 +17627,11 @@ void ExprTC::visitMember(const ast::Member& m) {
                             initTy->primitive != PrimitiveType::Object &&
                             fty->kind == TypeRef::Kind::Named &&
                             !fty->declaration && fty->genericArgs.empty() &&
+                            // fix #5241 (§2.2, v0.313): an alias-qualified
+                            // built-in field type (`owned sw: D.Stopwatch;`) is
+                            // never the same-named type parameter — the alias
+                            // is a qualifier, not a rename.
+                            !fty->isAliasQualifiedBuiltin() &&
                             currentScopeGenericParamNames().count(
                                 fty->headName()) &&
                             // fix #4810 scope: only UNCONSTRAINED type-
@@ -18031,6 +18036,11 @@ void ExprTC::visitMember(const ast::Member& m) {
                             initTy->primitive != PrimitiveType::Object &&
                             pty->kind == TypeRef::Kind::Named &&
                             !pty->declaration && pty->genericArgs.empty() &&
+                            // fix #5241 (§2.2, v0.313): an alias-qualified
+                            // built-in property type is never the same-named
+                            // type parameter — the alias is a qualifier, not a
+                            // rename. Mirrors the field clause above.
+                            !pty->isAliasQualifiedBuiltin() &&
                             currentScopeGenericParamNames().count(
                                 pty->headName()) &&
                             // fix #4810 scope: only UNCONSTRAINED type-
