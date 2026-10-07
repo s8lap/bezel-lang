@@ -3391,11 +3391,10 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // give: `Object` is always true for a value; an interface is true iff the
     // value's type conforms (§14.2). Primitives decide through
     // primitiveConformsToBuiltinInstanceIface (IEquatable<P> / IComparable<P>).
-    // KNOWN #5159 GAP: a record / enum / choice against an interface answers
-    // `false` here — the variance-aware §14.2 predicate it needs is not
-    // reachable from codegen (sema::argSatisfiesTypeBound is exact-
-    // instantiation only). `as` is untouched (rejected at the instantiation
-    // site by #5146).
+    // fix #5159 (§12.7 "Value-typed operands", v0.315): a record / enum / choice
+    // against an interface also decides via argSatisfiesTypeBound, which performs
+    // the BFS walk over baseTypes / baseTypeRefs (§14.2 conformance, with §12.9
+    // variance). `as` is untouched (rejected at the instantiation site by #5146).
     // fix-forward #5234 (§12.7 "Value-typed operands", v0.313): a NULLABLE
     // value carrier (`v: T?` at T = int, the `{i8, T}` struct) takes the same
     // per-instantiation answer, "true exactly when `v` is non-null and `R` is
@@ -3423,6 +3422,11 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                          valueOpTy->primitive, rt->headName(),
                          rt->genericArgs) ==
                      sema::PrimBuiltinIfaceConformance::Conforms;
+        } else if (valueOpTy->kind == sema::TypeRef::Kind::Named &&
+                   valueOpTy->declaration) {
+            // fix #5159 (§12.7, v0.315): a record / enum / choice carrier against
+            // an interface — argSatisfiesTypeBound walks baseTypes (§14.2, with §12.9).
+            answer = sema::argSatisfiesTypeBound(valueOpTy, rt, &ctx_);
         }
         llvm::Value* holds = builder_.getInt1(answer);
         if (nullableCarrier && answer)  // per §12.7: null is an instance of no type

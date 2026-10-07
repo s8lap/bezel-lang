@@ -164,13 +164,13 @@ BEZEL_TEST(codegen_type_test_4925_4909,
         "end C;"), std::string("23\n17"));
 }
 
-// KNOWN #5159 GAP (pinned as the CURRENT answer, not the spec's): a record
-// value substituted for `v: T` and tested against an interface it implements
-// should be true (§12.7 v0.313, §14.2), but the variance-aware conformance
-// predicate is not reachable from codegen, so it answers false. Flip this row
-// when the gap closes.
+// fix #5159 (§12.7 "Value-typed operands", v0.315): a record value substituted
+// for `v: T` and tested by `is` against an interface it implements is true
+// (§14.2 conformance, with §12.9 variance). Before the fix, argSatisfiesTypeBound
+// was not reachable from codegen for non-primitive value types, so the test
+// answered false.
 BEZEL_TEST(codegen_type_test_4925_4909,
-           known_gap_5159_record_carrier_is_interface_answers_false) {
+           record_carrier_is_implemented_interface_answers_true_spec_12_7_5159) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "public interface IShape method Area(): int; end IShape; "
@@ -186,5 +186,5 @@ BEZEL_TEST(codegen_type_test_4925_4909,
         "    Console.WriteLine(T1<Sq>(new Sq(3))); "
         "    return 0; "
         "  end Main; "
-        "end C;"), std::string("0"));
+        "end C;"), std::string("1"));
 }
