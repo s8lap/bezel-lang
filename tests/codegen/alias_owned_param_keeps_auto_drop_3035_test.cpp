@@ -23,12 +23,15 @@
 //
 //   3. GENERIC (§14.1) — the umbrella title's "for ANY type" demands the
 //      fix works for a type-parameter T too. `method F<T>(p: owned T) where
-//      T: class { var alias := p; return alias.V; }`. R._n must be 1. The
-//      generic-specialization path (buildSpecializedMethodFn, §14.1 / §14.4)
-//      is the one where the disposal-registration code runs against a bare
-//      type parameter — the #1483 fix made this reachable at all; the #3035
-//      fix made the alias binding survive the walker's taint. FAIL-WITHOUT:
-//      R._n == 0 + LSan leak. PASS-WITH: R._n == 1.
+//      T: class, IR3 { var alias := p; return alias.V; }`. R3._n must be 1.
+//      The generic-specialization path (buildSpecializedMethodFn, §14.1 /
+//      §14.4) is the one where the disposal-registration code runs against a
+//      bare type parameter — the #1483 fix made this reachable at all; the
+//      #3035 fix made the alias binding survive the walker's taint.
+//      FAIL-WITHOUT: R3._n == 0 + LSan leak. PASS-WITH: R3._n == 1.
+//      The interface constraint `IR3` is load-bearing, not decoration: see
+//      the cell's own note below on #5449 (§3.6 rule 2 / §14.2, v0.315),
+//      which made the former `where T: class` spelling uncompilable.
 //
 //   4. CROSS-MODULE (§2.8.3 rule 4) — the param's TYPE is declared in
 //      module A and consumed via alias in module B. The dispose count must
@@ -245,18 +248,54 @@ BEZEL_TEST(alias_owned_param_keeps_auto_drop_3035,
 // reachable at all; the #3035 fix made the alias binding survive the
 // walker's taint. R._n must be 1. Before the fix R._n stayed 0 + LSan
 // flagged a leak from `main` (the `p` parameter's allocation).
+//
+// CONSTRAINT SPELLING (fix-forward of #5449, §3.6 rule 2 / §14.2, v0.315).
+// This cell previously spelled `where T: class` and read `alias.V`. That
+// program is REJECTED at sema, correctly: a generic body type-checks under
+// the weakest assumption its constraints establish (§3.6 rule 2), and
+// `class` establishes no members — the surface is Object's universal set
+// (§8.1) alone. `V` is not on it, so #5449's declaration-site check
+// (`ExprTypecheck_Calls.cpp`, "no member `V` on bare type parameter `T`")
+// fires, `runAotChecked` returns ran=false, and `run()` yields the -999
+// leak-oracle sentinel rather than a dispose count. The row was failing on
+// its own fixture, not on the disposal path it exists to pin.
+//
+// The cell now constrains T by an INTERFACE that declares `V` — the
+// diagnostic's own named remedy ("add a `where T: <constraint>` that
+// declares `V`"), and the §14.2 type-bound form whose bound contributes
+// members to the body's surface. `class` is retained alongside it so the
+// substitution domain still admits classes generally. This restores the
+// cell's original subject: a BARE TYPE PARAMETER carrying an alias over an
+// `owned` parameter, read through a member its constraint establishes, and
+// auto-dropped exactly once. `R3` (not `R`) is the substituted type because
+// a *field* does not satisfy an interface *property* contract (§11.2 /
+// §23) — `V` is declared as `public property`.
+//
+// NOT `where T: R` (the class-bound spelling): that form compiles but
+// reaches the member read through the CG8 "permissive acceptance" backstop
+// (issue #605), which emits the #2547/#2445 internal warning and DEGRADES
+// the slot to zero via lowerLocalDecl's initializer-failed fallback
+// (LlvmBackend_Exprs.cpp). It would report R._n == 1 while the member read
+// never happened — a vacuous oracle for a row whose subject is the
+// disposal count. Measured, both on staging @ fc990b6b.
 // ===========================================================================
 BEZEL_TEST(alias_owned_param_keeps_auto_drop_3035,
            generic_owned_param_alias_auto_drops_14_1_28_3) {
     const std::string src = prog(
+        "interface IR3 readonly property V: int; end IR3; "
+        "class R3: IR3 "
+        "  public property V: int := 0; "
+        "  public static _n: int := 0; "
+        "  destructor _n := _n + 1; end destructor; "
+        "end R3; "
         "class Q "
-        "  public static method F<T>(p: owned T): int where T: class "
+        "  public static method F<T>(p: owned T): int where T: class, IR3 "
         "    var alias := p; "
         "    return alias.V; "        // alias.V — borrow read of type-param
         "  end F; "
         "end Q; ",
-        "  do Q.F<R>(new R()); end; "
-        "  return R._n; ");           // 1: generic specialized body auto-drops
+        "  do Q.F<R3>(new R3()); end; "
+        "  return R3._n; ");          // 1: generic specialized body auto-drops
     BEZEL_EXPECT_EQ(run(src), 1);
 }
 
