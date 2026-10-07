@@ -31086,18 +31086,25 @@ bool Emitter::isOwnedCollectionFieldLvalue(const ast::Expr& target) {
 }
 
 
-// #824 / §28.5 / §28.9: dispose the prior value of an owned collection CLASS
-// field before storing the new pointer. Mirrors emitOwnedFieldDisposals for
-// the collection path: build the element disposer from elementPolicyFor, then
-// call bz_array_free or bz_llist_free on the old pointer.
-// bz_array_free / bz_llist_free are null-safe (no-op on null), so the first
-// assignment in a constructor (where the slot holds an uninitialized null
-// pointer) is correctly handled without an explicit null-guard — matching the
-// emitOwnedFieldDisposals comment at #2184.
-// Store-new BEFORE dispose-old (like lowerStringFieldStore retain-before-
-// release): the field points to the new value from the moment of the store, so
-// even if the disposal path is re-entrant (unlikely for collections, but
-// consistent), the field is never observed holding the old value after dispose.
+// #824 / §28.5 / §28.9 (#5459): dispose the prior value of an owned collection
+// CLASS field before storing the new pointer. Mirrors emitOwnedFieldDisposals for
+// the collection path: build the element disposer from elementPolicyFor, then call
+// bz_array_free / bz_llist_free / bz_dict_free on the old pointer.
+//
+// Identity guard (#5459): a self-assignment `this._items := this._items` must NOT
+// dispose the collection, because the value being stored IS the value already in
+// the slot. Mirrors lowerOwnedClassFieldStore / lowerOwnedTaskFieldStore: compute
+// doDispose = (oldVal != null) && (oldVal != newVal); skip disposal when false.
+//
+// Null guard: bz_array_free / bz_llist_free / bz_dict_free are null-safe (no-op
+// on null), so the first assignment in a constructor (where the slot holds an
+// uninitialized null pointer) is correctly handled without an explicit null-guard
+// — matching the emitOwnedFieldDisposals comment at #2184.
+//
+// Known limitation: OwningBuffer<T> IS covered (isCollectionTypeName includes it),
+// but OwningSlotMap<T> is NOT covered (not in kArrayBackedCollections,
+// kLinkedListNames, or kDictionaryNames in BuiltinRegistry.cpp). Such fields
+// fall through to lowerOwnedClassFieldStore and are rejected there.
 bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
                                              llvm::Value* fieldAddr,
                                              llvm::Value* newVal,
@@ -31109,8 +31116,21 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     // Load the old collection pointer before overwriting it.
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), fieldAddr, "ocf.old");
 
-    // Store the new pointer — field now owns the new collection.
-    builder_.CreateStore(newVal, fieldAddr);
+    // Null-guard AND identity-guard: self-assignment `this._items := this._items`
+    // must NOT dispose the collection (the value being stored IS the value already
+    // in the slot). bz_array_free / bz_llist_free / bz_dict_free are null-safe,
+    // so the null-guard is technically redundant for the first-assignment-in-ctor
+    // case, but the identity guard is required to skip disposal on self-assign.
+    // Mirrors lowerOwnedClassFieldStore / lowerOwnedTaskFieldStore exactly.
+    llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::Value* live = builder_.CreateICmpNE(oldVal, nullp, "ocf.live");
+    llvm::Value* diff = builder_.CreateICmpNE(oldVal, newVal, "ocf.diff");
+    llvm::Value* doDispose = builder_.CreateAnd(live, diff, "ocf.doDispose");
+
+    auto* dispBB  = llvm::BasicBlock::Create(llvm_, "ocf.dispose", currentFn_);
+    auto* contBB  = llvm::BasicBlock::Create(llvm_, "ocf.cont", currentFn_);
+    builder_.CreateCondBr(doDispose, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
     // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): paired with the
     // path-sensitive walker change in `collectBorrowingArrayFreeEligible`
     // (this file ~24423 / ~28134). When the field-store's RHS is a bare
@@ -31216,14 +31236,19 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
         auto* dynFn = declareC("bz_array_free_dynamic",
                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(dynFn, {oldVal});
-        return true;
+        builder_.CreateBr(contBB);
+    } else {
+        const char* freeName = isLL   ? "bz_llist_free"
+                              : isDict ? "bz_dict_free"
+                              :          "bz_array_free";
+        auto* freeFn = declareC(freeName,
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(freeFn, {oldVal, disp});
+        builder_.CreateBr(contBB);
     }
-    const char* freeName = isLL   ? "bz_llist_free"
-                          : isDict ? "bz_dict_free"
-                          :          "bz_array_free";
-    auto* freeFn = declareC(freeName,
-                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-    builder_.CreateCall(freeFn, {oldVal, disp});
+    builder_.SetInsertPoint(contBB);
+    // Store the new pointer — field now owns the new collection.
+    builder_.CreateStore(newVal, fieldAddr);
     return true;
 }
 
