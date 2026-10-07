@@ -23074,7 +23074,35 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // parameter (method/class generic param) from a builtinClassSym-minted
                 // type (OwningArray, OwningSet, …) whose Named ref also has
                 // declaration==null but whose headName is not a declared param.
+                //
+                // fix-forward of #5466 (issue #5449/#5466 family): that
+                // name-in-scope test is still too weak where a type
+                // parameter's NAME shadows a built-in. `class Holder<Stack>`
+                // declares a parameter spelled `Stack`, so
+                // isInScopeTypeParam("Stack") is true, while the receiver
+                // `G.Stack<int>` (alias-qualified, `import System.Collections.Generic
+                // as G`) is the BUILT-IN — §2.7 rule 1: an import alias is
+                // "an additional *qualifier*, not a rename" (§2.2), and
+                // #4698's `resolveNamed` already stripped the `G.` segment
+                // and stamped the surviving Type node, because the alias
+                // "adds nothing" to the name it qualifies. A name test
+                // cannot separate the two spellings, but that stamp can:
+                // `aliasQualifiedBuiltin` is set exactly when the qualifier
+                // was dropped, and §2.7's rule-1 bare-name sources (a type
+                // parameter among them) must not capture such a name.
+                //
+                // This is the same predicate the sibling #5241 guard applies
+                // to the same receiver shape ~16k lines up in this file
+                // (`!recvTy->astNode->aliasQualifiedBuiltin`, ExprTypecheck_Calls.cpp
+                // :6756); the two now discriminate identically.
+                //
+                // MEASURED, `class Holder<Stack>` + `new G.Stack<int>()`:
+                // with the flag read at this guard it is 1 for `G.Stack<int>`
+                // and `D.Stopwatch` (accept) and 0 for a bare `Stack` receiver
+                // that really is the parameter, at class level, method level
+                // and extension level (all still rejected).
                 if (!targetType && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    !(tt->astNode && tt->astNode->aliasQualifiedBuiltin) &&
                     isInScopeTypeParam(paramName)) {
                     bool isUniversalObjMember =
                         ma.member == "ToString" || ma.member == "Equals" ||
