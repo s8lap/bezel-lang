@@ -15,7 +15,7 @@ The entries in this section were reconstructed in 2026-10. They predate the per-
 - **A record of the design conversation** that ran from v0.24 to v0.30. The conversation did not produce spec files: it drafted patches, the owner applied them to the spec by hand and periodically re-uploaded it. The drafted patches are therefore the record of what changed, and the uploads are the revision boundaries. The record summarises most of its turns instead of quoting the spec text. The entries for v0.24 to v0.30 rest on it, one entry per round of patches between two uploads, and have been checked against the v0.31 snapshot. Its last patches, drafted after the v0.30 upload, are matched against v0.31 in the v0.30 to v0.31 entry.
 - **A later summary of the earliest design conversation**, covering v0.1–v0.3. It describes itself as "reconstructed progressive snapshots" and is not a verbatim spec, so it is the weakest source.
 
-v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.22 or v0.32–v0.51, except one decision dated v0.40; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
+v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.32–v0.51, except one decision dated v0.40; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. No v0.22 text survives; its contents are placed by a change record written when v0.23 was drafted, as its entry explains. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
 
 <a id="sec-v0-1-to-v0-2-changelog"></a>
 ### v0.1 to v0.2 changelog (reconstructed)
@@ -241,11 +241,10 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
 - Forgetting to dispose is stated to leak until the process exits. Records never require disposal.
 - The `using var` text gains an `Array<byte>` example. Explicit `try`/`finally { x.Dispose(); }` is shown, and `scope` is presented as a way to dispose early.
 
-<a id="sec-v0-21-to-v0-23-changelog"></a>
-### v0.21 to v0.23 changelog (reconstructed)
+<a id="sec-v0-21-to-v0-22-changelog"></a>
+### v0.21 to v0.22 changelog (reconstructed)
 
-- Gap note: no v0.22 snapshot survives, so these changes cannot be split between v0.22 and v0.23. The v0.23 text does not settle the order either. Enums and Nullability are inserted where they belong by topic instead of being appended, so the append-order evidence used for v0.19 does not apply. The cross-references show only that nullability came no later than the sections that cite it: nullable enums, nullable `owned` fields and nullable function types.
-
+- Source: the v0.21 and v0.23 snapshots. No v0.22 text survives; the split between this entry and the next rests on a change record written by the assistant that drafted v0.23, compiled from its reviews of v0.22 (1,562 lines) and v0.23 (2,130 lines). That record attributes the enums and lambdas sections, the comma unification and the `void` wording to v0.23, so the remaining v0.21→v0.23 changes are placed here by elimination.
 - **Compiler-checked ownership replaces the hand-written Dispose pattern.** A class declares at most one `public destructor … end destructor;`, and the compiler generates an idempotent `Dispose()`. That `Dispose()` runs the destructor, disposes `owned` fields in reverse declaration order, chains to the base destructor and frees the heap block. `Dispose(bool)`, the `disposing` flag, `_disposed` and manual `base.Dispose` calls are removed, and "no finalizers" is added. The convention-only Ownership Conventions subsection gives way to these rules and an Ownership Summary.
 - **`owned` modifier** added for class-type fields:
   - Automatic disposal, with a null check for nullable fields.
@@ -257,19 +256,26 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
   - flow-sensitive narrowing after `<> null` checks and early returns;
   - `?.`, `??`, `??=`, and a postfix `!` that throws `NullReferenceException`;
   - non-nullable fields must be assigned in every constructor or have an initializer.
+- Primitive type **`real` replaced by `double`** in the built-in types list, the literals section and the `const Pi` example. The operator-overloading example switches to `float` instead.
+
+<a id="sec-v0-22-to-v0-23-changelog"></a>
+### v0.22 to v0.23 changelog (reconstructed)
+
+- Source: the v0.23 snapshot and the change record described in the previous entry. The two new sections account for almost all of the 568 lines v0.23 adds.
 - **Enums** added (`enum Priority Low, Medium, High; end Priority;`):
   - explicit `:=` values, and an optional integer underlying type (`enum X: byte`);
   - instance methods, expression-bodied computed properties, and static methods and readonly fields, but no instance fields, constructors, nesting, inheritance or interfaces;
   - no implicit integer conversion; explicit `int(p)` and `Priority(1)` casts are used instead;
   - the enum prefix may be omitted in `case` arms.
+  - inside an enum member `this` is the current value, compared with `=`/`<>` or matched with `case this`; interface implementation is reserved for a later revision.
 - **Lambdas, function types and type aliases** added:
-  - the unit type `()`; the method rules now say the return type is omitted "when nothing is returned" instead of "for `void`";
+  - the unit type `()`, a real type with one value, replacing `void` in function types; the method rules now say the return type is omitted "when nothing is returned" instead of "for `void`", though the Methods section's "void methods" label survives;
   - function types `(int, int) -> int`, with optional documentation-only parameter names and nullable form `((…) -> T)?`;
   - lambdas `(x) => expr` and `(x) => do … end`, with parameter types inferred from the target, by-reference closures, and a fresh `foreach` binding per iteration;
   - method references and null-conditional calls `f?(…)`;
   - `type Name = T;` aliases, which are pure synonyms (single-field records are recommended for distinct types).
-- **Parameter separator in declarations changes from `;` to `,`** (`record Point(x: int, y: int)`, `method Add(a: int, b: int)`), matching the call-site change in v0.16. Two examples still use `;`: the operator-overloading `Vector2` record and the optional-parameters `Log` method.
-- Primitive type **`real` replaced by `double`** in the built-in types list, the literals section and the `const Pi` example. The operator-overloading example switches to `float` instead.
+  - deliberately omitted: named `delegate` declarations, a `Func`/`Action` split and trailing-lambda syntax. The aliases text says aliases may not be generic, yet its own example declares `type Validator<T>`.
+- **Parameter separator in declarations changes from `;` to `,`** (`record Point(x: int, y: int)`, `method Add(a: int, b: int)`), matching function types, generic argument lists and the call-site change in v0.16; the Pascal-style `;` separated type groups (`a, b: int; c: string`), which the language never had, since every parameter carries its own type. Two examples still use `;`: the operator-overloading `Vector2` record and the optional-parameters `Log` method.
 
 <a id="sec-v0-23-to-v0-24-changelog"></a>
 ### v0.23 to v0.24 changelog (reconstructed)
