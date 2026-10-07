@@ -19,6 +19,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -59,8 +60,17 @@ private:
 // through that would be asserting on an unarmed oracle.
 bool skipped(const JitResult& r) {
     if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        // A toolchain skip and a real finding are DIFFERENT outcomes, and only
+        // the former may be returned past. "runAotChecked: SKIP — C toolchain
+        // (clang) ..." means the sanitizer never ran; "sanitizer fired" means it
+        // ran and found something. Returning true for the second would discard
+        // a genuine leak as if the box merely lacked clang — the #3733 silent
+        // -skip defect, and the reason this predicate is not a bare find("SKIP").
+        if (d.message.find("SKIP") == std::string::npos) continue;
+        if (d.message.find("sanitizer fired") != std::string::npos) return false;
+        return true;
+    }
     return false;
 }
 
@@ -91,6 +101,10 @@ BEZEL_TEST(todictionary_duplicate_key_leak_5421,
         "  i := i + 1; "
         "end while; "
         "return 0; "));
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (skipped(r)) return;
     // With strict leak detection, LSan fires if any leak occurred.
     // The fix releases closures on the throw path so no leak accumulates.
@@ -115,6 +129,10 @@ BEZEL_TEST(todictionary_duplicate_key_leak_5421,
         "  i := i + 1; "
         "end while; "
         "return 0; "));
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (skipped(r)) return;
     // String-key path uses a separate code path in bz_lazy_to_dict.
     // Both the generic-key and string-key throw paths must release closures.
@@ -138,6 +156,10 @@ BEZEL_TEST(todictionary_duplicate_key_leak_5421,
         "  i := i + 1; "
         "end while; "
         "return 0; "));
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (skipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -159,6 +181,10 @@ BEZEL_TEST(todictionary_duplicate_key_leak_5421,
         "  i := i + 1; "
         "end while; "
         "return 0; "));
+    // #3733: a silent `return` here would report a clean PASS on a box
+    // whose ASan link is unavailable — green while asserting nothing about
+    // memory safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (skipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

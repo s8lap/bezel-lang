@@ -16,6 +16,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"    // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -35,8 +36,17 @@ int countOccurrences(const std::string& hay, const std::string& needle) {
 // A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
 bool wasSkipped(const JitResult& r) {
     if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        // A toolchain skip and a real finding are DIFFERENT outcomes, and only
+        // the former may be returned past. "runAotChecked: SKIP — C toolchain
+        // (clang) ..." means the sanitizer never ran; "sanitizer fired" means it
+        // ran and found something. Returning true for the second would discard
+        // a genuine leak as if the box merely lacked clang — the #3733 silent
+        // -skip defect, and the reason this predicate is not a bare find("SKIP").
+        if (d.message.find("SKIP") == std::string::npos) continue;
+        if (d.message.find("sanitizer fired") != std::string::npos) return false;
+        return true;
+    }
     return false;
 }
 
@@ -89,6 +99,10 @@ const char* kOwningChoiceParamLeak =
 BEZEL_TEST(ownership_owning_choice_param_leak,
            owning_choice_param_disposed_at_scope_end_spec_15_3) {
     JitResult r = runAotChecked(kOwningChoiceParamLeak);
+    // #3733: a silent `return` here would report a clean PASS on a box whose
+    // ASan link is unavailable — green while asserting nothing about memory
+    // safety. Invert the branch so the skip is loud, then skip.
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
 
     // Debug: print diagnostics if ran is false
