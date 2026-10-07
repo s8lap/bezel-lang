@@ -23070,7 +23070,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // nothing (targetType still null), the member is not in the
                 // constraint-derived surface. The universal Object members (§8.1) are
                 // always present; reject everything else.
-                if (!targetType && tt->kind == TypeRef::Kind::Named && !tt->declaration) {
+                // Guard: isInScopeTypeParam(paramName) distinguishes a genuine type
+                // parameter (method/class generic param) from a builtinClassSym-minted
+                // type (OwningArray, OwningSet, …) whose Named ref also has
+                // declaration==null but whose headName is not a declared param.
+                if (!targetType && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    isInScopeTypeParam(paramName)) {
                     bool isUniversalObjMember =
                         ma.member == "ToString" || ma.member == "Equals" ||
                         ma.member == "GetHashCode" || ma.member == "GetType" ||
