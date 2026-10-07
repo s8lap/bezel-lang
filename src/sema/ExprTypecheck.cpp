@@ -11790,6 +11790,25 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
                         };
                         if (!hasMod(fs->modifiers, "static")) return nullptr;
                     }
+                    // §2.7 (v0.315): a static body has no `this`, so an instance
+                    // method or property is not in scope. Check both using the same
+                    // static modifier test.
+                    if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                        auto hasMod = [](const std::vector<std::string_view>& mods,
+                                         std::string_view mod) {
+                            for (auto x : mods) if (x == mod) return true;
+                            return false;
+                        };
+                        if (!hasMod(ms->modifiers, "static")) return nullptr;
+                    }
+                    if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+                        auto hasMod = [](const std::vector<std::string_view>& mods,
+                                         std::string_view mod) {
+                            for (auto x : mods) if (x == mod) return true;
+                            return false;
+                        };
+                        if (!hasMod(ps->modifiers, "static")) return nullptr;
+                    }
                 }
                 return m;
             }
@@ -11830,6 +11849,25 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
                     };
                     if (!hasMod(fs->modifiers, "static")) return nullptr;
                 }
+                // §2.7 (v0.315): a static body has no `this`, so an instance
+                // method or property is not in scope. Check both using the same
+                // static modifier test.
+                if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                    auto hasMod = [](const std::vector<std::string_view>& mods,
+                                     std::string_view mod) {
+                        for (auto x : mods) if (x == mod) return true;
+                        return false;
+                    };
+                    if (!hasMod(ms->modifiers, "static")) return nullptr;
+                }
+                if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+                    auto hasMod = [](const std::vector<std::string_view>& mods,
+                                     std::string_view mod) {
+                        for (auto x : mods) if (x == mod) return true;
+                        return false;
+                    };
+                    if (!hasMod(ps->modifiers, "static")) return nullptr;
+                }
             }
             return m;
         }
@@ -11856,16 +11894,34 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
 //     static members by bare name).
 // So a true result always co-occurs with a name `lookupName` declines: this
 // re-labels an existing rejection, it never creates or removes one.
+//
+// §2.7 (v0.315): the check covers instance fields (§22.10 posParam excluded),
+// instance methods, and instance properties. Static members (§2.7 admits them by
+// bare name) and §22.10 capture fields (not members per §22.10) are excluded.
 bool ExprTC::isStaticCtxInstanceMemberOfEnclosingType(
     std::string_view name) const {
     if (!inStaticMember_ || !currentType_) return false;
     Symbol* m = lookupMember(currentType_, name);
-    auto* fs = dynamic_cast<FieldSymbol*>(m);
-    if (!fs) return false;
-    if (fs->posParam) return false;   // §22.10 — a capture field is not a member
-    for (auto mod : fs->modifiers)
-        if (mod == "static") return false;   // §2.7 — static members are admitted
-    return true;
+    // Instance field (capture field (§22.10) excluded)
+    if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+        if (fs->posParam) return false;
+        for (auto mod : fs->modifiers)
+            if (mod == "static") return false;
+        return true;
+    }
+    // Instance method
+    if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+        for (auto mod : ms->modifiers)
+            if (mod == "static") return false;
+        return true;
+    }
+    // Instance property
+    if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+        for (auto mod : ps->modifiers)
+            if (mod == "static") return false;
+        return true;
+    }
+    return false;
 }
 
 // §31.1 / §31.2.1 (v0.243, proposal 0080, #3046): is `ty` the built-in
