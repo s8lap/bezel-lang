@@ -389,7 +389,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 disposeStack_.back().push_back(d);
             }
         }
-        // fix #5437 (§28.9 / §28.2 / §28.1 / §8.1, v0.314): a plain `var` that
+        // fix #5437 (§28.9 / §28.2 / §28.1 / §8.1, v0.315): a plain `var` that
         // RECEIVES an `owned` transfer whose substituted type is `Object`.
         //
         // This is the shape the #1857 row pins — `class Factory<T> method
@@ -2092,6 +2092,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (!as->lhsMovedFromAtStore)
                         disposeDisplacedOwningChoiceLocal(as->target.get(), addr,
                                                           as->value.get());
+                    // fix #5421 (§28.7 / §28.9, v0.315): drop-on-overwrite for
+                    // collection locals. disposeDisplacedOwnedClassLocal explicitly
+                    // declines collection locals (unwindOwnedLocalClass returns nullptr
+                    // for them), so this sibling handles the Dictionary/Array/LinkedList
+                    // case. Finds the registered Disposal entry in disposeStack_ and
+                    // calls the appropriate bz_*_free. Same moved-from suppression.
+                    if (!as->lhsMovedFromAtStore)
+                        disposeDisplacedCollectionLocal(as->target.get(), addr,
+                                                      rhs);
                     // #914: a narrowed value-nullable RHS (sema proved non-null)
                     // assigned to a non-nullable target — unwrap the {flag,value}
                     // struct to its value. No-op for a nullable target (elemTy is

@@ -33,6 +33,15 @@ bool wasSkipped(const JitResult& r) {
     return false;
 }
 
+// runAotChecked wrapper: returns exit code if ran, -999 if not ran.
+// runAotChecked is the LSan-clean oracle; a leak → exit 1 → assertion fails.
+// Handles the skip case (ASan runtime unavailable) the same way as wasSkipped.
+int checkedExit(const std::string& p) {
+    auto r = runAotChecked(p);
+    if (wasSkipped(r)) return -999;
+    return r.ran ? r.exitCode : -999;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -227,4 +236,62 @@ BEZEL_TEST(todictionary_duplicate_key_raises_4693,
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);
+}
+
+// ---------------------------------------------------------------------------
+// fix #5421 (§28.7 / §28.9): drop-on-overwrite for collection locals.
+// When a Dictionary/Array/LinkedList local is reassigned, the displaced value
+// was never disposed.  The pre-fix compiler leaks the old dict on every
+// duplicate-key throw (352 bytes: 96-byte header + 256-byte buckets).
+// These rows use runAotChecked so LSan is active, and loop 200x so the
+// one-shot leak clears Lsan's threshold.  The reassignment SHAPE is required:
+// `var d := new Dictionary()` is OUTSIDE the try, so reassigning `d` inside
+// displaces the pre-existing owner.  A fresh declaration inside the try
+// (`var d := ...`) displaces nothing and cannot exercise drop-on-overwrite.
+// ---------------------------------------------------------------------------
+
+// fix #5421: Dictionary reassignment — single-selector ToDictionary.
+// var d := new Dictionary() is OUTSIDE the try; d := ... inside the try
+// displaces the pre-existing dict and must be dropped on throw.
+// Uses type inference (var d := ...) since explicit type annotation
+// (var d: Dictionary<int, int> := ...) is rejected by the ownership
+// analysis even though semantically identical.
+// PRE-FIX: LSan reports 70400-byte leak (200 * 352), exit 1.
+// POST-FIX: exitCode==0, no LSan report.
+BEZEL_TEST(todictionary_duplicate_key_raises_4693,
+           dict_reassign_drop_on_overwrite_single_selector_5421) {
+    BEZEL_EXPECT_EQ(checkedExit(prog(
+        "var arr: Array<int> := [1, 2, 1]; "
+        "var i := 0; "
+        "while i < 200 do "
+        "  var d := new Dictionary<int, int>(); "
+        "  try "
+        "    d := arr.ToDictionary(lambda(x: int) => x); "
+        "  catch "
+        "    var e: ArgumentException => do end "
+        "  end try; "
+        "  i := i + 1; "
+        "end while; "
+        "return 0; ")), 0);
+}
+
+// fix #5421: OwningArray reassignment — non-dictionary collection type.
+// The fix is general over bz_array_free / bz_dict_free / bz_llist_free;
+// cover at least one non-Dictionary collection to exercise the array arm.
+// Array<T> has no duplicate-key throw, so this uses an array reassigned 200x:
+// the displaced value must be dropped on every reassignment.
+// Uses type inference (var a := ...) since explicit type annotation
+// (var a: Array<int> := ...) is rejected by the ownership analysis.
+// Pre-fix: the displaced OwningArray<int> value is leaked on every
+// reassignment.  Post-fix: each displaced value is freed via bz_array_free.
+BEZEL_TEST(todictionary_duplicate_key_raises_4693,
+           array_reassign_drop_on_overwrite_5421) {
+    BEZEL_EXPECT_EQ(checkedExit(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  var a := new Array<int>(10); "
+        "  a := new Array<int>(20); "
+        "  i := i + 1; "
+        "end while; "
+        "return 0; ")), 0);
 }

@@ -1775,7 +1775,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
                 continue;  // fix #3152 — see the string walk above
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
-            // fix #5389 (§23.1 / §28.9, v0.314): also a bare-`T` member at
+            // fix #5389 (§23.1 / §28.9, v0.315): also a bare-`T` member at
             // `T = function type` — this walk runs inside the per-instantiation
             // disposer (needsSpecDispose's layoutDiffers clause forces one at every
             // pointer-sized instantiation) with the substitution active, and every
@@ -6617,6 +6617,128 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
     builder_.SetInsertPoint(contBB);
 }
 
+// fix #5421 (§28.7 / §28.9, v0.315): drop-on-overwrite for collection locals.
+// Mirrors `disposeDisplacedOwnedClassLocal` for collection-typed locals. When a
+// Dictionary/Array/LinkedList local is reassigned, the displaced value must be
+// disposed. Finds the Disposal entry registered for this slot in disposeStack_
+// (by registerUsingDisposal at lowerLocalDecl) and calls the appropriate free
+// function. Skips if the slot is null or self-assigned.
+void Emitter::disposeDisplacedCollectionLocal(const ast::Expr* target,
+                                             llvm::Value* addr,
+                                             llvm::Value* newVal) {
+    if (!addr) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    if (!id) return;  // field / index / static target — not a plain local
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc) return;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld) return;
+    // Only collection types need this helper; plain class is handled by
+    // disposeDisplacedOwnedClassLocal.
+    bool isColl = collectionTypeOfLocal(ld);
+    bool isDict = dictTypeOfLocal(ld);
+    bool isLL = linkedListTypeOfLocal(ld);
+    if (!isColl && !isDict && !isLL) return;
+    // Find the Disposal entry for this slot in disposeStack_.
+    // slot is llvm::AllocaInst*; use localSlot() to get the alloca for id.
+    llvm::AllocaInst* allocaSlot = localSlot(*id);
+    if (!allocaSlot) return;
+    const Disposal* entry = nullptr;
+    for (auto scopeIt = disposeStack_.rbegin();
+         scopeIt != disposeStack_.rend() && !entry;
+         ++scopeIt) {
+        for (auto it = scopeIt->rbegin(); it != scopeIt->rend(); ++it) {
+            if (it->slot == allocaSlot) {
+                entry = &(*it);
+                break;
+            }
+        }
+    }
+    if (!entry) return;  // no registered disposal entry (e.g. borrow-typed local)
+    llvm::Value* old = builder_.CreateLoad(ptrTy(), addr, "coll.reassign.old");
+    llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::Value* live = builder_.CreateICmpNE(old, nullp, "coll.reassign.live");
+    llvm::Value* doDispose = live;
+    if (newVal && newVal->getType()->isPointerTy())
+        doDispose = builder_.CreateAnd(
+            live, builder_.CreateICmpNE(old, newVal, "coll.reassign.diff"));
+    auto* frBB  = llvm::BasicBlock::Create(llvm_, "coll.reassign.free", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "coll.reassign.cont", currentFn_);
+    builder_.CreateCondBr(doDispose, frBB, contBB);
+    builder_.SetInsertPoint(frBB);
+    if (isDict) {
+        // Dictionary / Set: bz_dict_free(tbl, dictValueDisposer).
+        // Mirror the dict arm in emitDisposals (lines 8119-8177).
+        llvm::Value* tbl = builder_.CreateLoad(ptrTy(), addr);
+        llvm::Value* isNullTbl = builder_.CreateICmpEQ(
+            tbl, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* fr2BB = llvm::BasicBlock::Create(llvm_, "dict.free2", currentFn_);
+        builder_.CreateCondBr(isNullTbl, contBB, fr2BB);
+        builder_.SetInsertPoint(fr2BB);
+        if (entry->dictStringKeys) {
+            auto* relFn = declareC("bz_set_string_keys_release",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(relFn, {tbl});
+        }
+        if (entry->dictKeyDisposer) {
+            auto* keysDispFn = declareC("bz_set_coll_keys_dispose",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+            builder_.CreateCall(keysDispFn, {tbl, entry->dictKeyDisposer});
+        }
+        llvm::Value* disp = entry->dictValueDisposer
+            ? llvm::cast<llvm::Value>(entry->dictValueDisposer)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_dict_free",
+                            llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {tbl, disp});
+        if (elementDisposerRunsUserCode(entry->dictValueDisposer))
+            ++userCodeDisposalCount_;
+        builder_.CreateStore(
+            llvm::ConstantPointerNull::get(ptrTy()), addr);
+    } else if (isColl) {
+        // Array: bz_array_free(arr, collectionElemDisposer).
+        // Mirror the collection arm in emitDisposals (lines 8045-8100).
+        llvm::Value* arr = builder_.CreateLoad(ptrTy(), addr);
+        llvm::Value* isNullArr = builder_.CreateICmpEQ(
+            arr, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* fr2BB = llvm::BasicBlock::Create(llvm_, "arr.free2", currentFn_);
+        builder_.CreateCondBr(isNullArr, contBB, fr2BB);
+        builder_.SetInsertPoint(fr2BB);
+        if (entry->collArrayDynamicFree) {
+            auto* dynFn = declareC("bz_array_free_dynamic",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(dynFn, {arr});
+            ++userCodeDisposalCount_;
+        } else {
+            llvm::Value* disp = entry->collectionElemDisposer
+                ? llvm::cast<llvm::Value>(entry->collectionElemDisposer)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* fn = declareC("bz_array_free",
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+            builder_.CreateCall(fn, {arr, disp});
+        }
+    } else {
+        // LinkedList: bz_llist_free(llist, collectionElemDisposer).
+        llvm::Value* ll = builder_.CreateLoad(ptrTy(), addr);
+        llvm::Value* isNullLl = builder_.CreateICmpEQ(
+            ll, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* fr2BB = llvm::BasicBlock::Create(llvm_, "ll.free2", currentFn_);
+        builder_.CreateCondBr(isNullLl, contBB, fr2BB);
+        builder_.SetInsertPoint(fr2BB);
+        llvm::Value* disp = entry->collectionElemDisposer
+            ? llvm::cast<llvm::Value>(entry->collectionElemDisposer)
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* fn = declareC("bz_llist_free",
+                            llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+        builder_.CreateCall(fn, {ll, disp});
+    }
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
 
 // fix #4552 / §35.9 *Nullable `C?`* (v0.306): dispose the owning-choice value
 // held AT AN ADDRESS, unwrapping §35.9's `C?` representation first.
@@ -6841,7 +6963,7 @@ void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
     markOwningChoiceMovedFromCore(targetLd, srcExpr);
 }
 
-// fix #5436 (§15.3 *Parameter passing*, v0.314): a call ARGUMENT whose formal
+// fix #5436 (§15.3 *Parameter passing*, v0.315): a call ARGUMENT whose formal
 // is a by-value-move parameter. §15.3: "A parameter declared `(x: V)` for an
 // ordinary V is by value (copy); for a move-only V, it is by value-move
 // (transfer ownership). The caller's argument expression is in moved-from
@@ -9259,7 +9381,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             continue;
         }
         if (it->objectReclaim) {
-            // fix #5437 (§28.9 / §28.2 / §8.1, v0.314). `Object` is a
+            // fix #5437 (§28.9 / §28.2 / §8.1, v0.315). `Object` is a
             // trivial-dispose CLASS (§8.1 declares no destructor and no fields),
             // so §28.9's rule — "the compiler frees the undischarged value at
             // its owner's release point" — applies to `new Object()` instances.

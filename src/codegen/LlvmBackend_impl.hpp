@@ -1903,7 +1903,7 @@ private:
         // exactly like the `cls`-set path but without needing a TypeSymbol in
         // disposerFns_. `cls` is null for these.
         bool dynamicDispose = false;
-        // fix #5437 (§28.9 / §28.2 / §8.1, v0.314): a holder of a `new Object()`
+        // fix #5437 (§28.9 / §28.2 / §8.1, v0.315): a holder of a `new Object()`
         // instance — a trivial-dispose class (§28.9's definition: no destructor,
         // no `owned` fields, no owning-inline-array fields, trivial-dispose base
         // — `Object` has no base at all), so §28.9's "the compiler frees the
@@ -9529,7 +9529,7 @@ private:
     // own and all ancestor descriptors so `catch Ancestor` matches.
     void setupBuiltinExceptions();
 
-    // fix #5340 (§2.8.3 / §8.1, v0.314): build the Object type descriptor
+    // fix #5340 (§2.8.3 / §8.1, v0.315): build the Object type descriptor
     // and vtable. Object is the root class and has no user TypeSymbol, so it
     // bypasses the normal buildVtable path. Its vtable carries Dispose (no-op),
     // ToString ("System.Object"), Equals (reference equality), and GetHashCode
@@ -13204,7 +13204,7 @@ private:
         return isTypeParamBoundToString(recordMemberType(m));
     }
 
-    // fix #5389 (§23.1 / §28.9, v0.314): the closure twin of
+    // fix #5389 (§23.1 / §28.9, v0.315): the closure twin of
     // isTypeParamBoundToString / isTypeParamStringStorageMember. A bare `T`
     // type parameter that resolves to a function type under the active
     // substitution (e.g. Holder<() -> int> with property v: T) needs the same
@@ -19582,7 +19582,7 @@ private:
     // the target — so the declaration site calls this form directly.
     void markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
                                         const ast::Expr* srcExpr);
-    // fix #5436 (§15.3 *Parameter passing*, v0.314): the SOURCE-ONLY mark, for
+    // fix #5436 (§15.3 *Parameter passing*, v0.315): the SOURCE-ONLY mark, for
     // a call argument whose formal is a by-value-move parameter. There is no
     // target local to check — the callee's formal is the recipient, and it is
     // a PARAMETER, so the "both ends must be plain locals" scope note on the
@@ -19597,7 +19597,7 @@ private:
     // self-assignment exclusion. // per §15.3, §28.7
     void markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
                                        const ast::Expr* srcExpr);
-    // fix #5436 (§15.3 *Parameter passing*, v0.314): the call-argument sweep —
+    // fix #5436 (§15.3 *Parameter passing*, v0.315): the call-argument sweep —
     // every argument whose bound FORMAL is a by-value-move parameter of an
     // owning-classified choice. Driven off the formal, not the argument (§22.6).
     // Called from `lowerCall` AFTER `lowerCallDispatch`, so the value each call
@@ -20419,6 +20419,18 @@ private:
     void disposeDisplacedOwnedClassLocal(const ast::Expr* target,
                                          llvm::Value* addr, llvm::Type* elemTy,
                                          llvm::Value* newVal);
+
+    // fix #5421 (§28.7 / §28.9, v0.315): drop-on-overwrite for collection locals.
+    // When a Dictionary/Array/LinkedList local is reassigned, the displaced value
+    // must be disposed. `disposeDisplacedOwnedClassLocal` explicitly declines
+    // collection locals (unwindOwnedLocalClass returns nullptr for them), so an
+    // equivalent local-side helper is needed. Walks disposeStack_ to find the
+    // registered Disposal entry for the slot and calls the appropriate free
+    // function (bz_array_free / bz_dict_free / bz_llist_free), mirroring the
+    // scope-end disposal of a `using var` collection local.
+    void disposeDisplacedCollectionLocal(const ast::Expr* target,
+                                        llvm::Value* addr,
+                                        llvm::Value* newVal);
 
     // #1039 / #1053: true if `e` is a FRESH owned-CLASS producer that transfers
     // a +1 the caller solely owns — a literal `new <heap class>()` or a call to
