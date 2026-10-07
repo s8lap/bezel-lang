@@ -24,9 +24,13 @@ clause number EXCEEDS the highest numbered item found in that section -- a
 well-formed citation to a section that genuinely has no items at all passes
 silently.
 
-Exit 1 on any unresolvable citation or misattributed clause.  Build-free: it
-is a text cross-reference, so it belongs in the fast gate phase, not the
-compile path.
+Also detect fabricated version citations: any vN.N newer than the current
+spec revision is flagged.  Older and current versions are valid -- the spec
+is never edited retroactively.
+
+Exit 1 on any unresolvable citation, misattributed clause, or fabricated
+version.  Build-free: it is a text cross-reference, so it belongs in the
+fast gate phase, not the compile path.
 """
 import glob, io, os, re, sys
 
@@ -43,6 +47,7 @@ CITE = re.compile('§(\\d+(?:\\.\\d+)*)')
 CLAUSE_CITE = re.compile(
     r'§(\d+(?:\.\d+)*)\s+(cl(?:ause)?|rule|step|item)\s+(\d+)',
     re.IGNORECASE)
+VERSION_ANY = re.compile(r'\bv(\d+)\.(\d+)\b')
 SRC_EXT = ('.cpp', '.hpp', '.h', '.cc')
 
 # Narrow allowlist for clause citations that are imprecise but whose behaviour
@@ -62,6 +67,21 @@ def defined_sections(root='.'):
         for m in HEADING.finditer(io.open(p, encoding='utf-8').read()):
             out.add(m.group(1).lstrip('.'))
     return out
+
+def get_spec_version(root='.'):
+    """Read the current spec version from the spec header.
+
+    Returns a comparable (major, minor) tuple, e.g. (0, 315) for v0.315.
+    Returns None if the version cannot be determined.
+    """
+    spec_path = os.path.join(root, 'docs/Bezel_Language_Spec.md')
+    if not os.path.exists(spec_path):
+        return None
+    content = io.open(spec_path, encoding='utf-8').read()
+    m = re.search(r'\*\*Version\s+(\d+)\.(\d+)', content)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
 
 def section_max_clause_number(content):
     """Return the highest numbered item found in section content.
@@ -106,13 +126,14 @@ def scan(root='.'):
     section_items = build_section_items_map(root)
     if not known:
         print("check_src_citations: no document headings found -- wrong root?"); sys.exit(2)
+    spec_ver = get_spec_version(root)
     bad = []
     for base, _, files in os.walk(os.path.join(root, 'src')):
         for f in sorted(files):
             if not f.endswith(SRC_EXT): continue
             p = os.path.join(base, f)
             for i, ln in enumerate(io.open(p, encoding='utf-8', errors='replace'), 1):
-                # Existing section-resolution check
+                # Section-resolution check
                 for m in CITE.finditer(ln):
                     s = m.group(1)
                     if s in known: continue
@@ -137,6 +158,13 @@ def scan(root='.'):
                             bad.append(
                                 f"  {rel}:{i}: "
                                 f"§{sec} has no {kind} {n} (highest: {max_n})")
+                # Version-string check: vN.N newer than current spec is fabricated
+                # (older and current versions are valid -- spec is never edited retroactively)
+                for m in VERSION_ANY.finditer(ln):
+                    if spec_ver is None: continue
+                    cited_ver = (int(m.group(1)), int(m.group(2)))
+                    if cited_ver > spec_ver:
+                        bad.append(f"  {os.path.relpath(p, root)}:{i}: v{m.group(1)}.{m.group(2)} is a spec revision newer than the current v{spec_ver[0]}.{spec_ver[1]}")
     return bad
 
 def selftest():
@@ -175,12 +203,14 @@ def selftest():
             "6. Static init across artifacts.\n\n"
             "### 32.13 Foreign-memory\n\n"
             "   1. First sub-item\n"
-            "   2. Second sub-item\n"
+            "   2. Second sub-item\n\n"
+            "**Version 0.300 — October 2026**\n"
         )
         io.open(os.path.join(d, 'docs/Bezel_Design_Rationale.md'), 'w', encoding='utf-8').write(
             "# R\n\n### 5.11 Ownership\n"
         )
         src = os.path.join(d, 'src/a.cpp')
+
         # Test 1: valid section citations
         io.open(src, 'w', encoding='utf-8').write(
             "// §9.7 ok\n"
@@ -235,7 +265,7 @@ def selftest():
         bad = scan(d)
         assert len(bad) == 1 and 'no clause 20' in bad[0], bad
 
-        # Test 8: the bug-class this found — adjacent-section item N (#5439).
+        # Test 8: the bug-class this found -- adjacent-section item N (#5439).
         # §2.8.3 has rules 1-4; §2.8.4 has rules 1-6 including rule 5.
         # Citing "§2.8.3 rule 5" should fail (rule 5 is in §2.8.4, not §2.8.3).
         io.open(src, 'w', encoding='utf-8').write(
@@ -251,15 +281,36 @@ def selftest():
         bad = scan(d)
         assert bad == [], f"expected [] for §2.8.4 rule 5, got {bad}"
 
+        # Test 9: version-string checks
+        src2 = os.path.join(d, 'src/b.cpp')
+        # Current revision (v0.300 = spec) -- ok
+        io.open(src2, 'w', encoding='utf-8').write("// §9.7, v0.300 ok\n")
+        assert scan(d) == [], scan(d)
+        # Older revision -- ok (spec is never edited retroactively)
+        io.open(src2, 'w', encoding='utf-8').write("// §9.7, v0.299 ok\n")
+        assert scan(d) == [], scan(d)
+        # Future revision -- must be flagged
+        io.open(src2, 'w', encoding='utf-8').write("// §9.7, v0.301 fabricated\n")
+        bad2 = scan(d)
+        assert len(bad2) == 1, bad2
+        assert 'v0.301' in bad2[0], bad2
+        assert 'newer than' in bad2[0], bad2
+        # v0.320 (clearly fabricated, much newer than current)
+        io.open(src2, 'w', encoding='utf-8').write("// §9.7, v0.320 fabricated\n")
+        bad3 = scan(d)
+        assert len(bad3) == 1, bad3
+        assert 'v0.320' in bad3[0], bad3
+
     print("check_src_citations: self-test OK")
 
 if __name__ == '__main__':
     if '--self-test' in sys.argv: selftest(); sys.exit(0)
     bad = scan()
     if bad:
-        print(f"check_src_citations: {len(bad)} unresolvable §-citation(s) or misattributed clause(s):")
+        print(f"check_src_citations: {len(bad)} unresolvable §-citation(s), misattributed clause(s), or fabricated version(s):")
         print("\n".join(bad[:40]))
         if len(bad) > 40: print(f"  ... and {len(bad)-40} more")
         sys.exit(1)
     print("check_src_citations: clean (every §-citation in src/ resolves, "
-          "and every clause citation is within the section's numbered items)")
+          "every clause citation is within the section's numbered items, "
+          "and no version cites a future spec revision)")
