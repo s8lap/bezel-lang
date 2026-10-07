@@ -42,8 +42,10 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
@@ -56,6 +58,12 @@ bool wasSkipped(const JitResult& r) {
     if (r.ran) return false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("SKIP") != std::string::npos) return true;
+    return false;
+}
+
+bool diagContains(const JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
     return false;
 }
 
@@ -177,6 +185,6 @@ BEZEL_TEST(case_expr_string_result_leak_1934,
 BEZEL_TEST(case_expr_string_result_leak_1934,
            return_when_producer_arm_lsan_clean_spec_19_1) {
     JitResult r = runAotChecked(kWhenProducerArm);
-    if (wasSkipped(r)) return;
-    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a `when`-led expression is retired"));
 }

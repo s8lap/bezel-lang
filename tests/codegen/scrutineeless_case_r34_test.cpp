@@ -17,12 +17,21 @@
 // with scrutinee remains functional.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
+
+bool diagContains(const bezel::test::JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
+
 int run(const std::string& src) {
     auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
@@ -39,7 +48,8 @@ BEZEL_TEST(scrutineeless_case_727, case_expr_literal_condition) {
         "  ); "
         "  return r; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a `when`-led expression is retired"));
 }
 
 // v0.289 (§19, §22.4): the `(when …)` expression is retired.
@@ -54,7 +64,8 @@ BEZEL_TEST(scrutineeless_case_727, case_expr_variable_condition_chain) {
         "  ); "
         "  return r; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a `when`-led expression is retired"));
 }
 
 // v0.289 (§19, §22.4): the `(when …)` expression is retired.
@@ -69,7 +80,8 @@ BEZEL_TEST(scrutineeless_case_727, case_expr_first_match_wins) {
         "  ); "
         "  return r; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a `when`-led expression is retired"));
 }
 
 // v0.289 (§19, §22.4): the `when … end;` statement is retired.
@@ -84,7 +96,8 @@ BEZEL_TEST(scrutineeless_case_727, case_stmt_variable_condition) {
         "  end; "
         "  return r; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `when … end;` statement is retired
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a `when`-led statement is retired"));
 }
 
 // Regression: a normal `case` WITH a scrutinee still compiles and runs.

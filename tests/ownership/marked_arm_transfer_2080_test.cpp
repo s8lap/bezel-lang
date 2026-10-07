@@ -24,6 +24,7 @@
 #include "support/ownership_support.hpp"  // parseAndCheckOwnership / hasErrorMessage — §3591 const-target question below
 #include "test_harness.hpp"
 
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::JitResult;
 using bezel::test::OwnershipResult;
 using bezel::test::hasErrorMessage;
@@ -31,6 +32,12 @@ using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 namespace {
+
+bool diagContains(const JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
 
 // A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
 // runAotChecked returns ran=false with a "<name>: SKIP — C toolchain (clang)"
@@ -167,12 +174,8 @@ BEZEL_TEST(marked_arm_transfer_2080, spec_19_2_when_arm_results) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    // #3733: a silent `return` here would report a clean PASS on a box whose
-    // ASan link is unavailable — green while asserting nothing about memory
-    // safety. Invert the branch so the skip is LOUD, then skip.
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
-    BEZEL_EXPECT_FALSE(r.ran);  // v0.289: `(when …)` expression is retired
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a `when`-led expression is retired"));
 }
 
 // §28.3 K3.4 (v0.209; #2080 review F4): SHADOWING determinism — the marker
