@@ -13830,7 +13830,7 @@ static bool isRangeOrderedType(const TypeRef* ty) {
 }
 
 static std::string getTypeNameForOrderingDiag(const TypeRef* ty) {
-    if (!ty) return "?";
+    if (!ty) return "?";  // defence-in-depth; caller guards the primary path
     if (ty->kind == TypeRef::Kind::Named && ty->declaration)
         return std::string(ty->declaration->name);
     if (ty->kind == TypeRef::Kind::Unit) return "()";
@@ -13860,6 +13860,10 @@ static std::string getTypeNameForOrderingDiag(const TypeRef* ty) {
 void ExprTC::checkOrderingPatternsOverUnorderedScrutinee(
         const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms,
         const ast::Expr* scrutinee) {
+    // §19.3 (v0.315, #5474): with an unresolved scrutinee there is no type,
+    // so the ordering precondition (§19.3) is unmet and the check must not run.
+    // The unresolved identifier diagnostic is sufficient.
+    if (!scrutTy) return;
     // §7.4 / §19.3 (v0.314): a §7.4-narrowed non-null read of a nullable
     // value-typed scrutinee is tested at its non-nullable type. Mirror the
     // nullable sibling's narrowing check here: if the scrutinee is narrowed

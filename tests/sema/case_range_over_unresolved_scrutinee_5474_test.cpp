@@ -3,10 +3,13 @@
 // least one range/relational pattern. The crash was in
 // `getTypeNameForOrderingDiag(scrutTy)` at ExprTypecheck.cpp:13833:
 // `ty->kind` dereferenced `ty` without checking for null when `scrutTy`
-// was null (unresolved scrutinee → no type set). The fix adds a `!ty`
-// null guard to `getTypeNameForOrderingDiag`, so the function returns "?"
-// instead of crashing. The established diagnostic for this situation is
-// "unresolved identifier `name`".
+// was null (unresolved scrutinee → no type set).
+//
+// The fix adds a caller-side precondition: `checkOrderingPatternsOverUnorderedScrutinee`
+// bails when `scrutTy` is null, before the ordering analysis runs. §19.3's
+// rule requires a type; with no type the precondition is unmet and the check
+// must not be entered. The unresolved identifier diagnostic is sufficient.
+// A cheap leaf guard in `getTypeNameForOrderingDiag` remains as defence-in-depth.
 //
 // Spec §19.3 (v0.315): a relational pattern "compares the scrutinee
 // against the other-hand operand, under the intrinsic ordering of the
@@ -22,8 +25,9 @@ using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 // ── R1 — unresolved scrutinee with range pattern: must not crash,
-// must report "unresolved identifier". The fix guards getTypeNameForOrderingDiag
-// against a null TypeRef*; without the fix bezelc dies with SIGSEGV.
+// must report "unresolved identifier". Without the fix bezelc dies with
+// SIGSEGV. With the fix, the ordering check is skipped when there is no
+// scrutinee type, so the only diagnostic is the unresolved identifier.
 BEZEL_TEST(sema_case_range_over_unresolved_scrutinee_5474,
            unresolved_scrutinee_with_range_pattern_clean_reject) {
     auto r = runAot(
@@ -41,4 +45,8 @@ BEZEL_TEST(sema_case_range_over_unresolved_scrutinee_5474,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     // The scrutinee `score` must be reported as unresolved.
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "unresolved identifier"));
+    // §19.3's precondition is unmet (no scrutinee type), so the ordering
+    // check must not run. Assert the spurious diagnostic is absent — vacuous
+    // on a compile (runAot fills diagnostics only on reject), real here.
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "has no intrinsic ordering"));
 }
