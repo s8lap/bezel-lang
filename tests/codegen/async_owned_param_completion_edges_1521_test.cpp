@@ -355,7 +355,7 @@ BEZEL_TEST(async_owned_param_completion_edges_1521,
         0);
 }
 
-// REGRESSION — moved out via `return move c;` through an `OwningTask<T>`
+// REGRESSION — moved out via `return c;` through an `OwningTask<T>`
 // (Pattern B): §30.5 "chaining ... is an ordinary §28.3 move-out of the
 // parameter ... so §30.1's dispose-at-terminal-state rule for not-moved-out
 // `owned` parameters does not apply to it". The frame must NOT auto-drop a
@@ -367,7 +367,7 @@ BEZEL_TEST(async_owned_param_completion_edges_1521,
         "module M; " + std::string(kCell) +
         "class C "
         "  public static async method Worker(owned c: Cell): OwningTask<Cell> "
-        "    return move c; "
+        "    return c; "
         "  end Worker; "
         "  public static async method Helper(): Task "
         "    using var result := await C.Worker(new Cell()); "

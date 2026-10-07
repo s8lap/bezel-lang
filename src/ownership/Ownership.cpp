@@ -4032,7 +4032,20 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             // not-reassigned diagnostic that owns those cases must continue to
             // fire (`s28_8_1_0002`, etc.).
             if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
-                if (ue->op == "move" && returnOwned_) {
+                if (ue->op == "move" &&
+                    (returnOwned_ ||
+                     // fix #4647 (§28.3 K3.13/K3.2, v0.315): also flag the
+                     // redundant marker when the return type is mint-announcing
+                     // (OwningTask always; Task in a non-async body). The
+                     // declared return type already announces the transfer in
+                     // these positions too.
+                     (returnType_ &&
+                      returnType_->kind == ast::TypeKind::Named &&
+                      returnType_->name &&
+                      !returnType_->name->parts.empty() &&
+                      common::isTaskFamilyHead(
+                          returnType_->name->parts.front()) &&
+                      !isAsync_))) {
                     // fix #5144 / §17.8 (v0.309): `return move x!;` is the SAME
                     // redundant marker as `return move x;` — the `!` is
                     // transparent to the marker (§17.8). The pre-fix check
