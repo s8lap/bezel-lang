@@ -31603,24 +31603,64 @@ bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
         // Dispose: old is non-null AND NOT identity-same.
         doDispose = builder_.CreateAnd(hvOldNonNull, builder_.CreateNot(identitySame, "ocfs.notSame"), "ocfs.doDispose");
     } else {
-        // fix #5440 (identity guard) / §35.4 / §28.7 (v0.315): AND with
-        // CreateICmpNE on the tag AND payload pointer so self-assignment
-        // `h._o := h._o` is skipped. The choice struct is { i32 tag, case0_payload, ... }.
-        // Identity = same tag AND same payload pointer. When tags differ (e.g. Ready→Empty),
-        // ptrSame is undefined but irrelevant since identitySame=false → doDispose=true.
+        // fix #5460 (poison read) / §35.4 / §28.7 (v0.315): the non-nullable
+        // identity guard must not read the inactive payload of a non-owning case.
+        // The choice struct is { i32 tag, case0_payload, case1_payload, ... }.
+        // For a non-owning case (e.g. `Bundle.Empty`), field 1 is a { i8 }
+        // padding struct (choiceCasePayloadStruct: empty payload → { i8 });
+        // extracting field 0 (the owned ptr) from that is poison in LLVM.
+        // Fix: gate the payload-pointer comparison behind a per-case hasPayload
+        // check, using separate basic blocks so the non-owning arm never loads
+        // the poison value.  When the case has no payload, `same = tagSame`
+        // is sufficient — a non-owning case holds nothing to dispose regardless
+        // of bytes.  When the case has a payload and tags match, the original
+        // ptrSame comparison detects self-assignment (§28.7).  When tags differ,
+        // doDispose=true regardless (the switch arm handles the actual disposal).
         llvm::Value* oldVal = builder_.CreateLoad(fieldTy, fieldAddr, "ocfs.old");
         llvm::Value* tagOld = builder_.CreateExtractValue(oldVal, {0u}, "ocfs.tagOld");
         llvm::Value* tagNew = builder_.CreateExtractValue(newVal, {0u}, "ocfs.tagNew");
         llvm::Value* tagSame = builder_.CreateICmpEQ(tagOld, tagNew, "ocfs.tagSame");
-        // Payload pointer comparison: field 1 (payload struct), then field 0 (owned ptr).
-        // For the owning case (Ready(owned r: Resource)), the payload is { ptr }.
+        // Determine if the active case has an owning payload to dispose.
+        // choiceCasePayloadStruct: empty payload → { i8 }, non-empty → { ptr }.
+        auto cases = choiceCasesOf(res->declaration);
+        llvm::Value* hasPayload = nullptr;
+        for (std::size_t i = 0; i < cases.size(); ++i) {
+            const sema::ChoiceCaseSymbol* cc = cases[i];
+            bool caseHasPayload = cc && cc->caseDecl && !cc->caseDecl->payload.empty();
+            llvm::Value* thisTagVal = llvm::ConstantInt::get(i32(), static_cast<unsigned>(i));
+            llvm::Value* tagIsThis = builder_.CreateICmpEQ(tagOld, thisTagVal, "ocfs.tagIsCase");
+            llvm::Value* thisHasPayload = builder_.CreateSelect(
+                tagIsThis,
+                caseHasPayload ? llvm::ConstantInt::getTrue(llvm_) : llvm::ConstantInt::getFalse(llvm_),
+                llvm::ConstantInt::getFalse(llvm_));
+            if (!hasPayload)
+                hasPayload = thisHasPayload;
+            else
+                hasPayload = builder_.CreateOr(hasPayload, thisHasPayload, "ocfs.hasPayload");
+        }
+        if (!hasPayload) hasPayload = llvm::ConstantInt::getFalse(llvm_);
+        auto* owningBB = llvm::BasicBlock::Create(llvm_, "ocfs.owning", currentFn_);
+        auto* nonOwningBB = llvm::BasicBlock::Create(llvm_, "ocfs.nonowning", currentFn_);
+        auto* mergeBB = llvm::BasicBlock::Create(llvm_, "ocfs.tagcmp.merge", currentFn_);
+        builder_.CreateCondBr(hasPayload, owningBB, nonOwningBB);
+        // owning arm: both cases have payloads; compare payload pointers.
+        builder_.SetInsertPoint(owningBB);
         llvm::Value* payloadOld = builder_.CreateExtractValue(oldVal, {1u}, "ocfs.payloadOld");
         llvm::Value* payloadNew = builder_.CreateExtractValue(newVal, {1u}, "ocfs.payloadNew");
         llvm::Value* ptrOld = builder_.CreateExtractValue(payloadOld, {0u}, "ocfs.ptrOld");
         llvm::Value* ptrNew = builder_.CreateExtractValue(payloadNew, {0u}, "ocfs.ptrNew");
         llvm::Value* ptrSame = builder_.CreateICmpEQ(ptrOld, ptrNew, "ocfs.ptrSame");
-        llvm::Value* same = builder_.CreateAnd(tagSame, ptrSame, "ocfs.same");
-        doDispose = builder_.CreateNot(same, "ocfs.doDispose");
+        llvm::Value* sameOwning = builder_.CreateAnd(tagSame, ptrSame, "ocfs.same.owning");
+        builder_.CreateBr(mergeBB);
+        // non-owning arm: no payload to dispose; identity is tag-only.
+        builder_.SetInsertPoint(nonOwningBB);
+        builder_.CreateBr(mergeBB);
+        // merge: phi on hasPayload to pick the right comparison result.
+        builder_.SetInsertPoint(mergeBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "ocfs.same");
+        phi->addIncoming(sameOwning, owningBB);
+        phi->addIncoming(tagSame, nonOwningBB);
+        doDispose = builder_.CreateNot(phi, "ocfs.doDispose");
     }
     auto* dispBB = llvm::BasicBlock::Create(llvm_, "ocfs.dispose", currentFn_);
     auto* contBB = llvm::BasicBlock::Create(llvm_, "ocfs.cont", currentFn_);

@@ -347,3 +347,46 @@ BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
                "private _o: Outcome?;"),
         std::string("self done\nwidget disposed\n"));
 }
+
+// --- fix #5460: non-owning self-assignment must not read poison (gate the payload load)
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_4_owning_choice_field_non_owning_self_assign_does_not_dispose) {
+    // fix #5460 (poison read) / §35.4 / §28.7 (v0.315): `h._o := h._o` where
+    // h._o holds `Bundle.Empty` (a non-owning case) must NOT dispose.
+    // The non-owning case's payload slot is { i8 } padding; extracting field 0
+    // (the owned ptr) from that padding struct is poison in LLVM.  The fix gates
+    // the payload-pointer comparison behind a per-case hasPayload check (separate
+    // basic blocks), so the non-owning arm never loads the poison value.
+    // Scope-end is also a no-op since Bundle.Empty has no owned payload fields.
+    BEZEL_EXPECT_EQ(
+        runOut(kCountingResourceDecls,
+               "Host.NonOwningSelfAssign(); Console.WriteLine(Resource._n);",
+               "private _o: Bundle; "
+               "public static method NonOwningSelfAssign() "
+               "  var h := new Host(); "
+               "  h._o := Bundle.Empty; "
+               "  var i := 0; "
+               "  while i < 500 do "
+               "    h._o := h._o; "  // non-owning self-assignment — must NOT dispose
+               "    i := i + 1; "
+               "  end while; "
+               "end NonOwningSelfAssign;"),
+        std::string("0\n"));  // 0 loop disposals + 0 scope-end (Empty has no owned payload)
+}
+
+BEZEL_TEST(codegen_choice_drop_on_overwrite_4552,
+           spec_35_4_owning_choice_field_owning_to_non_owning_still_disposes) {
+    // fix #5460: the fix must not accidentally skip disposal when it IS needed.
+    // Ready→Empty disposes the displaced Ready (the owning value).  If the fix
+    // accidentally made the guard too broad (skipped dispose for owning→non-owning
+    // transitions), this row would show a leak.
+    BEZEL_EXPECT_EQ(
+        runOut(kNamedResourceDecls,
+               "var h := new Host(); "
+               "h._o := Bundle.Ready(new Resource(\"old\")); "
+               "h._o := Bundle.Empty; "  // owning → non-owning: must dispose "old"
+               "Console.WriteLine(\"reassigned\");",
+               "private _o: Bundle;"),
+        std::string("dispose old\nreassigned\n"));
+}
