@@ -298,6 +298,26 @@ BEZEL_TEST(codegen_enum_owned_1564, single_field_block_freed_at_exit_no_leak_10_
 // 1564-b: enum failed-init interaction, mirroring 1557-c
 // =====================================================================
 
+// The throwing leg is a LATER static readonly field initializer, not a static
+// constructor: §10.4's admitted-static list for an enum names `const` members,
+// static methods and `static readonly` fields only, and states that "a mutable
+// static field, a `static` property, and a static constructor are not among
+// them". Fix #3840 (§10.4 / §35.2, v0.288) enforces exactly that, and
+// tests/lit/sema/sema_enum__static_constructor_rejected_3840.bzl pins the
+// rejection. The earlier spelling of this fixture used `public static V: int`
+// plus a `public static constructor()` that threw — a program §10.5 forbids
+// outright, so it never reached codegen: both rows failed on a sema rejection
+// (`run` → -999, the ASan helper → asanBuildFailure("sema") = -2) and asserted
+// nothing about disposal. `Boom.Fire()` reproduces the intended shape on a
+// legal enum: §22.7 puts an uncaught throw from "the static field initializers,
+// the static constructor body, or both" into the same permanently-failed state,
+// so a throwing field initializer is the enum-legitimate spelling of the same
+// event.
+//
+// §22.13 orders the two initializers textually, which is what makes Cache's
+// registration happen before V's initializer throws — the same precondition the
+// static-class 1557-c fixture gets from "field initializers run before the
+// static constructor".
 const char* kEnumFailedInitAfterOwnedField =
     "module M; "
     "class Res "
@@ -305,11 +325,13 @@ const char* kEnumFailedInitAfterOwnedField =
     "  public constructor() end constructor; "
     "  destructor Res.n := Res.n + 1; end destructor; "
     "end Res; "
+    "class Boom "
+    "  public static method Fire(): int => throw new Exception(\"boom\"); "
+    "end Boom; "
     "enum Kind "
     "  A, B; "
     "  public static owned readonly Cache: Res := new Res(); "
-    "  public static V: int := 0; "
-    "  public static constructor() throw new Exception(\"boom\"); end constructor; "
+    "  public static readonly V: int := Boom.Fire(); "
     "end Kind; "
     "class C "
     "  public static method Main(): int "
@@ -323,13 +345,18 @@ const char* kEnumFailedInitAfterOwnedField =
 
 BEZEL_TEST(codegen_enum_owned_1564, failed_init_catches_wrapped_exception_res_still_live_22_7) {
     // Same reasoning as the static-class 1557-c case: Cache's initializer
-    // completed and was registered before Kind's static constructor threw.
+    // completed and was registered before a later initializer threw, so the
+    // §22.7 failure surfaces as TypeInitializationException at the `Kind.V`
+    // access (returning -1) while Cache is still undisposed (Res.n = 0).
     BEZEL_EXPECT_EQ(run(kEnumFailedInitAfterOwnedField), 0);
 }
 
 BEZEL_TEST(codegen_enum_owned_1564, failed_init_owned_field_still_freed_no_leak_22_7_22_13) {
     // LSan: Cache's block is still freed at exit despite Kind's own static
-    // init ending in the §22.7 failed state.
+    // init ending in the §22.7 failed state. Note the `== -1` guard is
+    // toolchain-absence only; a build failure returns -2
+    // (asanBuildFailure, #4563) and therefore fails this row loudly rather
+    // than passing vacuously — which is how the illegal spelling surfaced.
     int lsan = runUnderLeakSanitizer(kEnumFailedInitAfterOwnedField);
     if (lsan == -1) return;
     BEZEL_EXPECT_EQ(lsan, 0);
