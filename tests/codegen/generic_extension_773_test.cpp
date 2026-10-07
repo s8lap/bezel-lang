@@ -42,6 +42,21 @@
 // commit and #4244's comment thread for the full, honest account; do not
 // take the tests below as proof that discrepancy is explained, only that it
 // was not reproducible under the conditions tested here.
+//
+// #5449 update (f28e3406, §3.6 rule 2 / §14.2, v0.315): "a bare type
+// parameter's member surface is what its constraints establish, never the
+// concrete substitution's." The `where T: class` Combine-shaped rows below
+// read `a.v` on a bare `T` that no constraint provides `v`, so they are now
+// REJECTED AT THE DECLARATION SITE (bezelc exits 1, no binary) rather than
+// computing a value. Each such row is split into the `*_rejected` half (must
+// not run, and must carry the §3.6 rule 2 / §14.2 diagnostic naming `T` and
+// `v`) and a `*_constrained` working twin carrying the remedy `where T: W` —
+// the same pairing, and for the same reason, as
+// generic_record_field_590_test.cpp. Two soundness controls were additionally
+// going VACUOUS on #5449 (the declaration-site rejection made `rejected()`
+// true regardless of the arity / argument-type error each row exists to pin);
+// they are now constrained AND assert the specific §26.5 / §5.1 diagnostic.
+// The spurious `#2491` Warning is unchanged and still tracked as #4248.
 
 #include "support/aot_result_asserts.hpp"  // diagnosticMessageContains,
                                             // failedAtCompileTimeWithRealLocation
@@ -78,6 +93,25 @@ std::string prog(const std::string& ext, const std::string& mainBody) {
         ext +
         " public static class P public static method Main(): int " + mainBody +
         " end Main; end P;";
+}
+
+// #5449 (f28e3406) rejects member access on a bare type parameter at the
+// DECLARATION site when the member is not in the constraint-derived surface
+// (§3.6 rule 2 / §14.2, v0.315). Asserting on the message (not merely `!ran`)
+// keeps the rows below load-bearing: a program that failed for an UNRELATED
+// reason would not satisfy them.
+void expectBareTypeParamRejection(const std::string& program,
+                                  const std::string& member) {
+    auto r = runAot(program);
+    BEZEL_EXPECT_FALSE(r.ran);           // the program never ran
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("bare type parameter") != std::string::npos &&
+            d.message.find("`T`") != std::string::npos &&
+            d.message.find("`" + member + "`") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);            // names T and the missing member
 }
 }  // namespace
 
@@ -226,12 +260,42 @@ BEZEL_TEST(generic_extension_773, concrete_generic_extension_not_misapplied) {
 // regression in kind, not a completion") for a case that, unlike this one,
 // really did just return the wrong value.
 //
-// This test pins the corrected, measured ACCEPT-side value (not the wrong
-// answer #4244 reported) — do not read this as "the #2491 diagnostic is
+// This row now pins the REJECT-side outcome #5449 established for exactly this
+// program (a bare `T` whose constraint never promised `v`): the declaration-site
+// §3.6 rule 2 / §14.2 diagnostic. Its ACCEPT-side counterpart, the measured
+// value-7 row that refuted #4244's wrong-value claim, is
+// combine_style_body_computes_correct_value_constrained_4244 below — same body,
+// with the remedy constraint. Do not read either as "the #2491 diagnostic is
 // fixed"; it still fires and is tracked separately as #4248.
-BEZEL_TEST(generic_extension_773, combine_style_body_computes_correct_value_4244) {
-    BEZEL_EXPECT_EQ(runFull(prog(
+BEZEL_TEST(generic_extension_773, combine_style_body_rejected_4244) {
+    expectBareTypeParamRejection(prog(
         "public extension Bag<T> where T: class "
+        "  public method Combine(a: T, b: T): int => a.v + b.v; "
+        "end; ",
+        "  using var b := new Bag<W>(); "
+        "  using var w1 := new W(3); "
+        "  using var w2 := new W(4); "
+        "  return b.Combine(w1, w2); "),
+        "v");
+}
+
+// WORKING TWIN of combine_style_body_rejected_4244: the same Combine-shaped
+// non-pass-through body with the constraint #5449's remedy names
+// (`where T: W`, W declaring `v`) added, so §14.2 puts `v` in `T`'s surface
+// and the read resolves at the DECLARATION site. Preserves the coverage
+// combine_style_body_computes_correct_value_4244 existed for — that a
+// Combine-shaped body computes the right value rather than 0 — at the shape
+// the spec admits.
+//
+// MEASURED that this value is genuine, not a backstop artifact landing on 0:
+// with `W(3)`/`W(4)` it is 7, and with `W(30)`/`W(40)` it is 70, so a
+// degraded-to-zero slot would fail the row rather than pass it. The spurious
+// `#2491` "degraded to zero" internal Warning still fires on this shape and is
+// tracked separately as #4248 — unchanged by this row; see the file header.
+BEZEL_TEST(generic_extension_773,
+           combine_style_body_computes_correct_value_constrained_4244) {
+    BEZEL_EXPECT_EQ(runFull(prog(
+        "public extension Bag<T> where T: W "
         "  public method Combine(a: T, b: T): int => a.v + b.v; "
         "end; ",
         "  using var b := new Bag<W>(); "
@@ -241,23 +305,30 @@ BEZEL_TEST(generic_extension_773, combine_style_body_computes_correct_value_4244
 }
 
 // fix #4233 review send-back (issue #4244) SOUNDNESS CONTROL 1: even for a
-// Combine-shaped (non-pass-through) body that touches the #605 backstop
-// internally, the CALL-SITE arity check #4233 relies on
-// (checkCallArity/bindArgsToParams, §26.5) is unaffected by what the body
-// does — a wrong-arity call is still cleanly rejected before the body is
-// ever reached. Companion to combine_style_body_computes_correct_value_4244
+// Combine-shaped (non-pass-through) body, the CALL-SITE arity check #4233
+// relies on (checkCallArity/bindArgsToParams, §26.5) is unaffected by what
+// the body does — a wrong-arity call is still cleanly rejected before the
+// body is ever reached. Companion to the `combine_style_body_*_4244` rows
 // above; not a new code path, this pins that #4233's own machinery stays
 // sound for a body shape richer than the pass-through `FirstOr` this file's
 // other #4233 tests use.
+//
+// #5449: constrained to `where T: W`. Unconstrained, this row went VACUOUS on
+// #5449 — `a.v` on a bare `T` is rejected at the declaration site whatever the
+// call site passes, so `rejected()` stayed true even if the arity check were
+// deleted. With the constraint the body is legal, so the rejection this row
+// asserts is now the §26.5 arity diagnostic and nothing else.
 BEZEL_TEST(generic_extension_773,
            combine_style_body_wrong_arity_still_rejected_4244) {
-    BEZEL_EXPECT_TRUE(rejected(prog(
-        "public extension Bag<T> where T: class "
-        "  public method Combine(a: T, b: T): int => a.v + b.v; "
-        "end; ",
-        "  using var b := new Bag<W>(); "
-        "  using var w1 := new W(3); "
-        "  return b.Combine(w1); ")));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        runAot(prog(
+            "public extension Bag<T> where T: W "
+            "  public method Combine(a: T, b: T): int => a.v + b.v; "
+            "end; ",
+            "  using var b := new Bag<W>(); "
+            "  using var w1 := new W(3); "
+            "  return b.Combine(w1); ")),
+        "takes 1 argument(s)"));
 }
 
 // fix #4233 review send-back (issue #4244) SOUNDNESS CONTROL 2: the
@@ -266,9 +337,15 @@ BEZEL_TEST(generic_extension_773,
 // for the Combine-shaped body — an argument of the wrong concrete type is
 // still a compile error, not silently accepted alongside the body's own
 // (separately tracked, #4248) diagnostic-accuracy issue.
+//
+// #5449: constrained to `where T: W` for the same reason as SOUNDNESS CONTROL
+// 1 above — unconstrained, the declaration-site bare-`T` rejection made this
+// row vacuous. Asserting on the §5.1 message (not merely `rejected()`) keeps
+// it load-bearing: an unrelated rejection would not satisfy it.
 BEZEL_TEST(generic_extension_773,
            combine_style_body_wrong_arg_type_still_rejected_4244) {
-    BEZEL_EXPECT_TRUE(rejected(
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        runAot(
         "module M; "
         "class Bag<T> where T: class "
         "  private owned _items: Array<T>; "
@@ -278,7 +355,7 @@ BEZEL_TEST(generic_extension_773,
         "end Bag; "
         "class W public v: int; public constructor(n: int) v := n; end; end W; "
         "class Other end Other; "
-        "public extension Bag<T> where T: class "
+        "public extension Bag<T> where T: W "
         "  public method Combine(a: T, b: T): int => a.v + b.v; "
         "end; "
         "public static class P public static method Main(): int "
@@ -286,7 +363,8 @@ BEZEL_TEST(generic_extension_773,
         "  using var w1 := new W(3); "
         "  using var o := new Other(); "
         "  return b.Combine(w1, o); "
-        "end Main; end P;"));
+        "end Main; end P;"),
+        "not implicitly convertible"));
 }
 
 // fix #4238 (§26.4/§26.5, v0.298): a `this.Method(...)` self-call to a
