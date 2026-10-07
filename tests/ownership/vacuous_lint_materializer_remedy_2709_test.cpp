@@ -302,16 +302,23 @@ BEZEL_TEST(vacuous_lint_materializer_2709,
 // =====================================================================
 // (4) OVER-SUPPRESSION GUARD — the lint must still fire where its remedy IS
 // legal. A fix that disabled the lint wholesale passes (1)-(3) and fails here.
-// The lazy-query case is the important one: a bound `Where(…)` is a genuinely
-// single-consumption affine value (§29.11), it is NOT a materializer, and the
-// steering must survive untouched.
+// The alias and literal cases below are the preserved arms.
 // =====================================================================
+// #5471 (§29.11, v0.315): the vacuity arm's three-negated check cannot classify
+// a lazy query (it is none of a borrow, a disposable class type, or an owning
+// choice) and fell through to "value-typed/runtime-managed, no obligation" — a
+// default, not a classification. §29.11 names the bound lazy query in K3.14's
+// closed suppression set, proving the spec reasons about it in the warning
+// context. A bound `Where(…)` is an "ordinary minted caller-owned frame" with a
+// real disposal obligation; `using var` over it is the correct pattern and the
+// vacuity warning must NOT fire. // per §29.11, §28.3 K3.14 (v0.315)
 BEZEL_TEST(vacuous_lint_materializer_2709,
-           lint_still_fires_on_lazy_query_and_alias_spec_28_10) {
-    // A bound lazy query — not a materializer; lint unchanged.
+           lazy_query_not_vacuous_alias_and_literal_still_warn_spec_29_11) {
+    // A bound lazy query — NOT vacuous: §29.11 frame with real disposal
+    // obligation, correctly discharged by `using var`. // per #5471
     auto lazy = parseAndCheckOwnership(
         prog("using var q := a.Where(lambda(x) => x > 0);"));
-    BEZEL_EXPECT_TRUE(hasInertRhsWarning(lazy, "q"));
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(lazy, "q"));
 
     // A bound-then-pinned collection alias — #2695's preserved arm.
     auto alias = parseAndCheckOwnership(

@@ -7129,6 +7129,30 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // identical `common::isOwningCollectionDrainAliasCall` shape. The
         // shared predicate removes the opportunity to drift.
         //
+        // #5471 (§29.11, v0.315): a lazy query call (e.g. `xs.Where(f)`) is an
+        // "ordinary minted caller-owned frame" (§29.11) — its container obligation
+        // is discharged by `using var` exactly as with any other owned call result.
+        // The vacuity arm's three-negated check cannot classify it (it is none of
+        // a borrow, a disposable class type, or an owning choice), so without this
+        // exclusion it would fall through to "value-typed/runtime-managed, no
+        // obligation" — a default, not a classification. §29.11 and §28.3's must-
+        // use suppression sentence name exactly this binding in the lint's closed
+        // suppression set, which proves the spec reasons about it in the warning
+        // context. `using var q := xs.Where(f);` is not vacuous.
+        // Must match DefiniteAssignment::isLazyEnumerableExprType (§29.11 / #1226).
+        // Note: isLazyEnumerableExprType is a private member of DefiniteAssignment
+        // (not exported from DefiniteAssignment.hpp); a direct call is not possible
+        // without adding an export. The two copies are kept in sync by this
+        // comment and the §29.11 / #1226 citation — a future pass may extract a
+        // shared helper to common/. // per #5471
+        auto isLazyQueryCall = [&](const ast::Expr& e) -> bool {
+            const ast::CallExpr* ce = dynamic_cast<const ast::CallExpr*>(&e);
+            if (!ce) return false;
+            const sema::TypeRef* ty = ctx_.exprType(e);
+            return ty && ty->kind == sema::TypeRef::Kind::Named &&
+                   !ty->declaration && !ty->astNode &&
+                   !ty->genericArgs.empty() && ty->importedName.empty();
+        };
         // It does NOT newly protect Case B: `rhsIsVacuousBorrowPin` returns
         // false for every `CallExpr` (it classifies only identifier and
         // field-chain shapes), and both new disjuncts REQUIRE a `CallExpr`, so
@@ -7136,7 +7160,8 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // That is a scope fact worth stating rather than a benefit: this fix
         // widens nothing on the Case B path. // per §28.10, §21.1, #2146, #2709
         if (rhsTy && !isBorrowableType(rhsTy) &&
-            !rhsIsDisposableClassType(rhsTy) && !rhsIsOwningChoice) {
+            !rhsIsDisposableClassType(rhsTy) && !rhsIsOwningChoice &&
+            !isLazyQueryCall(*ld.initializer)) {
             report(Severity::Warning, ld.span.begin,
                 std::string("`using var` `") + std::string(lsym->name) +
                 "` is vacuous — the RHS is a value-typed/runtime-managed "
