@@ -209,7 +209,7 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
 <a id="sec-v0-18-to-v0-20-changelog"></a>
 ### v0.18 to v0.20 changelog (reconstructed)
 
-- Gap note: The v0.19 snapshot is missing, so these changes cannot be attributed to a single revision.
+- Gap note: The v0.19 snapshot is missing, so these changes cannot be attributed to a single revision. A later reconstruction of the design conversation for v0.14 onward (a secondary source) estimates that resource management and `scope` blocks came first, possibly as v0.19, and exception handling last, possibly as v0.20. Its version estimates for v0.15–v0.18 are off by one against the surviving snapshots, so the split is not adopted here.
 
 - New section **Resource Management**. It states that there is **no garbage collector** and that all cleanup is deterministic and manual, built on the `IDisposable` interface (`method Dispose();`).
 - The C#-style **Dispose pattern** is prescribed:
@@ -219,6 +219,8 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
 - **`scope … end;` blocks** are added: anonymous inner scopes for early disposal, which dispose their `using var` locals in reverse declaration order.
 - **Exception handling** is added: `try` / `catch` / `finally` / `throw`, with `catch Type then` (short form) and `catch ex: Type then` (long form). A `when` guard is allowed only on the long form, catches match first-to-last, and bare `throw;` rethrows. All exceptions derive from `Exception`.
 - Records "almost never" implement `IDisposable`. A base `Object` class is promised for later.
+- The runtime reclaims an object's memory itself once `Dispose()` completes, so the pattern drops C#'s managed/unmanaged distinction and has no finalizers.
+- Considered and declined, per the same reconstruction: a block form of `using` (only the `using var` declaration exists), and `block` or `begin` as the keyword for anonymous scopes (`scope` was preferred).
 
 <a id="sec-v0-20-to-v0-21-changelog"></a>
 ### v0.20 to v0.21 changelog (reconstructed)
