@@ -31154,6 +31154,10 @@ bool Emitter::isOwnedCollectionFieldLvalue(const ast::Expr& target) {
 // uninitialized null pointer) is correctly handled without an explicit null-guard
 // — matching the emitOwnedFieldDisposals comment at #2184.
 //
+// The DISPOSAL is guarded by (live && diff); the #4068 slot-nulling is NOT
+// (it is emitted above the CondBr, unconditionally). Those are different
+// obligations — see the long comment at the nulling site.
+//
 // Known limitation: OwningBuffer<T> IS covered (isCollectionTypeName includes it),
 // but OwningSlotMap<T> is NOT covered (not in kArrayBackedCollections,
 // kLinkedListNames, or kDictionaryNames in BuiltinRegistry.cpp). Such fields
@@ -31180,10 +31184,6 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     llvm::Value* diff = builder_.CreateICmpNE(oldVal, newVal, "ocf.diff");
     llvm::Value* doDispose = builder_.CreateAnd(live, diff, "ocf.doDispose");
 
-    auto* dispBB  = llvm::BasicBlock::Create(llvm_, "ocf.dispose", currentFn_);
-    auto* contBB  = llvm::BasicBlock::Create(llvm_, "ocf.cont", currentFn_);
-    builder_.CreateCondBr(doDispose, dispBB, contBB);
-    builder_.SetInsertPoint(dispBB);
     // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): paired with the
     // path-sensitive walker change in `collectBorrowingArrayFreeEligible`
     // (this file ~24423 / ~28134). When the field-store's RHS is a bare
@@ -31196,11 +31196,50 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     // the same eligibility gate so an `eligible ⟹ nulled` invariant holds.
     // Gated on `borrowingArrayFreeEligibleFn_ == currentFn_` so a lambda
     // body lowered mid-function does not fire against the OUTER function's
-    // analysis. The post-store null goes HERE rather than at the call site
-    // because this is the one place that actually performs the field-store;
-    // the AssignmentStmt dispatch chain returns `handled=true` here and
-    // skips its post-`CreateStore` block, so a sibling null in Stmts.cpp
-    // is unreachable for owned-collection field stores.
+    // analysis. The null goes HERE rather than at the call site because this
+    // is the one place that actually performs the field-store; the
+    // AssignmentStmt dispatch chain returns `handled=true` here and skips its
+    // post-`CreateStore` block, so a sibling null in Stmts.cpp is
+    // unreachable for owned-collection field stores.
+    //
+    // fix #4068 (2nd hunk) / §28.3 K3.7 / §28.9 (v0.315) — UNCONDITIONAL, and
+    // this must stay unconditional. #5459's identity guard below splits the
+    // store into `ocf.dispose` / `ocf.cont`; when the nulling lived INSIDE
+    // `ocf.dispose` it became conditional on `doDispose`, i.e. on
+    // `(oldVal != null) && (oldVal != newVal)`. That is the WRONG predicate.
+    // The nulling is a consequence of the TRANSFER, not of the DISPOSAL: the
+    // store `fieldAddr <- newVal` runs on BOTH arms of the guard, so the
+    // source local's obligation transfers on both arms and must be released on
+    // both arms. Trapping it behind the guard left the first store into an
+    // owned-collection field with no prior assignment and no field initializer
+    // (`oldVal == null` => `ocf.live` false => `doDispose` false) with an
+    // un-nulled slot: the ctor's scope-end `bz_array_free(items)` then
+    // double-freed against the destructor-side free — measured `free():
+    // invalid pointer` / SIGABRT (exit 134) plain, backtrace
+    // `bz_array_free <- bz$M.Holder$DisposeCore <- bz$M.Holder$Dispose <-
+    // bz$M.C$Main`. Measured trigger is a clean 2x2: if/else branch shape AND
+    // no field initializer crashes; adding `Data: Array<int> := new
+    // Array<int>()` fixes it; and so does a pre-branch `this.Data := new
+    // Array<int>()`, which makes `oldVal` non-null and flips `doDispose`
+    // true — the last being the direct confirmation that the missing
+    // execution is the GUARD, not the transfer.
+    //
+    // WHY HERE AND NOT IN `ocf.cont`: this block is the sole predecessor of
+    // both `dispBB` and `contBB`, so it DOMINATES the store and every path
+    // that reaches it; `ocf.cont` would also dominate the store but would
+    // place the null AFTER the free of the displaced value, changing the
+    // pre-#5459 relative order (null, then free) for no gain.
+    //
+    // WHY HOISTING IS SAFE FOR #5459's GUARD: `oldVal` (the `ocf.old` load)
+    // and `newVal` (a caller-supplied pointer VALUE, already loaded into an
+    // SSA register by the assignment statement) are both materialized ABOVE
+    // this point, and the nulling writes the LOCAL's slot — different storage
+    // from `fieldAddr` — so it can perturb neither operand nor `doDispose`.
+    // The identity guard therefore still sees exactly the operands it saw
+    // before the hoist, and `this._items := this._items` still skips disposal.
+    // Nulling on the identity arm is also correct rather than merely harmless:
+    // there `newVal == oldVal`, so the FIELD retains the sole ownership and
+    // the local must not also free it.
     if (valueExpr && currentFn_ == borrowingArrayFreeEligibleFn_) {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(valueExpr)) {
             sema::Symbol* asym = ctx_.exprSymbol(*id);
@@ -31214,6 +31253,11 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
             }
         }
     }
+
+    auto* dispBB  = llvm::BasicBlock::Create(llvm_, "ocf.dispose", currentFn_);
+    auto* contBB  = llvm::BasicBlock::Create(llvm_, "ocf.cont", currentFn_);
+    builder_.CreateCondBr(doDispose, dispBB, contBB);
+    builder_.SetInsertPoint(dispBB);
 
     // Identify the collection element type and whether this is an owning family.
     // Reuse the same logic as emitOwnedFieldDisposals (#2185-#2218).
