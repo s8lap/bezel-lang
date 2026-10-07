@@ -602,17 +602,17 @@ Apart from what the v0.47 change record attributes to v0.47, the one explicitly 
 <a id="sec-v0-45-to-v0-46-changelog"></a>
 ### v0.45 to v0.46 changelog (reconstructed)
 
-- Source: the v0.45 and v0.47 snapshots (verbatim) and the change record described in the next entry. No v0.46 text survives. This entry is placed by elimination: it is the v0.45→v0.47 diff minus the 17 changes the record attributes to v0.47. The record names no v0.46 changes, so what remains could also be v0.47 housekeeping the record left out. Apart from passages that differ only in line endings, two changes remain:
-- **The enum examples close their `case` expressions with `end`**, as the rules already required (five examples in the Enums section).
+- Source: the v0.45 and v0.47 snapshots (verbatim), the change record described in the next entry, and later answers from the assistant that wrote that record. No v0.46 text survives. The v0.45→v0.47 diff minus the 17 changes the record attributes to v0.47 leaves two changes, and that assistant confirms both were already in v0.46, which it received from the owner: the owner had fixed the `case` examples by hand, and the heading was present in the v0.46 it diffed against. Whether v0.46 also changed something that v0.47 later overwrote is unknown; no v0.45→v0.46 diff was ever made.
+- **The enum examples close their `case` expressions with `end`**, as the rules already required (five examples in the Enums section, fixed by hand).
 - **The `## Comments and Documentation` heading is restored**, ending the run-on that v0.43 introduced (see the [v0.42 to v0.43 entry](#sec-v0-42-to-v0-43-changelog)).
 
 <a id="sec-v0-46-to-v0-47-changelog"></a>
 ### v0.46 to v0.47 changelog (reconstructed)
 
-- Source: the v0.47 snapshot (verbatim, headed "v0.47 – May 2026") and a change record written when v0.47 was drafted. The record lists 17 changes and gives the previous header as "v0.46 – April 2026". Each item has been checked against the v0.45→v0.47 diff; all are present, with the one exception noted below.
+- Source: the v0.47 snapshot (verbatim, headed "v0.47 – May 2026"; the month was chosen by the assistant that drafted it and is unverified) and a change record written when v0.47 was drafted. The record lists 17 changes and gives the previous header as "v0.46 – April 2026". Each item has been checked against the v0.45→v0.47 diff; all are present, with the one exception noted below.
 - **Corrections.**
   - The primary-constructor examples add `public property Balance: decimal => _balance;`, and `SavingsAccount.Interest()` reads `Balance` instead of `BankAccount`'s private `_balance`.
-  - The leftover comparisons of ranges with `for … to`/`until` loops are removed from Range Expressions.
+  - Three leftover comparisons of ranges with `for … to`/`until` loops are removed from Range Expressions (one more survives; see below).
   - Block comments do not nest: the first `*/` closes the comment. v0.45 left nesting to the implementation.
   - The dangling `GetType()` reference now says that a value's runtime `Type` is reserved for a future revision, and points to `typeof(T)` in generic bodies and to `is`.
 - **The `readonly` modifier** replaces the "`readonly` fields" subsection. It means write-once at initialization on any declaration with storage: instance fields, auto-properties and static fields. On an auto-property it also means there is no setter. New examples show `private readonly` and `private readonly owned` fields, and `readonly` is a compile error on expression-bodied properties, block-form properties with accessors, methods, constructors and parameters.
@@ -629,8 +629,8 @@ Apart from what the v0.47 change record attributes to v0.47, the one explicitly 
   - `IEnumerator<T>` and `IAsyncEnumerator<T>` join Tier 1 beside their `IEnumerable` counterparts;
   - the core exceptions are laid out as a hierarchy under `Exception`, with `ArgumentNullException` under `ArgumentException`;
   - `StackOverflowException` is added. User code cannot catch it, and it terminates the program.
-- **Where the record and the diff disagree.** The record says all references to `to` and `until` were removed and that Control Structures now describes `..` and `..<` iteration. v0.47's Range Expressions still opens with "Both endpoints are **inclusive**, matching the `to` keyword in for-loops", and Control Structures' text is unchanged apart from the loop-variable annotation (its examples already labelled `1..10` inclusive and `0..<n` exclusive in v0.42).
-- **Deferred.** The record lists items discussed and left out of v0.47: a runtime `GetType()`; slicing semantics (whether a slice copies or borrows, and its type); an appendix summarising `owned`; disambiguating the `with` keyword, not needed until record copy-with-modification is specified; and a modifier-order quick-reference table.
+- **Where the record and the diff disagree, as its author later confirmed.** The record says all references to `to` and `until` were removed and that Control Structures now describes `..` and `..<` iteration. In fact three references were removed, all in Range Expressions: the "equivalent to a `for` loop with `to` … `until`" sentences in *Using ranges with `for`* and in the locked-in range rules (both reworded to say `..` iterates inclusively and `..<` exclusively), and the "parallels the `until` keyword" sentence in *Exclusive ranges*. A fourth, "Both endpoints are **inclusive**, matching the `to` keyword in for-loops", was missed and survives in v0.47. Control Structures was not touched apart from the loop-variable annotation.
+- **Deferred, none with a target version.** The owner deferred a runtime `GetType()` for a discussion of its own; the drafting assistant proposed deferring the other four and the owner agreed. The record lists them as: a runtime `GetType()`; slicing semantics (whether a slice copies or borrows, and its type); an appendix summarising `owned`; disambiguating the `with` keyword, not needed until record copy-with-modification is specified; and a modifier-order quick-reference table.
 
 <a id="sec-v0-47-to-v0-48-changelog"></a>
 ### v0.47 to v0.48 changelog (reconstructed)
