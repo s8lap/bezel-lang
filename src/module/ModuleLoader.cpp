@@ -6768,6 +6768,12 @@ static void loadMetadataPass2(
             auto* extSym = ctx.makeImportedSymbol<sema::ExtensionSymbol>();
             extSym->decl = decl.get();
             extSym->scope = sema::kModuleScope;
+            // fix #2335 (§2.8.3 rule 3 / §26, v0.315): record the declaring
+            // module so `Emitter::functionName` can qualify primitive-target
+            // extension method mangling with the extension's own module, not
+            // just the target's.
+            extSym->moduleName = md.moduleName;
+            ctx.registerExtensionForDecl(decl.get(), extSym);
 
             // fix #3362 (§26.3 / §26.5 step 2 / §2.8.3 rule 4, v0.NNN,
             // importer half of #2583's writer-half fix): when the

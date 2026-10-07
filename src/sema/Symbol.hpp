@@ -1188,6 +1188,13 @@ struct ExtensionSymbol : Symbol {
                                         // declare generic params on the
                                         // extension itself, only generic
                                         // constraints over the target type)
+    // fix #2335 (§2.8.3 rule 3 / §26, v0.315): the module that declared this
+    // extension. Used in `Emitter::functionName` to qualify the mangled name of
+    // extension methods on primitive/builtin targets (which have no
+    // TypeSymbol/module of their own), so two modules each declaring
+    // `public extension int { method Foo(): ... }` produce distinct mangled
+    // names rather than colliding at link time.
+    std::string moduleName;
 };
 
 // A.3 ExternBlock — FFI declarations.

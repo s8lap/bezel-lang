@@ -668,6 +668,11 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         sym->decl = ext;
         sym->declLoc = ext->span.begin;  // fix #2418: ExtensionDecl : TopDecl : Node
         sym->scope = parentScope;
+        // fix #2335 (§2.8.3 rule 3 / §26, v0.315): record the declaring module
+        // so `Emitter::functionName` can qualify primitive-target extension
+        // method mangling with the extension's own module, not just the target's.
+        sym->moduleName = moduleDottedName(ctx.module());
+        ctx.registerExtensionForDecl(ext, sym);
         const ScopeId extScope = ctx.newScope();
         // We need a dummy TypeSymbol-shape parent for member collection;
         // since extension members aren't owned by a real type at this

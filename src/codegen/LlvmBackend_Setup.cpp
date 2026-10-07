@@ -93,14 +93,16 @@ std::string Emitter::functionName(sema::MethodSymbol* ms) {
     if (isExtensionMethod(ms)) {
         std::string tgt = "?";
         if (const ast::Type* tt = ms->extensionDecl->targetType.get()) {
-            // #1488: when the target resolves to a real declared type (class/
-            // interface/record — anything with a TypeSymbol), qualify by its
-            // declaring module so two modules each extending a same-named
-            // target (or a local extension colliding with an imported one)
-            // don't mangle identically. A primitive/builtin target (`extension
-            // int`) has no TypeSymbol/module to qualify by; it keeps the bare
-            // spelling — a residual extension-on-primitive collision across
-            // modules is a known, separately-tracked gap (see #1488 follow-up).
+            // #1488 / fix #2335 (§2.8.3 rule 3 / §26, v0.315): when the target
+            // resolves to a real declared type (class/interface/record — anything
+            // with a TypeSymbol), qualify by its declaring module so two modules
+            // each extending a same-named target don't mangle identically. For a
+            // primitive/builtin target (`extension int`) that has no
+            // TypeSymbol/module, qualify by the extension's OWN declaring module
+            // (tracked via `extensionSymbolOf`) instead of the bare target name,
+            // so two modules each declaring `public extension int { method Foo() }`
+            // produce distinct `bz$ext$<module>.int$Foo` symbols rather than
+            // colliding at link time.
             if (const sema::TypeRef* rt = ctx_.resolvedType(*tt);
                 rt && rt->declaration) {
                 return "bz$ext$" + mangledTypeName(rt->declaration) + "$" +
@@ -109,6 +111,12 @@ std::string Emitter::functionName(sema::MethodSymbol* ms) {
             if (tt->name && !tt->name->parts.empty())
                 tgt = std::string(tt->name->parts.back());
         }
+        // fix #2335: for primitive/builtin targets, qualify with the extension's
+        // declaring module (not the target's, which has no module of its own).
+        if (sema::ExtensionSymbol* extSym =
+                ctx_.extensionSymbolOf(ms->extensionDecl))
+            if (!extSym->moduleName.empty())
+                tgt = extSym->moduleName + "." + tgt;
         return "bz$ext$" + tgt + "$" + std::string(ms->name);
     }
     std::string cls = ms->parent ? mangledTypeName(ms->parent) : "";

@@ -744,6 +744,21 @@ public:
         return it == importedExtensionsByModule_.end() ? nullptr : &it->second;
     }
 
+    // fix #2335 (§2.8.3 rule 3 / §26, v0.315): reverse lookup from an
+    // ExtensionDecl to its ExtensionSymbol, so `Emitter::functionName` can
+    // reach the moduleName field of an extension method's owning extension.
+    ExtensionSymbol* extensionSymbolOf(const ast::ExtensionDecl* ext) const {
+        auto it = importedExtensionsByDecl_.find(ext);
+        return it != importedExtensionsByDecl_.end() ? it->second : nullptr;
+    }
+    // fix #2335: register the ExtensionDecl→ExtensionSymbol reverse mapping.
+    // Called from both local symbol collection and the module loader for imported
+    // extensions, so `extensionSymbolOf` works for all extension methods.
+    void registerExtensionForDecl(const ast::ExtensionDecl* ext,
+                                  ExtensionSymbol* sym) {
+        importedExtensionsByDecl_[ext] = sym;
+    }
+
     // §14 / #662c: take ownership of a re-parsed SourceFile that holds
     // ctor/dtor AST nodes for imported generic classes.  The SourceFile's
     // lifetime is tied to this SemaContext so that symbol decl pointers
@@ -1331,6 +1346,11 @@ private:
     // §26 / §2.5 (#735): imported extension blocks, keyed by defining module.
     std::unordered_map<std::string, std::vector<ExtensionSymbol*>>
         importedExtensionsByModule_;
+    // fix #2335: reverse map from ExtensionDecl* to its ExtensionSymbol*, so
+    // `Emitter::functionName` can reach the moduleName field for extension
+    // methods on primitive/builtin targets.
+    std::unordered_map<const ast::ExtensionDecl*, ExtensionSymbol*>
+        importedExtensionsByDecl_;
     std::unordered_set<Symbol*> imported_;
     std::unordered_set<const Symbol*> constraintRouteBodies_;  // fix #5009
     std::vector<std::unique_ptr<std::string>> internedStrings_;
