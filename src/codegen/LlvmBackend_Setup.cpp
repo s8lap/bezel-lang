@@ -41859,10 +41859,14 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     if (!isCollectionTypeName(collTy)) return nullptr;
     // Dispatch Set/OwningSet to the dedicated hash-backed materializer (they use
     // bz_dict_alloc_generic + bz_dict_set_gen, not the array path below).
-    std::string_view name = collTy->astNode && collTy->astNode->name &&
-                            !collTy->astNode->name->parts.empty()
-                                ? collTy->headName()
-                                : std::string_view{};
+    // fix #5328 item 3 (§15.4, v0.313): the previous name lookup read
+    // `collTy->astNode` directly, which is null for an IMPORTED formal's TypeRef
+    // (the wire carries the name on `importedName` instead). An imported
+    // `Set<int>` formal therefore fell through to the array path, the literal
+    // was stored as a bz_array_t* with no deduplication, and the callee saw 3
+    // elements where the same-module twin (§15.4: "duplicates are collapsed")
+    // saw 2. Use builtinTypeName which consults both astNode and importedName.
+    std::string_view name = builtinTypeName(collTy);
     if (name == "Set" || name == "OwningSet")
         return materializeHeapSetLiteral(cl, collTy);
 
@@ -42754,10 +42758,14 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
         d.dynamicDispose = true;  // emit vtable slot-2 dispatch (any class)
         return d;
     }
-    bool isOwning =
-        collTy->astNode && collTy->astNode->name &&
-        !collTy->astNode->name->parts.empty() &&
-        common::isOwningPrefixedName(collTy->headName());
+    // fix #5328 item 4 (§15.4 / §28.3, v0.313): the previous `isOwning`
+    // check read `collTy->astNode` directly, which is null for an IMPORTED
+    // formal's TypeRef (the name lives on `importedName`). An imported
+    // `borrow OwningArray<Box>` formal therefore had `isOwning = false`, the
+    // borrowed-element policy was applied instead of the owning one, and each
+    // `new Box()` element leaked (400 allocations / 200 calls under ASan).
+    // Use builtinTypeName which consults both astNode and importedName.
+    bool isOwning = common::isOwningPrefixedName(builtinTypeName(collTy));
     auto isStrElem = [&](const sema::TypeRef* el, bool owning) {
         if (!el || el->nullable) return false;
         ElementPolicy p = elementPolicyFor(el, owning);
@@ -42801,11 +42809,10 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
     // null) → that Set is array-backed and falls through to bz_array_free below.
     const sema::TypeRef* el =
         (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
-    bool isSetName =
-        collTy->astNode && collTy->astNode->name &&
-        !collTy->astNode->name->parts.empty() &&
-        (collTy->headName() == "Set" ||
-         collTy->headName() == "OwningSet");
+    // fix #5328 item 4 (§15.4 / §28.3, v0.313): same importedName-vs-astNode
+    // issue as the isOwning fix above — use builtinTypeName here too.
+    std::string_view setName = builtinTypeName(collTy);
+    bool isSetName = (setName == "Set" || setName == "OwningSet");
     bool setDictBacked = isSetName &&
         genericBackingType(collTy, 0, /*isSet=*/true, nullptr) != nullptr;
     if (setDictBacked) {
