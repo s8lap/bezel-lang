@@ -144,7 +144,7 @@ BEZEL_TEST(lazy_select_minting_selector_launder_1917,
         "class C public static method Main(): int "
         "  using var xs: Array<int> := [1, 2, 3]; "
         "  using var arr: Array<Box> := xs.Select(lambda(x) => new Box(x)).ToArray(); "
-        "  return arr.Length; "
+        "  return arr.Count; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(saysMintingSelect(src));
 }
