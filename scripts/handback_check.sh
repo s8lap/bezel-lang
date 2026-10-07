@@ -72,7 +72,17 @@ check_branch() {
   row PASS branch "$BRANCH @ ${TIP:0:10}"
   BASESHA="$(g rev-parse --verify --quiet "$BASE^{commit}")"
   if [ -z "$BASESHA" ]; then row FAIL base "'$BASE' does not resolve"; return 1; fi
-  MB="$(g merge-base "$BASESHA" "$TIP")"
+  # `git merge-base` exits non-zero when the histories are UNRELATED. That
+  # non-zero was this function's return value, so `if check_branch; then`
+  # skipped EVERY remaining check and the script fell through to
+  # "VERDICT: PASS" -- the single case that must never pass reported green.
+  # (a24-4976 carries root f667b8bf; r23-c28's root is e2aa55d0.)
+  MB="$(g merge-base "$BASESHA" "$TIP")" || true
+  if [ -z "$MB" ]; then
+    row FAIL base "no common ancestor with $BASE -- UNRELATED HISTORIES (roots: $(g rev-list --max-parents=0 "$TIP" | head -1 | cut -c1-10) vs $(g rev-list --max-parents=0 "$BASESHA" | head -1 | cut -c1-10)); not pickable as-is"
+    return 1
+  fi
+  return 0
 }
 
 check_reported() {
