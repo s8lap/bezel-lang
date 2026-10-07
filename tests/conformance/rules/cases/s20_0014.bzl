@@ -16,8 +16,8 @@ end Resource;
 
 public class Program
   private static method Compute()
-    using var a := new Resource();
-    using var b := new Resource();
-    using var r := (if true then move a else move b);
+    var a := new Resource();
+    var b := new Resource();
+    var r := (if true then move a else move b);
   end Compute;
 end Program;
