@@ -9,15 +9,16 @@ Entries are pinned history — each was written at its revision and is not retro
 <a id="sec-reconstructed-early-history"></a>
 ### Early history, v0.1 to v0.52 (reconstructed)
 
-The entries in this section were reconstructed in 2026-10. They predate the per-revision changelog that begins at v0.52 to v0.53 below. Each one summarises what changed and is not a complete migration record. They rest on three kinds of source, and each entry names its own:
+The entries in this section were reconstructed in 2026-10. They predate the per-revision changelog that begins at v0.52 to v0.53 below. Each one summarises what changed and is not a complete migration record. They rest on four kinds of source, and each entry names its own:
 
-- **Archived snapshots of the specification** (v0.4–v0.18, v0.20, v0.21, v0.23, v0.24, v0.31, v0.37–v0.42, v0.47–v0.51, v0.60). These are verbatim, and they are the strongest source.
+- **Archived snapshots of the specification** (v0.4–v0.18, v0.20, v0.21, v0.23, v0.24, v0.31, v0.37–v0.42, v0.47–v0.53, v0.60). These are verbatim, and they are the strongest source. The v0.53 snapshot is used only to check the v0.51 to v0.52 entry.
+- **Archived snapshots of the design rationale** (v0.52, v0.60), also verbatim. The rationale is a separate companion document from v0.52 on, as the v0.51 to v0.52 entry explains.
 - **A record of the design conversation** that ran from v0.24 to v0.30. The conversation did not produce spec files: it drafted patches, the owner applied them to the spec by hand and periodically re-uploaded it. The drafted patches are therefore the record of what changed, and the uploads are the revision boundaries. The record summarises most of its turns instead of quoting the spec text. The entries for v0.24 to v0.30 rest on it, one entry per round of patches between two uploads, and have been checked against the v0.31 snapshot. Its last patches, drafted after the v0.30 upload, are matched against v0.31 in the v0.30 to v0.31 entry.
 - **A later summary of the earliest design conversation**, covering v0.1–v0.3. It describes itself as "reconstructed progressive snapshots" and is not a verbatim spec, so it is the weakest source.
 
 A review of v0.48 written at the time also survives. It is not used as evidence of what changed: the entries from v0.48 to v0.49 through v0.50 to v0.51 cite it only to explain why some changes were made.
 
-v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.32–v0.36, v0.43–v0.46 or v0.52; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. No v0.22 text survives; its contents are placed by a change record written when v0.23 was drafted, as its entry explains. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
+v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.32–v0.36 or v0.43–v0.46; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. No v0.22 text survives; its contents are placed by a change record written when v0.23 was drafted, as its entry explains. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
 
 <a id="sec-v0-1-to-v0-2-changelog"></a>
 ### v0.1 to v0.2 changelog (reconstructed)
@@ -466,7 +467,7 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
   - extension methods can be used as method references.
 
   `extension` moves from the reserved-for-future-use keywords to the declaration keywords, which leaves no reserved-for-future-use keywords. The Iteration section now presents `Map`, `Filter`, `SortBy` and the other sequence operations as extension methods on `IEnumerable<T>` from `Collections.Linq`. Its locked-in rules still call them "reserved for future revisions", a sentence the patch did not reach.
-- **Not applied: `SortBy` → `OrderBy`.** The conversation agreed the rename and applied it to the standard library document (library 0.2), but v0.31 still writes `SortBy` throughout. The spec still writes `SortBy` in v0.51 and uses `OrderBy` by v0.60 (see the [v0.51 to v0.52 entry](#sec-v0-51-to-v0-52-changelog)).
+- **Not applied: `SortBy` → `OrderBy`.** The conversation agreed the rename and applied it to the standard library document (library 0.2), but v0.31 still writes `SortBy` throughout. The spec still writes `SortBy` in v0.52 and uses `OrderBy` from v0.53 (see the [v0.51 to v0.52 entry](#sec-v0-51-to-v0-52-changelog)).
 
 <a id="sec-v0-31-to-v0-37-changelog"></a>
 ### v0.31 to v0.37 changelog (reconstructed, span)
@@ -528,7 +529,7 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
 - **Unconstrained `T` becomes conservative.** Inside a generic body an unconstrained `T` is treated as possibly null, so a field that must accept any substitution is declared `T?`. In v0.39's example a `T` field was "non-nullable if T is non-nullable". `T?` always means the nullable form of `T`, even under `notnull`.
 - **`default(T)`** yields the zero value of `T` (`0`, `false`, the zero enum value, a zeroed record, or `null`). Assigning it to a non-nullable `T` location is an error unless the constraints prove it non-null. `notnull` and `default` become contextual keywords.
 - **`await for`** is listed among the control-structure rules as the async counterpart of `for`, valid only in async code, and `break`/`continue` are valid in its body. The async section already used it. The keyword appendix explains that `await for` is a compound of two reserved words, not a new keyword.
-- **The v0.40 decision on inline arrays is not visible in these snapshots.** A later rationale dates a rejection of inline fixed-size value-type array fields (C#-`fixed`-style inline arrays in classes) to v0.40: the current rationale §17.6 cites "the v0.40-v0.97 rejection rationale", and `docs/proposals/DECLINED.md` records "rejected v0.40–v0.97, shipped v0.98". Neither the v0.39 nor the v0.40 spec mentions inline array fields or C# `fixed` at all, and nothing between them touches arrays. The snapshots therefore neither confirm nor contradict the date. The decision left no trace in the spec text and was presumably recorded in a design rationale, which survives only from v0.60, where §17.6 already carries the rejection. It is placed here on the strength of those later citations alone.
+- **The v0.40 decision on inline arrays is not visible in these snapshots.** A later rationale dates a rejection of inline fixed-size value-type array fields (C#-`fixed`-style inline arrays in classes) to v0.40: the current rationale §17.6 cites "the v0.40-v0.97 rejection rationale", and `docs/proposals/DECLINED.md` records "rejected v0.40–v0.97, shipped v0.98". Neither the v0.39 nor the v0.40 spec mentions inline array fields or C# `fixed` at all, and nothing between them touches arrays. The snapshots therefore neither confirm nor contradict the date. The decision left no trace in the spec text. The earliest surviving design rationale, v0.52's, already records it (§18.6, "Fixed-size value type arrays as fields", among the things explicitly rejected) but gives no date, so it shows only that the rejection existed by v0.52. It is placed at v0.40 on the strength of the later citations alone.
 
 <a id="sec-v0-40-to-v0-41-changelog"></a>
 ### v0.40 to v0.41 changelog (reconstructed)
@@ -595,7 +596,7 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
   - "Namespace" gives way to "module" in the import rules and `nameof`.
   - `ICollection<T>` is marked as an illustrative sketch whose normative form belongs to the standard library, and it gains `Remove`.
   - A note explains that `IAsyncDisposable.DisposeAsync` carries no `async` on the interface, only on implementations.
-- **Datable decisions.** No revision from v0.43 to v0.46 is named in any source searched: the design-conversation record, which ends at v0.30; the v0.31, v0.37–v0.42 and v0.47–v0.51 snapshots, which have no revision notes; the v0.60 spec and rationale snapshots, the v0.62 and v0.63 patch sets and the v0.93 spec snapshot; and the current `docs/*.md` and `docs/proposals/*.md`. The one explicitly dated decision between v0.31 and v0.52, the v0.40 rejection of inline array fields, is discussed in the [v0.39 to v0.40 entry](#sec-v0-39-to-v0-40-changelog). The changes above can only be dated to "after v0.42, at or before v0.47".
+- **Datable decisions.** No revision from v0.43 to v0.46 is named in any source searched: the design-conversation record, which ends at v0.30; the v0.31, v0.37–v0.42 and v0.47–v0.51 snapshots, which have no revision notes; the v0.52 and v0.53 spec snapshots and the v0.52 rationale, which name no revision before v0.52; the v0.60 spec and rationale snapshots, the v0.62 and v0.63 patch sets and the v0.93 spec snapshot; and the current `docs/*.md` and `docs/proposals/*.md`. The one explicitly dated decision between v0.31 and v0.52, the v0.40 rejection of inline array fields, is discussed in the [v0.39 to v0.40 entry](#sec-v0-39-to-v0-40-changelog). The changes above can only be dated to "after v0.42, at or before v0.47".
 
 <a id="sec-v0-47-to-v0-48-changelog"></a>
 ### v0.47 to v0.48 changelog (reconstructed)
@@ -697,24 +698,39 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
 <a id="sec-v0-51-to-v0-52-changelog"></a>
 ### v0.51 to v0.52 changelog (reconstructed)
 
-- Source: no text of v0.52 survives. This entry lists differences between the v0.51 snapshot and the v0.60 spec and rationale snapshots, leaving out what the v0.52→v0.60 entries (below) record as changed after v0.52. What remains describes v0.52. Where the v0.53 entry states v0.52's behaviour directly, that statement is used. The entry rests on that subtraction. An item's absence from the v0.52→v0.60 entries is the only evidence that it predates v0.53, so an item could belong after v0.52 if one of those entries left it out.
-- **The specification is restructured.**
-  - It is reorganised into numbered sections, from Lexical Structure to Comments and Documentation, with three appendices: a complete grammar (A), reserved words (B) and compiler-enforced invariants (C).
-  - Up to v0.51 the only appendix is a reserved-keyword list, and every section still ends in a "Locked-in … rules" list, shortened in v0.48 and v0.49. Those lists are gone by v0.60, and Appendix C collects the enforced rules.
-  - The v0.53 to v0.54 entry revises Appendices A and C, and the v0.52 to v0.53 entry does not record adding them, so both are taken to exist at v0.52.
-- **One entry point.** The module-level `main` of v0.50's Compilation Model is gone. By v0.60 the compilation-unit rules require the static `Main` of the Program Entry Point section, now §33. No later entry records the change.
-- **`case` exhaustiveness.** Enum and `bool` scrutinees get compile-time exhaustiveness proofs, and v0.51 still only warns when coverage is not provable. Sealed hierarchies were added in v0.53.
-- **Precedence.** The table gains levels for range and the type tests (`is`, `is not`, `as`), neither of which appears in v0.51's table. Where the bitwise and `??` levels sat at v0.52 cannot be recovered, because v0.53 reshuffled them.
-- **`GetType` and record `with`.** `Object` gains `GetType`, which v0.51 still reserves for a future revision. Records gain non-destructive update with `with` (`recordExpr with Name := value, … end`), the "`with`-copy expression" that v0.51 still defers. It shares its shape with the class-only object initializer block. In v0.52 the library still declared the primitive keywords as `class int`, `class string`, … until v0.53.
-- **Inferred local ownership.** A local's ownership state (owned or borrowed) is inferred from how it was introduced and is never annotated. The v0.53 entry notes that this model "was load-bearing throughout v0.52 but never written down". By v0.60 the runtime-managed list names all function-typed values where v0.51 named lambda closures; the v0.55 to v0.56 entry already treats function-typed values as runtime-managed and unchanged.
-- **Standard library at v0.52.**
+- Source: the v0.51 and v0.52 spec snapshots and the v0.52 design rationale (all verbatim). The standard library document of v0.52 does not survive; where this entry describes the library, it relies on the v0.52 to v0.53 entry. An earlier version of this entry had no v0.52 text. It subtracted the v0.52→v0.60 entries from a v0.51/v0.60 comparison, and the real diff corrects some of its items (listed at the end).
+- **The specification is rewritten as a numbered reference.**
+  - v0.51's unnumbered sections become 34 numbered sections, from Lexical Structure to Comments and Documentation, with three appendices: a complete grammar (A), reserved words (B) and compiler-enforced invariants (C). v0.51's only appendix is a reserved-keyword list.
+  - The text shrinks by about 40% (from about 6,970 lines to about 4,060). Worked explanations and the 41 "Locked-in … rules" lists are dropped, and Appendix C collects the enforced rules. The header now calls the spec a normative reference and points to companion documents for the design rationale and the standard library.
+  - Most rules carry over unchanged in substance. The new Lexical Structure section adds that source files are UTF-8, with LF, CR or CRLF line endings.
+- **One entry point.** v0.51 has two: the static `Main` of its Program Entry Point section, and the module-level `main` of its Compilation Model. v0.52 drops the module-level `main`. An executable needs exactly one `Main` (§33), declared on a class in the program's main module, where v0.51 allowed any class.
+- **Precedence.** The table gains a range level (`..` and `..<`, with optional `step`) between primary and unary. The relational level gains `is`, `is not` and `as`, the primary level gains `?( )` and postfix `!`, and the conditional level gains `throw` expressions. The rest of the order is v0.51's: equality above bitwise AND, XOR and OR, then `and`, `or`, `??`, the conditional level and assignment. v0.53 reshuffles the bitwise and `??` levels.
+- **`GetType` and record `with`.** `Object` gains a non-virtual `GetType()`, which v0.51 still reserves for a future revision. Records gain non-destructive update, `recordExpr with Name := value, … end`, the "`with`-copy expression" that v0.51 defers. It shares its shape with the class-only object initializer block, `new T(args) with … end`.
+- **Smaller changes.**
+  - `Range<T>.Step` becomes `long` (v0.51: `T`), so that descending ranges work over unsigned `T`. `Range<T>` is declared as a record.
+  - `KeyNotFoundException` joins the exception types available without import.
+  - The reserved words are re-listed. `with`, `nameof`, `typeof` and `default`, contextual in v0.51, become fully reserved, the primitive type keywords are listed, and `step` becomes contextual. `operator`, `owned`, `notnull`, `get` and `set`, all listed in v0.51, appear in neither of v0.52's lists, though its grammar still uses them.
+- **The design rationale first appears.** v0.52 has a separate design rationale, "Companion to the … Specification, v0.52", in 19 sections. No earlier snapshot (v0.4–v0.51) refers to a rationale document, although v0.51 already refers to a separate standard library specification. The rationale explains the main choices: no garbage collector, `owned` and `using var` instead of a borrow checker, collections that do not own their elements, Pattern A versus Pattern B for async results, extension blocks, and the FFI.
+- **Rejected and deferred, as recorded at v0.52.** Rationale §18, "Things explicitly rejected", covers truthiness in conditions, implicit `int`/`bool` conversions, `+` between strings and non-strings, `goto`, inline fixed-size value-type array fields (§18.6, undated; see the [v0.39 to v0.40 entry](#sec-v0-39-to-v0-40-changelog)) and default interface methods. It also discourages side-effecting property getters. §19, "Things deferred", covers sum types, traits with associated types, const generics, reflection beyond `typeof` and `GetType`, macros, custom collection-literal protocols, synchronization contexts and module-private types, and calls unsafe pointer arithmetic "probably never".
+- **Standard library.** The v0.53 entry describes v0.52's library.
   - It has a doubly linked `List<T>` (renamed `LinkedList<T>` in v0.53), which is absent from library 0.4.
   - LINQ-style queries have `ToList()`, where library 0.4 had only `ToArray`, and keep `Map` from library 0.1.
-  - The spec's sequence-operation examples move from `Filter`/`SortBy`, still used in v0.51, to `Where`/`OrderBy`. No later entry records either change, unlike `Map` → `Select` in v0.53.
-- **Cross-check.**
-  - The v0.31, v0.37–v0.42 and v0.47–v0.51 snapshots confirm the v0.53 entry's account of v0.52 async: Pattern A versus Pattern B is syntax-directed, and `Task<owned T>` is forbidden.
-  - The same snapshots already carry two v0.52 states that v0.53 changes: strings specified as UTF-32 (stated as the internal storage from v0.48) and IEEE float equality.
-  - Events keep the v0.37 shape, raised with `Event?.Invoke(args)`, through v0.51.
+  - The primitive classes are declared as `class int`, `class string`, … until v0.53. The spec already names the library types `System.Int32`, `System.String`, … as v0.51 does.
+  - The spec's own examples still use `Map`, `Filter` and `SortBy`. They become `Select`, `Where` and `OrderBy` in v0.53.
+- **States that v0.53 changes.** The v0.52 snapshot confirms the v0.53 entry's account of v0.52, and all of these states are already v0.51's:
+  - events are raised with `Event?.Invoke(args)`;
+  - Pattern A versus Pattern B is syntax-directed, and `Task<owned T>` is forbidden;
+  - strings are stored as UTF-32 (stated from v0.48), and floating-point values follow IEEE 754 with no reflexive-equality rule;
+  - `when` guards require the long form of `catch`;
+  - a body-only record has no generated equality;
+  - `case` exhaustiveness is only warned about, with no proof rules;
+  - the runtime-managed types are `string`, boxed values and lambda closures.
+- **Corrections to the earlier version of this entry.** The real diff confirms Appendices A and C at v0.52, the dropped module-level `main`, `GetType`, record `with` and the new precedence levels. It corrects five items:
+  - It credited v0.52 with compile-time exhaustiveness proofs for enum and `bool` scrutinees. v0.52, like v0.51, only warns when coverage cannot be proved. The proof rules for enums, `bool` and sealed hierarchies first appear in v0.53.
+  - It said the v0.52 positions of the bitwise and `??` levels could not be recovered. They are v0.51's (see Precedence above).
+  - It listed inferred local ownership as v0.52 text. Like v0.51, v0.52 says only that locals are not marked `owned` and points to `using var`. The inferred model is first written down in v0.53, which matches the v0.53 entry's "load-bearing throughout v0.52 but never written down".
+  - It dated the examples' move from `Filter`/`SortBy` to `Where`/`OrderBy` to v0.52. The move is in v0.53.
+  - It noted that by v0.60 the runtime-managed list names all function-typed values. v0.52 still names lambda closures, and the change is made in the v0.53 snapshot.
 - **Placement corrections.** An earlier version of this history covered v0.42 to v0.52 in one span entry. The v0.47–v0.51 snapshots now date several of its items earlier:
   - `typeof` by v0.47;
   - the entry point and runtime-managed strings in v0.48;
@@ -722,7 +738,7 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
   - record destructuring, slice copies, runtime-managed closures and `Mutex` in v0.50;
   - interface variance in v0.51.
 
-  That entry also placed the discard `_` as an expression before v0.53, but the v0.53 entry lists the discard's out-argument and expression-statement positions as new there, so it is dropped here. Its earlier corrections against v0.31 and v0.37–v0.42 stand: those snapshots date `mod`, `in`, nested types, object initializer blocks and events by v0.37, and `is not`, the conditional level, `notnull`, `default(T)`, the `null` pattern and `where T: value` to v0.38–v0.41.
+  That entry also placed the discard `_` as an expression before v0.53. The v0.53 entry lists the discard's out-argument and expression-statement positions as new there, and v0.52 allows `_` only in patterns, so the item is dropped here. Its earlier corrections against v0.31 and v0.37–v0.42 stand: those snapshots date `mod`, `in`, nested types, object initializer blocks and events by v0.37, and `is not`, the conditional level, `notnull`, `default(T)`, the `null` pattern and `where T: value` to v0.38–v0.41.
 
 ---
 
