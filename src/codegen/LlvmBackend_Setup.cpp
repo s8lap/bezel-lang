@@ -23218,10 +23218,6 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // to bound. // per §28.3 K3.13, K3.14
     auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
     if (!ps) return;
-    // Only an `owned` parameter carries a disposal obligation (§28.8); `ref`/
-    // `out`/borrow params do not. (`out owned` is by-ref — the callee writes the
-    // caller's storage and does not own at entry — and is excluded.)
-    if (ps->modifier != "owned") return;
     // Must be a class/interface type to have a Dispose to call. fix #1483 /
     // §28.3: `rt` alone misses an `owned t: T` parameter of a generic method,
     // where T is a bare (erased) type parameter — rt->declaration is null and
@@ -23236,6 +23232,33 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // no further plumbing of the resolved type is needed here.
     const sema::TypeRef* rt =
         ps->declType ? ctx_.resolvedType(*ps->declType) : ps->resolvedDeclType;
+    // fix #TBD (§15.3 / §35.4, v0.315): an `owned` parameter of an
+    // owning-classified choice type.  §15.3: parameter passing for a move-only
+    // type is by value-move; the callee's scope-end auto-dispose must cover
+    // the incoming value on every exit path.  Before this fix,
+    // registerUnwindOwnedParam had no branch for owning choice parameters —
+    // the slot fell through all checks and was silently skipped,
+    // causing a direct leak.  Classify the resolved parameter type and register
+    // the active-case disposal entry if it is Owning.
+    if (ps->modifier == "owned" &&
+        rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+        rt->declaration->kind == ast::TypeDeclKind::Choice) {
+        const sema::TypeRef* instRt = resolveTypeParamRef(rt);
+        auto verdict = common::classifyChoiceType(instRt, ctx_);
+        if (verdict && *verdict == common::ChoiceClassification::Owning) {
+            Disposal d{slot, nullptr};
+            d.owningChoice = true;
+            d.owningChoiceTy = instRt->declaration;
+            d.owningChoiceRef = instRt;
+            d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+            disposeStack_.front().push_back(d);
+            return;
+        }
+    }
+    // Only an `owned` parameter carries a disposal obligation (§28.8); `ref`/
+    // `out`/borrow params do not. (`out owned` is by-ref — the callee writes the
+    // caller's storage and does not own at entry — and is excluded.)
+    if (ps->modifier != "owned") return;
     // §30.15 / §28.13 (#1957): a builtin ChannelSender<T> / Channel<T> /
     // Shared<T> owned parameter has NO user TypeSymbol (rt->declaration == null),
     // so isClassOrInterfaceRef below rejects it and the disposal registration is
@@ -23448,6 +23471,28 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             if (bn != name) continue;
             Disposal d{slot, nullptr};
             d.vtablelessBuiltin = name;
+            d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+            disposeStack_.front().push_back(d);
+            return;
+        }
+    }
+    // fix #TBD (§15.3 / §35.4, v0.315): an `owned` parameter of an
+    // owning-classified choice type.  §15.3: parameter passing for a move-only
+    // type is by value-move; the callee's scope-end auto-dispose must cover
+    // the incoming value on every exit path.  Before this fix,
+    // registerUnwindOwnedParam had no branch for owning choice parameters —
+    // the slot fell through all type-specific branches and was silently skipped,
+    // causing a direct leak.  Classify the resolved parameter type and register
+    // the active-case disposal entry if it is Owning.
+    if (rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+        rt->declaration->kind == ast::TypeDeclKind::Choice) {
+        const sema::TypeRef* instRt = resolveTypeParamRef(rt);
+        auto verdict = common::classifyChoiceType(instRt, ctx_);
+        if (verdict && *verdict == common::ChoiceClassification::Owning) {
+            Disposal d{slot, nullptr};
+            d.owningChoice = true;
+            d.owningChoiceTy = instRt->declaration;
+            d.owningChoiceRef = instRt;
             d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
             disposeStack_.front().push_back(d);
             return;
