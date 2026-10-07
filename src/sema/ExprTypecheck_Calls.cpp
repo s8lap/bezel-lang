@@ -23064,6 +23064,31 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         targetType = ctr->declaration;
                         return true;
                     });
+                // fix #5449 (§3.6 rule 2 / §14.2, v0.315): the member surface of
+                // a bare type parameter is exactly what its constraints establish,
+                // never the concrete substitution's. When the constraint walk found
+                // nothing (targetType still null), the member is not in the
+                // constraint-derived surface. The universal Object members (§8.1) are
+                // always present; reject everything else.
+                if (!targetType && tt->kind == TypeRef::Kind::Named && !tt->declaration) {
+                    bool isUniversalObjMember =
+                        ma.member == "ToString" || ma.member == "Equals" ||
+                        ma.member == "GetHashCode" || ma.member == "GetType" ||
+                        ma.member == "ReferenceEquals" || ma.member == "Dispose";
+                    if (!isUniversalObjMember) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            "no member `" + std::string(ma.member) +
+                            "` on bare type parameter `" +
+                            std::string(paramName) +
+                            "`: a bare type parameter exposes only the members "
+                            "its constraints establish (§3.6 rule 2 / §14.2); "
+                            "add a `where " + std::string(paramName) +
+                            ": <constraint>` that declares `" +
+                            std::string(ma.member) + "`");
+                        return;
+                    }
+                }
             }
         } else if (!tt) {
             // Target had no resolvable type — fall back to the

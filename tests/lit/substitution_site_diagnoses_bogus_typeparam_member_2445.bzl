@@ -25,17 +25,20 @@
 // continues to pin that text); #2445 is the *additional* path for the
 // bare-T substitution case.
 //
-// This control pins the new substitution-site diagnostic. The test
-// exercises a generic method that is INSTANTIATED (so the
-// genericSubstSemaTy_ substitution site IS reachable) with a
-// substituted record type whose declared member surface does NOT
-// include the bogus name being read. The new diagnostic fires on the
-// member read at the substitution site; the CG8 #2547 generic message
-// would have been the prior signal here.
+// NOTE: fix #5449 (§3.6 rule 2 / §14.2, v0.315) superseded this test's
+// expectation. The member access on a bare type parameter now errors at the
+// DECLARATION site (not the substitution site) with the
+// bare-type-parameter surface diagnostic: "no member `X` on bare type
+// parameter `T`: a bare type parameter exposes only the members its
+// constraints establish". The `where T: value` constraint does not add
+// members to the surface; `value` is not a type/interface bound that
+// contributes members via forEachConstraintBound. This test now pins the
+// declaration-site diagnostic. The substitution-site #2445 path is
+// superseded for the bare-T member-access case.
 //
 // RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
 // RUN: %not %bezelc -c -o %t.o %s 2>&1 | FileCheck %s
 
 module M; record Pt(X: int, Y: int); class C public static method F<T>(val: T): int where T: value return val.TotallyBogusTypeParamMember; end F; public static method Main(): int var x := F(new Pt(9, 5)); return x; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `TotallyBogusTypeParamMember` on substituted type `Pt` for type parameter `T`; the member is not part of `Pt`'s documented surface, or add a `where T: <constraint>` that provides this member (§14.2, #2445)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `TotallyBogusTypeParamMember` on bare type parameter `T`: a bare type parameter exposes only the members its constraints establish (§3.6 rule 2 / §14.2); add a `where T: <constraint>` that declares `TotallyBogusTypeParamMember`

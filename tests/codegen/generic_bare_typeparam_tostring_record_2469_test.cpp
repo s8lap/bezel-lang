@@ -231,12 +231,19 @@ BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
     BEZEL_EXPECT_EQ(run(program), 42);
 }
 
-// The canary this exact surface previously regressed against (#2433's
-// retraction): a genuinely-declared bare type parameter's field access must
-// keep working. Not a ToString call — this pins that the fix (scoped to
-// `tryLowerValueSemanticsCall`, a different function from #2433/#2465's
-// sema-side `resolveMemberAccess` change) has no effect on ordinary
-// generic-record field access.
+// fix #5449 (§3.6 rule 2 / §14.2, v0.315) BEHAVIOUR FLIP: the
+// canary_generic_record_field_access_unaffected test is RETRACTED.
+// Per the owner ruling on #5449: "A bare type parameter's member surface
+// is what its constraints establish, never the concrete substitution's."
+// `_val.X` on an unconstrained `T` is a compile error — the member is
+// not in T's constraint-derived surface (T has no constraints). The
+// codegen permissive backstop is no longer reached for this shape; the
+// new sema check emits a declaration-site error naming T and the missing
+// member, with the remedy of adding a constraint that declares it.
+// OLD EXPECTATION (accept): run(program) == 9
+// NEW EXPECTATION (reject): the sema diagnostic fires.
+// The working twin that preserves the covered behaviour (field access on
+// T where T has an appropriate constraint) follows below.
 BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
            canary_generic_record_field_access_unaffected) {
     const std::string program =
@@ -251,6 +258,53 @@ BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
         "class C public static method Main(): int "
         "  using var c := new Container<Pt>(new Pt(9, 5)); "
         "  return c.GX(); "
+        "end Main; end C;";
+    // #5449: the sema check fires at the declaration site (§3.6 rule 2).
+    auto r = runAot(program);
+    BEZEL_EXPECT_FALSE(r.ran);          // must not have run
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors()); // and must have an error
+    // The error names bare type parameter T and the missing member X.
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("bare type parameter") != std::string::npos &&
+            d.message.find("T") != std::string::npos &&
+            d.message.find("X") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);  // names T and X with the bare-type-parameter wording
+}
+
+// WORKING TWIN: the same field access works when T is constrained by an
+// interface that declares the member. This preserves the covered behaviour
+// (generic-record field access) under the spec-compliant constraint model.
+// Per the #5449 ruling: "add a constraint that declares it" is the remedy.
+BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
+           with_interface_constraint_member_access_works) {
+    // The fix #5449 adds: add a `where T: <constraint>` that declares X.
+    // Container<T> is now constrained to T: IHasX, so _val.X resolves.
+    const std::string program =
+        "module M; "
+        "interface IHasX\n"
+        "  property X: int;\n"
+        "end IHasX;\n"
+        "class Pt: IHasX\n"
+        "  public _x: int;\n"
+        "  public _y: int;\n"
+        "  public constructor(x: int, y: int) _x := x; _y := y; end constructor;\n"
+        "  public property X: int\n"
+        "    get => _x;\n"
+        "    set => _x := value;\n"
+        "  end X;\n"
+        "  destructor end destructor;\n"
+        "end Pt;\n"
+        "class Container<T> where T: IHasX\n"
+        "  protected _val: T;\n"
+        "  public constructor(v: T) _val := v; end constructor;\n"
+        "  public method GX(): int return _val.X; end GX;\n"
+        "  destructor end destructor;\n"
+        "end Container;\n"
+        "class C public static method Main(): int\n"
+        "  using var c := new Container<Pt>(new Pt(9, 5));\n"
+        "  return c.GX();\n"
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 9);
 }
