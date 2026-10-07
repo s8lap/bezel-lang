@@ -381,6 +381,32 @@ const Entry kAstKeyedTables[] = {
      "conversion adapter, so an uncarried entry would silently drop the "
      "adapter (the #5208 wrong-representation shape). TypeRef values live in "
      "the fresh context kept alive with the re-parsed AST."},
+    {"builtinCallBindings_",
+     "NOT carried. fix #3423 (§22.5, v0.283): the named-argument binding "
+     "permutation for builtin calls is published by `checkBuiltinNamedArgs` "
+     "during `typecheckExpressions` in `freshCtx`, but `freshCtx`'s copy is "
+     "NOT merged into `mainCtx` by the body-reconstruction remap. Codegen's "
+     "builtin arms read `ctx_.builtinCallBinding(call)` from `mainCtx`, so "
+     "the binding is structurally unreachable for a builtin call inside an "
+     "imported generic body: `freshCtx` computes it but codegen's consumer "
+     "finds nothing and falls back to positional ordering. "
+     "SemaContext.hpp: 'Local-only — never copied by ModuleLoader's "
+     "body-reconstruction remap (builtin calls have no cross-module surface)' "
+     "— the binding permutation is internal to the body and has no cross-"
+     "module semantic surface; the codegen consumer falls back safely."},
+    {"importedExtensionsByDecl_",
+     "NOT carried, and UNREACHABLE. fix #2335 (§2.8.3 rule 3 / §26, "
+     "v0.315): the reverse map from ExtensionDecl* to ExtensionSymbol*, "
+     "populated by `registerExtensionForDecl` from both local symbol "
+     "collection and the module loader's import path, read by "
+     "`Emitter::functionName` to qualify extension-method mangling for "
+     "primitive/builtin targets. Extensions are module-level; they are never "
+     "inside a method/ctor/dtor body and therefore never re-parsed by "
+     "`parseAndAttach*` into `freshCtx`. The table is populated in "
+     "`mainCtx` during import (ModuleLoader.cpp registers imported extensions "
+     "with `ctx.registerExtensionForDecl`) and is read from `mainCtx` during "
+     "codegen — the reconstruction loop has no `freshCtx` entry to carry, "
+     "and no consumer would consult one if it did."},
 };
 
 // Every member name declared as an AST-keyed `std::unordered_map`, in
