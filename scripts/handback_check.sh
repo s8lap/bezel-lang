@@ -225,11 +225,15 @@ check_reverts() {
   # "REVERT fix #NNNN: ... introduces a UAF" recording an ASan heap-use-after-free.
   # Scan the branch's ancestry and make the lane answer why it was reverted.
   local hits="" depth="${HANDBACK_REVERT_DEPTH:-12}"
+  # Anchored to the START of the subject for REVERT: a commit that merely
+  # *mentions* one ("surface a REVERT/UAF ancestor before a pick" — this
+  # file's own history) is not itself a revert. Anchoring still catches the
+  # real shape, "REVERT fix #5434: ... introduces a UAF".
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     hits+="$line"$'\n'
   done < <(g log --first-parent -n "$depth" --format='%h %s' "$TIP" 2>/dev/null \
-             | grep -iE '\b(revert|reverted|not landed|not-landed|superseded|unsafe|use-after-free|uaf|abandon(ed)?|do not land)\b')
+             | grep -iE '^([0-9a-f]+ )?[^ ]*(revert|reverted)[^ ]* |not landed|not-landed|superseded by|unsafe:|use-after-free|do not land')
   if [ -z "$hits" ]; then
     row PASS reverts "no revert/UAF marker in the last $depth first-parent commits"
   else
