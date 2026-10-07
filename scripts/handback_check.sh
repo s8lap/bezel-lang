@@ -239,10 +239,17 @@ check_reverts() {
   # *mentions* one ("surface a REVERT/UAF ancestor before a pick" — this
   # file's own history) is not itself a revert. Anchoring still catches the
   # real shape, "REVERT fix #5434: ... introduces a UAF".
+  #
+  # --skip=1: scan ANCESTORS, not the candidate. The candidate is the thing
+  # being judged, and a soundness FIX legitimately names the defect it fixes
+  # ("retire #4832's operand release in record .Equals: use-after-free",
+  # R28) — matching that would WARN every correct repair of a UAF. The revert
+  # that matters is always in the ancestry (R28 #5434: the candidate's own
+  # parent was the REVERT).
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     hits+="$line"$'\n'
-  done < <(g log --first-parent -n "$depth" --format='%h %s' "$TIP" 2>/dev/null \
+  done < <(g log --first-parent -n "$depth" --skip=1 --format='%h %s' "$TIP" 2>/dev/null \
              | grep -iE '^([0-9a-f]+ )?[^ ]*(revert|reverted)[^ ]* |not landed|not-landed|superseded by|unsafe:|use-after-free|do not land')
   if [ -z "$hits" ]; then
     row PASS reverts "no revert/UAF marker in the last $depth first-parent commits"
