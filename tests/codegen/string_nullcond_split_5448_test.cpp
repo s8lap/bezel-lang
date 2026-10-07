@@ -99,3 +99,22 @@ BEZEL_TEST(string_nullcond_split_5448,
         "  if chars = null then return 99; else return 0; end; "
         "end Main; end C;"), 99);
 }
+
+// §9.6 / §7.5 / #5448: accessing an element of string?.ToCharArray() must
+// not crash. Pre-fix: sema types the result as Array<string>? (wrong),
+// so chars[0] is typed as string and codegen emits a string load
+// (pointer+length) but the runtime value is a char, causing a segfault.
+// Post-fix: sema types it correctly as Array<char>? and codegen emits
+// a char load, which works correctly.
+BEZEL_TEST(string_nullcond_split_5448,
+           tochararray_element_access_does_not_crash) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class C public static method Main(): int "
+        "  var t: string? := \"abc\"; "
+        "  var chars := t?.ToCharArray(); "
+        "  if chars <> null and chars.Count = 3 then "
+        "    var first := chars[0]; "
+        "    return 99; "
+        "  else return 0; end; "
+        "end Main; end C;"), 99);
+}

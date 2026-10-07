@@ -28943,8 +28943,11 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 tr->kind = TypeRef::Kind::Named;
                 tr->declaration = nullptr;
                 tr->astNode = kArrayAstNode;
+                // Split returns Array<string>, ToCharArray returns Array<char>.
                 tr->genericArgs.push_back(
-                    ctx_.primitiveTypeRef(PrimitiveType::String));
+                    nm.member == "ToCharArray"
+                        ? ctx_.primitiveTypeRef(PrimitiveType::Char)
+                        : ctx_.primitiveTypeRef(PrimitiveType::String));
                 tr->nullable = true;
                 ctx_.setExprType(&nm, tr);
                 typedNcm = true;
