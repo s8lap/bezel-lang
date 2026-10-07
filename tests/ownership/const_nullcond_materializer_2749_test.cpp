@@ -259,35 +259,43 @@ BEZEL_TEST(const_nullcond_materializer_2749,
 // `narrow #3376` keeps the type (so the §21.1 `const` rejection above still
 // fires) and lets the gate reject as well. These two tests pin BOTH halves of
 // that invariant so it cannot silently invert again.
+//
+// BEHAVIOR FLIP (fix #5448, §9.6 / §7.5, v0.315): the `?.Split` call is now
+// LOWERED by codegen (no longer hits the "not yet supported" gate). The var
+// case now COMPILES correctly, and the const case only gets the ownership
+// error (Split returns owned Array<string>), not the codegen error.
+// The test names and assertions below reflect the NEW correct behavior.
 // =====================================================================
+// fix #5448 (§9.6 / §7.5, v0.315): `var parts := t?.Split(",")` now compiles
+// and runs correctly. The codegen gate no longer fires; §21.1 is silent on
+// non-const bindings.
 BEZEL_TEST(const_nullcond_materializer_2749,
-           nullcond_split_var_still_rejected_by_codegen_gate_spec_7_5) {
+           nullcond_split_var_now_accepted_spec_7_5) {
     auto r = parseAndCheckOwnership(
         "module M; class C public static method M(): int "
         "    var t: string? := \"a,b,c\"; "
         "    var parts := t?.Split(\",\"); "
         "    return 0; end M; "
         "  public static method Main(): int return 0; end Main; end C;");
-    // The whole point: a `var` binding of an unlowerable `?.` builtin call is
-    // REJECTED, not accepted-and-degraded. Without the narrowing this is false
-    // and the program compiles to a zero-initialized slot.
-    BEZEL_EXPECT_TRUE(hasNotYetSupportedInCodegen(r));
-    // ...and §21.1 is still correctly silent on a non-`const` binding, so the
-    // narrowing did not achieve the rejection by over-firing §21.1.
+    // With the fix, codegen lowers Split and the program compiles cleanly.
+    BEZEL_EXPECT_FALSE(hasNotYetSupportedInCodegen(r));
+    // §21.1 is still correctly silent on a non-`const` binding.
     BEZEL_EXPECT_FALSE(hasAnyConstOwnedProductionError(r));
 }
 
+// fix #5448 (§9.6 / §7.5, v0.315): `const parts := t?.Split(",")` is rejected
+// by §21.1 (Split returns owned Array<string>, const cannot hold owned) but
+// NOT by the codegen gate (which no longer fires for Split).
 BEZEL_TEST(const_nullcond_materializer_2749,
-           nullcond_split_const_keeps_both_diagnostics_spec_21_1_7_5) {
+           nullcond_split_const_keeps_ownership_error_only_spec_21_1_7_5) {
     auto r = parseAndCheckOwnership(
         "module M; class C public static method M(): int "
         "    var t: string? := \"a,b,c\"; "
         "    const parts := t?.Split(\",\"); "
         "    return 0; end M; "
         "  public static method Main(): int return 0; end Main; end C;");
-    // #3376's actual value-add — the §21.1 const rejection — is PRESERVED by
-    // the narrowing (it depends only on the exprType, which is still set)...
+    // §21.1 const rejection is PRESERVED (the exprType is still set by sema).
     BEZEL_EXPECT_TRUE(hasAnyConstOwnedProductionError(r));
-    // ...and now sits alongside the codegen gate rather than replacing it.
-    BEZEL_EXPECT_TRUE(hasNotYetSupportedInCodegen(r));
+    // The codegen gate no longer fires — Split is now lowered correctly.
+    BEZEL_EXPECT_FALSE(hasNotYetSupportedInCodegen(r));
 }

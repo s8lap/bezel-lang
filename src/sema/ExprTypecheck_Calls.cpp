@@ -28855,13 +28855,24 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             // may return early. See the block comment at the `if (typedNcm
             // && typedNcmMayReturn)` site for why.
             bool typedNcmMayReturn = false;
-            // §9.6 Split(char|string|Array<char>) on string receiver.
+            // §9.6 Split / ToCharArray on string receiver.
+            // fix #5448 (§9.6 / §7.5, v0.315): these are builtin string
+            // methods, NOT LINQ operators. They are typed here (the §21.1
+            // `const` materializer rejection depends on the exprType being
+            // set), and typedNcmMayReturn=true lets them bypass the string
+            // LINQ gate below so codegen can lower them. The `.` form
+            // (resolveMemberAccess) handles both in its own builtin-string
+            // block ~line 24639, returning early without reaching the LINQ
+            // gate; the `?.` form mirrors that by setting typedNcmMayReturn
+            // here so the gate is bypassed rather than fired.
+            // AsSpan is excluded: it returns ReadOnlyStringSpan (a struct),
+            // not owned Array<string>, and requires separate nullable-handling.
             if (recvTyForDiag->kind == TypeRef::Kind::Primitive &&
                 recvTyForDiag->primitive == PrimitiveType::String &&
-                nm.member == "Split") {
-                // Same shape as the resolveMemberAccess Split arm at L16024,
-                // but with `nullable=true` per §7.5 (`s.Split` is non-nullable,
-                // `s?.Split` lifts to nullable).
+                (nm.member == "Split" || nm.member == "ToCharArray")) {
+                // Same shape as the resolveMemberAccess arms at L16024+
+                // (Split), L16067 (ToCharArray), L16085 (AsSpan), but with
+                // `nullable=true` per §7.5.
                 static const ast::Type* kArrayAstNode = []() -> ast::Type* {
                     auto* qn = new ast::QualifiedName;
                     qn->parts.push_back("Array");
@@ -28879,6 +28890,7 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 tr->nullable = true;
                 ctx_.setExprType(&nm, tr);
                 typedNcm = true;
+                typedNcmMayReturn = true;
             }
             // §4.4 Sorted/Reversed/Slice, §5 ToArray/ToSet/ToDictionary on
             // builtin collections (Array/Set/Dictionary Named, declaration-

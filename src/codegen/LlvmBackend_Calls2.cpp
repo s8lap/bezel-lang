@@ -19554,6 +19554,78 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             }
         }
     }
+    // fix #5448 (§9.6 / §7.5, v0.315): builtin string methods (Split,
+    // ToCharArray) on a `?.` call have no MethodSymbol (ms is null), so
+    // they fall through here and would return nullptr without lowering.
+    // Inline the relevant Split/ToCharArray dispatch from tryLowerStringMethod
+    // (LlvmBackend_String.cpp), with the same null-handling the Equals path
+    // uses: emit the call in a non-null block and phi the result with null
+    // (the call is skipped when the receiver is null).
+    // AsSpan is excluded: its return type (ReadOnlyStringSpan struct) differs
+    // from Split/ToCharArray (owned Array<string>) and needs separate
+    // nullable-handling that is not yet implemented.
+    if ((!ms || isStaticMethod(ms) || !nm.target) &&
+        (nm.member == "Split" || nm.member == "ToCharArray")) {
+        const sema::TypeRef* strRecvTy =
+            ctx_.exprType(*nm.target);
+        if (strRecvTy &&
+            strRecvTy->kind == sema::TypeRef::Kind::Primitive &&
+            strRecvTy->primitive == sema::PrimitiveType::String) {
+            // Lower the receiver: for string? this is the unwrapped string ptr.
+            llvm::Value* recv = lowerExpr(*nm.target);
+            if (!recv) return nullptr;
+            auto* strRecvEntryBB = builder_.GetInsertBlock();
+            auto* strRecvDoBB = llvm::BasicBlock::Create(
+                llvm_, "ncstr.do", currentFn_);
+            auto* strRecvEndBB = llvm::BasicBlock::Create(
+                llvm_, "ncstr.end", currentFn_);
+            llvm::Value* isNull =
+                builder_.CreateICmpEQ(recv,
+                                      llvm::ConstantPointerNull::get(ptrTy()));
+            builder_.CreateCondBr(isNull, strRecvEndBB, strRecvDoBB);
+            builder_.SetInsertPoint(strRecvDoBB);
+            // Inline Split/ToCharArray lowering from tryLowerStringMethod.
+            // Both return owned Array<string> (ptr result). The argument is
+            // lowered with the same lowerExpr call used in the non-?. path.
+            llvm::Value* result = nullptr;
+            if (nm.member == "Split" && call.args.size() == 1 &&
+                call.args[0].value) {
+                auto* argTy = ctx_.exprType(*call.args[0].value);
+                if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
+                    argTy->primitive == sema::PrimitiveType::String) {
+                    // Split(separator: string)
+                    llvm::Value* delim = lowerExpr(*call.args[0].value);
+                    if (delim) {
+                        auto* fn = declareC("bz_str_split_str",
+                                            ptrTy(), {ptrTy(), ptrTy()});
+                        result = builder_.CreateCall(fn, {recv, delim},
+                                                     "split.result");
+                    }
+                }
+            } else if (nm.member == "ToCharArray" && call.args.empty()) {
+                auto* fn = declareC("bz_str_to_char_array", ptrTy(), {ptrTy()});
+                result = builder_.CreateCall(fn, {recv}, "tochararray.result");
+            }
+            if (!result) {
+                // Fall through: didn't recognise the call shape.
+                builder_.CreateBr(strRecvEndBB);
+                builder_.SetInsertPoint(strRecvEndBB);
+                return nullptr;
+            }
+            // owned Array<string>? is a nullable REFERENCE (ptr result),
+            // so the null value is a null ptr. Both Split and ToCharArray
+            // return ptr.
+            auto* strRecvDoEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(strRecvEndBB);
+            builder_.SetInsertPoint(strRecvEndBB);
+            auto* resultPhi = builder_.CreatePHI(ptrTy(), 2);
+            resultPhi->addIncoming(
+                llvm::ConstantPointerNull::get(ptrTy()), strRecvEntryBB);
+            resultPhi->addIncoming(result, strRecvDoEnd);
+            return resultPhi;
+        }
+        return nullptr;
+    }
     if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
     llvm::FunctionType* fnTy = methodFnType(ms);
     if (!fnTy) return nullptr;
