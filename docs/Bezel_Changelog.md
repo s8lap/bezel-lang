@@ -11,14 +11,16 @@ Entries are pinned history — each was written at its revision and is not retro
 
 The entries in this section were reconstructed in 2026-10. They predate the per-revision changelog that begins at v0.52 to v0.53 below. Each one summarises what changed and is not a complete migration record. They rest on four kinds of source, and each entry names its own:
 
-- **Archived snapshots of the specification** (v0.4–v0.18, v0.20, v0.21, v0.23, v0.24, v0.31, v0.37–v0.42, v0.47–v0.53, v0.60). These are verbatim, and they are the strongest source. The v0.53 snapshot is used only to check the v0.51 to v0.52 entry.
+- **Archived snapshots of the specification** (v0.4–v0.18, v0.20, v0.21, v0.23, v0.24, v0.31, v0.37–v0.45, v0.47–v0.53, v0.60). These are verbatim, and they are the strongest source. The v0.53 snapshot is used only to check the v0.51 to v0.52 entry.
 - **Archived snapshots of the design rationale** (v0.52, v0.60), also verbatim. The rationale is a separate companion document from v0.52 on, as the v0.51 to v0.52 entry explains.
 - **A record of the design conversation** that ran from v0.24 to v0.30. The conversation did not produce spec files: it drafted patches, the owner applied them to the spec by hand and periodically re-uploaded it. The drafted patches are therefore the record of what changed, and the uploads are the revision boundaries. The record summarises most of its turns instead of quoting the spec text. The entries for v0.24 to v0.30 rest on it, one entry per round of patches between two uploads, and have been checked against the v0.31 snapshot. Its last patches, drafted after the v0.30 upload, are matched against v0.31 in the v0.30 to v0.31 entry.
 - **A later summary of the earliest design conversation**, covering v0.1–v0.3. It describes itself as "reconstructed progressive snapshots" and is not a verbatim spec, so it is the weakest source.
 
 A review of v0.48 written at the time also survives. It is not used as evidence of what changed: the entries from v0.48 to v0.49 through v0.50 to v0.51 cite it only to explain why some changes were made.
 
-v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.32–v0.36 or v0.43–v0.46; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. No v0.22 text survives; its contents are placed by a change record written when v0.23 was drafted, as its entry explains. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
+v0.6 rests on a design discussion from the time that records its full text. Nothing at all survives for v0.32–v0.36; v0.19's contents are inferred from the v0.20 snapshot's structure, as its entry explains. No v0.22 or v0.46 text survives; their contents are placed by change records written when v0.23 and v0.47 were drafted, as their entries explain. v0.26 is known only as the label of one upload, and its text is not reproduced; nor is the text of v0.30, which is known from the drafted patches and from what v0.31 contains. Four further uploads fall between v0.26 and v0.30 without a recorded version number, so v0.27, v0.28 and v0.29 cannot be tied to any of them; those entries are numbered by application round (rounds 1–4) instead. Where an entry spans a missing revision, it covers the whole span and says so.
+
+Apart from what the v0.47 change record attributes to v0.47, the one explicitly dated decision between v0.31 and v0.52 is the v0.40 rejection of inline array fields, discussed in the [v0.39 to v0.40 entry](#sec-v0-39-to-v0-40-changelog).
 
 <a id="sec-v0-1-to-v0-2-changelog"></a>
 ### v0.1 to v0.2 changelog (reconstructed)
@@ -553,50 +555,82 @@ v0.6 rests on a design discussion from the time that records its full text. Noth
 - **Scientific notation** is stated as a rule: an `e`/`E` exponent with an optional sign is valid on `double`, `float` and `decimal` literals (`1.23e2m`), and fractional exponents are not allowed. v0.41's literal examples already used it.
 - **`nameof(T)` on a type parameter** returns the parameter's declared name (`"T"`), never the substituted type. The `nameof` examples now show their results.
 
-<a id="sec-v0-42-to-v0-47-changelog"></a>
-### v0.42 to v0.47 changelog (reconstructed, span)
+<a id="sec-v0-42-to-v0-43-changelog"></a>
+### v0.42 to v0.43 changelog (reconstructed)
 
-- Source: the v0.42 and v0.47 snapshots (verbatim, headed "v0.42 – April 2026" and "v0.47 – May 2026"). No text of v0.43–v0.46 survives, so none of these changes can be attributed to a single revision. Neither snapshot carries a changelog or revision notes. The v0.47 text gives no evidence of the order in which the changes were made: its new subsections are inserted where their topic belongs, not appended, and they cross-reference only material that v0.42 already had.
-- **The `typeof` operator** (a new section). `typeof(TypeName)` returns a runtime `Type` value exposing `Name` and `FullName`.
+- Source: the v0.42 and v0.43 snapshots (verbatim, both headed "April 2026").
+- **The `typeof` operator** (a new section after `nameof`). `typeof(TypeName)` returns a runtime `Type` value exposing `Name` (unqualified) and `FullName` (module-qualified).
   - The runtime keeps one `Type` instance per type, so `=` and reference equality agree.
   - On a concrete type `typeof` is a compile-time constant. On a type parameter it is evaluated at runtime and yields the substituted type, unlike `nameof(T)`.
-  - Only type names are accepted. Retrieving a value's runtime type (C#'s `GetType()`) and any further reflection are reserved for a future revision.
+  - Only type names are accepted: a variable, a method or a literal is a compile error. Reflection beyond `Name` and `FullName` is reserved for a future revision. For a value's runtime type (C#'s `GetType()`) the text points to a "future revision note below" that it does not contain; v0.47 fixes the reference.
   - `typeof` becomes a contextual keyword, and field initializers may use it. v0.42 mentioned it only as a feature that might exist in a future revision.
-- **Tier 1 grows.**
-  - It adds `IEnumerator<T>`, `IAsyncEnumerator<T>` and `Type`.
-  - `Task.WhenAll`, `WhenAny`, `FromResult` and `FromException` are usable without an import.
-  - The core exceptions are laid out as a hierarchy under `Exception`, with `ArgumentNullException` under `ArgumentException`. Two are new: `OperationCanceledException`, and `StackOverflowException`, which user code cannot catch and which terminates the program.
-- **Circular imports are permitted.** All type declarations are resolved before method bodies are checked, so types in different modules may refer to each other, provided field initializers and static constructors form no cycle at initialization time.
-- **Primitive types and their library names.** A table pairs each keyword with its `System.*` type (`int` with `System.Int32`, and so on), and static members are reachable through the keyword (`int.Parse`, `double.IsNaN`, `string.IsNullOrEmpty`). Strings gain `<`, `>`, `<=` and `>=`, which compare by ordinal code-point order with no locale collation.
+- **Tier 1 grows.** `Type` joins the always-available names, and `OperationCanceledException` joins the core exceptions.
+- **The `byte` overflow example** becomes `n := byte(n + 1)`, with a note that `n := n + 1` is a compile error: `n + 1` is an `int`, and narrowing it back implicitly is not allowed.
+- **"Namespace" gives way to "module"** in the import rule ("all other library modules"), the nested-types text (the module's "top-level scope") and `nameof`, whose accepted identifiers no longer include namespaces.
+- **`ICollection<T>`** is marked as an illustrative sketch whose normative form belongs to the standard library, and it gains `Remove`.
+- **A lost heading.** The `typeof` section is inserted in place of the `## Comments and Documentation` heading, so from v0.43 to v0.45 the comment rules run on under the `typeof` section while the table of contents still links to the missing heading. The heading is back by v0.47 (see the [v0.45 to v0.46 entry](#sec-v0-45-to-v0-46-changelog)).
+
+<a id="sec-v0-43-to-v0-44-changelog"></a>
+### v0.43 to v0.44 changelog (reconstructed)
+
+- Source: the v0.43 and v0.44 snapshots (verbatim, both headed "April 2026").
+- **`Task` helpers.** `Task.WhenAll`, `WhenAny`, `FromResult` and `FromException` are members of `Task`, so they are usable wherever `Task` is, with no import.
+- **Primitive types and their library names** (a new subsection of Built-in Types). A table pairs each keyword with its `System.*` type (`int` with `System.Int32`, and so on); the two are the same type. Static members are reachable through the keyword (`int.Parse`, `double.IsNaN`, `string.IsNullOrEmpty`), and the member lists belong to the standard library.
 - **Multi-dimensional arrays** get their own subsection:
-  - creation is `new double[rows, cols]` and indexing is `arr[i, j]`;
-  - every fixed-size array has the intrinsic members `Length` (the total element count), `Rank` and `GetLength(dim)`;
+  - creation is `new double[rows, cols]` and indexing is `arr[i, j]`, zero-based, with `IndexOutOfRangeException` along any dimension;
+  - every fixed-size array has the intrinsic members `Rank` and `GetLength(dim)` (`Length` follows in v0.47);
   - nested collection literals initialise them. Inner lists of unequal length are a compile error when the lengths are statically known, and an `ArgumentException` otherwise;
-  - they cannot be sliced, and the text states that range slicing applies to one-dimensional `T[]` and `Array<T>`.
-- **The `readonly` modifier** gets its own subsection:
-  - it means write-once at initialization, on instance fields, auto-properties and static fields: assignment is allowed only in a field initializer or a (static) constructor;
+  - they cannot be sliced: range slicing applies to one-dimensional `T[]` and `Array<T>` only.
+- **Compound assignment** operators are listed in full (`+= -= *= /= &= |= ^= <<= >>= ??=`) in the rule that makes them statements.
+- **Collections and the standard library.** A note says `Array<T>`, `Set<T>`, `Stack<T>`, `Queue<T>` and `Dictionary<K, V>` are standard-library types whose constructors and members are defined there; the language section describes only the iteration behaviour it depends on.
+- **`DisposeAsync`.** A note explains that `IAsyncDisposable.DisposeAsync` carries no `async` on the interface, since interface methods have no body; implementations mark their own `DisposeAsync` `async`.
+- **Cancellation types.** `CancellationToken` and `CancellationTokenSource` live in `System.Threading` and need an explicit import.
+
+<a id="sec-v0-44-to-v0-45-changelog"></a>
+### v0.44 to v0.45 changelog (reconstructed)
+
+- Source: the v0.44 and v0.45 snapshots (verbatim, both headed "April 2026").
+- **`readonly` fields** (a new subsection of Declarations and Scoping, which v0.47 generalises):
+  - a `readonly` field may be assigned once, in a field initializer or a constructor body, and assignment anywhere else is a compile error. The examples apply it to auto-properties (`public readonly property Radius: double`);
   - it freezes the binding, not the object it refers to;
-  - `static readonly` is the form for values computed once at startup, where `const` requires a compile-time constant;
-  - it is a compile error on expression-bodied and block-form properties, methods, constructors and parameters.
-- **Format specifiers in interpolation.** `{expr,alignment:format}` follows the C# convention, and the format strings are left to the standard library.
-- **Smaller rule additions:**
-  - `is` works on value types. `obj is int` tests a boxed value, and a test the compiler can prove always false (`someInt is string`) is a compile error, while one always true is warned about;
-  - a `for` loop variable may carry a type annotation (`for var x: int in source`), which must match the element type or be an implicit widening of it;
-  - block comments do not nest. v0.42 left nesting to the implementation;
-  - a body-only record gets no generated `=`, `<>` or `GetHashCode`, and `=`/`<>` on one is a compile error unless the type overloads them;
-  - an interface constraint alone does not imply non-nullability, so `where T: IFoo` still admits `int?`. `where T: class, IFoo` gets its own row in the constraints table;
+  - `static readonly` fields are assigned in a static field initializer or static constructor. They are the form for values computed once at startup, where `const` requires a compile-time constant.
+- **Interface constraints and nullability.** An interface constraint alone does not imply non-nullability, so `where T: IFoo` still admits `int?`. `where T: class, IFoo` gets its own row in the constraints table.
+- **Sequence operations.** `Map`, `Filter`, `SortBy`, `Take`, `Skip`, `First`, `Any`, `All`, `Count`, `ToArray` and the rest are extension methods on `IEnumerable<T>` from `Collections.Linq`, which needs `import Collections.Linq;`. v0.44's rule still reserved them for future revisions.
+- **Iterator methods returning `IEnumerator<T>`** produce a fresh enumerator on each call, which advances forward only and cannot be reset. v0.44 called the result single-use.
+- **`extern` scoping.** `extern` methods are module-level declarations and take only `public` or `internal`; v0.44 also allowed `private`. A new subsection says they are called unqualified from any file of the declaring module and with the module name from outside, and that an `internal extern` is invisible outside its module. The text calls module-level placement a deliberate divergence from C#, where P/Invoke declarations live in a class.
+
+<a id="sec-v0-45-to-v0-46-changelog"></a>
+### v0.45 to v0.46 changelog (reconstructed)
+
+- Source: the v0.45 and v0.47 snapshots (verbatim) and the change record described in the next entry. No v0.46 text survives. This entry is placed by elimination: it is the v0.45→v0.47 diff minus the 17 changes the record attributes to v0.47. The record names no v0.46 changes, so what remains could also be v0.47 housekeeping the record left out. Apart from passages that differ only in line endings, two changes remain:
+- **The enum examples close their `case` expressions with `end`**, as the rules already required (five examples in the Enums section).
+- **The `## Comments and Documentation` heading is restored**, ending the run-on that v0.43 introduced (see the [v0.42 to v0.43 entry](#sec-v0-42-to-v0-43-changelog)).
+
+<a id="sec-v0-46-to-v0-47-changelog"></a>
+### v0.46 to v0.47 changelog (reconstructed)
+
+- Source: the v0.47 snapshot (verbatim, headed "v0.47 – May 2026") and a change record written when v0.47 was drafted. The record lists 17 changes and gives the previous header as "v0.46 – April 2026". Each item has been checked against the v0.45→v0.47 diff; all are present, with the one exception noted below.
+- **Corrections.**
+  - The primary-constructor examples add `public property Balance: decimal => _balance;`, and `SavingsAccount.Interest()` reads `Balance` instead of `BankAccount`'s private `_balance`.
+  - The leftover comparisons of ranges with `for … to`/`until` loops are removed from Range Expressions.
+  - Block comments do not nest: the first `*/` closes the comment. v0.45 left nesting to the implementation.
+  - The dangling `GetType()` reference now says that a value's runtime `Type` is reserved for a future revision, and points to `typeof(T)` in generic bodies and to `is`.
+- **The `readonly` modifier** replaces the "`readonly` fields" subsection. It means write-once at initialization on any declaration with storage: instance fields, auto-properties and static fields. On an auto-property it also means there is no setter. New examples show `private readonly` and `private readonly owned` fields, and `readonly` is a compile error on expression-bodied properties, block-form properties with accessors, methods, constructors and parameters.
+- **A `for` loop variable may carry a type annotation** (`for var x: int in source`). It must match the element type or be an implicit conversion of it; a narrowing or incompatible annotation is a compile error.
+- **Format specifiers in interpolation.** `{expr,alignment:format}` follows the C# convention: positive alignment right-aligns, negative left-aligns, and the format strings are left to the standard library.
+- **Ranges, arrays, strings, records and `is`:**
   - `Range<T>` lists its members: `Start`, `End`, `Step`, `IsInclusive`, and `Contains`, which `in` calls. An open start or end means the type's minimum or maximum;
-  - an iterator method returning `IEnumerator<T>` produces a fresh enumerator on each call, which cannot be reset. v0.42 called the result single-use.
-- **`extern` scoping.** `extern` methods are module-level declarations and take only `public` or `internal`; v0.42 also allowed `private`. Inside the module they are called unqualified, and from outside with the module name.
-- **Sequence operations and imports.** The iteration rules now say that `Map`, `Filter`, `SortBy`, `Take`, `Skip`, `First`, `Any`, `All`, `Count`, `ToArray` and the rest are extension methods on `IEnumerable<T>` from `Collections.Linq`, which needs `import Collections.Linq;`. v0.42's rule still reserved them for future revisions. `CancellationToken` and `CancellationTokenSource` are said to live in `System.Threading`, which also needs an import.
-- **Examples and wording.**
-  - The `byte` overflow example becomes `n := byte(n + 1)`, with a note that `n := n + 1` is a compile error: `n + 1` is an `int`, and narrowing it back implicitly is not allowed.
-  - The enum examples close their `case` expressions with `end`, as the rules already required.
-  - The leftover comparisons with `for … to`/`until` loops are removed.
-  - "Namespace" gives way to "module" in the import rules and `nameof`.
-  - `ICollection<T>` is marked as an illustrative sketch whose normative form belongs to the standard library, and it gains `Remove`.
-  - A note explains that `IAsyncDisposable.DisposeAsync` carries no `async` on the interface, only on implementations.
-- **Datable decisions.** No revision from v0.43 to v0.46 is named in any source searched: the design-conversation record, which ends at v0.30; the v0.31, v0.37–v0.42 and v0.47–v0.51 snapshots, which have no revision notes; the v0.52 and v0.53 spec snapshots and the v0.52 rationale, which name no revision before v0.52; the v0.60 spec and rationale snapshots, the v0.62 and v0.63 patch sets and the v0.93 spec snapshot; and the current `docs/*.md` and `docs/proposals/*.md`. The one explicitly dated decision between v0.31 and v0.52, the v0.40 rejection of inline array fields, is discussed in the [v0.39 to v0.40 entry](#sec-v0-39-to-v0-40-changelog). The changes above can only be dated to "after v0.42, at or before v0.47".
+  - every fixed-size array gains `Length`, the total element count;
+  - strings gain `<`, `>`, `<=` and `>=`, which compare by ordinal code-point order with no locale collation;
+  - a body-only record gets no generated `=`, `<>` or `GetHashCode`, and `=`/`<>` on one is a compile error unless the type overloads them;
+  - `is` works on value types. `obj is int` tests a boxed value and narrows, a test the compiler can prove always false (`someInt is string`) is a compile error, and one always true is warned about.
+- **Modules and Imports:**
+  - circular imports are permitted. All type declarations are resolved before method bodies are checked, provided field initializers and static constructors form no cycle at initialization time;
+  - `IEnumerator<T>` and `IAsyncEnumerator<T>` join Tier 1 beside their `IEnumerable` counterparts;
+  - the core exceptions are laid out as a hierarchy under `Exception`, with `ArgumentNullException` under `ArgumentException`;
+  - `StackOverflowException` is added. User code cannot catch it, and it terminates the program.
+- **Where the record and the diff disagree.** The record says all references to `to` and `until` were removed and that Control Structures now describes `..` and `..<` iteration. v0.47's Range Expressions still opens with "Both endpoints are **inclusive**, matching the `to` keyword in for-loops", and Control Structures' text is unchanged apart from the loop-variable annotation (its examples already labelled `1..10` inclusive and `0..<n` exclusive in v0.42).
+- **Deferred.** The record lists items discussed and left out of v0.47: a runtime `GetType()`; slicing semantics (whether a slice copies or borrows, and its type); an appendix summarising `owned`; disambiguating the `with` keyword, not needed until record copy-with-modification is specified; and a modifier-order quick-reference table.
 
 <a id="sec-v0-47-to-v0-48-changelog"></a>
 ### v0.47 to v0.48 changelog (reconstructed)
