@@ -25,6 +25,6 @@
 # support_calls   : the control — same tokens, no filters. Differs
 #                   from checked_calls only when a file moves into
 #                   or out of tests/support/.
-absorbing_sites = 1197
-checked_calls   = 2726
-support_calls   = 2742
+absorbing_sites = 1196
+checked_calls   = 2745
+support_calls   = 2761
