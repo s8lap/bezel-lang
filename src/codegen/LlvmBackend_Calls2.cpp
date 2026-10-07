@@ -4491,7 +4491,22 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         }
         // §9.1/§9.2: drive per-field comparison off the record's declared
         // member types so string fields compare by content (per §8.3).
-        return emitStructEquality(recv, other, st, ts);
+        llvm::Value* eq = emitStructEquality(recv, other, st, ts);
+        // fix #4832 (§8.3 / §28.2, v0.307): `emitStructEquality` reads the
+        // string fields of `recv` and `other` (passes them to emitStringEq)
+        // but the temporaries are not tracked by the Disposal system. Mirror
+        // the disposal that `collectRecordCallResultReleaseEligible` /
+        // `lowerLocalDecl` provides for record-typed locals: store each
+        // temporary to a stack slot and release its string fields.
+        if (recordHasStringFields(recvTy)) {
+            llvm::AllocaInst* recvSlot = entryAlloca(st);
+            builder_.CreateStore(recv, recvSlot);
+            emitRecordStringFieldReleases(recvSlot, recvTy);
+            llvm::AllocaInst* otherSlot = entryAlloca(st);
+            builder_.CreateStore(other, otherSlot);
+            emitRecordStringFieldReleases(otherSlot, recvTy);
+        }
+        return eq;
     }
     return nullptr;
 }
