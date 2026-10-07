@@ -5667,10 +5667,40 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         nodePtr, llvm::ConstantPointerNull::get(ptrTy()),
                         "ll.empty");
                     const sema::TypeRef* resTy = ctx_.exprType(e);
-                    // For a NULLABLE VALUE element type (int?, double?, …) the
-                    // result is the tagged {i8 hasValue; T value} struct, built
-                    // only on the present branch so the value load never runs on
-                    // an empty list (a null `valPtr`).
+                    const sema::TypeRef* elemTy =
+                        (tt && !tt->genericArgs.empty()) ? tt->genericArgs[0]
+                                                        : nullptr;
+                    // per §7.2 / §4.6, v0.307: `First`/`Last` return T?.
+                    // For a NULLABLE VALUE element type (Guid?, TimeOnly?, int?,
+                    // …) the node's value slot already stores the complete
+                    // {i8, payload} nullable struct — the element type IS the
+                    // nullable. In this case `elemLLTy` is the nullable struct
+                    // type and no further wrapping is needed.
+                    if (elemTy && isNullableValueTy(elemTy)) {
+                        auto* entryBB = builder_.GetInsertBlock();
+                        auto* presentBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.val", currentFn_);
+                        auto* mergeBB =
+                            llvm::BasicBlock::Create(llvm_, "ll.first.end", currentFn_);
+                        auto* st = nullableValueStructTy(resTy);
+                        builder_.CreateCondBr(nodeNull, mergeBB, presentBB);
+                        builder_.SetInsertPoint(presentBB);
+                        auto* valF = declareC("bz_llist_node_value_ptr",
+                                              ptrTy(), {ptrTy()});
+                        llvm::Value* valPtr =
+                            builder_.CreateCall(valF, {nodePtr}, "ll.vptr");
+                        llvm::Value* loaded =
+                            builder_.CreateLoad(elemLLTy, valPtr, "ll.val");
+                        auto* presentEndBB = builder_.GetInsertBlock();
+                        builder_.CreateBr(mergeBB);
+                        builder_.SetInsertPoint(mergeBB);
+                        auto* phi = builder_.CreatePHI(st, 2, "ll.first");
+                        phi->addIncoming(nullableValueNull(resTy), entryBB);
+                        phi->addIncoming(loaded, presentEndBB);
+                        return phi;
+                    }
+                    // For a NON-nullable value element type, the node stores the
+                    // bare inner value; wrap it into the nullable struct here.
                     if (resTy && isNullableValueTy(resTy)) {
                         auto* entryBB = builder_.GetInsertBlock();
                         auto* presentBB =
