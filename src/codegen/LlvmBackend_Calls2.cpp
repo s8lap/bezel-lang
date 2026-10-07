@@ -4491,22 +4491,30 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         }
         // §9.1/§9.2: drive per-field comparison off the record's declared
         // member types so string fields compare by content (per §8.3).
-        llvm::Value* eq = emitStructEquality(recv, other, st, ts);
-        // fix #4832 (§8.3 / §28.2, v0.307): `emitStructEquality` reads the
-        // string fields of `recv` and `other` (passes them to emitStringEq)
-        // but the temporaries are not tracked by the Disposal system. Mirror
-        // the disposal that `collectRecordCallResultReleaseEligible` /
-        // `lowerLocalDecl` provides for record-typed locals: store each
-        // temporary to a stack slot and release its string fields.
-        if (recordHasStringFields(recvTy)) {
-            llvm::AllocaInst* recvSlot = entryAlloca(st);
-            builder_.CreateStore(recv, recvSlot);
-            emitRecordStringFieldReleases(recvSlot, recvTy);
-            llvm::AllocaInst* otherSlot = entryAlloca(st);
-            builder_.CreateStore(other, otherSlot);
-            emitRecordStringFieldReleases(otherSlot, recvTy);
-        }
-        return eq;
+        // §8.4 / §9.1 (v0.315): `emitStructEquality` READS the string fields
+        // of `recv` and `other` (passes them to emitStringEq) and consumes
+        // neither. Neither operand may be disposed here. §9.1 gives a record
+        // value semantics — "assignment copies the value" — and a copy of the
+        // record STRUCT copies the field POINTERS; it does not retain the
+        // strings they point at. The string objects belong to whoever created
+        // the operands (the caller's locals, or the enclosing expression's own
+        // disposal), so releasing them here frees a heap object still owned by
+        // the caller: a use-after-free on the very next read of either
+        // operand. §8.4 requires `a = b` and `a.Equals(b)` to be the same
+        // comparison, and the `=` path (LlvmBackend_Exprs.cpp's operator
+        // lowering) discharges nothing here — a disposal on one spelling and
+        // not the other is exactly the observable divergence §8.4 forbids.
+        //
+        // This retires fix #4832's release block. Its premise — that `recv`
+        // and `other` are "independent copies" whose strings this call owns —
+        // does not hold for a string field: the struct copy aliases the same
+        // string object the caller owns. MEASURED (a24-wt-5272, r28-receq):
+        // `a.Equals(b)` on `record Name(value: string)` returned True and
+        // then SEGV'd reading `b.value` at address 0x8 / reported
+        // heap-use-after-free under ASan. A plain `var c := b;` copy leaves
+        // `b` intact (copy semantics, §9.1), and `=` leaves both operands
+        // intact, which is what fixes the comparison's contract.
+        return emitStructEquality(recv, other, st, ts);
     }
     return nullptr;
 }
