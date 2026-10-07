@@ -19,6 +19,16 @@ lane's commit claim Opus authorship. The checked invariants are the ones the
 rule exists for: one trailer, last line, Co-Authored-By to a Claude model at
 the noreply address.
 
+2026-10-08: the same defect returned at a larger scale, and the owner ruled on
+it. A coordinator session running MiniMax-M3.1-Flash was signing every commit
+"Claude Opus 5 (1M context)" -- so ~100 commits in one cycle attributed their
+authorship to a model that did not write them. That is precisely the failure
+the paragraph above records for Sonnet lanes, so the fix is the same one:
+enumerate the KNOWN model identities rather than pinning one string. Every
+Claude spelling stays accepted (history must not go red), MiniMax is added for
+the current session, and a wrong address stays a violation -- the check is
+widened to the set of real models, not loosened into accepting anything.
+
 Usage:
     check_commit_trailers.py [--range origin/main..HEAD] [--self-test]
 Exit 0 clean, 1 on a violation.
@@ -29,8 +39,12 @@ import subprocess
 import sys
 
 # e.g. "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
-WANT_RE = re.compile(r"^Co-Authored-By: Claude [A-Z][a-z]+ \d+(\.\d+)*"
-                     r"( \([^()]*\))? <noreply@anthropic\.com>$")
+#      "Co-Authored-By: MiniMax-M3.1-Flash <noreply@anthropic.com>"
+_WANT = (r"Co-Authored-By: (?:Claude [A-Z][a-z]+ \d+(?:\.\d+)*"
+         r"(?: \([^()]*\))?"
+         r"|MiniMax-[A-Za-z0-9.-]+)"
+         r" <noreply@anthropic\.com>")
+WANT_RE = re.compile(r"^%s$" % _WANT)
 EXAMPLE = "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 TRAILER_RE = re.compile(r"^(Co-Authored-By|Signed-off-by|Claude-Session|Reviewed-by|"
                         r"Acked-by|Tested-by|Reported-by):", re.I)
@@ -63,7 +77,11 @@ def self_test():
         ("subject\n\nbody\n\nCo-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>", []),
         ("subject\n\nbody\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <me@example.com>",
          ["wrong trailer"]),
-        ("subject\n\nbody\n\nCo-Authored-By: MiniMax-M3 <noreply@anthropic.com>",
+        ("subject\n\nbody\n\nCo-Authored-By: MiniMax-M3.1-Flash <noreply@anthropic.com>", []),
+        ("subject\n\nbody\n\nCo-Authored-By: MiniMax-M3 <noreply@anthropic.com>", []),
+        ("subject\n\nbody\n\nCo-Authored-By: MiniMax-M3.1-Flash <me@example.com>",
+         ["wrong trailer"]),
+        ("subject\n\nbody\n\nCo-Authored-By: MiniMax <noreply@anthropic.com>",
          ["wrong trailer"]),
         ("subject\n\nbody\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
          ["wrong trailer"]),
