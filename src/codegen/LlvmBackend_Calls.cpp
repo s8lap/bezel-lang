@@ -6802,6 +6802,43 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* phi2 = builder_.CreatePHI(i1(), 2, "tryp.r");
             phi2->addIncoming(builder_.getTrue(), foundEnd);
             phi2->addIncoming(builder_.getFalse(), condBB);
+            // fix #5434 / §28.3 Unbound owned temporaries / stdlib §4.10 (v0.315):
+            // `TryPop(query: T, out owned removed: T?)` takes its query as a
+            // BORROW — stdlib §4.10 declares `Pop(query: T): owned T` with the
+            // inline comment "borrow-taking query", and TryPop's own `query: T`
+            // carries no `owned` marker — so the callee never assumes the +1
+            // and the CALLER keeps sole ownership. An UNBOUND owned temporary
+            // in that position (`new R(1)` written inline at the call) is a
+            // §28.3 non-owned argument with no binding to carry the obligation,
+            // and nothing else reclaims it: pre-fix LSan reported 16 B leaked
+            // per call (measured 3200 B across 200 allocations in the
+            // 200-iteration repro).
+            //
+            // This is the SAME shape the #1881 Add/Push/Enqueue, #1039/#1053
+            // receiver-temp and #2204 Insert fixes dispose, and it uses their
+            // discriminant verbatim: `isFreshOwnedClassProducer`. That guard is
+            // load-bearing, not defensive. A query that is NOT a fresh producer
+            // is a pre-declared OWNING LOCAL, whose own scope-end disposal is
+            // already the single owner — disposing it here as well frees it
+            // early and the scope-end disposal then reads freed memory.
+            // Measured on that shape, an unconditional `emitDisposeAndReclaim`
+            // yields `AddressSanitizer: heap-use-after-free ... READ of size 8`,
+            // which is why #5434's first attempt was reverted; the predicate is
+            // what distinguishes the two. It also settles the aliasing question
+            // the reverted attempt's pointer-equality guard was built for:
+            // `existing` is an element already stored in the collection, so it
+            // can never be the SAME allocation as a freshly minted `new R(...)`
+            // (measured — the pristine tree leaks exactly the one 16 B temporary
+            // and frees no second time), so there is no alias to skip and
+            // nothing to double-free.
+            //
+            // Placement: after the result PHI, at endBB, whose predecessors are
+            // exactly the two the PHI lists (foundBB and condBB). That covers
+            // BOTH the found and the not-found path, and nothing here is
+            // conditional on the query having matched — which the leak repro
+            // needs, since iterations 2..N take the not-found edge.
+            if (isFreshOwnedClassProducer(call.args[0].value.get()))
+                emitDisposeAndReclaim(query);
             if (call.args[1].isDiscard)
                 disposeDiscardedOwnedOut(
                     outAddr, recvTy && !recvTy->genericArgs.empty()
