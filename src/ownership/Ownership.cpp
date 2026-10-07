@@ -4402,6 +4402,39 @@ static bool isClassOrInterfaceResult(const sema::TypeRef* rt) {
            rt->declaration->kind == ast::TypeDeclKind::Interface;
 }
 
+// fix #5421 (§28.7 / §28.9, v0.315): the COLLECTION counterpart of
+// `isClassOrInterfaceResult`, for `localDropOnOverwriteCovered`.
+//
+// The plain builtin collections (`Array<T>` / `Dictionary<K,V>` / `Set<T>` /
+// `Stack<T>` / `Queue<T>` / `LinkedList<T>` / `SortedDictionary<K,V>` /
+// `SortedSet<T>`) are heap objects with a real free obligation, but they are
+// NOT class/interface TYPEDECS — `isClassOrInterfaceResult` reads
+// `rt->declaration->kind`, which a builtin's resolved TypeRef does not carry —
+// so a collection local fell out of the drop-on-overwrite coverage and kept
+// the §28.3 discharge error even though codegen disposes it (see
+// `disposeDisplacedCollectionLocal`, LlvmBackend_Disposal.cpp). The head
+// lists are the registry's single home (`kPlainBuiltinCollectionHeads` /
+// `kOwningCollectionHeads`, §28.3 row 4 / §5.11), so this cannot drift from
+// the type classification the rest of the ownership pass uses.
+//
+// `head` may be empty (an unresolvable head): empty is not a member of either
+// list, so an unreadable head stays on the conservative (keep-the-error) side.
+// // per §28.7, §28.9, §28.3 row 4, v0.315, #5421
+static bool isCollectionTypeHead(std::string_view head) {
+    if (head.empty()) return false;
+    return common::isPlainBuiltinCollectionHead(head) ||
+           common::isOwningCollectionHead(head);
+}
+
+// fix #5421 (§28.7 / §28.9, v0.315): read a TypeRef's head name, tolerating a
+// null TypeRef. `TypeRef::headName()` (sema/TypeRef.hpp:80) already returns
+// empty for every unreadable case; this only wraps the null check so the two
+// call sites in `localDropOnOverwriteCovered` read as one expression.
+// // per §28.7, §28.9, v0.315, #5421
+static std::string_view typeRefHeadName(const sema::TypeRef* rt) {
+    return rt ? rt->headName() : std::string_view{};
+}
+
 // fix-forward #5112 (§28.3 K7.3, v0.307): `isClassOrInterfaceResult` is
 // SHARED by ~8 callers (the K7.3 mixed-meet checks below, the builtin
 // owned-transfer-call classifier, the imported-owned-return classifier,
@@ -6159,10 +6192,24 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     // (LlvmBackend_Disposal.cpp) disposes the displaced value only for a plain
     // owned CLASS/INTERFACE local classified by unwindOwnedLocalClass: a `new
     // ClassType` / owned-returning call / owned-operator / `??`-fresh producer.
-    // Owning collections, owning wrappers (OwningTask/Shared/Weak/…), the Task
-    // family, and subscription locals free through their own runtime calls, not
-    // class dispatch, so their overwrite does NOT dispose the displaced value —
-    // they must keep the discharge error. Mirror that coverage decidably here.
+    // Owning wrappers (OwningTask/Shared/Weak/…), the Task family, and
+    // subscription locals free through their own runtime calls, not class
+    // dispatch, so their overwrite does NOT dispose the displaced value —
+    // they must keep the discharge error. COLLECTIONS were in that exclusion
+    // until #5421: they are the one family whose overwrite codegen now DOES
+    // dispose (disposeDisplacedCollectionLocal, LlvmBackend_Disposal.cpp,
+    // calling bz_dict_free / bz_array_free / bz_llist_free with the slot's own
+    // registered Disposal entry). Withholding them here left the predicate
+    // disagreeing with the code it mirrors in BOTH directions: the excluded
+    // local kept the §28.3 discharge error (so `var a := new Array<int>(10);
+    // a := new Array<int>(20);` in a loop was REJECTED rather than admitted),
+    // and codegen's registration gate (registerUsingDisposal ← autoDropAt-
+    // ScopeEnd, Stmts.cpp) never ran for it, so disposeDisplacedCollection-
+    // Local found no Disposal entry and declined — the displaced value leaked.
+    // §28.7's rule is type-agnostic ("Assignment to an owned field or owned
+    // local disposes the displaced value"), and §28.9 gives the plain builtin
+    // collections the same free obligation as the owning ones. Mirror the
+    // codegen coverage decidably here.
     auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym);
     if (!ls) return false;
     // LOCALDECL-ONLY: `sym` here is always drawn from `reassignedLocals`
@@ -6178,14 +6225,16 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     // becomesOwnedViaReassign marker; a no-initializer local (`var x: T;`) has
     // the same adoption and §28.3 K3.14 warning+auto-drop obligation, but no
     // initializer to mark (spec §28.3 Pattern 2, v0.277). The declared type (not
-    // the `null` initializer's type) is the class/interface; exclude owning
-    // collections, wrappers and tasks (their overwrite does not dispose via
+    // the `null` initializer's type) is the class/interface or the collection;
+    // exclude owning wrappers and tasks (their overwrite does not dispose via
     // class dispatch — codegen's unwindOwnedLocalClass excludes them too),
-    // mirroring the initializer-based checks below. Falls through when not a
-    // covered class/interface local.
+    // mirroring the initializer-based checks below. COLLECTIONS are admitted
+    // (#5421, §28.7 / §28.9): disposeDisplacedCollectionLocal disposes them,
+    // so they no longer keep the discharge error.
     if (ld->becomesOwnedViaReassign || !ld->initializer) {
         const sema::TypeRef* dt =
             ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+        if (dt && isCollectionTypeHead(typeRefHeadName(dt))) return true;
         if (isClassOrInterfaceResult(dt)) {
             std::string_view head =
                 (dt->astNode && dt->astNode->name &&
@@ -6202,6 +6251,14 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     if (!ld->initializer) return false;
     if (producerState(*ld->initializer) != OwnershipState::Owned) return false;
     const sema::TypeRef* t = ctx_.exprType(*ld->initializer);
+    // #5421 (§28.7 / §28.9): the collection arm, mirroring codegen's
+    // disposeDisplacedCollectionLocal (collectionTypeOfLocal /
+    // dictTypeOfLocal / linkedListTypeOfLocal, LlvmBackend_Setup.cpp). Those
+    // read the DECLARED type first and the initializer's type second; the two
+    // arms above read the declared type (`dt`) and the initializer's expr type
+    // (`t`, which for a `new` initializer IS the constructed type), so the
+    // ownership pass admits every local codegen's pass disposes.
+    if (t && isCollectionTypeHead(typeRefHeadName(t))) return true;
     if (!isClassOrInterfaceResult(t)) return false;
     // Positively confirm the value is NOT a collection / wrapper / task by name-
     // head; if the head cannot be read, stay conservative (keep the error).
