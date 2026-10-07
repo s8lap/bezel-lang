@@ -13830,6 +13830,7 @@ static bool isRangeOrderedType(const TypeRef* ty) {
 }
 
 static std::string getTypeNameForOrderingDiag(const TypeRef* ty) {
+    if (!ty) return "?";
     if (ty->kind == TypeRef::Kind::Named && ty->declaration)
         return std::string(ty->declaration->name);
     if (ty->kind == TypeRef::Kind::Unit) return "()";
