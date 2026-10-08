@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.316 — October 2026**
+**Companion to the Bezel Language Specification, v0.317 — October 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -208,7 +208,7 @@ public static class Convert
   public static method TryToBoolean(value: string, out result: bool): bool;
 
   public static method ToString(value: int): string;
-  public static method ToString(value: long): string;                          // elision expanded
+  public static method ToString(value: long): string;
   public static method ToString(value: double): string;
   public static method ToString(value: decimal): string;
   public static method ToString(value: bool): string;
@@ -218,6 +218,8 @@ end Convert;
 ```
 
 The `To*` methods raise `FormatException` when the string is not a well-formed representation of the target type and `OverflowException` when the value does not fit — the same contract as the §9 per-type `Parse` family these conversions mirror; `ToBoolean` accepts exactly `"true"`/`"false"`, case-insensitively (`Boolean.Parse`'s contract, [§9.4](#sec-boolean)). `Try` forms return `false` in exactly the cases the throwing forms would raise; the `out` parameter receives the default value.
+
+Each one-argument `ToString` returns the text the value it receives renders as under its own no-format `ToString()` ([§9](#sec-primitive-type-members); [§2.18](#sec-iformattable) for the round-trip and exact forms and the non-finite spellings), and `ToString(value, toBase)` returns the text `value.ToString(toBase)` returns ([§9.1](#sec-integer-types)): `Convert.ToString(true)` is `"True"` and `Convert.ToString(1.0 / 0.0)` is `"Infinity"`. An argument of any other type is resolved against these parameter types by overload resolution (language spec [§22.6](Bezel_Language_Spec.md#sec-overloading)), and where that selects an overload the text is the converted value's: a `float` converts to `double` alone among them, so `Convert.ToString(0.1f)` is `"0.10000000149011612"` where `0.1f`'s own `ToString()` is `"0.1"`. A `char` and the integer types other than `int` and `long` each convert to two or more of these parameter types and match none exactly, so the call is ambiguous and a compile error (§22.6); the remedy is an explicit cast to one parameter type, or the value's own `ToString()`, which renders it in its own type.
 
 <a id="sec-environment"></a>
 ### 2.4 `Environment`
@@ -5129,7 +5131,7 @@ end Int32;
 
 Records implement `IEquatable<T>` implicitly through the auto-generated equality (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)): `Equals(other: int): bool` exists on `Int32` and is invoked when calling `someInt.Equals(otherInt)` directly or when an `IEquatable<int>`-constrained generic uses `Equals` through the constraint. The same convention applies to every primitive declaration in [§9.1](#sec-integer-types)–[§9.5](#sec-char).
 
-**The radix alphabet.** The digits of radix *r* are the first *r* of `0`–`9` then `A`–`Z`; for the admitted radices that is `0`/`1`, `0`–`7`, `0`–`9`, and `0`–`9` with `A`–`F`. `Parse(s, radix)` and `TryParse(s, radix, …)` accept **either case** of the letter digits — `int.Parse("ff", 16)` and `int.Parse("FF", 16)` are both `255` — under the input grammar the string forms carry throughout: an optional leading `+` or `-`, then one or more digits of that radix, and nothing else; no whitespace, no `0x`/`0b` prefix, no digit separators, and any other input raises `FormatException`, a value outside the type's range raising `OverflowException`. `ToString(radix)` emits the **lower-case** digits — a `-` for a negative value followed by the magnitude's digits most significant first, a single `0` for zero, never a leading zero otherwise — and takes the same radix set, raising `ArgumentException` for any other. The two are therefore inverse: `T.Parse(n.ToString(radix), radix)` is `n` for every value of every integer type and every admitted radix. `Convert.ToString(value, toBase)` ([§2.3](#sec-convert)) emits the same text as `ToString(radix)`.
+**The radix alphabet.** The digits of radix *r* are the first *r* of `0`–`9` then `A`–`Z`; for the admitted radices that is `0`/`1`, `0`–`7`, `0`–`9`, and `0`–`9` with `A`–`F`. `Parse(s, radix)` and `TryParse(s, radix, …)` accept **either case** of the letter digits — `int.Parse("ff", 16)` and `int.Parse("FF", 16)` are both `255` — under the input grammar the string forms carry throughout: an optional leading `+` or `-`, then one or more digits of that radix, and nothing else; no whitespace, no `0x`/`0b` prefix, no digit separators, and any other input raises `FormatException`, a value outside the type's range raising `OverflowException`. `ToString(radix)` emits the **lower-case** digits — a `-` for a negative value followed by the magnitude's digits most significant first, a single `0` for zero, never a leading zero otherwise — and takes the same radix set, raising `ArgumentException` for any other. The two are therefore inverse: `T.Parse(n.ToString(radix), radix)` is `n` for every value of every integer type and every admitted radix. `Convert.ToString(value, toBase)` ([§2.3](#sec-convert)) emits the same text as `ToString(radix)`. The no-format `ToString()`, which an interpolation hole without a format spec uses (language spec [§18.5](Bezel_Language_Spec.md#sec-interpolated-strings)), emits the text `ToString(10)` emits: `(-42).ToString()` is `"-42"`.
 
 The span overloads (#1810) accept exactly the inputs the string forms accept — same `FormatException`/`OverflowException` contract, no whitespace tolerance — over a `ReadOnlyStringSpan` window without materializing a substring; `TryParse` is shape (c) of the §1 Try convention. `IParsable<T>` (§2.19) is unchanged — the span forms are per-type members, not constraint surface. The `ParseOrNull` members are the §1 `*OrNull` convenience tier's parse form — string input only, no radix or span duals — and share the span forms' per-type, non-constraint status.
 

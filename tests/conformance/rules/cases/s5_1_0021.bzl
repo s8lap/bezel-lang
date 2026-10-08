@@ -3,7 +3,7 @@
 //! section: 5.1
 //! title: a value type implicitly converts to Object by boxing
 //! rule: Reference conversions are implicit: any type to Object — value types
-//!   (primitives, records, enums, non-owning inline arrays, the unit type) by
+//!   (primitives, records, enums, choices, non-owning inline arrays, the unit type) by
 //!   boxing.
 //! cites: 5.1, 8.6
 //! expect: accept
