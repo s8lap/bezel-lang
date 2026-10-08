@@ -1,4 +1,4 @@
-# # Observed verdicts, banked by runner.py. A `fail` row is a recorded divergence between the spec and the implementation, not a case to edit. See README.md.
+# Observed verdicts, banked by runner.py. A `fail` row is a recorded divergence between the spec and the implementation, not a case to edit. See README.md.
 case-id	verdict	note
 s1_3_0001	pass	
 s1_3_0002	pass	
@@ -351,10 +351,10 @@ s9_7_0023	fail	#5649
 s9_7_0024	fail	#5649
 s9_7_0025	fail	#5649
 s9_7_0026	pass	
-s9_7_0027	fail	#5659
-s9_7_0028	fail	#5659
-s9_7_0029	fail	#5659
-s9_7_0030	fail	#5659
+s9_7_0027	pass	#5659
+s9_7_0028	pass	#5659
+s9_7_0029	pass	#5659
+s9_7_0030	pass	#5659
 s9_8_0001	pass	
 s9_8_0002	pass	
 s9_8_0003	pass	
