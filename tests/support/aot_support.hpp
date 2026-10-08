@@ -1934,7 +1934,8 @@ struct BuildIdentity {
     std::array<uint8_t, 32> compiler{};   // core.a (guarded) or /proc/self/exe
     std::array<uint8_t, 32> runtime{};    // libbezel_runtime.a; valid iff splitUsable
     std::array<uint8_t, 32> toolchain{};  // per #3006: clang/ld/libLLVM; required
-    std::array<uint8_t, 32> combined{};   // SHA-256(compiler ‖ runtime ‖ toolchain)
+    std::array<uint8_t, 32> bezelc{};     // per #4908: the bezelc driver binary
+    std::array<uint8_t, 32> combined{};   // SHA-256(compiler ‖ runtime ‖ toolchain ‖ bezelc)
 };
 
 inline const BuildIdentity& buildIdentity() {
@@ -2068,6 +2069,17 @@ inline const BuildIdentity& buildIdentity() {
         // it; K1/K2 fold it in via their own composers (the emitted object
         // depends on the libLLVM backend, the link on clang/ld).
         h.update(llvm::ArrayRef<uint8_t>(tcHash.data(), tcHash.size()));
+        // per #4908: the bezelc DRIVER BINARY is the compiler, not libbezel_core.a.
+        // The archive is an input to the driver, but the driver itself — its own
+        // code and any metadata — can change without rebuilding the archive. The KE
+        // key must carry the driver identity or a branch switch that replaces the
+        // driver binary (without rebuilding the archive) serves a cached executable
+        // produced by the old driver. Fail closed: if the driver binary cannot be
+        // hashed, the cache is unusable.
+        std::array<uint8_t, 32> bzHash{};
+        if (!sha256File(BEZELC_PATH, bzHash)) return out;  // unusable — fail CLOSED
+        out->bezelc = bzHash;
+        h.update(llvm::ArrayRef<uint8_t>(bzHash.data(), bzHash.size()));
         out->combined = h.final();
         out->usable = true;
         // The two-level split is only sound when the runtime archive the link
@@ -2083,8 +2095,9 @@ inline const BuildIdentity& buildIdentity() {
     return *id;
 }
 
-// SHA-256(compiler ‖ runtime ‖ toolchain) — the k2 exe key's identity
-// component (per #3006 the toolchain — clang/ld/libLLVM — is folded in).
+// SHA-256(compiler ‖ runtime ‖ toolchain ‖ bezelc) — the k2 exe key's identity
+// component (per #3006 the toolchain — clang/ld/libLLVM — is folded in; per #4908
+// the bezelc driver binary is also folded in).
 // Returns nullptr if no identity input can be hashed: with no sound compiler
 // identity the cache DISABLES itself rather than risk a stale hit.
 inline const std::array<uint8_t, 32>* combinedIdentity() {

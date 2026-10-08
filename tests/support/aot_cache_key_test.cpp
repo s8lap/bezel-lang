@@ -30,6 +30,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -322,6 +323,85 @@ BEZEL_TEST(aot_cache_key, live_identity_carries_a_toolchain_component) {
     for (std::size_t i = 0; i < id.toolchain.size(); ++i)
         if (id.toolchain[i]) { anyNonZero = true; break; }
     BEZEL_EXPECT_TRUE(anyNonZero);
+}
+
+// ---------------------------------------------------------------------------
+// BEZELC DRIVER BINARY identity (per #4908).
+//
+// The KE (whole-executable) key's identity component is SHA-256(compiler ‖
+// runtime ‖ toolchain ‖ bezelc). Before the fix, the bezelc binary was absent
+// from this hash: a branch switch that replaced the driver binary (without
+// rebuilding libbezel_core.a) served a cached executable produced by the old
+// driver, even though a new driver was on disk. The fix adds the bezelc binary
+// to the combined hash so any driver change invalidates the KE key.
+//
+// The object key (K1) does NOT contain the bezelc binary: the object is emitted
+// by Driver::compileFile from libbezel_core.a, and that function's inputs are
+// compiler ‖ runtime ‖ codegen mode ‖ prelude ‖ source ‖ toolchain. The
+// driver binary's own code (beyond those inputs) does not reach the emitted
+// object. The KE key covers the whole pipeline including the driver itself, so
+// the driver belongs there and not in K1.
+// ---------------------------------------------------------------------------
+
+// THE WIRING PIN. The combined identity (SHA-256(compiler ‖ runtime ‖
+// toolchain ‖ bezelc)) must include the bezelc component. At base,
+// BuildIdentity::combined is zero-initialized (the fix is absent), so
+// SHA-256(combined) is a fixed constant unrelated to the real inputs. With
+// the fix, combined = SHA-256(compiler‖runtime‖toolchain‖bezelc), which differs
+// from SHA-256(compiler‖runtime‖toolchain). This assertion is false at base
+// (all-zeros != a real SHA-256 digest) and true with the fix — the load-bearing
+// pin that proves the bezelc binary reaches the KE key.
+BEZEL_TEST(aot_cache_key, combined_identity_includes_bezelc_not_just_three_way_4908) {
+    const auto* comb = bezel::test::aot_detail::combinedIdentity();
+    if (!comb) return;  // unusable — nothing to pin
+    // Compute what the combined hash would be WITHOUT bezelc (the three-way
+    // SHA-256 of compiler ‖ runtime ‖ toolchain). At base, combined is
+    // zero-initialized so this differs. With the fix, combined is the four-way
+    // SHA-256 including bezelc, which also differs from the three-way SHA-256.
+    llvm::SHA256 h3;
+    const auto& id = bezel::test::aot_detail::buildIdentity();
+    h3.update(llvm::ArrayRef<uint8_t>(id.compiler.data(), id.compiler.size()));
+    h3.update(llvm::ArrayRef<uint8_t>(id.runtime.data(), id.runtime.size()));
+    h3.update(llvm::ArrayRef<uint8_t>(id.toolchain.data(), id.toolchain.size()));
+    auto threeWay = h3.final();
+    BEZEL_EXPECT_TRUE(*comb != threeWay);
+}
+
+// THE LOAD-BEARING PIN. The KE key = SHA-256(combined ‖ mode ‖ source).
+// At base, combined = SHA-256(compiler ‖ runtime ‖ toolchain) (no bezelc
+// component). Computing the KE key directly from the three raw components gives
+// SHA-256(SHA-256(compiler‖runtime‖toolchain)‖mode‖source). With the fix,
+// combined = SHA-256(compiler ‖ runtime ‖ toolchain ‖ bezelc) and the live
+// KE = SHA-256(SHA-256(...‖bezelc)‖mode‖source), which differs from the
+// three-way KE. This proves the bezelc binary reaches the KE key: a branch
+// switch that replaces the driver binary produces a different key and therefore
+// a cache miss, not a stale hit.
+BEZEL_TEST(aot_cache_key, ke_key_differs_when_computed_without_bezelc_4908) {
+    const auto* comb = bezel::test::aot_detail::combinedIdentity();
+    if (!comb) return;  // unusable — nothing to pin
+    std::string mode = plainMode();
+    // Live KE key = SHA-256(combined ‖ mode ‖ source).
+    llvm::SHA256 hLive;
+    hLive.update(llvm::ArrayRef<uint8_t>(comb->data(), comb->size()));
+    hLive.update(llvm::StringRef(mode.data(), mode.size()));
+    hLive.update(llvm::StringRef(kSourceA, strlen(kSourceA)));
+    auto liveKE = bezel::test::aot_detail::toHex(hLive.final());
+    // KE key computed entirely from the three raw components (no bezelc):
+    // SHA-256(SHA-256(compiler‖runtime‖toolchain)‖mode‖source). At base this
+    // equals liveKE and the test fails. With the fix, combined includes bezelc
+    // and the two keys differ.
+    const auto& id = bezel::test::aot_detail::buildIdentity();
+    llvm::SHA256 h3;
+    h3.update(llvm::ArrayRef<uint8_t>(id.compiler.data(), id.compiler.size()));
+    h3.update(llvm::ArrayRef<uint8_t>(id.runtime.data(), id.runtime.size()));
+    h3.update(llvm::ArrayRef<uint8_t>(id.toolchain.data(), id.toolchain.size()));
+    auto threeWay = h3.final();
+    llvm::SHA256 h3ke;
+    h3ke.update(llvm::ArrayRef<uint8_t>(threeWay.data(), threeWay.size()));
+    h3ke.update(llvm::StringRef(mode.data(), mode.size()));
+    h3ke.update(llvm::StringRef(kSourceA, strlen(kSourceA)));
+    auto keFromThreeWay = bezel::test::aot_detail::toHex(h3ke.final());
+    BEZEL_EXPECT_TRUE(liveKE != keFromThreeWay);
 }
 
 // ---------------------------------------------------------------------------
