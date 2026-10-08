@@ -7367,6 +7367,19 @@ sema::Symbol* MethodOwnership::carriedBorrowSourceOfValueExpr(
     // arguments. Check each argument for an escape-bound local source; a
     // deferred-activation call carries its arguments' borrows in a frame with
     // its own lifetime rules, so return nullptr there. // per §9.7, v0.326
+    //
+    // fix #5627 review: this arm must NOT swallow the member-call receiver.
+    // Returning `nullptr` when no ARGUMENT yields a source captured the
+    // arg-less factory call too — `s := buf.AsSpan()` is a CallExpr with zero
+    // args, so the loop found nothing and the arm returned before the
+    // `identifierRoot` member-chain leg below, which is the leg #4679's four
+    // span rows are decided by. That silently un-rejected §9.7 bullet 1 for
+    // every builtin span (the corpus row l4_14_0001, `expect: reject`, went to
+    // rc=0 and the binary SEGV'd reading the freed buffer). FALL THROUGH to
+    // that leg instead when no argument yields a source: it is exactly the
+    // pre-#5627 path for every call whose borrow rides the receiver, so
+    // admitting a source here can only restore a rejection the rule already
+    // made, never invent one. // per §9.7, v0.326; fix #4679
     if (const auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (isDeferredActivationCallResult(e)) return nullptr;
         for (const auto& a : call->args) {
@@ -7376,7 +7389,8 @@ sema::Symbol* MethodOwnership::carriedBorrowSourceOfValueExpr(
             sema::Symbol* s = ctx_.exprSymbol(*argRoot);
             if (s && isEscapeBoundLocal(s)) return s;
         }
-        return nullptr;
+        // No escaping argument: fall through to the member-chain leg rather
+        // than returning nullptr (see the review note above).
     }
     const ast::IdentifierExpr* root = identifierRoot(e);
     if (!root) return nullptr;
@@ -10168,7 +10182,19 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             const int td = targetLocal->decl ? depthOfDecl(targetLocal->decl) : -1;
             const int sd = viewSrc->decl ? depthOfDecl(viewSrc->decl) : -1;
             if (td >= 0 && sd >= 0 && td < sd) {
-                const bool spanForm = !isBorrowBearingRecordOrSpan(
+                // fix #5627 review (v0.326): read the span form off the
+                // BUILTIN-span predicate, not off isBorrowBearingRecordOrSpan.
+                // Or-Span deliberately admits Span / ReadOnlySpan / ArraySpan /
+                // ReadOnlyArraySpan (§9.7 reads each as a borrow-bearing record),
+                // so `!OrSpan` is FALSE for a builtin span and printed the
+                // RECORD wording where #4679's rows pin the span wording. The
+                // diagnostic's two forms split on "is this one of the four
+                // builtin span views", which is exactly isBuiltinSpanTypeRef
+                // (and it is the #3022/#2997-hardened one). An inline array of
+                // borrow-bearing records is not a builtin span, so it takes the
+                // record wording — the #5627 classification this flag was
+                // widened for, without reclassifying spans.
+                const bool spanForm = isBuiltinSpanTypeRef(
                     ctx_.exprType(*as.value));
                 report(
                     Severity::Error, as.span.begin,
