@@ -1,4 +1,4 @@
-# Observed verdicts, banked by runner.py. A `fail` row is a recorded divergence between the spec and the implementation, not a case to edit. See README.md.
+# # Observed verdicts, banked by runner.py. A `fail` row is a recorded divergence between the spec and the implementation, not a case to edit. See README.md.
 case-id	verdict	note
 s1_3_0001	pass	
 s1_3_0002	pass	
@@ -539,10 +539,10 @@ s14_2_0019	pass
 s14_2_0020	pass	
 s14_2_0021	fail	compiled but spec rejects this (unconstrained T in interface impl)
 s14_2_0022	pass	
-s14_2_0023	fail	rejects, but on a parse error (expected ] to close collection literal) in the case body, not on the rule it means to pin — case file needs a syntax fix
+s14_2_0023	pass	fix #5640
 s14_2_0024	pass	
-s14_2_0025	fail	rejects, but on a parse error (expected ] to close collection literal) in the case body, not on the rule it means to pin — case file needs a syntax fix
-s14_2_0026	fail	syntax errors: expected ] and other parse errors
+s14_2_0025	pass	fix #5640
+s14_2_0026	pass	fix #5640
 s14_2_0027	pass	
 s14_2_0028	pass	
 s14_4_0001	pass	
@@ -2287,4 +2287,3 @@ l10_5_0002	fail	divergence
 l10_5_0003	pass	
 l10_6_0001	fail	divergence
 l10_6_0002	pass	
-case-id	verdict	note
