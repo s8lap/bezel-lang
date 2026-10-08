@@ -49,8 +49,7 @@ static void bz_free_static_event_sources(void) {
     if (!g_static_event_sources) return;
     for (bz_event_source_t* s : *g_static_event_sources) {
         if (!s) continue;
-        free(s->handlers);
-        free(s);
+        bz_event_source_free(s);
     }
     delete g_static_event_sources;
     g_static_event_sources = nullptr;
@@ -293,6 +292,24 @@ extern "C" void bz_subscription_dispose(void* subp) {
 extern "C" void bz_event_source_free(void* srcp) {
     auto* s = (bz_event_source_t*)srcp;
     if (!s) return;
+    // fix #4976 (stdlib §6.5 v0.315): per §24 / §27.5 / #841, the source OWNS
+    // exactly one reference on every registered handler closure — codegen's
+    // bz_event_add / bz_event_subscribe hand it a transferred +1 the source
+    // must release exactly once. Before this fix bz_event_source_free only
+    // freed the handler array and the struct, leaking every still-active
+    // handler closure. Iterate and release each non-null closure: bz_event_add
+    // stores a non-null pointer, `bz_subscription_dispose` nulls the closure
+    // before releasing its +1 (so a subscription-disposed handler is already
+    // accounted for), and `bz_event_remove_closure` (Remove / `-=`) only
+    // deactivates without nulling — its matched handler must be released
+    // here (or earlier, in the same statement, by the #4970 caller-side fix).
+    for (int64_t i = 0; i < s->count; ++i) {
+        void* cl = s->handlers[i].closure;
+        if (cl) {
+            s->handlers[i].closure = nullptr;
+            bz_closure_release(cl);
+        }
+    }
     free(s->handlers);
     free(s);
 }
