@@ -6536,6 +6536,37 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // are excluded (their borrow-lifetime model is frame-based, not scope-based).
     if (const auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (isDeferredActivationCallResult(e)) return;
+        // fix #4811 (§9.7, v0.330): a CallExpr whose callee is a member-access
+        // expression — e.g. `return local.AsSpan()` — carries the borrow in the
+        // RECEIVER, not in any argument, so the argument scan below (which is
+        // what this arm ends in) misses it and the whole expression was
+        // admitted: the `return` at the end of this block is unconditional, so
+        // nothing downstream ever re-read the receiver. `identifierRoot` peels
+        // the call/member/index chain to that receiver and null-guards each
+        // link, so `buf.AsSpan()`, `buf.AsSpan(2..5)` and `s.Slice(1)` all land
+        // here with the receiver root.
+        //
+        // The parameter root is decided first (#4428), ahead of the scope-bound
+        // owned local, as the projection branch below does — §9.7's closing
+        // text rejects both ("a borrow of a scope-bound local, of a `using
+        // var`, of an `owned` parameter … and … of a plain parameter of the
+        // returning method"). Neither reporting branch returns unless it
+        // reported: a receiver that is neither (a `this` root, a static-field
+        // root, a module path) falls through to the argument scan, so a call
+        // whose borrow rides an ARGUMENT is still decided there. // per §9.7
+        if (const ast::IdentifierExpr* recvRoot = identifierRoot(e)) {
+            if (sema::Symbol* s = ctx_.exprSymbol(*recvRoot)) {
+                if (methodParamSet_.count(s)) {
+                    if (reportIfParameterRoot(recvRoot, e.span.begin,
+                                              /*spanForm=*/typeIsSpan))
+                        return;
+                } else if (isEscapeBoundLocal(s)) {
+                    reportCarriedSource(s, e.span.begin,
+                                        /*spanForm=*/typeIsSpan);
+                    return;
+                }
+            }
+        }
         // Helper: find an escape-bound local source in a NewExpr's arguments.
         // Mirrors carriedBorrowSourceOfValueExpr's NewExpr arm but with recursive
         // tracing for nested non-identifier args.
