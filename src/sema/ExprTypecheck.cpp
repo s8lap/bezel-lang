@@ -483,19 +483,51 @@ void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
         if (targetArgs.size() != rt->genericArgs.size()) continue;
         for (std::size_t i = 0; i < targetArgs.size(); ++i) {
             const auto& ga = targetArgs[i];
-            // §26.4: a bare, non-nullable, single-segment identifier with no
-            // generic args of its own is a free type-parameter position; a
-            // concrete or nested argument at this position is not (and is
-            // not walked recursively here — see the declaration's Scope note).
-            if (!ga || ga->kind != ast::TypeKind::Named || !ga->name ||
-                ga->name->parts.size() != 1 || ga->nullable ||
-                !ga->genericArgs.empty())
-                continue;
-            std::string_view paramName = ga->name->parts[0];
             TypeRef* arg = rt->genericArgs[i];
-            if (!arg) continue;
-            recordGenericInstantiationSite(ed, paramName, arg,
-                                           argNameOf(arg), ne.span.begin);
+            if (!ga || !arg) continue;
+            // fix #3910 (§26.4, v0.315): the original guard rejected any arg
+            // with nested generic args (the `!ga->genericArgs.empty()` clause)
+            // and therefore never walked to find a bare type-parameter at a
+            // nested position (e.g. `T` in `extension Box<Array<T>>`). §26.4's
+            // "any nesting depth" rule requires walking to ALL depth, not just
+            // the top level. Now recurses into nested generic args to bind a
+            // free type-parameter at any depth.
+            std::function<void(const ast::Type*, TypeRef*)> walkNestedPosition;
+            walkNestedPosition = [&](const ast::Type* targetArg,
+                                    TypeRef* instantiatedArg) {
+                if (!targetArg ||
+                    targetArg->kind != ast::TypeKind::Named ||
+                    !targetArg->name ||
+                    targetArg->name->parts.size() != 1 ||
+                    targetArg->nullable)
+                    return;
+                if (targetArg->genericArgs.empty()) {
+                    // §26.4: a bare, non-nullable, single-segment identifier
+                    // with no generic args of its own is a free type-parameter
+                    // position.
+                    std::string_view paramName = targetArg->name->parts[0];
+                    recordGenericInstantiationSite(ed, paramName, instantiatedArg,
+                                                   argNameOf(instantiatedArg),
+                                                   ne.span.begin);
+                } else {
+                    // Has nested generic args — recurse to find bare params
+                    // at deeper positions. The positional correspondence: each
+                    // nested generic arg's position in `targetArg->genericArgs`
+                    // maps to the same position in `instantiatedArg->genericArgs`
+                    // (which may itself be Named, InlineArray, Primitive, etc.).
+                    for (std::size_t j = 0;
+                         j < targetArg->genericArgs.size() &&
+                         j < instantiatedArg->genericArgs.size();
+                         ++j) {
+                        const auto& nestedTarget =
+                            targetArg->genericArgs[j];
+                        if (nestedTarget)
+                            walkNestedPosition(nestedTarget.get(),
+                                             instantiatedArg->genericArgs[j]);
+                    }
+                }
+            };
+            walkNestedPosition(ga.get(), arg);
         }
     }
 }
@@ -17493,6 +17525,23 @@ void ExprTC::visitMember(const ast::Member& m) {
                             // its exprType by the `setExprType` above, which
                             // is what the check reads.
                             checkBuiltinClosedConstructorSurface(*shNe);
+                            // fix #3910 (§17.11 / §3.6 rule 2, v0.315): the
+                            // explicit `new T(...)` arm records the instantiation
+                            // site at a class/record construction
+                            // (recordDefaultObligationsForConstruction,
+                            // ExprTypecheck.cpp); the §17.7 `new()` shorthand
+                            // was not instrumented, so a class-level or
+                            // extension-level `default(T)` obligation was not
+                            // discharged at a field-initializer shorthand
+                            // construction site. Instrument it now.
+                            if (fty->declaration &&
+                                (fty->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 fty->declaration->kind ==
+                                     ast::TypeDeclKind::Record)) {
+                                recordDefaultObligationsForConstruction(
+                                    *shNe, fty->declaration, fty);
+                            }
                         }
                     }
                 }
@@ -19213,6 +19262,24 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // above — `var g: Guid := new();` is `new Guid()`
                             // with the type taken from the declared target.
                             checkBuiltinClosedConstructorSurface(*shNe);
+                            // fix #3910 (§17.11 / §3.6 rule 2, v0.315): the
+                            // explicit `new T(...)` arm records the instantiation
+                            // site at a class/record construction
+                            // (recordDefaultObligationsForConstruction,
+                            // ExprTypecheck.cpp); the §17.7 `new()` shorthand
+                            // was not instrumented, so a class-level or
+                            // extension-level `default(T)` obligation was not
+                            // discharged at a local-declaration shorthand
+                            // construction site. Instrument it now.
+                            if (lsym->declType->declaration &&
+                                (lsym->declType->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 lsym->declType->declaration->kind ==
+                                     ast::TypeDeclKind::Record)) {
+                                recordDefaultObligationsForConstruction(
+                                    *shNe, lsym->declType->declaration,
+                                    lsym->declType);
+                            }
                         }
                     }
                 }
