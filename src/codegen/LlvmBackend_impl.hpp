@@ -13063,6 +13063,89 @@ private:
     // the TypeRef when astNode is null (they inspect the TypeRef via its own
     // name-detection logic), so the same predicates work for imported fields once
     // the TypeRef is obtained from the correct source.
+    // fix #5652 (§15.1.1 / §15.3 / §9.4 / §28.8.1, v0.328, proposal 0143): the
+    // resolved type of `fs` when it is an OWNING inline-array field — `[N
+    // owned]T` / `[N owned]T?` — otherwise null. The move-only value-type FIELD
+    // twin of the local predicate `rt->kind == InlineArray && rt->arrayOwned`
+    // used by registerInlineOwnedArrayDisposal and lowerOwningInlineArrayReassign.
+    //
+    // It exists because the three whole-value-move arms in lowerUnary gate their
+    // field-slot nulling on isOwnedReferenceField / isOwnedIteratorInterfaceField
+    // / ownedCollectionFieldType, and NONE of them admits an inline-array field:
+    // they all require `hasOwnedModifier` and a `Named` TypeRef, whereas an
+    // owning inline array is an InlineArray TypeRef carrying its ownership in
+    // the `owned` marker INSIDE the brackets, not as a field modifier. Their
+    // bodies then narrow further to `fty->isPointerTy()`, and the field's
+    // storage is an inline `[N x ptr]` aggregate (lowerTypeRef), never a
+    // pointer. So no arm fired and the field kept the moved-out pointers.
+    //
+    // §22.10 / #1594: a captured `owned` primary-ctor parameter is not a field
+    // slot (fs->decl is the owning TypeDecl, not a FieldDecl), so the FieldDecl
+    // path can never classify it — the posParam bail mirrors
+    // ownedCollectionFieldType's.
+    //
+    // #662 foundation B: an IMPORTED field (fs->decl == nullptr) takes its
+    // type from ctx_.importedMemberType(fs), mirroring ownedCollectionFieldType.
+    const sema::TypeRef* owningInlineArrayFieldType(
+        const sema::FieldSymbol* fs) {
+        if (!fs) return nullptr;
+        if (fs->posParam) return nullptr;
+        const sema::TypeRef* rt = nullptr;
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return nullptr;
+            rt = ctx_.resolvedType(*fd->type);
+        }
+        if (!rt || rt->kind != sema::TypeRef::Kind::InlineArray ||
+            !rt->arrayOwned)
+            return nullptr;
+        return rt;
+    }
+
+    // fix #5652 (§15.1.1 / §15.3 / §9.4 / §28.8.1, v0.328, proposal 0143): the
+    // value a whole-value `move` must leave in a moved-out field's storage. A
+    // pointer-typed owned field (class/interface reference, builtin iterator
+    // frame, owning-collection handle) discharges by storing null. An OWNING
+    // INLINE ARRAY field discharges by storing null into EVERY slot: the spec's
+    // rule is that the move "leaves the field's storage in §9.4's disposed
+    // state until the restoration store" (§15.1.1, §15.3 *Local lifetime*),
+    // and every pass that reads the slots back —
+    // emitOwnedFieldDisposals' `ioaf` loop and lowerOwningInlineArrayReassign's
+    // `ioar` loop on the restoration store — null-guards each slot
+    // individually, so N nulls is exactly the "empty" state.
+    //
+    // Storing one aggregate null over an `[N x ptr]` field would be a
+    // struct-typed store of a `ptr`-typed constant — malformed IR — so the N
+    // per-slot stores are what the shape requires.
+    //
+    // Only OWNING arrays are routed here (the caller gates on
+    // owningInlineArrayFieldType): a non-owning inline array (`[N]T` without
+    // `owned`) is copyable and its slots are borrows or values, never a
+    // disposal obligation, so nulling them would fabricate a §9.4 disposed
+    // state where the spec requires a copy (§15.1 "Move-only membership
+    // follows from structure").
+    void nullMovedFieldStorage(llvm::Value* addr, llvm::Type* fty) {
+        if (!addr || !fty) return;
+        if (fty->isPointerTy()) {
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 addr);
+            return;
+        }
+        auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(fty);
+        if (!arrTy) return;
+        if (!arrTy->getElementType()->isPointerTy()) return;
+        unsigned n = arrTy->getNumElements();
+        for (unsigned i = 0; i < n; ++i) {
+            llvm::Value* slot = builder_.CreateInBoundsGEP(
+                arrTy, addr, {builder_.getInt32(0), builder_.getInt32(i)},
+                "mv.nullslot");
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 slot);
+        }
+    }
+
     const sema::TypeRef* ownedCollectionFieldType(const sema::FieldSymbol* fs) {
         // §22.10 (v0.180) / #1594: a captured `owned` primary-ctor parameter
         // of a concretely-typed owning-collection (e.g. `owned v: OwningArray

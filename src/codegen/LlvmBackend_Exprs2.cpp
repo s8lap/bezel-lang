@@ -863,6 +863,27 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                                 llvm::ConstantPointerNull::get(ptrTy()), addr);
                     }
                 }
+                // fix #5652 (§15.1.1 / §15.3 / §9.4 / §28.8.1, v0.328, proposal
+                // 0143): the OWNING INLINE ARRAY field, which the arm above
+                // cannot reach. Vacating every slot is what makes the disposal
+                // exactly-once: the §28.7 drop-on-overwrite at the restoration
+                // store and the owner's own per-slot dispose pass both
+                // null-guard each slot, so empty slots are skipped and the
+                // taker stays the sole owner.
+                // MEASURED without this: heap-use-after-free in
+                // bz$Conf.Holder$DisposeCore (ASan) — the restoration store
+                // disposed a slot the taker still owned and the taker's
+                // scope-end disposal freed it again.
+                //
+                // `!emittingDisposerBody_` mirrors the gate above for the same
+                // reason: inside a destructor the sole disposal site for an
+                // owned field is the auto-dispose pass, so vacating here would
+                // make it skip a still-owned slot (a leak).
+                if (owningInlineArrayFieldType(fs) && !emittingDisposerBody_) {
+                    llvm::Type* fty = nullptr;
+                    if (llvm::Value* addr = implicitFieldAddr(*id, fty))
+                        nullMovedFieldStorage(addr, fty);
+                }
             }
         } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                        moveSrc)) {
@@ -892,7 +913,16 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                     ctx_.exprSymbol(*ma));
                 fs && (isOwnedReferenceField(fs) ||
                        isOwnedIteratorInterfaceField(fs) ||
-                       ownedCollectionFieldType(fs) != nullptr) &&
+                       ownedCollectionFieldType(fs) != nullptr ||
+                       // fix #5652 (§15.1.1 / §15.3, v0.328): the QUALIFIED
+                       // twin of the bare-form arm added below, and the form
+                       // the three s15_1_1_000x conformance cases use
+                       // (`var t := move h.Slots;`). An owning inline array is
+                       // stored inline, so the three pointer-typed predicates
+                       // miss it and neither arm's `isPointerTy()` test can
+                       // fire; without widening the guard no arm is reached for
+                       // it at all.
+                       owningInlineArrayFieldType(fs) != nullptr) &&
                 fs->parent && !emittingDisposerBody_) {
                 auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     ma->target.get());
@@ -926,7 +956,17 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                     auto idxIt = fieldIndex_.find(fs);
                     if (idxIt != fieldIndex_.end()) {
                         llvm::StructType* st = classStruct(fs->parent);
-                        if (st && st->getElementType(idxIt->second)
+                        // fix #5652 (§15.1.1 / §15.3, v0.328): an owning inline
+                        // array's struct member is an `[N x ptr]`, so the
+                        // `isPointerTy()` test cannot fire for it. Vacate
+                        // every slot — the multi-slot twin of the store below,
+                        // which stays as the fall-through for every other kind.
+                        if (st && owningInlineArrayFieldType(fs)) {
+                            llvm::Value* addr = builder_.CreateStructGEP(
+                                st, currentThis_, idxIt->second);
+                            nullMovedFieldStorage(
+                                addr, st->getElementType(idxIt->second));
+                        } else if (st && st->getElementType(idxIt->second)
                                       ->isPointerTy()) {
                             llvm::Value* addr = builder_.CreateStructGEP(
                                 st, currentThis_, idxIt->second);
@@ -957,7 +997,12 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                     // receiver inside fieldAddr is an idempotent pointer load.
                     llvm::Type* fty = nullptr;
                     if (llvm::Value* addr = fieldAddr(*ma, fty)) {
-                        if (fty && fty->isPointerTy())
+                        // fix #5652 (§15.1.1 / §15.3, v0.328): vacate every slot
+                        // of an owning inline-array field; the pointer-typed
+                        // store stays as the fall-through.
+                        if (owningInlineArrayFieldType(fs))
+                            nullMovedFieldStorage(addr, fty);
+                        else if (fty && fty->isPointerTy())
                             builder_.CreateStore(
                                 llvm::ConstantPointerNull::get(ptrTy()), addr);
                     }
