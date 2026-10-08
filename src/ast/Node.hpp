@@ -90,8 +90,11 @@ struct DestructuringPattern;
 // A.4 / §A.5 Argument: `ArgModifiers? (Identifier ":=")? ArgExpression`
 struct CallArgument {
     std::string_view modifier;  // "", "ref", "out", "out var",
-                                // "out using var", "out owned", "owned",
+                                // "out using var", "out owned",
                                 // "scoped" (v0.180, §22.3/§28.14, #1439)
+                                // Note: bare "owned" was removed at argument
+                                // position per §A.4 / proposal 0090 (v0.246);
+                                // use `move x` to transfer ownership.
     std::string_view name;      // "" when no `Identifier :=` named-arg prefix
     bool isDiscard = false;
     std::unique_ptr<Expr> value; // null when isDiscard

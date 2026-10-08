@@ -35,7 +35,9 @@
 //     accepted and double-owned (row T8).
 //   * Conversely `this(owned x)` was REJECTED with "this parameter position
 //     does not take ownership" — naming a position that IS `owned`. So no
-//     correct spelling of the transfer existed.
+//     correct spelling of the transfer existed. (After v0.246 / proposal 0090,
+//     bare `owned` at argument position is a parse error; `move` is the
+//     correct transfer marker at chain arguments.)
 //
 // ── THE BRIEF WAS NARROWER THAN THE DEFECT ─────────────────────────────────
 //
@@ -158,11 +160,12 @@ const char* kPrimaryOwned =
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
-// T1 — ACCEPT, ASan/LSan, 200 iterations. `this(owned x)` into an `owned`
-// §22.10 PRIMARY-constructor parameter. This is the spelling issue 3751 says
-// had NO correct form: pre-fix it was rejected outright.
-// FAIL-WITHOUT: compile error "the `owned` call-site marker is only valid on an
-// argument to an `owned` parameter" (measured on a31fb7b).
+// T1 — ACCEPT, ASan/LSan, 200 iterations. `this(move x)` into an `owned`
+// §22.10 PRIMARY-constructor parameter. The grammar change (v0.246 /
+// proposal 0090) removed bare `owned` at argument position; `move` is the
+// correct transfer marker.
+// FAIL-WITHOUT: parse error "invalid use of 'owned' at argument position" on
+// `this(owned x)` (measured on 5e423834).
 // The convenience constructor carries a trailing `salt: int` so its parameter
 // list differs from the primary's `(owned r: Res)`: #5132 (§9.3 / §11.3 /
 // §22.6, v0.313) rejects a body constructor with the primary's parameter list
@@ -179,7 +182,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         "class Base(owned r: Res) "
         "  private owned _s: Res := r; "
         "  public constructor(owned x: Res, salt: int) "
-        "    this(owned x); "
+        "    this(move x); "
         "  end constructor; "
         "  public method Id(): int "
         "    return _s.Id(); "
@@ -288,7 +291,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// T4 — ACCEPT, ASan/LSan, 200 iterations. `this(owned x)` chaining to an
+// T4 — ACCEPT, ASan/LSan, 200 iterations. `this(move x)` chaining to an
 // explicit SIBLING constructor with an `owned` parameter — NOT a primary
 // constructor. Issue 3751 attributes the hole to the primary's missing
 // `ConstructorSymbol`; this row is the evidence that the defect was in the
@@ -306,7 +309,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         "    _s := r; "
         "  end constructor; "
         "  public constructor(owned x: Res, tag: bool) "
-        "    this(owned x); "
+        "    this(move x); "
         "  end constructor; "
         "  public method Id(): int "
         "    return _s.Id(); "
@@ -358,7 +361,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// T6 — ACCEPT, ASan/LSan, 200 iterations. `base(owned x)` into a BASE class's
+// T6 — ACCEPT, ASan/LSan, 200 iterations. `base(move x)` into a BASE class's
 // `owned` constructor parameter — §12.8's other chain form, same predicate.
 // ═══════════════════════════════════════════════════════════════════════════
 // per §12.8 ("A derived class's constructor may chain to a base constructor") /
@@ -376,7 +379,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         "end P; "
         "class D: P "
         "  public constructor(owned x: Res) "
-        "    base(owned x); "
+        "    base(move x); "
         "  end constructor; "
         "end D; "
         "class C "
@@ -532,12 +535,10 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
 
 // ═══════════════════════════════════════════════════════════════════════════
 // T11 — REJECT PRESERVED. The `owned` call-site marker written at a chain whose
-// target parameter is PLAIN stays rejected: the spurious-marker rule is what
-// keeps the fix from being a blanket "accept `owned` at any chain". Pre-fix
-// this was rejected too — but for the wrong reason (no formals at all), so the
-// rejection was indistinguishable from the WRONG rejection of `this(owned x)`
-// against an `owned` slot. After the fix the two are decided by the target's
-// actual modifier.
+// target parameter is PLAIN stays rejected: the grammar change (v0.246 /
+// proposal 0090) removed bare `owned` at argument position, so the parse error
+// fires before any sema analysis. The test verifies the rejection is still
+// reported (now as a parse error, not a sema error).
 // ═══════════════════════════════════════════════════════════════════════════
 // per §22.3 ("writing it ... on a non-`owned` parameter position is likewise an
 // error"), issue #3751
@@ -553,7 +554,7 @@ BEZEL_TEST(this_chain_owned_ctor_param_3751,
         "end PB; ");
     bool spurious = false;
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("this parameter position does not take ownership") !=
+        if (d.message.find("invalid use of 'owned' at argument position") !=
             std::string::npos)
             spurious = true;
     BEZEL_EXPECT_TRUE(spurious);
