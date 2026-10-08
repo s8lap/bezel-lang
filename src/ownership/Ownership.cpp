@@ -10753,6 +10753,14 @@ void MethodOwnership::scanLambdaBodyBorrowStores(const ast::Stmt& s) {
         // same reason as above.
         forEachBorrowStoreCallInStmt(cur, [this](const ast::CallExpr& call) {
             checkCollectionBorrowStoreEscape(call, /*fromLambdaBody=*/true);
+            // fix #5145 (§28.3, v0.330): the call-site `ref` / plain-`out`
+            // recipient check, reachable from inside a lambda body for the same
+            // reason as its two siblings above — the statement walks do not
+            // enter a lambda body, so a `Put(ref keep, t)` written there would
+            // otherwise never be seen. `fromLambdaBody=true` triggers the
+            // enclosing-frame retry so a borrow of a captured owned local
+            // declared in the enclosing method resolves as a source.
+            checkRefOutLocationOutlivesCall(call, /*fromLambdaBody=*/true);
         });
     });
 }

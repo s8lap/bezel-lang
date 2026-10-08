@@ -2834,6 +2834,49 @@ private:
     void checkCollectionBorrowStoreEscape(const ast::CallExpr& call,
                                           bool fromLambdaBody = false);
 
+    // fix #5145 (§28.3 *A `ref` or plain `out` location outlives the call*,
+    // v0.330; derives K2.3 + K2.4 with K2.2's union; issue #4819's call-site
+    // leg): a `ref` or plain `out` argument location whose type can carry a
+    // borrow is CALLER storage the callee may fill with any borrow the call
+    // carries, so the caller must apply to each such location the admission
+    // the DIRECT assignment into it would apply. Without this the program
+    // `Put(ref keep, t)` compiled clean and heap-use-after-freed `keep`'s
+    // Widget after `t`'s block disposed it: the callee's `slot := x` store is
+    // rejected INSIDE the callee (§28.3 callee-side, already enforced), but
+    // nothing in the CALLER noticed that its own `keep` was about to receive a
+    // borrow of `t`.
+    //
+    // The rule reads only the callee's SIGNATURE ("a callee that stores
+    // nothing is checked as one that stores everything"), so this scans every
+    // CallExpr — no callee-body interprocedural analysis. The pooled sources
+    // are the receiver and every plain (non-`owned`, non-`scoped`) argument;
+    // a `ref` argument's current value is a source too, and `out _` names no
+    // location. A function-typed location is EXEMPT (v0.327: the callee can
+    // store only a capture-free value there, so on the call's normal return an
+    // `out` carries the empty set and a `ref` the set it carried before).
+    //
+    // `fromLambdaBody` mirrors `checkCollectionBorrowStoreEscape`: the lambda
+    // -body pre-pass (`scanLambdaBodyBorrowStores`) passes true so a borrow of
+    // a captured owned local declared in the ENCLOSING method resolves as a
+    // source on the enclosing-frame retry. // per §28.3, v0.330
+    void checkRefOutLocationOutlivesCall(const ast::CallExpr& call,
+                                         bool fromLambdaBody = false);
+
+    // fix #5145 (§28.3, v0.330): the `ref` / plain-`out` LOCATION side of
+    // checkRefOutLocationOutlivesCall — one argument's recipient. Returns a
+    // `None` kind when the argument is not such a location, and otherwise
+    // answers through `sym` how the location's lifetime compares to a borrow
+    // source in this frame. `Kind` is the mirror of `checkBorrowStoreEscape`'s
+    // `Dest` enum: a plain local defers to the declaring-block depth
+    // comparison, while a field or a parameter of this method provably
+    // outlives every local declared in it.
+    struct RefOutLocation {
+        enum class Kind { None, Local, Escapes };
+        Kind kind = Kind::None;
+        sema::Symbol* sym = nullptr;
+    };
+    RefOutLocation refOutLocationFor(const ast::CallArgument& arg);
+
     // §28.11 "Storing a borrow" (hole closed #1884) — the indexer-set sibling of
     // checkCollectionBorrowStoreEscape. §28.11 lists "Add, Insert, indexer-set"
     // as the store operations of a borrowing collection, so `coll[i] := value`

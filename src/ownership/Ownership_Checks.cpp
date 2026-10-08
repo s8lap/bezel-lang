@@ -2132,6 +2132,18 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // rejected at the store site. See the declaration comment for the
         // full rule; independent of the §28.6 capability check above.
         checkCollectionBorrowStoreEscape(*call);
+        // fix #5145 (§28.3 *A `ref` or plain `out` location outlives the
+        // call*, v0.330): the CALLER's half of the rule that
+        // checkBorrowStoreEscape's `Dest::OutParam` leg enforces inside the
+        // callee. A `ref` / plain-`out` location is caller storage the callee
+        // may fill with any borrow the call carries, so each such borrow must
+        // be admissible there exactly as the direct assignment would be. The
+        // check reads only the callee's signature, so it is driven for every
+        // CallExpr and declines internally on any shape that is not a
+        // borrow-carrying `ref`/`out` recipient — independent of the §28.11
+        // collection-store check above, which fires only for a builtin storing
+        // method on a borrowing collection.
+        checkRefOutLocationOutlivesCall(*call);
         // §28.4 / §28.5 (#1230): explicit `.Dispose()` of an owned field of
         // THIS object inside a destructor body double-frees: the compiler-
         // generated Dispose() runs the destructor body first and then
@@ -11199,6 +11211,233 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
             "as `" + recvName + "`, or store into an owning-family "
             "collection and transfer ownership with `Add(owned item)` "
             "instead)");
+    }
+}
+
+// fix #5145 (§28.3 *A `ref` or plain `out` location outlives the call*,
+// v0.330; derives K2.3 + K2.4 with K2.2's union; issue #4819's call-site
+// leg). The `ref` / plain-`out` LOCATION side of the rule.
+//
+// The spec's own admission test is "exactly as the direct assignment into that
+// location would be", and this returns precisely the destination class that
+// `checkBorrowStoreEscape`'s `Dest` enum computes for the equivalent
+// assignment target, so the two channels cannot drift:
+//
+//   * a bare IdentifierExpr naming a LOCAL  → `Dest::OuterLocal` → `Local`,
+//     decided by the declaring-block depth comparison (the local bullet);
+//   * a bare or qualified FIELD             → `Dest::Field`     → `Escapes`,
+//     because the field's object outlives every local of this frame;
+//   * a PARAMETER of this method            → `Dest::OutParam`   → `Escapes`,
+//     because that parameter's storage is the caller's frame, which outlives
+//     this method — the same reason the callee-side `slot := x` store is
+//     rejected inside the callee.
+//
+// `out owned` is a §28.8 ownership TRANSFER, not a borrow-carrying location,
+// and `out _` names no location at all; both are excluded here exactly as the
+// spec's modifier table excludes them. A function-typed location returns
+// `None`: v0.327 narrows the caller-side union for that kind (the callee can
+// store only a capture-free value there, so on the call's normal return an
+// `out` carries the empty set and a `ref` the set it carried before, and the
+// call's borrows need no admissibility check against it).
+//
+// The argument must carry a BORROW to be a recipient worth checking, so the
+// declared type gate is the spec's own: a class or interface type, or a
+// borrow-bearing record / choice / inline array (§3.6). A value-typed
+// `ref slot: int` copies an int into the location and can never dangle, so
+// pooling a borrow against it would be a false rejection.
+// // per §28.3, v0.330
+MethodOwnership::RefOutLocation
+MethodOwnership::refOutLocationFor(const ast::CallArgument& arg) {
+    RefOutLocation out;
+    // §22.3 modifiers. `out owned` transfers ownership (§28.8) and carries no
+    // borrow; `out var` / `out using var` DECLARE the location at this call, so
+    // it is this frame's own storage, not a caller location outliving it — the
+    // spec's rule is about a location the CALLER already holds. `isDiscard`
+    // (`out _`) is exempt by the spec's own sentence.
+    const std::string_view m = arg.modifier;
+    const bool isRef = (m == "ref");
+    const bool isPlainOut = (m == "out");
+    if (!isRef && !isPlainOut) return out;
+    if (arg.isDiscard || !arg.value) return out;
+
+    // The declared type of the LOCATION. `ctx_.exprType` on the argument
+    // expression is the location's own type for the shapes that can be a
+    // recipient at all (a bare local, a field access, `this._f`); null or
+    // non-borrowable means the rule does not apply, so decline.
+    const sema::TypeRef* t = ctx_.exprType(*arg.value);
+    if (!t) return out;
+    // v0.327: a function-typed location is exempt from the caller-side union.
+    if (t->kind == sema::TypeRef::Kind::Function) return out;
+    const bool borrowCarrying = isBorrowableType(t) ||
+                                isBorrowBearingRecord(t) ||
+                                isBorrowBearingChoice(t) ||
+                                isBorrowBearingRecordOrSpan(t);
+    if (!borrowCarrying) return out;
+
+    // Classify the destination the way the assignment channel classifies its
+    // target, so one scope comparison decides both.
+    const ast::Expr* target = arg.value.get();
+    // A bare identifier names a local, a field, or a parameter.
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return out;
+        if (dynamic_cast<sema::LocalSymbol*>(sym)) {
+            out.kind = RefOutLocation::Kind::Local;
+            out.sym = sym;
+            return out;
+        }
+        if (dynamic_cast<sema::FieldSymbol*>(sym) ||
+            dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            out.kind = RefOutLocation::Kind::Escapes;
+            out.sym = sym;
+            return out;
+        }
+        return out;
+    }
+    // `obj._f` / `this._f` — a MemberAccessExpr target is the `Dest::Field`
+    // case of the assignment channel, whose object outlives this frame.
+    if (dynamic_cast<const ast::MemberAccessExpr*>(target)) {
+        out.kind = RefOutLocation::Kind::Escapes;
+        return out;
+    }
+    return out;
+}
+
+// fix #5145 (§28.3 *A `ref` or plain `out` location outlives the call*,
+// v0.330). See the declaration comment for the rule.
+//
+// MEASURED before this fix (r23-c28 / 56c10b7a, `--probe --asan`): the issue's
+// canonical `Put(ref keep, t)` compiled with rc=0 and no diagnostic, and the
+// emitted native binary died with
+//   `AddressSanitizer: heap-use-after-free ... in bz$M.Widget$Name`
+// on the `keep.Name()` read after `t`'s `do` block disposed `t`. The callee's
+// own `slot := x` store IS rejected inside the callee (§28.3's callee-side
+// sentence, enforced by `checkBorrowStoreEscape`'s `Dest::OutParam` leg); what
+// was missing is the CALLER's half.
+//
+// The pooled sources are the receiver and every plain (non-`owned`,
+// non-`scoped`) argument, plus — per the spec's own list — the current value of
+// every other `ref` argument. Each is resolved through the ONE authority for
+// "an owned scope-bound local this expression borrows", `ownedLocalBorrowSource`
+// (the same query `checkBorrowStoreEscape` and `checkCollectionBorrowStoreEscape`
+// use), so a source is recognized here exactly as it is on the assignment
+// channel. With the enclosing-frame retry for the lambda-body pre-pass, the
+// same signal `checkCollectionBorrowStoreEscape`'s `fromLambdaBody` carries.
+void MethodOwnership::checkRefOutLocationOutlivesCall(
+    const ast::CallExpr& call, bool fromLambdaBody) {
+    if (!call.callee) return;
+
+    // ---- The recipient side: every `ref` / plain-`out` argument location. ----
+    // Collected first so a location's OWN value is not pooled as a source for
+    // itself — the spec counts "every OTHER `ref` argument's current value",
+    // since a `ref` argument only ever reads what it already holds.
+    std::vector<RefOutLocation> locations;
+    for (const ast::CallArgument& a : call.args) {
+        RefOutLocation loc = refOutLocationFor(a);
+        if (loc.kind == RefOutLocation::Kind::None) continue;
+        locations.push_back(loc);
+    }
+    if (locations.empty()) return;
+
+    auto depthOf = [&](const ast::Node* declNode) -> int {
+        auto it = localDepth_.find(declNode);
+        return it == localDepth_.end() ? -1 : it->second;
+    };
+
+    // One diagnostic per source symbol, so a source pooled by two roles (a
+    // receiver that is also a named plain argument) reports once.
+    std::vector<sema::Symbol*> reported;
+    auto alreadyReported = [&](sema::Symbol* s) {
+        for (sema::Symbol* r : reported)
+            if (r == s) return true;
+        return false;
+    };
+
+    auto checkOne = [&](const ast::Expr* srcExpr, const std::string& role,
+                        const std::string& srcName) {
+        if (!srcExpr) return;
+        sema::Symbol* src =
+            ownedLocalBorrowSource(*srcExpr, OwnedSourceKinds::LocalOnly);
+        if (!src && fromLambdaBody)
+            src = enclosingFrameOwnedLocalBorrowSource(
+                *srcExpr, OwnedSourceKinds::LocalOnly);
+        if (!src) return;
+        if (alreadyReported(src)) return;
+
+        for (const RefOutLocation& loc : locations) {
+            bool escapes = (loc.kind == RefOutLocation::Kind::Escapes);
+            if (!escapes) {
+                // The local bullet: the location's declaring block must not
+                // STRICTLY enclose the source's. This is the same comparison
+                // `checkBorrowStoreEscape`'s `Dest::OuterLocal` leg makes, so
+                // the call site and the direct assignment agree by
+                // construction rather than by two hand-written rules.
+                auto* ls = dynamic_cast<sema::LocalSymbol*>(loc.sym);
+                if (!ls) continue;
+                const int td = ls->decl ? depthOf(ls->decl) : -1;
+                const int sd = src->decl ? depthOf(src->decl) : -1;
+                if (!(td >= 0 && sd >= 0 && td < sd)) continue;
+            }
+            reported.push_back(src);
+            const std::string locName = loc.sym ? std::string(loc.sym->name)
+                                                : std::string("it");
+            report(
+                Severity::Error, call.span.begin,
+                std::string("borrow of ") + role + " `" + srcName +
+                "` would be stored into `" + locName +
+                "` by this call, and outlive its source — `" + srcName +
+                "` is an owned scope-bound local disposed at the end of its "
+                "block, while `" + locName + "` " +
+                (escapes
+                     ? "lives in caller storage that outlives this method"
+                     : "lives in an enclosing scope") +
+                ", so a later read would see a disposed value. A `ref` or "
+                "plain `out` location is caller storage the callee may fill "
+                "with any borrow the call carries, and each such borrow must "
+                "be admissible there exactly as a direct assignment would be "
+                "(§28.3 *A `ref` or plain `out` location outlives the call*; "
+                "keep `" +
+                srcName + "` alive at least as long as `" + locName +
+                "`, or pass an `out owned` / transfer an owned value instead)");
+        }
+    };
+
+    // ---- The pooled sources, in the spec's own order. ----
+    // (a) the receiver — at a constructor call the object or value constructed,
+    // and `this` in a `this(...)` / `base(...)` chain (v0.326).
+    if (const auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+        if (ma->target) {
+            const ast::IdentifierExpr* root = identifierRoot(*ma->target);
+            const std::string rname =
+                root ? std::string(root->name) : std::string("the receiver");
+            checkOne(ma->target.get(), "the receiver", rname);
+        }
+    }
+
+    // (b) every plain (non-`owned`, non-`scoped`) argument, and (c) the current
+    // value of every other `ref` argument. Both resolve through the one
+    // borrow-source query, so they are one loop: a `ref` argument's value is a
+    // source by the spec's own list, and a plain argument by its own.
+    for (const ast::CallArgument& a : call.args) {
+        if (!a.value || a.isDiscard) continue;
+        const std::string_view m = a.modifier;
+        // An `owned` argument transfers ownership (§28.8) and a `scoped` one is
+        // admitted only by §28.14's storage-bounded rule; neither is a
+        // "plain parameter" source in §28.3's count. `out owned` likewise.
+        const bool isSource =
+            (m.empty() || m == "ref" || m == "out" || m == "out var" ||
+             m == "out using var");
+        if (!isSource) continue;
+        // The argument's own name is the concrete source spelling for the
+        // diagnostic; an unnamed expression falls back to a generic phrase.
+        std::string nm;
+        if (const auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+            nm = std::string(id->name);
+        else
+            nm = std::string("the argument");
+        checkOne(a.value.get(), "argument", nm);
     }
 }
 
