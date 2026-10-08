@@ -1977,8 +1977,8 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             if (ctors.empty()) return true;  // implicit default ctor
             for (const ConstructorSymbol* cs : ctors)
                 if (cs->params.empty() &&
-                    cs->visibility != ast::Visibility::Private)
-                    return true;  // accessible parameterless ctor
+                    cs->visibility == ast::Visibility::Public)
+                    return true;  // public parameterless ctor
             return false;
         }
     }

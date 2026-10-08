@@ -5036,8 +5036,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     } else {
                                         for (const ConstructorSymbol* cs : ctors) {
                                             if (cs->params.empty() &&
-                                                cs->visibility !=
-                                                    ast::Visibility::Private) {
+                                                cs->visibility ==
+                                                    ast::Visibility::Public) {
                                                 satisfied = true;
                                                 break;
                                             }
