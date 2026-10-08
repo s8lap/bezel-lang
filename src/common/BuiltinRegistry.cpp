@@ -651,8 +651,50 @@ constexpr std::array<BuiltinParamNameRow, 6> kStringBuilderParamNames = {{
     {"StringBuilder", "Remove", 2, 2, {"startIndex", "length", "", "", "", "", "", ""}},
     {"StringBuilder", "Replace", 2, 2, {"oldValue", "newValue", "", "", "", "", "", ""}},
 }};
+// fix #3424 (stdlib §2.2 / spec §22.5, v0.315): `Math` static methods that
+// declare named parameters.  DivRem has an `out` parameter; §22.5 makes the
+// `out` slot positional-only but the by-value `a` and `b` slots may be named.
+// Uses the partial-naming shape: the `out` slot is an empty string.
+constexpr std::array<BuiltinParamNameRow, 15> kMathParamNames = {{
+    {"Math", "Abs", 1, 1, {"x", "", "", "", "", "", "", ""}},
+    {"Math", "Min", 2, 2, {"a", "b", "", "", "", "", "", ""}},
+    {"Math", "Max", 2, 2, {"a", "b", "", "", "", "", "", ""}},
+    {"Math", "Clamp", 3, 3, {"value", "low", "high", "", "", "", "", ""}},
+    {"Math", "Sqrt", 1, 1, {"x", "", "", "", "", "", "", ""}},
+    {"Math", "Pow", 2, 2, {"x", "y", "", "", "", "", "", ""}},
+    {"Math", "Floor", 1, 1, {"x", "", "", "", "", "", "", ""}},
+    {"Math", "Ceiling", 1, 1, {"x", "", "", "", "", "", "", ""}},
+    {"Math", "Round", 2, 1, {"x", "digits", "", "", "", "", "", ""}},
+    {"Math", "Truncate", 1, 1, {"x", "", "", "", "", "", "", ""}},
+    {"Math", "Sign", 1, 1, {"x", "", "", "", "", "", "", ""}},
+    {"Math", "Fmod", 2, 2, {"x", "y", "", "", "", "", "", ""}},
+    {"Math", "IEEERemainder", 2, 2, {"x", "y", "", "", "", "", "", ""}},
+    // DivRem overloads (stdlib §2.2): 3 params, 2 named (a, b), 1 positional-only.
+    {"Math", "DivRem", 3, 2, {"a", "b", "", "", "", "", "", ""}},
+    {"Math", "DivRem", 3, 2, {"a", "b", "", "", "", "", "", ""}},  // long overload
+}};
 
-// fix #3425 — the built-in CONSTRUCTOR rows (§17.7's closed constructor
+// fix #3424 (stdlib §2.3 / spec §22.5, v0.315): `Convert` static methods that
+// declare named parameters.  Each TryTo* method has an `out` parameter; §22.5 makes
+// the `out` slot positional-only but the by-value `value` slot may be named.
+// Uses the partial-naming shape: the `out` slot is an empty string.
+constexpr std::array<BuiltinParamNameRow, 12> kConvertParamNames = {{
+    {"Convert", "ToInt32", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "ToInt64", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "ToDouble", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "ToDecimal", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "ToBoolean", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "ToString", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "ToString", 2, 2, {"value", "toBase", "", "", "", "", "", ""}},
+    // TryTo* overloads (stdlib §2.3): 2 params, 1 named (value), 1 positional-only.
+    {"Convert", "TryToInt32", 2, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "TryToInt64", 2, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "TryToDouble", 2, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "TryToDecimal", 2, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Convert", "TryToBoolean", 2, 1, {"value", "", "", "", "", "", "", ""}},
+}};
+
+// fix #3425 — the built-in CONSTRUCTOR rows) (§17.7's closed constructor
 // surface; the argument-taking constructors the standard library declares).
 // A head absent here rejects a named `new` argument loudly rather than
 // binding it positionally, so the coverage below is a floor, not a contract
@@ -743,8 +785,8 @@ constexpr std::array<std::string_view, 2> kBuiltinCtorLoweredByNameHeads = {
 // The heads `kStringParamNames` / `kEncodingParamNames` /
 // `kStringBuilderParamNames` answer for. See the header for the two roles this
 // predicate plays at the call site.
-constexpr std::array<std::string_view, 4> kBuiltinNamedArgTableHeads = {
-    "string", "String", "Encoding", "StringBuilder",
+constexpr std::array<std::string_view, 6> kBuiltinNamedArgTableHeads = {
+    "string", "String", "Encoding", "StringBuilder", "Math", "Convert",
 };
 
 // fix #3589 (stdlib §5 / §9.6): see the header — the string-receiver LINQ
@@ -1524,6 +1566,10 @@ std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead
         collectRows(kEncodingParamNames, typeHead, member, argCount, out);
     else if (typeHead == "StringBuilder")
         collectRows(kStringBuilderParamNames, typeHead, member, argCount, out);
+    else if (typeHead == "Math")
+        collectRows(kMathParamNames, typeHead, member, argCount, out);
+    else if (typeHead == "Convert")
+        collectRows(kConvertParamNames, typeHead, member, argCount, out);
     return out;
 }  // per §22.5 / stdlib §1 / §9.6 / §3.1 / §3.2
 
