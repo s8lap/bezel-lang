@@ -250,7 +250,7 @@ spec	28.10	using var	5	3	14	3	0	4	0	7	covered
 spec	28.11	Collection element ownership	0	4	14	4	3	5	2	0	covered
 spec	28.12	Asynchronous disposal	0	5	12	0	1	0	2	9	covered
 spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	0	8	0	0	3	0	5	covered
-spec	28.14	Scoped callback parameters: storage-bounded capture	19	8	25	1	0	16	0	8	covered
+spec	28.14	Scoped callback parameters: storage-bounded capture	20	8	25	1	0	16	0	8	covered
 spec	29	Iteration	0	0	0	0	0	0	0	0	n/a
 spec	29.1	The protocol	1	1	6	0	0	1	1	4	covered
 spec	29.2	Desugaring of for	5	3	15	0	0	2	1	12	covered

@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.329 — October 2026**
+**Companion to the Bezel Language Specification, v0.330 — October 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -517,7 +517,7 @@ public interface IEquatable<T>
 end IEquatable;
 ```
 
-A typed alternative to `Object.Equals(Object?)`. Records implement this implicitly; classes may implement it for type-safe equality without boxing. As for `IComparable<T>` ([§2.8](#sec-icomparablet)), the stdlib's primitives and `string` conform at their own type only and the interface is invariant — no `IEquatable<Object>` view of them exists.
+A typed alternative to `Object.Equals(Object?)`. Records implement this implicitly; classes may implement it for type-safe equality without boxing. A class's `Equals(other: T)` is an overload beside the inherited `Equals(Object?)` (spec [§12.2](Bezel_Language_Spec.md#sec-hiding-is-not-allowed)), not an override of it, and is declared at `T`, not `T?`: at `T?` a `T` argument converts to both members and the call is ambiguous (spec [§22.6](Bezel_Language_Spec.md#sec-overloading)), while at `T` a `T?` argument reaches `Equals(Object?)`, as `string`'s does ([§9.6](#sec-string)). `a.Equals(b)` and `a = b` (spec §8.4) at `T`-typed operands select it, and so does a `Dictionary<T, V>` or `Set<T>` constructed without a comparer, whose key comparison is a `T`-typed use (spec §9.2 *Through a type parameter*) and whose hash is `GetHashCode()`; an `Object`-typed receiver or argument reaches `Equals(Object?)`. Spec §8.3's hash rule reads every `a.Equals(b)`, so such a class overrides `GetHashCode()` to agree with its `Equals(T)` (the compiler's pairing check reads an `override Equals` only), and overrides `Equals(Object?)` where an `Object`-typed comparison must give the same answer. As for `IComparable<T>` ([§2.8](#sec-icomparablet)), the stdlib's primitives and `string` conform at their own type only and the interface is invariant — no `IEquatable<Object>` view of them exists.
 
 <a id="sec-idisposable-and-iasyncdisposable"></a>
 ### 2.10 `IDisposable` and `IAsyncDisposable`
@@ -1391,7 +1391,7 @@ public class StringBuilder
   public method Replace(oldValue: string, newValue: string): StringBuilder;
   public method Clear(): StringBuilder;
 
-  public method ToString(): string;
+  public override method ToString(): string;
 end StringBuilder;
 ```
 
@@ -5474,9 +5474,10 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public pure method CompareTo(other: string, ignoreCase: bool): int;   // the case-folded form (note above);
                                                                        //   `other` is non-nullable, as the
                                                                        //   conformance member's is
-  public pure method Equals(other: string?): bool;             // satisfies IEquatable<string>'s
-                                                          //   Equals(string) under §11.2's
-                                                          //   parameter-nullability widening
+  public pure method Equals(other: string): bool;              // satisfies IEquatable<string>'s
+                                                          //   Equals(string) exactly; a `string?`
+                                                          //   argument reaches the content-based
+                                                          //   Equals(Object?) below (spec §12.2, §22.6)
   public pure method Equals(other: string?, ignoreCase: bool): bool;
 
   // Object overrides

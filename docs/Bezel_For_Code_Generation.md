@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.329. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.330. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.329 and `Bezel_Standard_Library.md` v0.329 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.330 and `Bezel_Standard_Library.md` v0.330 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -573,7 +573,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 | a store — a field or a collection, a property or indexer, a record component declared at a function type (at construction or in `with`), a choice payload declared at a function type, a slot of an inline array of function type (a local array included); a write through `out`/`ref`; a `return` (`yield return` included) | **rejected** — the only storage route is a `scoped` parameter (§28.14) |
 | a set-erasing position: a parameter declared `Object` (the receiver of an `extension Object` call included), or one at a bare type parameter that your call instantiates at a function type — likewise a lambda or a function value passed to a parameter typed `() -> T` at such an instantiation — or a field declared at a bare type parameter, written through a receiver instantiated at a function type (`b.V := f` at `b: Box<() -> int>`) | **rejected** — `x.Equals(f)`, and `Pick(f, g)` over `Pick<T>(a: T, b: T): T`; here a function-typed parameter of yours counts as capturing (it carries itself). Write `f = g` for equality and `(if c then f else g)` for a selector |
 
-Do not form a method reference whose parameter is a function type over such a parameter, an `out` one excepted (`var add := xs.Add;` with `xs: Array<() -> int>` is rejected; `var tg := d.TryGetValue;` with `d: Dictionary<string, () -> int>` is fine): write `lambda(g) => xs.Add(g)`. And a member taking `reg: ((T) -> ()) -> ()` cannot be used at a function-type `T` at all (§28.3, §28.14, v0.320).
+Do not form a method reference whose parameter is a function type over such a parameter, an `out` one excepted (`var add := xs.Add;` with `xs: Array<() -> int>` is rejected; `var tg := d.TryGetValue;` with `d: Dictionary<string, () -> int>` is fine): call `xs.Add(f)` directly at each site; a lambda `lambda(g) => xs.Add(g)` is rejected too, since its own function-typed parameter carries itself (the set-erasing row above). And a member taking `reg: ((T) -> ()) -> ()` cannot be used at a function-type `T` at all (§28.3, §28.14, v0.320).
 
 **Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case` arms identically.
 
@@ -665,7 +665,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.329 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.330 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1426,7 +1426,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   method Split(separator: string): owned Array<string>;
   method Split(separators: Array<char>): owned Array<string>;
   pure CompareTo(other: string): int;   pure CompareTo(other: string, ignoreCase: bool): int;   // no static string.Compare — `a.CompareTo(b, ignoreCase := true)`
-  pure Equals(other: string?[, ignoreCase: bool]): bool;
+  pure Equals(other: string): bool;   pure Equals(other: string?, ignoreCase: bool): bool;   // `s.Equals(n)` at `n: string?` is the content-based Equals(Object?)
   pure override Equals(other: Object?): bool;   pure override GetHashCode(): int;   pure override ToString(): string;
   method ToCharArray(): owned Array<char>;      method GetEnumerator(): owned IEnumerator<char>;
   static pure operator +(left: string, right: string): string;
@@ -2017,13 +2017,16 @@ public method WithValue(v: int): Port => new Port(v);      // the sanctioned upd
 case h.Slots of                      // `h.Slots: [4 owned]Conn?` — a borrowing binding over an owning-inline-array FIELD
   var a => do
     var t := move h.Slots;           // the field is vacated; `a` now addresses storage holding no value
-    _ := a[0];                       // FAULT in checked mode: DisposedAccessException — the slots belong to `t` (§9.4, §15.3)
-    h.Slots := t;                    // restoration (§28.8.1); reads through `a` see the stored value again
+    try
+      _ := a[0];                     // FAULT in checked mode: DisposedAccessException — the slots belong to `t` (§9.4, §15.3)
+    finally
+      h.Slots := t;                  // restoration on every edge, the fault's included (§28.8.1, K9.2); reads through `a` see the stored value again
+    end;
   end
 end;
 ```
 
-> §15.3 / §9.4: a whole-value `move` out of a move-only **field** leaves the field's storage in the disposed state until the restoration store, and a `case` binding taken over the field before the move reads that state. Read what you need through the binding **before** the move, or move the field into a local first and match the local (`var t := move h.Slots; case t of …`).
+> §15.3 / §9.4: a whole-value `move` out of a move-only **field** leaves the field's storage in the disposed state until the restoration store, and a `case` binding taken over the field before the move reads that state. Read what you need through the binding **before** the move, or move the field into a local first and match the local (`var t := move h.Slots; case t of …`). A slot read through an inline-array binding (`a[0]`) is an indexer access, throwable under §28.8.1, so any such read between the move and the restoration needs the restoration in a `finally` — a restoration after it leaves the read's exception edge unrestored, a compile error (K9.2).
 
 ```bezel
 public static method Show(o: Object)
@@ -2059,6 +2062,30 @@ method TryPopCached(k: string, out owned v: Conn? when true): bool;  // take
 if not seen.Contains(candidate) then  seen.Add(move candidate);  end;
 r.Append(new Widget());
 return fresh;
+```
+
+```bezel
+public class Point: IEquatable<Point>
+  public readonly property X: int;
+  public method Equals(other: Object?): bool => ReferenceEquals(this, other);   // ERROR: `Object`'s own signature without `override` is §12.2 hiding
+  public method Equals(other: Point): bool => X = other.X;                      // fine: another parameter list overloads the inherited member
+end Point;
+var same := p.Equals(sub);   // ERROR at `sub: Point3`, a subclass of Point: converts to `Point` and to `Object?`, exact at neither — ambiguous (§22.6)
+```
+
+> §12.2: `Object`'s `Equals(Object?)`, `GetHashCode()` and `ToString()` block only their **own signature**, which `override` reaches. A class declares `Equals(other: T)` (`IEquatable<T>`), `Equals(a: T, b: T)` and `GetHashCode(value: T)` (`IEqualityComparer<T>`) or `ToString(format: string)` (`IFormattable`) as plain members beside the inherited ones. `p.Equals(q)` and `p = q` at `Point` operands pick the own-typed overload, and so does a `Set<Point>`; an `Object`-typed receiver or argument reaches `Object`'s identity `Equals`. An argument of a subclass type converts to both: bind it to a `Point` local first. The plain `Equals(T)` is not an override, so the compiler does not demand `GetHashCode`, but §8.3's hash rule reads it: override `GetHashCode()` to agree, and `Equals(Object?)` too when a boxed comparison must agree. A static `Equals`, and `Equals(T)` in a subclass of a class that already declares one, stay rejected.
+
+```bezel
+public class Point: IEquatable<Point>
+  public readonly property X: int;
+  public method Equals(other: Point): bool => X = other.X;
+  public override method GetHashCode(): int => X;                        // agrees with Equals(Point): §8.3
+end Point;
+var pp: Point := sub;  var same := p.Equals(pp);                         // the argument at `Point`: exact
+public class Money: IFormattable
+  public readonly property Cents: long;
+  public method ToString(format: string): string => $"{Cents}";          // beside the inherited ToString()
+end Money;
 ```
 
 ### 7.5 Iterators, queries, liveness

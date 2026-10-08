@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.329 — October 2026**
+**Companion to the Bezel Language Specification, v0.330 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -12657,5 +12657,114 @@ Checked at the seams, with no edit needed:
     - #5647: `s28_12_0009` (run) and its synchronous twin.
     - #5648: `d.M<[2 owned]Node>()` (reject) beside `b.M<[2 owned]Node>()` (accept).
     - #5628: the record twin of #5099's ambiguity row, with #5658.
+
+---
+
+### v0.330 changelog (v0.329 → v0.330)
+
+**Three defects found by the rule-corpus catch-up, decided under the owner's delegation.** The rule-corpus catch-up that covered the v0.324–v0.329 rulings (commit `8de0292`, 120 cases) found three places where the documents could not be written against: a case that the text required could not be stated, or a program the text printed did not compile. On 2026-10-08 the owner directed: "Please resolve and decide all known spec related issues. Do proposals for issues that need them." This revision decides the three under that direction, each as a delegated ruling (process §8, `accepted (delegated)`). None needed a proposal: two resolve contradictions the text already contained, and one corrects a printed example. The decisions:
+- **Rulings, no proposal:**
+  - [#5664](https://github.com/s8lap/bezel-lang/issues/5664), a spec defect: §12.2's hiding rule, read against `Object`'s members, blocked every class from implementing `IEquatable<T>`, `IEqualityComparer<T>` and `IFormattable`;
+  - [#5665](https://github.com/s8lap/bezel-lang/issues/5665), a spec defect: §28.14's formation-bar remedy, `lambda(g) => xs.Add(g)`, is itself rejected.
+- **Clarification and editorial:** proposal 0143's example did not compile; it is corrected, and §28.8.1 gains a sentence on `finally` restorations.
+
+One lane, `P1`, wrote all three. It passed its author's adversarial pass and an independent critique: **4 blocking and 8 non-blocking findings**, all resolved. Its 15 edits (4 spec, 2 stdlib, 1 rationale, 4 code-generation reference, 3 in proposal 0143, 1 in the decline index) were applied as one sequence. A composition check added 9: 4 in the documents (2 stdlib, 1 code-generation reference, 1 guide) and 5 in the proposals folder and the decline index.
+
+The critic's blocking findings were these:
+- The drafted stdlib §2.9 text said `=` and the hash containers reach `Equals(Object?)` on a class that declares `Equals(T)`, and that §8.3's hash rule does not bind `Equals(T)`. Both were wrong. §8.4 makes `a = b` the call `a.Equals(b)`, §9.2 *Through a type parameter* binds a container's key comparison to the member the same use on a `T`-typed operand binds, and §22.6 resolves both to the exact own-typed overload. §8.3's rule reads every `a.Equals(b)`. Stdlib §2.9 and the code-generation reference now say which member each surface reaches, and that the author overrides `GetHashCode()` to agree.
+- The drafted §12.2 said `p.Equals(q)` selects the own-typed overload and `p.Equals(o)` reaches `Object`'s, as a general rule. §22.6 ranks only exact matches, so an argument that converts to both overloads and matches neither exactly is ambiguous: a subclass of `Point`, or a `Point` where the overload is declared at `Point?`. §12.2 now states the ambiguity and its remedy, and that `=`, `<>` and uses through a type parameter are such calls.
+- The issue placeholders were links without a `#`, which `check_docs.sh`'s anchor check never examines, so they would have landed silently. They are now fail-loud missing anchors, with a `grep` for the decline index, which the check does not cover.
+- The lane asserted that no test flips. A scan found nine `tests/` programs that declare a class member at `Object`'s own signature without `override`, and the standard library's own `StringBuilder` sketch did the same. The nine are listed for the tracker, and `StringBuilder.ToString()` is now spelled `override`.
+
+**Outcomes the owner should see.**
+- **`p = d` with a subclass-typed `d` is a compile error** on a class that declares `Equals(T)`, and so is `p.Equals(d)`. The argument converts to both `Point` and `Object?` and matches neither exactly, which is §22.6's ambiguity. The remedy is to bind `d` at `Point` first (`var pp: Point := d;`). Whether `=` on classes should instead bind a fixed member is filed as a question ([#5670](https://github.com/s8lap/bezel-lang/issues/5670)).
+- **`=` and the hash containers use the own-typed `Equals`.** On a class declaring `Equals(T)`, `a.Equals(b)` and `a = b` at `T` operands, and a `Set<T>` or `Dictionary<T, V>` built without a comparer, compare by `Equals(T)` and hash by `GetHashCode()`. `Object`-typed dispatch reaches `Equals(Object?)`. Such a class overrides `GetHashCode()` to agree, because the compiler's pairing check reads `override Equals` only. Whether the compiler should enforce that pairing for a plain own-typed `Equals`, as v0.327 made it for enums and choices, is filed ([#5668](https://github.com/s8lap/bezel-lang/issues/5668)).
+- **Nine compiler tests flip when the tracker lands** ([#5669](https://github.com/s8lap/bezel-lang/issues/5669)). Each declares a class `ToString()`, `GetHashCode()` or `Equals(other: Object[?])` without `override`, plain or `virtual`, and each must be re-spelled with `override` in the fixing commit. They were already ill-formed under the literal v0.329 §12.2, so no spec verdict moves.
+- **`string`'s `Equals` is declared at `string`** (composition check, below). As printed at v0.329, `Equals(other: string?)` beside `override Equals(Object?)` would have made `s.Equals(t)`, `s = t` and every `Set<string>` ambiguous under this revision's §12.2 sentence.
+
+A composition check over the union then fixed four seams:
+- **[#5664](https://github.com/s8lap/bezel-lang/issues/5664) × `string`.** Stdlib §9.6 declared `public pure method Equals(other: string?): bool`, satisfying `IEquatable<string>` under §11.2's nullability widening, beside `override Equals(other: Object?)`. A `string` argument converts to both and matches neither exactly, so by the ambiguity this revision states, `s.Equals(t)`, `s = t` (§8.4) and a `Set<string>`'s key comparison (§9.2) had no unique member. The member is now `Equals(other: string)`, exact at a `string` argument. A `string?` argument reaches the content-based `Equals(Object?)`, which gives the same answer, so no program changes verdict or result. The code-generation reference's `String` listing says the same. Stdlib §2.9 now tells a class to declare `Equals` at `T`, not `T?`.
+- **[#5664](https://github.com/s8lap/bezel-lang/issues/5664) × Guide 07.** Its *A name is never reused down an inheritance chain* paragraph said §12.2 forbids hiding "outright", so that every same-named derived member is an error unless it is an `override`. The paragraph now names the exception for `Object`'s three members at another parameter list.
+- **[#5665](https://github.com/s8lap/bezel-lang/issues/5665) × proposals 0140 and 0133.** Proposal 0140's item 7 quoted the code-generation reference's remedy as "write `lambda(g) => xs.Add(g)`". It is corrected in place to the new reference text, with a one-line note. Proposal 0133 states the old remedy twice (its option 5's §28.14 edit and §4.3's list of costs and remedies). Both sentences keep their text and gain a superseded note, since they record what was landed at v0.320.
+- **The decline index.** One `rejected` row records the composition's alternative, and the size line is recomputed (below).
+
+Checked at the seams, with no edit needed:
+- **[#5664](https://github.com/s8lap/bezel-lang/issues/5664) × #5598 (v0.327).** On an enum or a choice the `Object` slot is reached by the own-typed `Equals`; on a class by `override Equals(Object?)`. In both, other parameter lists are ordinary methods, and the rationale paragraph states the parallel. The *Member hiding* and hand-written `Serialize` rows in the decline index are narrowed at `Object`'s signature only, not reopened.
+- **Rationale §8.1's opening** ("Bezel rejects same-name members in derived classes outright") stays. The v0.330 paragraph qualifies it, as the v0.184 visibility paragraph already does.
+- **Spec §8.4** ("classes customize equality by overriding `Equals`") stays true. Operator overloading of `=` is still refused on classes, and the own-typed overload is an `Equals`.
+- **Appendix C.** C.1's hiding row is `P1`'s. No other row restates the hiding rule, the remedy or the restoration discipline.
+- **§28.8.1's `finally` sentence × build-before-take.** Rationale §5.10's *exception-path obligation*, the code-generation reference's §28.8.1 note and Guide 01 §7 teach build-before-take, which stays the idiom. The `finally` form is for a read that must follow the move, so none of them is contradicted.
+- **The rule corpus.** `s15_1_1_0009` already restores in a `finally`. `s15_1_1_0010`/`0011` and `s9_4_0010` read before the move or restore adjacently. `s28_14_0024` cites the bar's rule sentence, not the remedy. No case states a class `Equals` at a non-`Object` signature as rejected.
+- **The guides.** No guide teaches `IEquatable`, `IFormattable` or `IEqualityComparer` on a class, the formation-bar remedy, or a field move with a read before the restoration.
+- **`scripts/check_docs.sh`** on the composed tree: ANCHOR fails only on the unfilled placeholder `rationale#UNFILED-P1-ISSUE-1`, and passes once both placeholders are replaced. VERSION, FACTS, TABLE, SETS, REGISTER, STYLE and EXTRACT are clean (523 fragments). The one CITATION advisory, `§4.12`, was already present at v0.329. `scripts/check_proposals.sh` passes (live 48, graduated 99).
+
+- **§12.2, Appendix C.1, rationale §8.1, stdlib §2.9, §3.1 and §9.6, Guide 07, the code-generation reference — `Object`'s virtual members block only their own signature (ruling; [#5664](https://github.com/s8lap/bezel-lang/issues/5664)).** §12.2 blocked a derived member of any inherited visible name at any signature, and §8.1 gives every class `Equals(Object?)`, `GetHashCode()` and `ToString()`. Read literally, no class could declare `Equals(other: T)`, `Equals(a: T, b: T)`, `GetHashCode(value: T)` or `ToString(format: string)`, so none could implement `IEquatable<T>`, `IEqualityComparer<T>` or `IFormattable`. That contradicted §18.5 and stdlib §2.9, §2.18 and §4.8–§4.10, whose comparer constructors would have had no admissible argument.
+  - **The rule.** A class may declare a non-`override` instance member of the three names at any parameter list other than `Object`'s (nullability-widened). It overloads the inherited member at the class and its subclasses, resolved by §22.6:
+    - the exact own-typed overload at a `T` argument;
+    - `Object`'s member, overridden or not, at an `Object?` argument;
+    - §22.6's ambiguity at an argument that converts to both and matches neither exactly (a subclass of `T`, or a `T` where the overload is declared at `T?`), remedied by binding the argument at the intended parameter's type.
+
+    `=` and `<>` (§8.4) and uses through a type parameter (§9.2) are such calls.
+  - **Unchanged.** The plain same-signature spelling stays hiding, and `override` stays the only route to the slot. The standard library's `StringBuilder.ToString()` is now spelled `override`.
+  - **The admission is `Object`'s alone.** A class's `Equals(T)` blocks the name in its subclasses as any member does. Static members of the three names, `GetType` and `ReferenceEquals` block as before.
+  - **What each surface reaches (stdlib §2.9).** `a.Equals(b)`, `a = b` and a comparer-less `Dictionary<T, V>`/`Set<T>` select `Equals(T)` and hash by `GetHashCode()`. The hash containers' key comparison is §9.2's `T`-typed use. `Object`-typed dispatch reaches `Equals(Object?)`. §8.3's hash rule reads every `a.Equals(b)`, so the class overrides `GetHashCode()` to agree; the compiler's pairing check still reads `override Equals` only. The member is declared at `T`, not `T?`, as `string`'s now is (composition).
+  - **The accepted residual (rationale §8.1).** `p.Equals(q)` at a `Point` receiver may answer differently from the same call through `Object`. Every typed-equality interface carries that split, and a record whose only `Equals` is `Equals(T)` already has it on its boxed path (§9.2). The author overrides `Equals(Object?)` where the two answers must agree.
+
+  **Declined** (three `rejected` rows):
+  - the literal reading, which contradicts four normative statements and leaves stdlib surface unreachable;
+  - exempting any member that implements an interface member, whatever base declares the name, which admits the static-type shadow §8.1 refuses (the hand-written `Serialize` row's shape);
+  - a §22.6 tie-break ranking a class's own-typed `Equals` above `Object`'s inherited member (composition). §22.6 ranks no implicit conversion above another, and a tie-break keyed on one member name would be the only exception, for a shape the declaration avoids.
+
+  Kernel: no contact. Body-locality: declaration-local. **Compiler (tracked, [#5669](https://github.com/s8lap/bezel-lang/issues/5669), probe first):** `checkHidingAndOverride` seeds its frontier from `t->baseTypes` (`src/sema/TypeResolution_Checks.cpp:6797–6803`), which never holds `Object`, so `Object`'s members take no part in the check. The overloads are therefore already accepted, and the plain same-signature spelling probably is too, which this ruling rejects. Nine tests flip (above). `l2_9_0003`, `s18_5_0007` and `s18_5_0008` stay `pass` and now have a rule to cite.
+- **§28.8.1, the code-generation reference §7.3, proposal 0143 — a `finally` restoration satisfies K9.2, and the 0143 example is corrected (clarification and editorial).** The v0.328 example `var t := move h.Slots; _ := a[0]; h.Slots := t;` put an inline-array indexer access between the move and the restoration. §28.8.1 lists that access as throwable, with no constant-index carve-out, so the example had an unrestored exception edge (K9.2) and could not compile. The read now sits in a `try` whose `finally` restores the field: in the reference pair, and in proposal 0143 §1.1, §5 and §7. The reference's note says a slot read through an inline-array binding needs the restoration in a `finally`.
+  - **The sentence.** §28.8.1 states what the path rule and §31.2 already compose to. A restoration in a `finally` satisfies the rule when every throwable expression between the move and the store lies in the `try`'s protected block, because §31.2 runs the `finally` on every exit edge of the block, the exception edges included. The store into the moved-from location is non-throwable.
+  - The condition is sufficient, not necessary: a throwable in a `catch` arm also exits through the `finally`. The path rule stays authoritative, and nothing new is admitted.
+
+  Verdict impact: none. Kernel: no contact (K9.2's path set and §31.2's exit edges). **Compiler:** the restoration analysis runs on the CFG, which expands `try`/`finally` into real blocks and exception edges (`src/ownership/Ownership.cpp:2733–2740`), so the shape is probably accepted. No test pins it; a probe-first pin is filed ([#5667](https://github.com/s8lap/bezel-lang/issues/5667)). [#5652](https://github.com/s8lap/bezel-lang/issues/5652)'s test specification copied the uncompilable probe and gets a comment.
+- **§28.14 *The method-reference formation bar*, the code-generation reference §4.4, proposals 0133 and 0140 — the remedy is the direct call, not a lambda (ruling; [#5665](https://github.com/s8lap/bezel-lang/issues/5665)).** The bar's last sentence offered `lambda(g) => xs.Add(g)` as the remedy for a rejected `xs.Add` at `Array<() -> int>`. That lambda's body is rejected for every argument, capture-free ones included. `g` is a plain function-typed parameter, which:
+  - contributes itself (§28.3 provenance clause 3);
+  - is call-bounded (§28.14);
+  - is refused by every collection slot (§28.3 *Function-typed holders*).
+
+  No function value can forward an arbitrary argument into a set-erasing position: a plain function type announces no retention (K2.4), which is the bar's own ground. The sentence now says so and names the direct call at each site, `xs.Add(f)`, as the remedy. The code-generation reference is corrected in place, proposal 0140's quotation of it is corrected, and proposal 0133's two remedy sentences carry a superseded note (composition).
+
+  **Declined** (one `rejected` row): every function-value spelling (`lambda(g)`, `lambda(scoped g)`, a `ref`-forwarding lambda). The reopening bar is a function-type form that announces its parameter's retention. Kernel: no contact (K2.4 is the ground, unchanged). Verdict impact: none; the body checks already rejected the lambda. **Compiler:** it rejects the lambda at a field-held `xs` (`lambda_own_param_call_bounded_1432.store_into_field_collection_rejected`, `tests/ownership/lambda_own_param_call_bounded_1432_test.cpp:131`) and accepts it at a local `xs` (`store_into_local_collection_accepted`, `:393`). That is the delta [#5518](https://github.com/s8lap/bezel-lang/issues/5518) already tracks, and the test flips when #5518 lands. [#5515](https://github.com/s8lap/bezel-lang/issues/5515) listed "the lambda remedy (run)" among its tests to add and gets a comment: the lambda is a reject.
+
+- **Migration.** *Newly rejected (spec-ahead-of-impl):*
+  - **[#5664](https://github.com/s8lap/bezel-lang/issues/5664).** A non-`override` class member at `Object`'s own signature, plain or `virtual`: `Equals(other: Object?)`, `Equals(other: Object)`, `GetHashCode()` or `ToString()`. It is hiding. The compiler accepts it today; nine `tests/` programs exercise it ([#5669](https://github.com/s8lap/bezel-lang/issues/5669)). It was already ill-formed under the literal v0.329 text. Measured by scan and hand-check, not probed.
+
+  *Newly a compile error by §22.6 (a stated consequence):* `p.Equals(d)` and `p = d` at a subclass-typed `d` on a class that declares `Equals(T)`, and the same at a `T` argument where the overload is declared at `T?`. Measured reach: none in `tests/`. The compiler's resolution is unprobed ([#5669](https://github.com/s8lap/bezel-lang/issues/5669)).
+
+  *Newly admitted:* nothing the compiler did not already accept. The text now admits what `tests/codegen/builtin_interface_value_1115_test.cpp` (`class C: IEquatable<int>`, `class Cmp: IEqualityComparer<int>`) and `set_dict_comparer_ctor_2722_test.cpp` (`ModCmp`, `BoxCmp`) exercise.
+
+  *Doc-only:*
+  - §12.2's overload-set and ambiguity sentences, Appendix C.1, rationale §8.1, stdlib §2.9 and §3.1, and the code-generation reference §7.4 pair.
+  - Stdlib §9.6's `Equals(other: string)`: a `string?` argument reaches the content-based `Equals(Object?)` with the same answer, so no program changes verdict or result (`sema_string_nullable_arg_2315.builtin_equals_accepts_nullable_per_11_2` still compiles).
+  - The §28.8.1 sentence, the code-generation reference §7.3 pair and proposal 0143's corrected example.
+  - The §28.14 sentence, the code-generation reference §4.4 sentence and the notes in proposals 0133 and 0140.
+  - `DECLINED.md` gains 4 rows, all `rejected`. No row moves group. The index size is recomputed once: 758 rows — 431 · 133 · 147 · 7 · 40 · 0.
+
+  *Spec-ahead-of-impl (tracking issues filed at landing):*
+  - [#5664](https://github.com/s8lap/bezel-lang/issues/5664): the hiding check at `Object`'s own signature, the nine test flips, and the resolution probes for the overload set, the subclass ambiguity and `string` ([#5669](https://github.com/s8lap/bezel-lang/issues/5669), probe first).
+  - The §28.8.1 sentence: a probe-first pin that a `finally` restoration is accepted ([#5667](https://github.com/s8lap/bezel-lang/issues/5667)), and a note on [#5652](https://github.com/s8lap/bezel-lang/issues/5652) correcting its probe.
+  - [#5665](https://github.com/s8lap/bezel-lang/issues/5665): no new tracker. [#5518](https://github.com/s8lap/bezel-lang/issues/5518) owns the local-collection divergence, and [#5515](https://github.com/s8lap/bezel-lang/issues/5515) gets a note correcting its test list.
+  - [#5610](https://github.com/s8lap/bezel-lang/issues/5610) (closed, #5598's compiler fix) gets a note recording the class twin of its rule.
+
+  *Owner decisions recorded:* the owner's 2026-10-08 delegation, under which the three decisions above are delegated rulings. [#5664](https://github.com/s8lap/bezel-lang/issues/5664) and [#5665](https://github.com/s8lap/bezel-lang/issues/5665) are filed at landing and close with this revision.
+
+  *Filed as questions:*
+  - [#5668](https://github.com/s8lap/bezel-lang/issues/5668): should §8.3's compiler-enforced `GetHashCode` pairing reach a class's plain own-typed `Equals(T)`, as v0.327 made it reach a plain `Equals` on enums and choices? Recommended, but it is a new rejection and is measured first.
+  - [#5670](https://github.com/s8lap/bezel-lang/issues/5670): should `=` on a class bind a fixed `Equals` member rather than resolve `a.Equals(b)` as a call? The composition check adds a second shape: whether §8.4's null-safe wrapper reads a present nullable operand at its stripped type, which decides whether `p = q` at `q: Point?` reaches `Equals(Point)` or `Equals(Object?)`.
+  - [#5666](https://github.com/s8lap/bezel-lang/issues/5666) (spec defect): proposal 0143's checked-mode fault is also raised by reads outside §28.8.1's throwable inventory (a `case` over an owning-choice binding, `a.Length`, iteration), which need no `finally` under the current text, so the field can leave the method in the disposed state.
+
+  *Guides:* Guide 07's inheritance-chain paragraph names `Object`'s three members (composition). No idiom a guide teaches changes and no guide example changes verdict, so every pin stays: Guides 02 and 04 at v0.328, Guides 01 and 05 at v0.327, and Guides 03, 06 and 07 at v0.326.
+
+  *Corpus:*
+  - The rule corpus stays at 2,315 cases, and no verdict or `baseline.tsv` row changes.
+  - The doc-example corpus is unedited (#1380). `stdlib_0042` (`StringBuilder`) and `stdlib_0147` (`String`) transcribe the old signatures and are `skip:signature`, so no verdict moves. The extraction count is 523 fragments (522 at v0.329), from `P1`'s code-generation reference fences.
+  - Coverage gaps recorded, not written:
+    - [#5664](https://github.com/s8lap/bezel-lang/issues/5664): a class's plain `Equals(other: Object?)` without `override` (reject; a `fail` row until the tracker lands); a class `Equals(a: K, b: K)` with `GetHashCode(value: K)` passed to `new Dictionary<K, V>(cmp)` (pass), which unblocks the comparer-held pair [#5604](https://github.com/s8lap/bezel-lang/issues/5604) surfaced; `p = d` at a subclass-typed `d` (reject).
+    - The `finally` restoration: a `run` case, which is #5652's probe once the encoding lands.
+    - [#5665](https://github.com/s8lap/bezel-lang/issues/5665): `lambda(g) => xs.Add(g)` at a field-held `xs` (reject) and at a local `xs` (reject; a `fail` row until #5518).
 
 ---

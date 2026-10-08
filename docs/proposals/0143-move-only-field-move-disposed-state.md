@@ -38,8 +38,11 @@ class Pool
     case Slots of
       var a => do
         var t := move alias.Slots;            // the value now lives in `t`; the field is moved-from (K9.2)
-        Console.WriteLine(a[0] <> null);      // reads the vacated storage
-        alias.Slots := t;                     // restoration
+        try
+          Console.WriteLine(a[0] <> null);    // reads the vacated storage
+        finally
+          alias.Slots := t;                   // restoration, on the read's exception edge too (K9.2)
+        end;
       end
     end;
   end Drain;
@@ -109,7 +112,7 @@ The text names **instance** fields: a static owned field admits no `move` (K9.4)
 - **Tests that flip:** none. Census: no test, doc example or corpus case whole-value-moves an owning-inline-array or owning-choice field inside a borrowing `case` over that field (`grep -rn 'move [a-z_]*\.[A-Za-z_]*;' tests/` → the `move box.n` / `move h.n` rejections of `move_non_owned_field_rejected_4284_test.cpp` and the class-typed `move this._res` restorations of the `move_after_move_field_897_898` lit cases, none an inline array or a choice; `tests/ownership/move_only_scrutinee_pattern_binding_borrow_1665_test.cpp` and `borrowing_match_move_only_binding_consume_4803_test.cpp` match owning inline arrays over **locals**, where the freeze already governs). The rule corpus: `s15_3_0001`–`0015`, `s15_1_1_0001`–`0007`, `s19_3_*` state no verdict this proposal changes (`s15_3_0006`/`0007` are the local-freeze cases; `s15_3_0015` is the whole-value move out of a local). No `baseline.tsv` row changes.
 - **Doc-only:** the §9.4, §15.1.1, §15.3, §19.3, §28.3 and C.5 sentences; the rationale paragraph; the code-generation pair; the three decline rows.
 - **Guides:** none mentions a borrowing `case` over an owning inline array field or a whole-value field move (`grep -n 'Slots\|move h\.' docs/Bezel_Guide_0*.md` → 0); no pin moves for this proposal.
-- **Corpus coverage gaps, recorded not written:** the checked-mode fault (`case h.Slots of var a => do var t := move h.Slots; _ := a[0]; h.Slots := t; end end;` — run, expect `DisposedAccessException`); its control reading `a[0]` before the move (run); the restoration control reading `a[0]` after `h.Slots := t;` (run, the replacement); the owning-choice twin over `case h.C of var c => …`.
+- **Corpus coverage gaps, recorded not written:** the checked-mode fault (`case h.Slots of var a => do var t := move h.Slots; try _ := a[0]; finally h.Slots := t; end; end end;` — run, expect `DisposedAccessException`; the restoration sits in a `finally` because `a[0]` is an inline-array indexer access, throwable under §28.8.1, and K9.2 counts its exception edge); its control reading `a[0]` before the move (run); the restoration control reading `a[0]` after `h.Slots := t;` (run, the replacement); the owning-choice twin over `case h.C of var c => …`.
 
 ---
 
@@ -123,7 +126,7 @@ The text names **instance** fields: a static owned field admits no `move` (K9.4)
 
 - No disposed-state encoding exists for either move-only kind (proposal 0135 §13.6 item 5; v0.321's #5496 item tracks the owning choice; v0.327's #5554 tracker the inline array's holder kill). The whole-value move of a move-only value is lowered as a bitwise transfer with the source marked moved-from (`src/codegen/LlvmBackend_Disposal.cpp:6880–6900`, the #4566 note: "a whole-value move 'leaves the local holding no value rather than a hole, so no pass walks it'"); for a field source the same lowering leaves the field's bytes as they were. The restoration store is §15.3's whole-value reassignment pass (`LlvmBackend_Disposal.cpp:1630`), which at a moved-from field "disposes nothing" (§28.7 *Moved-from and null*).
 - **Where the state lives: in the field's own storage, with no layout change.** An owning choice's state is a tag value no case uses. An owning inline array's state is a value written into its first slot, which every form has (`[0]T` is a compile error, §15.1): a reserved address no object occupies (a tombstone the runtime allocates once), at both forms. `null` would not serve even at the non-nullable form `[N owned]C`: a slot moved out by `move h.Slots[0]` and not yet restored may hold it, and a read of another slot through the binding would then fault on a live array. Owning-inline-array elements are class- or interface-typed (§15.1.1), so every slot is a reference-sized word and the tombstone fits. A read tests the first slot, so the move costs one store whatever `N` is, and the test is one compare.
-- **Tracker to file (spec-ahead-of-impl, §9.4 / §15.3 / §28.3, v0.328):** at a whole-value `move` of an owning-inline-array or owning-choice instance field, write the #5554 sentinel (above) into the vacated field storage in checked mode; test it on every read through a borrowing-match binding addressing that storage, and on every read of the field itself (an alias of the holder reaches it, §3 item 1) — slot reads, iteration, the compiler-provided operations; for a choice, payload and tag reads — raising `DisposedAccessException`; and have the restoration store (and `Dispose()`'s per-slot pass, should the object die moved-from inside a destructor, K9.3) treat the sentinel as "no live slots". The two probes in §5 are the regression pair. Companion to #5554's encoding item; one encoding serves both.
+- **Tracker to file (spec-ahead-of-impl, §9.4 / §15.3 / §28.3, v0.328):** at a whole-value `move` of an owning-inline-array or owning-choice instance field, write the #5554 sentinel (above) into the vacated field storage in checked mode; test it on every read through a borrowing-match binding addressing that storage, and on every read of the field itself (an alias of the holder reaches it, §3 item 1) — slot reads, iteration, the compiler-provided operations; for a choice, payload and tag reads — raising `DisposedAccessException`; and have the restoration store (and `Dispose()`'s per-slot pass, should the object die moved-from inside a destructor, K9.3) treat the sentinel as "no live slots". The two probes in §5 are the regression pair; each read between the move and the restoration sits in a `try` whose `finally` restores the field, since the read is throwable (§28.8.1) and a restoration after it would leave the fault's edge unrestored (K9.2). Companion to #5554's encoding item; one encoding serves both.
 
 ---
 
