@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.321 — October 2026**
+**Companion to the Bezel Language Specification, v0.322 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -11242,5 +11242,147 @@ A composition check over the union then fixed five seams:
   - #5533: `G(ref this._c)` over an owning-choice field (reject).
   - #5534: a closure over `ref x: int` added to a local `Array<() -> int>` (reject); one invoked within the call (run).
   - #5530: `async method M(xs: [2]Item): Task` (reject).
+
+---
+
+### v0.322 changelog (v0.321 → v0.322)
+
+**The follow-up wave on v0.321's questions.** v0.321 filed seven questions; six were decidable without the owner, and this revision rules all six. The seventh (§15.1.1 / §28.4, an owning inline array's boxed slot read after its holder is destroyed) is design-change-sized and awaits the owner. Two lanes:
+- `arr`: [#5555](https://github.com/s8lap/bezel-lang/issues/5555) (which element types an inline array admits, and when it is borrow-bearing) and [#5556](https://github.com/s8lap/bezel-lang/issues/5556) (`new()` at a nullable type).
+- `refs2`: [#5557](https://github.com/s8lap/bezel-lang/issues/5557), [#5558](https://github.com/s8lap/bezel-lang/issues/5558), [#5559](https://github.com/s8lap/bezel-lang/issues/5559) and [#5560](https://github.com/s8lap/bezel-lang/issues/5560), the four `ref`/`out`, closure and `scoped` questions.
+
+Each lane passed its author's adversarial pass and an independent critique: 5 blocking and 15 non-blocking findings, all resolved or recorded (`arr` 3 and 7, `refs2` 2 and 8). The 44 edits (`arr` 26, `refs2` 18) were applied as one sequence, and a composition check added 4.
+
+The critics' blocking findings were these:
+- `arr`: the borrow-bearing definition ("a class or interface type") classed `[2]Type` as borrow-bearing, though `Type` is runtime-managed (§28.9), so `async M(ts: [2]Type)` would have been rejected while `async M(t: Type)` was admitted. A bare class instance field of type `[N]Pair` was left unsettled, admitting the laundering the ruling declines one wrapper fewer, and a test that pins it was missed (see *Tests that flip*). The null-source form's depth clause was added to §9.7's static-field bullet only, leaving three restatements of the one definition (§9.7's instance-field bullet, §22.12 note (f), Appendix C.3) disagreeing at depth 2, the defect #3291 recorded.
+- `refs2`: #5558's formation rule rejected the recursive closure, `var fact: (int) -> int; fact := lambda(n: int) => … fact(n - 1) …;`, which five `runAot` tests pin (`tests/codegen/recursive_lambda_579_test.cpp`), and the lane's "measured reach: none" was false. And the lane's open question on whether an owning choice's `C?` is move-only is settled by §35.9, so #5560 reaches `ref c: C?`.
+
+**Two rulings carry more than their issue asked; the owner should see each.**
+- **#5558 admits the recursive closure by name (added by the critic).** The plain formation rule would make the only spelling of a self-calling closure over captured state need a nullable variable and a `!` at every self-call, since a local's own initializer is outside its scope (§21.1). Where the lambda expression is the whole right-hand side of a plain assignment to the captured variable (`f := lambda …`), that variable counts as assigned in the lambda's body: the store follows the right-hand side's evaluation and forming a lambda invokes nothing, so no invocation can precede the store. The shape is kept narrow: `f := Wrap(lambda … f() …)` is not covered, since `Wrap` could invoke the lambda before the store. C#'s rule, which rejects the self-reference, is recorded as declined.
+- **#5555 folds in the null-source form's depth.** Once `[2]Pair` is borrow-bearing, §9.7's static-field exception ("every reference-typed field, and every reference-typed slot of every inline-array field, `null`") read a `[2]Pair` field vacuously, its slots being records, not reference-typed. The same gap already existed for a nested record field. The form now reads record and choice components at any depth. This is a ruling, not a design change: the one-level reading contradicts the form's stated reason (note (f): "A null-source value references nothing") and Appendix C.3's K2.3 premise, and the compiler has enforced the nested reading for records since #3973 (`tests/sema/static_readonly_nested_borrow_bearing_record_3973_test.cpp`).
+
+A composition check over the union then fixed four seams:
+- §8.6's inline-array boxing sentence said a boxed `[N]T` carries borrows "when the element type is a reference type", which included runtime-managed elements and missed `[N]Pair`. It now keys on §15.1.2's borrow-bearing property, as Appendix C.1's boxing bullet already did.
+- §7.9's pointer said a lambda body reads a captured local "as of the lambda's formation", which the recursive-closure shape contradicts. It now points at §27.5's reading.
+- §15.1's value-type element bullet named no nullable form, though `[1]Color?` is admitted and the bullet's own move-only sentence speaks of an owning choice's nullable form. It reads "a primitive, a record, an enum or a choice, nullable or not, or the unit type".
+- §28.14's boxed-argument sentence began "Otherwise the box carries no borrow" after the move-only sentence, which read as covering borrow-bearing values. It reads "any other admitted value's box carries no borrow".
+
+- **§14.2 / Appendix C.4, rationale §10 — `new()` admits a nullable value type and no nullable reference type (ruling; [#5556](https://github.com/s8lap/bezel-lang/issues/5556)).** §14.2's `new()` row admits "defaultable value types", and every nullable type is defaultable (§17.11), but no sentence decided `C<int?>` or `C<Widget?>`, nor what `new T()` yields there. v0.321 (#5529) filed `C<W?>` under `new()` on this question.
+  - A nullable value type (`int?`, `Priority?`, the nullable form of any record, enum or choice) satisfies `new()`, and `new T()` there is `null` (`default(T)`). That includes the nullable form of a choice, a constructor-only record or a zero-less enum, whose non-nullable forms do not satisfy it.
+  - A nullable reference type (`Widget?`, `IFoo?`, `string?`) satisfies neither arm: it is not a class type, so it names no constructor, and it is not a value type. It is a compile error at the instantiation site.
+  - `C<W?>` under `new()` holds exactly where `W`'s constraints guarantee a value type (as `where W: value` does).
+  - Appendix C.4's bullet and the code-generation reference's *Generics* line say the same.
+
+  **Declined:** excluding every nullable type, for uniformity with `notnull`, `class`, `value` and the type bounds. Those constraints state a non-null kind or contract, while `new()` states only that `new T()` yields a value of `T`, and §14.2's value arm is keyed on defaultability. Also declined: admitting `Widget?`, which would give `new T()` two readings with different ownership (a constructed owned `Widget`, or `null`). Two `rejected` rows. The stated cost: a nullable choice or constructor-only record satisfies `new()` while its non-nullable form does not, as `default(T)` already behaves. Kernel: no contact. Body-locality: local.
+
+  **Compiler (tracked):** `Resolver::argSatisfiesNew` (`TypeResolution_Checks.cpp:10039`) and `ExprTC::groundSatisfiesNew` (`ExprTypecheck.cpp:1762`) never read the argument's nullability. `int?` is admitted (conforms). `Widget?` is admitted where `Widget` has a non-private parameterless constructor (newly rejected). A nullable choice, a nullable constructor-only record and a nullable zero-less enum are rejected through the non-nullable arms (newly accepted). `lowerNew`'s `new T()` substitution path (`LlvmBackend_Exprs2.cpp:6225`) does not read the substitution's nullability, so `new T()` at `Widget?` would construct a `Widget` (source reading). What `new T()` yields at `int?` is unverified; the probe is `Make<int?>()` printing `null`.
+- **§15.1 / §15.1.2 / §9.7 / §8.6 / §22.12 / §30.1 / Appendix C.1, C.3 — an inline array's element kinds, and when it is borrow-bearing (ruling; [#5555](https://github.com/s8lap/bezel-lang/issues/5555)).** §15.1's value-type bullet read "primitive or record", though the compiler and tests admit enums, choices, interfaces and the unit type. §15.1.2's *Lifetime* paragraph and §9.7's field bullet named only `[N]C`/`[N]C?` for a class or interface `C`, while §3.6's borrow-bearing row reads "records (and inline arrays) carrying at least one borrow". So `[2]Pair`, for a borrow-bearing `record Pair(A: Item, B: Item)`, was unclassified, and v0.321's async ban keys on the term.
+  - §15.1 names the element kinds: a value type other than an inline array (a primitive, a record, an enum or a choice, nullable or not, or the unit type), a class or interface type, and a runtime-managed reference type (`string`, `Type`, function values). v0.321's owning-choice exclusion is unchanged.
+  - The one-dimensional rule holds wherever the nested form arises: `[N]T` with `T` substituted by an inline array is a compile error at the instantiation site, and so is a generic type alias reference whose expansion forms one (§27.8). Appendix C.1 gains the bullet.
+  - An inline array without `owned` is **borrow-bearing** exactly when its element type, nullability stripped, is a class or interface type that is not runtime-managed, a borrow-bearing record, or a choice that holds borrows (§15.1.2). §9.7's field bullet reads it, so a record or choice holding a `[2]Pair` is borrow-bearing, and §35.4's holds-borrows follows through §9.7's field-level definition.
+  - Borrows a slot carries through a record or choice element are under §9.7's bullet list as that record or choice is: a `[2]Pair` value is stored in a class instance field, a static field or a longer-lived collection only where a `Pair` value would be, and is under §30.1's `async` ban as `Pair` is. Class- and interface-element arrays keep §28.3's direct-borrow field rules.
+  - §9.7's null-source form reads record and choice components at any depth, so a `[2]Pair` field qualifies only where both slots hold a null-source `Pair`. The restatements in §9.7's instance-field bullet, §22.12 note (f) and Appendix C.3 say the same.
+  - §30.1's ban names `[2]Pair` beside `[2]Item`. The code-generation reference's borrow-bearing paragraph says the same.
+
+  **Declined:** classing only class- and interface-element arrays as borrow-bearing. The array would launder every borrow-bearing record rule through one level of wrapping (`async M(xs: [2]Pair)` admitted where `async M(p: Pair)` is rejected). One `rejected` row. Kernel: derivation (K2.1 + K6.1 at the async ban, as the ban; K2.3 at the null-source form). Body-locality: local, and per instantiation for a generic element type (§3.6 rule 2).
+
+  **Compiler (tracked):** `recordFieldIsBorrowCarrying`'s inline-array arm (`Ownership_Checks.cpp:5714`) and `choiceHoldsBorrows`'s (`:18861`) test only class or interface elements (`isBorrowableType`), so a `[2]Pair` field or payload is not borrow-carrying, and no check applies §9.7's bullets to a bare `[N]Pair` value. The async checks (`checkAsyncSignatureBorrowBearing`, `:18887`) have no top-level inline-array arm at all (v0.321's #5530 tracker). The generic-type path does not re-check a nested inline array formed by substitution; only the alias path does (`SubstArgs.cpp:121`, `validateNestedInlineArrays`, #4280). `isNullSourceRecordExpr` (`:5806`) already recurses into nested constructions.
+- **§22.3 / §14.2 / §35.11 / Appendix C.3, rationale §10 — the `ref`/`out` owned-state bound is read per instantiation (clarification, gated as a ruling; [#5557](https://github.com/s8lap/bezel-lang/issues/5557)).** v0.321 barred any location of move-only value type at a `ref` or `out` argument. A generic body is checked once, and in `class Box<T>` a field `_v: T` is move-only at `Box<C>` for an owning choice `C`.
+  - A location whose declared type is or contains a type parameter (`T`, `T?`, or a generic choice over it) is barred at each instantiation at which that type is a move-only value type. This is §3.6 rule 2's interior-use requirement, as §7.10's copy demand is.
+  - `G(ref _v)` in a member of `Box<T>` makes `Box<C>` a compile error wherever it is named, and is admitted at every other substitution.
+  - §35.11's list of admissibility rules enforced at the instantiation names the bound. §14.2's `where T: value` row, which read on its face as a body-level check, says the demand is checked at each instantiation, as §7.10 does.
+
+  **Declined:** checking the body under a move-only assumption whenever `T` admits a move-only substitution, which would reject `Swap(ref a, ref b)` over `T`-typed locations at every `T`. One `rejected` row. Kernel: no contact. Body-locality: carve-out (generic instantiation: §3.6 rule 2's interior-use clause).
+
+  **Compiler (tracked):** `checkRefOutOwnedOperand` (`Ownership_Checks.cpp:13566`) has no type-keyed move-only arm (v0.321's #5533 tracker), and the ownership pass checks a generic body once, before monomorphization (`Ownership.cpp:5848`), so the bound is enforced neither in the body nor per instantiation.
+- **§22.3 / Appendix C.3, rationale §10 — a `ref` parameter is not declared at a move-only type (ruling; [#5560](https://github.com/s8lap/bezel-lang/issues/5560)).** §22.3 bars every location of move-only value type at a `ref` argument, so `ref c: C` over an owning choice `C` bound no argument at any call, yet the declaration was admitted.
+  - A `ref` parameter whose declared type is a move-only value type, an owning choice's `C?` among them (§35.9), is a compile error at the declaration, and so is a function type's `ref` slot at such a type.
+  - The remedy is a plain parameter and return, `c := Step(c);` (§15.3's *Parameter passing*), or `out`, which an `out var` recipient binds.
+  - A `ref` parameter whose declared type is or contains a type parameter stays legal. At a move-only substitution no argument binds it, by #5557's per-instantiation bound.
+
+  **Declined:** leaving the declaration legal and uncallable, which reports the defect at each call, and for an interface member nobody calls, never. One `rejected` row, whose reopening bar is a revision lifting §22.3's owned-state bound for move-only locations. Appendix C.3 gains a row (shared with #5557), and the code-generation reference's `ref`/`out` line states it. Kernel: no contact. Body-locality: local.
+
+  **Compiler (tracked):** no declaration-time check exists (`TypeResolution_Checks.cpp:5780` `isByRefParamModifier` is ABI-only; `isMoveOnlyValueType` has no `ref`-parameter site).
+- **§27.5 / §7.9 / §32.5 / Appendix C.1, rationale §4.2 — definite assignment across a closure (ruling; [#5558](https://github.com/s8lap/bezel-lang/issues/5558)).** v0.321 admitted capturing an `out` parameter and ruled that a closure's write does not discharge its obligation. §7.9 and §27.5 said nothing about a read in a lambda body.
+  - A lambda body's definite assignment starts from the enclosing body's state at the lambda's **formation**, the point at which the lambda expression is evaluated. A captured local of non-defaultable type, or an `out` parameter of any type, that is unassigned there is unassigned at the body's entry, and the body reads it only after assigning it on every path.
+  - Where the lambda expression is the whole right-hand side of a plain assignment to the captured variable (`f := lambda …`), that variable is assigned in the lambda's body. This is the recursive closure's spelling.
+  - The analysis does not follow invocations: a write in the body assigns the variable nowhere outside the body, for a local as for an `out` parameter. Given `out x: int` unassigned, `var f := lambda() => x + 1; x := 5; return f();` is rejected; assign before forming the lambda.
+  - A lambda formed inside a lambda body starts from that body's state at its own formation.
+  - §32.5's extern `out`-capture ban is unchanged and still needed, since a defaultable pre-declared recipient counts as assigned at formation; its parenthetical, which said the analysis "does not reach into closure bodies", cites §27.5.
+
+  **Declined:** checking reads at the closure's invocations (an unannounced cross-body fact once the closure is passed); leaving closure bodies unanalysed (an unset read of an `out` slot or a non-defaultable local); and rejecting the recursive closure's self-reference, as C# does (a nullable variable and `!` for no soundness gain). One `rejected` row. Appendix C.1's definite-assignment bullet and the code-generation reference's `ref`/`out` line state the rule. Kernel: no contact. Body-locality: local.
+
+  **Compiler (tracked):** `DefiniteAssignment.cpp:2134–2170` walks a lambda body only when the lambda declares its own `out` parameter, and then with a fresh `MethodDA` holding none of the enclosing body's variables, so a captured unassigned read passes (`:2457–2470` flags only names declared in the walked body). `seedOutParams` (`:2306`) already seeds every `out` parameter unassigned whatever its type.
+- **§28.14 / Appendix C.3, rationale §4.2 — a boxed value at an interface-typed `scoped` parameter (ruling; [#5559](https://github.com/s8lap/bezel-lang/issues/5559)).** A record implementing an interface reaches an interface-typed `scoped` parameter by boxing (§8.6). §28.14 defined the argument's borrow source only for a class or interface value.
+  - Such an argument carries the same call-site marker, and meets the bound exactly where §9.7's instance-field bullet admits storing the value in an instance field of a class: when it is not borrow-bearing, or in the null-source form.
+  - A move-only value does not box. Any other admitted value's box carries no borrow, so the argument has no borrow source: it is admitted under every bounding object and freezes nothing, its own location included, the box holding a copy fixed at boxing.
+  - A borrow-bearing value is rejected, since the callee may keep the box in a field of the bounding object. The remedy is a class implementing the interface.
+  - The sentence decides the bound only. Which expressions may stand as the argument (the fresh-producer rejection) is unchanged. At a type-parameter-typed argument the condition is read at each instantiation.
+
+  **Declined:** admitting a borrow-bearing value with its carried sources tested and frozen as a closure's captures are. It would be sound, but it is an exception to §9.7's instance-field rule keyed on a parameter modifier, and that rule's stated reason is regime uniformity. One `rejected` row, whose reopening bar is a proposal lifting §9.7's instance-field rejection. Appendix C.3 gains a row, and the code-generation reference's `scoped` line states it. Kernel: derivation (K2.3, as §9.7's instance-field bullet). Body-locality: local, and per instantiation at a type-parameter-typed argument.
+
+  **Compiler (tracked):** `checkScopedAdmission` (`Ownership_Checks.cpp:21292`) classifies the argument with `scopedArgIsClassBorrow` (`:20914`), which reads the argument's pre-conversion type, so a record argument falls through to the identifier arm (`:21345`) and is rejected with the function-value diagnostic ("the captures of the function value `p` cannot be verified…"). Source reading; whether sema admits the boxing conversion at a `scoped` position was not determined.
+
+- **Migration.** *Newly rejected (spec-ahead-of-impl unless marked):*
+  - A `[N]Pair` value, `Pair` a borrow-bearing record or a choice that holds borrows, wherever §9.7 rejects a `Pair`: a class instance field of type `[N]Pair` assigned anything but the null-source form, a static outside the null-source form (§22.12's `static readonly` column moves the type from ‡ to note (f)), a copy into a longer-lived collection, a return with a non-re-establishable borrow (#5555).
+  - A record or choice whose field or payload is `[N]Pair`, wherever §9.7 rejects a borrow-bearing record: in a class instance field, in a static outside the null-source form, returned with a non-re-establishable borrow, copied into a longer-lived collection, or constructed from a temporary (#5555).
+  - `[N]Pair` as an `async` parameter, result or element type, or as a local crossing a suspension point with a caller-side source (#5555, extending #5530).
+  - `[N]T` instantiated at an inline-array `T` on the generic type and method path (#5555; the alias path already rejects, #4280).
+  - A static whose record or choice component holds a non-null borrow inside a nested value (`new Outer(new Pair(a, b))`) is not null-source (#5555; the compiler already reads records this way, #3973).
+  - A nullable reference type at `where T: new()` (`Make<Widget?>()`, `Box<IFoo?>`, `Box<string?>`) (#5556; source reading).
+  - Naming an instantiation whose generic body passes a location whose type is or contains `T` as a `ref`/`out` argument, at a move-only substitution (#5557).
+  - A `ref` parameter or function-type `ref` slot declared at a move-only value type, `C?` of an owning choice included (#5560).
+  - A read in a lambda body of a captured `out` parameter or non-defaultable local not definitely assigned at the lambda's formation, outside the `f := lambda …` shape; a read in the enclosing body relying on a closure's write to assign a local (#5558).
+  - A borrow-bearing value at an interface-typed `scoped` parameter (#5559; the compiler already rejects it, with the function-value diagnostic).
+
+  Tests that flip: one, spec-ahead. `tests/ownership/boxed_borrow_bearing_record_escape_4478_test.cpp` `boxed_borrow_record_escape_4478.borrow_bearing_record_at_value_slot_accepted` declares `class Holder public Items: [1]BorrowRec; …` over `record BorrowRec(W: Widget)`, assigns `Items := [new BorrowRec(w)]` in the constructor, and asserts no diagnostics. Under #5555 the store is §9.7's instance-field rejection. New expectation: rejected at the field store with the instance-field diagnostic. It flips when the compiler implements the tracked delta, and the tracking issue names it; it is not weakened in between. One further program is newly ill-formed without flipping: `tests/codegen/event_raise_reentrant_dispose_908_test.cpp` `event_raise_reentrant_dispose_908.handler_disposes_later_subscription` reads `sub2` in a lambda formed before `sub2 :=` (#5558). It is already ill-formed under §27.5/§28.3, since the lambda disposes a captured owned binding, and it runs on the deprecated JIT oracle, which skips definite assignment and ownership, so its verdict does not move; it is filed for the JIT-port backlog. The #579 recursive-closure tests (`tests/codegen/recursive_lambda_579_test.cpp`, five `runAot` rows) and `tests/parser/lambda_conditional_body_589_test.cpp` are kept by #5558's `f := lambda …` shape. #1217's `local_invocation_out_capturing_lambda_clean_27_5` assigns before formation and stays clean. No diagnostic text is renamed.
+
+  *Newly accepted (spec-ahead-of-impl, source reading):*
+  - A non-borrow-bearing value (a record, enum, primitive or copyable choice) at an interface-typed `scoped` parameter, `M(scoped p)` (#5559).
+  - `new()` at a nullable choice `Outcome?`, at `R?` for a constructor-only record, and at `E?` for an enum with no zero-valued constant; `new T()` is `null` at each (#5556).
+
+  *Newly defined:*
+  - `new T()` at a nullable value type is `null` (#5556; probe).
+  - A lambda body's definite assignment, including the recursive closure's `f := lambda …` shape, which the compiler already admits (#5558).
+
+  *Doc-only:*
+  - §15.1's element-kind list (enum, choice, interface, unit, nullable value forms), which the compiler admits (#5555).
+  - `int?` and `Priority?` at `new()`, which the compiler admits (#5556).
+  - §14.2's `where T: value` row (checked at each instantiation, restating §7.10), §35.11's list entry, §32.5's parenthetical and §7.9's pointer (#5557, #5558).
+  - The composition fixes to §8.6, §7.9, §15.1 and §28.14 above.
+  - Rationale: §4.2 (two paragraphs, #5558 and #5559), §10 (two paragraphs, #5557/#5560 and #5556).
+  - The code-generation reference's *Generics*, `ref`/`out`, `scoped` and borrow-bearing lines. Its pins move to v0.322.
+  - `DECLINED.md` gains 7 `rejected` rows (`arr` 3: #5555 one, #5556 two; `refs2` 4: #5557, #5558, #5559, #5560 one each). The index size is recomputed once: 668 rows — 371 · 126 · 128 · 7 · 36 · 0.
+
+  *Spec-ahead-of-impl (tracking issues filed at landing):*
+  - #5555: classify a record- or choice-element inline array as borrow-carrying, and apply §9.7's bullets to a bare `[N]Pair` value (names the 4478 flip).
+  - #5555: the async ban's inline-array arm covers record and choice elements (extends v0.321's #5530 tracker).
+  - #5555: reject a nested inline array formed by substitution on the generic type and method path.
+  - #5556: read the argument's nullability in both `new()` deciders, and yield `null` from `new T()` at a nullable value type.
+  - #5557: the per-instantiation `ref`/`out` bound at a `T`-dependent location (depends on #5533's type-keyed arm).
+  - #5560: reject a `ref` parameter declared at a move-only type.
+  - #5558: closure-body definite assignment from the formation state.
+  - #5559: classify a value-typed `scoped` argument by its boxed form, admit the non-borrow-bearing case and give the borrow-bearing rejection its own diagnostic.
+
+  *Implementation findings (filed as issues, not spec deltas):*
+  - §14.2 (v0.302): both `new()` deciders admit a non-`public` (`internal`, `protected`) parameterless constructor, where §14.2 requires `public` (`TypeResolution_Checks.cpp:10237`, `ExprTypecheck.cpp:1948`).
+  - §9.7 (v0.321): `tests/codegen/record_choice_class_field_over_suppress_4301_test.cpp` `record_containing_class_field_no_string_leak` pins a spec-rejected program (`new Str2(new Box(s))`, a temporary bound to a borrow-carrying field, returned in a `[1]Str2`); its oracle is to be re-founded on an admitted shape, not weakened.
+  - The 908 JIT test above, for the JIT-port backlog.
+  - HYPOTHESIS, probe first: `isNullSourceRecordExpr` cannot see a null-source inline-array literal argument (`new R([null, null])` for `record R(Xs: [2]Item?)`), a likely false reject of a spec-admitted form, pre-existing.
+
+  *Filed as questions:*
+  - §15.1.2 / §28.3: element-wise borrow tracking of a local `[N]Pair`: whether a slot store re-sources that slot only or joins the array's whole source set.
+  - §9.7 / §22.12 / §35.4: the null-source form of a choice value (a payload-free case; whether §9.7's definition is the one home for records and choices).
+  - §15.3 / §35.9 (editorial): §15.3's "the move-only value type kinds … are two" omits an owning choice's nullable wrapper `C?`, which §35.9 makes move-only.
+
+  *Guides:* no idiom a guide teaches changed, so the guide pins stay. The code-generation reference's pins move to v0.322.
+
+  *Corpus:* the rule corpus stays at 2,197 cases. No case changes verdict and none is made unwritable; no `rule:` header quotes an edited sentence beyond an unchanged prefix (`s9_7_0008`, `s7_9_0004`, `s22_3_0013`). Coverage gaps recorded:
+  - #5555: `async method M(xs: [2]Pair): Task` (reject); `class H private _r: R;` storing `record R(Ps: [2]Pair)` built from locals (reject); `class G<T> private _a: [2]T; end` named `G<[3]int>` (reject); a static `[2]Pair` with non-null slots (reject).
+  - #5556: `Make<int?>()` (run, prints `null`); `Make<Widget?>()` (reject); `Make<Outcome?>()` (run); `C<W?>` under `new()` in `Box<W> where W: value` (accept) and in an unconstrained `Box<W>` (reject).
+  - #5557: `class Box<T> where T: value` passing `ref _v`, named at an owning choice (reject).
+  - #5558: `out x: int` read in a lambda formed before `x := 5` (reject); the same with the assignment first (accept); `var f: (int) -> int; f := lambda(n: int) => … f(n - 1) …` (accept).
+  - #5559: a non-borrow-bearing record at `scoped x: I` under a `using var` holder (run); a span-carrying record there (reject).
+  - #5560: `method F(ref c: C)` over an owning choice (reject).
 
 ---
