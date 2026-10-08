@@ -181,7 +181,11 @@ private:
     // Slice 49: A.4 ArgList — `Argument ("," Argument)*`. Caller is
     // positioned at the first token of the first argument; the closing `)`
     // is left for the caller to consume.
-    std::vector<ast::CallArgument> parseArgList();
+    // `isIndexPosition` (default false) suppresses the bare `owned` rejection,
+    // letting index arguments through to sema's checkIndexArgsPositional (which
+    // fires with §23.5); at call positions the parser keeps rejecting `owned`
+    // with §A.4 per proposal 0090 / v0.246.
+    std::vector<ast::CallArgument> parseArgList(bool isIndexPosition = false);
     // Slice 36: a single LambdaParam (A.7). Differs from method ParamList
     // in that the `: Type` ascription is optional.
     ast::Param parseLambdaParam();

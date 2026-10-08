@@ -2219,7 +2219,12 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             // (slice 55). parseArgList stops on `)`; here we drive it until
             // `]` instead by inlining the empty-check.
             if (!isPunctuator("]")) {
-                idx->indices = parseArgList();
+                // Index arguments take a restricted subset of ArgModifiers (§23.5 /
+                // §28.1 / §28.14): `ref`/`out`/`owned`/`scoped` are rejected by
+                // sema's checkIndexArgsPositional, not by the parser. Pass
+                // isIndexPosition=true so the bare `owned` rejection in parseArgList
+                // is suppressed and the modifier is left for sema to handle.
+                idx->indices = parseArgList(/* isIndexPosition = */ true);
             }
             if (!consumePunctuator("]")) {
                 diagnostics_.report(Severity::Error, current_.location,

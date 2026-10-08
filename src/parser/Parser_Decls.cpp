@@ -2967,7 +2967,7 @@ std::vector<ast::Param> Parser::parseParamList() {
     return params;
 }
 
-std::vector<ast::CallArgument> Parser::parseArgList() {
+std::vector<ast::CallArgument> Parser::parseArgList(bool isIndexPosition) {
     // A.4 ArgList ::= Argument ("," Argument)*
     // Argument    ::= ArgModifiers? (Identifier ":=")? ArgExpression
     // ArgModifiers ∈ { ref | out var? | out using var | out owned var | owned
@@ -3011,13 +3011,19 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
             }
         } else if (consumeKeyword("owned")) {
             // per §A.4 / proposal 0090 (v0.246): the bare `owned` ArgModifiers
-            // alternative was removed; the call-site transfer marker is the `move`
-            // keyword inside the argument expression (§22.3, §28.8.1), not a
-            // modifier.
-            diagnostics_.report(
-                Severity::Error, current_.location,
-                "invalid use of 'owned' at argument position (§A.4, proposal 0090, "
-                "v0.246): use 'move x' to transfer ownership at a call site");
+            // alternative was removed at CALL positions; the call-site transfer
+            // marker is the `move` keyword inside the argument expression
+            // (§22.3, §28.8.1), not a modifier. At INDEX positions the modifier
+            // is left for sema's checkIndexArgsPositional (§23.5) to reject with
+            // the index-specific diagnostic.
+            if (isIndexPosition) {
+                a.modifier = "owned";
+            } else {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "invalid use of 'owned' at argument position (§A.4, proposal 0090, "
+                    "v0.246): use 'move x' to transfer ownership at a call site");
+            }
         } else if (current_.kind == TokenKind::Identifier &&
                    current_.text == "scoped" &&
                    (peekAt(1).kind == TokenKind::Identifier ||
