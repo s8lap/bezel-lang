@@ -6393,6 +6393,76 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         return;
     }
 
+    // fix #5630 (§9.7, v0.315): a CallExpr that returns a borrow-bearing record
+    // or inline array — e.g. `Pass<Pair>(new Pair(x))` — was not handled here.
+    // When the call result carries a borrow of an escape-bound local, the borrow
+    // escapes when the record is returned. Scan each argument: identifier args
+    // are checked directly; non-identifier args (e.g. NewExpr) are recursively
+    // checked for nested borrow-bearing construction. Deferred-activation calls
+    // are excluded (their borrow-lifetime model is frame-based, not scope-based).
+    if (const auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (isDeferredActivationCallResult(e)) return;
+        // Helper: find an escape-bound local source in a NewExpr's arguments.
+        // Mirrors carriedBorrowSourceOfValueExpr's NewExpr arm but with recursive
+        // tracing for nested non-identifier args.
+        std::function<sema::Symbol*(const ast::NewExpr&)> findEscapeInNewExpr =
+            [&](const ast::NewExpr& ne) -> sema::Symbol* {
+            for (const ast::CallArgument& a : ne.args) {
+                if (!a.value) continue;
+                const ast::IdentifierExpr* root = identifierRoot(*a.value);
+                if (root) {
+                    if (sema::Symbol* s = ctx_.exprSymbol(*root))
+                        if (isEscapeBoundLocal(s)) return s;
+                } else if (const auto* nested =
+                               dynamic_cast<const ast::NewExpr*>(a.value.get())) {
+                    // Recursively check nested NewExpr (e.g. `new Outer(new Inner(x))`).
+                    if (sema::Symbol* s = findEscapeInNewExpr(*nested))
+                        return s;
+                }
+            }
+            return nullptr;
+        };
+        for (const auto& a : call->args) {
+            if (!a.value) continue;
+            // Identifier arg: check directly.
+            if (const ast::IdentifierExpr* root = identifierRoot(*a.value)) {
+                if (sema::Symbol* s = ctx_.exprSymbol(*root))
+                    if (isEscapeBoundLocal(s)) {
+                        report(
+                            Severity::Error, e.span.begin,
+                            std::string("returned borrow-bearing record carries a "
+                            "borrow of `") +
+                            std::string(s->name) +
+                            "` whose source is disposed at scope end — a "
+                            "borrow-bearing record may not outlive the source of "
+                            "any borrow it carries, and returning it from this "
+                            "method does (§9.7 record borrow-lifetime rule; bind "
+                            "the source in the caller's scope and build the "
+                            "record there instead)");
+                        return;
+                    }
+            } else if (const auto* ne =
+                           dynamic_cast<const ast::NewExpr*>(a.value.get())) {
+                // NewExpr arg: scan its construction args recursively.
+                if (sema::Symbol* s = findEscapeInNewExpr(*ne)) {
+                    report(
+                        Severity::Error, e.span.begin,
+                        std::string("returned borrow-bearing record carries a "
+                        "borrow of `") +
+                        std::string(s->name) +
+                        "` whose source is disposed at scope end — a "
+                        "borrow-bearing record may not outlive the source of "
+                        "any borrow it carries, and returning it from this "
+                        "method does (§9.7 record borrow-lifetime rule; bind "
+                        "the source in the caller's scope and build the "
+                        "record there instead)");
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
     // §4.14 / §4.15 (#1959) projection form: `return local.AsSpan();` /
     // `return local.AsSpan(2..5)` / `return local[i]` — a builtin span VIEW
     // read off a scope-bound owned receiver. This function formerly bailed on
