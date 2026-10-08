@@ -49,7 +49,7 @@ BEZEL_TEST(codegen_move, move_as_constructor_argument) {
 // target and its source must be `owned` for the store to be ownership-valid:
 // storing an owned value (`move r`) into a non-`owned` field would leak (§28.5),
 // so `item` is `owned`, the ctor takes `owned r`, and the caller announces the
-// transfer with the §22.3 `owned` call-site marker (`new Box(owned r)`). The
+// transfer with the §22.3 `owned` call-site marker (`new Box(move r)`). The
 // value flows through unchanged — `b.Val()` reads V == 6. (The pre-migration
 // form stored `move r` into a non-`owned` field; the JIT harness ran it because
 // it skips the ownership pass the AOT/real driver enforces.)
@@ -59,7 +59,7 @@ BEZEL_TEST(codegen_move, move_as_field_assignment_rhs) {
         "  public constructor(owned r: R) item := r; end constructor; "
         "  public method Val(): int => item.V; end Box; "
         "class C public static method Main(): int "
-        "  var r := new R(); r.V := 6; using var b := new Box(owned r); "
+        "  var r := new R(); r.V := 6; using var b := new Box(move r); "
         "  return b.Val(); "
         "end Main; end C;"), 6);
 }

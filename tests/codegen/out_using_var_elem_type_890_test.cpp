@@ -179,7 +179,7 @@ BEZEL_TEST(out_using_var_elem_type_890, weak_tryupgrade_shared_regression) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  var obj := new Cell(66); "
-        "  using var sh := new Shared<Cell>(owned obj); "
+        "  using var sh := new Shared<Cell>(move obj); "
         "  using var w := sh.Downgrade(); "
         "  var got := -1; "
         "  if w.TryUpgrade(out using var s) then "

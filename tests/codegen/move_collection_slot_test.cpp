@@ -99,7 +99,7 @@ BEZEL_TEST(move_coll_slot_28_8_1, move_usingvar_local_into_owning_ctor_disposes_
         "class C public static method Main(): int "
         "  do "
         "    var b := new R(); "
-        "    using var a := new Holder(owned b); "
+        "    using var a := new Holder(move b); "
         "  end; "
         "  return R._n; "                     // 1 = single dispose (correct)
         "end Main; end C;"), 1);

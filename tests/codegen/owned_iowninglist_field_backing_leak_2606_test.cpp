@@ -290,7 +290,7 @@ const char* kOwnedIOwningListCtorParam =
     "    var tmp := new OwningArray<Cell>(); "
     "    tmp.Add(new Cell()); "
     "    tmp.Add(new Cell()); "
-    "    using var h := new Holder(owned tmp); "
+    "    using var h := new Holder(move tmp); "
     "    return h.N(); "
     "  end Run; "
     "  public static method Main(): int "

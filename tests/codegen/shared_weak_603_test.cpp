@@ -136,7 +136,7 @@ const char* kCounterClass =
 // released."
 // ──────────────────────────────────────────────────────────────────────────────
 
-// §28.13 / stdlib §2.16: new Shared<T>(owned obj) consumes obj; while h is alive
+// §28.13 / stdlib §2.16: new Shared<T>(move obj) consumes obj; while h is alive
 // the inner value is NOT disposed (disposed count is still 0).
 // The return is inside the method scope where h is still alive → returns 0.
 BEZEL_TEST(codegen_shared_weak_603, spec_28_13_inner_not_disposed_while_handle_alive) {
@@ -144,7 +144,7 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_inner_not_disposed_while_handle_a
         "class C "
         "  public static method Main(): int "
         "    var obj := new Inner(); "
-        "    using var h := new Shared<Inner>(owned obj); "
+        "    using var h := new Shared<Inner>(move obj); "
         "    return Inner.disposed; "
         "  end Main; "
         "end C;";
@@ -161,7 +161,7 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_scope_end_disposes_inner_exactly_
         "class C "
         "  public static method CreateAndRelease() "
         "    var obj := new Inner(); "
-        "    using var h := new Shared<Inner>(owned obj); "
+        "    using var h := new Shared<Inner>(move obj); "
         "  end CreateAndRelease; "
         "  public static method Main(): int "
         "    C.CreateAndRelease(); "
@@ -186,7 +186,7 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_clone_two_handles_dispose_once) {
         "class C "
         "  public static method TwoHandles() "
         "    var obj := new Inner(); "
-        "    using var h1 := new Shared<Inner>(owned obj); "
+        "    using var h1 := new Shared<Inner>(move obj); "
         "    using var h2 := h1.Clone(); "
         "  end TwoHandles; "
         "  public static method Main(): int "
@@ -204,7 +204,7 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_three_handles_dispose_once) {
         "class C "
         "  public static method ThreeHandles() "
         "    var obj := new Inner(); "
-        "    using var h1 := new Shared<Inner>(owned obj); "
+        "    using var h1 := new Shared<Inner>(move obj); "
         "    using var h2 := h1.Clone(); "
         "    using var h3 := h1.Clone(); "
         "  end ThreeHandles; "
@@ -230,7 +230,7 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_get_returns_readable_inner) {
         "  public static method Main(): int "
         "    var obj := new Inner(); "
         "    obj.V := 42; "
-        "    using var h := new Shared<Inner>(owned obj); "
+        "    using var h := new Shared<Inner>(move obj); "
         "    var b := h.Get(); "
         "    if b.V = 42 then return 0; end; "
         "    return 1; "
@@ -254,7 +254,7 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_tryupgrade_succeeds_while_strong_
         "  public static method Main(): int "
         "    var obj := new Inner(); "
         "    obj.V := 7; "
-        "    using var h := new Shared<Inner>(owned obj); "
+        "    using var h := new Shared<Inner>(move obj); "
         "    using var w := h.Downgrade(); "
         "    if w.TryUpgrade(out using var h2) then "
         "      if h2.Get().V = 7 then return 0; end; "
@@ -279,7 +279,7 @@ BEZEL_TEST(codegen_shared_weak_603, spec_28_13_shared_and_weak_no_leak_lsan) {
         "class C "
         "  public static method RunAndRelease() "
         "    var obj := new Inner(); "
-        "    using var h := new Shared<Inner>(owned obj); "
+        "    using var h := new Shared<Inner>(move obj); "
         "    using var w := h.Downgrade(); "
         "  end RunAndRelease; "
         "  public static method Main(): int "
