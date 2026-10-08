@@ -547,6 +547,30 @@ public:
     void checkLambdaBodyEscapesExpr(const ast::Expr& e);
     void checkOneLambdaBodyEscapes(const ast::LambdaExpr& lam);
 
+    // fix #5621 (§28.3, v0.326): a getter returning a function value with a
+    // non-empty source set (a lambda over `this` or a field) should be
+    // rejected at its return. checkClosureEscapesOnReturn is called on method
+    // returns but was not called on getter returns. This wrapper calls it with
+    // EscapeScope::Method (the getter is a method-like position).
+    void checkGetterReturnClosureEscapes(const ast::Expr& e);
+
+    // fix #5621 (§28.3, v0.326): for block-bodied getters, scan return
+    // statements and check that any returned function value does not carry a
+    // non-empty source set.
+    void checkGetterBlockReturnClosureEscapes(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
+    // fix #5621 (§28.3, v0.326): a getter returning a function value that
+    // captures `this` or a field is rejected. Unlike method returns where the
+    // closure-return check reads `states_` for locals/params, getters have no
+    // dataflow state - but a getter's `this` or instance fields are in scope
+    // and a capture of them is a non-empty source set.
+    void checkGetterReturnFieldCaptures(const ast::Expr& e);
+
+    // fix #5621 (§28.3, v0.326): block-bodied getter overload.
+    void checkGetterBlockReturnFieldCaptures(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
+
     // fix #3564: seed `states_` with the owned scope-bound locals declared in
     // ONE lambda body, so `checkClosureEscapesOnReturn`'s §28.3 leg (and
     // `checkBorrowStoreEscape`'s owned-source legs) can answer about that

@@ -10479,6 +10479,104 @@ void MethodOwnership::checkLambdaBodyEscapesExpr(const ast::Expr& e) {
         checkOneLambdaBodyEscapes(*lam);
 }
 
+// fix #5621 (§28.3, v0.326): a getter returning a function value with a
+// non-empty source set (a lambda over `this` or a field) should be
+// rejected at its return. checkClosureEscapesOnReturn is called on method
+// returns but was not called on getter returns. This wrapper calls it with
+// EscapeScope::Method (the getter is a method-like position).
+void MethodOwnership::checkGetterReturnClosureEscapes(const ast::Expr& e) {
+    checkClosureEscapesOnReturn(e, EscapeScope::Method);
+}
+
+// fix #5621 (§28.3, v0.326): for block-bodied getters, scan return
+// statements and check that any returned function value does not carry a
+// non-empty source set.
+void MethodOwnership::checkGetterBlockReturnClosureEscapes(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& s : stmts) {
+        if (s) {
+            scanReturnsIn(*s, [this](const ast::Expr& re) {
+                checkClosureEscapesOnReturn(re, EscapeScope::Method);
+            });
+        }
+    }
+}
+
+// fix #5621 (§28.3, v0.326): a getter returning a function value that
+// captures `this` or a field is rejected. Unlike method returns where the
+// closure-return check reads `states_` for locals/params, getters have no
+// dataflow state - but a getter's `this` or instance fields are in scope
+// and a capture of them is a non-empty source set.
+void MethodOwnership::checkGetterReturnFieldCaptures(const ast::Expr& e) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    collectBodyLambdasExpr(e, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            // A field access (directly or through a receiver) indicates capture
+            // of `this` or a field. Check if this identifier resolves to a
+            // FieldSymbol - if so, it's a field capture.
+            if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+                report(
+                    Severity::Error, id->span.begin,
+                    std::string("returned closure captures `") +
+                    std::string(id->name) +
+                    "`, a field of `this` — a getter is a borrow-producing "
+                    "position and its result carries a non-empty source set "
+                    "(the receiver's fields); a function value returned from a "
+                    "getter may not carry a non-empty source set (§28.3 "
+                    "closure-capture rule; expose the field directly, or copy "
+                    "the data the closure needs into an owned value before "
+                    "returning)");
+                return;  // one diagnostic per return is enough
+            }
+            // Also check for implicit `this` reference: if the identifier
+            // resolves to something that indicates `this` access, flag it.
+            // A MemberAccessExpr where the target is implicit `this` is caught
+            // above (the field is resolved). But direct `this` reference
+            // (rare in practice) would also be a capture.
+            // For now, the field capture check above covers the common case
+            // of `lambda() => _field.V()` or `lambda() => field.Method()`.
+        }
+    }
+}
+
+// fix #5621 (§28.3, v0.326): block-bodied getter overload.
+void MethodOwnership::checkGetterBlockReturnFieldCaptures(
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    for (const auto& s : stmts) {
+        if (s) {
+            scanReturnsIn(*s, [this](const ast::Expr& re) {
+                // Only check if the return expression contains a lambda
+                std::vector<const ast::LambdaExpr*> lambdas;
+                collectBodyLambdasExpr(re, lambdas);
+                for (const ast::LambdaExpr* lam : lambdas) {
+                    std::vector<const ast::IdentifierExpr*> ids;
+                    collectLambdaIdentifiers(*lam, ids);
+                    for (const ast::IdentifierExpr* id : ids) {
+                        sema::Symbol* sym = ctx_.exprSymbol(*id);
+                        if (!sym) continue;
+                        if (dynamic_cast<sema::FieldSymbol*>(sym)) {
+                            report(
+                                Severity::Error, id->span.begin,
+                                std::string("returned closure captures `") +
+                                std::string(id->name) +
+                                "`, a field of `this` — a getter is a "
+                                "borrow-producing position and its result "
+                                "carries a non-empty source set (§28.3 "
+                                "closure-capture rule)");
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
 // fix #3564 / #3565 (§28.9 / §31.1 / §27.5, v0.286): run one lambda body's
 // escape checks AGAINST THAT LAMBDA BODY'S OWN SCOPE.
 //
@@ -15889,6 +15987,17 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 pd->type ? ctx.resolvedType(*pd->type) : nullptr);
             // fix #3546 (§31.1, v0.283): same reachability gap, same position.
             mo.checkLambdaBodyEscapesExpr(*pd->exprBody);
+            // fix #5621 (§28.3, v0.326): a getter returning a function value
+            // with a non-empty source set (a lambda over `this` or a field)
+            // is rejected at its return. checkClosureEscapesOnReturn is called
+            // on method returns but was not called on getter returns.
+            mo.checkGetterReturnClosureEscapes(*pd->exprBody);
+            // fix #5621 (§28.3, v0.326): additionally check for field/`this`
+            // captures. checkClosureEscapesOnReturn reads `states_` which is
+            // empty for getters, so it cannot see field captures. A getter's
+            // `this` and instance fields are in scope - a closure capturing
+            // them carries a non-empty source set.
+            mo.checkGetterReturnFieldCaptures(*pd->exprBody);
         } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
             for (const auto& acc : pd->accessors) {
                 MethodOwnership mo(ctx);
@@ -15952,6 +16061,16 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                 } else if (acc.bodyKind ==
                            ast::PropertyAccessorBodyKind::Block) {
                     mo.scanGetterReturns(acc.stmts);
+                }
+                // fix #5621 (§28.3, v0.326): for block-bodied getters, scan
+                // return statements and check that any returned function value
+                // does not carry a non-empty source set.
+                if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block) {
+                    mo.checkGetterBlockReturnClosureEscapes(acc.stmts);
+                    // fix #5621 (§28.3, v0.326): additionally check for field/this
+                    // captures. checkClosureEscapesOnReturn reads `states_` which
+                    // is empty for getters, so it cannot see field captures.
+                    mo.checkGetterBlockReturnFieldCaptures(acc.stmts);
                 }
             }
         }
