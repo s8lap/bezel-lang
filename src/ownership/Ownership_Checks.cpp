@@ -5903,19 +5903,80 @@ bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
     // over `record Holder(r: Res?, tag: int)` compiled and ran when `Holder` was
     // local, and was rejected with the §9.7 diagnostic when the byte-identical
     // `Holder` was imported.
-    common::RecordSubstEnv env;
-    common::seedRecordSubstEnv(*recTs, *rt, /*incoming=*/nullptr, env);
-    const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
-    auto isBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
-        std::unordered_set<const sema::TypeRef*> seen;
-        return recordFieldIsBorrowCarrying(ft, seen, fieldEnv);
+    //
+    // fix #5590 (§9.7, v0.315): replaced isBorrowCarrying (which needed the
+    // env for generic record field substitution) with isRefType, which does
+    // not require env-threaded resolution. The env and seedRecordSubstEnv call
+    // are removed.
+    // fix #5590 (§9.7, v0.315): the null-source quantifier is over
+    // reference-typed fields, not borrow-carrying ones. isBorrowCarrying
+    // returns false for string / function types (they don't make a record
+    // borrow-bearing), but they ARE reference-typed per §9.7 and must also
+    // be null. Mirrors staticReadonlyFieldIsReferenceTyped
+    // (TypeResolution_Checks.cpp:15580). This lambda is non-recursive; the
+    // inline-array case checks the element type directly.
+    auto isRefType = [&](const sema::TypeRef* ft) -> bool {
+        if (!ft) return false;
+        switch (ft->kind) {
+            case sema::TypeRef::Kind::Primitive:
+                // Only string and Object are reference-typed primitives.
+                return ft->primitive == sema::PrimitiveType::String ||
+                       ft->primitive == sema::PrimitiveType::Object;
+            case sema::TypeRef::Kind::Function:
+                return true;  // runtime-managed, reference-typed
+            case sema::TypeRef::Kind::InlineArray: {
+                // An inline-array field is reference-typed when its element
+                // type is reference-typed (elements are heap references).
+                const sema::TypeRef* el = ft->arrayElement;
+                if (!el) return false;
+                if (el->kind == sema::TypeRef::Kind::Primitive)
+                    return el->primitive == sema::PrimitiveType::String ||
+                           el->primitive == sema::PrimitiveType::Object;
+                if (el->kind == sema::TypeRef::Kind::Function) return true;
+                if (el->kind == sema::TypeRef::Kind::Named) {
+                    if (!el->declaration) {
+                        return common::isHeapPointerReferenceBuiltin(el->headName()) ||
+                               el->headName() == "Channel" ||
+                               el->headName() == "Task" ||
+                               el->headName() == "CancellationTokenSource";
+                    }
+                    const auto k = el->declaration->kind;
+                    if (k == ast::TypeDeclKind::Class) return true;
+                    if (k == ast::TypeDeclKind::Interface) return true;
+                    return el->declaration->isValueBuiltin &&
+                           el->headName() == "CancellationToken";
+                }
+                return false;
+            }
+            case sema::TypeRef::Kind::Named: {
+                if (!ft->declaration) {
+                    // Builtin reference types: heap pointers, Channel, Task,
+                    // CancellationTokenSource.
+                    return common::isHeapPointerReferenceBuiltin(ft->headName()) ||
+                           ft->headName() == "Channel" ||
+                           ft->headName() == "Task" ||
+                           ft->headName() == "CancellationTokenSource";
+                }
+                // Class / interface are reference-typed; records / choices /
+                // enums are value-typed for §9.7's purpose.
+                const auto k = ft->declaration->kind;
+                if (k == ast::TypeDeclKind::Class) return true;
+                if (k == ast::TypeDeclKind::Interface) return true;
+                // CancellationToken is a value builtin but IS reference-typed
+                // at the field level per §9.7 (references nothing when null).
+                return ft->declaration->isValueBuiltin &&
+                       ft->headName() == "CancellationToken";
+            }
+            default:
+                return false;
+        }
     };
     const std::vector<const sema::Symbol*> fields =
         sema::recordPositionalFieldSymbols(recTs);
     for (std::size_t i = 0; i < ne->args.size() && i < fields.size(); ++i) {
         const sema::TypeRef* ft = sema::storageComponentType(fields[i], ctx_);
         if (!ft) continue;
-        if (!isBorrowCarrying(ft)) continue;
+        if (!isRefType(ft)) continue;
         const ast::Expr* arg = ne->args[i].value.get();
         if (!arg) return false;
         if (dynamic_cast<const ast::NullLiteralExpr*>(arg)) continue;
@@ -5988,11 +6049,10 @@ bool MethodOwnership::isNullSourceChoiceExpr(const ast::Expr& e) const {
     auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym);
     if (!cc || !cc->caseDecl) return false;
     // §35.4 / §9.7 / §30.1 (#2183): the per-instantiation substitution env
-    // for this choice's payload field walk (empty for a non-generic choice;
-    // threaded from the case's owning choice's generic args via the same
-    // recordFieldIsBorrowCarrying's lookup so a `Opt<T>` payload field whose
-    // `T` is a borrow-typed class resolves through it here, mirroring #2159
-    // for records).
+    // for this choice's payload field walk is no longer needed here:
+    // fix #5590 replaced recordFieldIsBorrowCarrying with the reference-typed
+    // predicate, which does not require env-threaded resolution of generic
+    // parameters. (The old env and seedRecordSubstEnv call are removed.)
     //
     // fix #3144 (family F9 of #3152): the choice's SYMBOL. This read was
     // `dynamic_cast<const ast::TypeDecl*>(chTs->decl)`, null for every
@@ -6001,19 +6061,60 @@ bool MethodOwnership::isNullSourceChoiceExpr(const ast::Expr& e) const {
     // template instead of at the instantiation. It is the SECOND AST-gated
     // read in this function — the audit's F9 table lists only the `caseDecl`
     // one, which the case-list channel fixes on its own (reported on #3168).
-    const sema::TypeSymbol* chDecl = cc->parent;
-    common::RecordSubstEnv env;
-    // The choice kind's static type of the case construction; used as the
-    // carrier for `rt`'s own generic arguments. Best-effort: the resolved
-    // type may be null on a malformed construction path.
-    if (const sema::TypeRef* ct = ctx_.exprType(e))
-        if (chDecl) common::seedRecordSubstEnv(*chDecl, *ct, /*incoming=*/nullptr, env);
-    const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
-    auto isBorrowCarrying = [&](const ast::Param& pf) -> bool {
+    // fix #5590 (§9.7, v0.315): same fix as isNullSourceRecordExpr — the
+    // null-source quantifier is over reference-typed payloads, not borrow-
+    // carrying ones. Mirrors the isRefType lambda in isNullSourceRecordExpr.
+    auto isRefType = [&](const ast::Param& pf) -> bool {
         if (!pf.type) return false;
-        std::unordered_set<const sema::TypeRef*> seen;
-        return recordFieldIsBorrowCarrying(
-            ctx_.resolvedType(*pf.type), seen, fieldEnv);
+        const sema::TypeRef* rt = ctx_.resolvedType(*pf.type);
+        if (!rt) return false;
+        switch (rt->kind) {
+            case sema::TypeRef::Kind::Primitive:
+                return rt->primitive == sema::PrimitiveType::String ||
+                       rt->primitive == sema::PrimitiveType::Object;
+            case sema::TypeRef::Kind::Function:
+                return true;
+            case sema::TypeRef::Kind::InlineArray:
+                if (!rt->arrayElement) return false;
+                // Recurse on the element type: check if element is ref-typed.
+                {
+                    const sema::TypeRef* el = rt->arrayElement;
+                    if (el->kind == sema::TypeRef::Kind::Primitive)
+                        return el->primitive == sema::PrimitiveType::String ||
+                               el->primitive == sema::PrimitiveType::Object;
+                    if (el->kind == sema::TypeRef::Kind::Function) return true;
+                    if (el->kind == sema::TypeRef::Kind::Named) {
+                        if (!el->declaration) {
+                            return common::isHeapPointerReferenceBuiltin(
+                                       el->headName()) ||
+                                   el->headName() == "Channel" ||
+                                   el->headName() == "Task" ||
+                                   el->headName() == "CancellationTokenSource";
+                        }
+                        const auto k = el->declaration->kind;
+                        if (k == ast::TypeDeclKind::Class) return true;
+                        if (k == ast::TypeDeclKind::Interface) return true;
+                        return el->declaration->isValueBuiltin &&
+                               el->headName() == "CancellationToken";
+                    }
+                    return false;
+                }
+            case sema::TypeRef::Kind::Named: {
+                if (!rt->declaration) {
+                    return common::isHeapPointerReferenceBuiltin(rt->headName()) ||
+                           rt->headName() == "Channel" ||
+                           rt->headName() == "Task" ||
+                           rt->headName() == "CancellationTokenSource";
+                }
+                const auto k = rt->declaration->kind;
+                if (k == ast::TypeDeclKind::Class) return true;
+                if (k == ast::TypeDeclKind::Interface) return true;
+                return rt->declaration->isValueBuiltin &&
+                       rt->headName() == "CancellationToken";
+            }
+            default:
+                return false;
+        }
     };
     const auto& fields = cc->caseDecl->payload;
     // §22.5 / #2268 (v0.236): build a payloadArg[] lookup keyed on the case's
@@ -6052,7 +6153,7 @@ bool MethodOwnership::isNullSourceChoiceExpr(const ast::Expr& e) const {
     }
     for (std::size_t fi = 0; fi < fields.size(); ++fi) {
         const ast::Param& f = fields[fi];
-        if (!isBorrowCarrying(f)) continue;
+        if (!isRefType(f)) continue;
         const ast::CallArgument* a = payloadArg[fi];
         if (!a || !a->value) return false;
         const ast::Expr* arg = a->value.get();
