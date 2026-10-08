@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.322. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.323. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -10,7 +10,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.322 and `Bezel_Standard_Library.md` v0.322 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.323 and `Bezel_Standard_Library.md` v0.323 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -149,7 +149,7 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Auto-property | `public property Name: string;` / `public property Id: int private set;` / `public readonly property Pi: double := 3.14159;` | §23.1 |
 | Expression property | `public property Area: decimal => Width * Height;` — **never write `readonly` here** (§23.2 rejects it on every body-bearing form) | §23.2 |
 | Block property | `public property Balance: decimal` / `get => _b;` / `set => do … end;` / `end Balance;` | §23.3 |
-| Setter parameter spec | `set(owned);` or `set(owned x);` takes the value owned — the type is the property's and is never repeated; `set(x)` only renames the parameter | §23.3 |
+| Setter parameter spec | `set(owned);` takes the value owned — the parameter is always `value`, and its type is the property's, never repeated; `set(x)`, `set(owned x)` and `set()` do not parse | §23.3 |
 | Indexer | `public property [i: int]: string => _items[i];` — the block form closes with a bare `end;` | §23.4 |
 | Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter. A `this(...)` chain must end at a constructor with no `this(...)`; a cycle is rejected. A **class** that declares no instance constructor has an implicit `public` parameterless one, so `new C()` compiles; declaring any instance constructor (a primary parameter list included) removes it, and a **body record** has no such implicit constructor | §22.7, §12.8 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
@@ -307,7 +307,7 @@ Literals (§18, A.8):
 ```text
 42   0xFF   0b1010_1010   1_234_567   42L   42U   42UL
 3.14   3.14f   1.23e-4   1.23456789m   1.23e2m
-'a'  '\n'  '\u0041'  '\U0001F600'  '\x41'
+'a'  '\n'  '\u0041'  '\U0001F600'
 "Hello\n"    @"C:\raw\path"                       // verbatim; "" is one embedded quote
 $"Hello, {name}!"     $@"C:\Users\{user}\x.pdf"
 $"{amount,12:F2}"     $"|{name,20}|"   $"{ratio:P1}"   // {expr,align:format}
@@ -316,7 +316,7 @@ true   false   null   ()                          // bool / null / the unit valu
 [1, 2, 3]     []      ["a": 1, "b": 2]            // collection and dictionary literals
 ```
 
-Escapes: `\n \r \t \\ \" \' \0 \a \b \f \v \uXXXX \UXXXXXXXX \xH..H` (§18.8). An interpolation hole renders `ToString()` (through a `T`, or through a generic choice over one such as `Result<T, E>` in a generic body, a choice with no `ToString` — not auto-hashable, none declared — renders its qualified type name and is not rejected; at a choice type containing no type parameter, it is an error, §8.5, v0.319); `{e:F2}` renders `ToString(format)` and requires an intrinsically formattable type or `IFormattable`; a **null** hole renders the four characters `null` (§18.5).
+Escapes: `\n \r \t \\ \" \' \0 \a \b \f \v \uXXXX \UXXXXXXXX` (§18.8) — there is no `\x` escape: write `\u0041`, not `\x41`. An interpolation hole renders `ToString()` (through a `T`, or through a generic choice over one such as `Result<T, E>` in a generic body, a choice with no `ToString` — not auto-hashable, none declared — renders its qualified type name and is not rejected; at a choice type containing no type parameter, it is an error, §8.5, v0.319); `{e:F2}` renders `ToString(format)` and requires an intrinsically formattable type or `IFormattable`; a **null** hole renders the four characters `null` (§18.5).
 
 Atoms and suffixes (A.7):
 
@@ -454,7 +454,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 **`using var`** (§28.10): owned, disposed at the block's end on **every** exit edge, non-reassignable, and **never movable out of**. `using var fresh := new Buffer(); … return fresh;` is a compile error; a factory uses plain `var`.
 
 - `using var y := move x;` — **adoption**: the standard way to turn an owned local, parameter or loop-variable obligation into scope-bound disposal.
-- `using var y := x;` (unmarked, `x` a **class- or interface-typed** named owned binding) — **does not adopt**. It is a **borrow-pin**: no obligation is assumed, `x` keeps it, and the pin extends `x`'s required liveness to this block's end — so moving, transferring or reassigning `x` under the pin is rejected, while an explicit `x.Dispose()` is **not** (a site-announced kill; a later read through `y` faults in checked mode).
+- `using var y := x;` (unmarked, `x` a **class- or interface-typed** named **owned** binding — an owned `var`/`using var` local, an owned loop variable, an `out owned` recipient, an owning-match binding, an `owned` parameter, a bare `T`; `x!`, `(x)`, `using var _ := x;` and `await using var y := x;` alike) — a **compile error**: the form says neither adopt nor view. Write `move x` to adopt; for a view that leaves the obligation with `x`, write `var y := x;` or `const y := x;` (a borrow, live to its last use) — for `using var _ := x;`, delete it; to hold `x` itself to this block's end, declare `x` with `using var`. Over a **borrow-state** source (a plain parameter, a borrowing alias or loop variable, a captured owned binding inside a closure), a **call** without an owned return, a **field** or an **indexer**, `using var y := …;` is a **borrow-pin**: no obligation is assumed, the source keeps it, and the pin extends the source's required liveness to this block's end — moving, transferring or reassigning the source under the pin is rejected, while an explicit `Dispose()` of it is not (a site-announced kill; a later read through `y` faults in checked mode).
 - `using var y := x;` (unmarked, `x` a **move-only value** binding — §15.3's owning inline arrays and owning choices) — **adopts**, not pins: the unmarked read *moves*, leaving `x` moved-from (a copy is impossible, so there is nothing for a marker to disambiguate). Scope-end auto-dispose runs under plain `var` too; `using var` adds the reassignment lock, and over an owning **choice** also suppresses the must-use warning on that auto-drop (§15.3, §35.4).
 - `using var _ := expr;` — the anonymous owning binding (`using var _ := mutex.Acquire();`). Not for a `Task`-family value (§17.13).
 - Admissible over value-typed, runtime-managed and move-only right-hand sides, where disposal is a no-op — safe to use uniformly in generic code.
@@ -540,7 +540,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 
 **The consume-site freeze** (§28.3). Consuming an owned **binding** while a **live local borrow of its current value** exists is a compile error. Frozen: every transfer (a `move` at an argument, binding, assignment or arm; a store into an `owned` field, an owning slot or a `set(owned)`; a `return` under an `owned` or mint-announcing return; an owning iterator's `yield return`) and drop-on-overwrite. **Not** frozen — these are site-announced kills, permitted while borrows live: an explicit `Dispose()` (including `x?.Dispose()`), the discard `_ := x;`, `throw x`, and a Pattern B `await` on an owned `OwningTask<T>` binding. Fields and collection slots are **not** frozen. The mechanical rewrite for the frozen case is **transfer first, then re-borrow from the new owner**.
 
-**Borrow-bearing records** (§9.7). A record is borrow-bearing if it has at least one **borrow-carrying** field: one whose declared type is a reference type (class or interface, nullable or not), an inline array whose element type is a reference type or a borrow-bearing record or choice (`[2]Pair` for a borrow-bearing `Pair`; v0.322), or another borrow-bearing record or choice. The predicate reads **declared field types**, never runtime contents — so `string` and function-typed fields are *not* borrow-carrying, while a field declared `Object` or an interface type **is**, nullable or not. Such a value may not outlive the source of any borrow it carries; may **not be constructed from a temporary** (bind the source to a named local first); may **not** be stored in a class instance field — store the *source* (an `owned CancellationTokenSource`, not a `CancellationToken`) and re-derive the view at the use site; may sit in a **static** field only in the null-source form (every reference-typed field and inline-array slot `null`, through nested records and choices too — a spelling **no span has**, its `Buffer`/`Source` being non-nullable, so spans go in neither static nor instance fields); may be **returned** only when every borrow it carries is **receiver-sourced** — the span shape `public method Header(): Span<byte> => _buf.AsSpan(0, 64);` over an `owned _buf: OwningBuffer<byte>` field is admitted, while a return carrying a borrow of a local, a `using var`, an `owned` parameter, or a **plain parameter** is rejected at the return site (declare it as an instance or extension member of the source's own type instead, whose receiver the caller re-establishes); and may not be an `async` parameter, result or element type, a local of such a type crossing a suspension point being admitted only if every borrow it carries has a frame-resident source (`CancellationToken` is the single stdlib-certified exception). An inline array whose slots carry borrows (`[2]Item` for a class `Item`, `[2]Pair` for a borrow-bearing record `Pair`) is under the same `async` rules (§15.1, §30.1, v0.322): pass an `Array<Item>`, or the elements as separate parameters.
+**Borrow-bearing records** (§9.7). A record is borrow-bearing if it has at least one **borrow-carrying** field: one whose declared type is a reference type (class or interface, nullable or not), an inline array whose element type is a reference type or a borrow-bearing record or choice (`[2]Pair` for a borrow-bearing `Pair`; v0.322), or another borrow-bearing record or choice. The predicate reads **declared field types**, never runtime contents — so `string` and function-typed fields are *not* borrow-carrying, while a field declared `Object` or an interface type **is**, nullable or not. Such a value may not outlive the source of any borrow it carries; may **not be constructed from a temporary** (bind the source to a named local first); may **not** be stored in a class instance field — store the *source* (an `owned CancellationTokenSource`, not a `CancellationToken`) and re-derive the view at the use site; may sit in a **static** field only in the null-source form (every reference-typed field, active-case payload and inline-array slot `null`, so a payload-free choice case is null-source, through nested records and choices too — a spelling **no span has**, its `Buffer`/`Source` being non-nullable, so spans go in neither static nor instance fields); may be **returned** only when every borrow it carries is **receiver-sourced** — the span shape `public method Header(): Span<byte> => _buf.AsSpan(0, 64);` over an `owned _buf: OwningBuffer<byte>` field is admitted, while a return carrying a borrow of a local, a `using var`, an `owned` parameter, or a **plain parameter** is rejected at the return site (declare it as an instance or extension member of the source's own type instead, whose receiver the caller re-establishes); and may not be an `async` parameter, result or element type, a local of such a type crossing a suspension point being admitted only if every borrow it carries has a frame-resident source (`CancellationToken` is the single stdlib-certified exception). An inline array whose slots carry borrows (`[2]Item` for a class `Item`, `[2]Pair` for a borrow-bearing record `Pair`) is under the same `async` rules (§15.1, §30.1, v0.322): pass an `Array<Item>`, or the elements as separate parameters. Such an array's borrows are checked as **one set**: a slot store `xs[i] := e` adds `e`'s sources and never removes one, so overwriting a slot does not release the borrow it held; a slot read carries the whole set, and a live array local freezes every source in it against a consume (§15.1.2, v0.323).
 
 Records also cannot have destructors, `owned` fields, owning-inline-array fields, or implement `IDisposable`. The spans are the canonical borrow-bearing records; `ReadOnlyStringSpan` is the deliberate exception — its only reference field is a `string`, so it may sit in fields and cross `await`.
 
@@ -604,11 +604,29 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **field moved and not restored** on some exit path; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** and the **element-borrow use-after-removal warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode, v0.307) and every borrow you store in a plain field, a borrowing collection, or an abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all.
 
+<a id="sec-recommended-diagnostic-wordings"></a>
+**Recommended wordings.** The spec fixes what each of these diagnostics names (spec §28.3 *Diagnostics*, §28.10's adoption rule, §30.5's near-miss forms, §35.5); the words below are its recommendations, kept here as teaching text. The compiler's own text may differ: match a diagnostic by what it names, not by its words.
+
+| Diagnostic (spec rule) | Recommended wording |
+|---|---|
+| An owned local goes out of scope undisposed (K3.14) | *"Owned value in `x` would be dropped here without disposal."* |
+| A borrow escapes (K2.1/K2.3) | *"Borrow held by `x` would outlive its source `y`."* |
+| A moved-from local is read (K1) | *"Owned value in `x` was already moved out at line N."* |
+| A `using var` is moved (A5) | *"Cannot move out of `using var` `x`; `using var` is scope-bound."* |
+| The consume-site freeze (K5; reused by §35.5) | *"Cannot consume `x` here: the borrow held by `b` (declared at line N) is still live."* |
+| An unmarked `using var` over a named owned binding (§28.10; over a `using var` source only the view is offered, and for `using var _ := x;` the view is replaced by deleting the declaration) | *"`using var c := conn;` does not say whether it adopts or views the owned binding `conn`: write `using var c := move conn;` to adopt it, or `var c := conn;` / `const c := conn;` to view it."* |
+| `using var x := await FetchAsync(url);` (§30.5) | *"`await` on a `Task<Config>` produces a borrow of the task's result, which §30.5's may-not-flow list bars from a `using var` binding. No pin is needed — write `var x := await …;` and the compiler pins the task (the result is valid to the end of this block), or use the explicit two-line form to name the task."* |
+| `x := await FetchAsync(url);` into an existing local (§30.5) | *"the scoped await-bind applies to a fresh `var`/`const` declaration only: the hidden task is pinned to this block, but `x` is not this declaration's binding. Bind the task first: `using var task := …; x := await task;` (§30.5)."* |
+| A payload case without a payload pattern (§35.5) | *"Payload case `Fetched` requires a payload pattern: write `Fetched(...)` with 1 slot, or `Fetched(_)` to discard."* |
+| A misplaced `case move` (§35.5) | *"`case move` requires a named owned binding of an owning choice type as its scrutinee; `x` is borrowed."* / *"… is a fresh producer, which needs no marker."* |
+| An owning choice at a property-keyed position (§35.5) | *"`FetchOutcome` is an owning choice (owned payload `response` of case `Fetched`); it cannot be boxed / is not sendable / does not satisfy `new()`."* |
+| A refutable slot pattern leaves a case uncovered (§35.5, §19.6) | *"Case arm does not cover `Failed`: its slot pattern `>= 500` is refutable; static exhaustiveness counts only irrefutable-slot arms."* |
+
 ---
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.322 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.323 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -621,7 +639,7 @@ Everything below is transcribed from `Bezel_Standard_Library.md` v0.322 with its
 | `System.Threading` | **explicit** | *except* the `Task` family, `CancellationToken`, `Subscription`, and the six event types, which are auto — `CancellationTokenSource` itself needs the import |
 | `System.IO` | **explicit** | `Stream`, `FileStream`, `File`, `TextReader`/`TextWriter`, `Directory`, `Path` |
 | `System.Diagnostics` | **explicit** | `Stopwatch`, `Debug` |
-| `System.Serialization` | **explicit** | `JsonSerializer`/`JsonDeserializer`/`BinarySerializer`/`BinaryDeserializer`/`JsonOptions`/`SerializationException`/`Json`/`Binary` |
+| `System.Serialization` | **explicit** | `JsonSerializer`/`JsonDeserializer`/`BinarySerializer`/`BinaryDeserializer`/`JsonOptions`/`SerializationException`/`Json`/`Binary` (the facades not yet implemented, #2349) |
 | `System.Interop` | **explicit** | `Ptr<T>`, `Interop` |
 
 **Deferred — do not use:** `System.Net`, `System.Net.Http` (**there is no `HttpClient`**), `System.Text.Json` DOM, `System.Text.Regex`, `System.Security.Cryptography`, `System.Globalization`, `System.Reflection`, `System.Diagnostics.Process` (stdlib §11).
@@ -692,9 +710,9 @@ public static class Convert     // string <-> T only; there is no Convert.ToInt3
 end                                                    // faults: FormatException, OverflowException
 
 public static class Environment
-  public static readonly property NewLine, MachineName, UserName, OSVersion: string;
+  public static readonly property NewLine, MachineName, UserName, OSVersion: string;   // UserName NOT YET IMPLEMENTED (#5579)
   public static readonly property ProcessorCount: int;
-  public static readonly property CommandLineArgs: IReadOnlyList<string>;
+  public static readonly property CommandLineArgs: IReadOnlyList<string>;   // NOT YET IMPLEMENTED (#5579)
   public static method Get(name: string): string?;
   public static method GetInt(name: string): int?;   GetBool(name: string): bool?;
   public static method Set(name: string, value: string?);      // null removes
@@ -720,7 +738,7 @@ public interface IFormattable      method ToString(format: string): string;   en
 public class Subscription  destructor; end     // no public ctor; returned as `owned Subscription`
 ```
 
-`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name` (the identifier alone), `FullName` (module path + enclosing-type path + identifier, `"M.Outer.Inner"`; an enclosing generic shows `_` per parameter, `"M.Tree<_>.Node<int>"`; the root is `"System.Object"`), `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `IsAssignableFrom(other)` (interface conformance is `iface.IsAssignableFrom(t)` — there is no `Implements`), `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
+`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`; not yet reachable from a running program, #3819): `Name` (the identifier alone), `FullName` (module path + enclosing-type path + identifier, `"M.Outer.Inner"`; an enclosing generic shows `_` per parameter, `"M.Tree<_>.Node<int>"`; the root is `"System.Object"`), `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `IsAssignableFrom(other)` (interface conformance is `iface.IsAssignableFrom(t)` — there is no `Implements`), `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
 
 **Format specifiers** (invariant culture only; an unrecognized specifier raises `FormatException`): integers `D`/`Dn`, `X`/`x`/`Xn`, `B` (no grouping separators); `double`/`float` `F`/`Fn` (default 2), `E`/`En`, `G`/`Gn`, `P`/`Pn`, `R`; `decimal` `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` (midpoints half-to-even); `DateTime`/`DateOnly`/`TimeOnly` patterns of `yyyy MM dd HH mm ss fff` with every other character a literal; `TimeSpan` `c`; `Guid` `D`/`N`; `bool`, `char`, `string` take **none** — a format spec on those is a compile error. **`C` (currency) deliberately does not exist**: write `$"{amount:F2} EUR"`.
 
@@ -760,7 +778,7 @@ end
 public class Weak<T>: IDisposable where T: class
   public method TryUpgrade(): owned Shared<T>?;         // Try shape (b)
 end
-public class ScopeGuard                                  // the sanctioned `errdefer`
+public class ScopeGuard                                  // the sanctioned `errdefer`; NOT YET IMPLEMENTED (#4669)
   public constructor(scoped action: () -> ());           // runs at disposal unless dismissed
   public method Dismiss();                               // idempotent
   public readonly property IsDismissed: bool;
@@ -996,7 +1014,7 @@ public class OwningBuffer<T>                    // class T: conforms to IEnumera
   readonly property Length: int;                // immutable after construction
   property [i: int]: T? { get;  set(owned); }   // class T: set disposes previous, `move buf[i]` ADMITTED
   property [i: int]: T  { get;  set; }          // value T: `move buf[i]` NOT admitted
-  method DangerousPointer(): Ptr<T>;            // value T only
+  method DangerousPointer(): Ptr<T>;            // value T only; NOT YET IMPLEMENTED (#1717)
   method AsSpan([start[, length]] | r: Range<int>): Span<T>;
   method AsReadOnlySpan([start[, length]] | r: Range<int>): ReadOnlySpan<T>;
 end
@@ -1031,7 +1049,7 @@ end                                             // `Slice` is deliberately NOT o
 
 **Byte accessors** (the read tier is one `public extension IReadOnlySpan<byte>` — every byte span of both families is a receiver; the write tier is declared on `Span<byte>` and `ArraySpan<byte>`): `Read{Int16,UInt16,Int32,UInt32,Int64,UInt64,Float,Double}{LittleEndian,BigEndian}()` and the matching `TryRead…(out value: T): bool`; on the writable spans additionally `Write…{LittleEndian,BigEndian}(value: T)` and `TryWrite…(value: T): bool`. **Endianness is in the name — there is no platform-default form, no enum parameter, and no offset parameter; slice first.** A short span raises `IndexOutOfRangeException`; a false `TryWrite*` leaves the span unmodified.
 
-**Bit tier** (v0.264): four borrow-bearing records — `BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)`, `BitWriter(Source: Span<byte>, …)` and their `ArrayBitReader`/`ArrayBitWriter` mirrors over the array spans — reached by `pure AsBitReader()` on the read-only spans and `AsBitReader()` (**not pure**) / `pure AsBitWriter()` on the writable ones. Each carries `pure IsEmpty`, `pure IsByteAligned`, `pure Slice` ×3, `pure AlignToByte()`, `AlignedTail()`, plus `ReadBitsBigEndianMsbFirst(count: int): ulong`, `ReadBitsLittleEndianLsbFirst(count: int): ulong`, `ReadBitMsbFirst()`/`ReadBitLsbFirst(): bool` and their `TryRead…(…, out value): bool` forms — the writer swapping reads for `WriteBits…(value: ulong, count: int)`/`WriteBit…(value: bool)`/`TryWrite…` and adding `AsReadOnly()`. Only **two** of the four bit-order × byte-order combinations exist; every multi-bit read returns `ulong` and every multi-bit write takes one (**no signed form**); a reader does not advance itself — slice to advance.
+**Bit tier** (v0.264; **not yet implemented**, #3283): four borrow-bearing records — `BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)`, `BitWriter(Source: Span<byte>, …)` and their `ArrayBitReader`/`ArrayBitWriter` mirrors over the array spans — reached by `pure AsBitReader()` on the read-only spans and `AsBitReader()` (**not pure**) / `pure AsBitWriter()` on the writable ones. Each carries `pure IsEmpty`, `pure IsByteAligned`, `pure Slice` ×3, `pure AlignToByte()`, `AlignedTail()`, plus `ReadBitsBigEndianMsbFirst(count: int): ulong`, `ReadBitsLittleEndianLsbFirst(count: int): ulong`, `ReadBitMsbFirst()`/`ReadBitLsbFirst(): bool` and their `TryRead…(…, out value): bool` forms — the writer swapping reads for `WriteBits…(value: ulong, count: int)`/`WriteBit…(value: bool)`/`TryWrite…` and adding `AsReadOnly()`. Only **two** of the four bit-order × byte-order combinations exist; every multi-bit read returns `ulong` and every multi-bit write takes one (**no signed form**); a reader does not advance itself — slice to advance.
 
 ```bezel
 public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> where K: IComparable<K>
@@ -1055,7 +1073,7 @@ public class FrozenArray<T>: IEnumerable<T>      // deeply immutable, sendable; 
   public readonly property Length: int;    public property [i: int]: T { get }
   public method ToArray(): owned Array<T>;    destructor;
 end
-public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
+public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable   // NOT YET IMPLEMENTED (#3848)
   constructor();
   method Increment(key: K, delta: int := 1);     // absent key is created at `delta`; negative admitted
   method CountOf(key: K): int;                   // 0 when absent — NOT pure
@@ -1067,7 +1085,7 @@ end
 public record SlotHandle                         // compiler-intrinsic value; sendable, hashable; NO public constructor — default(SlotHandle) denotes no map and FAULTS like a foreign handle
   readonly property Index: int;   readonly property Generation: int;   // =, <>, Equals, GetHashCode, ToString provided
 end
-public class OwningSlotMap<T>: IEnumerable<T>, IOwningEnumerable<T> where T: class   // v0.307: the handle-and-table type
+public class OwningSlotMap<T>: IEnumerable<T>, IOwningEnumerable<T> where T: class   // v0.307: the handle-and-table type; NOT YET IMPLEMENTED (#4604, #4777)
   constructor();  constructor(capacity: int);
   pure readonly property Count: int;
   method Insert(owned value: T): SlotHandle;     // takes ownership; mints the handle — a VALUE you may store anywhere
@@ -1250,7 +1268,7 @@ public class ChannelSender<T> where T: sendable
   async method SendAsync(owned item: T): Task;         // awaits capacity
   destructor;                                          // disposing the LAST sender closes the channel
 end
-public class Locked<T> where T: class                  // T must additionally be a SENDABLE class
+public class Locked<T> where T: class                  // T must additionally be a SENDABLE class; Locked/RwLocked NOT YET IMPLEMENTED (#1721)
   constructor(owned value: T);                         // the lock OWNS the interior
   method Lock(): owned LockGuard<T>;   TryLock(timeout: TimeSpan): owned LockGuard<T>?;
   async method LockAsync(token := ...): OwningTask<LockGuard<T>>;
@@ -1267,7 +1285,7 @@ public static class Domain            // 18 Spawn rows: {no arg, `owned arg: A`,
   Spawn<R>(entry: () -> owned R): owned OwningTask<R>           where R: sendable, class;
   Spawn<R>(entry: () -> R): owned Task<R>                       where R: sendable, notnull;
 end                                   // the entry MUST be capture-free; EXACTLY ONE argument
-public static class Parallel          // callbacks are SPAWN POSITIONS (capture-free)
+public static class Parallel          // callbacks are SPAWN POSITIONS (capture-free); NOT YET IMPLEMENTED (#3557)
   public static readonly property DefaultDegree: int;    // = Environment.ProcessorCount; degree := 0 means it
   Map<A, R>(items: Array<A>, body: (A) -> R, degree: int := 0): owned Task<Array<R>> where A, R: notnull;
   Reduce<A, R>(items: Array<A>, seed: R, selector: (A) -> R, combiner: (R, R) -> R,
@@ -1386,7 +1404,7 @@ All string comparison is **ordinal** (code-point), `ignoreCase` included; `Lengt
 
 ### 5.10 FFI
 
-The carriers are `IntPtr`/`UIntPtr` (records: `static readonly property Zero`, `Equals`, `GetHashCode`, `=`, `<>`; opaque, never dereferenced), `CString` (`static From(s: string): owned CString`, `static FromBytes(bytes: Array<byte>): owned CString`, `Length`, `Pointer: IntPtr`, `ToBytes(): owned Array<byte>`, `destructor`), `WString` (`static From`, `Length`, `Pointer`, `destructor`), `RawBytes` (`static From(buffer: Array<byte>)`, `static FromForeign(p: IntPtr, length: int, freeOnDispose: bool := false)`, `Length`, `Pointer`, `CopyTo(destination: Array<byte>, destOffset: int)`, `destructor`) — none has a public constructor — plus `System.Interop`'s `Ptr<T>` and `Interop` (`LastErrno()`, `CodeAddress<F>(callback)`). For the `extern` declaration syntax and the pointee gating, read spec §32 and stdlib §10.
+The carriers are `IntPtr`/`UIntPtr` (records: `static readonly property Zero`, `Equals`, `GetHashCode`, `=`, `<>`; opaque, never dereferenced), `CString` (`static From(s: string): owned CString`, `static FromBytes(bytes: Array<byte>): owned CString`, `Length`, `Pointer: IntPtr`, `ToBytes(): owned Array<byte>`, `destructor`), `WString` (`static From`, `Length`, `Pointer`, `destructor`), `RawBytes` (`static From(buffer: Array<byte>)`, `static FromForeign(p: IntPtr, length: int, freeOnDispose: bool := false)`, `Length`, `Pointer`, `CopyTo(destination: Array<byte>, destOffset: int)`, `destructor`) — none has a public constructor — plus `System.Interop`'s `Ptr<T>` (`LoadAt`/`StoreAt`/`CopyFromArray`/`FromIntPtr` not yet implemented, #5580; `Load`/`Store` do not yet reach memory, #1765) and `Interop` (`LastErrno()`, `CodeAddress<F>(callback)`; not yet implemented, #5581). For the `extern` declaration syntax and the pointee gating, read spec §32 and stdlib §10.
 
 ### 5.11 What the standard library does **not** have
 
@@ -1659,7 +1677,7 @@ public method Pick<T>(x: T): T => x;                        // WRONG inside `cla
 var ys := [1, 2, 3];                                        // WRONG: no target type for the literal
 var s := s!;                                                // WRONG wherever a local or parameter `s` is in scope: same block, body top beside a parameter, or any enclosing block, loop or arm body (§21.1) — `var t := s!;`
 for var x in xs do Use(xs.Where(lambda(x) => x > 0)); end;   // WRONG: a lambda parameter, loop variable or arm binding may not reuse an in-scope local's or parameter's name either (§21.1) — `lambda(y) => y > 0`; sibling loops and arms may reuse names
-set => do var value := 0; _x := value; end;                 // WRONG in a setter: its implicit `value` is a parameter, so no local in its body reuses the name (§21.1) — rename the local, or write `set(v)` to rename the parameter
+set => do var value := 0; _x := value; end;                 // WRONG in a setter: its implicit `value` is a parameter, so no local in its body reuses the name (§21.1) — rename the local
 var sd: SortedDictionary<string, int> := ["a": 1];          // WRONG: the dictionary literal targets only Dictionary/OwningDictionary (§15.4)
 var max := a > b ? a : b;                                   // WRONG: no `?:` operator
 x := y++;   ++c;   if count++ > 3 then ... end;               // WRONG: `++` is a postfix STATEMENT
@@ -1732,6 +1750,20 @@ method Make(): owned Buffer
   var fresh := new Buffer();
   return fresh;
 end Make;
+```
+
+```bezel
+method Finish(owned conn: Connection)
+  using var c := conn;             // ERROR: neither adopts nor views — say which
+end Finish;
+```
+
+> §28.10: over a class- or interface-typed named **owned** binding — a `var`/`using var` local, an `owned` parameter, an owned loop variable, `x!`, a bare `T` — the unmarked `using var` is rejected. Adopt with `move`; to look without taking, bind `var`/`const`; to hold a local whole-scope, declare *it* `using var` (and then never `move` it — A5). A call, field, indexer or borrowed-parameter right-hand side is still an ordinary borrow-pin.
+
+```bezel
+method Finish(owned conn: Connection)
+  using var c := move conn;        // adopt: c disposes it at this block's end
+end Finish;
 ```
 
 ```bezel

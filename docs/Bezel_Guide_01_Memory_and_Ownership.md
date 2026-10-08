@@ -467,7 +467,7 @@ finally
 end;
 ```
 
-It is also four extra lines and one mutable boolean at every site, and the `:= true` has to sit at exactly the right statement — a class of bug that is invisible on the success path. **`ScopeGuard` (stdlib §2.21) is that flag, packaged** — the same method, with the commit point a call the reader can see:
+It is also four extra lines and one mutable boolean at every site, and the `:= true` has to sit at exactly the right statement — a class of bug that is invisible on the success path. **`ScopeGuard` (stdlib §2.21) is that flag, packaged** — the same method, with the commit point a call the reader can see (the compiler does not implement `ScopeGuard` yet, [#4669](https://github.com/s8lap/bezel-lang/issues/4669); until it does, the flag form above is the spelling that compiles):
 
 ```bezel
 Register(id);
@@ -520,6 +520,7 @@ When *not* to reach for it: if the thing to undo is a **value**, it has an owner
 | Let a callee keep your lambda | declare the parameter `scoped`, store it in a `scoped` field; call it with a lambda literal (§9) |
 | Hand a new object to the caller | return type `: owned T`, `return x;` |
 | Hand an owned local to a method that takes it | `M(move x)` (marker required) |
+| Take over an owned local or parameter for scope-end disposal | `using var y := move x;` — the unmarked `using var y := x;` over an owned `x` is an error; to look at `x` without taking it, `var y := x;` or `const y := x;` |
 | Move an owned field's contents out | `move _f` (then reassign `_f` before exit) |
 | Dispose an unwanted owned value now | `_ := x;` (or `x.Dispose();` for an early release) — never a `Task` (§2) |
 | Make a resource-free helper (no destructor, no `owned`/inline-owned fields) | just `new` it — trivial-dispose, no `using var` needed (§2) |

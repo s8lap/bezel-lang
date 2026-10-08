@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.322 — October 2026**
+**Companion to the Bezel Language Specification, v0.323 — October 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -83,6 +83,9 @@ This document is normative for the names, signatures, and observable behavior li
 
 <a id="sec-statics-and-sharing-facts"></a>
 **Statics-and-sharing facts (proposal 0087).** Certain library types carry up to four normative per-type **facts**, each declared on a **Facts** line in the type's own section: **synchronized** — the type's operations are internally synchronized *and* an instance is safe to reach from every domain (a conjunction: `Channel<T>` declares no fact however synchronized its internals — its single-consumer receiving end is kept domain-confined by recorded policy, the ground on §6.9's fact line); **immutable** — deeply immutable after construction, so cross-domain reach needs no machinery; **self-distributing** — the type already has its own sanctioned distribution channel, so `Shared<T>` wrapping is excluded (it would add a second); and **displacement-unbounded** — the value a mutable static's overwrite would strand (language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2's overwrite-never-disposes store semantics) is of unbounded, payload-scaled size **and that cost was ruled unacceptable for mutable statics of the type** — contrast the `Task?` cache's bounded acceptance (language spec §22.12 rule 2's store semantics) and `SharedEventSource<T>`'s accepted subscriber-list leak ([§6.5](#sec-events-ievent-eventsource)), neither of which carries the fact. The language spec **derives** its three statics-and-sharing sets from these facts by three normative formulas: [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2's **form-(i)** set = synchronized ∧ ¬displacement-unbounded; [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 4's **warning-suppression set** = synchronized ∨ immutable; [§28.13](Bezel_Language_Spec.md#sec-shared-ownership)'s **`Shared`-payload synchronized set** = (synchronized ∨ immutable) ∧ ¬self-distributing. The fact lines are the single normative carrier of the memberships; the spec's membership parentheticals beside each formula are informative and derived (`scripts/check_docs.sh` check 3b recomputes them from the fact lines — and cross-checks these formulas and the fact-line roster — failing on divergence). A fact is granted or withdrawn only by **recorded ruling** — the ruling names the facts it grants and confronts each derived-set consequence in its record — and a type declaring no facts is in none of the derived sets.
+
+<a id="sec-sendability-statements"></a>
+**Sendability statements.** A compiler-known class type's sendability (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)) is stated in its own section — in a **Sendability** paragraph where the section has one — in one of the four forms §30.14 defines: **sendable**; **sendable iff** its element types meet the stated condition (the collections, `OwningBuffer<T>`, `OwningSlotMap<T>`); **sendable iff** its payload is in the `Shared`-payload synchronized set (`Shared<T>`); or **not sendable** (domain-local). The statements are the single normative carrier of these classifications; the spec states the forms and the rules for every other type, and lists no per-type memberships. A statement is independent of the facts above: `CancellationTokenSource` is **synchronized** and not sendable ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)), and `Channel<T>` carries none of the facts and is sendable ([§6.9](#sec-channel)).
 
 ---
 
@@ -226,6 +229,8 @@ Each one-argument `ToString` returns the text the value it receives renders as u
 ### 2.4 `Environment`
 
 Process- and OS-level information.
+
+> ⚠ **Spec-ahead-of-implementation ([#5579](https://github.com/s8lap/bezel-lang/issues/5579)):** `UserName` and `CommandLineArgs` are not implemented: no sema or codegen arm names them.
 
 ```bezel
 public static class Environment
@@ -428,7 +433,7 @@ end ArgumentOutOfRangeException;
 
 The no-argument `ToString()` renders a `DateTime` in the round-trippable ISO 8601 form `yyyy-MM-ddTHH:mm:ss` (e.g. `2024-03-15T00:00:00`); it is the value also used when a `DateTime` is interpolated into a string with no format specifier. `ToString(format)` selects an explicit format.
 
-**Parse and range contracts.** `DateTime.Parse` accepts exactly the type's own rendered forms — the round-trip form `yyyy-MM-ddTHH:mm:ss`, optionally extended with a fractional-seconds tail `.fff`, and the date-only form `yyyy-MM-dd` (time components zero); the result's `Kind` is `Unspecified` (the rendered forms carry no zone), and any other input raises `FormatException`, the `DateOnly.Parse` stance. `TimeOnly.Parse` accepts `HH:mm:ss` with the same optional `.fff` tail. Every `TryParse` returns `false`, and every `ParseOrNull` returns `null` (the §1 `*OrNull` tier), exactly where its `Parse` would raise. The `Add*` family, `Add`, `Subtract(span: TimeSpan)`, and `DateTime.FromTicks` raise `OverflowException` when the result falls outside `MinValue..MaxValue`: the condition is a data-dependent overflow of the tick domain — language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)'s `OverflowException` class, the fault `TimeSpan`'s arithmetic above already raises — a band-4 catchable fault, not a band-1 argument defect; the constructors' component validation keeps `ArgumentOutOfRangeException`. `ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()` first and treats `Unspecified` as already UTC (deterministic — no hidden machine-zone read); `FromUnixTimeSeconds` produces `Kind = Utc`.
+**Parse and range contracts.** `DateTime.Parse` accepts exactly the type's own rendered forms — the round-trip form `yyyy-MM-ddTHH:mm:ss`, optionally extended with a fractional-seconds tail `.fff`, and the date-only form `yyyy-MM-dd` (time components zero); the result's `Kind` is `Unspecified` (the rendered forms carry no zone), and any other input raises `FormatException`, the `DateOnly.Parse` stance. `TimeOnly.Parse` accepts `HH:mm:ss` with the same optional `.fff` tail. Every `TryParse` returns `false`, and every `ParseOrNull` returns `null` (the §1 `*OrNull` tier), exactly where its `Parse` would raise. The `Add*` family, `Add`, `Subtract(span: TimeSpan)`, and `DateTime.FromTicks` raise `OverflowException` when the result falls outside `MinValue..MaxValue`: the condition is a data-dependent overflow of the tick domain — language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)'s `OverflowException` class, the fault `TimeSpan`'s arithmetic above already raises — a band-4 catchable fault, not a band-1 argument defect; the constructors' component validation keeps `ArgumentOutOfRangeException`. The `Add*` family is complete over the units, one member per calendar and clock unit from `AddYears` to `AddMilliseconds`, so an offset is spelled the same way whatever its unit; a member of it is not removed for low use. `ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()` first and treats `Unspecified` as already UTC (deterministic — no hidden machine-zone read); `FromUnixTimeSeconds` produces `Kind = Utc`.
 
 <a id="sec-guid"></a>
 ### 2.6 `Guid`
@@ -926,6 +931,8 @@ end BinaryDeserializer;
 <a id="sec-one-shot-serialization-facades"></a>
 **The one-shot facades: `Json` and `Binary`.** The most common serialization operation — whole value in, encoded form out, and back — needs none of the agent ceremony. Two static classes, declared in `System.Serialization` beside the agents they wrap, provide it; the agents remain the extension point (streaming and incremental writing, multi-value streams, custom `ISerializer`/`IDeserializer` formats, hand-driven [§2.14](#sec-serialization-vocabulary) conformances) — the [§7.3](#sec-file) `File`-over-`FileStream` shape.
 
+> ⚠ **Spec-ahead-of-implementation ([#2349](https://github.com/s8lap/bezel-lang/issues/2349)):** the `Json` and `Binary` facades are not implemented; the agent spelling above (`JsonSerializer`/`JsonDeserializer`, `BinarySerializer`/`BinaryDeserializer`) is.
+
 ```bezel
 // One-shot facades over the agent pairs. The write members are ordinary
 // constrained generics; Parse/ParseOwned are compiler-known (see below).
@@ -1275,6 +1282,8 @@ The Try shapes of §1 remain the right tool for value extraction with a boring f
 <a id="sec-scopeguard"></a>
 ### 2.21 `ScopeGuard`
 
+> ⚠ **Spec-ahead-of-implementation ([#4669](https://github.com/s8lap/bezel-lang/issues/4669)):** `ScopeGuard` is not implemented: the compiler does not know the type, so a program naming it does not compile. The surface below is the normative contract the implementation will meet.
+
 Failure-only cleanup, packaged: perform a side effect (register something, mutate shared state, hand a handle to a foreign library, begin a transaction), arm a guard whose action undoes it, and `Dismiss()` on success. On any throwing edge the guard's disposal runs the undo; after `Dismiss()` it is a no-op. This is the commit-flag `try`/`finally` idiom — correct and composing today — as one declaration plus one visible commit point, and it requires **no compiler support**: `ScopeGuard` is an ordinary class using `scoped`, `destructor`, and `using var` exactly as declared (language spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters), [§28.4](Bezel_Language_Spec.md#sec-the-destructor), [§28.10](Bezel_Language_Spec.md#sec-using-var)). The language-level `defer`/`errdefer` statements a reader may expect instead are a recorded decline (rationale [§17.11](Bezel_Design_Rationale.md#sec-defer-errdefer)); this type is the sanctioned spelling of the failure half. Auto-imported, in the [§2.10](#sec-idisposable-and-iasyncdisposable)/[§2.11](#sec-subscription) cleanup family.
 
 ```bezel
@@ -1497,7 +1506,7 @@ The language separates **borrowing** collections (store references the caller co
 
 The naming convention (#1372): borrowing collection types use their plain names (`Array<T>`, `LinkedList<T>`, etc.); owning collection types are prefixed `Owning…` (`OwningArray<T>`, `OwningLinkedList<T>`, etc.) — the prefix names the **element** axis ("a collection that *owns its elements*"), lexically distinct from the `owned` qualifier, which names the **container** axis ("a value *you* own"). `owned OwningArray<Dog>` therefore reads exactly as intended: an owning array that you own; a bare `OwningArray<Dog>` is a borrow of someone else's owning array. Interface members of the owning family carry the standard `I` prefix (`IOwningList`, `IOwningCollection`, `IOwningEnumerable`, `IOwningEnumerator`, and the async pair). The owning types constrain `where T: class` (and, for `OwningDictionary<K, V>`, `where V: class`) because ownership only makes sense for class-typed elements — with one recorded exception: the storage primitive `OwningBuffer<T>` admits value-typed `T` with plain value slots ([§4.14](#sec-owned-buffers-and-spans); spec §14.4 names it), its `Owning` naming the storage axis.
 
-**Sendability (normative classification: language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)).** A **borrowing** collection (`Array<T>`, `LinkedList<T>`, `Set<T>`, `Stack<T>`, `Queue<T>`, `Dictionary<K, V>`, `SortedDictionary<K, V>`, `SortedSet<T>`) is sendable iff its element category (spec §28.11) is sendable-value or `string` — copy and shared-immutable slots; for the maps, the key's and the value's categories both. At class elements a borrowing collection carries borrows and is not sendable. An **owning** collection (and `OwningBuffer<T>`) is sendable iff its element type is itself sendable — its state is wholly owned. `Dictionary<string, int>` and `Set<Guid>` are therefore sendable classes, admissible as `Locked<T>` interiors ([§6.11](#sec-locked-and-rwlocked)); `Array<Session>` (class elements) is not.
+**Sendability** ([§1](#sec-sendability-statements); language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). A **borrowing** collection (`Array<T>`, `LinkedList<T>`, `Set<T>`, `Stack<T>`, `Queue<T>`, `Dictionary<K, V>`, `SortedDictionary<K, V>`, `SortedSet<T>`) is sendable iff its element category (spec §28.11) is sendable-value or `string` — copy and shared-immutable slots; for the maps, the key's and the value's categories both. At class elements a borrowing collection carries borrows and is not sendable. An **owning** collection (and `OwningBuffer<T>`) is sendable iff its element type is a sendable class type — its state is wholly owned; a value-typed `OwningBuffer<T>` (`OwningBuffer<double>`) is not sendable. `Dictionary<string, int>` and `Set<Guid>` are therefore sendable classes, admissible as `Locked<T>` interiors ([§6.11](#sec-locked-and-rwlocked)); `Array<Session>` (class elements) is not.
 
 <a id="sec-collection-equality-search"></a>
 **Equality search at an element type with no equality.** The members that compare an argument with stored elements by `Equals` are the equality search: `Contains` and `Remove(item)` of `ICollection<T>` and of its implementations here at an unconstrained element type (`Array<T>`, `LinkedList<T>`), `Contains` of `Stack<T>` and `Queue<T>`, `Array<T>.IndexOf` and `LastIndexOf`, `LinkedList<T>.Find`, and the span family's `IndexOf`, `Contains` and `SequenceEqual` ([§4.14](#sec-owned-buffers-and-spans)–[§4.16](#sec-ireadonlyspan)). Their signatures are unconstrained, and they are conditionally-admitted members (language spec [§14.2](Bezel_Language_Spec.md#sec-conditionally-admitted-members)): a call is admitted only where the element type, nullability stripped, has a member for the comparison language spec [§9.2](Bezel_Language_Spec.md#sec-equality-through-a-type-parameter) calls the first kind, `Equals` with an argument of that type. It has none exactly where the same comparison between two values of the type draws §9.2's, §35.7's or §15.1.2's use-site error, as for a record or choice that is neither auto-hashable nor declares an `Equals` of its own, or an inline array of one. There the call is a compile error, `x in xs` (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) included, and the collection type is unaffected: `Array<R>` is well-formed at such an `R`, and only its equality search is refused. Inside a generic body whose element type involves a type parameter, the call is the body's own comparison, read at each instantiation of the declaration that declares the parameter exactly as the same `Equals` written on that element type would be (language spec §14.2 rule 2, §9.2, [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2); a user `ICollection<T>` implementation called through its own type is its own declaration, under §3.6 rule 2, and only a call through `ICollection<T>` takes this rule. The remedy is to declare equality on the element type, which makes it **hashable**, or to search with a predicate (`xs.Any(lambda(x) => x.Id = id)`, [§5](#sec-system-collections-linq)). The owning collections' members of the same names never fire the rule, since their `where T: class` element type always has the member; `SortedSet<T>` compares by `CompareTo` ([§4.18](#sec-sorted-set)), and `Set<T>`, `Dictionary<K, V>` and §5's hashable block require **hashable** by constraint.
@@ -2591,6 +2600,8 @@ The "Owning" in the name refers to the buffer-class's ownership of *its allocate
 
 **Span views.** `AsSpan()` and its overloads return a `Span<T>` (writable view) over a contiguous range of the buffer; `AsReadOnlySpan()` returns a `ReadOnlySpan<T>`. These views are non-allocating record constructions and admit the standard span surface (`Slice`, indexer, search, equality, bulk mutation per T's category). The methods are pure ergonomics — `buf.AsSpan(0, 100)` reads more naturally than `new Span<T>(buf, 0, 100)` and matches the established pattern from `string.AsSpan()` and `Array<T>.AsSpan()`. `AsSpan` returns the writable form by default (matching the buffer's mutability); callers wanting read-only access either call `AsReadOnlySpan` directly or call `.AsReadOnly()` on the writable form. The four overload signatures of each form accept range parameters: no-arg (full buffer, `0..<Length`), `(start)` (from offset to end), `(start, length)`, or `(r: Range<int>)`. Bounds-check semantics follow the standard Bezel convention: `IndexOutOfRangeException` if `start` or `length` is out of range against the buffer's `Length`.
 
+> ⚠ **Spec-ahead-of-implementation ([#1717](https://github.com/s8lap/bezel-lang/issues/1717)):** `DangerousPointer()` is not implemented: a call to it is rejected with a diagnostic stating so.
+
 **`DangerousPointer()`.** Returns the address of slot 0 as a `Ptr<T>` (language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory)), valid until the buffer is disposed. Declared on the value-typed presentation only, and admitted only where `T` is in the **FFI-pointee set** — a **conditionally-admitted member** in the sense of language spec [§14.2](Bezel_Language_Spec.md#sec-conditionally-admitted-members), whose register carries this row and records that the compiler does not yet implement it — `Ptr<T>`'s own pointee gate (language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory)): integer types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, and C-compatible records (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)). The result is a `Ptr<T>`, so the gate is the same gate: every other `T` — classes (the class-typed presentation never satisfies the gate, so the member does not appear there), `string`, and `Ptr<U>` elements (whose slot address would be the declined `Ptr<Ptr<U>>`) — is rejected at the call's instantiation with a diagnostic naming the set. Pointer arrays are `OwningBuffer<IntPtr>` — exactly the argv shape. The `Dangerous` prefix marks the one accessor family whose result aliases mutable Bezel-owned slots; native retention past the synchronous call is the language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract) obligation, and the recorded mitigation is the wrapper class that owns buffer and registration together.
 
 **Iteration.** For class-typed T, `OwningBuffer<T>` implements `IEnumerable<T?>`; iteration yields borrows of `T?` (slot contents, possibly null). The `for var x in buf do ... end` form works both via the enumerator protocol and via the direct-indexed-loop optimization that [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) permits for concretely-typed sources. For value-typed T, `OwningBuffer<T>` does *not* implement `IEnumerable<T>` (the type-parameter-category dispatch would require conditional interface implementation, which Bezel does not currently provide as a general mechanism). `for var x in buf do ... end` over a value-typed OwningBuffer desugars to a direct indexed loop per the [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) extension; the iteration variable has type T and is a copy of the slot. Users who need IEnumerable<T> conformance on a value-typed buffer can wrap or convert.
@@ -2998,7 +3009,7 @@ The unsigned variants follow by casting through the matching unsigned type at th
 
 A tier below the byte accessors, for formats that pack fields at sub-byte positions — a protocol header whose flag, opcode, and code fields share a byte; a stream of variable-width codes. `BitReader` and `BitWriter` are records carrying a span plus a `(BitStart, BitLength)` window counted in **bits**; every read and write covers a run of 1 to 64 bits and needs no mask-and-shift ladder at the call site.
 
-> ⚠ **Implementation state ([#3558](https://github.com/s8lap/bezel-lang/issues/3558)):** the bit tier's `TryWrite*` forms have no compiler support yet, while the byte tier's are fully implemented — the two Try-write families are in opposite implementation states. The design contract is shared (the byte tier's recorded write-side reason in §4.14 covers both).
+> ⚠ **Spec-ahead-of-implementation ([#3283](https://github.com/s8lap/bezel-lang/issues/3283)):** the bit tier is not implemented — `BitReader`, `BitWriter`, their reads, writes, `TryRead*`/`TryWrite*` forms, slices and entry points have no sema or codegen arm. The byte tier's `TryWrite*` forms are implemented. The `TryWrite*` forms' design contract is the byte tier's (its recorded write-side reason covers both; [#3558](https://github.com/s8lap/bezel-lang/issues/3558)).
 
 ```bezel
 public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
@@ -3243,6 +3254,8 @@ The borrow-of-`Array<T>` lifetime story is the same as `ArraySpan<T>`'s.
 
 <a id="sec-array-bit-granular-accessors"></a>
 #### Bit-granular accessors
+
+> ⚠ **Spec-ahead-of-implementation ([#3283](https://github.com/s8lap/bezel-lang/issues/3283)):** `ArrayBitReader` and `ArrayBitWriter` are not implemented, as §4.14's bit tier is not.
 
 The [§4.14](#sec-bit-granular-accessors) bit tier is mirrored onto this family as `ArrayBitReader` and `ArrayBitWriter`, member-for-member identical to `BitReader` and `BitWriter` with `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>` substituted for the source type — the same device, and for the same reason, as the byte accessors' mirror above: the two span families are not interchangeable, and the dominant byte sources sit on opposite sides. `Stream.Read(buffer: Span<byte>)` ([§7.1](#sec-stream)) fills the buffer-backed family, while `File.ReadAllBytes` and `Stream.ReadAll()` return `owned Array<byte>`, whose `AsReadOnlySpan()` is the array-backed one. Without the mirror the file path could not reach the bit tier at all.
 
@@ -3497,6 +3510,8 @@ first).
 <a id="sec-counterk"></a>
 ### 4.20 `Counter<K>`
 
+> ⚠ **Spec-ahead-of-implementation ([#3848](https://github.com/s8lap/bezel-lang/issues/3848)):** `Counter<K>` is not implemented: no member has a sema or codegen arm. The surface below is the normative contract the implementation will meet.
+
 A tally: distinct keys mapped to `int` counts. The first stdlib surface to state its key requirement with the `where K: hashable` constraint ([§14.2](Bezel_Language_Spec.md#sec-constraints)) — an inadmissible key diagnoses at the *user's* instantiation site. (Recorded: `Dictionary`/`Set` keep their §3.6-rule-2 structural checks — the two mechanisms decide identically at a concrete key type, and re-spelling the existing containers is churn without payoff. At a key that is a type parameter of the naming declaration they decide at different sites: `Counter<V>` is admitted only where `V`'s own constraints guarantee `hashable` (language spec [§14.2](Bezel_Language_Spec.md#sec-constraints) *A type parameter as the type argument*), while a `Dictionary<V, int>` key check is carried to that declaration's instantiations (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2). Also recorded: a constrained-generic `extension Dictionary<K, V> where …` upsert was viable; the dedicated type was chosen for the tally-specific surface — `Total`, distinct-`Count`, creation-at-delta — not out of impossibility.)
 
 ```bezel
@@ -3530,6 +3545,8 @@ end;
 
 <a id="sec-owning-slot-map"></a>
 ### 4.21 `OwningSlotMap<T>` and `SlotHandle`
+
+> ⚠ **Spec-ahead-of-implementation ([#4604](https://github.com/s8lap/bezel-lang/issues/4604), [#4777](https://github.com/s8lap/bezel-lang/issues/4777)):** `OwningSlotMap<T>` and `SlotHandle` are not implemented: no member has a sema or codegen arm, and the runtime does not provide the map. The surface below is the normative contract the implementation will meet.
 
 An owning collection **keyed by handles it mints itself**: `Insert` takes ownership of a value and returns a `SlotHandle`; every read, take and removal is keyed by that handle; a removed slot's handle reads as absent for the rest of the map's life. It is the library form of the handle-and-table pattern (rationale [§5.4](Bezel_Design_Rationale.md#sec-no-shared-ownership)): a program that must refer to an object from many places — a graph's edges, a cache's index, a registry's entries — stores the object's `SlotHandle`, a value, where it would otherwise store a borrow, and so carries no [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) trust clause and no domain clause for the reference.
 
@@ -4199,6 +4216,8 @@ end SharedEventSource;
 
 **Facts** ([§1](#sec-statics-and-sharing-facts)): `SharedEventSource<T>` — **synchronized**, **self-distributing** (distributed by static reachability, spec §22.12 rule 5; wrapping it in a spec-§28.13 handle would add a second distribution mechanism). *Displacement-unbounded* was considered and declined: a displaced source leaks with its subscriber list intact (the *Statics* bullet above), an accepted cost — mutable statics of the type stay admitted. The instance sources `EventSource<T>`/`AsyncEventSource<T>` declare no facts (unsynchronized, domain-serial — above).
 
+**Sendability** ([§1](#sec-sendability-statements); language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). `EventSource<T>` and `AsyncEventSource<T>` are **not** sendable: the subscriber list is unsynchronized and domain-serial (*Thread safety, per type*, above). `SharedEventSource<T>` is **not** sendable either, although it is internally synchronized: static reachability, not transfer, is its distribution mechanism (language spec §22.12 rule 5).
+
 The static idiom, complete:
 
 ```bezel
@@ -4277,7 +4296,9 @@ end TaskCompletionSource;
 <a id="sec-task-static-helpers"></a>
 ### 6.7 `Task` static helpers
 
-See [§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers) of the language spec for the full list. They live on `Task`.
+Language spec [§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers) shows the helpers its rules read; the full set is declared below. They live on `Task`.
+
+**Sendability** ([§1](#sec-sendability-statements); language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). `Task`, `Task<T>` and `OwningTask<T>` are **not** sendable: a task is domain-local, its continuations and result buffer belonging to the domain that awaits it (language spec §30.13). Values cross a domain boundary as `Domain.Spawn` arguments and results ([§6.8](#sec-domain)) or as channel elements ([§6.9](#sec-channel)).
 
 **Task-family returns are caller-owned productions.** Every method in this library whose declared return type is `Task`, `Task<T>`, or `OwningTask<T>` — the async acquisitions (`AcquireAsync`/`TryAcquireAsync`, §6.2–§6.3), `Locked<T>`/`RwLocked<T>`'s `LockAsync`/`ReadAsync`/`WriteAsync` families (§6.11), `Channel<T>.Receive`/`SendAsync` (§6.9), stream and file I/O (`ReadAsync`/`WriteAsync`/`ReadAllAsync`, §7.1–§7.2; `ReadAllTextAsync`/`WriteAllTextAsync`, §7.3), `RaiseAsync` (§6.5), `TaskScope.Join` (§6.10), `IAsyncDisposable.DisposeAsync` and `MoveNextAsync` (§2.10, §4.12–§4.13), and the static helpers below — mints a **fresh task owned by the caller** at every call site (language spec [§28.3](Bezel_Language_Spec.md#sec-producers)). The signatures carry no `owned` marker: the `Task`-family return type is itself the transfer announcement (type-announced). Where a signature does spell it out — `Domain.Spawn(...): owned Task` (§6.8), the `Parallel` combinators (§6.12) — the marker states the same contract explicitly and is retained for emphasis at the domain boundary; it is not a semantic difference from the unmarked async forms. Stored tasks are exposed as **properties** (`TaskCompletionSource<T>.Task`, `OwningTaskCompletionSource<T>.Task`, §6.6), whose reads are borrows of the source's storage (spec [§30.11](Bezel_Language_Spec.md#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)).
 
@@ -4333,7 +4354,7 @@ end Task;
 
 The parameter type `Task` accepts any subtype: `Task`, `Task<T>`, and `OwningTask<T>` all satisfy the parameter. For `OwningTask<T>` (Pattern B), the runtime's task disposal cascades through any unconsumed owned result — `FireAndForget(someOwningTask)` is semantically "let it run to completion; if it produces a result, dispose it; if it produces an exception, log it." This is the right pattern when the caller wants the underlying operation to complete its side effects (e.g., an async write whose `OwningTask<WriteHandle>` would normally yield a handle, but the caller doesn't need the handle).
 
-**`FireAndForget` is the only supported way to discard a `Task`.** The discard form `_ := someAsyncCall();` is rejected at compile time because `Task` has a destructor that handles continuation cleanup; the discard would skip it — and so is the anonymous binding `using var _ := someAsyncCall();` (and `await using var _ := …;`), which nothing can await and which is the same abandonment one scope later (language spec [§17.13](Bezel_Language_Spec.md#sec-the-discard-_)). The two legal patterns — the second of them **named** — are:
+**`FireAndForget` is the only supported way to discard a `Task`.** The discard form `_ := someAsyncCall();` is rejected at compile time because disposing a task abandons a running operation — and so is the anonymous binding `using var _ := someAsyncCall();` (and `await using var _ := …;`), which nothing can await and which is the same abandonment one scope later (language spec [§17.13](Bezel_Language_Spec.md#sec-the-discard-_)). The two legal patterns — the second of them **named** — are:
 
 ```bezel
 Task.FireAndForget(DoTelemetryAsync());      // supervised; exceptions logged
@@ -4419,7 +4440,7 @@ public async method ProcessAll(paths: Array<string>): Task
 end ProcessAll;
 ```
 
-The `using var f := move file;` shape on entry to the body — the `move` marker is the binding-position transfer spelling (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows); unmarked, the binding would only borrow-pin) — is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
+The `using var f := move file;` shape on entry to the body — the `move` marker is the binding-position transfer spelling (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows); unmarked, the binding is rejected, language spec [§28.10](Bezel_Language_Spec.md#sec-using-var)) — is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
 
 The async-iterator form is preferable when the consumer processes each result before requesting the next; the owning `WhenAll` overload is preferable when the consumer needs all results at once.
 
@@ -4670,6 +4691,8 @@ end TaskScope;
 <a id="sec-locked-and-rwlocked"></a>
 ### 6.11 `Locked<T>` and `RwLocked<T>`
 
+> ⚠ **Spec-ahead-of-implementation ([#1721](https://github.com/s8lap/bezel-lang/issues/1721)):** `Locked<T>`, `RwLocked<T>` and their guards are not implemented: no member has a sema or codegen arm. The surface below is the normative contract the implementation will meet.
+
 Data-owning locks (language spec [§30.12 "Data-owning locks"](Bezel_Language_Spec.md#sec-data-owning-locks) — the
 normative statement of the interior admission, guard borrow-sourcing, the guard-liveness checks, blocking discipline,
 the read-guard write-restriction, the lock-disposal posture, visibility, and set memberships; design rationale
@@ -4790,7 +4813,7 @@ Semantics and obligations (normative statement: language spec §30.12):
 Compiler-known data-parallel combinators over a lazy, process-wide team of worker domains (normative checking and
 runtime semantics: language spec [§30.14 "Data-parallel combinators"](Bezel_Language_Spec.md#sec-data-parallel-combinators)).
 
-> ⚠ **Spec-ahead-of-implementation ([#3557](https://github.com/s8lap/bezel-lang/issues/3557)):** this entire class is unimplemented — no sema arm, no codegen arm, no runtime team. The surface below is the normative contract the implementation will meet; the 2026-08 subtraction review kept it on its recorded design weight (rationale §12.9; proposal 0032 §5.3's worked program), with a re-ask recorded.
+> ⚠ **Spec-ahead-of-implementation ([#3557](https://github.com/s8lap/bezel-lang/issues/3557)):** this entire class is unimplemented — no sema arm, no codegen arm, no runtime team. The surface below is the normative contract the implementation will meet.
 
 The `body`/`selector`/`combiner` parameters are **spawn positions**: capture-free (a non-capturing lambda or a static
 method reference), with element and result sendability compiler-checked at the call site — the same admission as
@@ -5011,7 +5034,7 @@ end TextWriter;
 
 `TextWriter`'s `WriteLine` members write the argument followed by `Environment.NewLine` ([§2.4](#sec-environment)), the no-argument form writing the terminator alone, and its `Write` members write no terminator — [§2.1](#sec-console)'s rule, of which `Console.Out` and `Console.Error` are instances; a `null` argument to a `Write`/`WriteLine` `Object` overload renders as the four characters `null`, as it does there.
 
-`TextReader`'s reads and `TextWriter`'s writes are **synchronous** and may block the calling domain for the I/O's duration — the §30.12 pool-starvation hazard, with no compiler/runtime backstop for I/O (the §7.1 classification, applied to the text surface). The types offer no async counterparts; asynchronous text I/O is deferred to the concrete stream family (proposal 0006).
+`TextReader`'s reads and `TextWriter`'s writes are **synchronous** and may block the calling domain for the I/O's duration — the §30.12 pool-starvation hazard, with no compiler/runtime backstop for I/O (the §7.1 classification, applied to the text surface). The types offer no async counterparts; asynchronous text I/O is deferred to the concrete stream family (proposal 0006). `TextReader` has no concrete subclass in this library: its one instance is `Console.In` ([§2.1](#sec-console)), and its members, `ReadToEnd` among them, are the base contract the concrete readers of accepted proposal 0006 ([#1433](https://github.com/s8lap/bezel-lang/issues/1433)) implement.
 
 `Directory` and `Path` (#1356):
 
@@ -5635,6 +5658,8 @@ Each FFI-boundary type has a corresponding `string.From` overload ([§9.6](#sec-
 <a id="sec-system-interop-ptr"></a>
 ### 10.5 `System.Interop`: `Ptr<T>`
 
+> ⚠ **Spec-ahead-of-implementation ([#5580](https://github.com/s8lap/bezel-lang/issues/5580), [#1765](https://github.com/s8lap/bezel-lang/issues/1765)):** `LoadAt`, `StoreAt`, `CopyFromArray` and `FromIntPtr` are not implemented. `Load()` and `Store()` are not implemented either: no lowering reads or writes the pointee.
+
 ```bezel
 // Compiler-intrinsic value record; module System.Interop (NOT auto-imported).
 // Representation identical to IntPtr. T is gated (per-instantiation, language
@@ -5683,6 +5708,8 @@ Equality is declared explicitly rather than left to record synthesis for the sam
 
 <a id="sec-system-interop-interop"></a>
 ### 10.6 `System.Interop`: `Interop`
+
+> ⚠ **Spec-ahead-of-implementation ([#5581](https://github.com/s8lap/bezel-lang/issues/5581)):** `Interop` is not implemented: no sema or codegen arm names `LastErrno()` or `CodeAddress<F>`. The surface below is the normative contract the implementation will meet.
 
 ```bezel
 /// Static intrinsics for the FFI boundary. Module System.Interop (NOT auto-imported).

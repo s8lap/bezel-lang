@@ -17,7 +17,7 @@ public class FrozenArray<T>: IEnumerable<T>      // deeply immutable, sendable; 
   public readonly property Length: int;    public property [i: int]: T { get }
   public method ToArray(): owned Array<T>;    destructor;
 end
-public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
+public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable   // NOT YET IMPLEMENTED (#3848)
   constructor();
   method Increment(key: K, delta: int := 1);     // absent key is created at `delta`; negative admitted
   method CountOf(key: K): int;                   // 0 when absent — NOT pure

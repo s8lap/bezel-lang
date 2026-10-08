@@ -58,8 +58,8 @@ The everyday shapes all discharge the obligation without ceremony:
 What you may **not** do is silently drop one — by the discard, or by the anonymous binding that reads like a holder and is not one:
 
 ```bezel
-_ := DoTelemetryAsync();            // ERROR: a task's discard would skip its
-                                    //   continuation cleanup (spec §17.13, §30.10)
+_ := DoTelemetryAsync();            // ERROR: disposing a task abandons its
+                                    //   running operation (spec §17.13, §30.10)
 using var _ := DoTelemetryAsync();  // ERROR too (v0.288): nothing can await an
                                     //   unnamed binding, so the form is the
                                     //   discard's abandonment one scope later
@@ -171,7 +171,7 @@ The mechanics worth knowing:
 
 Captures have their own admission test. Child captures are admitted when their sources are declared *before* the scope (parameters always qualify) or derive from the scope itself (`scope.Token`). A **class- or interface-typed** local declared after the scope is rejected at the `Spawn` call — value-typed captures are exempt from the declared-before test, so an `int` loop index is fine (spec §28.14). This is the `scoped` admission: `Spawn`'s `body` parameter is declared `scoped`, the scope is the bounding object, and the captured sources stay frozen until it is disposed — the same storage-bounded contract Guide 1 §9 teaches for your own callback-holding classes. For per-element fan-out, declare the source collection *before* the scope and capture a value-typed index, or reach for `Parallel`.
 
-**`Parallel`** is the uniform-work tool: the same capture-free function over every element of a collection, on a process-wide team of worker domains (stdlib §6.12; spec §30.14). It is also your second rehearsal of the Pattern A consumer shape:
+**`Parallel`** is the uniform-work tool: the same capture-free function over every element of a collection, on a process-wide team of worker domains (stdlib §6.12; spec §30.14). It is also your second rehearsal of the Pattern A consumer shape (`Parallel` is not yet implemented, [#3557](https://github.com/s8lap/bezel-lang/issues/3557); the example shows the specified surface):
 
 ```bezel
 using var job := Parallel.Map(paths, ComputeSize);   // ComputeSize: static (string) -> int;
@@ -281,7 +281,7 @@ Cross-domain *fan-in* is channels; the sanctioned multi-source shape is to merge
 
 ## 7. Locks that own their data
 
-Within one domain you need none of this (§1). The synchronization types earn their keep in exactly three places: state genuinely reached from several domains, foreign threads entering through the FFI, and code outside any domain (spec §30.12). When you do need a lock over data, Bezel's shape ties the two together: **the lock owns the value, and a guard is the only path in.**
+Within one domain you need none of this (§1). The synchronization types earn their keep in exactly three places: state genuinely reached from several domains, foreign threads entering through the FFI, and code outside any domain (spec §30.12). When you do need a lock over data, Bezel's shape ties the two together: **the lock owns the value, and a guard is the only path in.** (`Locked<T>` and `RwLocked<T>` are not yet implemented, [#1721](https://github.com/s8lap/bezel-lang/issues/1721); the example shows the specified surface.)
 
 ```bezel
 public static class Sessions

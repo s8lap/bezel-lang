@@ -85,7 +85,7 @@ public class ChannelSender<T> where T: sendable
   async method SendAsync(owned item: T): Task;         // awaits capacity
   destructor;                                          // disposing the LAST sender closes the channel
 end
-public class Locked<T> where T: class                  // T must additionally be a SENDABLE class
+public class Locked<T> where T: class                  // T must additionally be a SENDABLE class; Locked/RwLocked NOT YET IMPLEMENTED (#1721)
   constructor(owned value: T);                         // the lock OWNS the interior
   method Lock(): owned LockGuard<T>;   TryLock(timeout: TimeSpan): owned LockGuard<T>?;
   async method LockAsync(token := ...): OwningTask<LockGuard<T>>;
@@ -102,7 +102,7 @@ public static class Domain            // 18 Spawn rows: {no arg, `owned arg: A`,
   Spawn<R>(entry: () -> owned R): owned OwningTask<R>           where R: sendable, class;
   Spawn<R>(entry: () -> R): owned Task<R>                       where R: sendable, notnull;
 end                                   // the entry MUST be capture-free; EXACTLY ONE argument
-public static class Parallel          // callbacks are SPAWN POSITIONS (capture-free)
+public static class Parallel          // callbacks are SPAWN POSITIONS (capture-free); NOT YET IMPLEMENTED (#3557)
   public static readonly property DefaultDegree: int;    // = Environment.ProcessorCount; degree := 0 means it
   Map<A, R>(items: Array<A>, body: (A) -> R, degree: int := 0): owned Task<Array<R>> where A, R: notnull;
   Reduce<A, R>(items: Array<A>, seed: R, selector: (A) -> R, combiner: (R, R) -> R,

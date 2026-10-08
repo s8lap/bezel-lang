@@ -7,7 +7,7 @@ end
 public class Weak<T>: IDisposable where T: class
   public method TryUpgrade(): owned Shared<T>?;         // Try shape (b)
 end
-public class ScopeGuard                                  // the sanctioned `errdefer`
+public class ScopeGuard                                  // the sanctioned `errdefer`; NOT YET IMPLEMENTED (#4669)
   public constructor(scoped action: () -> ());           // runs at disposal unless dismissed
   public method Dismiss();                               // idempotent
   public readonly property IsDismissed: bool;
