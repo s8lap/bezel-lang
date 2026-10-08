@@ -14028,24 +14028,52 @@ void MethodOwnership::markOutOwnedArgsCore(
                 // auto-drop. The `out owned var` branch below is replaced by the
                 // `out var` adoption arm.
                 if (a.modifier == "out owned var") {
-                    // Retired form — the sema layer has already reported an
-                    // error for the retired `out owned var` modifier; do NOT
-                    // seed a state here so the downstream must-use / auto-drop
-                    // machinery does not fire on a local whose declaration form
-                    // is an error. (The local's symbol was still registered by
-                    // sema for error-recovery, so `states_` entry is skipped.)
+                    // The RETIRED spelling (v0.289 L2 deleted it; `out var` is
+                    // the sole inline owned form). The retirement branch that
+                    // used to sit here was emptied on the premise that "the
+                    // sema layer has already reported an error" — but it does
+                    // NOT: `out owned var x` still typechecks here (MEASURED —
+                    // `bezelc -c` exits 0), because the rejection half of
+                    // #3842 never landed. Emptying the seed therefore left an
+                    // ACCEPTED program with no Owned state, so codegen's
+                    // inline-owned arm (LlvmBackend_Calls2.cpp) saw
+                    // autoDropAtScopeEnd == false and registered only the
+                    // exception-edge `unwindOnly` backstop — the normal path
+                    // disposed nothing and the produced object leaked. Restore
+                    // the pre-retirement seed verbatim: while the spelling is
+                    // still accepted it must behave exactly as it did, and
+                    // retiring it (a sema rejection, which flips every
+                    // `out owned var` accept row) is the retirement's own
+                    // remaining work, not a leak fix.
+                    // per §22.4, §28.3, §28.11
+                    if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+                        LocalOwnership lo;
+                        lo.state = OwnershipState::Owned;
+                        lo.obligationOrigin = id;
+                        states_[sym] = lo;
+                        everOwnedPlainLocals_.insert(sym);
+                    }
                 } else if (a.modifier == "out var") {
                     // v0.289 adoption: `out var x` at an `out owned` formal
-                    // produces an owned local. Seed Owned. The discharge check
-                    // (§28.3) does NOT warn for inline `out var` (same as the
-                    // retired `out owned var` form it replaces): inline locals are
-                    // NOT added to `everOwnedPlainLocals_`, so the discharge
-                    // check's nested-scope auto-drop loop never sees them — they
-                    // are silently auto-dropped at scope end, exactly as
-                    // `out owned var x` was before this fix. (Pre-declared
-                    // `out x` recipients are added to preDeclaredOutOwnedRecipients_
-                    // in the else branch below and DO receive a warning if
-                    // undischarged.) // per §28.3
+                    // produces an owned local "under the standard owned-local
+                    // discharge rules, the must-use warning included" (§22.4,
+                    // v0.289 L2). Seed Owned; that seed is what arms the
+                    // end-of-method gate (Ownership.cpp, the IdentifierExpr
+                    // arm), which sets `ls->autoDropAtScopeEnd` and emits the
+                    // §28.3 must-use warning — the flag codegen's
+                    // `ensureOutVarSlots` reads to register the scope-end
+                    // disposal. DO NOT read the absence of an
+                    // `everOwnedPlainLocals_` insert here as "nothing warns and
+                    // nothing disposes": that set feeds the SEPARATE nested-scope
+                    // sweep only. An earlier revision of this comment claimed the
+                    // inline local was "silently auto-dropped at scope end"
+                    // because of that absence, and it was the mask over a real
+                    // leak — the `out owned var` spelling this arm replaced took
+                    // codegen's INLINE-OWNED arm (which registers a disposal),
+                    // while `out var` took the ordinary out-var arm, which
+                    // registered none until fix #3842 taught it the `out owned`
+                    // formal. Measured on the issue repro: 16 bytes leaked per
+                    // call, destructor never ran.  // per §28.3, §22.4
                     if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
                         LocalOwnership lo;
                         lo.state = OwnershipState::Owned;

@@ -2644,6 +2644,68 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;
         registerOutVarStringRelease(*id, loc, ms, pos, slot);
+        // fix #3842 (§22.4, v0.289 L2; §28.3, §28.11): `out owned var x` is
+        // RETIRED, and `out var x` is now the sole inline owned form — it
+        // ADOPTS the classification the callee's declaration announces, so at
+        // an `out owned` formal it produces an owned local "under the standard
+        // owned-local discharge rules, the must-use warning included"
+        // (§22.4, v0.289 L2). The ownership pass already does its half of that:
+        // markOutOwnedArgsCore's `out var` arm seeds Owned and the end-of-
+        // method gate sets `ls->autoDropAtScopeEnd` (measured: autoDrop=1).
+        // This arm used to register NO disposal at all, so the obligation the
+        // ownership pass records was dropped on the floor and the produced
+        // object leaked — the retired `out owned var` spelling took the
+        // INLINE-OWNED arm above, which does register one, which is why the
+        // leak appeared with the retirement and not before.
+        //
+        // So mirror that arm here, for the spelling that replaced it. The
+        // two-way choice is the same:
+        //   • autoDropAtScopeEnd (the ownership pass proved the recipient is
+        //     never discharged on any path) → dynamicDispose on BOTH the
+        //     normal-exit and unwind edges: the §28.3 affine AUTO-DROP,
+        //     null-guarded and nulled on disposal, so exactly-once.
+        //   • otherwise (discharged on some path — `x?.Dispose()`, `move`, a
+        //     transfer) → unwindOnly, the exception-edge backstop only; the
+        //     normal path is that explicit discharge's, which nulls the slot.
+        // Both are null-guarded, so the pair cannot double-free.
+        //
+        // Gated on the FORMAL (`isOutOwnedArgPosition`, the codegen mirror of
+        // markOutOwnedArgsCore's `userOutOwned || builtinOutOwned`), never on
+        // the call-site modifier alone: an ordinary `out var` against a
+        // borrowing `out` formal — or against a value-typed builtin `Try*` like
+        // `Stack<int>.TryPop(out var item)` — adopts a BORROW and must keep
+        // registering no disposal. Same over-fire guard the ownership pass
+        // applies at §28.11/#3779.
+        //
+        // `outOwnedRecipients_` so an explicit `x?.Dispose()` RECLAIMS the heap
+        // block (and nulls the slot) instead of only dispatching the
+        // destructor, which would leak the block; and `mapSuspendLocalSlot` so
+        // a disposal deferred past a suspend (the #3981 hazard the `out using
+        // var` arm above already guards) finds the recipient's value in the
+        // frame field rather than a reset per-activation alloca.
+        if (loc && isOutOwnedArgPosition(call, pos)) {
+            const void* declKey =
+                loc->decl ? static_cast<const void*>(loc->decl)
+                          : static_cast<const void*>(id);
+            outOwnedRecipients_.insert(declKey);
+            mapSuspendLocalSlot(id, slot);
+            // §28.1 (v0.196, #1860): at a value/runtime-managed substitution
+            // the `out owned T` marker is ERASED — the recipient owns nothing,
+            // so register no disposal (dynamic-disposing the erased value as an
+            // object segfaults).
+            const sema::TypeRef* recipTy =
+                loc->declType ? loc->declType : ctx_.exprType(*id);
+            if (!disposeStack_.empty() &&
+                currentFn_ == unwindIneligibleFn_ &&
+                !emittingDisposerBody_ &&
+                outOwnedRecipientDisposes(recipTy) &&
+                !unwindIneligible_.count(declKey)) {
+                Disposal d{slot, nullptr};
+                if (loc->autoDropAtScopeEnd) d.dynamicDispose = true;
+                else d.unwindOnly = true;
+                disposeStack_.back().push_back(d);
+            }
+        }
         pos++;
     }
 }
