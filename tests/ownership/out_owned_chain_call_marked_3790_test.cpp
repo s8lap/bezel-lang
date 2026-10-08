@@ -12,7 +12,7 @@
 //
 //   class Derived: Base
 //     public constructor(x: int)
-//       base(out owned var recipient);   // §22.4 inline declaration
+//       base(out var recipient);   // §22.4 inline declaration (out owned var retired v0.289 L2)
 //     end constructor;
 //   end Derived;
 //
@@ -38,7 +38,7 @@
 //
 // ── WHY THE OBSERVABLE SHAPE IS A §28.3 AUTO-DROP WARNING ──────────────────
 //
-// For an inline `out owned var recipient` at a chain call site, post-fix the
+// For an inline `out var recipient` at a chain call site, post-fix the
 // recipient enters `states_` with state Owned (via the #2436 unconditional
 // reseed at `markOutOwnedArgsCore`) and `everOwnedPlainLocals_` (so the
 // end-of-method discharge check fires on it). Pre-fix neither half ran, so
@@ -52,7 +52,7 @@
 //
 // ── ROWS THAT PASS ON BOTH SIDES, BY DESIGN ────────────────────────────────
 //
-// R3 / R4 are control rows: a plain (non-chain) `out owned` recipient still
+// R3 / R4 are control rows: a plain (non-chain) `out var` recipient still
 // triggers the §28.3 auto-drop warning (R3), and a chained constructor
 // WITHOUT an `out owned` formal produces no warning at all (R4). A fix that
 // over-fired would draw R4's warning; a fix that under-fired would have
@@ -89,7 +89,7 @@ bool hasOutOwnedVarAutoDropWarning(const OwnershipResult& r,
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
-// R1 — ACCEPT (with §28.3 warning). THE HEADLINE REPRO: a `base(out owned
+// R1 — ACCEPT (with §28.3 warning). THE HEADLINE REPRO: a `base(out
 // var recipient)` chain whose target is a constructor with an `out owned`
 // parameter. Post-fix the recipient is marked Owned and the end-of-method
 // discharge check fires the §28.3 auto-drop warning (because the recipient is
@@ -97,7 +97,7 @@ bool hasOutOwnedVarAutoDropWarning(const OwnershipResult& r,
 // no warning at all — and the value is leaked at runtime.
 // FAIL-WITHOUT: no §28.3 auto-drop warning naming `recipient`.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.3 (the `out owned` modifier) / §22.4 (inline `out owned var`) /
+// per §22.3 (the `out owned` modifier) / §22.4 (inline `out var`; out owned var retired v0.289 L2) /
 // §22.10 (constructor chaining) / §12.8 (the chain call's leading-statement
 // position) / §28.3 (the auto-drop obligation), issue #3790
 BEZEL_TEST(out_owned_chain_call_marked_3790,
@@ -111,7 +111,7 @@ BEZEL_TEST(out_owned_chain_call_marked_3790,
         "end Base; "
         "class Derived: Base "
         "  public constructor(x: int) "
-        "    base(out owned var recipient); "
+        "    base(out var recipient); "
         "  end constructor; "
         "end Derived; ");
     BEZEL_EXPECT_TRUE(hasOutOwnedVarAutoDropWarning(r, "recipient"));
@@ -126,7 +126,7 @@ BEZEL_TEST(out_owned_chain_call_marked_3790,
 // be exercised.
 // FAIL-WITHOUT: no §28.3 auto-drop warning naming `recipient`.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.3 / §22.4 / §22.10 / §12.8, issue #3790
+// per §22.3 / §22.4 (out owned var retired v0.289 L2) / §22.10 / §12.8, issue #3790
 BEZEL_TEST(out_owned_chain_call_marked_3790,
            this_chain_out_owned_var_recipient_marked_owned) {
     auto r = parseAndCheckOwnership(
@@ -136,19 +136,19 @@ BEZEL_TEST(out_owned_chain_call_marked_3790,
         "    r := new R(); "
         "  end constructor; "
         "  public constructor(tag: int) "
-        "    this(out owned var recipient); "
+        "    this(out var recipient); "
         "  end constructor; "
         "end Box; ");
     BEZEL_EXPECT_TRUE(hasOutOwnedVarAutoDropWarning(r, "recipient"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// R3 — CONTROL: a NON-CHAIN `out owned var recipient` site still fires the
+// R3 — CONTROL: a NON-CHAIN `out var recipient` site still fires the
 // §28.3 auto-drop warning. This was working before the fix and must keep
 // working; a fix that broke the ordinary (non-chain) path would draw no
 // warning here. Anti-over-fire pin.
 // ═══════════════════════════════════════════════════════════════════════════
-// per §22.3 / §22.4 / §28.3, issue #3790
+// per §22.3 / §22.4 (out owned var retired v0.289 L2) / §28.3, issue #3790
 BEZEL_TEST(out_owned_chain_call_marked_3790,
            non_chain_out_owned_var_recipient_still_marked_owned) {
     auto r = parseAndCheckOwnership(
@@ -161,7 +161,7 @@ BEZEL_TEST(out_owned_chain_call_marked_3790,
         "class C "
         "  public static method Main(): int "
         "    using var f := new Factory(); "
-        "    f.Make(out owned var x); "
+        "    f.Make(out var x); "
         "    return 0; "
         "  end Main; "
         "end C; ");
