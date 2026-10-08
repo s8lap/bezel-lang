@@ -3,7 +3,7 @@
 //! section: 30.1
 //! title: a borrow-bearing record result type is rejected on an async method
 //! rule: An `async` method ... may not declare ... a result/element type
-//!   that is such a record or choice.
+//!   that is such a record, inline array or choice.
 //! cites: 30.1, 9.7
 //! expect: reject
 //! diagnostic: borrow-bearing
