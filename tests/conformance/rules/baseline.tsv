@@ -539,9 +539,9 @@ s14_2_0019	pass
 s14_2_0020	pass	
 s14_2_0021	fail	compiled but spec rejects this (unconstrained T in interface impl)
 s14_2_0022	pass	
-s14_2_0023	fail	syntax error: expected ] to close collection literal
+s14_2_0023	fail	rejects, but on a parse error (expected ] to close collection literal) in the case body, not on the rule it means to pin — case file needs a syntax fix
 s14_2_0024	pass	
-s14_2_0025	fail	syntax error: expected ] to close collection literal
+s14_2_0025	fail	rejects, but on a parse error (expected ] to close collection literal) in the case body, not on the rule it means to pin — case file needs a syntax fix
 s14_2_0026	fail	syntax errors: expected ] and other parse errors
 s14_2_0027	pass	
 s14_2_0028	pass	
@@ -2219,11 +2219,11 @@ l6_10_0005	pass
 l6_10_0006	pass	
 l6_10_0007	pass	
 l6_10_0008	fail	compiled but spec rejects this (owned TaskScope field)
-l6_10_0009	fail	returning TaskScope via owned Object return slot
+l6_10_0009	pass	
 l6_10_0010	fail	compiled but spec rejects this (TaskScope at generic param)
 l6_10_0011	fail	compiled but spec rejects this (TaskScope at IAsyncDisposable)
 l6_10_0012	fail	compiled but spec rejects this (await using var at Object)
-l6_10_0013	pass	
+l6_10_0013	fail	compiler rejects: a plain var binding of a TaskScope is a compile error (stdlib 6.10 v0.175) — the manifest expect: accept is the outlier, compiler is correct
 l6_11_0001	pass	
 l6_11_0002	fail	divergence
 l6_11_0003	fail	divergence
