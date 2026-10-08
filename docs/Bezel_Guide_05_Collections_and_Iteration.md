@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.327.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.332.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5). Neither needs an `import`: both modules are on spec §2.3's always-available list, and the `System.Collections.Generic` row puts every stdlib §4 name in every file's bare-name space. What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -252,7 +252,7 @@ using var kept := q.ToArray();                             //   and its borrow o
                                                            //   until this consumption
 ```
 
-The compiler tracks the captures as sources carried by the query value (spec §28.14; stdlib §5), so the failure mode is a compile error, not a dangle. The same tracking draws the return boundary. A method may return a pipeline over its *own inputs* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — because each caller re-establishes the borrow against its own argument. A pipeline over a local you created dies with the method and cannot be returned. At value, `string`, and runtime-managed elements, materializing it into an owned `Array<T>` is the fix — the slots are copies or runtime-managed references, and the array carries nothing of the local. At **class or interface** elements it is not: the materialized slots are borrows of elements the local still owns, so the returned array dangles the moment the local is disposed (stdlib §5). Return an owning collection you built through §6's owning path, or let the caller own the source.
+The compiler tracks the captures as sources carried by the query value (spec §28.14; stdlib §5), so the failure mode is a compile error, not a dangle. The same tracking draws the return boundary. A method may return a pipeline over its *own inputs* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — because each caller re-establishes the borrow against its own argument. A pipeline over a local you created dies with the method and cannot be returned. At value, `string`, and runtime-managed elements, materializing it into an owned `Array<T>` is the fix — the slots are copies or runtime-managed references, and the array carries nothing of the local — unless the value element itself holds a borrow (a span, a record over an object): then the copy carries that borrow, sourced at the local, and returning or storing it is checked exactly as the local's own `Add` was (spec §9.7). At **class or interface** elements it is not: the materialized slots are borrows of elements the local still owns, so the returned array dangles the moment the local is disposed (stdlib §5). Return an owning collection you built through §6's owning path, or let the caller own the source.
 
 ---
 
@@ -349,7 +349,7 @@ method Header(): Span<byte>
 end Header;
 ```
 
-The fix is Guide 1 §3's: let the *caller* own the buffer and pass a span down, or return the owned buffer itself. The one exception is deliberate. `ReadOnlyStringSpan` is an ordinary record, not borrow-bearing: its `Source` is a `string`, runtime-managed, and the reference itself keeps the string alive. So string spans may sit in fields and cross `await` freely (stdlib §3.3); `ToString()` materializes a plain `string` when an API wants one.
+The fix is Guide 1 §3's: let the *caller* own the buffer and pass a span down, or return the owned buffer itself. Inside the method, a `move` or reassignment of the buffer is a compile error while a span over it is live; disposing it early (`buf.Dispose()`) is not, and the next read through the span faults in checked mode (spec §28.2, §28.3) — use the span first, dispose after. The one exception is deliberate. `ReadOnlyStringSpan` is an ordinary record, not borrow-bearing: its `Source` is a `string`, runtime-managed, and the reference itself keeps the string alive. So string spans may sit in fields and cross `await` freely (stdlib §3.3); `ToString()` materializes a plain `string` when an API wants one.
 
 The payoff of the view types is **reuse without allocation** — one buffer, many operations. The encode idiom (stdlib §3.2/§9.6) is the model:
 

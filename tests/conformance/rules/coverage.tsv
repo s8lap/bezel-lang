@@ -66,7 +66,7 @@ spec	8	The Object Class	0	0	0	0	0	0	0	0	n/a
 spec	8.1	Definition	1	0	2	1	0	1	0	0	covered
 spec	8.2	GetType	2	1	2	0	0	1	0	1	covered
 spec	8.3	Equals and GetHashCode	3	1	3	1	0	1	0	1	covered
-spec	8.4	= and <>	1	1	4	1	0	1	0	2	covered
+spec	8.4	= and <>	2	1	4	1	0	1	0	2	covered
 spec	8.5	ToString	2	0	3	0	0	0	0	3	covered
 spec	8.6	Boxing	0	4	12	1	0	7	0	4	covered
 spec	8.7	Dispose is not on Object	0	0	0	0	0	0	0	0	n/a
@@ -77,7 +77,7 @@ spec	9.3	Combined form	7	1	5	0	0	3	0	2	covered
 spec	9.4	Mutability	0	3	10	2	0	3	0	5	covered
 spec	9.5	Non-destructive update: with	6	2	7	1	0	3	0	3	covered
 spec	9.6	Records and inheritance	1	1	4	1	0	2	0	1	covered
-spec	9.7	Records and disposal	17	7	30	10	0	19	0	1	covered
+spec	9.7	Records and disposal	19	7	30	10	0	19	0	1	covered
 spec	9.8	Serialization synthesis	1	8	8	4	0	4	0	0	covered
 spec	9.9	Constructor-only records	4	3	8	3	0	4	0	1	covered
 spec	10	Enums	0	0	0	0	0	0	0	0	n/a
@@ -230,7 +230,7 @@ spec	27.1.1	Function-type assignability	3	1	6	2	0	4	0	0	covered
 spec	27.2	Nullable function types	0	0	3	0	0	1	0	2	covered
 spec	27.3	Lambda expressions	5	1	9	0	0	4	0	5	covered
 spec	27.4	Parameter type inference	1	0	6	0	0	3	0	3	covered
-spec	27.5	Closures	5	2	10	2	0	6	0	2	covered
+spec	27.5	Closures	5	3	10	2	0	6	0	2	covered
 spec	27.6	Method references	8	4	8	1	0	2	0	5	covered
 spec	27.7	Calling function values	1	0	3	0	0	0	0	3	covered
 spec	27.7.1	Equality of function values	2	0	3	0	0	0	0	3	covered
@@ -238,13 +238,13 @@ spec	27.8	Type aliases	1	1	2	0	0	1	0	1	covered
 spec	28	Resource Management	2	0	2	0	1	0	0	1	covered
 spec	28.1	Where the owned modifier can appear	1	3	10	7	0	3	0	0	covered
 spec	28.2	The IDisposable contract	0	4	12	4	0	4	2	2	covered
-spec	28.3	Local variables, ownership, and borrows	1	27	90	30	12	34	6	8	covered
+spec	28.3	Local variables, ownership, and borrows	1	28	90	30	12	34	6	8	covered
 spec	28.4	The destructor	1	1	8	0	0	2	0	6	covered
 spec	28.5	Owned fields	8	1	18	8	0	7	0	3	covered
 spec	28.6	Leak prevention	4	3	32	17	0	15	0	0	covered
 spec	28.7	Reassigning owned fields and locals — drop-on-overwrite	1	2	9	1	0	1	0	7	covered
 spec	28.8	Ownership transfer	2	1	4	1	1	1	0	1	covered
-spec	28.8.1	The move expression	1	2	16	5	0	7	0	4	covered
+spec	28.8.1	The move expression	1	3	16	5	0	7	0	4	covered
 spec	28.9	Runtime-managed types	7	5	18	1	5	5	4	3	covered
 spec	28.10	using var	5	3	14	3	0	4	0	7	covered
 spec	28.11	Collection element ownership	0	4	14	4	3	5	2	0	covered
@@ -255,7 +255,7 @@ spec	29	Iteration	0	0	0	0	0	0	0	0	n/a
 spec	29.1	The protocol	1	1	6	0	0	1	1	4	covered
 spec	29.2	Desugaring of for	5	3	15	0	0	2	1	12	covered
 spec	29.3	Iterator methods	2	1	6	1	0	2	0	3	covered
-spec	29.4	Lazy evaluation	3	1	4	1	0	1	0	2	covered
+spec	29.4	Lazy evaluation	2	1	4	1	0	1	0	2	covered
 spec	29.5	return not allowed in iterator methods	0	0	3	1	0	2	0	0	covered
 spec	29.6	Restrictions inside try/catch/finally	0	0	4	1	0	3	0	0	covered
 spec	29.7	Disposal of partially-consumed iterators	0	0	3	0	0	0	0	3	covered
@@ -266,7 +266,7 @@ spec	29.11	Multiple enumeration	3	2	14	0	3	3	4	4	covered
 spec	29.12	Mutation during iteration	2	1	10	0	4	0	1	5	covered
 spec	29.13	Async iterators	0	0	0	0	0	0	0	0	n/a
 spec	30	Asynchronous Programming	0	0	0	0	0	0	0	0	n/a
-spec	30.1	async methods	14	5	17	6	0	10	1	0	covered
+spec	30.1	async methods	16	6	17	6	0	10	1	0	covered
 spec	30.2	await	2	0	2	1	0	1	0	0	covered
 spec	30.3	The Task, Task<T>, and OwningTask<T> types	7	1	5	0	0	2	0	3	covered
 spec	30.4	Multiple awaiters	2	0	2	0	0	0	0	2	covered
@@ -379,14 +379,14 @@ stdlib	4.18	SortedSet<T>	0	0	4	0	0	0	0	4	covered
 stdlib	4.19	FrozenArray<T>	3	0	6	0	0	2	0	4	covered
 stdlib	4.20	Counter<K>	0	0	8	1	0	1	0	6	covered
 stdlib	4.21	OwningSlotMap<T> and SlotHandle	2	0	11	0	1	2	0	8	covered
-stdlib	5	System.Collections.Linq (auto-imported)	5	0	12	0	0	3	0	9	covered
+stdlib	5	System.Collections.Linq (auto-imported)	6	0	12	0	0	3	0	9	covered
 stdlib	5.1	No-selector aggregation overloads	0	0	3	0	0	0	0	3	covered
 stdlib	6	System.Threading	0	0	0	0	0	0	0	0	n/a
 stdlib	6.1	CancellationToken and CancellationTokenSource	9	0	10	0	0	0	0	10	covered
 stdlib	6.2	Mutex and Lock	2	0	2	0	0	0	0	2	covered
 stdlib	6.3	Semaphore	2	0	2	0	0	0	0	2	covered
 stdlib	6.4	Atomic<T> and AtomicInteger<T>	0	0	3	0	0	0	0	3	covered
-stdlib	6.5	Events: IEvent, EventSource, ISharedEvent, SharedEventSource	15	0	19	1	0	4	0	14	covered
+stdlib	6.5	Events: IEvent, EventSource, ISharedEvent, SharedEventSource	16	0	19	1	0	4	0	14	covered
 stdlib	6.6	TaskCompletionSource<T> and OwningTaskCompletionSource<T>	2	0	6	1	0	2	0	3	covered
 stdlib	6.7	Task static helpers	4	0	2	0	0	0	0	2	covered
 stdlib	6.8	Domain	6	0	5	1	0	1	0	3	covered

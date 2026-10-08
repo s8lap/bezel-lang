@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.331.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.332.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use after disposal is caught in layers: a borrow that would outlive its local source is rejected, a use of a variable after its explicit disposal is a warning on a straight line and a compile error after a conditional one, and in the default, checked build any member access through a disposed reference faults deterministically (spec §28.2). This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -84,7 +84,7 @@ var d := registry.Find("key");        // returns Buffer (no owned) -> borrowed
 var t := source.PrefetchAsync();      // returns Task<Buffer>  -> owned (task calls mint)
 var q := xs.Where(p);                 // returns a lazy query  -> owned (calls mint)
 var parts := line.Split(':');         // returns owned Array<string> -> owned (trivial-dispose: no ceremony, §2)
-var e := move holder.slot;            // move out of owned field -> owned
+var e := move holder.slot;            // move out of owned field -> owned (restore holder.slot before the method exits, §7)
 ```
 
 The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or — outside the mint-announcing families — a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest:
@@ -187,7 +187,7 @@ end TakeTransactions;
 
 So a caller that needs to *look at* `_transactions` gets a borrow (the bare-field-read return above, or a dedicated borrowing view); a caller that must *take* it uses `move` with an `owned` return (next section).
 
-**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver*, even though the returned frame borrows them: `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance or extension form is the same contract in the same unmarked spelling — every iterable-family call mints, whatever the callee kind; spec §28.3 — with `owned` admissible as emphasis). The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles. The returned task is itself caller-owned (task calls mint, spec §28.3), so it is discharged like any other owned value. What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle. Materialize it instead — but only where materializing actually gives the elements an owner: at a value element type an `owned Array<T>` is the answer, while at a class or interface element type `ToArray()` returns a *borrowing* array whose slots still borrow the local's elements and dangles exactly as the pipeline did (stdlib §5). There, hand the ownership out: build the elements into an owning collection and return it, or expose them through an owning enumeration (`IOwningEnumerable<T>` — `Drain()` where the source is already an owning collection).
+**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver*, even though the returned frame borrows them: `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance or extension form is the same contract in the same unmarked spelling — every iterable-family call mints, whatever the callee kind; spec §28.3 — with `owned` admissible as emphasis). The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles. The returned task is itself caller-owned (task calls mint, spec §28.3), so it is discharged like any other owned value. What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle. Materialize it instead — but only where materializing actually gives the elements an owner: at a borrow-free value element type an `owned Array<T>` is the answer (a value element that holds a borrow — a span, a record over an object — is copied with its borrow, and the copy is checked where it lands as the local's own `Add` was, spec §9.7), while at a class or interface element type `ToArray()` returns a *borrowing* array whose slots still borrow the local's elements and dangles exactly as the pipeline did (stdlib §5). There, hand the ownership out: build the elements into an owning collection and return it, or expose them through an owning enumeration (`IOwningEnumerable<T>` — `Drain()` where the source is already an owning collection).
 
 ---
 
@@ -217,7 +217,7 @@ method Rotate()
 end Rotate;                              // old disposed here
 ```
 
-Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw. A call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form works on owning-collection slots (`move buffer[i]`) — and, as the transfer marker, on named bindings (`move x`; §1, §8). See spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
+Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw. A call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form, under the same restoration rule, works on an owned field of any object you hold — a parameter, a local (`move h.item`) — so `return move h.item;` is an unrestored exit and rejected whatever `h` is: take the field into a local, restore it, return the local. It also works on owning-collection slots (`move buffer[i]`) — and, as the transfer marker, on named bindings (`move x`; §1, §8). See spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
 
 ---
 
