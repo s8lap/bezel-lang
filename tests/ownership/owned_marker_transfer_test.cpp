@@ -217,6 +217,40 @@ BEZEL_TEST(owned_marker, ctor_bare_named_owned_local_rejected) {
     BEZEL_EXPECT_TRUE(errorSays(r, "this call consumes `x`"));
 }
 
+// fix #4726 (§22.3, v0.315): REJECT (LocalDecl-initializer): `move new T()`
+// into an `owned` ctor formal is a redundant marker — a `new` expression
+// is a fresh producer and the spec says "no live binding is invalidated,
+// so there is nothing to announce". Before this fix `recordMovesIn`'s NewExpr
+// arm accepted this silently; `handleDischarge`'s NewExpr arm already rejected
+// it (#4721, the method-call twin). Both paths are now consistent.
+BEZEL_TEST(owned_marker, ctor_move_fresh_new_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class T end T; "
+        "class Box public constructor(owned t: T) using var h := move t; end constructor; end Box; "
+        "class C public method M() "
+        "  using var b := new Box(move new T()); " // spurious move on fresh producer
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "fresh producer"));
+}
+
+// GUARD (not a pin for #4726): the bare-statement `new Box(move new T())`
+// form is rejected by `handleDischarge`'s NewExpr arm — the #4721 fix already
+// covered it. This fixture is a NON-REGRESSION guard: it confirms that
+// `recordMovesIn`'s fix does not inadvertently bypass the handleDischarge
+// path. The #4726 pin is `ctor_move_fresh_new_rejected` above.
+// per §22.3, v0.315
+BEZEL_TEST(owned_marker, ctor_move_fresh_new_bare_statement_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class T end T; "
+        "class Box public constructor(owned t: T) using var h := move t; end constructor; end Box; "
+        "class C public method M() "
+        "  new Box(move new T()); " // spurious move on fresh producer
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(errorSays(r, "fresh producer"));
+}
+
 // UNAFFECTED: `move x.f` of an owned field (a fresh producer) stays UNMARKED.
 BEZEL_TEST(owned_marker, move_owned_field_unmarked_accepted) {
     auto r = parseAndCheckOwnership(

@@ -1476,6 +1476,27 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
                         checkOwnedArgMoveSource(*un, un->span.begin)) {
                         ++pos; continue;  // reported; skip the bogus move
                     }
+                    // fix #4726 / §22.3 (v0.315): a `move`-wrapped fresh producer
+                    // (NewExpr / CallExpr) at an `owned` ctor formal position is a
+                    // redundant marker — the spec says "no live binding is
+                    // invalidated, so there is nothing to announce". Reject it
+                    // here; without this, the fallthrough below silently accepts
+                    // and records the move, leaving the spurious-diagnostic path
+                    // (`reportSpuriousOwnedMarker`, gated on `a.modifier == "owned"`)
+                    // unreachable for this shape. Mirrors `handleDischarge`'s NewExpr
+                    // arm (#4721's primary fix) and `recordMovesIn`'s own
+                    // CallExpr-arm fresh-producer check. // per §22.3, v0.315
+                    if (ctorOwnedSink &&
+                        (dynamic_cast<const ast::NewExpr*>(un->operand.get()) ||
+                         dynamic_cast<const ast::CallExpr*>(un->operand.get()))) {
+                        report(Severity::Error, un->span.begin,
+                               "the `move` call-site marker is not written on a "
+                               "fresh producer (a `new` expression or a call "
+                               "returning an owned result) — no live binding is "
+                               "invalidated, so there is nothing to announce; "
+                               "remove `move` (§22.3, v0.315)");
+                        ++pos; continue;
+                    }
                 }
                 // Fresh producer (`new`, a call returning `owned T`, an operator
                 // result, `move obj.f`). §22.3 (v0.169): the marker is REJECTED
