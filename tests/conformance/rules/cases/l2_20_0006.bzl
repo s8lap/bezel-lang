@@ -2,7 +2,7 @@
 //! doc: stdlib
 //! section: 2.20
 //! title: UnwrapOr returns the fallback on Error
-//! rule: UnwrapOr(fallback) returns v on Ok(v) and fallback on Error(_).
+//! rule: UnwrapOr(fallback) ... returns v on Ok(v) and fallback on Error(_).
 //! cites: 2.20
 //! expect: run
 //! stdout: 99

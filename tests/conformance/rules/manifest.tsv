@@ -1875,11 +1875,11 @@ l2_19_0003	stdlib	2.19	reject	lib	bool conforms to none of INumber, ISteppable, 
 l2_19_0004	stdlib	2.19	reject	lib	string conforms to none of INumber, ISteppable, IParsable	string conforms to none of the three static abstractions — concatenation is not addition, and parsing a string to a string is meaningless.	2.19	IParsable				
 l2_19_0005	stdlib	2.19	run	program	a user class implementing ICollectionLiteralTarget is a literal target	A user class declares exactly one of ICollectionLiteralTarget<TSelf, T> / IOwningCollectionLiteralTarget<TSelf, T>, at TSelf = itself, and supplies FromCollectionLiteral — the sequence-literal target.	2.19, 15.4.1	3				
 l2_20_0001	stdlib	2.20	run	program	IsOk() is true for the Ok case	IsOk() distinguishes Ok from Error by case, compiler-provided.	2.20, 35.3	True				
-l2_20_0002	stdlib	2.20	run	program	Map transforms the Ok payload	Map(f) maps Ok(v) to Ok(f(v)).	2.20	10				
+l2_20_0002	stdlib	2.20	run	program	Map transforms the Ok payload	Map(f) ... maps Ok(v) to Ok(f(v)).	2.20	10				
 l2_20_0003	stdlib	2.20	run	program	Map passes Error through unchanged	Map(f) passes Error(e) through unchanged.	2.20	bad				
-l2_20_0004	stdlib	2.20	run	program	MapError transforms the Error payload	MapError(f) maps Error(e) to Error(f(e)).	2.20	3				
-l2_20_0005	stdlib	2.20	run	program	AndThen sequences a second fallible step on Ok	AndThen(f) returns f(v) on Ok(v) and passes Error(e) through.	2.20, 35.3	5				
-l2_20_0006	stdlib	2.20	run	program	UnwrapOr returns the fallback on Error	UnwrapOr(fallback) returns v on Ok(v) and fallback on Error(_).	2.20	99				
+l2_20_0004	stdlib	2.20	run	program	MapError transforms the Error payload	MapError(f) ... maps Error(e) to Error(f(e)).	2.20	3				
+l2_20_0005	stdlib	2.20	run	program	AndThen sequences a second fallible step on Ok	AndThen(f) ... returns f(v) on Ok(v) and passes Error(e) through.	2.20, 35.3	5				
+l2_20_0006	stdlib	2.20	run	program	UnwrapOr returns the fallback on Error	UnwrapOr(fallback) ... returns v on Ok(v) and fallback on Error(_).	2.20	99				
 l2_20_0007	stdlib	2.20	run	program	UnwrapOr's fallback argument is evaluated eagerly	UnwrapOr's argument is an ordinary value argument, not a deferred computation — it is evaluated at the call site, before the call, on the Ok path exactly as on the Error path.	2.20, 22.5	computing fallback				
 l2_20_0008	stdlib	2.20	reject	lib	Map is unreachable at an owning Result instantiation	Map/MapError/AndThen/UnwrapOr are conditionally-admitted members, admissible only where the receiver instantiation is value-like; a borrow-bearing or owning receiver is rejected at the use site.	2.20, 14.2, 35.4	value-like				
 l2_21_0001	stdlib	2.21	run	program	a ScopeGuard runs its action at disposal unless dismissed	ScopeGuard's constructor runs the action at disposal unless dismissed.	2.21, 28.14	undone				
