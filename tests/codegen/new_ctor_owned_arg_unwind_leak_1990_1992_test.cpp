@@ -60,7 +60,7 @@ bool wasSkipped(const JitResult& r) {
 }
 
 // T1 — #1990 exact repro: a single bare owned local `x` transferred into
-// `new Pair(owned x, <throws>)`, the throw CAUGHT in-method, with a post-catch
+// `new Pair(move x, <throws>)`, the throw CAUGHT in-method, with a post-catch
 // conditional `return`. Witness: after the catch, `x` must have been disposed
 // EXACTLY ONCE (X._n == 1). (On the base the destructor never ran → X._n == 0 →
 // return 3; and LSan caught the 16-byte leak.)
@@ -84,7 +84,7 @@ const char* kSingleOwnedCaughtPostCatchReturn =
     "  public static method Main(): int "
     "    var caught := 0; "
     "    var x := new X(); "
-    "    try using var p := new Pair(owned x, P.MakeIntOrThrow()); "
+    "    try using var p := new Pair(move x, P.MakeIntOrThrow()); "
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    if X._n <> 1 then return 3; end; "       // x disposed once on the caught edge
@@ -93,7 +93,7 @@ const char* kSingleOwnedCaughtPostCatchReturn =
     "end P;";
 
 // T2 — #1992: TWO bare owned locals of the SAME type transferred into
-// `new Trip(owned x, owned y, <throws>)`, the throw CAUGHT. Witness: BOTH must
+// `new Trip(move x, move y, <throws>)`, the throw CAUGHT. Witness: BOTH must
 // be disposed once (X._n == 2). (On the base only one was reclaimed → X._n == 0
 // witnessed here, and LSan caught the surviving 16-byte leak.)
 const char* kTwoOwnedSameTypeCaught =
@@ -117,7 +117,7 @@ const char* kTwoOwnedSameTypeCaught =
     "    var caught := 0; "
     "    var x := new X(); "
     "    var y := new X(); "
-    "    try using var t := new Trip(owned x, owned y, P.Boom()); "
+    "    try using var t := new Trip(move x, move y, P.Boom()); "
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    if X._n <> 2 then return 3; end; "       // BOTH disposed once
@@ -154,7 +154,7 @@ const char* kTwoOwnedDistinctTypesCaught =
     "    var caught := 0; "
     "    var x := new X(); "
     "    var y := new Y(); "
-    "    try using var t := new Trip(owned x, owned y, P.Boom()); "
+    "    try using var t := new Trip(move x, move y, P.Boom()); "
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    if X._n <> 1 then return 3; end; "       // x disposed once
@@ -189,7 +189,7 @@ const char* kSuccessfulTwoOwned =
     "    var x := new X(); "
     "    var y := new X(); "
     "    do "
-    "      using var t := new Trip(owned x, owned y, P.Ident(7)); "
+    "      using var t := new Trip(move x, move y, P.Ident(7)); "
     "      if t._b <> 7 then return 4; end; "
     "    end; "                                   // t disposed here → X._n == 2
     "    if X._n <> 2 then return 5; end; "
@@ -198,7 +198,7 @@ const char* kSuccessfulTwoOwned =
     "end P;";
 
 // T5 — the same defect on the shared buildOrderedArgs path used by an ORDINARY
-// method call: `P.Sink(owned x, owned y, <throws>)` caught in-method. Both
+// method call: `P.Sink(move x, move y, <throws>)` caught in-method. Both
 // transferred owned args are disposed exactly once on the caught edge. Sink
 // disposes its owned params on the (untaken here) normal path so the program is
 // well-formed. Witness: X._n == 2 after the catch.
@@ -217,7 +217,7 @@ const char* kMethodCallTwoOwnedCaught =
     "    var caught := 0; "
     "    var x := new X(); "
     "    var y := new X(); "
-    "    try var r := P.Sink(owned x, owned y, P.Boom()); "
+    "    try var r := P.Sink(move x, move y, P.Boom()); "
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    if X._n <> 2 then return 3; end; "       // both disposed once on the caught edge

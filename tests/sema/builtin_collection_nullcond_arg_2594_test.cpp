@@ -200,7 +200,7 @@ BEZEL_TEST(sema_collection_nullcond_arg_2594,
         "end R; "
         "class C "
         "  public static method T(s: OwningArray<R>?) "
-        "    s?.Add(owned new R(1)); "
+        "    s?.Add(move new R(1)); "
         "  end T; "
         "end C;");
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));

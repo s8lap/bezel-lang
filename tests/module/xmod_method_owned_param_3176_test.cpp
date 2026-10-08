@@ -364,7 +364,7 @@ bool mentions3176(const std::string& hay, const char* needle) {
 // ===========================================================================
 BEZEL_TEST(xmod_method_owned_param_3176,
            t1_marked_owned_arg_runs_and_disposes_once_22_3) {
-    int rc = runImported3176(workBody3176("Sink.Take(owned r)"), "t1");
+    int rc = runImported3176(workBody3176("Sink.Take(move r)"), "t1");
     if (rc == -2) return;  // no toolchain for the dependency
     BEZEL_EXPECT_EQ(rc, 211);
 }
@@ -444,7 +444,7 @@ BEZEL_TEST(xmod_method_owned_param_3176,
     std::string err;
     int rc = runImported3176(
         "  static method Give(b: Res): int "
-        "    return Sink.Take(owned b); "
+        "    return Sink.Take(move b); "
         "  end Give; "
         "  public static method Main(): int "
         "    var r := new Res(); "
@@ -474,7 +474,7 @@ BEZEL_TEST(xmod_method_owned_param_3176,
     int rc = runImported3176(
         "  public static method Main(): int "
         "    using var r := new Res(); "
-        "    return Sink.Peek(owned r); "
+        "    return Sink.Peek(move r); "
         "  end Main;",
         "t5", &err);
     if (rc == -2) return;
@@ -584,7 +584,7 @@ BEZEL_TEST(xmod_method_owned_param_3176,
 // ===========================================================================
 BEZEL_TEST(xmod_method_owned_param_3176, t9_same_module_control_22_3) {
     int rc = runSingleModule3176(
-        sameModuleProgram3176(workBody3176("Sink.Take(owned r)"), "T9"), "t9");
+        sameModuleProgram3176(workBody3176("Sink.Take(move r)"), "T9"), "t9");
     BEZEL_EXPECT_EQ(rc, 211);
 }
 

@@ -372,7 +372,7 @@ static const std::string kOwnedSinkScopedProg =
     "  end Sink; "
     "  public static async method Main(): Task<int> "
     "    var cfg := await C.FetchAsync(); "
-    "    return C.Sink(owned cfg); "                // borrow -> owned sink
+    "    return C.Sink(move cfg); "                // borrow -> owned sink
     "  end Main; "
     "end C;";
 
@@ -388,7 +388,7 @@ static const std::string kOwnedSinkTwoLineProg =
     "  public static async method Main(): Task<int> "
     "    using var task := C.FetchAsync(); "
     "    var cfg := await task; "
-    "    return C.Sink(owned cfg); "
+    "    return C.Sink(move cfg); "
     "  end Main; "
     "end C;";
 

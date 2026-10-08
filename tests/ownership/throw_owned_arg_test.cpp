@@ -116,7 +116,7 @@ BEZEL_TEST(throw_owned_arg, borrow_param_to_owned_ctor_arg_rejected_28_8) {
 BEZEL_TEST(throw_owned_arg, borrow_param_explicit_owned_modifier_rejected_28_8) {
     auto r = parseAndCheckOwnership(wrap(
         "public method Handle(b: Inner) "
-        "  throw new Wrap(owned b); "
+        "  throw new Wrap(move b); "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(

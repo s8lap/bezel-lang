@@ -1,7 +1,10 @@
 // Spec-derived parser tests for indexer index lists — §A.7 PrimarySuffix
 // `[ ArgList ]`. Slice 55 changes IndexExpr to carry the same Argument
-// shape as call/new arg lists, so modifiers (ref/out/owned), named-args,
+// shape as call/new arg lists, so modifiers (ref/out), named-args,
 // and the `_` discard are admissible inside `[...]`.
+//
+// Note: bare `owned` was removed from ArgModifiers per §A.4 / proposal 0090
+// (v0.246); use `move` to transfer ownership.
 //
 // Sema enforces which apply to indexer getters vs setters; the parser
 // admits the full ArgList grammar at the slot.
@@ -55,10 +58,11 @@ BEZEL_TEST(parser_index_args, ref_modifier_on_index) {
         std::string("arr[ref i]"));
 }
 
+// per §A.4 / proposal 0090 (v0.246): bare `owned` is not an ArgModifiers
+// alternative; `arr[owned r]` is a parse error. Use `move`.
 BEZEL_TEST(parser_index_args, owned_modifier_on_index) {
-    BEZEL_EXPECT_EQ(
-        render("arr[owned r]"),
-        std::string("arr[owned r]"));
+    BEZEL_EXPECT_EQ(render("arr[owned r]"),
+                    std::string("<errors>"));
 }
 
 BEZEL_TEST(parser_index_args, named_index) {

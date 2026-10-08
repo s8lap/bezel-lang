@@ -103,7 +103,7 @@ where T: class
   end Sub;
 
   public method ParallelArgs(name: string, ref count: int, owned r: Resource)
-    Update(name := name, ref count, owned r);
+    Update(name := name, ref count, move r);
   end ParallelArgs;
 
   public method Dispose()

@@ -228,7 +228,7 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
     const std::string src =
         std::string("module M3769b; ") + kRes + kBasePrimaryOwnedThenDefault +
         loop200("var x := new Res(i); "
-                "using var b := new Base(owned x); ");
+                "using var b := new Base(move x); ");
     auto r = runAotChecked(src);
     // `ran == false` is BOTH the ASan/LSan failure signal and the "cannot build
     // an instrumented executable here" skip — assert it so neither passes
@@ -288,7 +288,7 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
         "  private owned _s: Res := r; "
         "  private _t: int := tag; "
         "  public constructor(owned x: Res, flag: bool) "
-        "    this(owned x); "
+        "    this(move x); "
         "  end constructor; "
         "  public method Id(): int "
         "    return _t + _s.Id(); "
@@ -404,7 +404,7 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
         "  end Id; "
         "end B; " +
         loop200("var x := new Res(i); "
-                "using var b := new B(owned x); ");
+                "using var b := new B(move x); ");
     auto r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
@@ -537,7 +537,7 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
         "    _n := b; "
         "  end constructor; "
         "  public constructor(owned x: Res, y: bool) "
-        "    this(owned x); "
+        "    this(move x); "
         "  end constructor; "
         "  public method N(): int "
         "    return _n; "
@@ -622,7 +622,7 @@ BEZEL_TEST(defaulted_ctor_arity_owned_sink_3769,
         "end Base; "
         "class D : Base "
         "  public constructor(owned x: Res) "
-        "    base(owned x); "
+        "    base(move x); "
         "  end constructor; "
         "end D; " +
         loop200("using var b := new D(new Res(i)); ");

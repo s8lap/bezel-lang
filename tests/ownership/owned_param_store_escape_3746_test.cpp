@@ -486,7 +486,7 @@ BEZEL_TEST(owned_param_store_escape_3746,
         "    return n; "
         "  end Sink; "
         "  public static method Take(p: owned R): int "
-        "    return Sink(owned p); "
+        "    return Sink(move p); "
         "  end Take; "
         "  public static method Main(): int "
         "    Console.WriteLine(Take(new R()).ToString()); "
@@ -552,7 +552,7 @@ BEZEL_TEST(owned_param_store_escape_3746,
         "  end Sink3; "
         "  public static method Main(): int "
         "    var r := new R(); "
-        "    Console.WriteLine(Sink3(7, owned r).ToString()); "
+        "    Console.WriteLine(Sink3(7, move r).ToString()); "
         "    return 0; "
         "  end Main; "
         "end C;")), "7");

@@ -37,7 +37,7 @@
 //
 // OBSERVED PRE-FIX, on the PLAIN AOT path (both, mechanically):
 //     unmarked  `new W7(r)`     -> compiles rc=0, runs, **SIGSEGV (139)**
-//     marked    `new W7(owned r)` -> compile rc=1, the §22.3 spurious-marker error
+//     marked    `new W7(move r)` -> compile rc=1, the §22.3 spurious-marker error
 //     control, byte-identical code in ONE module -> 211 (correct)
 //
 // The SIGSEGV was confirmed to be the second disposal, not something adjacent:
@@ -251,7 +251,7 @@ bool mentions2659(const std::string& hay, const char* needle) {
 }  // namespace
 
 // ===========================================================================
-// T1 — §22.3 / §28.8: the MARKED spelling `new W7(owned r)` compiles, the
+// T1 — §22.3 / §28.8: the MARKED spelling `new W7(move r)` compiles, the
 // constructor body runs, and the resource is disposed EXACTLY ONCE.
 //
 // This is the row the issue was filed for (pre-fix: hard compile error, "the
@@ -261,7 +261,7 @@ bool mentions2659(const std::string& hay, const char* needle) {
 // giving v = 0 and a leaked argument (exit 0, not 211).
 // ===========================================================================
 BEZEL_TEST(xmod_ctor_owned_param_2659, t1_marked_owned_arg_runs_and_disposes_once_22_3) {
-    int rc = runImported2659(workBody2659("new W7(owned r)"), "t1");
+    int rc = runImported2659(workBody2659("new W7(move r)"), "t1");
     if (rc == -2) return;  // no toolchain for the dependency
     BEZEL_EXPECT_EQ(rc, 211);
 }
@@ -328,7 +328,7 @@ BEZEL_TEST(xmod_ctor_owned_param_2659, t4_borrow_into_imported_owned_formal_reje
     std::string err;
     int rc = runImported2659(
         "  static method Take(b: Res): int "
-        "    var w := new W7(owned b); "
+        "    var w := new W7(move b); "
         "    var q := w.v; "
         "    _ := w; "
         "    return q; "
@@ -359,7 +359,7 @@ BEZEL_TEST(xmod_ctor_owned_param_2659, t5_marker_on_borrow_formal_still_spurious
     int rc = runImported2659(
         "  static method Work(): int "
         "    var r := new Res(); "
-        "    var w := new WB(owned r); "
+        "    var w := new WB(move r); "
         "    var q := w.v; "
         "    _ := w; "
         "    r.Dispose(); "
@@ -400,7 +400,7 @@ BEZEL_TEST(xmod_ctor_owned_param_2659, t6_same_module_control_22_3) {
             "    v := r.v + 20; r.Dispose(); "
             "  end; "
             "end W7; "
-            "class C " + workBody2659("new W7(owned r)") + " end C;");
+            "class C " + workBody2659("new W7(move r)") + " end C;");
 
     bezel::Driver driver;
     if (!driver.compileFile(src.path, exe.path, {}).success) {

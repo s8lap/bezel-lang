@@ -18,7 +18,7 @@
 // parameters apply." §22.3 (v0.169): the `owned` call-site marker is REQUIRED
 // when the argument is a named owned binding the call leaves moved-from —
 // omitting it "is a compile error naming the fix". So `new Holder(x)` for an
-// `owned` primary-ctor param must be REJECTED (write `new Holder(owned x)`),
+// `owned` primary-ctor param must be REJECTED (write `new Holder(move x)`),
 // exactly as it already was for a regular `owned` constructor parameter.
 //
 // Fix: a shared resolveCtorParams() helper falls back to the class primary
@@ -30,11 +30,11 @@
 // `owned` primary-ctor param compiled and valgrind reported "Invalid free()"
 // (double-free) plus use-after-free reads. Post-fix: the same program is
 // rejected with the §22.3 missing-owned-marker error; the marked form
-// `new Holder(owned x)` and a fresh producer `new Holder(new Res())` compile and
+// `new Holder(move x)` and a fresh producer `new Holder(new Res())` compile and
 // dispose the resource exactly once (valgrind clean).
 //
 // Anti-over-reject surface (all ACCEPTED):
-//   - `new Holder(owned x)` — marked transfer to an owned primary-ctor param.
+//   - `new Holder(move x)` — marked transfer to an owned primary-ctor param.
 //   - `new Holder(new Res())` — fresh producer to an owned primary-ctor param.
 //   - `new Sink(x)` where `Sink(r: Res)` has a NON-owned primary-ctor param —
 //     a named owned local is a borrow here; no marker required, no double-free.
@@ -117,7 +117,7 @@ BEZEL_TEST(primary_ctor_owned_marker_1627,
 // ACCEPTED — anti-over-reject surface.
 // =============================================================================
 
-// §22.3 marked transfer `new Holder(owned x)`: the call-site marker announces
+// §22.3 marked transfer `new Holder(move x)`: the call-site marker announces
 // the move; the primary-ctor param consumes `x`. No missing-marker error.
 BEZEL_TEST(primary_ctor_owned_marker_1627,
            marked_named_local_to_owned_primary_ctor_param_accepted) {
@@ -130,7 +130,7 @@ BEZEL_TEST(primary_ctor_owned_marker_1627,
         "class Program "
         "  public static method Main(): int "
         "    var x := new Res(); "
-        "    do using var h := new Holder(owned x); end; "
+        "    do using var h := new Holder(move x); end; "
         "    return 0; "
         "  end Main; "
         "end Program;");

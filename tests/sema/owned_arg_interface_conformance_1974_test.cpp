@@ -134,7 +134,7 @@ BEZEL_TEST(owned_arg_conformance_1974, owned_conforming_to_interface_accepted_5_
         "  public static method Take(owned x: IThing): int return x.Ping(); end Take; "
         "  public static method Main(): int "
         "    var w := new Widget(42); "
-        "    return C.Take(owned w); "
+        "    return C.Take(move w); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -155,7 +155,7 @@ BEZEL_TEST(owned_arg_conformance_1974, owned_to_matching_class_param_accepted) {
         "  public static method Take(owned x: Widget): int return x.Ping(); end Take; "
         "  public static method Main(): int "
         "    var w := new Widget(42); "
-        "    return C.Take(owned w); "
+        "    return C.Take(move w); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -179,7 +179,7 @@ BEZEL_TEST(owned_arg_conformance_1974, owned_derived_to_base_param_accepted_5_1)
         "  public static method Take(owned x: Base): int return x.Ping(); end Take; "
         "  public static method Main(): int "
         "    var d := new Derived(); "
-        "    return C.Take(owned d); "
+        "    return C.Take(move d); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -206,7 +206,7 @@ BEZEL_TEST(owned_arg_conformance_1974, owned_conforming_to_interface_runs) {
         "  public static method Take(owned x: IThing): int return x.Ping(); end Take; "
         "  public static method Main(): int "
         "    var w := new Widget(42); "
-        "    return C.Take(owned w); "
+        "    return C.Take(move w); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);
@@ -226,7 +226,7 @@ BEZEL_TEST(owned_arg_conformance_1974, owned_to_matching_class_param_runs) {
         "  public static method Take(owned x: Widget): int return x.Ping(); end Take; "
         "  public static method Main(): int "
         "    var w := new Widget(42); "
-        "    return C.Take(owned w); "
+        "    return C.Take(move w); "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);

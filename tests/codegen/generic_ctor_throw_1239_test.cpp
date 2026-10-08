@@ -118,7 +118,7 @@ BEZEL_TEST(generic_ctor_throw_1239, field_store_then_throw_owned_cleanup) {
         "class Cell end Cell; "
         "class C public static method Main(): int "
         "  var inner := new Inner(); "
-        "  try using var g := new G<Cell>(owned inner); "
+        "  try using var g := new G<Cell>(move inner); "
         "  catch Exception => do "
         "    if Inner._n <> 1 then return 1; end; "
         "  end "

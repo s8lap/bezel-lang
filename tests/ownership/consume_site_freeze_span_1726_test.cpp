@@ -18,7 +18,7 @@
 // rule with the structurally-identical consume shapes: `FrozenArray<double>.
 // From(owned buf)` is an owned-argument transfer into a static, owned-returning
 // sink over a value-typed `OwningBuffer<double>` — mirrored here by
-// `Freeze.From(owned buf)` — plus the marked-transfer and drop-on-overwrite
+// `Freeze.From(move buf)` — plus the marked-transfer and drop-on-overwrite
 // consume shapes the freeze covers uniformly (§28.3 consume sites). The rule
 // checked is the same for the real FrozenArray construction when it lands.
 //
@@ -80,7 +80,7 @@ BEZEL_TEST(consume_site_freeze_span,
     auto r = parseAndCheckOwnership(mod(
         "    var buf := new OwningBuffer<double>(4); "
         "    var s := buf.AsSpan(); "
-        "    var frozen := Freeze.From(owned buf); "  // consume buf while s live
+        "    var frozen := Freeze.From(move buf); "  // consume buf while s live
         "    var n := s.Length; "                     // s's surviving use
         "    _ := n; "
         "    frozen.Dispose(); "));
@@ -91,7 +91,7 @@ BEZEL_TEST(consume_site_freeze_span,
 
 // ---------------------------------------------------------------------------
 // (b) plain-move shape: a plain owned-argument transfer into an owned parameter
-// (`Freeze.Move(owned buf)`) is a consume; with a live span over `buf` it is
+// (`Freeze.Move(move buf)`) is a consume; with a live span over `buf` it is
 // likewise frozen — REJECTED. This is the "plain move" companion to the
 // FrozenArray-construction shape above (the freeze applies at every consume
 // site, not a compiler-known-transfer subset, §28.3).
@@ -102,7 +102,7 @@ BEZEL_TEST(consume_site_freeze_span,
     auto r = parseAndCheckOwnership(mod(
         "    var buf := new OwningBuffer<double>(4); "
         "    var s := buf.AsSpan(); "
-        "    Freeze.Move(owned buf); "                // plain owned-arg move
+        "    Freeze.Move(move buf); "                // plain owned-arg move
         "    var n := s.Length; "
         "    _ := n; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -142,7 +142,7 @@ BEZEL_TEST(consume_site_freeze_span,
         "    var buf := new OwningBuffer<double>(8); "
         "    var s := buf.AsSpan(); "
         "    var t := s.Slice(0..<4); "
-        "    var frozen := Freeze.From(owned buf); "
+        "    var frozen := Freeze.From(move buf); "
         "    var n := t.Length; "                     // t's surviving use
         "    _ := n; "
         "    frozen.Dispose(); "));
@@ -164,7 +164,7 @@ BEZEL_TEST(consume_site_freeze_span,
         "    var s := buf.AsSpan(); "
         "    var n := s.Length; "                     // s's last use, before consume
         "    _ := n; "
-        "    var frozen := Freeze.From(owned buf); "  // now safe
+        "    var frozen := Freeze.From(move buf); "  // now safe
         "    frozen.Dispose(); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -181,7 +181,7 @@ BEZEL_TEST(consume_site_freeze_span,
         "    var s := buf.AsSpan(); "
         "    var n := s.Length; "
         "    _ := n; "
-        "    var frozen := Freeze.From(owned buf); "
+        "    var frozen := Freeze.From(move buf); "
         "    frozen.Dispose(); "));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

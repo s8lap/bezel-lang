@@ -106,7 +106,7 @@ BEZEL_TEST(bind_atom_k85_2098, clause_consumed_by_owned_arg_spec_28_3) {
     auto r = runAotChecked(std::string(kPrelude) +
         "class C "
         "  public static method Main(): int "
-        "    var v := (var c := new Res(7); W.Sink(owned c)); "
+        "    var v := (var c := new Res(7); W.Sink(move c)); "
         "    Console.WriteLine(\"V\" + v.ToString()); "
         "    return 0; "
         "  end Main; "

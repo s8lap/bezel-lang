@@ -71,7 +71,7 @@ BEZEL_TEST(owned_marker_throw_before,
         "  end Inner; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    try var r := C.Inner(owned w); catch AppError => _ := 1; end; "
+        "    try var r := C.Inner(move w); catch AppError => _ := 1; end; "
         "    return Cell.live; "               // 0 — x disposed exactly once on unwind
         "  end Main; "
         "end C;";
@@ -94,7 +94,7 @@ BEZEL_TEST(owned_marker_throw_before,
         "  end Inner; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    try var r := C.Inner(owned w); catch AppError => _ := 1; end; "
+        "    try var r := C.Inner(move w); catch AppError => _ := 1; end; "
         "    return Cell.live; "               // 0
         "  end Main; "
         "end C;";
@@ -171,7 +171,7 @@ BEZEL_TEST(owned_marker_throw_before,
         "  end Inner; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    try var r := C.Inner(owned w); catch AppError => _ := 1; end; "
+        "    try var r := C.Inner(move w); catch AppError => _ := 1; end; "
         "    return Cell.live; "               // 0 — disposed once, no double-free
         "  end Main; "
         "end C;";
@@ -194,7 +194,7 @@ BEZEL_TEST(owned_marker_throw_before,
         "  end Inner; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    try var r := C.Inner(owned w); catch AppError => _ := 1; end; "
+        "    try var r := C.Inner(move w); catch AppError => _ := 1; end; "
         "    return Cell.live; "               // 0
         "  end Main; "
         "end C;";
@@ -224,7 +224,7 @@ BEZEL_TEST(owned_marker_throw_before,
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "            // Cell #2
-        "    var r := C.Take(owned w); "
+        "    var r := C.Take(move w); "
         "    return Cell.live; "               // 0 — both disposed exactly once
         "  end Main; "
         "end C;";
@@ -263,7 +263,7 @@ BEZEL_TEST(owned_marker_throw_before,
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    try var r := C.Take(owned w); catch AppError => _ := 1; end; "
+        "    try var r := C.Take(move w); catch AppError => _ := 1; end; "
         "    return Cell.live; "               // 0 — disposed once on unwind
         "  end Main; "
         "end C;";

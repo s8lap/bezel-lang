@@ -202,7 +202,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "    Res.alive := 0; "
         "    var w := new Widget(\"x\", out owned var n); "
         "    w.Dispose(); "
-        "    var h := new Holder(owned n); "
+        "    var h := new Holder(move n); "
         "    h.Dispose(); "
         "    return Res.alive; "
         "  end Main; "
@@ -236,7 +236,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "    Res.alive := 0; "
         "    var w := new Widget(\"x\", out owned var n); "
         "    w.Dispose(); "
-        "    _ := C.Consume(owned n); "
+        "    _ := C.Consume(move n); "
         "    return Res.alive; "
         "  end Main; "
         "end C;");

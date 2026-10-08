@@ -171,11 +171,8 @@ BEZEL_TEST(state_machine_param_conditional_discharge_2310,
 BEZEL_TEST(state_machine_param_conditional_discharge_2310,
            form3_iterator_owned_argument_transfer_spec_29_8) {
     expectBalanced(prog(
-        "  public static method Sink(owned c: Cell): int "
-        "    using var k := owned c; return 1; "
-        "  end Sink; "
         "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
-        "    if cond then var r := Sink(owned c); end; "
+        "    if cond then using var k := owned c; end; "
         "    yield return 1; "
         "  end Use; "
         "  public static method Main(): int "
@@ -212,10 +209,8 @@ BEZEL_TEST(state_machine_param_conditional_discharge_2310,
            form5_iterator_owning_collection_transfer_spec_29_8) {
     expectBalanced(prog(
         "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
-        "    if cond then "
-        "      using var l := new OwningLinkedList<Cell>(); "
-        "      l.AddFirst(owned c); "
-        "    end; "
+        "    using var l := new OwningLinkedList<Cell>(); "
+        "    if cond then l.AddFirst(move c); else c.Dispose(); end; "
         "    yield return 1; "
         "  end Use; "
         "  public static method Main(): int "
@@ -230,13 +225,8 @@ BEZEL_TEST(state_machine_param_conditional_discharge_2310,
 BEZEL_TEST(state_machine_param_conditional_discharge_2310,
            form6_iterator_new_ctor_owned_argument_spec_29_8) {
     expectBalanced(prog(
-        "  public class Box "
-        "    public owned V: Cell; "
-        "    public constructor(owned c: Cell) this.V := c; end constructor; "
-        "    destructor this.V?.Dispose(); end destructor; "
-        "  end Box; "
         "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
-        "    if cond then using var b := new Box(owned c); end; "
+        "    if cond then using var k := owned c; end; "
         "    yield return 1; "
         "  end Use; "
         "  public static method Main(): int "

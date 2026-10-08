@@ -167,7 +167,7 @@ BEZEL_TEST(own_branch_disposal, dispose_two_of_three_arms_auto_drops_third_k7_4)
 BEZEL_TEST(own_branch_disposal, dispose_then_move_else_both_discharge_clean_28_3) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Stream(); "
-        "if cond then x.Dispose(); else sink.Take(owned x); end;"));
+        "if cond then x.Dispose(); else sink.Take(move x); end;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -177,7 +177,7 @@ BEZEL_TEST(own_branch_disposal, dispose_then_move_else_both_discharge_clean_28_3
 BEZEL_TEST(own_branch_disposal, move_then_only_leaks_else_path_28_6) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Stream(); "
-        "if cond then sink.Take(owned x); end;"));
+        "if cond then sink.Take(move x); end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
@@ -304,6 +304,6 @@ BEZEL_TEST(own_branch_disposal, dispose_then_early_return_else_dispose_clean_747
 BEZEL_TEST(own_branch_disposal, move_then_early_return_leaks_fallthrough_747) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Stream(); "
-        "if cond then sink.Take(owned x); return; end;"));
+        "if cond then sink.Take(move x); return; end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }

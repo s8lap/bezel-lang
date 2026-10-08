@@ -93,7 +93,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, collection_add_owned_transfer_after_
         "    using var log := new OwningArray<Resource>(); "
         "    var b := new Resource(); "        // plain owned local
         "    Boom(); "                          // throws BEFORE transfer — b live (§28.3)
-        "    log.Add(owned b); "                // normal path: b moved into log
+        "    log.Add(move b); "                // normal path: b moved into log
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "
@@ -124,7 +124,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, collection_add_transfer_then_throw_n
         "  public static method Work() "
         "    using var log := new OwningArray<Resource>(); "
         "    var b := new Resource(); "
-        "    log.Add(owned b); "                // b moved into log; slot nulled
+        "    log.Add(move b); "                // b moved into log; slot nulled
         "    Boom(); "                          // throw AFTER transfer — log owns b
         "  end Work; "
         "  public static method Main(): int "
@@ -151,7 +151,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, collection_add_normal_path_not_doubl
         "  public static method Work() "
         "    using var log := new OwningArray<Resource>(); "
         "    var b := new Resource(); "
-        "    log.Add(owned b); "
+        "    log.Add(move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    Work(); "
@@ -178,7 +178,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, constructor_owned_transfer_after_thr
         "  public static method Work() "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    using var box := new Box(owned b); "  // ctor transfer: b moved into box
+        "    using var box := new Box(move b); "  // ctor transfer: b moved into box
         "    _ := box; "
         "  end Work; "
         "  public static method Main(): int "
@@ -214,7 +214,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, constructor_throws_after_field_store
         "class Program "
         "  public static method Work() "
         "    var b := new Resource(); "
-        "    using var box := new Box(owned b); "  // ctor takes ownership then throws
+        "    using var box := new Box(move b); "  // ctor takes ownership then throws
         "    _ := box; "
         "  end Work; "
         "  public static method Main(): int "
@@ -365,7 +365,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, user_method_transfer_still_correct_c
         "  public static method Work() "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    Sink(owned b); "
+        "    Sink(move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "
@@ -405,7 +405,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, builtin_shared_ctor_transfer_then_th
         "  end Boom; "
         "  public static method Work() "
         "    var x := new Resource(); "
-        "    using var sh := new Shared<Resource>(owned x); "  // manual-lowered builtin ctor
+        "    using var sh := new Shared<Resource>(move x); "  // manual-lowered builtin ctor
         "    Boom(); "                          // throw AFTER transfer — Shared owns x
         "  end Work; "
         "  public static method Main(): int "
@@ -458,7 +458,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, primary_ctor_class_transfer_then_thr
         "  end Boom; "
         "  public static method Work() "
         "    var b := new Resource(); "
-        "    using var box := new Box(owned b); "      // manual positional-field store (no null)
+        "    using var box := new Box(move b); "      // manual positional-field store (no null)
         "    Boom(); "                          // throw AFTER transfer — Box owns b
         "  end Work; "
         "  public static method Main(): int "
@@ -486,7 +486,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, owning_stack_push_before_throw_28_3)
         "    using var st := new OwningStack<Resource>(); "
         "    var b := new Resource(); "
         "    Boom(); "                          // throw BEFORE transfer — b live
-        "    st.Push(owned b); "
+        "    st.Push(move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    var c := 0; "
@@ -508,7 +508,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, owning_stack_push_transfer_then_thro
         "  public static method Work() "
         "    using var st := new OwningStack<Resource>(); "
         "    var b := new Resource(); "
-        "    st.Push(owned b); "                // b moved in; slot nulled
+        "    st.Push(move b); "                // b moved in; slot nulled
         "    Boom(); "                          // throw AFTER transfer
         "  end Work; "
         "  public static method Main(): int "
@@ -531,7 +531,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, owning_queue_enqueue_transfer_then_t
         "  public static method Work() "
         "    using var q := new OwningQueue<Resource>(); "
         "    var b := new Resource(); "
-        "    q.Enqueue(owned b); "
+        "    q.Enqueue(move b); "
         "    Boom(); "
         "  end Work; "
         "  public static method Main(): int "
@@ -557,7 +557,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, owning_array_insert_before_throw_28_
         "    log.Add(new Resource()); "
         "    var b := new Resource(); "
         "    Boom(); "                          // throw BEFORE transfer — b live
-        "    log.Insert(0, owned b); "
+        "    log.Insert(0, move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    var c := 0; "
@@ -580,7 +580,7 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, owning_array_insert_transfer_then_th
         "    using var log := new OwningArray<Resource>(); "
         "    log.Add(new Resource()); "
         "    var b := new Resource(); "
-        "    log.Insert(0, owned b); "
+        "    log.Insert(0, move b); "
         "    Boom(); "                          // throw AFTER transfer
         "  end Work; "
         "  public static method Main(): int "
@@ -603,10 +603,10 @@ BEZEL_TEST(unwind_owned_transfer_1955_1956, owning_collection_transfer_normal_pa
         "  public static method Work() "
         "    using var st := new OwningStack<Resource>(); "
         "    var a := new Resource(); "
-        "    st.Push(owned a); "
+        "    st.Push(move a); "
         "    using var q := new OwningQueue<Resource>(); "
         "    var b := new Resource(); "
-        "    q.Enqueue(owned b); "
+        "    q.Enqueue(move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    Work(); "

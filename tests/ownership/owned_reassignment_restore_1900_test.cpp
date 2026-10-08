@@ -3,7 +3,7 @@
 // idiom) was spuriously rejected. The owned value in `x` reached scope end
 // alive (the fresh value placed by the reassign), but the ownership pass
 // denied auto-drop because `everDischarged_` was set from a prior
-// `s.Take(owned x)` / explicit `x.Dispose()`, falling through to the hard
+// `s.Take(move x)` / explicit `x.Dispose()`, falling through to the hard
 // discharge error.
 //
 // §28.3 "Move semantics for owned locals" + "Owned-local discharge requirement
@@ -92,7 +92,7 @@ bool hasAutoDropWarningFor(const OwnershipResult& r, const std::string& name) {
 // ACCEPTED — the consume-and-restore idiom: move-out then fresh-reassign.
 // ============================================================================
 
-// §28.3 (#1900): the exact issue repro — `s.Take(owned x); x := new Res();`
+// §28.3 (#1900): the exact issue repro — `s.Take(move x); x := new Res();`
 // is the consume-and-restore idiom and must be ACCEPTED. The fresh `x` is a
 // plain owned class local that auto-drops with the §28.3 must-use WARNING
 // (NOT the hard "would be dropped without disposal" error). Returns 1 from
@@ -103,7 +103,7 @@ BEZEL_TEST(owned_reassignment_restore_1900,
     auto r = parseAndCheckOwnership(wrap(
         "var s: Sink := new Sink(); "
         "var x: Res := new Res(); "
-        "s.Take(owned x); "
+        "s.Take(move x); "
         "x := new Res(); "
         "return x.Ping();"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -136,7 +136,7 @@ BEZEL_TEST(owned_reassignment_restore_1900,
         "var s: Sink := new Sink(); "
         "var x: Res := new Res(); "
         "for var i in 0..2 do "
-        "  s.Take(owned x); "
+        "  s.Take(move x); "
         "  x := new Res(); "
         "end; "
         "_ := x; "
@@ -209,7 +209,7 @@ BEZEL_TEST(owned_reassignment_restore_1900,
     JitResult jr = runAot(wrap(
         "var s: Sink := new Sink(); "
         "var x: Res := new Res(); "
-        "s.Take(owned x); "
+        "s.Take(move x); "
         "x := new Res(); "
         "return x.Ping();"));
     BEZEL_EXPECT_EQ(jr.exitCode, 1);

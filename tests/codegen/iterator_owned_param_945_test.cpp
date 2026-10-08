@@ -263,7 +263,7 @@ BEZEL_TEST(iterator_owned_param_945, owned_param_consumed_in_yield_operand) {
         "    using var u := x; return 1; "
         "  end Consume; "
         "  public static method UseCell(owned c: Cell): IEnumerable<int> "
-        "    yield return Consume(owned c); "  // §22.3 v0.169: named owned binding
+        "    yield return Consume(move c); "  // §22.3 v0.169: named owned binding
         "  end UseCell; "
         "  public static method Main(): int "
         "    for var v in UseCell(new Cell()) do end; "

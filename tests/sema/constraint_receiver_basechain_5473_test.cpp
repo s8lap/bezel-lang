@@ -392,7 +392,7 @@ BEZEL_TEST(constraint_receiver_basechain_5473,
         "end CD; "
         "public static class H "
         "  public static method F<T>(a: T, u: Unrelated): bool "
-        "    where T: IDer<Other> => a.Move(owned u); "
+        "    where T: IDer<Other> => a.Move(move u); "
         "end H; ",
         "using var c := new CD(); "
         "using var u := new Unrelated(); "

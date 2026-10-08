@@ -75,7 +75,7 @@ BEZEL_TEST(unwind_branch_owned_arg_transfer_1918, sync_owned_arg_discharged_one_
         "  public static method Work(flag: bool) "
         "    var r := new Resource(); "             // plain owned local
         "    if flag then "
-        "      Sink(owned r); "                     // discharged on THIS branch
+        "      Sink(move r); "                     // discharged on THIS branch
         "    else "
         "      throw new InvalidOperationException(\"boom\"); "  // r LIVE here (§28.3)
         "    end; "
@@ -111,7 +111,7 @@ BEZEL_TEST(unwind_branch_owned_arg_transfer_1918, async_owned_arg_discharged_one
         "    var r := new Resource(); "
         "    await Task.Delay(0); "                 // suspend: r is frame-spilled
         "    if flag then "
-        "      Sink(owned r); "
+        "      Sink(move r); "
         "    else "
         "      throw new InvalidOperationException(\"boom\"); "
         "    end; "
@@ -155,7 +155,7 @@ BEZEL_TEST(unwind_branch_owned_arg_transfer_1918, transfer_window_consumer_throw
         "  public static method Work(flag: bool) "
         "    var r := new Resource(); "
         "    if flag then "
-        "      ConsumeThenThrow(owned r); "         // transfer-window: callee throws
+        "      ConsumeThenThrow(move r); "         // transfer-window: callee throws
         "    else "
         "      throw new InvalidOperationException(\"boom\"); "  // sibling: r live
         "    end; "
@@ -194,12 +194,12 @@ BEZEL_TEST(unwind_branch_owned_arg_transfer_1918, owned_param_repassed_live_thro
         "    _ := r; "
         "  end Sink; "
         "  public static method Relay(owned r: Resource) "
-        "    Sink(owned r); "                        // owned param re-passed onward
+        "    Sink(move r); "                        // owned param re-passed onward
         "  end Relay; "
         "  public static method RelayCond(flag: bool) "
         "    var r := new Resource(); "
         "    if flag then "
-        "      Relay(owned r); "
+        "      Relay(move r); "
         "    else "
         "      throw new InvalidOperationException(\"boom\"); "
         "    end; "
@@ -239,7 +239,7 @@ BEZEL_TEST(unwind_branch_owned_arg_transfer_1918, later_arg_throws_owned_arg_orp
         "  end MayThrow; "
         "  public static method OrphanArg() "
         "    var r := new Resource(); "
-        "    Sink2(owned r, MayThrow()); "           // MayThrow throws before the call
+        "    Sink2(move r, MayThrow()); "           // MayThrow throws before the call
         "  end OrphanArg; "
         "  public static method Main(): int "
         "    try "
@@ -272,7 +272,7 @@ BEZEL_TEST(unwind_branch_owned_arg_transfer_1918, normal_path_owned_arg_transfer
         "  public static method Work(flag: bool) "
         "    var r := new Resource(); "
         "    if flag then "
-        "      Sink(owned r); "
+        "      Sink(move r); "
         "    else "
         "      throw new InvalidOperationException(\"boom\"); "
         "    end; "

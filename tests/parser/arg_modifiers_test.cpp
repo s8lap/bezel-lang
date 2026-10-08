@@ -3,7 +3,9 @@
 //   ArgList       ::= Argument ("," Argument)*
 //   Argument      ::= ArgModifiers? (Identifier ":=")? ArgExpression
 //   ArgModifiers  ::= "ref" | "out" "var"? | "out" "using" "var"
-//                   | "out" "owned" "var" | "owned"
+//                   | "out" "owned" "var"
+//                   // Note: bare "owned" was removed per §A.4 /
+//                   // proposal 0090 (v0.246); use `move x` to transfer.
 //   ArgExpression ::= Expression | "_"
 //
 // v0.160 (§22.4/§22.5): the former bare `out owned x` form now requires "var"
@@ -73,10 +75,11 @@ BEZEL_TEST(parser_arg, out_owned_var_modifier) {
         std::string("f(out owned var r)"));
 }
 
+// per §A.4 / proposal 0090 (v0.246): bare `owned` is not an ArgModifiers
+// alternative; `M(owned x)` is a parse error. Use `move x` (§22.3, §28.8.1).
 BEZEL_TEST(parser_arg, owned_modifier) {
-    BEZEL_EXPECT_EQ(
-        render("Take(owned resource)"),
-        std::string("Take(owned resource)"));
+    BEZEL_EXPECT_EQ(render("Take(owned resource)"),
+                    std::string("<errors>"));
 }
 
 BEZEL_TEST(parser_arg, named_arg) {
@@ -98,19 +101,20 @@ BEZEL_TEST(parser_arg, discard_underscore) {
         std::string("f(out _, out var keep)"));
 }
 
+// per §A.4 / proposal 0090 (v0.246): bare `owned` is not an ArgModifiers
+// alternative; the `owned r` argument is a parse error. Use `move r`.
 BEZEL_TEST(parser_arg, mixed_args) {
     BEZEL_EXPECT_EQ(
         render(
             "f(1, ref x, owned r, name := \"x\", out _, out using var d)"),
-        std::string(
-            "f(1, ref x, owned r, name := \"x\", "
-            "out _, out using var d)"));
+        std::string("<errors>"));
 }
 
+// per §A.4 / proposal 0090 (v0.246): bare `owned` is not an ArgModifiers
+// alternative; `new Foo(ref x, owned r)` is a parse error. Use `move r`.
 BEZEL_TEST(parser_arg, new_with_modifiers) {
-    BEZEL_EXPECT_EQ(
-        render("new Foo(ref x, owned r)"),
-        std::string("new Foo(ref x, owned r)"));
+    BEZEL_EXPECT_EQ(render("new Foo(ref x, owned r)"),
+                    std::string("<errors>"));
 }
 
 BEZEL_TEST(parser_arg, null_cond_call_with_named) {

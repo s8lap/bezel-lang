@@ -140,7 +140,7 @@ BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_owned_param_bareid_bor
         "    using var x := p; var n := x.Ping(); return 0; "  // borrow-pin; p disposes
         "  end Take; "
         "  public static method Main(): int "
-        "    var w := new R(); var r := P.Take(owned w); "
+        "    var w := new R(); var r := P.Take(move w); "
         "    return R.live; "                     // 0 — disposed once by the frame
         "  end Main; "
         "end P;");

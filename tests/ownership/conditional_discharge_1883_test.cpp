@@ -121,7 +121,7 @@ BEZEL_TEST(conditional_discharge_1883,
         "var s: Sink := new Sink(); "
         "var x: A := new A(); "
         "if C.Cond() then "
-        "  s.Take(owned x); "
+        "  s.Take(move x); "
         "end; "
         "return 0;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -165,7 +165,7 @@ BEZEL_TEST(conditional_discharge_1883,
         "var s: Sink := new Sink(); "
         "var x: A := new A(); "
         "if C.Cond() then "
-        "  s.Take(owned x); "
+        "  s.Take(move x); "
         "end; "
         "return 0;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());

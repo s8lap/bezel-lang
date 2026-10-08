@@ -260,14 +260,15 @@ BEZEL_TEST(named_arg_owned_sink_1973, closure_borrow_reorder_to_borrow_param_acc
 // --- Positive controls: ordinary spellings still classified correctly -------
 
 // CONTROL: the legitimate way to consume `r` into the owned parameter is
-// POSITIONAL with the marker (`Sink3(7, owned r)`) — the marker is positional-
+// POSITIONAL with the marker (`Sink3(7, move r)`) — the marker is positional-
 // only. `r` is consumed exactly once and the call compiles clean. Guards that
 // the fix does not block a sound positional owned transfer.
+// per §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
 BEZEL_TEST(named_arg_owned_sink_1973, positional_owned_transfer_with_marker_accepted_22_3) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  var r := new R(); "
-        "  return C.Sink3(7, owned r); "
+        "  return C.Sink3(7, move r); "
         "end Main;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

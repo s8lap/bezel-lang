@@ -99,7 +99,7 @@ const char* kSharedLocalCaughtMethodCall =
     "    var caught := 0; "
     "    var s := new Shared<X>(new X()); "            // one strong handle, refcount=1
     "    try "
-    "      P.Sink(owned s, P.Boom()); "                // transfer s; Boom() throws
+    "      P.Sink(move s, P.Boom()); "                // transfer s; Boom() throws
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    if X._n <> 1 then return 3; end; "            // shared released once on caught edge
@@ -131,7 +131,7 @@ const char* kSharedLocalCaughtCtor =
     "    var caught := 0; "
     "    var s := new Shared<X>(new X()); "
     "    try "
-    "      using var w := new Wrap(owned s, P.Boom()); "
+    "      using var w := new Wrap(move s, P.Boom()); "
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    if X._n <> 1 then return 3; end; "            // shared released once on caught edge
@@ -161,7 +161,7 @@ const char* kTwoSharedLocalCaught =
     "    var s := new Shared<X>(new X()); "
     "    var t := new Shared<X>(new X()); "
     "    try "
-    "      P.Sink(owned s, owned t, P.Boom()); "       // both transferred; Boom() throws
+    "      P.Sink(move s, move t, P.Boom()); "       // both transferred; Boom() throws
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    if X._n <> 2 then return 3; end; "            // BOTH released once
@@ -197,7 +197,7 @@ const char* kTwoSharedLocalSuccessful =
     "    var s := new Shared<X>(new X()); "
     "    var t := new Shared<X>(new X()); "
     "    do "
-    "      P.Sink(owned s, owned t); "                 // both transferred, no throw
+    "      P.Sink(move s, move t); "                 // both transferred, no throw
     "    end; "                                        // s + t released in Sink
     "    if X._n <> 2 then return 5; end; "
     "    return 0; "

@@ -81,7 +81,7 @@ BEZEL_TEST(consume_site_freeze, move_while_borrowed_spec_28_3) {
     auto r = parseAndCheckOwnership(mod(
         "    var a := new Res(1); "
         "    var b := a; "
-        "    Take(owned a); "
+        "    Take(move a); "
         "    var x := b.N(); "
         "    _ := x; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -95,7 +95,7 @@ BEZEL_TEST(consume_site_freeze, move_while_borrowed_interpolated_use_spec_28_3) 
     auto r = parseAndCheckOwnership(mod(
         "    var a := new Res(1); "
         "    var b := a; "
-        "    Take(owned a); "
+        "    Take(move a); "
         "    Console.WriteLine($\"b={b.N()}\"); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(errorSays(r, "cannot consume `a` here"));
@@ -124,7 +124,7 @@ BEZEL_TEST(consume_site_freeze, cross_domain_spawn_live_alias_spec_30_14) {
         "  public static async method Main(): Task<int> "
         "    var c := new Counter(); "
         "    var alias := c; "
-        "    using var worker := Domain.Spawn(Work.Bump, owned c); "
+        "    using var worker := Domain.Spawn(Work.Bump, move c); "
         "    alias.N := alias.N + 1; "
         "    await worker; "
         "    return 0; "
@@ -174,7 +174,7 @@ BEZEL_TEST(consume_site_freeze, transfer_after_dead_borrow_accepted_spec_28_3) {
         "    var b := a; "
         "    var seen := b.N(); "
         "    _ := seen; "
-        "    Take(owned a); "));
+        "    Take(move a); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -188,7 +188,7 @@ BEZEL_TEST(consume_site_freeze, closure_held_borrow_live_spec_28_3) {
     auto r = parseAndCheckOwnership(mod(
         "    var s := new Res(5); "
         "    var f := lambda() => s.N(); "
-        "    Take(owned s); "
+        "    Take(move s); "
         "    var y := f(); "
         "    _ := y; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -230,7 +230,7 @@ BEZEL_TEST(consume_site_freeze,
         "    var seen := b.N(); "
         "    _ := seen; "
         "    a := new Res(2); "
-        "    Take(owned a); "));
+        "    Take(move a); "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -245,7 +245,7 @@ BEZEL_TEST(consume_site_freeze,
         "    var seen := b.N(); "
         "    _ := seen; "
         "    a := new Res(2); "
-        "    Take(owned a); "));
+        "    Take(move a); "));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

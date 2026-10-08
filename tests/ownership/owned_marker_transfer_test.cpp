@@ -187,7 +187,7 @@ BEZEL_TEST(owned_marker, marker_on_owned_call_rejected) {
 BEZEL_TEST(owned_marker, marker_on_borrow_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink, b: T) "
-        "  s.Add(owned b); "
+        "  s.Add(move b); "
         "end M; end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     // The sema "borrow" check is unreachable — parse rejects first.
@@ -199,7 +199,7 @@ BEZEL_TEST(owned_marker, marker_on_borrow_rejected) {
 BEZEL_TEST(owned_marker, marker_on_non_owned_position_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
-        "  var x := new T(); s.Peek(owned x); x.Dispose(); "
+        "  var x := new T(); s.Peek(move x); x.Dispose(); "
         "end M; end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     // The sema "does not take ownership" check is unreachable — parse rejects first.

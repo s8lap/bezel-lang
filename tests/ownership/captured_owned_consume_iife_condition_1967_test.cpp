@@ -90,7 +90,7 @@ BEZEL_TEST(own_captured_owned_1967, iife_in_if_condition_transfer_rejected_28_3)
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  using var r := new R(); "
-        "  if (lambda() => do return Sink(owned r); end)() = 0 then return 0; else return 1; end; "
+        "  if (lambda() => do return Sink(move r); end)() = 0 then return 0; else return 1; end; "
         "  return 0; "
         "end Main;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -104,7 +104,7 @@ BEZEL_TEST(own_captured_owned_1967, iife_in_while_condition_transfer_rejected_28
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  using var r := new R(); "
-        "  while (lambda() => do return Sink(owned r); end)() = 0 do return 0; end; "
+        "  while (lambda() => do return Sink(move r); end)() = 0 do return 0; end; "
         "  return 0; "
         "end Main;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -159,7 +159,7 @@ BEZEL_TEST(own_captured_owned_1967, iife_in_if_condition_discard_rejected_28_3) 
 BEZEL_TEST(own_captured_owned_1967, iife_in_if_condition_capture_owned_param_rejected_28_3) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Run(owned p: R): int "
-        "  if (lambda() => do return Sink(owned p); end)() = 0 then return 0; else return 1; end; "
+        "  if (lambda() => do return Sink(move p); end)() = 0 then return 0; else return 1; end; "
         "  return 0; "
         "end Run;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -218,7 +218,7 @@ BEZEL_TEST(own_captured_owned_1967, iife_in_if_condition_consumes_own_local_clea
         "public static method Main(): int "
         "  if (lambda() => do "
         "    using var q := new R(); "
-        "    return Sink(owned q); "
+        "    return Sink(move q); "
         "  end)() = 0 then return 0; else return 1; end; "
         "  return 0; "
         "end Main;"));

@@ -198,9 +198,9 @@ BEZEL_TEST(bounded_channel_809, close_while_waiting_faults_and_disposes_item_onc
         "    var ch := new Channel<Item>(1); "
         "    var tx := ch.NewSender(); "
         "    var it0 := new Item(0); "
-        "    tx.Send(owned it0); "                 // buffer=[it0] full (owned move)
+        "    tx.Send(move it0); "                 // buffer=[it0] full (owned move)
         "    var it1 := new Item(1); "
-        "    var s := tx.SendAsync(owned it1); "   // parks it1 (full; owned move)
+        "    var s := tx.SendAsync(move it1); "   // parks it1 (full; owned move)
         "    var faulted := 0; "
         "    tx.Dispose(); "                       // last sender → close+drain: dispose it1, fault s
         "    try "
@@ -317,9 +317,9 @@ BEZEL_TEST(bounded_channel_809, asan_close_while_waiting_disposal_no_leak) {
         "    var ch := new Channel<Item>(1); "
         "    var tx := ch.NewSender(); "
         "    var it0 := new Item(0); "
-        "    tx.Send(owned it0); "
+        "    tx.Send(move it0); "
         "    var it1 := new Item(1); "
-        "    var s := tx.SendAsync(owned it1); "     // parks it1
+        "    var s := tx.SendAsync(move it1); "     // parks it1
         "    tx.Dispose(); "                          // close+drain: dispose it1, fault s
         "    try await s; catch ChannelClosedException => do end end; "
         "    ch.Dispose(); "                          // dispose buffered it0

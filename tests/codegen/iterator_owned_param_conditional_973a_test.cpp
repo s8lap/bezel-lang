@@ -345,7 +345,7 @@ BEZEL_TEST(iterator_owned_param_conditional_973a,
         "    using var k := owned c; return 1; "
         "  end Sink; "
         "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
-        "    if cond then var r := Sink(owned c); end; "
+        "    if cond then var r := Sink(move c); end; "
         "    yield return 1; "
         "  end Use; "
         "  public static method Main(): int "

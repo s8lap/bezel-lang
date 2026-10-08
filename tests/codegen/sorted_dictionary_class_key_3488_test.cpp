@@ -321,7 +321,7 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, class_key_survives_rehash_and_tombs
         "  var i := 0; "
         "  while i < 40 do "
         "    var k := new Ord(39 - i); "
-        "    big.Add(owned k); "
+        "    big.Add(move k); "
         "    sd.Add(big[i], i); "
         "    i := i + 1; "
         "  end; "

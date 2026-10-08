@@ -433,7 +433,7 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
     const std::string body =
         "  static method Work(): int "
         "    var r := new Res(); "
-        "    var h := new Holder(owned r, 20); "
+        "    var h := new Holder(move r, 20); "
         "    var q := h.Val(); "
         "    _ := h; "
         "    return q; "
@@ -452,7 +452,7 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
     const std::string body =
         "  static method Work(): int "
         "    var r := new Res(); "
-        "    var h := new Holder(owned r, 20); "
+        "    var h := new Holder(move r, 20); "
         "    var q := h.Val(); "
         "    _ := h; "
         "    return q; "
@@ -474,7 +474,7 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
     const std::string body =
         "  static method Work(): int "
         "    var r := new Res(); "
-        "    var h := new Holder(owned r, 20); "
+        "    var h := new Holder(move r, 20); "
         "    var q := h.Val(); "
         "    _ := h; "
         "    return q; "
@@ -547,7 +547,7 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
            t6_borrow_into_owned_primary_parameter_is_rejected_28_8) {
     const std::string body =
         "  static method Take(b: Res): int "
-        "    var h := new Holder(owned b, 20); "
+        "    var h := new Holder(move b, 20); "
         "    var q := h.Val(); "
         "    _ := h; "
         "    return q; "

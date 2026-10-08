@@ -78,7 +78,7 @@ BEZEL_TEST(consume_site_freeze_span_reassign,
         "    var other := new OwningBuffer<double>(8); "
         "    var s := buf.AsSpan(); "
         "    s := other.AsSpan(); "               // s now views other, not buf
-        "    var frozen := Freeze.From(owned buf); "  // buf no longer borrowed
+        "    var frozen := Freeze.From(move buf); "  // buf no longer borrowed
         "    var n := s.Length; "                 // s used later — views other
         "    _ := n; "
         "    frozen.Dispose(); "
@@ -101,7 +101,7 @@ BEZEL_TEST(consume_site_freeze_span_reassign,
         "    var other := new OwningBuffer<double>(8); "
         "    var s := buf.AsSpan(); "
         "    s := other.AsSpan(); "
-        "    var frozen := Freeze.From(owned other); "  // consume the NEW source
+        "    var frozen := Freeze.From(move other); "  // consume the NEW source
         "    var n := s.Length; "                       // s views other, used here
         "    _ := n; "
         "    frozen.Dispose(); "
@@ -124,7 +124,7 @@ BEZEL_TEST(consume_site_freeze_span_reassign,
         "    var buf := new OwningBuffer<double>(4); "
         "    var other := new OwningBuffer<double>(8); "
         "    var s := buf.AsSpan(); "
-        "    var frozen := Freeze.From(owned buf); "  // consume buf while s live
+        "    var frozen := Freeze.From(move buf); "  // consume buf while s live
         "    var n := s.Length; "                     // s STILL views buf here
         "    _ := n; "
         "    s := other.AsSpan(); "                   // rebind is AFTER the use
@@ -150,7 +150,7 @@ BEZEL_TEST(consume_site_freeze_span_reassign,
         "    var buf := new OwningBuffer<double>(8); "
         "    var s := buf.AsSpan(); "
         "    s := s.Slice(0..<4); "                // still a view of buf
-        "    Freeze.Move(owned buf); "             // consume buf while s live
+        "    Freeze.Move(move buf); "             // consume buf while s live
         "    var n := s.Length; "
         "    _ := n; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -174,7 +174,7 @@ BEZEL_TEST(consume_site_freeze_span_reassign,
         "    if s.Length > 0 then "
         "      s := other.AsSpan(); "              // conditional — may not run
         "    end; "
-        "    var frozen := Freeze.From(owned buf); "
+        "    var frozen := Freeze.From(move buf); "
         "    var n := s.Length; "                  // else-path: s still views buf
         "    _ := n; "
         "    frozen.Dispose(); "
@@ -196,7 +196,7 @@ BEZEL_TEST(consume_site_freeze_span_reassign,
         "    var buf := new OwningBuffer<double>(4); "
         "    var s: ReadOnlySpan<double>? := buf.AsSpan(); "
         "    s := null; "                          // s carries no borrow now
-        "    var frozen := Freeze.From(owned buf); "  // buf no longer borrowed
+        "    var frozen := Freeze.From(move buf); "  // buf no longer borrowed
         "    var n := s?.Length ?? 0; "            // read of the (null) s
         "    _ := n; "
         "    frozen.Dispose(); "));

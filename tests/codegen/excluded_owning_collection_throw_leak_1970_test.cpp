@@ -62,7 +62,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owningset_add_before_thro
         "    using var s := new OwningSet<Resource>(); "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live (§28.4)
-        "    s.Add(owned b); "                  // OwningSet.Add dedup-inserts (stdlib §4.10)
+        "    s.Add(move b); "                  // OwningSet.Add dedup-inserts (stdlib §4.10)
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "
@@ -92,7 +92,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owningset_add_transfer_th
         "  public static method Work() "
         "    using var s := new OwningSet<Resource>(); "
         "    var b := new Resource(); "
-        "    s.Add(owned b); "                  // b moved into s; slot nulled
+        "    s.Add(move b); "                  // b moved into s; slot nulled
         "    Boom(); "                          // throw AFTER transfer
         "  end Work; "
         "  public static method Main(): int "
@@ -123,7 +123,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owninglinkedlist_addlast_
         "    using var ll := new OwningLinkedList<Resource>(); "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    ll.AddLast(owned b); "             // OwningLinkedList.AddLast (linked-list runtime)
+        "    ll.AddLast(move b); "             // OwningLinkedList.AddLast (linked-list runtime)
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "
@@ -152,7 +152,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owninglinkedlist_addlast_
         "  public static method Work() "
         "    using var ll := new OwningLinkedList<Resource>(); "
         "    var b := new Resource(); "
-        "    ll.AddLast(owned b); "
+        "    ll.AddLast(move b); "
         "    Boom(); "                          // throw AFTER transfer
         "  end Work; "
         "  public static method Main(): int "
@@ -181,7 +181,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owninglinkedlist_addfirst
         "    using var ll := new OwningLinkedList<Resource>(); "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    ll.AddFirst(owned b); "
+        "    ll.AddFirst(move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "
@@ -207,7 +207,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owninglinkedlist_addfirst
         "  public static method Work() "
         "    using var ll := new OwningLinkedList<Resource>(); "
         "    var b := new Resource(); "
-        "    ll.AddFirst(owned b); "
+        "    ll.AddFirst(move b); "
         "    Boom(); "
         "  end Work; "
         "  public static method Main(): int "
@@ -240,7 +240,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owninglinkedlist_addbefor
         "    var node := ll.LastNode; "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    ll.AddBefore(node, owned b); "
+        "    ll.AddBefore(node, move b); "
         "    _ := node; "
         "  end Work; "
         "  public static method Main(): int "
@@ -272,7 +272,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owninglinkedlist_addafter
         "    var node := ll.FirstNode; "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    ll.AddAfter(node, owned b); "
+        "    ll.AddAfter(node, move b); "
         "    _ := node; "
         "  end Work; "
         "  public static method Main(): int "
@@ -302,7 +302,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owningdictionary_add_befo
         "    using var d := new OwningDictionary<string, Resource>(); "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    d.Add(\"k\", owned b); "           // OwningDictionary takes ownership
+        "    d.Add(\"k\", move b); "           // OwningDictionary takes ownership
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "
@@ -361,7 +361,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, owningdictionary_add_tran
         "  public static method Work() "
         "    using var d := new OwningDictionary<string, Resource>(); "
         "    var b := new Resource(); "
-        "    d.Add(\"k\", owned b); "
+        "    d.Add(\"k\", move b); "
         "    Boom(); "                          // throw AFTER transfer
         "  end Work; "
         "  public static method Main(): int "
@@ -455,7 +455,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, builtin_shared_ctor_befor
         "  public static method Work() "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer — b live
-        "    using var sh := new Shared<Resource>(owned b); "
+        "    using var sh := new Shared<Resource>(move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "
@@ -487,7 +487,7 @@ BEZEL_TEST(excluded_owning_collection_throw_leak_1970, regression_control_1955_o
         "    using var log := new OwningArray<Resource>(); "
         "    var b := new Resource(); "
         "    Boom(); "                          // throws BEFORE transfer
-        "    log.Add(owned b); "
+        "    log.Add(move b); "
         "  end Work; "
         "  public static method Main(): int "
         "    var caught := 0; "

@@ -70,7 +70,7 @@ BEZEL_TEST(task_wheneach_2109, owned_named_local_iterable_accepted) {
         "  public static async method Main(): Task<int> "
         "    var tasks := C.Make(); "      // owned local binds the producer
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned tasks) do "  // documented form
+        "    await for var tk in Task.WhenEachOwned(move tasks) do "  // documented form
         "      using var x := await tk; "
         "      count := count + 1; "
         "    end; "
@@ -99,7 +99,7 @@ BEZEL_TEST(task_wheneach_2109, owned_named_local_iterable_break_dispose_once) {
         "  public static async method Main(): Task<int> "
         "    var tasks := C.Make(); "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned tasks) do "
+        "    await for var tk in Task.WhenEachOwned(move tasks) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "      break; "  // dispose with two Cells left in the array

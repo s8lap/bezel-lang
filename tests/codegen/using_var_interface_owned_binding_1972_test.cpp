@@ -77,7 +77,7 @@ BEZEL_TEST(using_var_interface_owned_1972, unmarked_param_adopts_interface_28_6)
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := Program.Take(owned w); "   // §22.3 call-site transfer
+        "    var r := Program.Take(move w); "   // §22.3 call-site transfer
         "    return Cell.live; "                 // 0 — disposed exactly once
         "  end Main; "
         "end Program;");
@@ -134,7 +134,7 @@ BEZEL_TEST(using_var_interface_owned_1972, annotated_param_control_28_6) {
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := Program.Take(owned w); "
+        "    var r := Program.Take(move w); "
         "    return Cell.live; "
         "  end Main; "
         "end Program;");
@@ -159,7 +159,7 @@ BEZEL_TEST(using_var_interface_owned_1972, marked_param_control_28_6_1962) {
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := Program.Take(owned w); "
+        "    var r := Program.Take(move w); "
         "    return Cell.live; "
         "  end Main; "
         "end Program;");
@@ -186,7 +186,7 @@ BEZEL_TEST(using_var_interface_owned_1972, exactly_once_no_double_dispose_28_6) 
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := Program.Take(owned w); "
+        "    var r := Program.Take(move w); "
         "    return r + Cell.live; "       // 1 (Ping return) + 0 = 1
         "  end Main; "
         "end Program;");

@@ -526,7 +526,7 @@ BEZEL_TEST(task_wheneach_2082, owned_named_local_marker_transfers) {
         "  public static async method Main(): Task<int> "
         "    var tasks := C.Make(); "      // named owned local
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned tasks) do "
+        "    await for var tk in Task.WhenEachOwned(move tasks) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "    end; "

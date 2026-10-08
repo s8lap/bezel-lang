@@ -193,7 +193,7 @@ BEZEL_TEST(owned_assign_marker, poly_null_adopt_disposes_once_value_28_3) {
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := C.Take(owned w); "       // §22.3 call-site transfer
+        "    var r := C.Take(move w); "       // §22.3 call-site transfer
         "    return Cell.live; "               // 0 — disposed exactly once
         "  end Main; "
         "end C;";
@@ -223,7 +223,7 @@ BEZEL_TEST(owned_assign_marker, owned_lhs_drop_on_overwrite_disposes_once_28_7) 
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "            // Cell #2
-        "    var r := C.Take(owned w); "
+        "    var r := C.Take(move w); "
         "    return Cell.live; "               // 0 — both disposed exactly once
         "  end Main; "
         "end C;";
@@ -299,7 +299,7 @@ BEZEL_TEST(owned_assign_marker, marked_transfer_disposes_on_unwind_edge_28_3) {
         "  public static method Main(): int "
         "    var w := new Cell(); "
         "    try "
-        "      var r := C.Inner(owned w); "
+        "      var r := C.Inner(move w); "
         "    catch AppError => _ := 1; "
         "    end; "
         "    return Cell.live; "               // 0 — disposed exactly once on unwind
@@ -334,7 +334,7 @@ BEZEL_TEST(owned_assign_marker, poly_null_adopt_interface_disposes_once_28_3) {
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := C.Take(owned w); "
+        "    var r := C.Take(move w); "
         "    return Cell.live; "               // 0 — disposed exactly once
         "  end Main; "
         "end C;";

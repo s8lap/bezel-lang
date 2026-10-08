@@ -85,7 +85,7 @@ BEZEL_TEST(own_captured_owned_1958, marked_transfer_in_closure_rejected_28_3) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  using var r := new R(); "
-        "  var f := lambda() => do return Sink(owned r); end; "
+        "  var f := lambda() => do return Sink(move r); end; "
         "  return f(); "
         "end Main;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -188,7 +188,7 @@ BEZEL_TEST(own_captured_owned_1958, transfer_in_nested_closure_rejected_28_3) {
         "public static method Main(): int "
         "  using var r := new R(); "
         "  var f := lambda() => do "
-        "    var g := lambda() => do return Sink(owned r); end; "
+        "    var g := lambda() => do return Sink(move r); end; "
         "    return g(); "
         "  end; "
         "  return f(); "
@@ -219,7 +219,7 @@ BEZEL_TEST(own_captured_owned_1958, dispose_in_closure_control_flow_rejected_28_
 BEZEL_TEST(own_captured_owned_1958, capture_owned_param_transfer_rejected_28_3) {
     auto r = parseAndCheckOwnership(wrap(
         "public static method Run(owned p: R): int "
-        "  var f := lambda() => do return Sink(owned p); end; "
+        "  var f := lambda() => do return Sink(move p); end; "
         "  var n := f(); "
         "  return n; "
         "end Run;"));
@@ -279,7 +279,7 @@ BEZEL_TEST(own_captured_owned_1958, closure_consumes_own_local_owned_clean_28_9)
         "public static method Main(): int "
         "  var f := lambda() => do "
         "    using var q := new R(); "
-        "    return Sink(owned q); "
+        "    return Sink(move q); "
         "  end; "
         "  return f(); "
         "end Main;"));
@@ -295,7 +295,7 @@ BEZEL_TEST(own_captured_owned_1958, lambda_consumes_own_owned_param_clean_28_9) 
     auto r = parseAndCheckOwnership(wrap(
         "public static method Take(cb: (owned R) -> int): int return 0; end Take; "
         "public static method Main(): int "
-        "  return Take(lambda(owned x: R) => Sink(owned x)); "
+        "  return Take(lambda(owned x: R) => Sink(move x)); "
         "end Main;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -308,7 +308,7 @@ BEZEL_TEST(own_captured_owned_1958, direct_transfer_of_using_var_still_rejected_
     auto r = parseAndCheckOwnership(wrap(
         "public static method Main(): int "
         "  using var r := new R(); "
-        "  return Sink(owned r); "
+        "  return Sink(move r); "
         "end Main;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }

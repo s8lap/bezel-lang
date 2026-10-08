@@ -91,7 +91,7 @@ BEZEL_TEST(aggregate_receiver_source_1902,
         "arr.Add(1); arr.Add(2); "
         "var seed := new C(); "
         "var m := arr.Aggregate(seed, lambda(acc: C, x: int) => acc); "
-        "_ := Util.Sink(owned arr); "  // consume receiver while `m` live
+        "_ := Util.Sink(move arr); "  // consume receiver while `m` live
         "var p := m.Poke(); "              // `m` (result) still live
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -113,7 +113,7 @@ BEZEL_TEST(aggregate_receiver_source_1902,
         "arr.Add(1); arr.Add(2); "
         "var seed := new C(); "
         "var m := arr.Aggregate(seed, lambda(acc: C, x: int) => acc); "
-        "_ := Util.Sink(owned seed); "  // consume seed while `m` live
+        "_ := Util.Sink(move seed); "  // consume seed while `m` live
         "var p := m.Poke(); "                // `m` (result) still live
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -136,7 +136,7 @@ BEZEL_TEST(aggregate_receiver_source_1902,
         "var seed := new C(); "
         "var m := arr.Aggregate(seed, lambda(acc: C, x: int) => acc); "
         "var p := m.Poke(); "              // last use of `m`
-        "_ := Util.Sink(owned arr); "  // consume receiver — `m` dead
+        "_ := Util.Sink(move arr); "  // consume receiver — `m` dead
         "return p; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

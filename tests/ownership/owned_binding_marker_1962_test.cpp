@@ -175,7 +175,7 @@ BEZEL_TEST(owned_binding_marker, using_var_adopt_disposes_once_value_28_10) {
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := C.Take(owned w); "       // §22.3 call-site transfer
+        "    var r := C.Take(move w); "       // §22.3 call-site transfer
         "    return Cell.live; "               // 0 — disposed exactly once
         "  end Main; "
         "end C;";
@@ -213,7 +213,7 @@ BEZEL_TEST(owned_binding_marker, marked_transfer_disposes_on_unwind_edge_28_3) {
         "  public static method Main(): int "
         "    var w := new Cell(); "
         "    try "
-        "      using var got := C.Inner(owned w); "
+        "      using var got := C.Inner(move w); "
         "    catch AppError => _ := 1; "
         "    end; "
         "    return Cell.live; "               // 0 — disposed exactly once on unwind
@@ -242,7 +242,7 @@ BEZEL_TEST(owned_binding_marker, plain_var_marked_transfer_disposes_once_28_3) {
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := C.Take(owned w); "
+        "    var r := C.Take(move w); "
         "    return Cell.live; "               // 0 — disposed exactly once
         "  end Main; "
         "end C;";
@@ -282,7 +282,7 @@ BEZEL_TEST(owned_binding_marker, using_var_adopt_interface_disposes_once_28_10) 
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := C.Take(owned w); "
+        "    var r := C.Take(move w); "
         "    return Cell.live; "               // 0 — disposed exactly once
         "  end Main; "
         "end C;";
@@ -313,7 +313,7 @@ BEZEL_TEST(owned_binding_marker, plain_var_adopt_interface_disposes_once_28_3) {
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Cell(); "
-        "    var r := C.Take(owned w); "
+        "    var r := C.Take(move w); "
         "    return Cell.live; "               // 0 — disposed exactly once
         "  end Main; "
         "end C;";
@@ -346,7 +346,7 @@ BEZEL_TEST(owned_binding_marker, plain_var_adopt_interface_disposes_on_unwind_28
         "  public static method Main(): int "
         "    var w := new Cell(); "
         "    try "
-        "      var r := C.Inner(owned w); "
+        "      var r := C.Inner(move w); "
         "    catch AppError => _ := 1; "
         "    end; "
         "    return Cell.live; "               // 0 — disposed exactly once on unwind

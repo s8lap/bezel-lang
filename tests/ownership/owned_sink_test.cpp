@@ -72,15 +72,16 @@ BEZEL_TEST(owned_sink, add_move_owned_local_accepted) {
 }
 
 // §22.3 (v0.169, #1348): a NAMED OWNED BINDING (owned local) in an owned-
-// consuming position requires the call-site `owned` marker — `s.Add(owned x)`
+// consuming position requires the call-site `move` marker — `s.Add(move x)`
 // transfers ownership (x → moved-from) and the marker announces it. (The bare
 // `s.Add(x)` form is now rejected; see marker_transfer_test.cpp.)
+// per §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
 BEZEL_TEST(owned_sink, add_marked_owned_local_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
         "  public method M(s: Sink) "
         "    var x := new T(); "
-        "    s.Add(owned x); "
+        "    s.Add(move x); "
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -177,7 +178,7 @@ BEZEL_TEST(owned_sink, add_borrowed_param_rejected) {
 }
 
 // §28.8: the same with an explicit `owned` call-site modifier on a borrow
-// — still a borrow, still REJECTED.
+// — still a borrow, still REJECTED. Now at parse time (per §A.4 / proposal 0090).
 BEZEL_TEST(owned_sink, add_owned_modifier_on_borrowed_param_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C "
@@ -187,7 +188,7 @@ BEZEL_TEST(owned_sink, add_owned_modifier_on_borrowed_param_rejected) {
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "a borrow cannot be passed where an `owned` value is required"));
+        r, "invalid use of 'owned' at argument position"));
 }
 
 // §28.8 / §28.3: `move` of a borrowed parameter is not a legal owned
@@ -330,7 +331,7 @@ BEZEL_TEST(owned_sink, task_whenallowned_consumes_owned_array_1121) {
         "  public static async method LoadAll(): OwningTask<OwningArray<Res>> "
         "    var tasks := new OwningArray<OwningTask<Res>>(); "
         "    tasks.Add(Make(3)); "
-        "    using var wt := Task.WhenAllOwned<Res>(owned tasks); "  // §22.3 v0.169
+        "    using var wt := Task.WhenAllOwned<Res>(move tasks); "
         "    return await wt; "
         "  end LoadAll; "
         "  public static method Main(): int => 0; "

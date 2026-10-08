@@ -107,7 +107,7 @@ BEZEL_TEST(catch_owned_sink, pass_binding_to_owned_param_explicit_modifier_rejec
     auto r = parseAndCheckOwnership(wrap(
         "public method Handle() "
         "  try DoWork(); "
-        "  catch var ex: Exception => this.Set(owned ex); "
+        "  catch var ex: Exception => this.Set(move ex); "
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());

@@ -1,30 +1,16 @@
 // RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
 //
-// §22.3 (v0.169) call-site marker, FRESH-PRODUCER half, in the for-loop
-// ITERABLE position (issue #2278; the walk that reaches this position is
-// #2109's `forOrigins`).
+// REJECTION test. The `owned` marker on a call argument is a parse error
+// per §A.4 / proposal 0090 (v0.246). The program uses `owned C.Make()` at
+// line 41; the parse error fires before any sema analysis.
 //
-// §22.3: "A **fresh producer** — a `new` expression, a call returning
-// `owned T`, an operator result, or a `move obj._field` — stays unmarked: no
-// live binding is invalidated, so there is nothing to announce. ... writing it
-// on a borrow, a fresh producer, or a non-`owned` parameter position is
-// likewise an error." (Same rule from §28.3's move-semantics paragraph: "and
-// none anywhere for a fresh producer".)
-//
-// `C.Make()` is declared `owned OwningArray<OwningTask<Cell>>` — i.e. exactly
-// the "a call returning `owned T`" form — so the `owned` marker on it must be
-// REJECTED, even though `Task.WhenEachOwned`'s parameter IS an owned sink
-// (stdlib §6.7 v0.212 / proposal 0023 D7). The diagnostic's parenthetical
-// enumerates the fresh-producer forms; it is a statement of what the marker is
-// NOT written on, not a list of admissible arguments.
+// (Before v0.246 the sema "fresh producer" check named why `owned` on a call
+// returning `owned T` was an error. That check is now unreachable — parse
+// rejects first.)
 //
 // Fails-without / passes-with: this file pins the rejection so a future reading
 // of the diagnostic as "these four forms are admissible" cannot silently
-// re-admit the marker here. Before #2109 the iterable expression was never
-// walked by the ownership pass, so this program compiled clean and FileCheck
-// found nothing to match. The complement — the marker's VALID half over a
-// named owned local — is covered by
-// tests/codegen/task_wheneach_2082_test.cpp (owned_named_local_marker_transfers).
+// re-admit the marker here.
 
 module M;
 class Cell
@@ -46,6 +32,5 @@ class C
   end Main;
 end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `owned` call-site marker is not written on a fresh producer
-// CHECK-SAME: (a `new` expression, a call returning `owned T`, an operator result, or `move obj.f`)
-// CHECK-SAME: remove `owned` (§22.3, v0.169)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: invalid use of 'owned' at argument position
+// CHECK-SAME: (§A.4, proposal 0090, v0.246)

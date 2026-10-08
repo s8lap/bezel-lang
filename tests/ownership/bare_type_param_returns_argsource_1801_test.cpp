@@ -249,7 +249,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "    var a := new C(); "
         "    var b := new C(); "
         "    var m := vc.Pick(a, b); "
-        "    _ := Util.Sink(owned a); "  // consume `a` while `m` is live
+        "    _ := Util.Sink(move a); "  // consume `a` while `m` is live
         "    var p := m.Poke(); "
         "    b.Dispose(); "
         "    return p; "
@@ -281,7 +281,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "    var b := new C(); "
         "    var m := vc.Pick(a, b); "
         "    var p := m.Poke(); "            // `m`'s last use precedes the consume
-        "    _ := Util.Sink(owned a); "
+        "    _ := Util.Sink(move a); "
         "    b.Dispose(); "
         "    return p; "
         "  end Main; "
@@ -302,7 +302,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var a := new C(); "
         "var b := new C(); "
         "var m := Math.Max(a, b); "
-        "_ := Util.Sink(owned a); "  // consume an operand while `m` is live
+        "_ := Util.Sink(move a); "  // consume an operand while `m` is live
         "var p := m.Poke(); "
         "b.Dispose(); "
         "return p; "));
@@ -320,7 +320,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var low := new C(); "
         "var high := new C(); "
         "var m := Math.Clamp(value, low, high); "
-        "_ := Util.Sink(owned high); "
+        "_ := Util.Sink(move high); "
         "var p := m.Poke(); "
         "value.Dispose(); low.Dispose(); "
         "return p; "));
@@ -355,7 +355,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var arr: Array<int> := [1, 2, 3]; "
         "var seed := new C(); "
         "var m := arr.Aggregate(seed, lambda(acc: C, x: int) => acc); "
-        "_ := Util.Sink(owned seed); "  // consume the seed while `m` is live
+        "_ := Util.Sink(move seed); "  // consume the seed while `m` is live
         "var p := m.Poke(); "
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -372,7 +372,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var seed := new C(); "
         "var m := arr.Aggregate(seed, lambda(acc: C, x: int) => acc); "
         "var p := m.Poke(); "               // last use of the result
-        "_ := Util.Sink(owned seed); "  // now safe — the borrow is dead
+        "_ := Util.Sink(move seed); "  // now safe — the borrow is dead
         "return p; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -437,7 +437,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var arr := new OwningArray<Obj>(); "
         "arr.Add(new Obj()); "
         "var e := arr.First(); "
-        "_ := Sink.Arr(owned arr); "  // consume the receiver while `e` is live
+        "_ := Sink.Arr(move arr); "  // consume the receiver while `e` is live
         "var p := e.Poke(); "
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -454,7 +454,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "arr.Add(new Obj()); "
         "var e := arr.First(); "
         "var p := e.Poke(); "             // last use of the borrow
-        "_ := Sink.Arr(owned arr); "  // now safe — the borrow is dead
+        "_ := Sink.Arr(move arr); "  // now safe — the borrow is dead
         "return p; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -509,7 +509,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var arr := new OwningArray<Obj>(); "
         "arr.Add(new Obj()); "
         "var e := arr.Last(); "
-        "_ := Sink.Arr(owned arr); "
+        "_ := Sink.Arr(move arr); "
         "var p := e.Poke(); "
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -524,7 +524,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var arr := new OwningArray<Obj>(); "
         "arr.Add(new Obj()); "
         "var e := arr.ElementAt(0); "
-        "_ := Sink.Arr(owned arr); "
+        "_ := Sink.Arr(move arr); "
         "var p := e.Poke(); "
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -540,7 +540,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var arr := new OwningArray<Obj>(); "
         "arr.Add(new Obj()); "
         "var e := arr.FirstOrNull(); "
-        "_ := Sink.Arr(owned arr); "
+        "_ := Sink.Arr(move arr); "
         "var p := e!.Poke(); "
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -557,7 +557,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var arr := new OwningArray<Obj>(); "
         "arr.Add(new Obj()); "
         "var e := arr.First(lambda(o: Obj) => true); "
-        "_ := Sink.Arr(owned arr); "
+        "_ := Sink.Arr(move arr); "
         "var p := e.Poke(); "
         "return p; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -576,7 +576,7 @@ BEZEL_TEST(bare_type_param_returns_argsource,
         "var arr := new Array<int>(); "
         "arr.Add(5); "
         "var e := arr.First(); "
-        "_ := Sink.Ints(owned arr); "  // consuming the receiver is fine — `e` is a copy
+        "_ := Sink.Ints(move arr); "  // consuming the receiver is fine — `e` is a copy
         "return e; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

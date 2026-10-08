@@ -218,7 +218,7 @@ BEZEL_TEST(throwing_destructor_propagates_from_explicit_dispose_1878,
         "class Program "
         "  public static method Main(): int "
         "    var f := new Field(); "
-        "    var o := new Owner(owned f); "
+        "    var o := new Owner(move f); "
         "    try "
         "      o.Dispose(); "
         "      return 1; "                       // pre-fix: swallowed, returns 1

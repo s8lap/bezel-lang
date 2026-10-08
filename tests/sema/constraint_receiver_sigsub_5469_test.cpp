@@ -178,7 +178,7 @@ BEZEL_TEST(constraint_receiver_sigsub_5469,
         "end CM; "
         "public static class H "
         "  public static method F<T>(a: T, u: Unrelated): bool "
-        "    where T: IMove<Other> => a.Move(owned u); "
+        "    where T: IMove<Other> => a.Move(move u); "
         "end H; ",
         "using var c := new CM(); "
         "using var u := new Unrelated(); "

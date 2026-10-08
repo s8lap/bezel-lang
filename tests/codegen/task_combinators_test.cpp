@@ -703,7 +703,7 @@ BEZEL_TEST(task_combinators_6_7, fire_and_forget_owned_named_task_local_1890) {
         "  end Ping; "
         "  public static async method Main(): Task<int> "
         "    var t := Ping(); "
-        "    Task.FireAndForget(owned t); "
+        "    Task.FireAndForget(move t); "
         "    return 7; "
         "  end Main; end C;";
     for (int i = 0; i < 3; ++i)
@@ -725,7 +725,7 @@ BEZEL_TEST(task_combinators_6_7, fire_and_forget_owned_named_task_then_await_189
         "  end Ping; "
         "  public static async method Main(): Task<int> "
         "    var t := Ping(); "
-        "    Task.FireAndForget(owned t); "
+        "    Task.FireAndForget(move t); "
         "    await Task.Delay(2); "
         "    return 8; "
         "  end Main; end C;";
@@ -1155,7 +1155,7 @@ BEZEL_TEST(task_combinators_1529,
         "    var tasks := new OwningArray<OwningTask<Cell>>(); "
         "    tasks.Add(MakeCellFast(1)); tasks.Add(BoomA()); "
         "    tasks.Add(BoomB()); tasks.Add(MakeCellSlow(2)); "
-        "    try using var results := await Task.WhenAllOwned(owned tasks); "
+        "    try using var results := await Task.WhenAllOwned(move tasks); "
         "    catch ErrA => var ignored := 1; "
         "    catch ErrB => var ignored := 2; "
         "    end; "
@@ -1227,7 +1227,7 @@ BEZEL_TEST(task_combinators_2519,
         "    var tasks := new OwningArray<OwningTask<Cell>>(); "
         "    tasks.Add(MakeCellFast(1)); tasks.Add(BoomA()); "
         "    tasks.Add(BoomB()); tasks.Add(MakeCellSlow(2)); "
-        "    try using var results := await Task.WhenAllOwned(owned tasks); "
+        "    try using var results := await Task.WhenAllOwned(move tasks); "
         "    catch ErrA => var ignored := 1; "
         "    catch ErrB => var ignored := 2; "
         "    end; "

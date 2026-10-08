@@ -35,7 +35,7 @@ BEZEL_TEST(own_call_arg, owned_arg_modifier_consumes_local) {
         "class C "
         "  public method M(s: Sink) "
         "    var x := new T(); "
-        "    s.Take(owned x); "
+        "    s.Take(move x); "
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -57,7 +57,7 @@ BEZEL_TEST(own_call_arg, read_after_owned_arg_diagnoses) {
         "class C "
         "  public method M(s: Sink) "
         "    var x := new T(); "
-        "    s.Take(owned x); "
+        "    s.Take(move x); "
         "    _ := x; "
         "  end M; "
         "end C;"));
@@ -84,7 +84,7 @@ BEZEL_TEST(own_call_arg, owned_arg_in_initializer_consumes) {
         "  public method Pass(owned x: T): owned T => move x; "
         "  public method M() "
         "    var x := new T(); "
-        "    using var y := this.Pass(owned x); "
+        "    using var y := this.Pass(move x); "
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -132,7 +132,7 @@ BEZEL_TEST(own_call_arg, new_owned_arg_consumes_local) {
     auto r = parseAndCheckOwnership(box(
         "public method M() "
         "  var t := new T(); "
-        "  using var b := new Box(owned t); "
+        "  using var b := new Box(move t); "
         "end M;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

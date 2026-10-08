@@ -340,7 +340,7 @@ BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_idisposable_constrained_o
         "end F; "
         "class C public static method Main(): int "
         "  var r := new Res(); "
-        "  return F.Take<Res>(owned r); "  // 7
+        "  return F.Take<Res>(move r); "  // 7
         "end Main; end C;"), 7);
 }
 
@@ -356,7 +356,7 @@ BEZEL_TEST(generic_constraint_dispatch_484, dispose_on_class_constrained_ok_1293
         "end F; "
         "class C public static method Main(): int "
         "  var r := new Res(); "
-        "  return F.Take<Res>(owned r); "  // 9
+        "  return F.Take<Res>(move r); "  // 9
         "end Main; end C;"), 9);
 }
 

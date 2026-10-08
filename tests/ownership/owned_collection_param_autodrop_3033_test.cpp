@@ -132,7 +132,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    arr.Add(new Cell(1)); "
         "    arr.Add(new Cell(2)); "
         "    arr.Add(new Cell(3)); "
-        "    using var bg := Bag.Consume(owned arr); "
+        "    using var bg := Bag.Consume(move arr); "
         "    return bg.Total; "
         "  end Main; "
         "end C;");
@@ -169,7 +169,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    arr.Add(new Cell(1)); "
         "    arr.Add(new Cell(2)); "
         "    arr.Add(new Cell(3)); "
-        "    return C.Consume(owned arr); "
+        "    return C.Consume(move arr); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -192,7 +192,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    var arr := new OwningArray<Cell>(); "
         "    arr.Add(new Cell(1)); "
         "    arr.Add(new Cell(2)); "
-        "    return C.Consume(owned arr); "
+        "    return C.Consume(move arr); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -226,7 +226,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    var xs := new OwningLinkedList<Cell>(); "
         "    xs.AddLast(new Cell(1)); "
         "    xs.AddLast(new Cell(2)); "
-        "    return C.Take(owned xs); "
+        "    return C.Take(move xs); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -250,7 +250,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    var d := new OwningDictionary<string, Cell>(); "
         "    d.Add(\"a\", new Cell(1)); "
         "    d.Add(\"b\", new Cell(2)); "
-        "    return C.Take(owned d); "
+        "    return C.Take(move d); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -275,7 +275,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    var s := new Set<int>(); "
         "    s.Add(1); "
         "    s.Add(2); "
-        "    return C.Take(owned s); "
+        "    return C.Take(move s); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -304,7 +304,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    var a := new Array<int>(); "
         "    a.Add(5); "
         "    a.Add(6); "
-        "    return C.Take(owned a); "
+        "    return C.Take(move a); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -328,7 +328,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    var a := new Array<string>(); "
         "    a.Add(\"alpha\"); "
         "    a.Add(\"beta\"); "
-        "    return C.Take(owned a); "
+        "    return C.Take(move a); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -357,7 +357,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    a.Add(new Cell(1)); "
         "    a.Add(new Cell(2)); "
         "    try "
-        "      return C.Take(owned a); "
+        "      return C.Take(move a); "
         "    catch e: InvalidOperationException => "
         "      return 43; "
         "    end; "
@@ -398,11 +398,11 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "  public static method Main(): int "
         "    var a := new OwningArray<Cell>(); "
         "    a.Add(new Cell(1)); "
-        "    using var b := C.Fwd(owned a); "
+        "    using var b := C.Fwd(move a); "
         "    var c2 := new OwningArray<Cell>(); "
         "    c2.Add(new Cell(8)); "
         "    c2.Add(new Cell(9)); "
-        "    return C.Disp(owned c2) + b.Count + 41; "
+        "    return C.Disp(move c2) + b.Count + 41; "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
@@ -536,7 +536,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    var a := new OwningArray<Cell>(); "
         "    a.Add(new Cell(1)); "
         "    a.Add(new Cell(2)); "
-        "    return C.Take(owned a); "
+        "    return C.Take(move a); "
         "  end Main; "
         "end C;");
     if (wasSkipped(r)) return;
