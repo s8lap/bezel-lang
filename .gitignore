@@ -28,3 +28,13 @@ __pycache__/
 # lit hand-run fallback writes these in-tree (lit.cfg.py test_exec_root); #5265
 /tests/lit/.lit_test_times.txt
 tests/lit/**/Output/
+
+# A hand-run `lit tests/lit` without `-Dtest_exec_root` writes one extensionless
+# build artifact per test NEXT TO ITS SOURCE — ~1119 of them under tests/lit/ in a
+# single run, plus tree-root ELF objects from ad-hoc `--probe` compiles. Measured
+# across several R28 worktrees: 2366 in one tree, 870 in another. They are
+# untracked build output, never sources, and they turn `git status --porcelain`
+# into a 2400-line wall that hides real WIP. Prefer `-Dtest_exec_root=<dir>`
+# under /var/tmp; this is the belt-and-braces for the lanes that forget.
+tests/lit/*[!.]
+/tmp*

@@ -5059,6 +5059,60 @@ void ExprTC::checkAssignable(
             return;  // reported; the checks below would only cascade
         }
     }
+    // fix #5659 (§9.7 / §8.6, proposal 0146, v0.315): a borrow-bearing value
+    // at a borrow-erasing position. A value that holds borrows (a borrow-bearing
+    // record, inline array, choice, or a value declared IReadOnlySpan<TElement>)
+    // may not be converted to Object or an interface type other than
+    // IReadOnlySpan<TElement>. The exception: a concrete span (Span /
+    // ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) may be passed to an
+    // IReadOnlySpan<TElement> position without borrow-erasing, because
+    // IReadOnlySpan is the unifying read-only surface for concrete spans.
+    // This check fires for every conversion site: local init, call argument,
+    // field store (though field store has its own more specific check), return,
+    // collection element, etc.
+    if (isBoxingTargetType(to)) {
+        const bool sourceIsIReadOnlySpan = common::isIReadOnlySpanType(from);
+        // IReadOnlySpan<TElement> is itself borrow-bearing per §9.7 ("read
+        // IReadOnlySpan<TElement> as holding borrows"). A concrete span is also
+        // borrow-bearing. Both should error at non-IReadOnlySpan positions.
+        const bool sourceIsBorrowBearing =
+            sourceIsIReadOnlySpan ||
+            common::isBorrowBearingRecordOrSpan(from, ctx_);
+        // fix #5659 (v0.315): §8.6 says non-owning inline arrays (`[N]T` and
+        // `[N]T?`) are ordinary value types and box per the general rule. They
+        // are not rejected at the boxing site, even when their element type is
+        // a reference type. (The elements' borrows, if any, are subject to
+        // lifetime constraints after boxing; the box itself is allowed.)
+        const bool sourceIsNonOwningInlineArray =
+            from->kind == TypeRef::Kind::InlineArray && !from->arrayOwned;
+        // Error if: the source holds borrows AND the target is not
+        // IReadOnlySpan AND the source is not a non-owning inline array.
+        // §8.6 / §9.7: a position declared `IReadOnlySpan<TElement>` is one of
+        // the two ADMITTED positions for a value that holds borrows, so the
+        // target guard must apply to an IReadOnlySpan source too — an
+        // `IReadOnlySpan -> IReadOnlySpan` conversion is legal. The source
+        // predicate needs no separate IReadOnlySpan disjunct:
+        // `sourceIsBorrowBearing` already includes `sourceIsIReadOnlySpan`.
+        if (sourceIsBorrowBearing && !sourceIsNonOwningInlineArray &&
+            !common::isIReadOnlySpanType(to)) {
+            std::string fromName(namedTypeSimpleName(from));
+            if (fromName.empty()) fromName = spellMoveOnlySource(from);
+            std::string toName =
+                to->kind == TypeRef::Kind::Primitive
+                    ? std::string("Object")
+                    : std::string(namedTypeSimpleName(to));
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the expression has type `") + fromName +
+                "`, a borrow-bearing type, and may not be converted to `" +
+                toName +
+                "`: a value that holds borrows may not reach a "
+                "borrow-erasing position — a position declared `Object` or "
+                "an interface type other than `IReadOnlySpan<TElement>` "
+                "(§9.7; use the span directly, call `.ToString()` on it, "
+                "or store its backing buffer instead)");
+        }
+    }
     // §7.4 / §12.7 (#914): a value-type (primitive) nullable simple variable
     // proved non-null by null-flow narrowing (`if x is null then return; end`,
     // `is not null`, else-of-`is null`, or initialization with a non-null value)

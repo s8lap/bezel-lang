@@ -19285,7 +19285,13 @@ void MethodOwnership::checkAsyncSignatureBorrowBearing(
                     "explicit offset/count, or an owned result type");
                 continue;
             }
-            if (!isBorrowBearingRecordOrSpan(rt)) continue;
+            // fix #5659 (§9.7 / §30.1, proposal 0146, v0.315): also check for
+            // IReadOnlySpan<TElement> — the spec says a value declared at
+            // IReadOnlySpan<TElement> is read as holding borrows under every
+            // rule keyed on a value that holds borrows.
+            if (!isBorrowBearingRecordOrSpan(rt) &&
+                !common::isIReadOnlySpanType(rt))
+                continue;
             report(
                 Severity::Error, ps->declLoc,
                 std::string("`async` parameter `") + std::string(ps->name) +
@@ -19319,7 +19325,11 @@ void MethodOwnership::checkAsyncSignatureBorrowBearing(
                     "with no bounded source (§30.1, §35.4). Return a heap-owned "
                     "window (an `Array<T>` with explicit offset/count) or an "
                     "owned result type instead");
-            else if (isBorrowBearingRecordOrSpan(resRt))
+            // fix #5659 (§9.7 / §30.1, proposal 0146, v0.315): also check for
+            // IReadOnlySpan<TElement> — the spec says a value declared at
+            // IReadOnlySpan<TElement> is read as holding borrows.
+            else if (isBorrowBearingRecordOrSpan(resRt) ||
+                     common::isIReadOnlySpanType(resRt))
                 report(
                     Severity::Error, resultNode->span.begin,
                     "an `async` method may not have a borrow-bearing result or "

@@ -10881,25 +10881,6 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
         retainAssignedClosureParams(*ci.stmts, ms->params);
 
-    // §28.2 v0.134 / issue #601: checked disposal mode guard.
-    // For every instance method of a class (not static, not the entry point,
-    // not constructors — those go through emitConstructorBody — not the
-    // compiler-generated Dispose — that goes through emitDisposerBody): emit
-    // a disposed-flag test at method entry. If the flag is set, raise
-    // DisposedAccessException and unwind. This is a no-op when checkedDisposal_
-    // is false (unchecked mode pays zero cost — the flag test is absent).
-    if (checkedDisposal_ && !isStaticMethod(ms) && !isMain(ms) &&
-        ms->parent && ms->parent->kind == ast::TypeDeclKind::Class) {
-        llvm::StructType* st = classStruct(ms->parent);
-        unsigned fi = disposedFlagIndex(ms->parent);
-        llvm::Value* flagAddr =
-            builder_.CreateStructGEP(st, currentThis_, fi, "cd.flag");
-        llvm::Value* disposed = builder_.CreateICmpNE(
-            builder_.CreateLoad(disposedFlagTy(), flagAddr),
-            llvm::ConstantInt::get(disposedFlagTy(), 0), "cd.disposed");
-        emitGuardThrow(disposed, "DisposedAccessException");
-    }
-
     // §22.16 (v0.203, #2053): the requires prologue. A `requires` clause
     // evaluates on EVERY invocation, AFTER argument binding completes and
     // BEFORE any of the member's own execution — before the body's first
@@ -10918,6 +10899,18 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // requires prologue so the allocas are placed at the top of
             // the entry block (LLVM's alloca-required-in-entry rule).
             allocateOldCaptureSlots(fn, md->contractClauses);
+            // fix #5187 (§28.2 / §22.16, v0.330): capture every `old(E)`
+            // operand into its slot, in the entry block, BEFORE the requires
+            // prologue and BEFORE the checked-disposal guard (emitGuardThrow).
+            // LLVM requires all allocas in the entry block; captureOldOperands
+            // uses SetInsertPoint(entryBB) which appends after existing
+            // instructions. Placing captures here, before any terminator is
+            // set, ensures the stores land in the right place. A failed
+            // requires skips the captures — correct, because ensures clauses
+            // are never evaluated on a throws path (§22.16 "no clause
+            // evaluation of any kind; the ordinary exception-path discharge
+            // unwinds the frame").
+            captureOldOperands(fn, md->contractClauses);
             if (!md->contractClauses.empty()) {
                 std::vector<const ast::ContractClause*> localPtrs;
                 localPtrs.reserve(md->contractClauses.size());
@@ -11001,17 +10994,6 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // through the `invariantClass` parameter. Finalized after the
             // body is complete (below).
             //
-            // §22.16 (v0.250, #3038): capture every `old(E)` operand
-            // into its slot, in the entry block, after the requires
-            // prologue. The requires checks branch past each other
-            // and the `req.cont` block falls through; placing the
-            // captures in the entry block means they happen on every
-            // path that survives the requires checks. A failed
-            // `requires` skips the captures — correct, because the
-            // ensures clauses are never evaluated on a throws path
-            // (§22.16 "no clause evaluation of any kind; the ordinary
-            // exception-path discharge unwinds the frame").
-            captureOldOperands(fn, md->contractClauses);
             // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
             // epilogue before lowering the body. If armed, emitReturn
             // redirects every normal-completion path through the epilogue
@@ -11033,6 +11015,24 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                                (isPublicInstanceMethod &&
                                 !emittingUncheckedFace_)
                                    ? ms->parent : nullptr);
+            // fix #5187 (§28.2 / §22.16, v0.330): the checked-disposal
+            // guard. Must run AFTER captureOldOperands (so the capture stores
+            // land before this block's terminator) and AFTER
+            // armEnsuresEpilogue (so the ensures epilogue is wired before the
+            // guard can throw). The requires prologue and invariant check are
+            // already done, so throwing here is correct.
+            if (checkedDisposal_ && !isStaticMethod(ms) && !isMain(ms) &&
+                ms->parent && ms->parent->kind == ast::TypeDeclKind::Class) {
+                llvm::StructType* st = classStruct(ms->parent);
+                unsigned fi = disposedFlagIndex(ms->parent);
+                llvm::Value* flagAddr =
+                    builder_.CreateStructGEP(st, currentThis_, fi, "cd.flag");
+                llvm::Value* disposed = builder_.CreateICmpNE(
+                    builder_.CreateLoad(disposedFlagTy(), flagAddr),
+                    llvm::ConstantInt::get(disposedFlagTy(), 0),
+                    "cd.disposed");
+                emitGuardThrow(disposed, "DisposedAccessException");
+            }
         }
     }
 
