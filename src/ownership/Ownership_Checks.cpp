@@ -17378,6 +17378,71 @@ bool MethodOwnership::deferredActivationArgIsPlainRefParam(
 // by the dataflow, which runs before checkDeferredActivationTempSites. A borrow
 // local (none of the flags) is a carried source but NOT an owned obligation —
 // its real owner outlives the enclosing frame. // per §28.3 v0.196
+// fix #5661 (§28.3 *Argument contributions* clause 4, v0.326; §28.1 clauses
+// 3/5, v0.326; §14.2): the `where T: value` exclusion, applied to a bare type
+// parameter named by a CAPTURE. Mirrors bareReturnParamIsValueConstrained
+// (Ownership.cpp) — same clause 5 test, reached from the capture reduction rather
+// than the bare-return rule. // per §28.1 v0.326, §14.2
+static bool captureParamIsValueConstrained(
+    std::string_view name,
+    const std::vector<ast::GenericConstraint>* constraints) {
+    if (!constraints) return false;
+    for (const ast::GenericConstraint& gc : *constraints) {
+        if (gc.typeParam != name) continue;
+        for (const ast::ConstraintItem& item : gc.items)
+            if (item.kind == "value") return true;
+    }
+    return false;
+}
+
+// fix #5661 (§28.3 *Argument contributions* clause 4, v0.326): see the
+// declaration. A capture whose declared type is a bare type parameter admitting
+// a class or interface substitution is borrow-bearing — clause 4 counts it "at a
+// type parameter admitting a class or interface substitution, what a class- or
+// interface-typed argument contributes", and §28.1 clauses 3/5 fix the generic
+// body's assumption to class-or-interface with exactly this `where T: value`
+// exclusion. isBorrowableType's answer stands for every other type.
+// // per §28.3 v0.326, §28.1 v0.326, §14.2
+bool MethodOwnership::typeParamAdmitsClassOrInterface(
+    std::string_view head) const {
+    if (!genericCtx_) return false;
+    // Positional recognition — the head must name one of THIS body's own generic
+    // parameters, method-level or enclosing-type-level. `extensionEnclosingParams`
+    // is already folded into `enclosingParams` by computeBareReturnContext's
+    // caller (Ownership.cpp), so the two vectors below are the complete name set.
+    auto inParams = [&](const std::vector<ast::GenericParam>* ps) -> bool {
+        if (!ps) return false;
+        for (const ast::GenericParam& g : *ps)
+            if (g.name == head) return true;
+        return false;
+    };
+    if (!inParams(genericCtx_->methodParams) &&
+        !inParams(genericCtx_->enclosingParams))
+        return false;
+    if (captureParamIsValueConstrained(head, genericCtx_->methodConstraints) ||
+        captureParamIsValueConstrained(head, genericCtx_->enclosingConstraints))
+        return false;  // §14.2 `where T: value` — outside the rule entirely
+    return true;
+}
+
+// fix #5661 (§28.3 *Argument contributions* clause 4, v0.326): see the
+// declaration. // per §28.3 v0.326, §28.1 v0.326
+bool MethodOwnership::captureTypeIsBorrowBearing(
+    const sema::TypeRef* t) const {
+    if (isBorrowableType(t)) return true;
+    // The type-parameter row. A bare type parameter reaches this point as a
+    // Named TypeRef with a null declaration — the shape isBorrowableType's
+    // §31.1 comment shares with builtin exceptions and value builtins — so it
+    // is recognized by its AST head name and the body's own parameter name set,
+    // never by the shape alone. // per §28.3 v0.326
+    if (!t || t->kind != sema::TypeRef::Kind::Named || t->declaration)
+        return false;
+    if (!t->astNode || !t->astNode->name ||
+        t->astNode->name->parts.size() != 1)
+        return false;
+    return typeParamAdmitsClassOrInterface(t->astNode->name->parts.front());
+}
+
 bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const {
     if (!ls) return false;
     // #3591 tested: a `const` local can never be an owned obligation (§21.1:
@@ -17551,7 +17616,17 @@ void MethodOwnership::deferredActivationCaptureSources(
             // Value-typed captures live in their heap capture cell — no borrow,
             // no lifetime hazard (checkScopedAdmission's isBorrowableType gate;
             // a null declType stays conservative → treated as a reference).
-            if (ls->declType && !isBorrowableType(ls->declType)) continue;
+            // fix #5661 (§28.3 *Argument contributions* clause 4, v0.326):
+            // captureTypeIsBorrowBearing, not isBorrowableType — a bare type
+            // parameter is not a value type here (§28.1 clauses 3/5 fix the
+            // generic body's assumption to class-or-interface), so a `var t :=
+            // new T()` captured by a closure riding an escaping frame was
+            // dropped by the plain predicate and the frame's carried-source set
+            // lost its scope-bound borrow. Every other type keeps
+            // isBorrowableType's answer verbatim.
+            // // per §28.3 v0.326, §28.1 v0.326
+            if (ls->declType && !captureTypeIsBorrowBearing(ls->declType))
+                continue;
             // fix #3746: the same one predicate; its LocalSymbol arm delegates
             // to `localIsOwnedObligation` verbatim, so this row is unchanged.
             out.push_back({id, sym, symbolIsOwnedObligation(sym)});

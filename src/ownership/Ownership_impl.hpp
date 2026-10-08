@@ -853,6 +853,16 @@ private:
     // parameter-sourced borrow returns. Defaults true (a no-op) so a non-bare-T
     // method is never affected. // per §28.3 v0.194
     bool bareReturnSourceSetEmpty_ = true;
+    // fix #5661 (§28.3 *Argument contributions* clause 4, v0.326): the generic
+    // context of the body being analysed, kept so the capture reduction
+    // (deferredActivationCaptureSources) can POSITIONALLY recognize a bare type
+    // parameter and apply §28.1 clause 5's `where T: value` exclusion — the
+    // class-or-interface assumption that clause 4 reads a type-parameter-typed
+    // argument under. Null for a non-generic body (no parameter can name a type
+    // parameter then, so every capture takes the concrete classification).
+    // Set by computeBareReturnContext, which runs before any statement visit.
+    // // per §28.3 v0.326, §28.1 v0.326, §14.2
+    const GenericReturnContext* genericCtx_ = nullptr;
     // prep #4146 Stage 2-A (§28.3, v0.298): CFG build options for lambda body
     // CFGs constructed by runLambdaBody. Initialised to the default (full CFG
     // with exception edges, same as buildCFG's default for method bodies).
@@ -5389,6 +5399,30 @@ private:
     // owned-ness flags are populated by the dataflow before this post-pass runs
     // (Ownership.cpp). // per §28.3 v0.196
     bool localIsOwnedObligation(const sema::LocalSymbol* ls) const;
+
+    // fix #5661 (§28.3 *Argument contributions* clause 4, v0.326): whether a
+    // CAPTURED binding's declared type is borrow-bearing for the capture-set
+    // reduction. isBorrowableType alone is not the whole answer in a generic
+    // body: it classifies a bare type parameter as NOT borrowable (a Named
+    // TypeRef with a null declaration, §28.9's runtime-managed remainder), so a
+    // `var t := new T()` captured by a closure riding a returned frame was
+    // silently dropped as a value-typed capture. Clause 4 reads a type-parameter-
+    // typed argument "at a type parameter admitting a class or interface
+    // substitution, what a class- or interface-typed argument contributes", and
+    // §28.1 clauses 3/5 fix the generic body's weakest assumption to
+    // class-or-interface with the `where T: value` exclusion — so such a capture
+    // IS borrow-bearing here. Everything else (value builtins, primitives,
+    // function values, records) keeps isBorrowableType's answer verbatim.
+    // // per §28.3 v0.326, §28.1 v0.326, §14.2
+    bool captureTypeIsBorrowBearing(const sema::TypeRef* t) const;
+    // fix #5661: true when `head` names one of the analysed body's own generic
+    // parameters (method-level or enclosing-type-level, the extension-block
+    // vector included) and is NOT `where T: value`-constrained — §28.1 clause 5's
+    // exclusion. Recognized POSITIONALLY (the name-set membership test
+    // computeBareReturnContext uses), so a 0-arity builtin sharing the
+    // null-declaration Named shape is not mistaken for a type parameter.
+    // // per §28.1 v0.326, §28.3 v0.326, §14.2
+    bool typeParamAdmitsClassOrInterface(std::string_view head) const;
 
     // fix #3746 (§28.3 *Captured owned bindings*, v0.286): the ONE both-kinds
     // form of the question above — "is this symbol a binding whose owned value

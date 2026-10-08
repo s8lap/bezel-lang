@@ -13851,6 +13851,14 @@ void MethodOwnership::computeBareReturnContext(
     returnIsBareTypeParam_ = false;
     bareReturnSourceSetEmpty_ = true;
     bareReturnAllClassInstantiations_ = false;
+    // fix #5661 (§28.3 *Argument contributions* clause 4, v0.326): keep the
+    // generic context on the pass so the deferred-activation capture reduction
+    // (deferredActivationCaptureSources) can apply the same positional
+    // bare-type-parameter recognition and `where T: value` exclusion this
+    // function applies to the RETURN type. Both are reached from statements
+    // this call precedes, so the member is stable before the first is visited.
+    // // per §28.3 v0.326, §28.1 v0.326
+    genericCtx_ = genericCtx;
     // §28.3 (v0.194 S10; #1885): carry the inherited-bare-T fact computed in
     // checkMember (where the enclosing type's base types are reachable) onto the
     // pass, so checkInstanceBorrowReturn admits a parameter-sourced borrow return
