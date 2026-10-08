@@ -5,4 +5,4 @@ arr.Count(pred);                   // does NOT reach the predicate count on an A
 var s := "n = " + count;           // ERROR: no implicit ToString in `+`
 pool.Sorted();                     // OwningArray<T> declares no Sorted/Reversed copy-forms
 var text := String.Format("{0}", x);   // no String.Format
-if a < b then ...                    // ERROR when either is `int?` (section 8.1)
+if a < b then ...                    // ERROR when either is `int?` (section 7.8)

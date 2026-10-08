@@ -3,8 +3,8 @@
 //! section: 17.6
 //! title: a nullable operand to ++ is rejected
 //! rule: "An operand whose static type is a nullable type is a compile
-//!   error: the desugared `x + 1` has no meaning on a nullable operand
-//!   (§7.11) ... write `x := (x ?? 0) + 1;`, `x := x! + 1;`, or narrow
+//!   error: `x++` takes the verdict `x += 1` has on a nullable operand
+//!   (§6.6, §7.11) — write `x := (x ?? 0) + 1;`, `x := x! + 1;`, or narrow
 //!   first."
 //! cites: 17.6, 7.11
 //! expect: reject

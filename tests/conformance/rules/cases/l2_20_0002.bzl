@@ -2,7 +2,7 @@
 //! doc: stdlib
 //! section: 2.20
 //! title: Map transforms the Ok payload
-//! rule: Map(f) maps Ok(v) to Ok(f(v)).
+//! rule: Map(f) ... maps Ok(v) to Ok(f(v)).
 //! cites: 2.20
 //! expect: run
 //! stdout: 10

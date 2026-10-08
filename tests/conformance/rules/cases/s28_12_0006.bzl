@@ -7,6 +7,7 @@
 //!   object, not per-method.
 //! cites: 28.12, 28.2
 //! expect: run
+//! warns: yes
 //! output: async cleanup
 //!   done
 module Conf;

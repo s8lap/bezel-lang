@@ -4,7 +4,8 @@
 //! title: int satisfies where T: hashable
 //! rule: `where T: hashable` admits types whose hashable derived type property
 //!   holds — every type except a non-auto-hashable record (or choice) with no
-//!   user equality (§14.2, §3.6).
+//!   user equality, and a nullable type or inline array over an excluded type
+//!   (§14.2, §3.6).
 //! cites: 14.2, 3.6
 //! expect: accept
 //! issue: 4367

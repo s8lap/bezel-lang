@@ -2,7 +2,8 @@
 //! doc: spec
 //! section: 30.1
 //! title: a borrow-bearing local with a frame-resident source may cross a suspension point
-//! rule: A local of borrow-bearing record type ... is admitted across the
+//! rule: A local of borrow-bearing record or borrow-bearing inline-array
+//!   type ... is admitted across the
 //!   suspension iff every borrow it carries has a frame-resident source: an
 //!   owned local, a `using var`/`await using var`, or an `owned` parameter
 //!   of the same async body.

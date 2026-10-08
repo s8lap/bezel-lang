@@ -5,6 +5,6 @@ public static method Load(paths: IEnumerable<string>): IEnumerable<Doc>
   end;
 end Load;
 
-var first := Load(paths).First();  // WARNS (v0.268) — spec §29.11's adopting arm
+var first := Load(paths).First();  // WARNS — spec §29.11's adopting arm
 first.Title;                       // checked mode: DisposedAccessException — §29.7's
                                    //   pass disposed d when First() disposed the enumerator

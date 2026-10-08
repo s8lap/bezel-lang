@@ -7,7 +7,7 @@
 //!   invocation, or a field access through the reference — raises
 //!   `DisposedAccessException`. This is the default: a build that selects
 //!   neither mode is a checked build.
-//! cites: 28.2, 31.4, 28.10
+//! cites: 28.2, 31.4, 28.3
 //! expect: run
 //! stdout: faulted
 //! issue: 4602
@@ -27,7 +27,7 @@ end Widget;
 public class Program
   public static method Main()
     var w := new Widget();
-    using var view := w;
+    var view := w;
     w.Dispose();
     try
       Console.WriteLine(view.Label);

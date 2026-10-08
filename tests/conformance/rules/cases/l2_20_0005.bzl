@@ -2,7 +2,7 @@
 //! doc: stdlib
 //! section: 2.20
 //! title: AndThen sequences a second fallible step on Ok
-//! rule: AndThen(f) returns f(v) on Ok(v) and passes Error(e) through.
+//! rule: AndThen(f) ... returns f(v) on Ok(v) and passes Error(e) through.
 //! cites: 2.20, 35.3
 //! expect: run
 //! stdout: 5

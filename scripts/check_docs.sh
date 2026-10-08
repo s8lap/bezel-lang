@@ -383,7 +383,7 @@ none_named = set()
 for m in re.finditer(r'((?:`[^`]+`[/,\s]*)+)declares? no facts', text['stdlib']):
     none_named |= set(re.findall(r'`([^`]+)`', m.group(1)))
 
-EXPECT_TYPED = 12   # the 10 fact-granted types (CancellationTokenSource added v0.263, stdlib §6.1) + the explicit '— none' lines: Channel<T> and ScopeGuard (v0.259, stdlib §2.21)
+EXPECT_TYPED = 13   # the 11 fact-granted types (CancellationTokenSource added v0.263, stdlib §6.1; Type added v0.328, stdlib §2.13) + the explicit '— none' lines: Channel<T> and ScopeGuard (v0.259, stdlib §2.21)
 EXPECT_NONE_NAMED = {'Lock', 'SemaphoreToken', 'EventSource<T>', 'AsyncEventSource<T>'}
 if len(facts) != EXPECT_TYPED:
     bad.append(f"  Facts-line roster: expected {EXPECT_TYPED} typed entries, found {len(facts)}: {sorted(facts)}")

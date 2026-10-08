@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 28.11
 //! title: move on a borrowing collection slot is rejected — there is no ownership to transfer
-//! rule: Array<T>, Dictionary<K, V>, and the other borrowing collections do
-//!   not admit move coll[i] — their slots hold borrows, not owned values;
-//!   there is no ownership to transfer.
+//! rule: "No other receiver admits it ... A copy, shared-reference or
+//!   borrow slot, and a read-only view, admit none: ... the borrowing
+//!   collections ... reject `move coll[i]` at compile time."
 //! cites: 28.11
 //! expect: reject
 //! diagnostic: move

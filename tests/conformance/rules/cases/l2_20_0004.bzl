@@ -2,7 +2,7 @@
 //! doc: stdlib
 //! section: 2.20
 //! title: MapError transforms the Error payload
-//! rule: MapError(f) maps Error(e) to Error(f(e)).
+//! rule: MapError(f) ... maps Error(e) to Error(f(e)).
 //! cites: 2.20
 //! expect: run
 //! stdout: 3

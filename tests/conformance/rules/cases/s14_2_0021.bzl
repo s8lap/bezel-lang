@@ -1,30 +1,34 @@
 //! case: s14_2_0021
 //! doc: spec
 //! section: 14.2
-//! title: a class with a protected parameterless constructor does not satisfy where T: new()
-//! rule: A class substitution satisfies `where T: new()` exactly when the
-//!   class declares a parameterless constructor that is `public` — not
-//!   merely accessible from some scope — (§14.2, v0.315). A class declaring
-//!   only a `protected` parameterless constructor does not satisfy the
-//!   constraint.
-//! cites: 14.2
+//! title: an interface implementation comparing its own unconstrained type parameter is rejected at its body
+//! rule: Every body of a dispatched generic method ... is checked under its
+//!   constraint set (above) as any generic body is, and a requirement of its
+//!   own type parameter that the set does not establish is a **compile error
+//!   at that body** ... The diagnostic names the requirement and the
+//!   remedies: a constraint of this section on the **declaring** interface or
+//!   base method, which every implementation then inherits (`where T:
+//!   hashable` for an equality use ...).
+//! cites: 14.2, 9.2, 3.6
 //! expect: reject
-//! diagnostic: new()
+//! diagnostic: hashable
+//! issue: 5639
 module Conf;
 
-// A class with only a protected parameterless constructor.
-// It should NOT satisfy `where T: new()`.
-public class Widget
-  protected constructor()
+public interface IFinder
+  method Find<T>(xs: Array<T>, x: T): int;
+end IFinder;
+
+public class LinearFinder: IFinder
+  public constructor()
   end constructor;
-end Widget;
 
-public static class Factory
-  public static method Make<T>(): owned T where T: new() => new T();
-end Factory;
-
-public class Program
-  public static method Main()
-    var w := Factory.Make<Widget>();
-  end Main;
-end Program;
+  public method Find<T>(xs: Array<T>, x: T): int
+    for var i in 0..<xs.Count do
+      if xs[i] = x then
+        return i;
+      end if;
+    end for;
+    return -1;
+  end Find;
+end LinearFinder;

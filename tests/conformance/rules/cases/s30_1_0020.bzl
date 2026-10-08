@@ -2,7 +2,8 @@
 //! doc: spec
 //! section: 30.1
 //! title: a borrow-bearing local with a caller-side source may not cross a suspension point
-//! rule: A local of borrow-bearing record type ... is admitted across the
+//! rule: A local of borrow-bearing record or borrow-bearing inline-array
+//!   type ... is admitted across the
 //!   suspension iff every borrow it carries has a frame-resident source ...
 //!   A borrow whose source is caller-side — a plain parameter, `this`, a
 //!   field reached through `this` — does not qualify.

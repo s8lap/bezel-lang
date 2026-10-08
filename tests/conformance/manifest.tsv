@@ -398,15 +398,15 @@ codegen_0069	codegen	78-Nullability-narrowing	error	diagnose
 codegen_0070	codegen	78-Nullability-narrowing	fragment	compiles	env:Use,_field; activated 2026-09-21 coverage pass (was skip:incomplete-fragment)
 codegen_0071	codegen	79-Small-standard-library-mistakes	error	diagnose	
 codegen_0072	codegen	79-Small-standard-library-mistakes	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
-codegen_0073	codegen	81-v0267-operators-no-longer-lift-over-nullable-value-types-	error	diagnose	
-codegen_0074	codegen	81-v0267-operators-no-longer-lift-over-nullable-value-types-	skip	n/a	skip:incomplete-fragment
-codegen_0075	codegen	82-v0265-UnwrapOrs-argument-is-evaluated-eagerly	skip	n/a	skip:incomplete-fragment
-codegen_0076	codegen	82-v0265-UnwrapOrs-argument-is-evaluated-eagerly	skip	n/a	skip:literal-listing
-codegen_0077	codegen	83-v0265-materializing-is-not-a-remedy-for-the-fresh-yield-l	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
-codegen_0078	codegen	83-v0265-materializing-is-not-a-remedy-for-the-fresh-yield-l	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
-codegen_0079	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
-codegen_0080	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	error	diagnose	chained:1
-codegen_0081	codegen	84-v0268-a-constructor-only-record-is-not-defaultable-and-re	fragment	compiles	wrap:mixed; activated 2026-09-21 coverage pass (was skip:literal-listing)
+codegen_0073	codegen	78-Nullability-narrowing	error	diagnose	
+codegen_0074	codegen	78-Nullability-narrowing	skip	n/a	skip:incomplete-fragment
+codegen_0075	codegen	79-Small-standard-library-mistakes	skip	n/a	skip:incomplete-fragment
+codegen_0076	codegen	79-Small-standard-library-mistakes	skip	n/a	skip:literal-listing
+codegen_0077	codegen	75-Iterators-queries-liveness	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
+codegen_0078	codegen	75-Iterators-queries-liveness	skip	n/a	skip:incomplete-fragment (measured 2026-09-21: the block's only blocker is an unbound illustrative name, not a literal listing — relabelled from skip:literal-listing)
+codegen_0079	codegen	73-Value-kinds	fragment	compiles	activated 2026-09-21 coverage pass (was skip:literal-listing)
+codegen_0080	codegen	73-Value-kinds	error	diagnose	chained:1
+codegen_0081	codegen	73-Value-kinds	fragment	compiles	wrap:mixed; activated 2026-09-21 coverage pass (was skip:literal-listing)
 guide1_0000	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0001	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0002	guide1	3-Borrowing-the-default-for-just-let-me-use-it	skip	n/a	skip:incomplete-fragment

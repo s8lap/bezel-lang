@@ -1,8 +1,8 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.291.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.327.*
 
-The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5). Neither needs an `import`: both modules are on spec §2.3's always-available list — `System.Collections.Linq` since v0.278, `System.Collections.Generic` since v0.289, which puts every stdlib §4 name in every file's bare-name space. What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
+The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5). Neither needs an `import`: both modules are on spec §2.3's always-available list, and the `System.Collections.Generic` row puts every stdlib §4 name in every file's bare-name space. What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
 **Contents:** §1 the two families · §2 what the loop variable is · §3 consuming iteration: `Drain()` and the take-forms · §4 affine queries · §5 `GroupBy` · §6 `First` at class elements · §7 spans and buffers · §8 choosing, and the five traps.
 
@@ -28,13 +28,7 @@ c.Ping();                                        // use it; you may not dispose 
 // scope end: pool disposed → both connections disposed with it, no destructor written
 ```
 
-The `Owning` prefix names the **element** axis, not the container axis: `owned OwningArray<Dog>` is an owning array *you* own, while a bare `OwningArray<Dog>` parameter is a borrow of someone else's owning array (stdlib §4). One classification drives every element operation — the **element slot policy** (spec §28.11). A slot's behavior follows from the family and the element's kind, never from per-collection quirks.
-
-| Element type | Borrowing family | Owning family |
-|---|---|---|
-| value type (`int`, records) | copies in and out (a *borrow-bearing* record — §7, spec §9.7 — additionally requires every source it carries to outlive the collection) | *(rejected — nothing to own)* |
-| `string`, function values | shared references | *(rejected)* |
-| class / interface | slots hold **borrows** | slots are **owned** |
+The `Owning` prefix names the **element** axis, not the container axis: `owned OwningArray<Dog>` is an owning array *you* own, while a bare `OwningArray<Dog>` parameter is a borrow of someone else's owning array (stdlib §4). One classification drives every element operation — the **element slot policy** (spec §28.11). A slot's behavior follows from the family and the element's kind, never from per-collection quirks: in the borrowing family copyable value elements are copies (a *borrow-bearing* record — §7, spec §9.7 — additionally requires every source it carries to outlive the collection), `string` and function values are shared references, and class or interface slots hold **borrows**; in the owning family class or interface slots are **owned** and every other element kind is rejected. The operation-by-operation table is the code-generation reference's §4.5 (*The two families*), over spec §28.11's slot-policy table.
 
 So an owning collection admits only class or interface elements (`where T: class` — a value has no disposal obligation to take). For `OwningDictionary<K, V>` the split is per-axis: values owned, keys value-like (stdlib §4.9). Reading is uniform across both families — the indexer-get and default iteration produce a borrow (or a copy, for value elements). Reading never transfers ownership.
 
@@ -59,9 +53,9 @@ end;
 
 (`TryAdd(owned item): bool` reports the outcome instead; the duplicate is still disposed.)
 
-**Dictionaries in practice.** The lookup tiers are Guide 2 §2's: the indexer throws `KeyNotFoundException` (absence is a bug here), `GetOrNull` composes with `??`, `TryGetValue` distinguishes what a collapsed `T?` cannot (stdlib §4.8). At *class-typed* values `GetOrNull` returns a borrow of the stored value — a look, not a take. A borrow never meets an *owned* fallback through `??` (Guide 1 §8's meet rule): null-test instead, and use `PopValue`/`TryPopValue` when you mean take. Two adjacent habits are worth noting. `dict[key] += 1` updates but never inserts — it throws on an absent key — so tallying is `Counter<K>`'s job (`tally.Increment(word);`, stdlib §4.20). And `GetOrAdd(key, factory)` is a read path whose factory, on the owning map, produces an `owned V` the dictionary keeps — the call still returns a borrow; at a value-typed `V` it returns a **copy** of the stored value, so incrementing through its result mutates nothing (stdlib §4.8).
+**Dictionaries in practice.** The lookup tiers are Guide 2 §2's: the indexer throws `KeyNotFoundException` (absence is a bug here), `GetOrNull` composes with `??`, `TryGetValue` distinguishes what a collapsed `T?` cannot (stdlib §4.8). At *class-typed* values `GetOrNull` returns a borrow of the stored value — a look, not a take. A borrow never meets an *owned* fallback through `??` (Guide 1 §8's meet rule): null-test instead, and use `PopValue`/`TryPopValue` when you mean take. Two adjacent habits are worth noting. `dict[key] += 1` updates but never inserts — it throws on an absent key — so tallying is `Counter<K>`'s job (`tally.Increment(word);`, stdlib §4.20; not yet implemented, [#3848](https://github.com/s8lap/bezel-lang/issues/3848)). And `GetOrAdd(key, factory)` is a read path whose factory, on the owning map, produces an `owned V` the dictionary keeps — the call still returns a borrow; at a value-typed `V` it returns a **copy** of the stored value, so incrementing through its result mutates nothing (stdlib §4.8). Its key and its factory's result are stores, checked against the dictionary at every call as `Add`'s arguments are (spec §28.11).
 
-Two conventions are worth absorbing in passing (stdlib §1). `Count` counts membership that grows and shrinks (`Array<T>.Count`); `Length` measures a fixed extent (buffers, spans, `FrozenArray<T>`, `string`). And the imperative form mutates in place (`Sort`, `Reverse`) while the participle returns a fresh owned copy (`Sorted()`, `Reversed()`) — *declared* on the borrowing family only, because an owning copy would double-own every element: `OwningArray<T>` declares no `Sorted`, no `Reversed`, no `ToArray` (stdlib §4.4). That is its **declared surface**, not what resolves on it. §5's `ToArray()`/`ToSet()`/`ToDictionary(…)` are extensions on `IEnumerable<T>`, which the owning family implements, so `pool.ToArray()` does resolve — and is sound, because what it returns is a **borrowing snapshot**: a fresh `Array<T>` whose slots borrow the elements `pool` still owns. No second owner is minted; the obligation is a lifetime one, `pool` must outlive every use of the snapshot, and `Clear`, `Remove`, `RemoveAt`, or an indexer-set kills the slot a snapshot entry points at (stdlib §4.5, v0.266). To reorder in place use `Reverse()`/`Sort()`; to move the elements into a new owning collection, `Drain()`.
+Two conventions are worth absorbing in passing (stdlib §1). `Count` counts membership that grows and shrinks (`Array<T>.Count`); `Length` measures a fixed extent (buffers, spans, `FrozenArray<T>`, `string`). And the imperative form mutates in place (`Sort`, `Reverse`) while the participle returns a fresh owned copy (`Sorted()`, `Reversed()`) — *declared* on the borrowing family only, because an owning copy would double-own every element: `OwningArray<T>` declares no `Sorted`, no `Reversed`, no `ToArray` (stdlib §4.5). That is its **declared surface**, not what resolves on it. Stdlib §5's `ToArray()`/`ToSet()`/`ToDictionary(…)` are extensions on `IEnumerable<T>`, which the owning family implements, so `pool.ToArray()` does resolve — and is sound, because what it returns is a **borrowing snapshot**: a fresh `Array<T>` whose slots borrow the elements `pool` still owns. No second owner is minted; the obligation is a lifetime one, `pool` must outlive every use of the snapshot, and `Clear`, `Remove`, `RemoveAt`, or an indexer-set kills the slot a snapshot entry points at (stdlib §4.5). To reorder in place use `Reverse()`/`Sort()`; to move the elements into a new owning collection, `Drain()`.
 
 **Reading code doesn't need to care which family.** The two families never interconvert: an `OwningArray<Connection>` *is not* an `Array<Connection>`. But both implement the read-only interfaces `IEnumerable<T>`, `IReadOnlyCollection<T>`, `IReadOnlyList<T>`, because reading produces borrows either way (spec §28.11; stdlib §4.3). So a consumer that only reads declares one of those and accepts either source:
 
@@ -80,21 +74,11 @@ The mutating interfaces are deliberately separate hierarchies (`IList<T>` vs `IO
 
 ## 2. How Bezel does it: the loop variable is not always yours
 
-`for var x in source do … end;` compiles to the enumeration protocol (`GetEnumerator()`/`MoveNext()`/`Current`, spec §29.1–§29.2), and **what `x` is follows from the source**:
-
-| Source | `x` is |
-|---|---|
-| value elements (`Array<int>`, a range, a `string`'s chars) | a copy |
-| `string` or function-typed elements | a shared reference |
-| class elements of a collection — either family, default iteration | a **borrow** of the slot |
-| an iterator's enumerator-owned yields — minted, or adopted into a frame binding (`IEnumerable<T>` at class T) | a borrow of the **enumerator's** slot |
-| `coll.Drain()`, or any `IOwningEnumerable<T>` | **owned** — you discharge it (§3) |
-| `Dictionary<K, V>` | a `DictionaryEntry<K, V>`; `entry.Value` borrows at class V |
-| spans, inline arrays | direct indexed loop; copy or borrow per slot (§7) |
+`for var x in source do … end;` compiles to the enumeration protocol (`GetEnumerator()`/`MoveNext()`/`Current`, spec §29.1–§29.2), and **what `x` is follows from the source's static type**: a copy at value elements, a shared reference at `string` or function-typed elements, a **borrow** of the slot at class elements of either family under default iteration (a borrow of the *enumerator's* slot where an iterator's enumerator owns what it yields — §6), and **owned** only from `coll.Drain()` or another `IOwningEnumerable<T>` (§3); spans (§7) and inline arrays (below) loop by index. The source-by-source table, `Dictionary<K, V>` entries included, is the code-generation reference's §4.5 (*What the `for` variable is*).
 
 Two consequences do the habit-breaking.
 
-**An element borrow does not escape the loop.** Over a *concrete* collection the borrow's source is the collection itself, so keeping a reference past the loop is fine while the collection lives — with §1's residual still yours on the borrowing family: the elements' own owners must outlive that use (spec §28.11). Over an *interface-typed* source the compiler cannot see the backing — the yielded value may live in the enumerator, which the loop disposes — so the variable's source is conservatively the loop's own enumerator, and any escape is rejected (spec §28.3/§29.2, v0.235):
+**An element borrow does not escape the loop.** Over a *concrete* collection the borrow's source is the collection itself, so keeping a reference past the loop is fine while the collection lives — with §1's residual still yours on the borrowing family: the elements' own owners must outlive that use (spec §28.11). Over an *interface-typed* source the compiler cannot see the backing — the yielded value may live in the enumerator, which the loop disposes — so the variable's source is conservatively the loop's own enumerator, and any escape is rejected (spec §28.3/§29.2):
 
 ```bezel
 method Report(samples: IEnumerable<Sample>)
@@ -133,7 +117,7 @@ end;
 
 If the elements are the pool's to dispose, say so through the pool: `pool.Clear()` disposes every element, `pool.RemoveAt(i)` disposes one, and disposing the pool cascades. To dispose elements *yourself*, take them out first — that is §3.
 
-Two smaller rules complete the picture. Structurally modifying a collection while iterating it raises `InvalidOperationException` at the next advance (spec §29.12) — and the compiler warns at the in-loop call when the loop would advance after it, naming this remedy. The standard shape is collect-then-remove, two passes:
+Two smaller rules complete the picture. Structurally modifying a collection while iterating it raises `InvalidOperationException` at the next advance (spec §29.12) — and the compiler warns at an in-loop structural call on the loop's own source binding when the loop would advance after it, naming this remedy. The standard shape is collect-then-remove, two passes:
 
 ```bezel
 using var expired := new Array<Transaction>();
@@ -162,7 +146,7 @@ end;
 // pool is now empty
 ```
 
-Skip the adoption and the element auto-drops at the body's end with a per-iteration must-use warning — a drop is never silent. Partial iteration drains only what was yielded: `break` out and the remaining elements are still in the collection, intact (spec §28.11). `OwningDictionary<K, V>` drains entries that own their values (stdlib §4.9):
+Skip the adoption and the element auto-drops at the body's end with a per-iteration must-use warning (none at a trivial-dispose element type, spec §28.9). Partial iteration drains only what was yielded: `break` out and the remaining elements are still in the collection, intact (spec §28.11). `OwningDictionary<K, V>` drains entries that own their values (stdlib §4.9):
 
 ```bezel
 for var entry in sessions.Drain() do
@@ -173,7 +157,7 @@ end;
 
 (The *borrowing* `Dictionary<K, V>` iterates entries directly — `for var entry in dict` yields `DictionaryEntry<K, V>` values in insertion order, `entry.Value` a borrow at class V. The owning dictionary deliberately has **no** default entry iteration: its common intent is transfer, so you either iterate `Keys` to look or `Drain()` to take — stdlib §4.8/§4.9.)
 
-For *one* element, use the take-forms: `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Pop(query)` on the owning set (named `Take` through v0.258 — the v0.259 rename un-shadows LINQ's `Take(count)` on set receivers, stdlib §4.10). Each has a `Try*` variant except `PopAt` (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i]`. It takes the element but leaves the slot **moved-from**, and the field-restoration rule applies: restore the slot before the method can exit (spec §28.8.1/§28.11; the same discipline as `move` on a field, Guide 1 §7):
+For *one* element, use the take-forms: `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Pop(query)` on the owning set (stdlib §4.10). Each has a `Try*` variant except `PopAt` (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i]`. It takes the element but leaves the slot **moved-from**, and the field-restoration rule applies: restore the slot before the method can exit (spec §28.8.1/§28.11; the same discipline as `move` on a field, Guide 1 §7):
 
 ```bezel
 var fresh := Connect("fresh");   // build the replacement first — it may throw
@@ -198,7 +182,7 @@ end Tail;
 Five rules cover the shape:
 
 - An `IEnumerable<T>`-returning iterator is re-iterable — each `GetEnumerator()` runs the body afresh — while an `IEnumerator<T>` return is single-use (spec §29.3).
-- An iterator's declared type is announcement enough at *every* callee kind — static, instance, or extension (type-announced; calls mint, spec §28.3, v0.258 — the full declared-kind × callee-kind matrix is §28.3's announcement table) — so the unmarked spelling above is the whole convention, and `owned IEnumerable<T>` is admissible emphasis. A *stored* collection you want to re-expose is not a method's job: expose it as a **property** (`public property Items: IEnumerable<Item> => _items;`), whose reads are borrows — a method returning the field no longer compiles.
+- An iterator's declared type is announcement enough at *every* callee kind — static, instance, or extension (type-announced; calls mint, spec §28.3 — the full declared-kind × callee-kind matrix is §28.3's announcement table) — so the unmarked spelling above is the whole convention, and `owned IEnumerable<T>` is admissible emphasis. A *stored* collection you want to re-expose is not a method's job: expose it as a **property** (`public property Items: IEnumerable<Item> => _items;`), whose reads are borrows — an `IEnumerable<Item>`-returning method that returns the field does not compile (spec §28.3).
 - There is no plain `return` in an iterator — exit early with `yield break;` (spec §29.5).
 - Resource handling inside the body prefers `using var` over `try`/`finally` (`yield` is barred inside a `try` that has a `catch`, spec §29.6). Cleanup is reliable on abandonment: if the consumer `break`s or the enumerator is disposed early, the frame runs its pending `using var` disposals and `finally` clauses exactly as if the body had exited at the suspension point (spec §29.7). An `owned` parameter the body never moved out is disposed by the frame too (spec §29.8; adopt-on-entry is the warning-free spelling, Guide 1 §9).
 - What a yield *hands over* follows the return type: yields from an `IEnumerable<T>` iterator at class T are retained by the enumerator — the consumer borrows them (§2, §6) — while an `IOwningEnumerable<T>` iterator passes ownership through to the consumer, `Drain()`-style. Yielding a *named* owned local in a borrowing iterator is the adopt-then-yield idiom (Guide 1 §9).
@@ -207,7 +191,7 @@ Five rules cover the shape:
 
 ## 4. How Bezel does it: a bound query is consumed exactly once
 
-The stdlib §5 operators (auto-imported since v0.278 — the module is on spec §2.3's list, so no `import` is needed) are the headline unusual feature. As elsewhere, most of them are **lazy**: `xs.Where(p)` does no work — it builds a deferred pipeline that runs when enumerated. Unlike elsewhere, a **bound lazy query is affine**: it may be enumerated **at most once** — the first consumption spends its one *enumeration right*, the way a `move` spends ownership. The frame itself is still yours to dispose — `using var` where you want scope disposal, otherwise K3.14's auto-drop, with the must-use warning suppressed wherever the consumption point is statically visible; the right and the disposal obligation are layered, not the same thing (spec §29.11).
+The stdlib §5 operators (auto-imported — the module is on spec §2.3's list, so no `import` is needed) are the headline unusual feature. As elsewhere, most of them are **lazy**: `xs.Where(p)` does no work — it builds a deferred pipeline that runs when enumerated. Unlike elsewhere, a **bound lazy query is affine**: it may be enumerated **at most once** — the first consumption spends its one *enumeration right*, the way a `move` spends ownership. The frame itself is still yours to dispose — `using var` where you want scope disposal, otherwise K3.14's auto-drop, with the must-use warning suppressed wherever the consumption point is statically visible; the right and the disposal obligation are layered, not the same thing (spec §29.11).
 
 ```bezel
 using var hot := readings.Where(lambda(r) => r.Celsius > 90.0);   // bound lazy query
@@ -268,19 +252,19 @@ using var kept := q.ToArray();                             //   and its borrow o
                                                            //   until this consumption
 ```
 
-The compiler tracks the captures as sources carried by the query value (spec §28.14; stdlib §5), so the failure mode is a compile error, not a dangle. The same tracking draws the return boundary. A method may return a pipeline over its *own inputs* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — because each caller re-establishes the borrow against its own argument. A pipeline over a local you created dies with the method and cannot be returned. At value, `string`, and runtime-managed elements, materializing it into an owned `Array<T>` is the fix — the slots are copies or runtime-managed references, and the array carries nothing of the local. At **class or interface** elements it is not: the materialized slots are borrows of elements the local still owns, so the returned array dangles the moment the local is disposed (stdlib §5, v0.265). Return an owning collection you built through §6's owning path, or let the caller own the source.
+The compiler tracks the captures as sources carried by the query value (spec §28.14; stdlib §5), so the failure mode is a compile error, not a dangle. The same tracking draws the return boundary. A method may return a pipeline over its *own inputs* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — because each caller re-establishes the borrow against its own argument. A pipeline over a local you created dies with the method and cannot be returned. At value, `string`, and runtime-managed elements, materializing it into an owned `Array<T>` is the fix — the slots are copies or runtime-managed references, and the array carries nothing of the local. At **class or interface** elements it is not: the materialized slots are borrows of elements the local still owns, so the returned array dangles the moment the local is disposed (stdlib §5). Return an owning collection you built through §6's owning path, or let the caller own the source.
 
 ---
 
 ## 5. `GroupBy`: consume the outer sequence once; read each group freely
 
-`GroupBy` is lazy until first enumerated, then buffers fully — no complete group can exist before the source is exhausted. That first enumeration is where it consumes its source (stdlib §5, v0.230). Single-consumption binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` only. Each group is a materialized, **re-enumerable** collection that stays valid after the outer sequence advances past it — the *grouping* survives, though at class or interface elements its buffer holds borrows, so the *elements* survive only as long as their own owner does, and a grouping over a source whose enumerator owns the elements carries dead borrows exactly as a materializer does — and, since v0.268, draws §6's warning at an accessor over the group where that source is same-unit (stdlib §5; §6). Over a collection-backed source the many-aggregations idiom is direct:
+`GroupBy` is lazy until first enumerated, then buffers fully — no complete group can exist before the source is exhausted. That first enumeration is where it consumes its source (stdlib §5). Single-consumption binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` only. Each group is a materialized, **re-enumerable** collection that stays valid after the outer sequence advances past it — the *grouping* survives, though at class or interface elements its buffer holds borrows, so the *elements* survive only as long as their own owner does, and a grouping over a source whose enumerator owns the elements carries dead borrows exactly as a materializer does — and draws §6's warning at an accessor over the group where that source is same-unit (stdlib §5; §6). Over a collection-backed source the many-aggregations idiom is direct:
 
 ```bezel
 for var g in requests.GroupBy(lambda(r) => r.Route) do     // outer: consumed by this loop
   Console.WriteLine(
     $"{g.Key}: {g.Count()} calls, slowest {g.Max(lambda(r) => r.Millis)} ms");
-end;                                                       // g read twice — defined (v0.230)
+end;                                                       // g read twice — defined
 ```
 
 Groups appear in first-occurrence-of-key order, elements within a group in source order. When a group feeds *many* aggregations, materializing it once — `using var items := g.ToArray();` on the body's first line — remains the advised shape (stdlib §5); it is advice, not a rule.
@@ -289,7 +273,7 @@ Groups appear in first-occurrence-of-key order, elements within a group in sourc
 
 ## 6. `First` and friends at class elements: you get a borrow of the element
 
-At value and `string` elements, `First()`, `FirstOrNull()`, `Single(pred)`, `ElementAt(i)`, `Min()`/`Max()` just hand you the value. At **class or interface** elements they hand you a **borrow of the element, sourced from the receiver** — no disposal obligation, usable while the element's backing is live (stdlib §5, scoped at v0.235). Over a collection-backed sequence that backing is the collection:
+At value and `string` elements, `First()`, `FirstOrNull()`, `Single(pred)`, `ElementAt(i)`, `Min()`/`Max()` just hand you the value. (At an inline-array element the `*OrNull` members do not exist — an inline array has no nullable form, spec §15.1 — so test `Count` and use `First()`.) At **class or interface** elements they hand you a **borrow of the element, sourced from the receiver** — no disposal obligation, usable while the element's backing is live (stdlib §5). Over a collection-backed sequence that backing is the collection:
 
 ```bezel
 using var fleet := new OwningArray<Connection>();
@@ -300,7 +284,7 @@ var idle := fleet.FirstOrNull(lambda(c) => not c.IsBusy());  // borrow of the el
 idle?.Ping();                     // fine while fleet lives — fleet is the backing
 ```
 
-**The trap is a pipeline whose elements the enumerator owns.** Over such a source — an iterator that `new`s its elements, an iterator that binds them to a binding **its own frame owns** (an owned local, a `using var` holding an owned value, or an `owned` parameter of the iterator body) and yields that name, or an operator chain over either — the element lives in the pipeline's *own* enumerator frame, which the terminal operator disposes before returning. The borrow you get back points at a disposed element, and the next use faults deterministically in checked mode (`DisposedAccessException`, spec §28.2). Since v0.243 the compiler **warns at the accessor call** whenever that iterator is compiled in the same unit — since v0.268 for the adopt-then-yield producer as well as the minting one, and through a `ToArray()` or `GroupBy` in the chain (stdlib §5; the predicate is spec §29.11's) — the diagnostic states the fault as certain where every reachable yield of the traced iterator is enumerator-owned and as *may not survive* where the yields are mixed, and it names the remedies below; a cross-module producer escapes the warning and keeps only the checked-mode fault:
+**The trap is a pipeline whose elements the enumerator owns.** Over such a source — an iterator that `new`s its elements, an iterator that binds them to a binding **its own frame owns** (an owned local, a `using var` holding an owned value, or an `owned` parameter of the iterator body) and yields that name, or an operator chain over either — the element lives in the pipeline's *own* enumerator frame, which the terminal operator disposes before returning. The borrow you get back points at a disposed element, and the next use faults deterministically in checked mode (`DisposedAccessException`, spec §28.2). The compiler **warns at the accessor call** whenever that iterator is called directly and compiled in the same unit — for the adopt-then-yield producer as well as the minting one, and through a `ToArray()` or `GroupBy` in the chain (stdlib §5; the predicate is spec §29.11's) — the diagnostic states the fault as certain where every reachable yield of the traced iterator is enumerator-owned and as *may not survive* where the yields are mixed, and it names the remedies below; a cross-module producer, or one reached through a function value or virtual dispatch, escapes the warning and keeps only the checked-mode fault:
 
 ```bezel
 using var probes := Probes(8);    // Probes is an iterator minting fresh Probe objects
@@ -311,7 +295,7 @@ p.Run();                          // checked mode: DisposedAccessException — t
                                   //   died with First()'s internal enumerator
 ```
 
-The `new`-in-the-yield spelling is not the only one. An iterator that binds the element first — the spelling §29.2 calls *warning-free*, because binding it is what silences the **producer's** must-use warning — hands the enumerator's frame the same ownership, and since v0.268 the consumer's accessor warns identically:
+The `new`-in-the-yield spelling is not the only one. An iterator that binds the element first — the spelling §29.2 calls *warning-free*, because binding it is what silences the **producer's** must-use warning — hands the enumerator's frame the same ownership, and the consumer's accessor warns identically:
 
 ```bezel
 public static method Load(paths: IEnumerable<string>): IEnumerable<Doc>
@@ -321,20 +305,20 @@ public static method Load(paths: IEnumerable<string>): IEnumerable<Doc>
   end;
 end Load;
 
-var first := Load(paths).First();  // WARNS (v0.268) — spec §29.11's adopting arm
+var first := Load(paths).First();  // WARNS — spec §29.11's adopting arm
 first.Title;                       // checked mode: DisposedAccessException — §29.7's
                                    //   pass disposed d when First() disposed the enumerator
 ```
 
-*Warning-free at the producer* and *warned at the consumer* are both true and are about different call sites. What still does **not** warn: yielding a re-borrow of an element the *caller* owns (`for var d in docs do yield return d; end;` — sound), and reaching a frame-owned value through an indexer or a field rather than by name (`yield return seen[i];` — silent by choice, spec §29.11, because a frame-resident *borrowing* collection would be warned on wrongly).
+*Warning-free at the producer* and *warned at the consumer* are both true and are about different call sites. What still does **not** warn: yielding a re-borrow of an element the *caller* owns (`for var d in docs do yield return d; end;` — sound), and reaching a frame-owned value through an indexer, a field, or an iteration variable rather than by name (`yield return seen[i];` — silent by choice, spec §29.11, because a frame-resident *borrowing* collection would be warned on wrongly).
 
 Ownership of the binding is what counts, not its spelling: `using var d := docs[i]; yield return d;` owns nothing — a `using var` initialized from a borrow assumes no obligation (spec §28.10) — so that yield is an ordinary re-borrow and stays silent.
 
-One shape is **over-warned**, and v0.268 says so rather than pretending otherwise (spec §29.11). An adopting yield whose binding the body then transfers out of the frame — `yield return d; sink.Add(move d);` — is dead at an *abandoning* accessor (`First`, `FirstOrNull`, `ElementAt`, which dispose the enumerator at the suspension point) and *live* at an *exhausting* one (`Last`, `Single`, `Min()`, `Max()`, which run the transfer first). The predicate keys on the receiver's provenance, not on which accessor consumes it, so it warns on both and states the fault as certain on both. The remedy is the same one below and worth taking anyway: make the transfer's destination the element's owner, and apply the accessor to *that* collection.
+One shape is **over-warned**, a recorded imprecision (spec §29.11). An adopting yield whose binding the body then transfers out of the frame — `yield return d; sink.Add(move d);` — is dead at an *abandoning* accessor (`First`, `FirstOrNull`, `ElementAt`, which dispose the enumerator at the suspension point) and *live* at an *exhausting* one (`Last`, `Single`, `Min()`, `Max()`, which run the transfer first). The predicate keys on the receiver's provenance, not on which accessor consumes it, so it warns on both and states the fault as certain on both. The remedy is the same one below and worth taking anyway: make the transfer's destination the element's owner, and apply the accessor to *that* collection.
 
 The remedy is the one the stdlib states (§5), and `ToArray()` is **not** it: materializing hands you a fresh `Array<T>` whose slots are *borrows* of the same dead elements (stdlib §5, §4.4) — §4's materialize-first remedy answers re-enumeration, not liveness. Two things work. Use each element inside the loop body that borrows it, before the next advance. Or give the elements an owner: run the producer through the owning path (an `IOwningEnumerable<T>` iterator consumed with §3's owning iteration, where you genuinely own each element) and build them into an owning collection — the plainest form, and then `probes.FirstOrNull(...)` over an `OwningArray<Probe>` is collection-backed and sound. If the producer is a borrowing minting iterator you cannot change, there is no way to keep an element past the next advance; consume it in the body.
 
-Three footnotes close the story. First, the tiers are the usual ones (stdlib §1): `First` throws `InvalidOperationException` on no match — absence is a bug at that call site — while `FirstOrNull` returns `null` for the expected-absence stance (Guide 2 §2). Second, `Aggregate(seed, fold)` at a class-typed accumulator additionally carries `seed` as a source: the result is usable only while receiver *and* seed live (stdlib §5). An empty source returns the seed itself (stdlib §5). Third, these accessors are *compiler-known* at class elements, because no in-language body over arbitrary `IEnumerable<T>` could hand an element borrow out of its loop (§2's escape rule). A first-element helper of your own takes an indexable receiver and returns `this[i]` — the receiver-sourced spelling the rule admits (spec §28.3, v0.235).
+Three footnotes close the story. First, the tiers are the usual ones (stdlib §1): `First` throws `InvalidOperationException` on no match — absence is a bug at that call site — while `FirstOrNull` returns `null` for the expected-absence stance (Guide 2 §2). Second, `Aggregate(seed, fold)` at a class-typed accumulator additionally carries `seed` as a source: the result is usable only while receiver *and* seed live (stdlib §5). An empty source returns the seed itself (stdlib §5). Third, these accessors are *compiler-known* at class elements, because no in-language body over arbitrary `IEnumerable<T>` could hand an element borrow out of its loop (§2's escape rule). A first-element helper of your own takes an indexable receiver and returns `this[i]` — the receiver-sourced spelling the rule admits (spec §28.3).
 
 ---
 
@@ -356,7 +340,7 @@ var kind := s.AsSpan(14);                        // ReadOnlyStringSpan — no al
 if kind.StartsWith("text/") then Accept(); end;
 ```
 
-**A span is a borrow of its buffer.** `Span<T>` is a borrow-bearing record (spec §9.7): it cannot outlive the buffer it views, cannot sit in fields or escape into async frames, and cannot be returned over a buffer that dies with the method:
+**A span is a borrow of its buffer.** `Span<T>` is a borrow-bearing record (spec §9.7): it cannot outlive the buffer it views, cannot sit in a class's instance fields or in any static field, or escape into async frames, and cannot be returned over a buffer that dies with the method:
 
 ```bezel
 method Header(): Span<byte>
@@ -397,7 +381,7 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 |---|---|
 | Hold references owned elsewhere | the borrowing family (`Array<T>`, `Dictionary<K, V>`, …) |
 | Hold resources this holder disposes | the owning family — `Dispose()` cascades, no destructor |
-| Refer to one object from many places — graph edges, a cache's index, a registry — without a stored borrow | `OwningSlotMap<T>` (stdlib §4.21): the map owns, you store the `SlotHandle` value and look it up at use; a removed entry's handle reads absent |
+| Refer to one object from many places — graph edges, a cache's index, a registry — without a stored borrow | `OwningSlotMap<T>` (stdlib §4.21; not yet implemented, [#4604](https://github.com/s8lap/bezel-lang/issues/4604)): the map owns, you store the `SlotHandle` value and look it up at use; a removed entry's handle reads absent |
 | Read elements, either family | an `IEnumerable<T>` / `IReadOnlyList<T>` parameter |
 | Look at an element | indexer, `Peek`, `GetOrNull` — borrows, no obligation |
 | Take one element out | `Pop*` / `Dequeue` / `PopValue` — owned result (`move coll[i]` + restore for replace-in-place) |
@@ -405,10 +389,10 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 | Read query results twice | `.ToArray()` first — a bound query is single-consumption |
 | Aggregate one group many ways | `GroupBy` — outer sequence once, each group re-enumerable |
 | Keep an element past the loop | a concrete collection-backed source (materializing gives one only where the elements' own owner outlives the use); the owning path when elements are minted |
-| Tally occurrences | `Counter<K>` (stdlib §4.20) — not a dictionary dance |
+| Tally occurrences | `Counter<K>` (stdlib §4.20; not yet implemented, [#3848](https://github.com/s8lap/bezel-lang/issues/3848)) — not a dictionary dance |
 | Zero-copy sub-range | spans via `AsSpan()` — bounded by the source's life (string spans exempt) |
 | Share bulk data across domains, forever | `FrozenArray<T>`, under `Shared<T>` |
 
-And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a pipeline whose enumerator owns the elements** (§6 — warned since v0.243 where the producer is same-unit, widened at v0.268 to adopt-then-yield producers and to chains through `ToArray()`/`GroupBy`, spec §29.11; materializing does not help — give the elements an *owner*, or use each one in the loop body that borrows it); **holding a span past its buffer** (§7 — the caller owns the storage).
+And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a pipeline whose enumerator owns the elements** (§6 — warned where the producer is a directly-called same-unit iterator, minting or adopt-then-yield, through `ToArray()`/`GroupBy` chains too, spec §29.11; materializing does not help — give the elements an *owner*, or use each one in the loop body that borrows it); **holding a span past its buffer** (§7 — the caller owns the storage).
 
 Three habits carry most of it. Pick the family that states who disposes, and let `Dispose()` cascades and `Drain()` do the element work — hand-written disposal loops over collections are almost always the wrong shape. Treat everything a loop or accessor hands you at class elements as a borrow unless the name says transfer (`Pop`/`Drain`). When you need it longer, take ownership explicitly rather than fighting the borrow checker. And treat a lazy query as a value you spend: bind it, consume it once, and reach for `ToArray()` the moment you need the results twice. The compiler enforces all three; the errors are it finding a leak, a dangle, or a silent re-execution before they happen.

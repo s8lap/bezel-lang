@@ -4,7 +4,7 @@ public class OwningBuffer<T>                    // class T: conforms to IEnumera
   readonly property Length: int;                // immutable after construction
   property [i: int]: T? { get;  set(owned); }   // class T: set disposes previous, `move buf[i]` ADMITTED
   property [i: int]: T  { get;  set; }          // value T: `move buf[i]` NOT admitted
-  method DangerousPointer(): Ptr<T>;            // value T only
+  method DangerousPointer(): Ptr<T>;            // value T only; NOT YET IMPLEMENTED (#1717)
   method AsSpan([start[, length]] | r: Range<int>): Span<T>;
   method AsReadOnlySpan([start[, length]] | r: Range<int>): ReadOnlySpan<T>;
 end

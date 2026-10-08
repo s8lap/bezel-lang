@@ -6,9 +6,10 @@ public class Task
   public method Wait();
 
   destructor;       // runs continuation cleanup and disposes any
-                    //   unconsumed `owned` result. Task is non-trivial-
-                    //   dispose, which is why discard `_ := someAsyncCall();`
-                    //   is rejected ([§17.13](#sec-the-discard-_)).
+                    //   unconsumed `owned` result. Disposing a task
+                    //   abandons a running operation, which is why
+                    //   `_ := someAsyncCall();` is rejected
+                    //   ([§17.13](#sec-the-discard-_), A6).
 end Task;
 
 public class Task<T>: Task

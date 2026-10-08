@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.291.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.328.*
 
 Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details (teaching order here, not the rule's band order):
 
@@ -56,7 +56,7 @@ end;
 
 `n += 1` is admitted exactly where `n := n + 1` is, and `n++` with it (spec §6.6, §17.6). Outside a narrowing both are compile errors, and the diagnostic names the three remedies — narrow first, or write `n := (n ?? 0) + 1;` or `n := n! + 1;` (spec §7.11).
 
-One rule that bites people: **narrowing applies to locals and `readonly` fields only, never to mutable fields or properties.** A mutable field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it. Copy it to a local first:
+One rule that bites people: **narrowing applies to locals, non-`ref` parameters, and `readonly` fields only, never to mutable fields, properties, or `ref` parameters.** A mutable field can be reassigned between the check and the use by things the compiler cannot see — a method call that writes it, a closure, or another continuation interleaving at an `await` — so the compiler will not narrow it; a `ref` parameter aliases a location the caller can still write the same way. Copy it to a local first:
 
 ```bezel
 var local := _field;               // copy
@@ -65,7 +65,7 @@ if local <> null then
 end;
 ```
 
-The exception is `readonly` fields. A nullable `readonly` field — instance or static — narrows like a local: nothing can rewrite it after construction, so no call, closure, or `await` can invalidate the fact. The tracked shape is one field directly off a tracked root (`this._f`, `TypeName._s`, or a tracked `local._f`). The rule does not apply inside the declaring type's constructors and initializers, where the field is still being assigned (spec §7.4).
+The exception is `readonly` fields. A nullable `readonly` field — instance or static — narrows like a local: nothing can rewrite it after construction, so no call, closure, or `await` can invalidate the fact. The tracked shape is one field directly off a tracked root (`this._f`, `TypeName._s`, or `v._f` off a tracked local or non-`ref` parameter `v`). The rule does not apply inside the declaring type's constructors and initializers, where the field is still being assigned (spec §7.4).
 
 Locals can lose their narrowing too. A local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
 
@@ -125,7 +125,7 @@ method TryPopCached(name: string, out owned conn: Connection? when true): bool
 end TryPopCached;
 ```
 
-The method is named `TryPopCached`, not `TryGetCached`, on purpose. Where the two operations genuinely differ — `Get`/`Peek` leave the entry in place and borrow; `Pop`/`Drain` also remove it and transfer — the stdlib keeps distinct names, so the name alone tells you whether you now owe a disposal (spec §22.6's `out owned` rule; stdlib §1). A pair that differs *only* in ownership on an **ordinary (argument-side)** parameter is instead a same-name overload pair since v0.250, the call-site `move` marker telling the forms apart (stdlib §1). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
+The method is named `TryPopCached`, not `TryGetCached`, on purpose. Where the two operations genuinely differ — `Get`/`Peek` leave the entry in place and borrow; `Pop`/`Drain` also remove it and transfer — the stdlib keeps distinct names, so the name alone tells you whether you now owe a disposal (spec §22.6's `out owned` rule; stdlib §1). A pair that differs *only* in ownership on an **ordinary (argument-side)** parameter is instead a same-name overload pair, the call-site `move` marker telling the forms apart (stdlib §1). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
 
 ```bezel
 if pool.TryPopCached("primary", out using var c) then
@@ -139,7 +139,7 @@ end;                               // c disposed at the end of the enclosing blo
 
 ## 3. Expected failure: outcomes with information — `Result<T, E>` and domain choices
 
-When the failure itself has something to say — *which* error, at *which* position, of *which* kind — absence is not enough. **The `choice` return** is the tool when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data. And the `case` over it is exhaustiveness-checked: adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
+When the failure itself has something to say — *which* error, at *which* position, of *which* kind — absence is not enough. **The `choice` return** is the tool when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data. And a `case` over it is proven exhaustive with no `_` arm (spec §19.6). In expression position, a `case` that misses an outcome draws the compiler's missing-arm warning, so adding an outcome flags every such consumer at compile time instead of silently falling through a null check; a statement-position `case`, like the one below, draws no warning and does nothing when no arm matches:
 
 ```bezel
 public method ParsePort(text: string): Result<int, string>
@@ -158,7 +158,7 @@ case ParsePort(arg) of
 end;                                  // exhaustive; no _ arm needed
 ```
 
-The bare `Ok(value)` / `Error(msg)` spelling is **declared-result target-typing** (spec §35.3). In a `return` statement — or an expression body, or a lambda with a return-type ascription — whose declared result type is a choice, a bare case name constructs that choice's case; the declared type supplies the type arguments whole. The qualified `Result<int, string>.Ok(value)` remains valid everywhere. The bare form exists for exactly these positions, and if a case name shadows something in scope the compiler warns. Restating the full type at every `return` was the old cost of the choice return; it is gone.
+The bare `Ok(value)` / `Error(msg)` spelling is **declared-result target-typing** (spec §35.3). In a `return` statement — or an expression body, or a lambda with a return-type ascription — whose declared result type is a choice, a bare case name constructs that choice's case; the declared type supplies the type arguments whole. The qualified `Result<int, string>.Ok(value)` remains valid everywhere. The bare form exists for exactly these positions, and if a case name shadows something in scope the compiler warns.
 
 `Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := move c;`) — see Guide 1 §9.
 
@@ -187,7 +187,7 @@ public method WellKnownPort(text: string): Result<int, string>
 end WellKnownPort;
 ```
 
-One trap the `??` of §1 does not prepare you for: **a combinator's argument is an ordinary argument, evaluated at the call site before the call — on the success path exactly as on the failure path** (stdlib §2.20, v0.265). `??` is conditional, so `a ?? Expensive()` never runs `Expensive()` when `a` is non-null (spec §7.7); `.UnwrapOr($"bad port: {raw}")` builds that string on the `Ok` path as well. There is no lazy `UnwrapOrElse`. Where the fallback must be computed only on failure, compute it in the `Error` arm of a `case`.
+One trap the `??` of §1 does not prepare you for: **a combinator's argument is an ordinary argument, evaluated at the call site before the call — on the success path exactly as on the failure path** (stdlib §2.20). `??` is conditional, so `a ?? Expensive()` never runs `Expensive()` when `a` is non-null (spec §7.7); `.UnwrapOr($"bad port: {raw}")` builds that string on the `Ok` path as well. There is no lazy `UnwrapOrElse`. Where the fallback must be computed only on failure, compute it in the `Error` arm of a `case`.
 
 Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
 
@@ -211,7 +211,7 @@ end;
 
 `finally` always runs — normal completion, exception, or `return`. An unmatched exception simply keeps propagating (there is no exhaustiveness warning on `catch`; letting non-matching exceptions through is normal). `return` inside `finally` is a compile error.
 
-The built-in hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `FormatException`, `OverflowException`, and so on, available without `import` (the full set is spec §31.4). Library producers declare their own exception types beside their APIs — `IOException` and `FileNotFoundException` with the file APIs, `KeyNotFoundException` with `Dictionary<K, V>`, and others — reached by the producer's `import` and otherwise ordinary. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
+The built-in hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `FormatException`, `OverflowException`, and so on, available without `import` (the full set is spec §31.4). Library producers declare their own exception types beside their APIs — `IOException` and `FileNotFoundException` with the file APIs, `KeyNotFoundException` with `Dictionary<K, V>`, and others — reached by the producer's `import` (none for an auto-imported module such as `System.Collections.Generic`, `KeyNotFoundException`'s home) and otherwise ordinary. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
 
 Two resource-exhaustion faults are deliberately unrecoverable — no `catch` will ever handle them, and both terminate the process. A **stack overflow** raises a `StackOverflowException`: the type exists in the hierarchy, but it **cannot be caught** — no `catch` arm ever matches it. An out-of-memory **allocation failure** is not an exception at all: there is no `OutOfMemoryException`, nothing unwinds, the process simply aborts. Neither is something a `catch` could meaningfully handle — the "handler" would itself need the stack or heap that just ran out — so Bezel does not pretend otherwise.
 
@@ -298,9 +298,9 @@ finally
 end;
 ```
 
-Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. The same holds for a half-built *expression*: if one argument throws while an earlier argument has already produced an owned temporary, that temporary is disposed during the unwind (v0.184) — an exception never leaks a half-built argument list. You do not write code for any of this.
+Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. The same holds for a half-built *expression*: if one argument throws while an earlier argument has already produced an owned temporary, that temporary is disposed during the unwind — an exception never leaks a half-built argument list. You do not write code for any of this.
 
-One edge worth knowing: what if cleanup itself throws *while an exception is already propagating*? A throw escaping a `finally` (or a disposer that throws during unwinding) **supersedes** the in-flight exception — the new one propagates, the old one is disposed (spec §31.2/§28.4). Since v0.259 the buried failure is not lost: before the drop, the runtime snapshots its type, message, and stack trace into the escaping exception's `SupersededChain` (spec §31.4) — the same three-string snapshot machinery as `CauseChain`, chronological, earliest lost first — and the uncaught-exception report prints it. So the failure you see at the top is always the *last* one thrown, and `SupersededChain` is where the *first* one — usually the real one — went. Read it like `CauseChain`: copy the strings out in the arm if you need them past it.
+One edge worth knowing: what if cleanup itself throws *while an exception is already propagating*? A throw escaping a `finally` (or a disposer that throws during unwinding) **supersedes** the in-flight exception — the new one propagates, the old one is disposed (spec §31.2/§28.4). The buried failure is not lost: before the drop, the runtime snapshots its type, message, and stack trace into the escaping exception's `SupersededChain` (spec §31.4) — the same three-string snapshot machinery as `CauseChain`, chronological, earliest lost first — and the uncaught-exception report prints it. So the failure you see at the top is always the *last* one thrown, and `SupersededChain` is where the *first* one — usually the real one — went. Read it like `CauseChain`: copy the strings out in the arm if you need them past it.
 
 One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use is a warning (and a deterministic fault in checked mode); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-consumed", spec §28.3). Both are the compiler catching a use-after-free before it can happen.
 
@@ -313,7 +313,7 @@ One diagnostic worth recognizing in this area: disposing a value and then using 
 | Value may legitimately be absent | nullable return `T?` (the stdlib's `*OrNull` tier: `ParseOrNull`, `GetOrNull`), handle with `?.` / `??` / narrowing |
 | Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
 | Failure is expected, carries information the caller *branches on* at or near the call, and the error payload is a plain value shape | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case`, or — where both payloads are value-like — pipeline with the combinators (`Map`/`MapError`/`AndThen`/`UnwrapOr`, stdlib §2.20) |
-| Failure is expected but consumed at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload is an owned resource | a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§5) |
+| Failure is expected but consumed at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload cannot be a plain value shape (it owns a resource, or carries a borrow; spec §35.4) | a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§5) |
 | Caller violated something a correct caller guarantees (a **bug**, not an outcome) | a `requires(...)` clause (spec §22.16) — always-on, faults `ContractViolationException`; never use `requires` for input whose invalidity is a normal outcome at a trust boundary (that is the `T?`/Try/`choice` territory above) |
 | Invalid input at a boundary with no contract (interop, pre-contract code) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
 | Operation invalid in current state | `throw new InvalidOperationException(...)` (or an `invariant(...)`/`requires(...)` where the condition is a class or caller contract) |

@@ -119,17 +119,15 @@ Accessor        ::= Visibility? "pure"? "get" AccessorBody
                               /* "pure" is admitted on "get" only — a "pure set"
                                  does not parse (the set alternative carries no
                                  "pure" slot); §22.15 states the rule */
-SetterParamSpec ::= "(" "owned"? Identifier? ")"
+SetterParamSpec ::= "(" "owned" ")"
                               /* Explicit setter parameter spec, used when
                                  the parameter modifier needs to be declared
                                  (typically `owned` for owned-element-collection
-                                 indexer setters). The parameter's type is
-                                 always the property's declared type, so it
-                                 is not repeated here. When the parameter
-                                 name is omitted (only the modifier given,
-                                 as in `set(owned)`), the implicit name
-                                 remains `value`. When the SetterParamSpec
-                                 is omitted entirely (`set` alone), the
+                                 indexer setters). The parameter is always
+                                 named `value`, and its type is always the
+                                 property's declared type, so neither is
+                                 written here. When the SetterParamSpec
+                                 is omitted (`set` alone), the
                                  implicit `value` parameter has no modifier
                                  and takes a borrow of the property's declared
                                  type (§22.3, §23.3). Only `owned` is

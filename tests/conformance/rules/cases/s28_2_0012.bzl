@@ -7,7 +7,7 @@
 //!   `DisposedAccessException` in checked mode has undefined behavior in
 //!   unchecked mode: unchecked mode is the release-build relaxation of the
 //!   default checked semantics, not a different language.
-//! cites: 28.2, 28.10
+//! cites: 28.2, 28.3
 //! expect: accept
 //! flags: --unchecked-disposal
 //! issue: 4602
@@ -27,7 +27,7 @@ end Widget;
 public class Program
   public method Demo()
     var w := new Widget();
-    using var view := w;
+    var view := w;
     w.Dispose();
     try
       Console.WriteLine(view.Label);

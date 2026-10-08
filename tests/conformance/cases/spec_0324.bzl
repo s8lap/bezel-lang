@@ -288,8 +288,7 @@ AltPattern      ::= Pattern ("|" Pattern)*
                                  be binding-free: constants, payload-free choice
                                  case names (§35.5), ranges, or
                                  relationals (§19.3). `|` never collides with
-                                 bitwise-or: pattern-embedded expressions parse
-                                 at Shift level or tighter (§19.3). */
+                                 bitwise-or (PatternBound below). */
 WhenExpr        ::= "(" "when" WhenArm ("," WhenArm)* ","? ")"
                               /* Scrutinee-less condition dispatch (§19.1), the
                                  expression-position atom: arms are
@@ -363,8 +362,8 @@ NamedSlot        ::= ("move")? Identifier "=" AltPattern
                                  QualifiedName "(", an Identifier followed by "="
                                  commits the named reading — "=" is not a pattern
                                  relop (RelOpPattern below) and cannot occur in
-                                 pattern-embedded expressions, which parse at
-                                 Shift level or tighter (§17.1). The optional
+                                 a pattern-embedded expression (PatternBound
+                                 below). The optional
                                  "move" marks the slot (v0.250; widened v0.251):
                                  admitted only in an owning match, on an
                                  `owned`-marked payload field or a payload field
@@ -402,7 +401,14 @@ PatternBound    ::= "-"? Shift
                                  leg (a lone Shift is not a range pattern) and no
                                  `step` (patterns test written bounds; stride has no
                                  membership meaning, §16.4). Bounds admit a
-                                 leading `-` for negative literals. */
+                                 leading `-` for negative literals. Every
+                                 pattern-embedded expression — a range bound
+                                 here, a relational operand (RelOpPattern
+                                 Shift) — is a Shift production (§17.1), below
+                                 `|` and `=`: a `|` at pattern level is always
+                                 an alternative separator, and no
+                                 pattern-interior expression can absorb a named
+                                 slot's "=" (§19.3). */
 RelOpPattern    ::= "<" | ">" | "<=" | ">="
                               /* Pattern-form relational operators are restricted
                                  to the four ordering operators. `is`, `is not`,
