@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — 2026-10-07; independent critique round 1 run and resolved (§9; findings log `scratch/v0317/p0133.critic.md`): three blocking findings (two soundness routes the draft missed, and a false "zero tests flip" claim) fixed inside Option 5, which stands as amended; owner ruling pending on §7 |
+| **Status** | graduated-v0.320 — superseded — graduated v0.320 (owner-accepted 2026-10-08 with §7's six recommendations; graduated in the v0.320 train with #5486's local half and #5499 under the composition gate; landed with the v0.320 changelog entry; graduation notes in §10) |
 | **Tracking issue** | [#5375](https://github.com/s8lap/bezel-lang/issues/5375) (folds in #5376's function-type-substitution half, per the v0.316 ruling train) |
 | **Target module(s)** | **spec** — §28.3 (*Borrow lifetime rules*, the closure bullet: one new clause, *set-erasing positions*; the announcement table's row 5 runtime-managed cell, one qualifying phrase; *Record components of function type*, the type-parameter sentence re-pointed; beside the `Task`-family exclusion, one admissibility paragraph for type parameters in nested parameter slots), §28.14 (the lead paragraph's "among the rest"; *The method-reference formation bar*, widened to set-erasing positions), §27.6 (one cross-reference), §28.1 (clause 3: one cross-reference), Appendix C (one invariant row); **rationale** §4.2 (a dated record); **code-generation reference** §4.4 (the closure bullet) and §7.2 (one row); `DECLINED.md` (three `rejected` rows, one `deferred` row annotated); **no stdlib change**; **compiler** (tracked at graduation) |
 | **Written against** | spec **v0.316** (`cef9a1f`, October 2026); stdlib companion v0.316; rationale v0.316 |
@@ -437,3 +437,16 @@ Independent adversarial critique, 2026-10-07. Findings log: `scratch/v0317/p0133
 - N10 and N11: §8 items 23 and 24.
 
 **Verified and unchanged:** 0126 §2's decline; 0132 §7's deferral bar; 0105's invariant; 0048's refactor hazard; rationale §4.2 (v0.298, v0.316 records), §5.24's #5374 addendum and §5.25 ("borrow-free by construction"); the K2.4 and §28.14 asymmetry quotations; the #5376 and #5377 v0.316 sentences; the §9.7, §3.1 and §14.2 quotations; the `DECLINED.md` #5360 `rejected` row and the *Unbounded retention tier* `deferred` row; the kernel class (derivation) and body-locality (local, plus one carve-out after B2); no conformance case flips. The Bezel programs use only members the stdlib companion declares.
+
+---
+
+## 10. Graduation (v0.320)
+
+The owner accepted Option 5 on 2026-10-08 with every §7 recommendation: (1) `Raise` rejected at a function-type payload, no allowlist; (2) the `Object`-typed stdlib sinks stay rejections; (3) `scoped x: T` stays unwritable, closed as not the remedy; (4) row 5's result is capture-free at a function-type substitution; (5) graduation in the same train as #5486's local half and #5499, under the composition gate; (6) the nested-slot exclusion. The pins were re-verified against v0.319's working text, where row 4 and the field-store bullet's clause 2 gained a generic-body reading of type-parameter-typed arguments; that reading composes, since at a function-type substitution such an argument is capture-free under the clause. Differences from §6 as landed:
+
+- §27.1.1's contravariance sentence, not §28.14's bar, carries the statement that a function-typed target slot is not retyped to a value's `Object` slot, since §27.1.1 is that rule's single normative statement; the compiler already conforms (`functionSlotConvertible` admits contravariance only between two class or interface slots).
+- §28.14's caller-side sentence and the closure bullet's extension-method note are qualified for the return-slot arm, which restricts what a function-typed parameter accepts; §6 had said they were unchanged.
+- *Choice payloads and inline-array slots of function type* (v0.317) is re-pointed like the record-component sentence.
+- The inferred-instantiation sweep §5.4 owed found a second flip, `generic_bare_typeparam_function_value_arg_5178.static_void_method_infers_function_parameter_value` (`Util5178d.Take(f)` with `f` a plain function-typed parameter); the #5499 half flips `call_bounded_2814.store_into_local_collection_clean`, `lambda_own_param_call_bounded_1432.store_into_local_collection_accepted` and `codegen_1073_closure_arg.local_collection_sink_released_once_spec_28_14`.
+- §8 item 4's return-slot-arm refinement is recorded as a `deferred` row.
+- Folded in by the graduation critique (`scratch/v0320/g0133.critic.md`): a `yield return` of a function value is judged as `return` is (the closure bullet), without which row 5's capture-free result is false for a terminal accessor over an iterator that yields a closure over its own parameter; §27.1.1's return-slot covariance is stated not to retype a function-typed value slot to `Object`, closing `() -> (() -> int)` passed where `() -> Object` is expected; a `scoped` parameter declared `Object` is a set-erasing position (`Object` is a class, §3.1, so §28.14's class-typed `scoped` reaches it); and a lambda's return path is named among the `return` sites.

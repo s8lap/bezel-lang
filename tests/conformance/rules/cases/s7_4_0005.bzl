@@ -2,8 +2,9 @@
 //! doc: spec
 //! section: 7.4
 //! title: a mutable field never narrows, even after a null check
-//! rule: The compiler narrows local variables and `readonly` fields; it never
-//!   narrows mutable fields or properties.
+//! rule: The compiler narrows local variables, parameters other than `ref`
+//!   parameters, and `readonly` fields; it never narrows mutable fields,
+//!   properties, or `ref` parameters.
 //! expect: reject
 //! diagnostic: never narrow
 module Conf;

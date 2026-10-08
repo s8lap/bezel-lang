@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.319 — October 2026**
+**Companion to the Bezel Language Specification, v0.320 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -10821,5 +10821,225 @@ The rulings train: nine issue rulings, seven rulings and clarifications from pro
   - #5503: `Show<T, E>(r: Result<T, E>): string => $"{r}"` at `Show<Widget, string>` (run, the qualified name); `$"{r}"` for a closed `r: Result<Widget, string>` in a generic body (reject).
   - #5504: `Outer<U> where U: class` holding `Inner<U>` over `OwningArray<U>`, at `Outer<string>` (reject); a two-level hash-key wrap at a non-hashable record (reject); `Outer<U> where U: class` holding a `Box<U>` with an `owned` field, at `Outer<string>` (reject); `Outer<T> where T: hashable` holding a `Dictionary<T, int>` at `Outer<int>` (accept).
   - #5507: a consume of a `T`-typed source while a row 4 invocation result it sources is live (reject).
+
+---
+
+### v0.320 changelog (v0.319 → v0.320)
+
+**The owner-decision train.** On 2026-10-08 the owner accepted proposal [0133](proposals/0133-set-erasing-positions.md) ([#5375](https://github.com/s8lap/bezel-lang/issues/5375)) with its §7 recommendations, and accepted every recommendation the coordinator put to them on the open `needs-owner-decision` questions filed by v0.317 and v0.318. This revision lands those decisions, with the three decidable questions v0.319 filed, in four lanes:
+- `g0133`: the graduation of proposal 0133 ([#5375](https://github.com/s8lap/bezel-lang/issues/5375)), with #5486's parked local half ([#5486](https://github.com/s8lap/bezel-lang/issues/5486)) and [#5499](https://github.com/s8lap/bezel-lang/issues/5499), which 0133's soundness argument depends on.
+- `owner`: [#5484](https://github.com/s8lap/bezel-lang/issues/5484), [#5500](https://github.com/s8lap/bezel-lang/issues/5500) and [#5491](https://github.com/s8lap/bezel-lang/issues/5491), and the declines [#5497](https://github.com/s8lap/bezel-lang/issues/5497), [#5505](https://github.com/s8lap/bezel-lang/issues/5505) and [#5506](https://github.com/s8lap/bezel-lang/issues/5506).
+- `misc`: [#5510](https://github.com/s8lap/bezel-lang/issues/5510), [#5512](https://github.com/s8lap/bezel-lang/issues/5512) and [#5513](https://github.com/s8lap/bezel-lang/issues/5513), with a §2.8.6 narration fix.
+- `g0134`: the graduation of proposal [0134](proposals/0134-ref-parameters-do-not-narrow.md) ([#5495](https://github.com/s8lap/bezel-lang/issues/5495)). Proposal 0134 was drafted in this train from the owner's accepted option (ii) and critiqued before graduation (3 blocking and 9 non-blocking findings, all resolved in the proposal).
+
+Each lane passed its author's adversarial pass and an independent critique: 6 blocking and 35 non-blocking findings, all resolved or recorded (`g0133` 3 and 10, `owner` 1 and 9, `misc` 2 and 8, `g0134` 0 and 8). The 114 edits (`g0133` 40, `owner` 31, `misc` 17, `g0134` 26) were applied as one sequence.
+
+The critics' blocking findings were these:
+- `g0133`: return-slot covariance still let a function value reach `Object` with no site (`() -> (() -> int)` used as `() -> Object`), so §27.1.1 now states both directions. A `scoped o: Object` parameter had been declared never set-erasing, though `Object` is a class (§3.1). A `yield return` of a function value had been left open, and is now judged as a `return` is.
+- `owner`: the new §14.2 bullet called the signature remedy "closed" for every member of the equality search, which is true only for the interface members.
+- `misc`: the #5510 records dropped one of the two grounds of v0.319's recorded decline, and its migration list of pinning tests was mostly wrong. The corrected list is 10 lit files and 21 gtest cases, including 7 tests that would go vacuous rather than fail.
+
+A composition check over the union then fixed four seams:
+- §23.3 and Appendix B called the setter's implicit `value` "a parameter of the setter like any other", which read against §28.3 and §28.14's empty-set treatment of that parameter. It is now "a parameter of the setter", with §21.1 applying "as to any other parameter".
+- §28.14's fan-out sentence read "a purely-local collection (a purely local collection, …)".
+- Rationale §10's #5491 paragraph had been placed between the v0.318 and v0.319 paragraphs, where the v0.319 paragraph's "the cost … stated above" pointed at it. It now follows the v0.320 paragraphs.
+- Four rationale sentences narrated a superseded state ("no longer take", "resolved … and rendered", "restores", "already read"), and now state the rule conditionally or in the present.
+
+Proposal [0135](proposals/0135-value-receiver-by-copy-when-source-writable.md) ([#5496](https://github.com/s8lap/bezel-lang/issues/5496), the owner's accepted direction that a value receiver is passed by copy whenever its source may be written) is in the folder. It has been critiqued (round 1: 6 blocking and 10 non-blocking findings). Its move-only half, which the direction leaves open, was settled by the owner-delegated choice of *F* (admit the call in place and close the hazard where a move-only payload is bound), recorded in the proposal's §13; it graduates in the next train after that decision's critique.
+
+- **§28.3 / §28.14 / §27.1.1 / §27.6 / §28.1 / Appendix C, rationale §4.2 — function values at set-erasing positions (graduation of proposal 0133; owner decision; [#5375](https://github.com/s8lap/bezel-lang/issues/5375)).** A generic body is checked once under §28.1's class-or-interface assumption, so `_v := x` with `x: T` is a parameter-sourced borrow admitted under the field-store bullet's residual. The caller's closure bullet tracks a function value by its source set, and a plain `T` parameter does not carry one. With neither side rejecting, `new Holder<() -> int>(f)` stored a closure over a scope-bound local in a field whose read "carries the empty set". `Object` (`k.Keep(f)` over `Keep(o: Object)`) and a function-typed parameter whose return slot is a bare `T` (`constructor(mk: () -> T)`) erased the set the same way.
+  - The closure bullet defines a **set-erasing position**: a position declared `Object`, or a parameter, return slot, `ref`/`out` location, record component, choice payload or inline-array slot declared at a bare type parameter that the instantiation substitutes with a function type. A function value reaches one by implicit conversion, at an argument, an initializer, an assignment, a `return` (a lambda's included), a pattern binding, a collection-literal element or a `with` assignment. It also reaches one through every invocation of an argument bound to a function-typed parameter whose return slot, reached through return slots only, is such a type parameter.
+  - At a set-erasing position a function value with a non-empty source set is rejected and a capture-free one is admitted. The receiver of a member `Object` declares (`f.ToString()`, an interpolation hole) is not such a position. A `scoped` parameter of function type is not one either, but a `scoped` parameter declared `Object` is. The check is the caller's, over the callee's declared signature, and the generic body is not re-checked.
+  - A function value is not returned from an iterator by `yield return` while its set is non-empty, as for a `return`. An iterator's element type announces no set either.
+  - §27.1.1: neither variance rule relates a function-typed slot to an `Object` slot. A function-typed target parameter slot is not contravariant to a value's `Object` slot, and a function-typed value return slot is not covariant to a target's `Object`.
+  - Two companion rules close the routes with no conversion at a caller. §28.14's *method-reference formation bar* also rejects a function-typed slot bound to a set-erasing callee parameter, capture-free uses included (`var add := xs.Add;` at `xs: Array<() -> int>`; `var keep: (() -> int) -> () := k.Keep;`), with a lambda as the remedy. A member with a type parameter in a parameter slot of a parameter slot (`Fill(reg: ((T) -> ()) -> ())`) is inadmissible at a function-type substitution of it, beside the `Task`-family exclusion.
+  - Row 5's runtime-managed cell states that the result is capture-free at a function-type substitution. The #5377 record-component sentence and the #5486 payload/slot sentence are re-pointed: a component, payload or element declared at a type parameter is a set-erasing position at a function-type substitution. §28.1 clause 3, §28.14's caller-side sentence and extension-method note, and §27.6 cross-reference the rule. Appendix C gains three rows here (set-erasing positions, the widened formation bar, the nested-slot exclusion) and one under #5499.
+  - Costs, with remedies:
+    - `Console.Write`/`WriteLine(Object)`, `StringBuilder.Append(Object)` and `Equals(Object?)` reject a capture-bearing argument. Use `f = g` to compare, and print a description.
+    - `EventSource<T>.Raise` at a function-type payload rejects one. Raise data instead.
+    - A selector `Pick<T>(a: T, b: T): T` rejects one. Use `(if c then f else g)`.
+    - A received callback is not forwarded to a generic or `Object`-typed utility.
+    - `Contains`/`IndexOf`/`Remove` at a function-typed element would find nothing anyway.
+  - The owner's answers: no `Raise` allowlist (Q1); the `Object` stdlib sinks stay rejections (Q2); `scoped x: T` stays unwritable and is not the remedy (Q3); row 5's result is capture-free (Q4); one train under the composition gate (Q5); the simple nested-slot rule (Q6).
+
+  **Declined** (owner-accepted with the proposal):
+  - an instantiation exclusion keyed on `T`-typed fields (Option 2a);
+  - a declaration-site store rejection in generic bodies (Option 3);
+  - a K4.3 trust residual for function values (Option 4, on proposal 0126 §2's record);
+  - a per-member `Raise` exemption;
+  - `ToString`-only stdlib overloads at function types;
+  - `scoped x: T` as the remedy;
+  - row 5 announcing its arguments' union;
+  - lambda-literal slot marking in place of the nested-slot exclusion.
+
+  **Deferred:** a body-keyed exclusion (Option 2b), recorded as a second dependent of proposal 0132's storage fact on the #5374 row; and exempting the return-slot arm where the member's own return is mint-announcing (lazy selectors). Eight `rejected` rows and one `deferred` row, and the *Unbounded retention tier* row gains the `Pick<T>` instance.
+
+  Kernel: derivation (K2.3 + K2.4; the companions K2.4, and K1.6 + K2.4). Body-locality: local, with one carve-out (the nested-slot exclusion, §3.6 rule 2's per-instantiation admissibility). The code-generation reference's closure line, call-bounded line and §7.2 carry the rule. Proposal 0133 is `graduated-v0.320` with a §10 graduation note.
+
+  **Compiler (tracked):** nothing implements the rule. `callBoundedParams_` is seeded with plain function-typed formals only (`Ownership.cpp:480`, `:1740`). The generic body's store is admitted, and the caller side of a bare-`T` or `Object` parameter is unchecked. The formation bar's existing site (`ExprTypecheck_Calls.cpp:21516–21559`) checks register positions only.
+- **§28.14 / §28.3 / §31.2 (exception arms) / §15.1, rationale §4.2 — no function value in a local collection; frames keep the exemption (owner decision; [#5499](https://github.com/s8lap/bezel-lang/issues/5499), with [#5486](https://github.com/s8lap/bezel-lang/issues/5486)'s local half).** §28.14's call-bounded default let a received callback live in "a purely local collection". The closure bullet gives a function value read from any collection the empty set, so `var xs: Array<() -> int> := []; xs.Add(f); _field := xs[0];` stored a call-bounded `f` in a field. `var fs: [1]() -> int := [cb]; _f := fs[0];` did the same through a local inline array.
+  - A call-bounded callback is not stored in any collection, a local one included.
+  - A deferred-activation frame carrying the callback, or a task minted by invoking it, may still be held in a *purely local* collection: one that is not a parameter, a borrow or a field, nor reached through one. The fan-out idiom `pending.Add(cb()); await Task.WhenAll(pending);` is unchanged.
+  - Every slot of a function-typed inline array is a field under the closure bullet, a local array's included (§15.1, §28.3, Appendix C).
+  - The exception-arm paragraph's "a collection local to the arm is an arm-local binding" is withdrawn for closures, on the same ground (fold-in).
+
+  **Declined:** tracking a local collection or local inline array as a carrier of its elements' source sets. Its value or reference copies into returns, fields, components, plain arguments and `Object`, none of which announces a set. One `rejected` row. Kernel: derivation (K2.4). Body-locality: local.
+
+  **Compiler (tracked):** `exprReachableBeyondCall` (`Ownership_Checks.cpp:22255`) treats a local root as purely local for every value. `checkRefOutLambdaCaptureOnStore` (`:6430`) has no `IndexExpr` destination into a local inline array.
+- **§21.1 / §23.3 / Appendix B / Appendix C.5, rationale §8.1 — a setter's implicit `value` is a parameter under the local-name rules (owner decision; [#5484](https://github.com/s8lap/bezel-lang/issues/5484)).** v0.314 and v0.316 kept the implicit `value` outside §21.1's *Local names*, because Appendix B said it "may be shadowed inside the setter body". The owner retired that permission, and the set parked at v0.317 lands with its pins retargeted to v0.320.
+  - A declaration in a setter body may not take the name `value` while the implicit parameter is in scope. That covers a body-top local, or a nested local, loop variable, arm binding, binding-atom clause, or lambda parameter or slot, in a property's setter or an indexer's.
+  - Appendix B says the name is not a true keyword in that role: it is a parameter of the setter, and §21.1's *Local names* applies to it. §23.3 and C.5 say the same, and §23.3 states the `set(x)` spelling, which Appendix A's `SetterParamSpec` already admits.
+  - The remedy is a fresh local name, or `set(v)` / `set(owned v)`, which renames the parameter and frees `value` in that setter.
+
+  **Declined:** keeping the exemption at body top and nested, which leaves one parameter outside both rules in the position where an owned obligation most often arrives; and keeping it at body top only, which is the same-scope rebinding v0.314 declines, applied to one parameter. One `rejected` row. Rationale §8.1 gains the paragraph, and its v0.316 sentence points to it. The code-generation reference's setter row names `set(x)` and gains a WRONG line. Kernel: no contact. Body-locality: local.
+
+  **Compiler (tracked):** sema still exempts a property setter's implicit `value` (`setterImplicitValueExempt_`, `ExprTypecheck.cpp:18132`).
+- **Stdlib §2.3, rationale §15.x — `Convert.ToString(value: float)` (owner decision; [#5500](https://github.com/s8lap/bezel-lang/issues/5500)).** With five one-argument overloads, `Convert.ToString(0.1f)` resolved to `ToString(double)` (§22.6, `float → double` being its one applicable conversion). It rendered `"0.10000000149011612"` where `0.1f.ToString()` is `"0.1"`, silently breaking §2.3's own equation (v0.317, [#5490](https://github.com/s8lap/bezel-lang/issues/5490)).
+  - §2.3 declares `ToString(value: float)`, so the call is an exact match, `Convert.ToString(0.1f)` is `"0.1"`, and the paragraph's widening example is gone.
+  - A `char`, `sbyte`, `byte`, `short`, `ushort`, `uint` or `ulong` argument is still a §22.6 ambiguity. `char` stays an error by the owner's direction.
+
+  **Declined:** keeping the five overloads, and the rest of .NET's set. `char` and the narrow integers share `float`'s arrival ground but are declined on cost: each call is a compile error today, not a wrong string, and its remedy is one call. One `rejected` row. The code-generation reference's `Convert` block lists `float`. Kernel: no contact.
+
+  **Compiler:** conforms for rendering (`emitPrimitiveToString` renders a `float` argument as `float`). v0.317's tracked item "render a `float` as its widened `double`" is withdrawn. Its §22.6-resolution item stands, now over six parameter types.
+- **§14.2 register / stdlib §4 / Appendix C.1, rationale §10 — the standard library's equality search is rejected at the call where the element type has no equality (owner decision; [#5491](https://github.com/s8lap/bezel-lang/issues/5491)).** The equality search compares an argument with stored elements by `Equals` on an unconstrained element type:
+  - `ICollection<T>.Contains`/`Remove(item)` and their `Array<T>` and `LinkedList<T>` implementations;
+  - `Stack<T>.Contains` and `Queue<T>.Contains`;
+  - `Array<T>.IndexOf`/`LastIndexOf`;
+  - `LinkedList<T>.Find`;
+  - the span family's `IndexOf`, `Contains` and `SequenceEqual`.
+
+  At a record or choice with no equality the comparison had nothing to reach, and v0.318 had kept standard-library types out of the interior-use rule.
+  - A call is admitted only where the element type, nullability stripped, has a member for §9.2's first kind (`Equals` with an argument of that type). Elsewhere it is a compile error at the call, `x in xs` included. The collection type stays well-formed: `Array<R>` is usable, and only its search is refused.
+  - In a generic body, a call at an element type involving a type parameter is that body's own comparison, checked at its instantiations as a written `Equals` is. A user `Bag<T>` delegating to `items.Contains(x)` is rejected at `R` as one writing `Equals` is.
+  - The members are conditionally admitted. §14.2's register gains a fourth row and a disposition bullet: the row lapses if a member-level condition is admitted, and the bullet states which signature remedies are closed and why. Stdlib §4 gains the paragraph listing the members (anchor `sec-collection-equality-search`), and the §4.4 register comment and both spans' *Search and equality* paragraphs point to it. Appendix C.1's equality bullet gains the clause. The code-generation reference's `Array<T>` block and *Generics* line state the rule. Signatures are unchanged.
+  - The family goes past the owner's named list by `LinkedList<T>.Find` and the span `SequenceEqual`, which compare the same way.
+  - Remedy: declare equality on the element type (making it `hashable`), or test a key with a predicate (`Any`) or a loop.
+
+  **Declined:** a `hashable` constraint on the members. A constrained block is never consulted for a name the receiver declares (§26.5 rule 1) and cannot carry `ICollection<T>`'s members (§26.3). A member-level `where` is Appendix C.1's declined form. Either would also demand a `GetHashCode` a linear search never calls. Comparing by identity is declined too, as the box identity §9.2 declines. One `rejected` row. The stated cost: a call through `ICollection<R>` is refused even where the implementing class is a user's whose `Contains` does not compare by `Equals`. Kernel: no contact. Body-locality: local at a concrete element type, and a carve-out (generic instantiation) for the generic-body reading.
+
+  **Compiler (tracked):** `Array<T>.Contains` is already rejected at a non-hashable `T` (`linqHashableCheck`, #3331), keyed on `hashable` rather than the first kind. `IndexOf`, `LastIndexOf`, `Remove`, `LinkedList<T>.Find`, `Stack`/`Queue` `Contains` and the span family are not gated. `isEqualityBearing` (`SymbolCollection.cpp:2438`) passes the declaration-less builtin span records.
+- **§9.8 / §12.2, rationale §5.22 — the hand-written serialization edges stay closed (owner decisions; [#5497](https://github.com/s8lap/bezel-lang/issues/5497), [#5505](https://github.com/s8lap/bezel-lang/issues/5505), [#5506](https://github.com/s8lap/bezel-lang/issues/5506)).** No normative text changes.
+  - A `serialized skip` or `serialized optional` component's type must be defaultable whatever directions the class declares (#5497). A `Deserialize`-only reading is the direction-dependent eligibility §9.8 declines for a record's collection components and v0.316 declines for a base. The nullable form is the remedy.
+  - A derived class's hand-written `Serialize`/`Deserialize` over a base's synthesized member stays a §12.2 hiding declaration (#5505, declined). Admitting it would admit the static-type-selected shadow the member-hiding record declines, and its `base.Serialize(s)` exemption would relax §9.8's run-time type check. The design also left unstated the identity tag a `base.Serialize(s)` of `this` writes, and it has no read counterpart. A hierarchy that needs a form per class hand-writes the base's `Serialize` as `virtual`.
+  - A derived class's recognized static `Deserialize` over a base's hand-written one stays rejected (#5506): a static has no `override` escape, and the hierarchy deserializes through one factory. **Deferred**, to be revisited with the `IDeserializable.Deserialize` static-interface promotion ([#1507](https://github.com/s8lap/bezel-lang/issues/1507)), under which each class's factory would be its own conformance witness.
+
+  Rationale §5.22 gains one paragraph. `DECLINED.md` gains two `rejected` rows and one `deferred` row, placed beside the #1507 row. Kernel: no contact. Body-locality: not applicable.
+- **§14.2 / stdlib §4.20, rationale §10 — a declared constraint at a type-parameter argument is decided where it is written (ruling; [#5510](https://github.com/s8lap/bezel-lang/issues/5510)).** v0.319 left open (§3.6 rule 2's "a declared constraint is not a requirement of this kind") whether `C<W>` in `class Box<W>`, under `class C<T> where T: new()`, is rejected at the declaration or checked at each `Box<X>`. The text settled it at the naming only for interface bounds (conformance rule 6) and the derived-property constraints. For `new()`, `class`, `value`, `notnull` and the type bounds it had no rule, because no type parameter is in their substitution sets.
+  - §14.2 gains *A type parameter as the type argument*. At an instantiation site whose argument for a constrained parameter is a type parameter `P`, each constraint is decided there by `P`'s own constraints. For a method type parameter of an override or implementation, those are its constraint set.
+  - `P` satisfies the constraint exactly when its constraints guarantee it at every substitution they admit, by language rule, as §22.6's declaration guard reads conformance. An ordinary interface bound guarantees no exclusion. A derived-property constraint is guaranteed only by the same constraint on `P`.
+  - The remedy is restating the constraint on `P`, after which the wrapper's own instantiations satisfy the inner one by construction.
+  - Stdlib §4.20's note that `Counter<K>` and `Dictionary`'s key check "decide identically" is scoped to a concrete key type. The code-generation reference's *Generics* line states the rule, and its owning-collections line says a generic type holding one at its own `T` states `where T: class` itself.
+
+  **Declined:** deferring the constraint to the wrapper's instantiations, which is the compiler's behaviour. A declared constraint is a signature fact that the wrapper can restate, save the concrete-argument case below. v0.319's other ground for its requirement decline, that rejecting would refuse wrappers at their admissible instantiations, does not reach a declared constraint: §3.6 rule 2 leaves those to §14.2, whose rule 6 and derived-property constraints already refuse such wrappers (`Box<W>` holding `Counter<W>`, at `Box<int>`). One `rejected` row. The stated costs: an inner `where T: U` at a concrete argument no type bound reaches (`C<W, int>`) has nothing to restate and is rejected for every `W`; and `Counter<V>` and `Dictionary<V, int>` decide at different sites for a type-parameter key. Kernel: no contact. Body-locality: local.
+
+  **Compiler (tracked):** `TypeResolution_Checks.cpp:11285` records a deferred obligation, and `checkDeferredNestedConstraints` (`:11479`) discharges it at the outer instantiations. `checkMethodGenericConstraints` (`ExprTypecheck_Calls.cpp:4654`) has no type-parameter branch: it is lenient for `class`, `hashable` and `new()`, and wrong for `value`.
+- **§2.8.6 / §3.6 rule 3, rationale §7.7 and §10 — a change to a generic's requirement summary is a classified delta (ruling; [#5512](https://github.com/s8lap/bezel-lang/issues/5512)).** §2.8.6 classified "carried generic bodies … changed, contract records unchanged" as preserving. Since v0.318 (#5493) and v0.319 (#5504), an interior use in a carried body or field is a requirement that rejects clients' instantiations.
+  - §2.8.6 now classifies a public generic declaration's **requirement summary** in two rows: a requirement gained is breaking and one lost is widening, the verdicts of a generic constraint added and removed. The summary is the set of requirements §3.6 rule 2 places on a type parameter's substitutions beyond what its constraints establish, from interior uses or carried through instantiations it forms.
+  - The preserving row covers only carried changes that leave both the contract records and the summaries unchanged. §3.6 rule 3 states the breaking case. Rationale §7.7's and the v0.318 paragraph's "gap" sentences now state the current rule.
+
+  **Declined:** reading the summary as a carried derived-property fact (§2.8.2 clause 1) classified by the verdict rows. §2.8.6 classifies a derived-property verdict gained as preserving, while a requirement gained narrows admission, so that reading would classify a breaking change as preserving. One `rejected` row. Kernel: no contact. Body-locality: not a compile-time rule. Compiler: no delta classifier exists.
+- **§28.3 / §30.1 / §30.14 / §2.8.6 — pending-async-frame summaries name the whole capture-set contribution (editorial; [#5513](https://github.com/s8lap/bezel-lang/issues/5513)).** The three summaries of what a pending async frame holds (§28.3's *Reach* clause, §30.1's lead sentence, §30.14's indirect-alias list) named only "the borrows its plain function-typed arguments capture". They now name the capture-set contribution of §28.3's *Deferred-activation callees*, under which a forwarded plain function-typed parameter contributes itself. §30.14's "extended in to" reads "extended to". §2.8.6 *Member matching* loses a parenthetical that described how the plain↔`owned` flip was reported before the matching key changed; the sentence before it states the current report shape. No rule changes.
+- **§7.4 / §12.7 / §22.3 / Appendix C.1, rationale §6.1 — a `ref` parameter is never flow-narrowed (graduation of proposal 0134; owner decision; [#5495](https://github.com/s8lap/bezel-lang/issues/5495)).** v0.317 filed the question. Inside `G(ref a: Animal?, f)`, `if a <> null then f(); a.Speak(); end;` fires none of §7.4's invalidating forms, while a closure the caller passed nulls `a`'s referent. `G(ref m, ref m)` with `b := null` in the callee, and `G(ref h.F, h)` with `h.F := null`, reach the same dereference without any call. §12.7's type narrowing has the same hole.
+  - §7.4 names parameters other than `ref` parameters among the narrowed carriers.
+  - A new paragraph, **`ref` parameters do not narrow**, covers a `ref` parameter of a method, constructor or lambda, written or inferred. It gives the routes and states that no establishing form writes a fact about one, and that a `readonly` path rooted at one is not tracked. Pattern bindings and `as` are unaffected. The paragraph gives the copy remedy (`var c := a;`, narrow `c`, write back with `a := c;`) with an example.
+  - *Storage inside a narrowed nullable value* names "a local or non-`ref` parameter" and gives the copy-and-write-back form.
+  - §12.7: type narrowing applies to a simple variable other than a `ref` parameter, with the copy or `as` remedy. Its box paragraph's carriers include non-`ref` parameters.
+  - §22.3: the `ref` bullet points at §7.4. The `out` bullet's hidden-reference licence covers only storage that is the callee's for the call: no write to the recipient's location during the call reaches the slot, whether through a closure, another argument, the receiver or static state; no write to the slot reaches the recipient before normal return; and §32.5's boundary `out` keeps its direct address. This restates copy-out and changes no defined behavior.
+  - Proposal 0134's Q6 is settled by the existing text: a plain move-only parameter is owned state at `ref`, by §15.3 and §28.3's consume table.
+
+  **Declined:**
+  - (i) narrowing with invalidation at every user-code transfer and every store that can reach heap storage or another `ref`/`out` parameter;
+  - (iii) rejecting overlapping caller storage at two `ref`/`out` arguments, which still needs (i) for the closure route and cannot see `G(ref h.F, h)`;
+  - treating `out` like `ref`, which would remove what discharges §22.4's `when true` postcondition.
+
+  Three `rejected` rows. The stated cost is that `if a <> null then a.M(); end;` and the early-return guard over a `ref` parameter need the copy, as a mutable field does. Kernel: no contact. Body-locality: local. Appendix C.1's narrowing bullet, rationale §6.1 and the code-generation reference (§2 row 17, the §4.2 `ref`/`out` bullet, §7.8's note and a second example) carry the rule. The corpus `rule:` headers of `s7_4_0005` and `s12_7_0001` quote the new sentences, with their verdicts unchanged. Proposal 0134 is `graduated-v0.320` with a §12 graduation note.
+
+  **Compiler (tracked):** `narrowFromNullTest`, `narrowFromTypeTest`, `narrowOnAssignment`, `narrowFromOutPostcond`/`narrowFromBuiltinShapeA` and `readonlyFieldPathOf`'s root admission accept every `ParameterSymbol` whatever its modifier. A lambda's inferred `ref` is not stamped on its symbol. The backend passes a pre-declared `out` recipient's own storage (#3304's comment), which the clarified licence excludes (HYPOTHESIS; probe required). `checkRefOutOwnedOperand` admits a plain move-only parameter at `ref`.
+
+- **Migration.** *Newly rejected (spec-ahead-of-impl unless marked):*
+  - A function value with a non-empty source set at a set-erasing position: `new Holder<() -> int>(f)`, `bag.Put(f)` on a user `Bag<T>`, `k.Keep(f)` over `Keep(o: Object)`, `Console.WriteLine(f)`, `sb.Append(f)`, `x.Equals(f)`, `source.Raise(f)` on `EventSource<() -> int>`, `Pick(f, g)`, `var o: Object := f;`, `new Box<() -> int>(f)` for `record Box<U>(V: U)`, `Result<() -> int, E>.Ok(f)`, and `new Holder<() -> int>(mk)` with `constructor(mk: () -> T)` (#5375). Tests that flip, to be re-pinned as rejections:
+    - `codegen_5129.param_arg_to_unreferenced_callee_no_over_release` (`tests/codegen/method_own_type_param_named_local_release_5129_test.cpp:97`);
+    - `generic_bare_typeparam_function_value_arg_5178.static_void_method_infers_function_parameter_value` (`tests/sema/generic_bare_typeparam_function_value_arg_5178_test.cpp:100`).
+  - A method reference with a function-typed slot over a set-erasing callee parameter (`var add := xs.Add;` at `xs: Array<() -> int>`), capture-free uses included; a use of a member with a type parameter in a parameter slot of a parameter slot at a function-type substitution; a `yield return` of a capture-bearing function value; a capture-bearing argument at a `scoped o: Object` parameter (#5375). No test flips.
+  - A call-bounded callback stored into a local collection or local function-typed inline array, and a closure over an exception-arm binding stored into an arm-local collection (#5499, #5486). Tests that flip:
+    - `call_bounded_2814.store_into_local_collection_clean` (`tests/ownership/call_bounded_2814_test.cpp:90`);
+    - `lambda_own_param_call_bounded_1432.store_into_local_collection_accepted` (`tests/ownership/lambda_own_param_call_bounded_1432_test.cpp:393`);
+    - `codegen_1073_closure_arg.local_collection_sink_released_once_spec_28_14` (`tests/codegen/closure_literal_arg_leak_1073_test.cpp:320`). Re-pin it as a rejection, with a capture-free twin if the release property should keep coverage.
+  - In a setter body, a declaration named `value` while the implicit `value` is in scope (#5484). Tests that flip:
+    - `sema_setter_implicit_value_exempt_5401.t1_setter_body_var_value_accepted_spec_21_1_23_3` (rewrite the file's behaviour matrix);
+    - `accessor_set_owned_field_store_5252.spec_23_3_shadowed_value_owned_transfer_accepted`;
+    - `shadow_owned_param_by_symbol_5267.setter_inner_local_moved_then_outer_store_accepted_spec_23_3`.
+
+    Re-pin with a renamed inner local, so that `accessor_set_owned_field_store_5252.spec_23_3_28_3_shadowed_value_borrow_escape_rejected` and `shadow_owned_param_by_symbol_5267.setter_value_shadow_then_outer_take_unmarked_rejected_spec_23_3` keep pinning their diagnostics.
+  - An equality-search call at an element type with no first-kind `Equals` (`Array<R>.IndexOf(r)`, `span.Contains(r)`, `x in xs` for a non-hashable record `R`), and an instantiation of a user generic body that makes such a call at `T` (#5491). `Array<T>.Contains` is already rejected, under a `hashable` gate. The test that flips is `element_equality_sema_dispatch_4573.array_arrayspan_contains_spec_4_15` (`tests/codegen/element_equality_sema_dispatch_4573_test.cpp:224`): `ArraySpan<int>` has no equality (§8.3, §9.3). `conditional_member_enforcement_3331.array_holder_contains_rejected_spec_5_14_2` stays a rejection and is re-cited to §14.2 / stdlib §4.
+  - An unconstrained wrapper naming a constrained generic at its own parameter, including every `class H<T>` holding an `OwningArray<T>`/`OwningLinkedList<T>`/… without `where T: class` (#5510). Changing from accept to reject:
+    - lit `sema_generic_constraints__generic_param_arg_deferred_14_2`, `…nested_new_indirect_satisfied_ok_14_2`, `…nested_chained_generic_param_satisfied_ok_14_2`, `…nested_iface_bound_indirect_satisfied_ok_14_2` and `…nested_value_indirect_satisfied_ok_14_2`;
+    - gtest `generic_owned_field_disposal_816.generic_owned_array_field_disposes_elements`, and in `owning_element_generic_instantiation_2713` `class_element_via_generic_param_admitted_2713`, `interface_element_via_generic_param_admitted_2713`, `nullable_class_element_via_generic_param_admitted_2713`, `nested_owning_collection_admitted_2713` and `method_own_param_bound_to_string_still_admitted_pending_2736a`.
+
+    Still rejected, but the diagnostic moves to the declaration and names the parameter, so the needles must be re-pinned:
+    - lit `…nested_new_indirect_violation_diagnoses_14_2`, `…nested_chained_generic_param_violation_diagnoses_14_2`, `…nested_class_indirect_violation_diagnoses_14_2`, `…nested_iface_bound_indirect_violation_diagnoses_14_2` and `…nested_indirect_source_order_independent_14_2`;
+    - the eight 2713 rows asserting `hasPerInstantiationOwningError`: `owning_linkedlist_string_field_…`, `owning_array_int_…`, `owning_array_record_…`, `owning_stack_enum_…`, `owning_queue_guid_…`, `owning_set_string_…`, `owning_dictionary_value_slot_via_generic_param_rejected_2713` and `enclosing_param_used_inside_method_body_rejected_2713`.
+
+    Vacuous-oracle hazard: all seven tests of `xmod_owning_element_instantiation_2735` return early once `kDep2735`'s unconstrained `Loose2735<T>` stops compiling, so move it out of the shared dependency. Re-check only: `collection_literal_factory_conjuncts_3032.private_owning_form_rejected_spec_15_4_1`, `….both_forms_declared_rejected_spec_15_4_1` and 2713 `method_param_shadowing_enclosing_param_admitted_2713`.
+  - Over a `ref` parameter (written or inferred on a lambda): member access, indexing or a call after a null test, early exit, assignment, `??=` or `out` postcondition; a §7.11 operator over a nullable one; a derived-type member after `is T`; `a._f` after a null test of a `readonly` `_f`; `n.X := 5` under `if n <> null` over `ref n: Pt?` (#5495). Measured reach: zero sites in `tests/`, `tests/conformance/`, `docs/` and the stdlib. No test flips.
+
+  *Newly accepted:*
+  - `class Box<W> where W: new()` holding `C<W>` for `class C<T> where T: new()`, which a literal reading of §14.2 rejected because no type parameter is in `new()`'s substitution set. The compiler already admits it (#5510).
+
+  *Newly defined:*
+  - The term *set-erasing position*. Row 5's result at a function-type substitution is a capture-free function value. A component, payload or element declared at a type parameter is a set-erasing position at a function-type substitution. Neither variance rule of §27.1.1 relates a function-typed slot to an `Object` slot; the compiler already conforms (`functionSlotConvertible`). A purely local collection is a local binding for frames only (#5375, #5499).
+  - `Convert.ToString(f)` for a `float` `f` renders `f.ToString()` (`"0.1"`), matching the compiler (#5500).
+  - *A type parameter as the type argument* (#5510); the requirement-summary rows of §2.8.6 (#5512).
+  - §22.3's hidden-reference licence names the storage it may hide. Parameters other than `ref` parameters are narrowing carriers, as the compiler already treats them (#5495).
+
+  *Doc-only:*
+  - §28.1 clause 3, §28.14's caller-side and fan-out cross-references, §27.6, and the §28.3 / §30.1 / §30.14 summaries (#5375, #5499, #5513).
+  - §2.8.6's narration parenthetical (#5513).
+  - The §9.8/§12.2 serialization decisions: rationale §5.22 and three `DECLINED.md` rows (#5497, #5505, #5506).
+  - Stdlib §4.20's note (#5510).
+  - Rationale paragraphs: §4.2 (two new records, and the v0.317 #5486 record re-pointed), §5.22, §6.1, §7.7, §8.1, §10 (three new paragraphs, and the v0.318 paragraph's pointer), §15.x.
+  - The code-generation reference's lines named above. Its pins move to v0.320.
+  - `DECLINED.md` gains 19 `rejected` and 2 `deferred` rows (`g0133` 9 and 1, `owner` 5 and 1, `misc` 2, `g0134` 3), and annotates two `deferred` rows (#5374 with Option 2b, *Unbounded retention tier* with `Pick<T>`). The index size is recomputed once: 649 rows — 352 · 126 · 128 · 7 · 36 · 0.
+  - Proposals 0133 and 0134 move to *Graduated*.
+
+  *Spec-ahead-of-impl (tracking issues filed at landing):*
+  - #5375: the caller-side set-erasing check, with a probe for a yielded capture-bearing lambda.
+  - #5375: the widened method-reference formation bar.
+  - #5375: the nested-slot instantiation exclusion.
+  - Proposal 0133 §5.4, independent of #5375: a generic `Wrap<U>(x: U): () -> U` returning `lambda () => x` captures a plain parameter. The text rejects it and the compiler admits it (`codegen_5127.method_own_type_param_wrapped_closure_return_value`, `method_own_type_param_escape_release_5127_test.cpp:130`'s `Wrap`, `codegen_5216.lambda_literal_captured_by_callee_wrapper_no_uaf`).
+  - #5499/#5486: drop the purely-local exemption for function values, keep it for frames, and treat `fs[i] := f` into a local function-typed inline array as a store. Keep the "collection reachable beyond the call" needle for parameter and field collections.
+  - #5484: drop `setterImplicitValueExempt_`.
+  - #5491: gate the equality search on the first kind, and stop treating declaration-less builtin span records as equality-bearing.
+  - #5510: decide a declared constraint at a type-parameter argument at the naming, on the type and method paths.
+  - #5495: the `ref`-parameter narrowing gate.
+  - #5495: a plain move-only parameter at `ref`/`out` (proposal 0134 Q6).
+  - §22.3 (#5495): the pre-declared `out`-recipient conformance probe.
+  - #5500 files no new issue: v0.317's [#5490](https://github.com/s8lap/bezel-lang/issues/5490) drops its `float`-widening item and keeps §22.6 resolution over six parameter types.
+
+  *Owner decisions recorded:* proposal 0133 and its Q1–Q6 (#5375); #5499 with #5486's local half; #5484; #5500; #5491; #5495 (option (ii), as proposal 0134); #5497 and #5505 (declined); #5506 (deferred to #1507). #5496's direction is accepted, and its move-only half is decided as *F* (owner-delegated); proposal 0135 graduates in the next train.
+
+  *Filed as questions:*
+  - §28.3 / §28.14 / §22.3: whether `scoped` reaches an `Object`-typed parameter (the text admits it; the compiler rejects it).
+  - §28.14: the widened formation bar over a set-erasing `out` parameter (`var tg := d.TryGetValue;` at a function-typed `V`), a liftable over-rejection (design-change-sized).
+  - §14.2 rule 2 / §3.6 rule 2: a conditionally-admitted member called in a generic body at an element type involving a type parameter, as one reading for the whole register.
+  - §15.1.2 / §14.2: an inline array's `Contains` is keyed on hashable, the equality search on §9.2's first kind.
+  - §14.2 / §14.1: a declared constraint at a type argument that contains a type parameter (`C<Pair<W>>`, `C<W?>`), and mixed arguments (`C<Widget, X>` under `where T: U`).
+  - §30.1 / §3.6 / §9.7: whether the async borrow-bearing-parameter ban covers inline arrays.
+  - §26.4 / §14.1 / §14.2: an extension head's bound parameters against the extended type's declared constraints.
+  - §12.7: whether a `readonly` field is a type-narrowing carrier.
+  - §22.3 / §15.3 / §28.5: whether an instance field of move-only type is owned state at `ref`/`out`.
+  - §27.5: capturing a `ref`/`out` parameter in a lambda.
+  - §7.4 (editorial): the `readonly` paragraph's `local._f` root wording, now that parameters are carriers.
+
+  *Guides:* no idiom a guide teaches changed, so their pins stay. The code-generation reference's pins move to v0.320.
+
+  *Corpus:* the rule corpus stays at 2,197 cases. No case changes verdict and none is made unwritable. The `rule:` headers of `s7_4_0005` and `s12_7_0001` (and their `manifest.tsv` rows) quote the new §7.4 and §12.7 sentences. `s28_14_0005`'s header quotes §28.14's caller-side sentence without the new return-slot exception; its program keeps its verdict, and the header refresh is left to the corpus sweep. Coverage gaps recorded:
+  - #5375: Programs A–E of proposal 0133 (reject) and their capture-free twins (accept); `Pick(f, g)` (reject) and `(if c then f else g)` (accept).
+  - #5499: `xs.Add(cb)` into a local array (reject); `[cb]` into a local `[1]() -> int` (reject); `pending.Add(cb())` with `await Task.WhenAll(pending)` (accept).
+  - #5484: `set => do var value := 0; … end;` (reject).
+  - #5500: `Convert.ToString(0.1f)` → `"0.1"` (run). This replaces v0.317's recorded gap.
+  - #5491: `Array<R>.IndexOf(r)` and `x in xs` at a non-hashable `R` (reject); `Array<R>` declared and used without search (accept).
+  - #5510: `class Box<W>` holding `C<W>` under `where T: new()` (reject); `Box<W> where W: new()` (accept).
+  - #5495: a null test then member access on a `ref` parameter, the guard form, an inferred lambda `ref`, `is Dog` on `ref a: Animal`, and `n.X := 5` over `ref n: Pt?` (reject); the copy remedies and `out` narrowing (run).
 
 ---

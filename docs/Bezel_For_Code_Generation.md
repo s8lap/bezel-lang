@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.319. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.320. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -10,7 +10,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.319 and `Bezel_Standard_Library.md` v0.319 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.320 and `Bezel_Standard_Library.md` v0.320 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -42,7 +42,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 | 14 | `if (count)` truthiness | Conditions are `bool`. Write `count <> 0` | §4.1 |
 | 15 | `i++` as an expression, `++i` | `++`/`--` are **postfix-only statements**: `i++;` on its own line. Assignments are statements too and produce no value | §17.6, §17.2 |
 | 16 | `int? + int?` lifts | **Retired at v0.267.** Arithmetic, bitwise, shift, relational, compound and `++`/`--` over a nullable operand are a compile error — a §7.4-narrowed local counts as non-nullable at every one of them (`if n <> null then n += 1; end;` is fine). `=`/`<>`/`??`/`?.`/`?(args)`/`??=` still work | §7.11, §6.6 |
-| 17 | `if (_field != null) Use(_field);` | Mutable fields and properties **never narrow**. Copy to a local first | §7.4 |
+| 17 | `if (_field != null) Use(_field);` | Mutable fields, properties and **`ref` parameters never narrow** (an `out` parameter does, after assignment). Copy to a local first | §7.4 |
 | 18 | `var y = x;` moves (Rust) or aliases-and-GCs (C#) | `var y := x;` is **always a borrow**; nothing is consumed silently. Transfer is written `move x` — at use sites only | §28.3, §22.3 |
 | 19 | `new Foo()` returned from an unmarked method | A plain class-typed **instance** return means "a borrow of the receiver". A method that creates must declare `: owned T`; a **static** method returning a class type without `owned` is rejected at its declaration | §28.3 |
 | 20 | `Dispose()`, `try/finally`, `using(...)` blocks | You never write disposal plumbing. `using var x := …;` disposes at scope end on every edge, including the exception edge; a written `x.Dispose();` means *release early* | §28.2, §28.10 |
@@ -149,7 +149,7 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Auto-property | `public property Name: string;` / `public property Id: int private set;` / `public readonly property Pi: double := 3.14159;` | §23.1 |
 | Expression property | `public property Area: decimal => Width * Height;` — **never write `readonly` here** (§23.2 rejects it on every body-bearing form) | §23.2 |
 | Block property | `public property Balance: decimal` / `get => _b;` / `set => do … end;` / `end Balance;` | §23.3 |
-| Owned-taking setter | `set(owned);` or `set(owned x);` — the type is the property's and is never repeated | §23.3 |
+| Setter parameter spec | `set(owned);` or `set(owned x);` takes the value owned — the type is the property's and is never repeated; `set(x)` only renames the parameter | §23.3 |
 | Indexer | `public property [i: int]: string => _items[i];` — the block form closes with a bare `end;` | §23.4 |
 | Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter. A `this(...)` chain must end at a constructor with no `this(...)`; a cycle is rejected. A **class** that declares no instance constructor has an implicit `public` parameterless one, so `new C()` compiles; declaring any instance constructor (a primary parameter list included) removes it, and a **body record** has no such implicit constructor | §22.7, §12.8 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
@@ -176,7 +176,7 @@ One condition per clause. `result` names the return value inside `ensures`; `old
 
 **Parameters** (A.4): `ParamModifiers? name: Type (:= default)? (when true|when false)?`, with `ParamModifiers ∈ ref | out | out owned | owned | scoped`. `owned` precedes the **identifier**: ✗ `x: owned T` ✓ `owned x: T`. A parameter may not be named `_` (§22.5).
 
-**Generics:** `<Variance? Ident, …>` with `Variance ∈ in | out` (interfaces only); `where T: Constraint, …` with `Constraint ∈ class | value | notnull | sendable | hashable | new() | Type` (§14.2). A method's `where` goes after its return type and before any `requires`/`ensures`, in an interface member too (`method Largest<T>(xs: Array<T>): T where T: IComparable<T>;`). An override or interface implementation **inherits** the member's constraints: omit its `where`, or restate an equivalent set; anything else is rejected, and so is one method implementing or overriding two declarations whose sets differ (§14.2). An override or interface implementation declares the same number of type parameters of its own, matched by position, so names may differ (`Show<U>(x: U)` implements `Show<T>(x: T)`; §11.2, §12.1). Type arguments are **never inferred** for a class, record, interface, or choice — only call-site inference for generic *methods* exists (§14.5). Generic choice construction writes its arguments: `Result<int, string>.Ok(v)` (§35.3). `x.Equals(y)`, `x.GetHashCode()` or `x = y` on a `T`-typed value compiles in the body but rejects the instantiation at a record or choice with no equality of its own (not auto-hashable, member undeclared); write `where T: hashable` to say so in the signature (§9.2, v0.317). In a generic **type** you declare, such a use in any member rejects the constructed type wherever it is named, whether or not that member is called (§3.6 rule 2, v0.318); to demand it of callers only, declare the member in `extension MyBag<T> where T: hashable` (public and same-module `internal` surface only) or as a generic method with its own type parameter; an override, interface implementation, operator, indexer, constructor, destructor, field initializer or settable property cannot move, so its use needs `where T: hashable` on the type. Standard-library types (`Array<T>`, the spans) are not rejected this way. Wrapping does not hide the use: a type or method you declare that names `MyBag<T>`, or calls such a generic method, at its own `T` is rejected at its own instantiations wherever `MyBag<R>` would be (§14.1, v0.319).
+**Generics:** `<Variance? Ident, …>` with `Variance ∈ in | out` (interfaces only); `where T: Constraint, …` with `Constraint ∈ class | value | notnull | sendable | hashable | new() | Type` (§14.2). A method's `where` goes after its return type and before any `requires`/`ensures`, in an interface member too (`method Largest<T>(xs: Array<T>): T where T: IComparable<T>;`). An override or interface implementation **inherits** the member's constraints: omit its `where`, or restate an equivalent set; anything else is rejected, and so is one method implementing or overriding two declarations whose sets differ (§14.2). An override or interface implementation declares the same number of type parameters of its own, matched by position, so names may differ (`Show<U>(x: U)` implements `Show<T>(x: T)`; §11.2, §12.1). Type arguments are **never inferred** for a class, record, interface, or choice — only call-site inference for generic *methods* exists (§14.5). Generic choice construction writes its arguments: `Result<int, string>.Ok(v)` (§35.3). `x.Equals(y)`, `x.GetHashCode()` or `x = y` on a `T`-typed value compiles in the body but rejects the instantiation at a record or choice with no equality of its own (not auto-hashable, member undeclared); write `where T: hashable` to say so in the signature (§9.2, v0.317). In a generic **type** you declare, such a use in any member rejects the constructed type wherever it is named, whether or not that member is called (§3.6 rule 2, v0.318); to demand it of callers only, declare the member in `extension MyBag<T> where T: hashable` (public and same-module `internal` surface only) or as a generic method with its own type parameter; an override, interface implementation, operator, indexer, constructor, destructor, field initializer or settable property cannot move, so its use needs `where T: hashable` on the type. Standard-library types (`Array<T>`, the spans) are not rejected this way; instead their equality search (`Contains`, `Remove`, `IndexOf`, `LastIndexOf`, `LinkedList<T>.Find`, the span `IndexOf`/`Contains`/`SequenceEqual`) is rejected at the call where the element type has no equality, and in a generic body such a call at `T` counts as your own `Equals` use of `T` (rejecting your type or method at a `T` with no equality) (§14.2, stdlib §4, v0.320). Wrapping does not hide the use: a type or method you declare that names `MyBag<T>`, or calls such a generic method, at its own `T` is rejected at its own instantiations wherever `MyBag<R>` would be (§14.1, v0.319). A declared `where` constraint is not carried that way: naming `C<T>` at your own `T`, where `C` declares `where T: new()` (or any constraint), needs `T`'s own constraints to guarantee it, so restate it (`class Box<T> where T: new()`); otherwise the naming is rejected (§14.2, v0.320).
 
 **Visibility:** `public | internal | protected | private`. Top-level types default to `internal`; class members **must** state one, with exactly four exceptions (static constructor, destructor, `polymorphic`, `invariant`). No combined forms: ✗ `protected internal` (§13.2, §13.3, §13.5).
 
@@ -478,11 +478,11 @@ Disposing an **owned field** from code of its declaring type (`_resource.Dispose
 
 - `out owned p: T` is the only modifier compound. At the call site `out var x` **adopts** what the signature announces — against `out owned` it is an owned local you discharge yourself (`move` it, store it in an owned slot, or let scope-end auto-drop with the must-use warning) — and `out using var x` is the scope-bound owned form, accepted **only** against `out owned`. There is no `out owned var` spelling (retired v0.289).
 - `ref`/`out` arguments may **not** name a location of owned state (an owned local, an `owned` parameter, an `owned` field, an owning slot), nor a `using var`, nor a `readonly` field outside its assignable context. **For an *instance* `readonly` field or auto-property that context is per-instance** (§22.8, v0.270): it is assignable only through an lvalue chain rooted at `this` — so a constructor may not write *another* value's `readonly` storage, and binding one to a `ref`/`out` parameter inside a constructor is the same store by other syntax — and an instance `readonly` **field** is assigned **at most once** on any path through one instance construction, counting the field initializer and every constructor body in the `this(...)` chain together (v0.271; stated for fields — auto-properties are not decided). A `static readonly` field is different on both counts: its context is its own static initializer or a constructor body of the declaring type, spelled as the bare name or `TypeName.F`, and its unit is one type initialization. Pass a borrow instead, or use `owned` parameters/returns and `move`.
-- `ref`/`out` are **forbidden** on `async` methods, on **`async` lambdas**, on iterator methods and on indexers (§30.1, §29.3, §23.5). An **ordinary** lambda admits them, as its function type does — `var f: (ref int) -> () := lambda(ref x: int) => do x := x + 1; end;` (A.7 `LambdaParam`/`FuncParamMods`, §27.1). The argument's static type must match the referent type exactly; a bare local or parameter counts at its **declared** type, never its §7.4/§12.7-narrowed one, both for the match and for inferring `T` at `ref x: T` (inside `if a is Dog then`, `G(ref a)` needs `G(ref x: Animal)`; to pass the narrowed value, `var d: Dog := a; G(ref d);`). A chain into a narrowed nullable value's own storage is rejected at `ref`/`out` (`ref n.X` over `n: Pt?` narrowed non-null, §7.4): write `var p: Pt := n; Inc(ref p.X); n := p;`. `out var _` is an error; write `out _`.
+- `ref`/`out` are **forbidden** on `async` methods, on **`async` lambdas**, on iterator methods and on indexers (§30.1, §29.3, §23.5). An **ordinary** lambda admits them, as its function type does — `var f: (ref int) -> () := lambda(ref x: int) => do x := x + 1; end;` (A.7 `LambdaParam`/`FuncParamMods`, §27.1). The argument's static type must match the referent type exactly; a bare local or parameter counts at its **declared** type, never its §7.4/§12.7-narrowed one, both for the match and for inferring `T` at `ref x: T` (inside `if a is Dog then`, `G(ref a)` needs `G(ref x: Animal)`; to pass the narrowed value, `var d: Dog := a; G(ref d);`). A chain into a narrowed nullable value's own storage is rejected at `ref`/`out` (`ref n.X` over `n: Pt?` narrowed non-null, §7.4): write `var p: Pt := n; Inc(ref p.X); n := p;`. `out var _` is an error; write `out _`. Inside the callee a `ref` parameter **never narrows** — not by `<> null`, `is T`, assignment or an early exit — so `if a <> null then a.M(); end;` over `ref a: Animal?` is rejected: write `var c := a; if c <> null then c.M(); end;`, and `a := c;` to write back (§7.4, v0.320).
 
 **`scoped`** (§28.14) declares **storage-bounded retention** — the callee may store the thing, bounded by the storing object's life.
 
-- On a **function-typed** parameter (`method Subscribe(scoped h: () -> ())`): the callee may store the callback in a `scoped` field of the bounding object, forward it to a same-bound `scoped` parameter, or invoke it. Function-typed arguments carry **no call-site marker**. Without `scoped` such a parameter is **call-bounded** — invocable during the call, never retained — and callers may pass any closure. A plain function-typed **primary-constructor** parameter is call-bounded too: invoke it in initializers, but a body reference captures it into a field and is rejected (§22.10).
+- On a **function-typed** parameter (`method Subscribe(scoped h: () -> ())`): the callee may store the callback in a `scoped` field of the bounding object, forward it to a same-bound `scoped` parameter, or invoke it. Function-typed arguments carry **no call-site marker**. Without `scoped` such a parameter is **call-bounded** — invocable during the call, never retained, not even in a local collection (a task or query it mints may wait in one until consumed) — and callers may pass any closure, except to a parameter whose return slot is a bare `T` that the call instantiates at a function type (§28.3's set-erasing positions, v0.320). A plain function-typed **primary-constructor** parameter is call-bounded too: invoke it in initializers, but a body reference captures it into a field and is rejected (§22.10).
 - On a **class- or interface-typed** parameter: the callee may store the borrow in a direct non-owned field of the bounding object. The call site writes `M(scoped x)` — an argument *modifier*, not an expression; a fresh producer is rejected there. A **primary-constructor** parameter may be `scoped` at these types — `class Box(scoped src: Source)`, used from a body as `src` — and its compiler-generated capture field is that direct non-owned field; the holder must still be a `using var` local (or `this`) with the source declared before it. A function-typed `scoped` primary parameter is rejected (§22.10).
 - **The price: captured local sources are frozen** while the bounding object lives — no move, no reassign, and **no `Dispose()`**. `scoped` on a **static** method is admitted only when that method's return is `owned`.
 
@@ -533,7 +533,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 - A borrow of a **scope-bound local** may not be stored in a field or in a longer-lived collection. A borrow whose source *does* outlive the object **is** admissible: the **back-reference** idiom binds a constructor parameter into a plain (non-`owned`) class-typed field (`private _owner: Customer;`). The check is structural — sourced from a parameter that is not `owned` (plain or `scoped`) or from the receiver: admitted; locals, temporaries **and `owned` parameters**: rejected (an `owned` parameter is disposed at the method's end, so it is scope-bound — §28.3, v0.288). The result of invoking a function-typed parameter counts as sourced from that parameter and from the call's arguments, a function-typed argument contributing what it captures and a span or other borrow-bearing value argument what it carries (v0.317): `_v := make()` with `make: () -> Item` is admitted; `_v := pick(local)` and `_v := wrap(lambda() => local)` are not (§28.3, v0.316). Assigning a class- or interface-typed value to a class's or interface's property is that store whatever the property's accessor form: `obj.P := local` (a scope-bound local) and `obj.P := new T()` are rejected, a parameter- or receiver-sourced borrow is admitted, and a `set(owned)` property takes the value instead (§28.3, v0.316). A settable **static** property's assignment is the store into a mutable static field of its type: `Config.Current := new Settings()` is admitted only at a type a mutable static may have (a synchronized handle, `Task?`), where the value lives to process exit, and is rejected at any other; assigning a `static readonly` auto-property in its type's static constructor is the `static readonly` field store and is admitted (§28.3, v0.317).
 - A borrow may not be returned unless its source is one every caller can re-establish: receiver-sourced from an instance method, the receiver-parameter borrow of an extension method, or static storage through a **static property getter**.
 - A `ref` or plain `out` argument whose type can carry a borrow (a class, interface or function type, or a borrow-bearing record, choice or inline array) is a holder the callee may fill from any of the call's borrows — the receiver, the plain arguments, the other `ref` arguments' values — so each must be admissible into it exactly as `location := borrow` would be: `Put(ref outerLocal, innerUsingVar)` is rejected at the call (§28.3).
-- A closure — or a method reference over an instance receiver — is a **borrow-carrying value**: its source set is the union of its captures' sources (calling a closure yields a value carrying the closure's own set), and every rule in this list applies to it by that set (§28.3, v0.298). So: bind it to any local, plain `var` or `using var`, whose scope does not strictly enclose a source's (a local helper lambda over a borrow needs no `using var`); invoke it; pass it to a function-typed parameter (§28.14). While it captures anything, do **not** store it in a field or a collection (assigning it to a property or indexer, passing it for a record component declared at a function type at construction, assigning it to one in `with`, passing it for a choice payload declared at a function type, or putting it in a slot of an inline array of function type, counts as a store, §28.3, v0.317), write it through `out`/`ref`, or return it from the method — a function type announces no sources, so the only storage route for a capture-bearing closure is a `scoped` parameter (§28.14); a capture-free closure goes anywhere. Reassigning a plain function-typed local is fine — each assignment is checked on its own; `using var` on a function-typed local adds only non-reassignability.
+- A closure — or a method reference over an instance receiver — is a **borrow-carrying value**: its source set is the union of its captures' sources (calling a closure yields a value carrying the closure's own set), and every rule in this list applies to it by that set (§28.3, v0.298). So: bind it to any local, plain `var` or `using var`, whose scope does not strictly enclose a source's (a local helper lambda over a borrow needs no `using var`); invoke it; pass it to a function-typed parameter (§28.14). While it captures anything, do **not** store it in a field or a collection (assigning it to a property or indexer, passing it for a record component declared at a function type at construction, assigning it to one in `with`, passing it for a choice payload declared at a function type, or putting it in a slot of an inline array of function type, a local array included, counts as a store, §28.3, v0.317), write it through `out`/`ref`, or return it from the method (`yield return` included) — a function type announces no sources, so the only storage route for a capture-bearing closure is a `scoped` parameter (§28.14). Nor pass it where the parameter is declared `Object`, or at a bare type parameter that your call instantiates at a function type: `new Holder<() -> int>(f)`, `bag.Put(f)` on a user `Bag<T>`, `Console.WriteLine(f)`, `x.Equals(f)`, `Pick(f, g)` over `Pick<T>(a: T, b: T): T`, and `source.Raise(f)` on an `EventSource<() -> int>` are all rejected while `f` captures anything, and a function-typed parameter of yours counts as capturing (it carries itself). The same holds for a lambda or a function value passed to a parameter typed `() -> T` at such an instantiation. Write `(if c then f else g)` for a selector and `f = g` for equality. Do not form a method reference whose parameter is a function type over such a parameter (`var add := xs.Add;` with `xs: Array<() -> int>`): write `lambda(g) => xs.Add(g)`. And a member taking `reg: ((T) -> ()) -> ()` cannot be used at a function-type `T` at all (§28.3, §28.14, v0.320). A capture-free closure goes anywhere. Reassigning a plain function-typed local is fine — each assignment is checked on its own; `using var` on a function-typed local adds only non-reassignability.
 - Every field-, collection- or async-frame-held borrow carries the obligation not to transfer the borrowed object to another domain. This has **no runtime backstop** — it is a data race (§30.14).
 
 **Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case` arms identically.
@@ -559,7 +559,7 @@ Records also cannot have destructors, `owned` fields, owning-inline-array fields
 | `Dispose()` | no user-visible work | disposes **every** element, then frees storage |
 | Ownership out | *none* | `move coll[i]`, `PopAt`/`PopFirst`/`PopLast`/`Pop`/`Dequeue`, `Drain()` |
 
-There is **no implicit conversion between the families**. Owning collections require `where T: class`. A class owning a collection of resources writes `private owned _items: OwningArray<T>;` and needs no destructor.
+There is **no implicit conversion between the families**. Owning collections require `where T: class`, and a generic type holding one at its own `T` states it too (`class Pool<T> where T: class`; §14.2, v0.320). A class owning a collection of resources writes `private owned _items: OwningArray<T>;` and needs no destructor.
 
 **What the `for` variable is** (§29.1–§29.3), decided by the **static type of the source**:
 
@@ -608,7 +608,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.319 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.320 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -686,8 +686,8 @@ end
 public static class Convert     // string <-> T only; there is no Convert.ToInt32(double)
   ToInt32/ToInt64/ToDouble/ToDecimal/ToBoolean(value: string);
   TryToInt32/.../TryToBoolean(value: string, out result: T): bool;         // shape (c)
-  ToString(int|long|double|decimal|bool);   ToString(value: int|long, toBase: int);  // bases 2/8/10/16
-  // = v.ToString() / v.ToString(toBase); a float WIDENS: Convert.ToString(0.1f) = "0.10000000149011612";
+  ToString(int|long|float|double|decimal|bool);   ToString(value: int|long, toBase: int);  // bases 2/8/10/16
+  // = v.ToString() / v.ToString(toBase): Convert.ToString(0.1f) = "0.1";
   // char/byte/sbyte/short/ushort/uint/ulong are AMBIGUOUS (spec §22.6) — call c.ToString(), or cast
 end                                                    // faults: FormatException, OverflowException
 
@@ -827,6 +827,8 @@ public class Array<T>: IList<T>                      // borrowing, resizable
   method Add(item: T);  AddRange(items: IEnumerable<T>);  Insert(index, item);  RemoveAt(index);
   method Remove(item: T): bool;  Clear();  Contains(item: T): bool;
   method IndexOf(item: T, startIndex: int := 0): int;   LastIndexOf(item: T): int;
+    // Remove/Contains/IndexOf/LastIndexOf (and `x in xs`): rejected AT THE CALL where T has no
+    //   equality (a record/choice not auto-hashable, none declared); Array<R> itself is fine (§14.2, v0.320)
   method Sort(comparer: (T, T) -> int);   method Reverse();                        // in place
   method Sorted(comparer: (T, T) -> int): owned Array<T>;   Reversed(): owned Array<T>;
   method ToArray(): owned Array<T>;
@@ -1657,6 +1659,7 @@ public method Pick<T>(x: T): T => x;                        // WRONG inside `cla
 var ys := [1, 2, 3];                                        // WRONG: no target type for the literal
 var s := s!;                                                // WRONG wherever a local or parameter `s` is in scope: same block, body top beside a parameter, or any enclosing block, loop or arm body (§21.1) — `var t := s!;`
 for var x in xs do Use(xs.Where(lambda(x) => x > 0)); end;   // WRONG: a lambda parameter, loop variable or arm binding may not reuse an in-scope local's or parameter's name either (§21.1) — `lambda(y) => y > 0`; sibling loops and arms may reuse names
+set => do var value := 0; _x := value; end;                 // WRONG in a setter: its implicit `value` is a parameter, so no local in its body reuses the name (§21.1) — rename the local, or write `set(v)` to rename the parameter
 var sd: SortedDictionary<string, int> := ["a": 1];          // WRONG: the dictionary literal targets only Dictionary/OwningDictionary (§15.4)
 var max := a > b ? a : b;                                   // WRONG: no `?:` operator
 x := y++;   ++c;   if count++ > 3 then ... end;               // WRONG: `++` is a postfix STATEMENT
@@ -1821,6 +1824,32 @@ var b := pool[pool.Count - 1];     // ...then re-borrow from the new owner
 b.Configure();
 ```
 
+```bezel
+class Holder<T>
+  public _v: T;
+  public constructor(x: T)
+    _v := x;
+  end constructor;
+end Holder;
+
+static method Make(item: Item): owned Holder<() -> int>
+  var f: () -> int := lambda() => item.Value();
+  return new Holder<() -> int>(f);         // ERROR: `x: T` at T = () -> int is a set-erasing position; f captures item
+end Make;
+```
+
+> §28.3 (v0.320): a generic body checks `x: T` as an object borrow, so at a function-type `T` the caller's argument must be capture-free; the same holds for any parameter declared `Object`. Keep the callback where its type says what it is: a function-typed parameter invoked inside the call, or a `scoped` one on a class that stores it.
+
+```bezel
+class Runner
+  private scoped _job: () -> int;
+  public constructor(scoped job: () -> int)
+    _job := job;
+  end constructor;
+  public method Run(): int => _job();
+end Runner;
+```
+
 ### 7.3 Value kinds
 
 ```bezel
@@ -1963,12 +1992,21 @@ if _field <> null then
 end;
 ```
 
-> §7.4: narrowing applies to **locals and `readonly` fields only** — a mutable field can be rewritten between check and use by a call, a closure, or another continuation at an `await`. A local that is *mutably captured* by any lambda in the method is re-widened at the next call, function-value invocation, or `await`.
+> §7.4: narrowing applies to **locals, parameters other than `ref` parameters, and `readonly` fields only** — a mutable field can be rewritten between check and use by a call, a closure, or another continuation at an `await`. A local that is *mutably captured* by any lambda in the method is re-widened at the next call, function-value invocation, or `await`.
 
 ```bezel
 var local := _field;
 if local <> null then Use(local); end;
 ```
+
+```bezel
+public static method Greet(ref a: Animal?): string
+  if a <> null then return a.Speak(); end;   // ERROR: a `ref` parameter never narrows
+  return "none";
+end Greet;
+```
+
+> §7.4 (v0.320): a `ref` parameter aliases caller storage the caller can still write during the call (a passed closure, a second `ref` argument, a field passed beside its holder). Copy to a local — `var c := a;` — and narrow the copy. `out` parameters are callee-local slots and narrow normally.
 
 ### 7.9 Small standard-library mistakes
 
