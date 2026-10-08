@@ -1,4 +1,4 @@
-//! case: s9_7_0031
+//! case: s9_7_0033
 //! doc: issue #5662
 //! section: 9.7
 //! title: non-owning inline array of interface in instance field is not a span
