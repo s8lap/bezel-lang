@@ -49,12 +49,12 @@ spec	6.2	Mixed-type arithmetic	1	0	2	0	0	1	0	1	covered
 spec	6.3	Floating-point arithmetic	0	0	3	0	0	0	0	3	covered
 spec	6.4	Decimal arithmetic	1	0	2	0	0	0	0	2	covered
 spec	6.5	Bitwise operations	1	1	5	0	0	2	0	3	covered
-spec	6.6	Compound assignments	9	4	15	0	0	7	0	8	covered
+spec	6.6	Compound assignments	11	4	15	0	0	7	0	8	covered
 spec	7	Nullability	0	0	0	0	0	0	0	0	n/a
 spec	7.1	Non-nullable and nullable types	0	0	2	0	0	1	0	1	covered
 spec	7.2	Nullable value types	0	0	1	0	0	0	0	1	covered
 spec	7.3	Assigning null	1	0	2	0	0	1	0	1	covered
-spec	7.4	Member access on nullable values	8	3	10	0	0	5	0	5	covered
+spec	7.4	Member access on nullable values	8	4	10	0	0	5	0	5	covered
 spec	7.5	Null-conditional access (?.)	0	0	3	0	0	0	0	3	covered
 spec	7.6	Null-conditional call (?(args))	0	0	2	0	0	0	0	2	covered
 spec	7.7	Null-coalescing (?? and ??=)	2	0	5	0	0	1	0	4	covered
@@ -85,7 +85,7 @@ spec	10.1	Basic syntax	0	0	1	0	0	0	0	1	covered
 spec	10.2	Explicit values	4	1	4	1	1	1	0	1	covered
 spec	10.3	Underlying type	1	0	2	1	0	1	0	0	covered
 spec	10.4	Methods, properties, static members	2	0	8	1	1	1	1	4	covered
-spec	10.5	Restrictions	5	2	8	4	0	4	0	0	covered
+spec	10.5	Restrictions	3	2	8	4	0	4	0	0	covered
 spec	10.6	Case matching	0	0	1	0	0	0	0	1	covered
 spec	11	Classes and Interfaces	0	0	0	0	0	0	0	0	n/a
 spec	11.1	Class declaration	0	0	3	1	0	2	0	0	covered
@@ -120,7 +120,7 @@ spec	14.1	Generic declarations	2	3	1	0	0	0	0	1	covered
 spec	14.2	Constraints	6	10	20	7	0	11	0	2	covered
 spec	14.3	Variance	0	0	0	0	0	0	0	0	n/a
 spec	14.4	owned and generic type arguments	0	2	6	3	0	3	0	0	covered
-spec	14.5	Type-argument inference for generic methods	9	2	8	0	0	4	0	4	covered
+spec	14.5	Type-argument inference for generic methods	11	2	8	0	0	4	0	4	covered
 spec	14.6	Recursive instantiation	3	0	2	1	0	1	0	0	covered
 spec	15	Arrays	0	0	0	0	0	0	0	0	n/a
 spec	15.1	Inline arrays	9	3	6	0	0	4	0	2	covered
@@ -220,7 +220,7 @@ spec	26.1	Declaration	0	0	2	2	0	0	0	0	covered
 spec	26.2	What can be extended	1	0	3	1	0	2	0	0	covered
 spec	26.3	Restrictions	3	0	7	0	0	7	0	0	covered
 spec	26.4	Generic extensions	4	2	3	2	0	1	0	0	covered
-spec	26.5	Resolution	3	0	14	0	0	6	0	8	covered
+spec	26.5	Resolution	2	0	14	0	0	6	0	8	covered
 spec	26.5.1	Specificity ordering	2	0	4	0	0	1	0	3	covered
 spec	26.6	Multiple blocks for the same type	1	0	3	0	0	1	0	2	covered
 spec	26.7	Ownership in extensions	1	0	6	0	0	2	0	4	covered
@@ -238,7 +238,7 @@ spec	27.8	Type aliases	1	1	2	0	0	1	0	1	covered
 spec	28	Resource Management	2	0	2	0	1	0	0	1	covered
 spec	28.1	Where the owned modifier can appear	1	1	10	7	0	3	0	0	covered
 spec	28.2	The IDisposable contract	0	4	12	4	0	4	2	2	covered
-spec	28.3	Local variables, ownership, and borrows	1	26	68	18	12	24	6	8	covered
+spec	28.3	Local variables, ownership, and borrows	1	24	68	18	12	24	6	8	covered
 spec	28.4	The destructor	1	1	8	0	0	2	0	6	covered
 spec	28.5	Owned fields	8	1	18	8	0	7	0	3	covered
 spec	28.6	Leak prevention	4	3	29	16	0	13	0	0	covered
@@ -317,7 +317,7 @@ spec	33.6	Example	0	0	0	0	0	0	0	0	n/a
 spec	34	Comments and Documentation	2	0	4	3	0	0	0	1	covered
 spec	35	Choices	0	1	2	1	0	1	0	0	covered
 spec	35.1	Declaration	5	1	10	2	0	8	0	0	covered
-spec	35.2	Members	5	0	8	2	0	3	0	3	covered
+spec	35.2	Members	4	0	8	2	0	3	0	3	covered
 spec	35.3	Construction and payload ownership	2	0	8	1	0	5	0	2	covered
 spec	35.4	The classification	8	5	12	2	1	4	0	5	covered
 spec	35.5	Matching	0	5	13	0	2	5	1	5	covered
