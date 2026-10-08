@@ -4935,6 +4935,17 @@ private:
     void collectCondOutOwnedRecipients(const ast::Expr& cond,
                                        std::unordered_set<sema::Symbol*>& out);
 
+    // fix #3842 (§22.3 / §22.4, v0.289): `out owned var` is RETIRED.
+    // The sole inline owned form is now `out var x`, which adopts the
+    // classification the callee's declaration announces. This function (called
+    // from the while-loop / if-condition processing in run()) populates
+    // loopCondOutOwnedSyms_ and ifCondOutOwnedSyms_ with inline locals from
+    // `out owned var` call arguments — extended here to also collect `out var`
+    // at `out owned` formal positions, so the hard-error carve-out (§28.3
+    // auto-drop exclusion) applies to both forms.
+    void collectOutOwnedVarSyms(const ast::Expr& e,
+                                std::unordered_set<sema::Symbol*>& out);
+
     // -- Async-readiness 3c: at-await-site Pattern A / B enforcement -----------
     //
     // §30.5 "Consumer-side rules". For `await <task>` the obligations are fixed

@@ -79,7 +79,7 @@ BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
         "class C "
         "  public method M() "
         "    for var i in 0..3 do "
-        "      var w := new Widget(\"x\", out owned var n); "
+        "      var w := new Widget(\"x\", out var n); "
         "      w.Dispose(); "
         "      n.Dispose(); "
         "    end for; "
@@ -99,6 +99,11 @@ BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
 // a dominating explicit Dispose() call" — invisible to the AOT-harness
 // tests (see the codegen test file's comment on this exact gap), which is
 // why this diagnostic-text assertion belongs here.
+//
+// fix #3842 (§22.3 / §22.4, v0.289): `out owned var` is RETIRED.
+// Migrated from `out owned var` to `out var` (the adoption form). The
+// read-check skip in recordMovesIn (consumed=true for `out var` at `out owned`
+// formal) prevents the spurious "use after Dispose" warning on loop revisit.
 // ===========================================================================
 BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
            method_form_for_loop_no_spurious_use_after_dispose_warning) {
@@ -113,7 +118,7 @@ BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
         "class C "
         "  public method M() "
         "    for var i in 0..3 do "
-        "      var ok := Widget.TryMake(\"x\", out owned var n); "
+        "      var ok := Widget.TryMake(\"x\", out var n); "
         "      n.Dispose(); "
         "    end for; "
         "  end M; "
@@ -140,7 +145,7 @@ BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
         "  public method M() "
         "    using var s := new OwningStack<Res>(); "
         "    s.Push(move (new Res())); "
-        "    while s.TryPop(out owned var item) do "
+        "    while s.TryPop(out var item) do "
         // `item` dropped without disposal on every iteration.
         "    end; "
         "  end M; "
@@ -175,7 +180,7 @@ BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
         "class C "
         "  public method M() "
         "    for var i in 0..3 do "
-        "      var w := new Widget(\"x\", out owned var n); "
+        "      var w := new Widget(\"x\", out var n); "
         "      w.Dispose(); "
         // `n` dropped without disposal on every iteration.
         "    end for; "
@@ -209,7 +214,7 @@ BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
         "class C "
         "  public method M() "
         "    for var i in 0..4 do "
-        "      var w := new Widget(\"x\", out owned var n); "
+        "      var w := new Widget(\"x\", out var n); "
         "      w.Dispose(); "
         "      if i mod 2 = 0 then "
         "        n.Dispose(); "
@@ -246,7 +251,7 @@ BEZEL_TEST(out_owned_var_loop_iteration_reset_2436,
         "end Widget; "
         "class C "
         "  public method M() "
-        "    var w := new Widget(\"x\", out owned var n); "
+        "    var w := new Widget(\"x\", out var n); "
         "    w.Dispose(); "
         "    Sink.Take(move n); "
         "    Sink.Take(move n); "

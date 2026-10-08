@@ -1963,29 +1963,6 @@ bool sameFlow(const FlowState& a, const FlowState& b) {
 void collectLocalDecls(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        std::unordered_set<const ast::Node*>& out);
 
-// §28.3 / #1387: scan `e` for `out owned var` call arguments and insert each
-// argument's resolved LocalSymbol into `out`. Used to populate
-// loopCondOutOwnedSyms_ for while-loop condition calls. Requires a SemaContext
-// to resolve the IdentifierExpr argument to its symbol.
-void collectOutOwnedVarSyms(const ast::Expr& e,
-                             sema::SemaContext& ctx,
-                             std::unordered_set<sema::Symbol*>& out) {
-    auto scan = [&](const std::vector<ast::CallArgument>& args) {
-        for (const auto& a : args) {
-            if (a.modifier == "out owned var" && a.value) {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        a.value.get()))
-                    if (sema::Symbol* s = ctx.exprSymbol(*id))
-                        out.insert(s);
-            }
-        }
-    };
-    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
-        scan(ce->args);
-    else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
-        scan(nc->args);
-}
-
 // Scan `e` for any CallExpr / NullCondCallExpr that has an `out owned var`
 // argument and insert the argument's IdentifierExpr node into `out`.
 void collectOutOwnedVarArgs(const ast::Expr* e,
@@ -2292,6 +2269,68 @@ BlockState dischargeOnExceptionEdge(
 }
 
 } // namespace
+
+// fix #3842 (§22.3 / §22.4 / §28.3, v0.289): `out owned var` is RETIRED.
+// The sole inline owned form is now `out var x`, which adopts the owned
+// classification the callee's formal parameter announces. This function
+// (called from the while-loop / if-condition processing in run()) populates
+// loopCondOutOwnedSyms_ and ifCondOutOwnedSyms_ with inline locals from
+// `out owned var` call arguments — extended here to also collect `out var` at
+// an `out owned` formal position, so the hard-error carve-out (§28.3
+// auto-drop exclusion) applies to both forms.
+void MethodOwnership::collectOutOwnedVarSyms(
+        const ast::Expr& e,
+        std::unordered_set<sema::Symbol*>& out) {
+    // Resolve the callee's parameter list. Inline the resolution logic here
+    // rather than calling resolveCalleeParams (file-local to Ownership_Checks.cpp)
+    // so this member function remains self-contained.
+    const ast::Expr* callee = nullptr;
+    const std::vector<ast::CallArgument>* args = nullptr;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        callee = ce->callee.get();
+        args = &ce->args;
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        callee = nc->callee.get();
+        args = &nc->args;
+    }
+    if (!args) return;
+    // Build CalleeFormals from the callee (mirrors resolveCalleeParams).
+    CalleeFormals formals;
+    if (callee) {
+        if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(
+                ctx_.exprSymbol(*callee)))
+            formals.methSym = ms;
+        else if (auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(
+                ctx_.exprSymbol(*callee)))
+            formals.ctorSym = cs;
+    }
+    std::size_t pos = 0;
+    for (const auto& a : *args) {
+        if (!a.value) { ++pos; continue; }
+        // The RETIRED form — kept for safety, sema already rejected it.
+        if (a.modifier == "out owned var") {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                if (sema::Symbol* s = ctx_.exprSymbol(*id))
+                    out.insert(s);
+            }
+        }
+        // fix #3842: `out var` at an `out owned` formal position adopts owned
+        // classification. Check both user-defined and builtin out-owned forms.
+        else if (a.modifier == "out var") {
+            const bool userOutOwned =
+                formals.valid() && formals.modifier(pos) == "out owned";
+            const bool builtinOutOwned = builtinOutOwnedArg(callee, pos);
+            if (userOutOwned || builtinOutOwned) {
+                if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(
+                        a.value.get())) {
+                    if (sema::Symbol* s2 = ctx_.exprSymbol(*id2))
+                        out.insert(s2);
+                }
+            }
+        }
+        ++pos;
+    }
+}
 
 void MethodOwnership::joinFieldsInto(FieldMovedFrom& into,
                                     const FieldMovedFrom& other) {
@@ -2932,7 +2971,7 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
             // Auto-drop only disposes the FINAL slot value → earlier iterations'
             // values would leak. Track these symbols so the auto-drop check in
             // run() can exclude them (they keep the hard §28.3 discharge error).
-            collectOutOwnedVarSyms(*block.condition, ctx_, loopCondOutOwnedSyms_);
+            collectOutOwnedVarSyms(*block.condition, loopCondOutOwnedSyms_);
             // §28.3 / §28.11 (#1466): a PRE-DECLARED recipient in a while-loop
             // condition shares its slot across iterations too — exclude it from
             // the recipient auto-drop (it keeps the hard discharge error, sound
@@ -2948,7 +2987,7 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
             // the then-branch alone correctly satisfies the obligation.
             // // per §28.3, #1407
             std::unordered_set<sema::Symbol*> condSyms;
-            collectOutOwnedVarSyms(*block.condition, ctx_, condSyms);
+            collectOutOwnedVarSyms(*block.condition, condSyms);
             // §28.3 / §28.11 (#1466): also demote a PRE-DECLARED recipient
             // (`if coll.TryX(out item) then item?.Dispose(); end`) to PolyNull on
             // the false edge, so an in-`then` discharge is not falsely reported.

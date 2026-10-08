@@ -2317,8 +2317,18 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // parameter / builtin dispatch so `consumed=true` suppresses the
             // unwanted read. User `out owned` is reliable; `builtinOutOwnedArg`
             // covers builtin TryPop / TryDequeue / etc. // per §28.3, §28.11
+            //
+            // fix #3842 (§22.3 / §22.4 / §28.3, v0.289): `out owned var` is
+            // RETIRED. The sole inline owned form is `out var x`, which adopts
+            // the `out owned` classification. Extended here to also skip the
+            // read-check for `out var` at an `out owned` formal, mirroring
+            // the `out owned var` treatment above.
             if (a.modifier == "out owned var" ||  // per §22.4 / v0.160
-                builtinOutOwnedArg(call->callee.get(), pos)) {
+                builtinOutOwnedArg(call->callee.get(), pos) ||
+                // fix #3842: `out var` at an `out owned` formal is also a write
+                // target — the call deposits an owned value into the local.
+                (a.modifier == "out var" &&
+                 boundModifier(call->args, pos, discFormals) == "out owned")) {
                 consumed = true;  // write target: skip read-check; markOutOwnedArgs handles it
             } else if (a.modifier == "owned") {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
@@ -3319,6 +3329,22 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
             if (a.modifier == "out owned var" ||  // per §22.4 / v0.160
                 builtinOutOwnedArg(call->callee.get(), pos)) {
                 ++pos; continue;
+            }
+            // fix #3842 (§22.3 / §22.4 / §28.3, v0.289): `out owned var` is
+            // RETIRED. The sole inline owned form is `out var x`, which adopts
+            // the `out owned` classification. Extended here to also skip the
+            // read-check for `out var` at an `out owned` formal, mirroring the
+            // `out owned var` treatment above.
+            if (a.modifier == "out var") {
+                // Check if the formal is `out owned` (user-defined).
+                const CalleeFormals formals =
+                    calleeOrChainFormals(call->callee.get(), call->args);
+                if (formals.valid() &&
+                    boundParamIndex(call->args, pos, formals) < formals.size() &&
+                    formals.modifier(
+                        boundParamIndex(call->args, pos, formals)) == "out owned") {
+                    ++pos; continue;  // write target: skip read-check
+                }
             }
             // fix #4023 (§28.3 K3.4, v0.294): a `move`/`await` TOP-LEVEL
             // argument is a WRITE/consume position — validated and marked
@@ -13966,13 +13992,42 @@ void MethodOwnership::markOutOwnedArgsCore(
                 // inline `out owned var` recipient is a fresh binding at its
                 // declaring call site, on every iteration, no different from a
                 // ordinary LocalDecl. per §22.4, §28.3, #2436
+                //
+                // fix #3842 (§22.3 / §22.4 / §28.3, v0.289): `out owned var`
+                // is RETIRED (proposal 0122 L2). The sole inline owned form is
+                // now `out var x`, which adopts the classification the callee's
+                // declaration announces — owned at an `out owned` formal. The
+                // old `out owned var x` is no longer accepted.
+                //
+                // v0.289 adoption clause: at an `out owned` formal, `out var x`
+                // produces exactly the owned local `out owned var x` produced —
+                // same Owned state, same must-use warning, same scope-end
+                // auto-drop. The `out owned var` branch below is replaced by the
+                // `out var` adoption arm.
                 if (a.modifier == "out owned var") {
+                    // Retired form — the sema layer has already reported an
+                    // error for the retired `out owned var` modifier; do NOT
+                    // seed a state here so the downstream must-use / auto-drop
+                    // machinery does not fire on a local whose declaration form
+                    // is an error. (The local's symbol was still registered by
+                    // sema for error-recovery, so `states_` entry is skipped.)
+                } else if (a.modifier == "out var") {
+                    // v0.289 adoption: `out var x` at an `out owned` formal
+                    // produces an owned local. Seed Owned. The discharge check
+                    // (§28.3) does NOT warn for inline `out var` (same as the
+                    // retired `out owned var` form it replaces): inline locals are
+                    // NOT added to `everOwnedPlainLocals_`, so the discharge
+                    // check's nested-scope auto-drop loop never sees them — they
+                    // are silently auto-dropped at scope end, exactly as
+                    // `out owned var x` was before this fix. (Pre-declared
+                    // `out x` recipients are added to preDeclaredOutOwnedRecipients_
+                    // in the else branch below and DO receive a warning if
+                    // undischarged.) // per §28.3
                     if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
                         LocalOwnership lo;
                         lo.state = OwnershipState::Owned;
                         lo.obligationOrigin = id;
                         states_[sym] = lo;
-                        everOwnedPlainLocals_.insert(sym);
                     }
                 } else {
                     // Pre-declared local (plain `out x`) or `out using var x`
