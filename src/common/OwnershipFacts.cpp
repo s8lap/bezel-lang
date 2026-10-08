@@ -1564,7 +1564,20 @@ bool recordFieldTypeIsBorrowCarryingCommon(
             // (`[N]T` at `T := C` is an inline array of references). // #2145
             const sema::TypeRef* el =
                 resolveRecordFieldSubst(ft->arrayElement, env).ty;
-            return isReferenceTypeForRecordField(el ? el : ft->arrayElement);
+            const sema::TypeRef* elTy = el ? el : ft->arrayElement;
+            // fix #5627 (§9.7, v0.326): the element might be a record whose
+            // fields make it borrow-carrying (§9.7 transitivity). The existing
+            // isReferenceTypeForRecordField check covers Class/Interface; add
+            // the Record case.
+            if (isReferenceTypeForRecordField(elTy)) return true;
+            if (elTy->kind == sema::TypeRef::Kind::Named &&
+                elTy->declaration &&
+                elTy->declaration->kind == ast::TypeDeclKind::Record) {
+                std::unordered_set<const sema::TypeRef*> localSeen;
+                return isBorrowBearingRecordCommon(elTy, ctx, localSeen, env,
+                                                  choiceSeen);
+            }
+            return false;
         }
         default:
             return false;  // Primitive, Unit, Function, Error
@@ -1766,6 +1779,25 @@ bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt,
     if (n == "Span" || n == "ReadOnlySpan" ||
         n == "ArraySpan" || n == "ReadOnlyArraySpan")
         return true;
+    // fix #5627 (§9.7, v0.326): an inline array of borrow-bearing records
+    // is borrow-carrying. §9.7: "a borrow-bearing inline array (one whose element
+    // type is a reference type or a borrow-bearing record …)" applies element-
+    // wise, so [1]Str2 (where Str2 has a Box field) carries a borrow of Box.
+    // Without this, isBorrowBearingRecordOrSpan returned false for InlineArray
+    // kind. // per §9.7, v0.326
+    if (rt->kind == sema::TypeRef::Kind::InlineArray && !rt->arrayOwned &&
+        rt->arrayElement) {
+        const sema::TypeRef* el = rt->arrayElement;
+        // Class/interface element → borrow-carrying
+        if (isReferenceTypeForRecordField(el)) return true;
+        // Record element → check if the record is borrow-bearing
+        if (el->kind == sema::TypeRef::Kind::Named && el->declaration &&
+            el->declaration->kind == ast::TypeDeclKind::Record) {
+            std::unordered_set<const sema::TypeRef*> seen;
+            return isBorrowBearingRecordCommon(el, ctx, seen, /*env=*/nullptr);
+        }
+        return false;
+    }
     std::unordered_set<const sema::TypeRef*> seen;
     return isBorrowBearingRecordCommon(rt, ctx, seen, /*env=*/nullptr);
 }

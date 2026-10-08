@@ -7357,6 +7357,27 @@ sema::Symbol* MethodOwnership::carriedBorrowSourceOfValueExpr(
         }
         return nullptr;
     }
+    // fix #5627 (§9.7, v0.326): a CallExpr that returns a borrow-bearing record
+    // or inline array — e.g. `Helper.Wrap(b)` returning `[1]Str2` — was not
+    // handled here, so `outer := Helper.Wrap(b)` (outer at method scope, b inside
+    // a do block) compiled clean and UAF'd at runtime: the borrow of b outlived
+    // b's scope because the outer-local check found no source and returned before
+    // the depth comparison. Non-deferred-activation calls that return a
+    // borrow-bearing value carry the borrows of their plain reference-typed
+    // arguments. Check each argument for an escape-bound local source; a
+    // deferred-activation call carries its arguments' borrows in a frame with
+    // its own lifetime rules, so return nullptr there. // per §9.7, v0.326
+    if (const auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (isDeferredActivationCallResult(e)) return nullptr;
+        for (const auto& a : call->args) {
+            if (!a.value) continue;
+            const ast::IdentifierExpr* argRoot = identifierRoot(*a.value);
+            if (!argRoot) continue;
+            sema::Symbol* s = ctx_.exprSymbol(*argRoot);
+            if (s && isEscapeBoundLocal(s)) return s;
+        }
+        return nullptr;
+    }
     const ast::IdentifierExpr* root = identifierRoot(e);
     if (!root) return nullptr;
     sema::Symbol* sym = ctx_.exprSymbol(*root);
@@ -10147,7 +10168,7 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             const int td = targetLocal->decl ? depthOfDecl(targetLocal->decl) : -1;
             const int sd = viewSrc->decl ? depthOfDecl(viewSrc->decl) : -1;
             if (td >= 0 && sd >= 0 && td < sd) {
-                const bool spanForm = !isBorrowBearingRecord(
+                const bool spanForm = !isBorrowBearingRecordOrSpan(
                     ctx_.exprType(*as.value));
                 report(
                     Severity::Error, as.span.begin,
@@ -18985,6 +19006,26 @@ bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const
     if (n == "Span" || n == "ReadOnlySpan" ||
         n == "ArraySpan" || n == "ReadOnlyArraySpan")
         return true;
+    // fix #5627 (§9.7, v0.326): an inline array of borrow-bearing records
+    // is borrow-carrying. §9.7: "a borrow-bearing inline array (one whose element
+    // type is a reference type or a borrow-bearing record …)" applies element-
+    // wise, so [1]Str2 (where Str2 has a Box field) carries a borrow of Box.
+    // Without this, isBorrowBearingRecordOrSpan returned false for InlineArray
+    // kind and carriedBorrowSourceOfValueExpr returned nullptr, so the outer-
+    // local escape check never fired. // per §9.7, v0.326
+    if (rt->kind == sema::TypeRef::Kind::InlineArray && !rt->arrayOwned &&
+        rt->arrayElement) {
+        const sema::TypeRef* el = rt->arrayElement;
+        // Class/interface element → borrow-carrying
+        if (isBorrowableType(el)) return true;
+        // Record element → check if the record is borrow-bearing
+        if (el->kind == sema::TypeRef::Kind::Named && el->declaration &&
+            el->declaration->kind == ast::TypeDeclKind::Record) {
+            std::unordered_set<const sema::TypeRef*> seen;
+            return isBorrowBearingRecordImpl(el, seen, /*env=*/nullptr);
+        }
+        return false;
+    }
     return isBorrowBearingRecord(rt);
 }
 
