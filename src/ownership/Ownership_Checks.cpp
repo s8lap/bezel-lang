@@ -3881,11 +3881,20 @@ bool MethodOwnership::returnedExprMayBorrow(const ast::Expr& e) const {
     // possibly-untyped `exprType(e)` branch.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (call->callee) {
-            if (const sema::TypeRef* ct = ctx_.exprType(*call->callee))
-                if (ct->kind == sema::TypeRef::Kind::Function && ct->funcReturn)
-                    return isBorrowableType(ct->funcReturn);
+            const sema::TypeRef* ct = ctx_.exprType(*call->callee);
+            if (ct && ct->kind == sema::TypeRef::Kind::Function && ct->funcReturn)
+                return isBorrowableType(ct->funcReturn);
         }
+        // fix #5624 / §28.3 (v0.315): a call whose result is a
+        // deferred-activation type (iterator factory, async iterator, lazy
+        // query, Task-family) carries borrows of its plain reference-typed
+        // arguments. ctx_.exprType(call) may resolve to the type argument
+        // (e.g. Item in IEnumerable<Item>) rather than the declared return
+        // type, so fall back to isDeferredActivationCallResult directly.
+        if (isDeferredActivationCallResult(*call))
+            return true;
     }
+    // Fallback: check the expression's own type
     // Prefer sema's resolved type for the returned expression: user-type
     // field/property/method-call results are typed here (e.g. `r.V`/`r.Size()`
     // returning int → value type → not a borrow). isBorrowableType is
@@ -3959,7 +3968,8 @@ void MethodOwnership::checkBorrowEscapesOnReturn(const ast::Expr& e) {
     // cannot outlive its source (§28.3: a borrowed local "may not be
     // returned from a method at all unless ... value-typed returns ...";
     // a value-typed projection is a copy, so it is never a borrow escape).
-    if (!returnedExprMayBorrow(e)) return;
+    bool mayBorrow = returnedExprMayBorrow(e);
+    if (!mayBorrow) return;
     // fix #4959: whether the returned `??` is an OWNED producer (#1029), in
     // which case its bare owned-local operands are transferred, not borrowed.
     // Only `!` and binding atoms are peeled — an `as` over it is a borrow
@@ -4099,9 +4109,22 @@ void MethodOwnership::collectReturnBorrowRoots(
         next = ma->target.get();
     else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e))
         next = nm->target.get();
-    else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+    else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // fix #5624 / §28.3 (v0.315): when the call result is a
+        // deferred-activation type (iterator factory, async iterator, lazy
+        // query, Task-family), its frame holds borrows of its PLAIN
+        // reference-typed arguments. Trace those arguments as sources so
+        // any scope-bound owned local among them is caught as a borrow
+        // escape. Only trace arguments for deferred-activation calls —
+        // ordinary calls do not carry their arguments into a returned frame.
+        if (isDeferredActivationCallResult(*ce)) {
+            for (const auto& a : ce->args) {
+                if (a.value)
+                    collectReturnBorrowRoots(*a.value, kRootDerived, out);
+            }
+        }
         next = ce->callee.get();
-    else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+    } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
         next = ix->target.get();
     if (next) collectReturnBorrowRoots(*next, kRootDerived, out);
 }
