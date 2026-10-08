@@ -7967,17 +7967,33 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 const auto& fp = rt->funcParams[pi];
                 const sema::TypeRef* pty = resolveTypeParamRef(fp.type);
                 if (isStringPinFormalType(pty)) {
-                    // Skip if the argument is a +1 producer or a string literal:
-                    // a +1 producer's own retain already covers the caller's
-                    // borrowed reference; a literal is static and needs no pin.
-                    if (!dynamic_cast<const ast::StringLiteralExpr*>(a.value.get()) &&
-                        !isPlusOneStringProducer(a.value.get())) {
+                    // fix #5441 (§28.2, v0.315): skip only for literals and
+                    // producer-local strings (whose scope-end release covers the
+                    // borrowed reference). Direct +1 producers (e.g. "a"+"b")
+                    // need a pin: the concat result is owned by the producer's
+                    // release, not by the lambda's env.
+                    const ast::Expr* argE = a.value.get();
+                    bool isLit = dynamic_cast<const ast::StringLiteralExpr*>(argE);
+                    bool isProdLocal = false;
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(argE)) {
+                        if (auto* sym = ctx_.exprSymbol(*id)) {
+                            isProdLocal = stringLocalCandidates_.count(
+                                static_cast<const void*>(sym->decl)) != 0;
+                        }
+                    }
+                    bool isDirectPlusOne = isPlusOneStringProducer(argE);
+                    if (isDirectPlusOne && !isLit && !isProdLocal) {
+                        // fix #5441 (§28.2, v0.315): direct +1 producer (e.g.
+                        // "a"+"b") — the concat result has RC=1 owned by the
+                        // caller's scope. The callee borrows it, so after the
+                        // call the caller must release. A retain+release leaves
+                        // RC at 1 (1->2->1), so emit only the post-call release
+                        // here (no retain: RC=1->0).
+                        closureStringPins.push_back(v);
+                    } else if (!isLit && !isProdLocal) {
+                        // Retain+release for other cases (captured local, etc.):
+                        // the retain extends the arg's lifetime across the call.
                         emitStringRetain(v);
-                        // Reserve a slot: post-call release walks closureStringPins
-                        // in order and matches by args position.  The actual
-                        // retained value (which may differ from args[1+pi] after
-                        // boxForTarget) is stored in closureStringPins so the
-                        // release hits the correct pointer.
                         closureStringPins.push_back(v);
                     }
                 }
@@ -8322,26 +8338,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // `closureStringPins` (declared above, in the argument loop) is the
         // #5347 pin: `emitStringRetain(v)` per borrowed by-value `string` /
         // `string?` formal, collected in argument order. MEASURED before this
-        // fix (issue #5438): the retain fired but NOTHING discharged it — the
-        // release had been swapped for a SECOND, independent pin vector
-        // (`stringPinArgs`, from `emitBorrowedStringArgPinsForClosure`) that
-        // covers a disjoint argument set, so neither pin's reference was
-        // dropped on the normal-return edge and one string leaked per closure
-        // call that passes a borrowed string. LSan on the issue's repro:
-        // 731 bytes / 40 allocations over 20 iterations; a two-argument
-        // closure call leaked 72 bytes / 4 allocations (both arguments).
-        // `BEZEL_DUMP_IR` on the same program shows the retained value with no
-        // matching `bz_string_release` anywhere in the callee.
-        //
-        // The discharge must cover BOTH vectors, because the two pin sites are
-        // not alternatives — they fire on overlapping argument sets and each
-        // retain needs its own matching release:
-        //
-        //   * `closureStringPins`  — #5347, emitted inside the argument loop on
-        //     the pre-boxing `v`, keyed on `rt->funcParams[pi]`.
-        //   * `stringPinArgs`      — #5281, computed AFTER the loop from the
-        //     finished `args` vector, keyed on `args[fi + 1]` (args[0] is the
-        //     ENV pointer, not a user argument).
+        // fix (issue #5438): the retain fired but NOTHING discharged it.
+        // fix #5441 (§28.2, v0.315): replaced the old skip logic
+        // (isPlusOneStringProducer) with stringLocalCandidates_ check, and
+        // changed direct +1 producers to emit release-only (no retain) so the
+        // post-call release frees the string (RC=1->0) instead of leaving it
+        // at RC=1 (retain+release: 1->2->1, string leaks).
         //
         // Releasing only one leaves the other's retain unreleased, so the fix
         // releases both, in the same argument order they were taken.
@@ -8364,27 +8366,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // `!diverged_` exactly as the `callBoundedClosures` release beside it
         // is, so no release is emitted into unreachable IR.
         //
-        // fix-forward #5281 (§4.6 / §28.9, v0.313): `emitBorrowedStringArgPinsForClosure`
-        // operates on function-type `funcParams` (a closure call carries no
-        // ParameterSymbol list). Its pins are the second vector.
-        std::vector<const ast::Expr*> argExprs;
-        argExprs.reserve(call.args.size());
-        for (const auto& a : call.args) argExprs.push_back(a.value.get());
-        const std::vector<llvm::Value*> stringPinArgs =
-            emitBorrowedStringArgPinsForClosure(args, &argExprs, rt->funcParams);
         // fix #5347 / #5438: install the throw-path cleanup BEFORE
         // `emitPendingCheck`. `emitPendingCheck` calls `unwindBB()` to set
         // `call.unwind`'s branch target. By setting `unwindTarget_` to the
         // cleanup block first, `call.unwind` will branch to cleanup, which
         // releases the pins then branches to the saved original
         // `unwindTarget_`. This integrates the pin release INTO the throw
-        // chain rather than creating a parallel path. #5438: the cleanup must
-        // cover `closureStringPins` too — `stringPinArgUnwindCleanup` is handed
-        // ONE vector, so the two are concatenated into `allStringPins` and the
-        // cleanup drains both, in the order they were taken.
+        // chain rather than creating a parallel path. fix #5441: removed the
+        // now-redundant emitBorrowedStringArgPinsForClosure call (the arg loop
+        // handles all string pin cases directly); allStringPins is just
+        // closureStringPins now.
         std::vector<llvm::Value*> allStringPins = closureStringPins;
-        allStringPins.insert(allStringPins.end(),
-                             stringPinArgs.begin(), stringPinArgs.end());
         llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
         if (!allStringPins.empty())
             unwindTarget_ = stringPinArgUnwindCleanup(allStringPins);
@@ -8409,14 +8401,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // double-free).
         if (!diverged_) {
             for (llvm::Value* cl : callBoundedClosures) emitClosureRelease(cl);
-            // fix #5438: discharge BOTH borrowed-string pin vectors on the
-            // normal-return edge — `closureStringPins` (#5347, taken in the
-            // argument loop) and `stringPinArgs` (#5281, computed after it).
-            // Before this the only release was of `stringPinArgs`, so every
-            // retain in `closureStringPins` leaked one string per call. The
-            // throw path is handled by the `stringPinArgUnwindCleanup` above,
-            // per §28.3's Exception-path discharge; see the rationale for why
-            // this cannot over-release at the `allStringPins` construction.
+            // fix #5438: discharge the borrowed-string pin vector on the
+            // normal-return edge. fix #5441: allStringPins is closureStringPins
+            // only now (the helper call was removed); direct +1 producers get
+            // release-only (no retain), other cases get retain+release.
+            // The throw path is handled by the `stringPinArgUnwindCleanup`
+            // above, per §28.3's Exception-path discharge.
             releaseBorrowedStringArgPins(allStringPins);
         }
         return retTy->isVoidTy() ? nullptr : r;
@@ -8732,6 +8722,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // Lower call arguments.
         std::vector<llvm::Value*> args;
         args.push_back(envPtr);  // env_ptr is always the first arg
+        std::vector<llvm::Value*> iifeStringPins;  // fix #5441: borrowed-string pins
         std::size_t iifeArgPos = 0;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
@@ -8767,6 +8758,42 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             if (!v) return nullptr;
             args.push_back(v);
+            // fix #5441 (§4.6 / §28.9 / §28.3, v0.315): emit a borrowed-string pin
+            // for a non-literal, non-producer-local argument whose formal is `string`
+            // with an empty modifier. This prevents a +1 string producer temporary
+            // (concat, interpolation, etc.) passed as a borrowed arg from leaking.
+            // Skip: string literals (static, never need a pin), and IdentifierExpr
+            // args bound to a producer-local (stringLocalCandidates_ — the
+            // scope-end release handles those).
+            if (iifeArgPos < iifeLam->params.size()) {
+                const ast::Param* ifp = &iifeLam->params[iifeArgPos];
+                if (ifp->modifier.empty()) {
+                    const sema::TypeRef* ifpty = ifp->type
+                        ? ctx_.resolvedType(*ifp->type) : nullptr;
+                    if (isStringPinFormalType(ifpty)) {
+                        const ast::Expr* argE = a.value.get();
+                        bool isLit = dynamic_cast<const ast::StringLiteralExpr*>(argE);
+                        bool isProdLocal = false;
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(argE)) {
+                            if (auto* sym = ctx_.exprSymbol(*id)) {
+                                isProdLocal = stringLocalCandidates_.count(
+                                    static_cast<const void*>(sym->decl)) != 0;
+                            }
+                        }
+                        bool isDirectPlusOne = isPlusOneStringProducer(argE);
+                        if (isDirectPlusOne && !isLit && !isProdLocal) {
+                            // fix #5441 (§28.2, v0.315): direct +1 producer
+                            // (e.g. "a"+"b") — RC=1, no retain, only post-call
+                            // release (RC=1->0).
+                            iifeStringPins.push_back(v);
+                        } else if (!isLit && !isProdLocal) {
+                            // Retain+release for other cases.
+                            emitStringRetain(v);
+                            iifeStringPins.push_back(v);
+                        }
+                    }
+                }
+            }
             ++iifeArgPos;
         }
         // Build the function type from the actual argument LLVM types.
@@ -8799,8 +8826,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // and masked this; the AOT path (which verifies) rejected it. Name the
         // result only when non-void (mirrors the unnamed CreateCall on the
         // var-stored closure-call path above).
+        // Throw-path cleanup for borrowed-string pins.
+        llvm::BasicBlock* savedUnwind = unwindTarget_;
+        if (!iifeStringPins.empty())
+            unwindTarget_ = stringPinArgUnwindCleanup(iifeStringPins);
         llvm::Value* result = builder_.CreateCall(
             fnTy, fnPtr, args, retTy->isVoidTy() ? "" : "iife.ret");
+        unwindTarget_ = savedUnwind;
+        if (!diverged_) releaseBorrowedStringArgPins(iifeStringPins);
         // #422 / §28.9: release the transient closure after the call.
         emitClosureRelease(closureObj);
         return retTy->isVoidTy() ? nullptr : result;

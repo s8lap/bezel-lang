@@ -4839,18 +4839,21 @@ private:
     // function TypeRef from the capture site.
     //
     // IMPORTANT: for closure calls, `args[0]` is the ENV POINTER (the captured
-    // receiver), not a user argument. User arguments start at `args[1]`.
+    // receiver), not a user argument. `argStartIndex` tells us where user
+    // args begin (1 for closure calls, 0 for IIFE calls).
     std::vector<llvm::Value*> emitBorrowedStringArgPinsForClosure(
         const std::vector<llvm::Value*>& args,
         const std::vector<const ast::Expr*>* argExprs,
-        const std::vector<sema::TypeRef::FuncParam>& funcParams) {
+        const std::vector<sema::TypeRef::FuncParam>& funcParams,
+        std::size_t argStartIndex) {
         std::vector<llvm::Value*> pinned;
         if (!argExprs) return pinned;
-        // For closure calls, args[0] is the env pointer (captured receiver).
-        // User arguments start at args[1]. funcParams[fi] maps to args[fi + 1].
+        // argExprs[fi] maps to args[argStartIndex + fi].
+        // Check fi against argExprs->size() and ai against args.size().
         for (std::size_t fi = 0; fi < funcParams.size(); ++fi) {
-            const std::size_t ai = fi + 1;  // +1: skip env pointer at args[0]
-            if (ai >= args.size() || ai >= argExprs->size()) break;
+            if (fi >= argExprs->size()) break;
+            const std::size_t ai = argStartIndex + fi;
+            if (ai >= args.size()) break;
             if (!funcParams[fi].modifier.empty()) continue;
             const sema::TypeRef* pty =
                 funcParams[fi].type
@@ -4858,11 +4861,28 @@ private:
                     : nullptr;
             if (!isStringPinFormalType(pty)) continue;
             if (!args[ai] || !args[ai]->getType()->isPointerTy()) continue;
-            if (isPlusOneStringProducer((*argExprs)[ai])) continue;
-            if (dynamic_cast<const ast::StringLiteralExpr*>((*argExprs)[ai]))
-                continue;
-            emitStringRetain(args[ai]);
-            pinned.push_back(args[ai]);
+            // fix #5441 (§4.6 / §28.9 / §28.3, v0.315): skip the pin for a
+            // string literal (static, never needs a pin) OR for an IdentifierExpr
+            // arg whose local is a +1 string producer (stringLocalCandidates_).
+            // For a producer-local, the scope-end release handles cleanup; adding
+            // a pin would double-release it.  For a direct +1 producer (not in
+            // stringLocalCandidates_), no scope-end release exists and the pin
+            // MUST be emitted to prevent the temporary from leaking.
+            // NOTE: argExprs[fi] (not argExprs[ai]) — argExprs has user args only,
+            // args[ai] has envPtr at index 0, so user args start at argStartIndex.
+            const ast::Expr* argE = (*argExprs)[fi];
+            bool isLit = dynamic_cast<const ast::StringLiteralExpr*>(argE);
+            bool isProdLocal = false;
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(argE)) {
+                if (auto* sym = ctx_.exprSymbol(*id)) {
+                    isProdLocal = stringLocalCandidates_.count(
+                        static_cast<const void*>(sym->decl)) != 0;
+                }
+            }
+            if (!isLit && !isProdLocal) {
+                emitStringRetain(args[ai]);
+                pinned.push_back(args[ai]);
+            }
         }
         return pinned;
     }
