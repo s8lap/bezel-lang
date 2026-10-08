@@ -14938,7 +14938,8 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         // and `recvTarget` guards make this a no-op for free functions and
         // non-generic receivers.
         if (pt && recvTarget && recvParent)
-            pt = substituteMemberType(pt, recvTarget, recvParent);
+            pt = substituteMemberType(pt, recvTarget, recvParent,
+                                    &calleeMethodGenericParamNames);
         if (!explicitSubst.empty())
             pt = substituteReturnType(pt, explicitSubst);  // narrow #4915
         // fix #5328 (§15.4, v0.313): the §15.4 collection-literal TARGET
@@ -17303,7 +17304,8 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
 static bool ancestorGenericSubst(
     const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
-    std::unordered_map<std::string_view, TypeRef*>& out);
+    std::unordered_map<std::string_view, TypeRef*>& out,
+    const std::unordered_set<std::string_view>* excludeNames = nullptr);
 
 // fix-forward #5469 (§14.2 / §5.1, v0.315): the substitution map for a
 // member call whose RECEIVER is itself an unsubstituted type parameter.
@@ -17619,7 +17621,8 @@ void ExprTC::checkArgsAgainstParams(
             TypeRef* rparamTy = ctx_.resolvedType(*rp.type);
             if (rparamTy && classTarget && classParent)
                 rparamTy = substituteMemberType(rparamTy, classTarget,
-                                                classParent);
+                                                classParent,
+                                                &calleeMethodGenericParamNames);
             // fix-forward #5469 (§22.3 / §14.2, v0.315): the twin of the
             // `ref`/`out` half's `substituteMemberType` above, for a receiver
             // that is itself a bare type parameter. Without it the referent
@@ -17679,7 +17682,8 @@ void ExprTC::checkArgsAgainstParams(
         // treating the raw `U` as a non-function type conservatively rejects
         // the valid function-type identity case.
         if (paramTy && classTarget && classParent)
-            paramTy = substituteMemberType(paramTy, classTarget, classParent);
+            paramTy = substituteMemberType(paramTy, classTarget, classParent,
+                                           &calleeMethodGenericParamNames);
         // fix-forward #5469 (§14.2 / §5.1, v0.315): the receiver is ITSELF a
         // bare type parameter (`a: T` under `where T: IEquatable<Other>`), so
         // the line above substituted nothing — the interface's own `T` was
@@ -20041,7 +20045,8 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
 static bool ancestorGenericSubst(
     const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
-    std::unordered_map<std::string_view, TypeRef*>& out) {
+    std::unordered_map<std::string_view, TypeRef*>& out,
+    const std::unordered_set<std::string_view>* excludeNames) {
     if (!derived || !parent || derived == parent) return false;
     out.clear();
     // (derived, its bound args) frontier. A declaration is visited at most once:
@@ -20059,8 +20064,10 @@ static bool ancestorGenericSubst(
         derived->genericParams.size() == recvTy->genericArgs.size())
         for (std::size_t gi = 0; gi < derived->genericParams.size(); ++gi)
             if (derived->genericParams[gi])
-                curArgs[derived->genericParams[gi]->name] =
-                    recvTy->genericArgs[gi];
+                if (!excludeNames ||
+                    !excludeNames->count(derived->genericParams[gi]->name))
+                    curArgs[derived->genericParams[gi]->name] =
+                        recvTy->genericArgs[gi];
     work.push_back({derived, std::move(curArgs)});
     std::unordered_set<const TypeSymbol*> visited;
     std::size_t i = 0;
@@ -20099,14 +20106,17 @@ static bool ancestorGenericSubst(
                         if (it != curArgsAt.end()) arg = it->second;
                     }
                     if (base->genericParams[gi])
-                        nextArgs[base->genericParams[gi]->name] = arg;
+                        if (!excludeNames ||
+                            !excludeNames->count(base->genericParams[gi]->name))
+                            nextArgs[base->genericParams[gi]->name] = arg;
                 }
             }
             if (base == parent) {
                 for (const Symbol* gp : parent->genericParams) {
                     auto it = nextArgs.find(gp->name);
                     if (it != nextArgs.end() && it->second)
-                        out[gp->name] = it->second;
+                        if (!excludeNames || !excludeNames->count(gp->name))
+                            out[gp->name] = it->second;
                 }
                 return true;
             }
@@ -20124,7 +20134,8 @@ static bool ancestorGenericSubst(
 // `b.v.x` resolve `.x` against the concrete record layout (issue #361 / D13).
 TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
                                       const ast::Expr* target,
-                                      TypeSymbol* parent) {
+                                      TypeSymbol* parent,
+                                      const std::unordered_set<std::string_view>* excludeNames) {
     if (!declared || !parent) return declared;
     if (parent->genericParams.empty()) return declared;
     // Substitution applies both to a bare type-parameter reference (`v: T`)
@@ -20210,9 +20221,11 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
         // Positional by index (param `B` at genericParams[1] -> genericArgs[1]).
         for (std::size_t gi = 0; gi < parent->genericParams.size() &&
                                  gi < recvTy->genericArgs.size(); ++gi)
-            if (parent->genericParams[gi] && recvTy->genericArgs[gi])
-                classSubst[parent->genericParams[gi]->name] =
-                    recvTy->genericArgs[gi];
+            if (parent->genericParams[gi] && recvTy->genericArgs[gi]) {
+                auto gpn = parent->genericParams[gi]->name;
+                if (!excludeNames || !excludeNames->count(gpn))
+                    classSubst[gpn] = recvTy->genericArgs[gi];
+            }
     } else if (derived && derived != parent) {
         // Inherited: the receiver is a DERIVED type that fixes `parent`'s
         // generic args somewhere up the base chain. Walk the chain transitively
@@ -20231,7 +20244,8 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
         // base is traversable, and a class has at most one — so no program that
         // compiled through this arm before compiles differently now.
         if (!ancestorGenericSubst(recvTy, derived, parent,
-                                  /*throughInterfaces=*/false, classSubst))
+                                  /*throughInterfaces=*/false, classSubst,
+                                  excludeNames))
             return declared;  // ancestor not reached / unresolvable generic link
     }
     if (classSubst.empty()) return declared;

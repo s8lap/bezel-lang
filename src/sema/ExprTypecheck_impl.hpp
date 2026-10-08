@@ -3991,7 +3991,8 @@ private:
     // `b.v` was typed as the unresolved type parameter.
     TypeRef* substituteMemberType(TypeRef* declared,
                                   const ast::Expr* target,
-                                  TypeSymbol* parent);
+                                  TypeSymbol* parent,
+                                  const std::unordered_set<std::string_view>* excludeNames = nullptr);
 
     // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
     // type-argument inference. A generic method whose type parameter appears
