@@ -1,0 +1,1937 @@
+{
+ "label": "First audit · v0.330",
+ "meta": "Spec v0.330 · first audit · 9 value kinds × 13 positions · five lanes, two cross-checks · 32 open cells, 10 root causes (#5674–#5683, all decided in v0.331)",
+ "cells": [
+  {
+   "row": "R1",
+   "col": "C1",
+   "verdict": "conditional",
+   "rule": "K3.1: \"store into an `owned` field or owning-collection slot, including through a `set(owned)` accessor\" | §28.6: \"A **freshly-produced owned value** — a `new` expression, a call returning `owned T`, a `move` expression, or an owned operator result — stored into a non-`owned` (borrow) field is an **error**\" | K3.13: \"An **unmarked read of a class-typed binding never consumes**\" | §28.3: \"An indexer assignment of such a value is not reached by this bullet: it is a call of the indexer's setter, or a\"",
+   "cite": "§28.3 (K3.1, K3.13, field-store bullet cl.2–3, property-store bullet), §28.5, §28.6, §28.7, App. C.3",
+   "status": "decided",
+   "note": "Into an `owned` field, or through `set(owned)`: a marker-free consume. The new holder disposes it on overwrite or teardown. Into a non-`owned` field or property: a fresh or `move`d value is rejected. An unmarked owned binding is a borrow of a scope-bound binding, so clause 2 rejects it. Through a user-declared indexer setter, a fresh temporary or scope-bound borrow is admitted at the call under clause 3's residual (it dangles past its boundary; the K4.1 backstop catches the use). This is an explicit, recorded asymmetry with property stores.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C2",
+   "verdict": "admitted",
+   "rule": "§22.12 r2: \"assigning a fresh owned value into an admitted mutable static discharges the producer\" | §22.13: \"Static `owned` fields are disposed at program exit\" | §28.3: \"a borrowed local may not be assigned to any field\" | K9.4: \"static owned fields admit no `move`\"",
+   "cite": "§22.12 rule 2 (forms i, ii, iv; Store semantics), §22.13 (static class-typed fields without `owned`), §28.3 (K3.1, K9.4, field-store bullet cl.1, property-store bullet), App. C.3",
+   "status": "decided",
+   "note": "A `static owned` (readonly) field takes the value under K3.1 and disposes it at program exit. A non-`owned` `static readonly` field, or an admitted mutable static (form i or ii only; other class or interface types are errors at the declaration), discharges a fresh or `move`d producer, and the referent is process-lived. An overwrite never disposes. An unmarked owned local is a borrow of a scope-bound binding and is rejected. No borrow arises, so nothing outlives a source.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C3",
+   "verdict": "conditional",
+   "rule": "§28.11 slot policy (owned slots): \"takes `owned`; indexer-set disposes the previous value first\" | §28.11: \"is not a borrow of any named source but a temporary that dies at its K8 boundary\" | App. C.3: \"A fresh-producer element of non-trivial-dispose class type in a borrowing-family collection literal is rejected\"",
+   "cite": "§28.11 (element slot policy, Borrowing collections, Owning collections), §15.4, K3.1, App. C.3",
+   "status": "decided",
+   "note": "Owning-family slot (Add/Insert/indexer-set/literal element/GetOrAdd factory result): an `owned` ingress, `move x` for a named binding, drop-on-overwrite at indexer-set. Borrowing-family slot: a fresh temporary passed to Add/Insert/indexer-set is admitted with §15.4's mandatory fresh-store warning; it dangles at its K8 boundary and the checked-mode backstop catches it. A non-trivial fresh literal element is rejected. An unmarked owned binding is a borrow (R2 C3).",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C1",
+   "verdict": "admitted-bounded",
+   "rule": "§28.3 field-store cl.2: \"borrows sourced from a parameter that is **not `owned`** — a plain or `scoped` parameter — or from the receiver are admissible; scope-bound locals and temporaries are rejected\" | cl.3: \"whether the caller-side source actually outlives the object is the programmer's obligation, not a compile-time guarantee\"",
+   "cite": "§28.3 (field-store bullet cl.1–5, property-store bullet), §28.6, §28.14, K2.3, K4.3, App. C.3",
+   "status": "decided",
+   "note": "Bounded by the structural check plus the K4.3-recorded residual: the caller-side source must outlive the object, with the K4.1 backstop live in checked mode and the domain clause recorded. A `scoped` class- or interface-typed parameter makes the bound static. A scope-bound local, an `owned` parameter or a temporary is rejected at a direct or property store. Through a plain parameter the callee stores (a user indexer setter included), it is admitted at the call under clause 3.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C2",
+   "verdict": "admitted-bounded",
+   "rule": "§28.3 property-store bullet (static): \"a class- or interface-typed borrow is admitted where the field-store bullet admits it, under its residual and domain clause\" | §28.3 cl.4: \"The caller-side obligation includes **not transferring the source's object to another domain**\" | §30.14: \"**no mutable state is ever reachable from two domains.**\"",
+   "cite": "§28.3 (field-store bullet cl.1–4, property-store bullet), §22.12 rule 2 (i)/(ii), §22.13, §30.14, App. C.3",
+   "status": "missing",
+   "note": "A plain-parameter-sourced borrow stored into an admitted mutable static (`Mutex?`, `Task<T>?`, …) is admitted by the field-store bullet's residual (`static readonly` is reachable only from static init, where locals are rejected). The residual and domain clause bound only an object holder and a transfer of the source. Process-global storage publishes the borrow to every domain with no transfer, and no text bounds the owner domain's disposal against another domain's use. Form (ii)'s ground ('every stored task remains independently awaitable') assumes a discharged, process-lived referent.",
+   "counterexample": "module M;\nclass Gate\n  private static _m: Mutex? := null;           // §22.12 rule 2 form (i)\n  public static method Publish(m: Mutex)\n    _m := m;                                   // plain-parameter borrow: field-store residual\n  end Publish;\n  public static method Work()\n    using var g := _m!.Acquire();              // runs in the spawned domain; no transfer\n  end Work;\nend Gate;\nclass Program\n  public static method Main(): int\n    using var t := Domain.Spawn(lambda() => Gate.Work());\n    do\n      using var m := new Mutex();              // owned by the main domain\n      Gate.Publish(m);\n    end;                                       // m disposed here, racing Work's use of Gate._m;\n    return 0;                                  // the domain clause names no transfer, so nothing applies\n  end Main;\nend Program;",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "CONFIRMED",
+    "evidence": "Open as stated (missing). The static-property clause admits a class borrow into a static \"under its residual and domain clause\", but the domain clause names only transferring or consuming the *source* (\"or a store into an admitted static\" there is a consume of the source, not a store of the borrow). Storing the borrow itself into a form-(i)/(ii) static publishes the source to every domain with no transfer; the owner domain's disposal then races the other domain's use, so the K4.1 flag backstop is not even reliable. Tension, not a decision: K4.3's recorded set (\"field-held, collection-held, comparer-held and frame-held borrows versus domain transfer\") lists no static-held clause. Lane counterexample stands."
+   },
+   "rc": [
+    "B3"
+   ]
+  },
+  {
+   "row": "R2",
+   "col": "C3",
+   "verdict": "admitted-bounded",
+   "rule": "§28.11: \"parameter-sourced (a parameter that is not `owned`), receiver-sourced, and field-sourced borrows are admitted\" | §28.11: \"stored into a collection that provably outlives that scope — the collection is a field, is reachable from one, escapes the method, or is a local of strictly wider scope — is **rejected** at the store site\" | slot policy (owned slots): \"takes `owned`; indexer-set disposes the previous value first\"",
+   "cite": "§28.11 (Storing a borrow; element slot policy), K2.3, K4.3, §28.3 cl.4 (domain clause)",
+   "status": "decided",
+   "note": "Borrowing slot: parameter-, receiver- and field-sourced borrows are admitted under the K4.3 residual and domain clause, with the K4.1 backstop. A scope-bound borrow into a collection that outlives its scope is rejected. Owning slot: a borrow cannot reach an `owned` ingress. A caller-supplied (parameter) collection is not in the dash list, but 'provably outlives that scope' decides it as rejected. The implementation agrees (collection_store_escape_1539.parameter_collection_rejected).",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C1",
+   "verdict": "rejected",
+   "rule": "§9.7: \"A borrow-bearing record value may not be stored in an **instance field of a class**\" | \"The checked-mode trust regime is therefore unavailable and the store is **rejected statically**\" | \"Stores of the **null-source** form are admitted\"",
+   "cite": "§9.7 (instance-field bullet, null-source definition), §28.3 property-store bullet, §8.6, App. C.3",
+   "status": "decided",
+   "note": "Rejected statically, with no residual, except for the null-source form (every reference-typed component null). Property stores are judged as the same field store, and a user-indexer setter body storing `value` hits the same bullet. Boxing to an `Object` or interface field is a borrow-erasing rejection. A generic `Keep<Pair>` is rejected per instantiation.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C2",
+   "verdict": "rejected",
+   "rule": "§9.7: \"A borrow-bearing record may not be stored in a static field of any type, *except* when every reference-typed field (and every reference-typed slot of every inline-array field) of the value is `null`\"",
+   "cite": "§9.7 (static-field bullet), §22.12 rule 4(f) and table row 'holds borrows', App. C.3",
+   "status": "decided",
+   "note": "Only the null-source form. A mutable static of such a type is an (iii)-closed error at the declaration, and `static readonly` admits only null-source values, so no borrow reaches static storage.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C3",
+   "verdict": "conditional",
+   "rule": "§9.7: \"A borrow-bearing record value may be **copied into a collection** only when every carried borrow's source provably outlives the collection's own binding scope\" | \"there is **no trust residual for record-carried borrows**\"",
+   "cite": "§9.7 (collection bullet), §28.11 slot policy (copy slots)",
+   "status": "decided",
+   "note": "The criterion is the collection's own binding scope, and the rejection list names a field, reachable-from-a-field, 'escapes the method', or a strictly enclosing binding scope. A caller-supplied (parameter) collection reads two ways: 'escapes the method' (rejected; the implementation's reading, record_collection_store_1540.parameter_collection_rejected), or a parameter binding scope that does not strictly enclose a top-level local (admitted, dangling with no backstop). Recommend the first reading, stated as 'a collection the method did not create'.",
+   "counterexample": "module M;\nclass Item public constructor() end constructor; end Item;\nrecord Pair(A: Item);\nclass Filler\n  public static method Fill(xs: Array<Pair>)\n    using var it := new Item();\n    var p := new Pair(it);\n    xs.Add(p);   // R1: a caller-supplied collection 'escapes the method' -> rejected\n                 // R2: the test is the collection's own *binding* scope; xs's binding\n                 //     (the method) does not strictly enclose it's scope -> admitted, and\n                 //     the caller's array keeps a Pair whose Item is disposed at this end\n  end Fill;      //     (no trust residual and no stated backstop for record-carried borrows)\nend Filler;",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected. The parameter-held (caller-supplied) collection outlives the method, so a source local to the method is not comparable with it: K2.3: \"Where they are not, an admission is made only under K4's posture: a structural, decidable check at the site plus a recorded residual obligation with a named backstop\"; §9.7 collection bullet: \"there is **no trust residual for record-carried borrows**\" — so no admission exists, and K4.3: \"no new admission may be made without recording its clause or its backstop\". The positive criterion agrees: §9.7: \"only when every carried borrow's source provably outlives the collection's own binding scope\" (a top-level local is bound after, and disposed no later than, the parameter binding). §28.11's twin rule reads the same case the same way: §28.11 Storing a borrow: \"an `owned` parameter included, its value being disposed at the method's end\" ... stored into a collection that provably outlives that scope — \"the collection is a field, is reachable from one, escapes the method\". Reading 2 of the lane (admitted, no residual) is therefore an unrecorded admission the kernel forbids. Matches the implementation (record_collection_store_1540.parameter_collection_rejected). Clarification worth making: say 'a collection the method did not create' in §9.7's dash list. (Pair)"
+   },
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C1",
+   "verdict": "conditional",
+   "rule": "§15.1.2: \"When such an array is passed by value, returned from a method, stored as a field, or captured by a closure, the same borrow-lifetime rules apply that govern borrow-bearing records\" | §15.1.2 slot store: \"is checked as an assignment to the array's holder\" | §28.3 property-store bullet: \"and a borrow-bearing record or choice value is admitted only in the null-source form\"",
+   "cite": "§15.1.2, §3.6 (holds-borrows row), §9.7 (instance-field bullet), §28.3 (field-store and property-store bullets); DECLINED.md (async inline-array row)",
+   "status": "decided",
+   "note": "`[2]Pair` is decided: rejected, as `Pair` would be. For `[N]C` over a class element there are two readings. (A) §15.1.2 and §3.6 key §9.7's record rules on the array, so a non-null-source store into an instance field is rejected statically. (B) The slots hold direct class-typed borrows whose every use hits the flag check (§9.7's own ground for exempting direct borrow fields), and the property-store bullet's verdict sentence names only class borrows and records or choices, so the field-store bullet's residual admits a parameter-sourced slot. DECLINED's async row says '§15.1 applies the borrow-bearing record rules to inline arrays', which favours (A).",
+   "counterexample": "module M;\nclass Item public constructor() end constructor; end Item;\nclass Slots\n  private _s: [2]Item?;          // borrow-bearing inline array field, all-null default\n  public method Put(x: Item)\n    _s[0] := x;                  // (A) §15.1.2 + §9.7: the array stops being null-source -> rejected\n  end Put;                       // (B) class-typed borrow from a plain parameter -> admitted under\nend Slots;                       //     the field-store residual (K4.1 backstop on each slot read)",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected (non-null-source store). §3.6 holds-borrows row: \"*A value type that holds borrows* — a borrow-bearing record, a borrow-bearing inline array, or a choice that holds borrows — is the condition on which the [§9.7] borrow-lifetime obligations key\" — so §9.7's instance-field bullet keys on `[N]C`, not only on records. The property-store bullet routes a borrow-bearing inline array to that bullet in its lead sentence: §28.3 property-store bullet: \"(... or a borrow-bearing record, choice or inline array ...) is judged at the site as a store of that value into a non-`owned` field of the receiver, whatever form the property is declared in: by the field-store bullet above, [§9.7]'s instance-field bullet\"; its later verdict sentence omitting 'inline array' is a drafting gap, not a second rule. §15.1.2 says a slot store \"is checked as an assignment to the array's holder\", i.e. the holder field `_s` takes a value that holds borrows. DECLINED.md (async inline-array row) agrees. Reading (B) (per-slot residual) has no text that keys §9.7 off for `[N]C`."
+   },
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C2",
+   "verdict": "rejected",
+   "rule": "App. C.3: \"may be stored in a static field only when every reference-typed field or payload (and every reference-typed slot of every inline-array field) of the value, through nested record and choice components, is null\"",
+   "cite": "§22.12 rule 4(f) and table row 'holds borrows', §9.7 (static-field bullet), §15.1.2, App. C.3",
+   "status": "decided",
+   "note": "A plain inline array carrying borrows is named by §22.12 note (f) and goes to §9.7's static bullet: null-source only (every slot null). A mutable static is an (iii)-closed error.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C3",
+   "verdict": "conditional",
+   "rule": "§15.1.2: \"When such an array is passed by value, returned from a method, stored as a field, or captured by a closure, the same borrow-lifetime rules apply that govern borrow-bearing records\" | §9.7: \"there is **no trust residual for record-carried borrows**\" | §28.11 slot policy (borrow slots): \"stores the borrow; the element's source must outlive the collection's use of it\"",
+   "cite": "§15.1.2, §3.6, §9.7 (collection bullet), §28.11 (element slot policy, copy slots)",
+   "status": "decided",
+   "note": "§15.1.2's list omits collection stores, and §28.11's copy-slot cell attaches §9.7's obligation to 'a borrow-bearing record value' only. §3.6 keys §9.7 on holds-borrows. So `[N]C` copied into a field-held collection is either §9.7's no-residual rejection or the element borrows' residual admission (R4 C1's split). It also inherits R3 C3's parameter-collection ambiguity.",
+   "counterexample": "module M;\nclass Item public constructor() end constructor; end Item;\nclass Keep\n  private owned _xs: Array<[2]Item?>;\n  public constructor() _xs := new Array<[2]Item?>(); end constructor;\n  public method Put(x: Item)\n    var a: [2]Item? := [x, null];\n    _xs.Add(a);   // (A) §3.6 keys §9.7: field-held collection, no residual -> rejected\n  end Put;        // (B) the copy slot's obligation is stated for records only; the slot borrows are\nend Keep;         //     parameter-sourced -> admitted under the §28.11 residual",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected. Same keying as R4 C1: §3.6 holds-borrows row: \"*A value type that holds borrows* — a borrow-bearing record, a borrow-bearing inline array, or a choice that holds borrows — is the condition on which the [§9.7] borrow-lifetime obligations key\", so §9.7's collection bullet (\"no trust residual for record-carried borrows\") governs `[N]C` copied into a field-held collection; §28.11's copy-slot cell, which names only 'a borrow-bearing record value', points to §9.7 for the obligation and adds no residual of its own, so it does not open one for `[N]C`. The parameter-collection half is decided as R3 C3 (K2.3 + K4.3)."
+   },
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C1",
+   "verdict": "rejected",
+   "rule": "§35.4: \"may not be stored in a class instance field or (outside the null-source form) a static field\" | §15.3: \"may not be a class field, since a class instance's lifetime is not bounded by any borrow source's scope\"",
+   "cite": "§35.4 (holds-borrows), §9.7 (instance-field bullet, read 'record or choice'), §15.3 (field placement), §28.3 property-store bullet, App. C.3",
+   "status": "decided",
+   "note": "Rejected statically except in the null-source form (a payload-free case, or every payload reference null). An owning choice that holds borrows cannot be a class field at all.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C2",
+   "verdict": "rejected",
+   "rule": "§35.4: \"may not be stored in a class instance field or (outside the null-source form) a static field\" | §22.12 4(g): \"is a **compile error at the declaration site** naming this rule, whether or not it also holds borrows\"",
+   "cite": "§9.7 (static-field bullet), §22.12 rule 4(f)/(g), §35.4, App. C.3",
+   "status": "decided",
+   "note": "Non-owning choice: null-source only (f). Owning-classified choice: rejected at the declaration (g). A mutable static is an (iii)-closed error.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C3",
+   "verdict": "conditional",
+   "rule": "§35.4: \"is constrained in returns, closures, and collection copies\" | §9.7: \"A borrow-bearing record value may be **copied into a collection** only when every carried borrow's source provably outlives the collection's own binding scope\"",
+   "cite": "§9.7 (collection bullet, read 'record or choice'), §35.4, §28.11 slot policy (move-only element rejected at instantiation)",
+   "status": "decided",
+   "note": "A non-owning choice that holds borrows goes to §9.7's collection bullet (structural scope check, no residual). An owning choice is a move-only element, rejected at instantiation for both families. This inherits R3 C3's parameter-collection ambiguity unchanged; the counterexample is R3 C3's with `Pair` replaced by a choice `Ref` with a case `Some(x: Item)`.",
+   "counterexample": "module M;\nclass Item public constructor() end constructor; end Item;\npublic choice Ref\n  Some(x: Item),\n  Empty;\nend Ref;\nclass Filler\n  public static method Fill(xs: Array<Ref>)\n    using var it := new Item();\n    var p := Ref.Some(it);\n    xs.Add(p);   // R1: a caller-supplied collection 'escapes the method' -> rejected\n                 // R2: the test is the collection's own *binding* scope; xs's binding\n                 //     (the method) does not strictly enclose it's scope -> admitted, and\n                 //     the caller's array keeps a Ref whose Item is disposed at this end\n  end Fill;      //     (no trust residual and no stated backstop for record-carried borrows)\nend Filler;",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected. The parameter-held (caller-supplied) collection outlives the method, so a source local to the method is not comparable with it: K2.3: \"Where they are not, an admission is made only under K4's posture: a structural, decidable check at the site plus a recorded residual obligation with a named backstop\"; §9.7 collection bullet: \"there is **no trust residual for record-carried borrows**\" — so no admission exists, and K4.3: \"no new admission may be made without recording its clause or its backstop\". The positive criterion agrees: §9.7: \"only when every carried borrow's source provably outlives the collection's own binding scope\" (a top-level local is bound after, and disposed no later than, the parameter binding). §28.11's twin rule reads the same case the same way: §28.11 Storing a borrow: \"an `owned` parameter included, its value being disposed at the method's end\" ... stored into a collection that provably outlives that scope — \"the collection is a field, is reachable from one, escapes the method\". Reading 2 of the lane (admitted, no residual) is therefore an unrecorded admission the kernel forbids. Matches the implementation (record_collection_store_1540.parameter_collection_rejected). Clarification worth making: say 'a collection the method did not create' in §9.7's dash list. (choice Ref.Some(it))"
+   },
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C1",
+   "verdict": "rejected",
+   "rule": "stdlib §4.16: \"A buffer- or array-backed span is therefore **never storable in a static field or in a class instance field**\" | §9.7: \"so no span is storable in a static field or in a class instance field at all\"",
+   "cite": "§9.7 (instance-field bullet; IReadOnlySpan reading), stdlib §4.14, §4.15, §4.16",
+   "status": "decided",
+   "note": "No span has a null-source value (its Buffer/Source is non-nullable). An `IReadOnlySpan<TElement>`-typed field is read as the span, so only `null` is storable. `ReadOnlyStringSpan` is not borrow-bearing and is unrestricted.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C2",
+   "verdict": "rejected",
+   "rule": "§9.7: \"so no span is storable in a static field or in a class instance field at all\"",
+   "cite": "§9.7 (static-field bullet), §22.12 rule 4(f), stdlib §4.16",
+   "status": "decided",
+   "note": "Same ground as C1. `ReadOnlyStringSpan` falls under §22.12's record-without-borrows row (`static readonly` ‡; mutable is an (iii)-closed error).",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C3",
+   "verdict": "conditional",
+   "rule": "§9.7: \"A borrow-bearing record value may be **copied into a collection** only when every carried borrow's source provably outlives the collection's own binding scope\" | \"there is **no trust residual for record-carried borrows**\"",
+   "cite": "§9.7 (collection bullet; IReadOnlySpan reading), §28.11 slot policy, stdlib §4.16",
+   "status": "decided",
+   "note": "Spans take §9.7's collection bullet (an `IReadOnlySpan<T>` element is read as the span, so the stricter rule applies alongside §28.11's interface borrow slot). This inherits R3 C3's parameter-collection ambiguity, and it is the most severe instance: a span's buffer window has no per-access flag check, so the admitted reading is unbacked.",
+   "counterexample": "module M;\nclass Filler\n  public static method Fill(xs: Array<ReadOnlySpan<int>>)\n    using var buf := new OwningBuffer<int>(4);\n    var s := buf.AsReadOnlySpan();\n    xs.Add(s);   // 'escapes the method' -> rejected; or binding-scope test -> admitted, and\n  end Fill;      // the caller reads freed buffer memory through xs[0] (no flag check on span reads)\nend Filler;",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected. The parameter-held (caller-supplied) collection outlives the method, so a source local to the method is not comparable with it: K2.3: \"Where they are not, an admission is made only under K4's posture: a structural, decidable check at the site plus a recorded residual obligation with a named backstop\"; §9.7 collection bullet: \"there is **no trust residual for record-carried borrows**\" — so no admission exists, and K4.3: \"no new admission may be made without recording its clause or its backstop\". The positive criterion agrees: §9.7: \"only when every carried borrow's source provably outlives the collection's own binding scope\" (a top-level local is bound after, and disposed no later than, the parameter binding). §28.11's twin rule reads the same case the same way: §28.11 Storing a borrow: \"an `owned` parameter included, its value being disposed at the method's end\" ... stored into a collection that provably outlives that scope — \"the collection is a field, is reachable from one, escapes the method\". Reading 2 of the lane (admitted, no residual) is therefore an unrecorded admission the kernel forbids. Matches the implementation (record_collection_store_1540.parameter_collection_rejected). Clarification worth making: say 'a collection the method did not create' in §9.7's dash list. (ReadOnlySpan<int>)"
+   },
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C1",
+   "verdict": "conditional",
+   "rule": "\"A function value reaches such a position by implicit conversion — at an argument ..., an initializer, an assignment, a `return` ..., a pattern binding, a collection-literal element or a `with` assignment\" | \"For `as`, the result is additionally a *borrow* of `x` (more precisely, a borrow with the same source as `x`)\" | Function-typed holders cl.1 \"keys on the assigned value's static type\"",
+   "cite": "§28.3 (Set-erasing positions; Function-typed holders cl.1; closure bullet sink rule; field-store bullet cl.2–3), §17.4, §9.7 borrow-erasing bullet (contrast)",
+   "status": "ambiguous",
+   "note": "M1 decided R7 C1 as rejected at every field, but `_o := f as Object` stores a capture-bearing function value into an Object field with no set-erasing check: the result's static type is Object. Readings: the sink rule follows the runtime value (rejected), §17.4's source carried into the class field-store bullet (a plain-parameter capture admitted under a residual a captured span lacks), or unclassified (admitted). Same root as R7 C11.",
+   "counterexample": "module M;\nclass Holder\n  private _o: Object? := null;\n  public method Keep(sp: ReadOnlySpan<int>)\n    var f: () -> int := lambda() => sp[0];   // set: {sp} (plain parameter)\n    // _o := f;                             // rejected: set-erasing assignment\n    _o := f as Object;                      // explicit `as`: no set-erasing check;\n  end Keep;                                 // at most the field-store residual (plain-param source)\n  public method Use(): int\n    var g := _o as () -> int;               // provenance untraced\n    return g!();                            // reads sp's window after the caller freed it\n  end Use;\nend Holder;\n// caller: do using var buf := new OwningBuffer<int>(4); h.Keep(buf.AsReadOnlySpan()); end; h.Use();",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "NEW-OPEN",
+    "evidence": "M1 decided R7 C1 as rejected at every field, but `_o := f as Object` stores a capture-bearing function value into an Object field with no set-erasing check: the result's static type is Object. Readings: the sink rule follows the runtime value (rejected), §17.4's source carried into the class field-store bullet (a plain-parameter capture admitted under a residual a captured span lacks), or unclassified (admitted). Same root as R7 C11."
+   },
+   "rc": [
+    "B2"
+   ]
+  },
+  {
+   "row": "R7",
+   "col": "C2",
+   "verdict": "rejected",
+   "rule": "§28.3: \"While its source set is non-empty, a function value may **not** be stored in a field, in any collection, in a property or indexer\" | §22.12 4(e): \"**Function type:** a function-typed static warns\"",
+   "cite": "§28.3 (sink rule; set-erasing positions for `Object`/bare-T statics), §22.12 rule 2 table and 4(e), App. C.3",
+   "status": "decided",
+   "note": "A mutable function-typed static is an error (†). A `static readonly` one warns, and in static init the sink rule rejects any non-empty set. An empty-set closure that captures value-typed locals (a mutable cell) is admitted with the 4(e) warning, which is a domain hazard, not a borrow. No `scoped` route reaches static storage.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C3",
+   "verdict": "conditional",
+   "rule": "Function-typed holders: \"and any collection slot. At every function-typed holder the closure bullet's sink rule holds\" | set-erasing reach list (implicit conversion only) | §17.4 'same source as x'",
+   "cite": "§28.3 (Function-typed holders; Set-erasing positions), §28.11 (Storing a borrow), §17.4",
+   "status": "ambiguous",
+   "note": "M1 decided R7 C3 as rejected ('an Object element slot is set-erasing'). `objs.Add(f as Object)` passes an Object-typed argument, so the set-erasing check never fires; whether 'any collection slot' as a holder reads the runtime value or the static type is the same split as R7 C11.",
+   "counterexample": "module M;\nclass Reg\n  private owned _objs: Array<Object>;\n  public constructor() _objs := new Array<Object>(); end constructor;\n  public method Run(): int => (_objs[0] as () -> int)!();\n  public method Add(sp: ReadOnlySpan<int>)\n    var f: () -> int := lambda() => sp[0];\n    // _objs.Add(f);                 // rejected: Object slot is set-erasing / any slot a holder\n    _objs.Add(f as Object);          // Object-typed argument: §28.11 class-borrow store rule,\n  end Add;                           // plain-param source admitted under its residual\nend Reg;\n// caller frees the span's buffer, then calls r.Run(): unchecked read of freed memory",
+   "lane": "M1",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "NEW-OPEN",
+    "evidence": "M1 decided R7 C3 as rejected ('an Object element slot is set-erasing'). `objs.Add(f as Object)` passes an Object-typed argument, so the set-erasing check never fires; whether 'any collection slot' as a holder reads the runtime value or the static type is the same split as R7 C11."
+   },
+   "rc": [
+    "B2"
+   ]
+  },
+  {
+   "row": "R8",
+   "col": "C1",
+   "verdict": "conditional",
+   "rule": "§9.7: \"and is rejected wherever `Keep<Pair>` is named, by the instance-field bullet, the diagnostic naming the store\" | §28.3: \"A field declared at a bare type parameter is reached from outside the generic body only through a receiver whose instantiation substitutes a function type for it\" | §28.5: \"the restriction \"only fields of class or interface types may be `owned`\" is checked at *instantiation*\"",
+   "cite": "§28.1 (class-or-interface assumption), §28.3 (field-store bullet cl.2, set-erasing positions), §9.7 (generic-body paragraph), §28.5 (generic class fields), §3.6 rule 2",
+   "status": "decided",
+   "note": "The body is checked under the class-or-interface assumption: the field-store residual for a parameter or receiver source, rejection for scope-bound sources, and K3.1 for `owned T` fields. Re-checked per instantiation: a substitution that holds borrows is rejected wherever named. A function substitution is a set-erasing field (the caller checks capture-freedom), and an inadmissible `owned` substitution is an instantiation-site error.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R8",
+   "col": "C2",
+   "verdict": "conditional",
+   "rule": "§22.12 (v): \"is admitted by no form above and is a **compile error at the declaration site**, whatever the parameter's constraints or eventual substitutions\" | §22.12 (i): \"is admitted at the declaration and classified **per instantiation, after substitution**\"",
+   "cite": "§22.12 rule 2 (v), rule 4 (i), §9.7 (static-field bullet), §3.6 rule 2",
+   "status": "decided",
+   "note": "A mutable `T` static is an error at the declaration. `static readonly T` is classified per instantiation: a substitution that holds borrows is null-source only, an owning choice is rejected (g), and class or interface substitutions warn. Stores happen only in static init, where scope-bound sources are rejected under the class assumption.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R8",
+   "col": "C3",
+   "verdict": "conditional",
+   "rule": "§9.7: \"copies `t` into a field-held `Array<T>` is admitted at the declaration and at `Bag<Item>`\" | \"and rejected wherever `Bag<Pair>` is named\"",
+   "cite": "§9.7 (collection bullet, generic-body paragraph), §28.11 (store rule), §28.3 (set-erasing positions), §14.4",
+   "status": "decided",
+   "note": "At a class substitution: the §28.11 residual. At a substitution that holds borrows: §9.7's no-residual rejection. At a function substitution: the generic method's `T` parameter is a set-erasing position, checked at the caller. Owning collections need `where T: class`. A parameter-held collection at a borrow-holding substitution inherits R3 C3's ambiguity; it is not repeated here.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C1",
+   "verdict": "admitted",
+   "rule": "K1.6: \"Values of runtime-managed type (`string`, `Type`, boxed value types, function values) and of ordinary value type carry no classification and no obligation\" | §9.7: \"runtime-managed values have unbounded lifetime by construction\"",
+   "cite": "K1.6, §28.9, §9.7, §28.5",
+   "status": "decided",
+   "note": "No borrow, unrestricted. A boxed primitive in an `Object` or interface field is a runtime-managed value. `owned` on `string`/`Type`/function fields is rejected (§28.5), which is irrelevant to borrows.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C2",
+   "verdict": "conditional",
+   "rule": "§22.12 r3: \"`static readonly` of **immutable content** — value types of sendable-value category, `string`, enums — and `const`\" | §22.12 r2: \"a mutable static admitted by none of (i)–(iv) is a compile error naming this rule\"",
+   "cite": "§22.12 rules 2–4 (table rows `string`, `Type`, 'any other class type'), K1.6",
+   "status": "decided",
+   "note": "No borrow arises. Reachability is limited by the sharing rules, not lifetime: a mutable `string`/`Type` static is an error, `static readonly`/`const` `string` and `static readonly Type` are unrestricted, and a boxed value in a `static readonly Object` takes rule 4's class-type warning.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C3",
+   "verdict": "admitted",
+   "rule": "§28.11 slot policy (shared-reference slots): \"| stores the reference |\" | K1.6: \"Values of runtime-managed type (`string`, `Type`, boxed value types, function values) and of ordinary value type carry no classification and no obligation\"",
+   "cite": "§28.11 (element slot policy), K1.6, §28.9",
+   "status": "decided",
+   "note": "Shared-reference slots, with no lifetime obligation. A boxed primitive in an `Object` slot carries no classification. Owning families reject runtime-managed element types at instantiation.",
+   "counterexample": "",
+   "lane": "M1",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C4",
+   "verdict": "admitted-bounded",
+   "rule": "\"The **ownership state of the source expression carries through unchanged**: upcasting an owned value yields an owned value of the wider type (the usual transfer rules apply at the receiving position, [§28.8](#sec-ownership-transfer))\" | \"a reference conversion never transfers, discharges, or creates a disposal obligation\"",
+   "cite": "§5.1 (reference conversions), §28.1 (owned admits any class other than Type or an interface), §28.3 Producers / borrowing positions",
+   "status": "decided",
+   "note": "A class value is not boxed; the upcast keeps the value owned (a fresh producer or `move x` at an `owned Object`/interface position transfers; at a plain position a named owned binding is lent as a borrow of the binding, a fresh producer is an unbound owned temporary bounded to its full expression). No borrow is created, so nothing can outlive a source.",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C4",
+   "verdict": "admitted-bounded",
+   "rule": "\"upcasting a borrow yields a borrow with the same source\" | \"Borrowed (source: same as `x`'s source if `x` is borrowed; `x` itself if `x` is owned). The cast does not move from `x`\"",
+   "cite": "§5.1 (reference conversions); §28.3 Producers (`x as T` row)",
+   "status": "decided",
+   "note": "The reference is the same reference at a wider static type; its source set rides along unchanged and every downstream position (field residual, collection store, return list) reads the converted value as a class/interface borrow of the original source.",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C4",
+   "verdict": "rejected",
+   "rule": "\"Every other conversion — at a parameter, plain or `scoped` ([§28.14](#sec-scoped-callback-parameters)), declared `Object` or any other interface type\" | \"is a **compile error at the conversion**\" | \"Two positions are not borrow-erasing, and they are where such a value boxes: the receiver of a member call, or of an extension call whose head is `IReadOnlySpan<TElement>`\"",
+   "cite": "§8.6 (Boxing of borrow-bearing records), §9.7 (borrow-erasing position bullet), Appendix C.1",
+   "status": "decided",
+   "note": "Only the member-call receiver (box lives for the call, payload borrowed for its duration) and, for a record that implements it, a position declared `IReadOnlySpan<TElement>` (read as holding the record's borrows) admit the conversion; every local/field/param/slot/ref/out/return conversion, implicit, `as` or typed pattern, is rejected at the conversion site. DECLINED rows 31-34 confirm the intended verdict.",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C4",
+   "verdict": "rejected",
+   "rule": "\"inline arrays are not class types and do not implement interfaces\" | \"When the array is borrow-bearing ([§15.1.2](#sec-inline-array-members)), the boxed array carries borrows; the same borrow-lifetime constraints apply as for boxed borrow-bearing records (above).\"",
+   "cite": "§8.6 (Boxing of inline arrays), §15.1.2, §9.7 (borrow-erasing position bullet)",
+   "status": "decided",
+   "note": "A non-owning borrow-bearing inline array reaches `Object` only as a member-call receiver (no interface conformance exists); every other conversion is §9.7's borrow-erasing compile error. An owning `[N owned]T` cannot be boxed at all (move-only).",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C4",
+   "verdict": "rejected",
+   "rule": "\"**Borrow-bearing** choices box under §8.6's borrow-bearing-record rules verbatim\" | \"the *conversion* of an owning value to an interface or `Object` type is rejected at the conversion site (it is a boxing, forbidden above)\" | \"A borrow-bearing **choice** ([§35.4](#sec-choice-classification)) boxes under exactly these rules.\"",
+   "cite": "§35.8, §8.6, §9.7 (borrow-erasing bullet; 'value that holds borrows' includes every choice that holds borrows)",
+   "status": "decided",
+   "note": "A borrow-bearing choice converts only as a member-call receiver (or at `IReadOnlySpan<TElement>` if it implements it); an owning choice that holds borrows is move-only and is never boxed.",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C4",
+   "verdict": "conditional",
+   "rule": "\"and at a position declared **`IReadOnlySpan<TElement>`** (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)), the one reference type whose values are read as holding borrows\" | \"or the reference conversion of an `IReadOnlySpan<TElement>` value to `Object` or another interface type, implicit or by an `as` ([§17.4](#sec-the-is-is-not-and-as-operators)) or a typed-pattern binding ([§19.3](#sec-patterns)) at such a type — is a **compile error at the conversion site**\" | \"(`ReadOnlyStringSpan` is not a borrow-bearing record and is outside this rule entirely, its only reference-typed field being a runtime-managed `string`.)\"",
+   "cite": "§8.6, §9.7 (IReadOnlySpan paragraph; borrow-erasing bullet), stdlib §4.16",
+   "status": "decided",
+   "note": "Buffer/array-backed spans convert only at a position declared `IReadOnlySpan<TElement>` (and as member-call / IReadOnlySpan-headed extension receiver), where the value is read as holding the span's borrows and bounded exactly as the span; to `Object` or any other interface (from the span or from an `IReadOnlySpan` value) is rejected. `ReadOnlyStringSpan` boxes freely (no borrow).",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C4",
+   "verdict": "conditional",
+   "rule": "\"A function value reaches such a position by implicit conversion\" (no `as`) vs §9.7 borrow-erasing: \"implicit or by an `as` ([§17.4]) or a typed-pattern binding\" | field-store cl.3: \"An unbound owned temporary or a borrow of a scope-bound local, passed to a plain parameter that the callee stores ... is admitted at the call\"",
+   "cite": "§28.3 (Set-erasing positions; field-store bullet cl.3), §17.4, §9.7 borrow-erasing bullet, App. C.1 (set-erasing row)",
+   "status": "ambiguous",
+   "note": "M2 decided R7 C4 on the set-erasing rule, but that rule's reach list omits an explicit `as`. `s.Put(f as Object)` passes an Object-typed value: under §17.4's same-source reading it is a scope-bound borrow at a storing plain parameter, which field-store clause 3 admits at the call under the residual; a captured span has no flag backstop. Under the unclassified reading it is admitted outright.",
+   "counterexample": "module M;\nclass Sink\n  private _o: Object? := null;\n  public method Put(o: Object)\n    _o := o;                                 // plain-parameter source: field-store residual\n  end Put;\n  public method Run(): int => (_o as () -> int)!();\nend Sink;\nclass Host\n  public static method Leak(s: Sink)\n    using var buf := new OwningBuffer<int>(4);\n    var sp := buf.AsReadOnlySpan();\n    var f: () -> int := lambda() => sp[0];   // set: buf's scope, through sp\n    // s.Put(f);                             // rejected: implicit conversion at a set-erasing parameter\n    s.Put(f as Object);                      // §17.4 reading: a scope-bound borrow passed to a storing\n  end Leak;                                  // plain parameter, admitted at the call (field-store cl.3)\nend Host;                                    // buf freed; s.Run() reads it, no flag check",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "NEW-OPEN",
+    "evidence": "M2 decided R7 C4 on the set-erasing rule, but that rule's reach list omits an explicit `as`. `s.Put(f as Object)` passes an Object-typed value: under §17.4's same-source reading it is a scope-bound borrow at a storing plain parameter, which field-store clause 3 admits at the call under the residual; a captured span has no flag backstop. Under the unclassified reading it is admitted outright."
+   },
+   "rc": [
+    "B2"
+   ]
+  },
+  {
+   "row": "R8",
+   "col": "C4",
+   "verdict": "conditional",
+   "rule": "\"**In a generic body** each bullet below is a requirement of the body's use of a type parameter ([§3.6](#sec-derived-type-properties) rule 2) wherever the value's type mentions one\" | \"and a bare `T` stored into an `Object`- or interface-typed field is the same store through [§8.6](#sec-boxing)'s box at such a substitution\" | \"The check is the caller's, over the callee's declared signature, per instantiation ([§3.6](#sec-derived-type-properties) rule 2); a generic body is not re-checked.\"",
+   "cite": "§9.7 (generic-body paragraph; instance-field bullet; borrow-erasing bullet), §3.6 rule 2, §14.2 Dispatched generic methods, §28.3 Set-erasing positions",
+   "status": "decided",
+   "note": "The generic-body paragraph makes every §9.7 bullet a per-instantiation requirement, and gives the Object-typed field store as an example. The borrow-erasing bullet's own closing clause says 'a generic body is not re-checked'. Read narrowly, that clause covers only the substituted callee (`Keep<Object>`), and `Fwd<Pair>` is rejected. Read broadly, a bare T converted to `Object` at a parameter or local inside the body is never checked, so a holds-borrows substitution reaches a storing `Object` parameter. Function substitutions are safe by the set-erasing induction. Dispatched generic bodies decide the requirement at the body (§14.2).",
+   "counterexample": "class Item\n  public method Use(): int => 1;\nend Item;\nrecord Pair(A: Item);\nclass Sink\n  private _o: Object? := null;\n  public method Put(o: Object): ()\n    _o := o;                      // §28.3 field-store residual: plain-param source\n  end Put;\nend Sink;\nstatic method Fwd<T>(s: Sink, x: T): ()\n  s.Put(x);                       // T -> Object at a parameter, inside a generic body\nend Fwd;\n// caller, s outlives it:\n//   var it := new Item(); var p := new Pair(it); Fwd<Pair>(s, p);\n// Reading A (body requirement, §9.7 generic paragraph): Fwd<Pair> rejected.\n// Reading B ('a generic body is not re-checked'): admitted; s._o keeps a boxed Pair\n//   whose borrow of `it` outlives it, the record-carried escape §9.7 bars statically.",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected at `Fwd<Pair>`. §9.7: \"**In a generic body** each bullet below is a requirement of the body's use of a type parameter\"; App. C.1: \"In a generic body, [§9.7]'s borrow-lifetime bullets over a value whose type is or is formed over a type parameter (`T`, `Box<T>`, `[2]T`) are requirements of the body's use of that parameter, read at each instantiation\". The borrow-erasing bullet is one of those bullets and `s.Put(x)` converts a value of bare type `T` to `Object` inside Fwd's own body, so it is Fwd's requirement, read at Fwd<Pair>. The instance-field bullet gives the same shape as its worked example (\"a bare `T` stored into an `Object`- or interface-typed field is the same store through §8.6's box at such a substitution\"). The closing 'a generic body is not re-checked' sits in the sentence about the *callee* checked over its declared signature (`b.Keep<Object>(span)`): Keep's body is not re-checked at T=Object. Reading B would contradict the generic-body paragraph and App. C.1, so it is not a second defensible reading. Clarification worth making: 'the callee's generic body is not re-checked'."
+   },
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C4",
+   "verdict": "admitted",
+   "rule": "\"Boxed value types — created implicitly when a value type is used where `Object` (or an interface) is expected\" | \"the expression carries no ownership classification, lends no borrow, and constrains no lifetime\" | \"**`string`** — a reference type with content equality and runtime-managed lifetime.\"",
+   "cite": "§28.9, §8.6, §3.1, §5.1",
+   "status": "decided",
+   "note": "`string` and `Type` reach `Object` by reference conversion and a primitive or other borrow-free value boxes into a runtime-managed box; none carries a borrow, so the converted value is unrestricted.",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C5",
+   "verdict": "conditional",
+   "rule": "\"two recorded v1 bounds (liftable): no location of **owned state** — an owned local or `owned` parameter, an `owned` field, an owning-collection or owning-inline-array slot\" | \"for `out owned`, exactly the recipient forms of [§22.4](#sec-inline-out-declarations), which admit no field, indexer slot, or property target.\" | \"a borrow of its own scope-bound locals, temporaries or `owned` parameters is rejected there as at a field\"",
+   "cite": "§22.3 (ref and out argument locations; out owned), §22.4, §28.3 (A ref or plain out location outlives the call), Appendix C.3",
+   "status": "decided",
+   "note": "An owned binding or owned field is never a ref/out location; a callee may not write a fresh/owned value into a plain ref/out location (temporary rejected as at a field). Ownership moves through a ref/out position only via `out owned` into `out var`/`out using var`/an adoptable pre-declared local, which then carries the owned-local discharge obligation; copy-out on normal return keeps exactly one owner.",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C5",
+   "verdict": "admitted-bounded",
+   "rule": "\"the callee may store into it a borrow sourced at its receiver, a plain parameter, or static storage, and a borrow of its own scope-bound locals, temporaries or `owned` parameters is rejected there as at a field.\" | \"The caller therefore treats each such location as receiving any borrow the call carries: the sources the receiver and every plain (non-`owned`, non-`scoped`) argument contribute\" | \"and the current value of every such `ref` argument\"",
+   "cite": "§28.3 (A ref or plain out location outlives the call; The sources an argument contributes), §22.3; cf. announcement-table row 4, Bare-type-parameter returns clause 1",
+   "status": "decided",
+   "note": "For method calls the bound holds: the caller pools receiver, plain args and ref values and checks each at the location. At a function-value invocation the pool names no invoked value. Row 4 and bare-T clause 1 add 'the function value' there, and the v0.309 migration named 'a capture's' borrow. The callee side admits receiver, plain-parameter and static sources and rejects 'its own' scope-bound locals; a lambda's captured enclosing local is neither. So nothing bounds a captured borrow a lambda writes into its own ref parameter.",
+   "counterexample": "class Item\n  public method Use(): int => 1;\nend Item;\nclass Host\n  public method Run(): int\n    var holder: Item? := null;\n    do\n      var x := new Item();                    // owned local, inner scope\n      var f: (ref Item?) -> () := lambda(ref r) => do\n        r := x;                               // captured borrow into the lambda's own ref slot:\n      end;                                    //   not 'its own scope-bound local', not a listed source\n      f(ref holder);                          // pool = receiver + plain args + ref values: f's set {x} not counted\n    end;                                      // x disposed here\n    return holder!.Use();                     // holder still holds x's borrow\n  end Run;\nend Host;",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Cell verdict admitted-bounded stands, but the lane's counterexample is rejected at the lambda's store `r := x`. §28.3 ref/out rule: \"the callee may store into it a borrow sourced at its receiver, a plain parameter, or static storage, and a borrow of its own scope-bound locals, temporaries or `owned` parameters is rejected there as at a field\"; field-store cl.1: \"so a borrowed local may not be assigned to any field\". The callee-side admission is a closed permission list (receiver, plain parameter, static storage); a captured owned local of the enclosing body is the producers row's 'Borrowed (source: the local's enclosing scope)', a scope-bound local, and 'as at a field' imports clause 1, which rejects any borrowed scope-bound local. The only capture sources that pass are enclosing plain parameters, the enclosing `this` and statics, which outlive every location the enclosing body can name, and the sink rule keeps the lambda inside that body. So the caller pool's omission of the invoked value is not reachable as an escape. Clarification worth making: add 'and, at a function-value invocation, the function value's source set' to the caller pool, as row 4 and bare-T clause 4 do."
+   },
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C5",
+   "verdict": "conditional",
+   "rule": "\"or a borrow-bearing record, choice or inline array ([§3.6](#sec-derived-type-properties); an inline array of class or interface elements among them) — is caller storage\" | \"At the call, each of those borrows must be admissible into each such location exactly as the direct assignment of it would be — the local bullet's scope comparison at a local or parameter, the field rule above at a field\" | \"A borrow-bearing record value may not be stored in an **instance field of a class**\"",
+   "cite": "§28.3 (A ref or plain out location outlives the call; field-store bullet), §9.7 (instance-field bullet), §22.3",
+   "status": "decided",
+   "note": "The caller checks each pooled borrow 'exactly as the direct assignment of it would be', 'the field rule above at a field'. Read per borrow, that is §28.3's class-borrow field-store bullet, which admits a plain-parameter or receiver source under the K4.3 residual. Read per value, the direct assignment is §9.7's instance-field bullet, which rejects any non-null-source value statically (no backstop for a record-carried borrow). The v0.309 migration wording ('that the direct assignment into that location would reject') leans toward per value. Callee side: a holds-borrows value sourced at a plain parameter is admitted into the ref slot. At a local/parameter location the scope comparison decides; at a class instance field of borrow-bearing record type the two readings split.",
+   "counterexample": "class Item\n  public method Use(): int => 1;\nend Item;\nrecord Pair(A: Item?);\nclass Holder\n  private _p: Pair := new Pair(null);\n  method Fill(ref p: Pair, a: Item): ()\n    p := new Pair(a);              // callee: plain-parameter source, admitted\n  end Fill;\n  public method Take(a: Item): ()\n    Fill(ref _p, a);               // per-borrow reading: field rule admits `a` (plain param) under residual\n  end Take;                        // per-value reading: `_p := new Pair(a)` is §9.7's instance-field error\nend Holder;",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected at the call when the `ref` location is a class instance field (per-value reading). The callee's write lands in the caller's field: §22.3: \"because a `ref` write is an assignment through an alias\"; and a value that holds borrows may not be stored in an instance field by any route: §9.7 instance-field bullet: \"The checked-mode trust regime is therefore unavailable and the store is **rejected statically**\"; §9.7 instance-field bullet. The ref rule's own test is \"exactly as the direct assignment of it would be\", and the direct assignment into a field of this type is the record/array/choice store, which §9.7 rejects. The per-borrow reading would admit a record-carried borrow into a class field under a residual §9.7 says does not exist (and K4.3 forbids an unrecorded one), so it is not a defensible second reading. Clarification worth making: at a location whose type holds borrows, name §9.7's instance-field bullet beside 'the field rule above', as the property-store bullet does."
+   },
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C5",
+   "verdict": "conditional",
+   "rule": "\"an inline array of class or interface elements among them) — is caller storage\" | \"a `[2]Pair` value is stored in a class instance field, in a static field, or in a longer-lived collection only where a `Pair` value would be\" | \"the field rule above at a field\"",
+   "cite": "§28.3 (A ref or plain out location outlives the call), §15.1.2, §9.7, §22.3",
+   "status": "decided",
+   "note": "Same split as R3/C5. At a class-field location of record-element inline-array type the per-borrow field rule admits the call (residual), while §15.1.2 defers the store to §9.7's instance-field bullet (reject). Owning `[N owned]T` locations are owned state and barred by §22.3.",
+   "counterexample": "class Item\n  public method Use(): int => 1;\nend Item;\nrecord Pair(A: Item?);\nclass Holder\n  private _a: [1]Pair := [new Pair(null)];\n  method Fill(ref xs: [1]Pair, a: Item): ()\n    xs := [new Pair(a)];           // plain-parameter source\n  end Fill;\n  public method Take(a: Item): ()\n    Fill(ref _a, a);               // per-borrow: admitted (residual); per-value: §9.7 via §15.1.2, rejected\n  end Take;\nend Holder;",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected at the call when the `ref` location is a class instance field (per-value reading). The callee's write lands in the caller's field: §22.3: \"because a `ref` write is an assignment through an alias\"; and a value that holds borrows may not be stored in an instance field by any route: §9.7 instance-field bullet: \"The checked-mode trust regime is therefore unavailable and the store is **rejected statically**\"; §15.1.2: \"a `[2]Pair` value is stored in a class instance field, in a static field, or in a longer-lived collection only where a `Pair` value would be\". The ref rule's own test is \"exactly as the direct assignment of it would be\", and the direct assignment into a field of this type is the record/array/choice store, which §9.7 rejects. The per-borrow reading would admit a record-carried borrow into a class field under a residual §9.7 says does not exist (and K4.3 forbids an unrecorded one), so it is not a defensible second reading. Clarification worth making: at a location whose type holds borrows, name §9.7's instance-field bullet beside 'the field rule above', as the property-store bullet does."
+   },
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C5",
+   "verdict": "conditional",
+   "rule": "\"Choices that hold borrows** (every borrow-bearing choice, and any owning choice with a borrow-carrying payload beside its owned ones) are subject to this section's **borrow-lifetime rules**\" | \"or any location whose declared type is a move-only value type\" | \"the field rule above at a field\"",
+   "cite": "§28.3 (A ref or plain out location outlives the call), §9.7, §22.3, §35.4",
+   "status": "decided",
+   "note": "An owning choice (holds borrows or not) is move-only, so its location is owned state and barred. A borrow-bearing choice at a class-field location has the same per-borrow vs per-value split as R3/C5.",
+   "counterexample": "class Item\n  public method Use(): int => 1;\nend Item;\nchoice Ref\n  Some(item: Item),\n  None;\nend Ref;\nclass Holder\n  private _r: Ref := Ref.None;\n  method Fill(ref r: Ref, a: Item): ()\n    r := Ref.Some(a);              // plain-parameter source\n  end Fill;\n  public method Take(a: Item): ()\n    Fill(ref _r, a);               // per-borrow: residual admits; per-value: §9.7 ('record' read as 'record or choice') rejects\n  end Take;\nend Holder;",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected at the call when the `ref` location is a class instance field (per-value reading). The callee's write lands in the caller's field: §22.3: \"because a `ref` write is an assignment through an alias\"; and a value that holds borrows may not be stored in an instance field by any route: §9.7 instance-field bullet: \"The checked-mode trust regime is therefore unavailable and the store is **rejected statically**\"; §9.7 ('record' read as 'record or choice'). The ref rule's own test is \"exactly as the direct assignment of it would be\", and the direct assignment into a field of this type is the record/array/choice store, which §9.7 rejects. The per-borrow reading would admit a record-carried borrow into a class field under a residual §9.7 says does not exist (and K4.3 forbids an unrecorded one), so it is not a defensible second reading. Clarification worth making: at a location whose type holds borrows, name §9.7's instance-field bullet beside 'the field rule above', as the property-store bullet does."
+   },
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C5",
+   "verdict": "conditional",
+   "rule": "\"so no span is storable in a static field or in a class instance field at all\" | \"**Exact referent type.** The argument's static type must be **exactly** the parameter's referent type.\" | \"the field rule above at a field\"",
+   "cite": "§28.3 (A ref or plain out location outlives the call), §9.7 (static-field bullet, spans), §22.3, stdlib §4.16",
+   "status": "decided",
+   "note": "A span can reach a ref/out location only at its exact type (no conversion to `IReadOnlySpan` at the argument). At a local the scope comparison bounds it. At a class instance field of nullable span type, the per-borrow reading admits the call. That would put a span window in a class field, which §9.7 and stdlib §4.16 say never happens and whose access has no per-access disposed check.",
+   "counterexample": "class Holder\n  private _s: ArraySpan<int>? := null;\n  method Fill(ref s: ArraySpan<int>?, a: Array<int>): ()\n    s := a.AsSpan();               // callee: plain-parameter source, admitted\n  end Fill;\n  public method Take(a: Array<int>): ()\n    Fill(ref _s, a);               // per-borrow: field rule residual admits `a`;\n  end Take;                        // per-value: '_s := a.AsSpan()' is §9.7's instance-field error\nend Holder;",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected at the call when the `ref` location is a class instance field (per-value reading). The callee's write lands in the caller's field: §22.3: \"because a `ref` write is an assignment through an alias\"; and a value that holds borrows may not be stored in an instance field by any route: §9.7 instance-field bullet: \"The checked-mode trust regime is therefore unavailable and the store is **rejected statically**\"; §9.7: \"so no span is storable in a static field or in a class instance field at all\". The ref rule's own test is \"exactly as the direct assignment of it would be\", and the direct assignment into a field of this type is the record/array/choice store, which §9.7 rejects. The per-borrow reading would admit a record-carried borrow into a class field under a residual §9.7 says does not exist (and K4.3 forbids an unrecorded one), so it is not a defensible second reading. Clarification worth making: at a location whose type holds borrows, name §9.7's instance-field bullet beside 'the field rule above', as the property-store bullet does."
+   },
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C5",
+   "verdict": "conditional",
+   "rule": "ref/out rule: \"the callee may store into it a borrow sourced at its receiver, a plain parameter, or static storage\" | set-erasing reach list (implicit conversion only) | §17.4 'same source as x'",
+   "cite": "§28.3 (A ref or plain out location outlives the call; Set-erasing positions), §17.4",
+   "status": "ambiguous",
+   "note": "M2 decided R7 C5 via holders and set-erasing positions. An `Object`-typed ref location assigned `f as Object` in the callee is neither: the reading that leaves an `as` result unclassified admits it and the caller pool (receiver and plain arguments) sees nothing; the §17.4 reading rejects it as the callee's own scope-bound local. Two readings, one escapes.",
+   "counterexample": "module M;\nclass Item public property Count: int => 1; end Item;\nclass Holder\n  private _o: Object? := null;\n  method Fill(ref o: Object?)\n    var x := new Item();\n    var f: () -> int := lambda() => x.Count; // set: x's scope\n    o := f as Object;                        // unclassified-`as` reading: admitted; §17.4 reading:\n  end Fill;                                  //   rejected (own scope-bound local 'as at a field')\n  public method Take(): int\n    Fill(ref _o);                            // caller pool: receiver only -> admitted\n    return (_o as () -> int)!();             // runs the closure over the disposed x\n  end Take;\nend Holder;",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "NEW-OPEN",
+    "evidence": "M2 decided R7 C5 via holders and set-erasing positions. An `Object`-typed ref location assigned `f as Object` in the callee is neither: the reading that leaves an `as` result unclassified admits it and the caller pool (receiver and plain arguments) sees nothing; the §17.4 reading rejects it as the callee's own scope-bound local. Two readings, one escapes."
+   },
+   "rc": [
+    "B2"
+   ]
+  },
+  {
+   "row": "R8",
+   "col": "C5",
+   "verdict": "conditional",
+   "rule": "\"a location whose declared type is or contains a type parameter (`T`, `T?`, or a generic choice over it) is such a location at each instantiation at which that type is a move-only value type\" | \"A `ref` argument's current value at a location declared at a bare type parameter is still checked there as at a set-erasing position\" | \"in a generic body, which is checked once under the weakest assumption its constraints establish\"",
+   "cite": "§22.3, §28.3 (A ref or plain out location outlives the call; Set-erasing positions; The sources an argument contributes, item 4), §3.6 rule 2",
+   "status": "decided",
+   "note": "Move-only and function-type substitutions are decided (owned-state bound per instantiation; set-erasing). At a holds-borrows substitution the caller's check reads the substituted signature, so a class-field location inherits R3/C5's per-borrow vs per-value split.",
+   "counterexample": "class Item\n  public method Use(): int => 1;\nend Item;\nrecord Pair(A: Item?);\nclass Holder\n  private _p: Pair := new Pair(null);\n  static method Put<T>(ref slot: T, v: T): ()\n    slot := v;                     // plain-parameter source\n  end Put;\n  public method Take(a: Item): ()\n    var p := new Pair(a);          // carries a's (plain-param) borrow\n    Put<Pair>(ref _p, p);          // per-borrow: residual admits; per-value: §9.7 instance-field rejects\n  end Take;\nend Holder;",
+   "lane": "M2",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected at the call when the `ref` location is a class instance field (per-value reading). The callee's write lands in the caller's field: §22.3: \"because a `ref` write is an assignment through an alias\"; and a value that holds borrows may not be stored in an instance field by any route: §9.7 instance-field bullet: \"The checked-mode trust regime is therefore unavailable and the store is **rejected statically**\"; §9.7 generic-body paragraph (Put<Pair> reads the substituted signature). The ref rule's own test is \"exactly as the direct assignment of it would be\", and the direct assignment into a field of this type is the record/array/choice store, which §9.7 rejects. The per-borrow reading would admit a record-carried borrow into a class field under a residual §9.7 says does not exist (and K4.3 forbids an unrecorded one), so it is not a defensible second reading. Clarification worth making: at a location whose type holds borrows, name §9.7's instance-field bullet beside 'the field rule above', as the property-store bullet does."
+   },
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C5",
+   "verdict": "admitted",
+   "rule": "\"whose type, after substitution, can carry a borrow — a class or interface type, a function type, or a borrow-bearing record, choice or inline array\" | \"the expression carries no ownership classification, lends no borrow, and constrains no lifetime\"",
+   "cite": "§28.3 (A ref or plain out location outlives the call), §28.9, §22.3",
+   "status": "decided",
+   "note": "A `string`/`Type`/primitive location carries no borrow and the rule does not engage. An `Object`-typed location holding a box is a class-typed location and is treated as receiving borrows (conservative). §12.7's narrowed-box write ban covers the only aliasing hazard.",
+   "counterexample": "",
+   "lane": "M2",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "`return` under an `owned` return type, or under an unmarked **mint-announcing** return type … A borrowed local may not be returned from a method whose return type is `owned`. … a freshly-produced owning value (`return new OwningArray<T>(...)`) returned through a non-`owned` return is likewise an error … A `using var` is owned but is additionally bound to its scope: it cannot be moved out of, only borrowed from",
+   "cite": "§28.3 (consume table K3.2; Borrow lifetime rules; Move semantics, axiom A5), §28.6, §28.3 Concrete-slot function bodies, v0.330",
+   "status": "decided",
+   "note": "An owned value reaches a return only through an `owned` (or unmarked mint-announcing) return type, a marker-free K3.2 consume that hands the obligation to the caller; through a plain return it is rejected (§28.6; a lambda at a plain concrete slot likewise, Concrete-slot function bodies); a `using var` is never returned (A5); getters cannot return fresh owned (A4). No borrow is carried, so nothing outlives a source.",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "A borrowed local may not be returned from a method at all unless the return is a borrow with a well-defined source that outlives the call … A borrow whose source no caller could re-establish (a scope-bound local, a temporary, a parameter source the signature does not announce) may not be returned. … A static **method** may not return such a read",
+   "cite": "§28.3 (K2.4; Borrow lifetime rules items 1-4; announcement table row 4; Concrete-slot function bodies), §28.6, v0.330",
+   "status": "decided",
+   "note": "Admitted only as a receiver-sourced borrow (instance/extension) or static storage through a static property getter; a lambda may also return a capture- or plain-parameter-sourced borrow at a concrete slot. The caller re-establishes the source (receiver, function value plus plain arguments). A borrow reached through a non-owned field is bounded only by the field-store residual (K4.3, checked-mode backstop). Side note: for a value-kind receiver, §9.4 makes `this` a full-expression temporary while §9.7 form 1 names \"the receiver expression\" as the caller-side source; either reading is sound (conservative).",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "\"The result of invoking a function value whose return type, after substitution and with nullability stripped, is such a type carries the union row 4 states for a function-value invocation: the function value's source set and what every plain argument contributes\" | \"a capture that contributes no source — a value-typed local or parameter, or a `string` — is not a captured source\"",
+   "cite": "§28.3 Concrete-slot function bodies, closure bullet provenance clauses 1 and 4, §28.14 (scoped construction admission text), §9.7 return bullet, v0.330",
+   "status": "ambiguous",
+   "note": "Invocation laundering. A local lambda that captures a borrow-bearing record and returns it is admitted (capture-sourced). Its invocation result carries only the function value's set, which is empty if a value-typed capture contributes nothing. §9.7's capture bullet does not fire because the closure never escapes. Same root as RC1.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nrecord Pair(Item: Item);\nclass Maker\n  public method Make(): Pair\n    using var it := new Item();\n    var p := new Pair(it);\n    var f := lambda() => p;   // return path: carried borrow reached through a capture -> admitted\n    return f();               // carries f's set: {} if p contributes nothing\n  end Make;                   // `it` disposed here\nend Maker;\n// Reading A (provenance clause 1 counts p's held sources, as argument-contribution item 3\n//   and the freeze's live-local rule do): f's set = {it}; the return is rejected.\n// Reading B (§28.14: a value-typed local 'is not a captured source', '§28.3's notion\n//   here as everywhere'): f's set = {}; the return sees no carried borrow; admitted;\n//   the caller's Pair dangles (flag-only).",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "NEW-OPEN",
+    "evidence": "Invocation laundering. A local lambda that captures a borrow-bearing record and returns it is admitted (capture-sourced). Its invocation result carries only the function value's set, which is empty if a value-typed capture contributes nothing. §9.7's capture bullet does not fire because the closure never escapes. Same root as RC1."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R4",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "(as R3/C6)",
+   "cite": "§28.3 Concrete-slot function bodies, §15.1.2, v0.330",
+   "status": "ambiguous",
+   "note": "Same invocation laundering for a borrow-bearing inline array.",
+   "counterexample": "// inside an instance method returning [1]Item:\nusing var it := new Item();\nvar a: [1]Item := [it];\nvar f := lambda() => a;\nreturn f();   // reading B: admitted; `it` disposed at scope end",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "NEW-OPEN",
+    "evidence": "Same invocation laundering for a borrow-bearing inline array."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R5",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "(as R3/C6)",
+   "cite": "§28.3 Concrete-slot function bodies, §35.4, v0.330",
+   "status": "ambiguous",
+   "note": "Same invocation laundering for a copyable borrow-bearing choice.",
+   "counterexample": "// choice Ref Some(item: Item), None; inside an instance method returning Ref:\nusing var it := new Item();\nvar r := Ref.Some(it);\nvar f := lambda() => r;\nreturn f();   // reading B: admitted; `it` disposed at scope end",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "NEW-OPEN",
+    "evidence": "Same invocation laundering for a copyable borrow-bearing choice."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R6",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "\"carries the union row 4 states for a function-value invocation: the function value's source set and what every plain argument contributes\" | \"a value-typed capture contributes nothing, living in its heap capture cell\"",
+   "cite": "§28.3 Concrete-slot function bodies, provenance clauses 1 and 4, §28.14, §9.7 return bullet, stdlib §4.15, v0.330",
+   "status": "ambiguous",
+   "note": "The concrete-span part of M3's R6/C6, which M3 treats as decided by §9.7 form 1, escapes through invocation. The worst case: no per-access flag check.",
+   "counterexample": "class Maker\n  public method Make(): ArraySpan<int>\n    var xs: Array<int> := [1, 2, 3];\n    var s := xs.AsSpan();\n    var f := lambda() => s;   // capture-sourced carried borrow: admitted\n    return f();               // reading B: carries {} -> admitted\n  end Make;                   // xs freed; caller reads a freed window, no flag\nend Maker;",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "NEW-OPEN",
+    "evidence": "The concrete-span part of M3's R6/C6, which M3 treats as decided by §9.7 form 1, escapes through invocation. The worst case: no per-access flag check."
+   },
+   "rc": [
+    "B4",
+    "B10"
+   ]
+  },
+  {
+   "row": "R7",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "may not be returned from the enclosing method (by `return`, or by `yield return` in an iterator, whose element type announces no source set either) … A capture-free function value is admitted at each of those sinks … A `return` inside a lambda body leaves only that lambda",
+   "cite": "§28.3 (Borrow lifetime rules: closure bullet, sink rule, provenance clauses 1-6; Function-typed holders), §27.5, v0.330",
+   "status": "decided",
+   "note": "A function value with a non-empty source set is never returned from a method (the return slot is a function-typed holder, or a set-erasing position at a bare-T function substitution); a lambda's own return is not a holder and carries only the enclosing value's set. The verdict is decided given the set; how the set is computed for value-typed captures that hold borrows is the R3-R6/R8 x C7 conflict, which also reaches this cell (`return lambda() => s[0];` over a local span).",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R8",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "Every return path supplies `null` or a borrow whose sources outlive the call — the receiver, a plain source parameter, or static storage … the call produces a **borrow** carrying the **union of the source-liveness constraints**",
+   "cite": "§28.3 (announcement table rows 5-7; Bare-type-parameter returns, caller and callee sides; Factory methods), §28.1 item 3, §9.7 return bullet, v0.330",
+   "status": "decided",
+   "note": "Signature-keyed and per instantiation category: a non-empty potential source set (receiver, plain parameters mentioning T, function value) announces the result's sources and each caller re-establishes them; an empty set is rejected at the declaration (`owned T` required); `where T: value` returns go to row 7 and §9.7's return bullet at holds-borrows substitutions; function-type substitutions carry the empty set through set-erasing positions; Task-family substitutions are excluded from bare-T function return slots.",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C6",
+   "verdict": "conditional",
+   "rule": "*Instance/extension:* return only a receiver-(parameter-)sourced borrow; a fresh owned value is rejected … (Value-typed and runtime-managed returns are not borrows and are outside this rule … the boxed wrapper is a runtime-managed value … may be **returned boxed through that interface**",
+   "cite": "§28.3 (announcement table rows 4 and 7; Borrow lifetime rules item 5; Factory methods), K1.6, §28.8, §28.9, §21.10, v0.330",
+   "status": "decided",
+   "note": "At a `string`, `Type` or value return type (row 7) the return is unrestricted, and no borrow arises. The open part is a box or `string` returned through an `Object`/interface return slot of an instance method or lambda: row 4's callee side admits only a receiver-sourced borrow, while K1.6/§28.8/item 5/§21.10 treat runtime-managed values as outside the borrow-return rule. A static method at such a slot is rejected at the declaration either way. Both readings are sound.",
+   "counterexample": "// spec v0.330 (HEAD 1ec0886)\nclass Cell\n  private _n: int := 0;\n  public method AsObject(): Object => _n;      // box of a copied int\n  public method Label(): Object => \"cell\";     // runtime-managed string\nend Cell;\n// Reading A (announcement table row 4, callee side: \"return only a\n//   receiver-(parameter-)sourced borrow\"): a box or string is no borrow,\n//   so both returns are outside the admitted set and rejected.\n// Reading B (K1.6: runtime-managed values carry no classification;\n//   §28.8: boxing \"is not subject to this rule\"; §28.3 borrow lifetime\n//   item 5: runtime-managed returns \"are not borrows and are outside this\n//   rule\"; §21.10: a value \"may be returned boxed through that interface\"):\n//   both admitted.\n// No escape either way: the caller reads row 4's receiver-sourced borrow,\n// a conservative bound on a value that carries no borrow.",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "Admitted at instance members and lambdas; a static method with an Object or interface return is rejected at the declaration (row 4; neither reading disputes this). §21.10 states the admission outright: a non-borrow-bearing record \"that implements an interface may be returned boxed through that interface\", \"stated exactly as far as §8.6 already goes\", so the admission is general. Also §28.3 item 5: \"(Value-typed and runtime-managed returns are not borrows and are outside this rule\", and §28.8: implicit boxing \"is not subject to this rule\". Row 4's callee-side list governs borrows only. No borrow arises."
+   },
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C7",
+   "verdict": "admitted-bounded",
+   "rule": "Borrowed (source: the local's enclosing scope). Capturing does not transfer ownership; the closure cannot outlive the local's scope. … a closure cannot consume, reassign, or dispose a captured owned binding … While its source set is non-empty, a function value may **not** be stored in a field",
+   "cite": "§28.3 (Producers rows; Captured owned bindings; closure bullet provenance clause 1, sink rule; Returning a deferred-activation frame), K5.5, K8.4, §28.9, §28.14, v0.330",
+   "status": "decided",
+   "note": "The capture is a borrow sourced at the enclosing scope (an `owned` parameter is scope-bound, field-store clause 2), so the closure is bounded by that scope: no field/collection/return/set-erasing sink, frames carrying it cannot be returned, and the binding is frozen (K5.5) while the closure lives. A method reference over a fresh receiver is a temporary source (K8.4). Loose wording: Returning a deferred-activation frame admits \"a capture sourced from its parameters\", which an `owned` parameter literally is; field-store clause 2's \"an `owned` parameter is scope-bound\" and K2.4 decide it.",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C7",
+   "verdict": "admitted-bounded",
+   "rule": "a captured borrowed local or parameter that binding's source … A **method reference** contributes its bound receiver's source, as a capture … A borrowed local may not be captured by a closure that may outlive the borrow's source.",
+   "cite": "§28.3 (closure bullet, provenance clauses 1-2, sink rule; method-reference bullet), §28.9, §28.14, Appendix C.3, v0.330",
+   "status": "decided",
+   "note": "The capture adds the borrow's source to the closure's source set; the closure may be bound to locals that do not strictly enclose the source, invoked, re-captured or passed to plain (call-bounded) or `scoped` parameters, never stored, returned or set-erased. Capturing `this` (implicitly through a field read) is a tested source (§28.14's `this` arm), so a `this`-capturing closure is not storable in a field of `this` except through `scoped`.",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C7",
+   "verdict": "conditional",
+   "rule": "A borrow-bearing record may not be captured by a closure that escapes its source's scope. … whether it may outlive a source is decided by its **source set** … (a value-typed capture contributes nothing, living in its heap capture cell … a capture that contributes no source — a value-typed local or parameter, or a `string` — is not a captured source",
+   "cite": "§9.7 (capture bullet), §8.6, §21.10 vs §28.3 (closure bullet provenance clause 1; Deferred-activation callees, the capture-set contribution), §28.14 v1 admission bound 1, v0.330",
+   "status": "decided",
+   "note": "Since #4154 a closure's escape is decided only by its source set, and provenance clause 1 lists no source for a captured value that holds borrows. Two normative passages state that such a capture contributes nothing (§28.3's capture-set contribution; §28.14 bound 1, \"§28.3's notion here as everywhere\"), so the closure is capture-free and storable or returnable. §9.7, §8.6 and §21.10 instead reject an escaping capture of a borrow-bearing record. Unbacked for spans (no per-access flag).",
+   "counterexample": "// spec v0.330 (HEAD 1ec0886)\nclass Item\n  public method Get(): int => 7;\nend Item;\nrecord Pair(Item: Item);             // borrow-bearing record (§9.7)\nclass Holder\n  private _f: (() -> int)? := null;\n  public method Arm(): ()\n    using var it := new Item();\n    var p := new Pair(it);           // p carries a borrow of the using var `it`\n    _f := lambda() => p.Item.Get();\n    // Reading A (§9.7 capture bullet): rejected, the closure escapes `it`'s scope.\n    // Reading B (§28.3 capture-set contribution, §28.14 bound 1): p is a\n    //   value-typed capture, contributes nothing; set empty; capture-free;\n    //   the function-typed field store is admitted.\n  end Arm;\n  public method Fire(): int => _f!();  // B: uses `it` after its disposal\nend Holder;",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "Rejected at every escaping sink (field, collection, return, wider-scope local, set-erasing position). §9.7 capture bullet: \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\" The two 'contributes nothing' passages do not reach C7's sinks. The first is scoped to *Deferred-activation callees* (a frame's source set: \"a value-typed capture contributes nothing, living in its heap capture cell\"). The second is scoped to §28.14's storage admission (bound 1: \"A capture contributing no borrow source is exempt, at both admission arms\"). §28.3's sink rule only rejects non-empty sets and never affirmatively admits a capture that §9.7 bars; the rules are conjunctive (K2.3: \"A borrow may not reach a holder — a binding of wider scope, a field, a collection, a frame, a return — whose lifetime the checker cannot bound by the borrow's source set.\"). Residual: the gap in provenance clause 1 is real but surfaces elsewhere (RC1: invocation laundering at C6, frames at C9/C10, scoped at C13), not at C7."
+   },
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C7",
+   "verdict": "conditional",
+   "rule": "When such an array is passed by value, returned from a method, stored as a field, or captured by a closure, the same borrow-lifetime rules apply that govern borrow-bearing records … (a value-typed capture contributes nothing, living in its heap capture cell … a capture that contributes no source — a value-typed local or parameter, or a `string` — is not a captured source",
+   "cite": "§15.1.2, §9.7 capture bullet vs §28.3 capture-set contribution, §28.14 v1 admission bound 1, v0.330",
+   "status": "decided",
+   "note": "Same root cause as R3/C7: §15.1.2 routes a captured borrow-bearing inline array through §9.7's capture rule, while the capture-set contribution and §28.14 bound 1 make any value-typed capture contribute no source. An owning inline array (move-only) is decided separately by §28.9 (the closure borrows the enclosing scope).",
+   "counterexample": "// spec v0.330 (HEAD 1ec0886)\nclass Item\n  public method Get(): int => 7;\nend Item;\nclass Holder\n  private _f: (() -> int)? := null;\n  public method Arm(): ()\n    using var it := new Item();\n    var arr: [1]Item := [it];        // borrow-bearing inline array (§15.1.2)\n    _f := lambda() => arr[0].Get();\n    // A (§15.1.2: \"captured by a closure, the same borrow-lifetime rules\n    //    apply\"; §9.7 capture bullet): rejected.\n    // B (§28.3 capture-set contribution: \"a value-typed capture contributes\n    //    nothing\"; §28.14 bound 1): empty set, field store admitted.\n  end Arm;\n  public method Fire(): int => _f!();\nend Holder;",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "As R3/C7, plus §15.1.2: \"When such an array is passed by value, returned from a method, stored as a field, or captured by a closure, the same borrow-lifetime rules apply that govern borrow-bearing records\". Verdict: rejected at escaping sinks. Shared residual RC1."
+   },
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C7",
+   "verdict": "conditional",
+   "rule": "is constrained in returns, closures, and collection copies … the closure captures a borrow whose source is the local's enclosing scope, and may not outlive it … (a value-typed capture contributes nothing, living in its heap capture cell",
+   "cite": "§35.4, §9.7 capture bullet, §28.9 (move-only capture), §28.14 bound 1 vs §28.3 capture-set contribution, v0.330",
+   "status": "decided",
+   "note": "An owning choice is move-only, so its capture is §28.9's borrow of the enclosing scope (decided; §28.14 bound 1 says the same). A copyable borrow-bearing choice falls into the R3/C7 conflict: §35.4/§9.7 constrain the closure, but the value-typed capture contributes no source to the set that decides escape.",
+   "counterexample": "// spec v0.330 (HEAD 1ec0886)\nclass Item\n  public method Get(): int => 7;\nend Item;\npublic choice Ref\n  Some(item: Item),                   // borrow-bearing choice (§35.4 rule 2)\n  None;\nend Ref;\nclass Holder\n  private _f: (() -> int)? := null;\n  public method Arm(): ()\n    using var it := new Item();\n    var r := Ref.Some(it);\n    _f := lambda() => (case r of Some(var i) => i.Get(), None => 0);\n    // A (§35.4 \"constrained in ... closures\" via §9.7): rejected.\n    // B (§28.3 capture-set contribution; §28.14 bound 1): r is a value-typed\n    //    capture, contributes nothing; capture-free; stored.\n  end Arm;\nend Holder;",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "As R3/C7, via §35.4 (a choice that holds borrows \"is constrained in returns, closures, and collection copies\") and Appendix C.3 (such a choice is subject to §9.7's \"borrow-lifetime rules in full — the null-source forms, the escape bullets, the `async` position bans\"). Owning choices: §28.9 move-only capture (already decided). Verdict: rejected at escaping sinks. Shared residual RC1."
+   },
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C7",
+   "verdict": "conditional",
+   "rule": "capture it in a closure that escapes … (a value-typed capture contributes nothing, living in its heap capture cell … The captures that *are* tested are those contributing a source: class- and interface-typed ones",
+   "cite": "stdlib §4.16 (Boxing and lifetime), §9.7 capture bullet, §8.6 vs §28.3 capture-set contribution, §28.14 v1 admission bound 1, v0.330",
+   "status": "decided",
+   "note": "The concrete buffer- and array-backed spans are borrow-bearing records, so the R3/C7 conflict reaches them. This is the worst case, because a span's buffer window has no per-access disposed-flag check (§9.7). An `IReadOnlySpan<TElement>`-typed capture is interface-typed and so a tested source (decided: rejected at escaping sinks). `ReadOnlyStringSpan` carries no borrow (admitted).",
+   "counterexample": "// spec v0.330 (HEAD 1ec0886)\nclass Holder\n  private _f: (() -> int)? := null;\n  public method Arm(): ()\n    using var buf := new OwningBuffer<int>(4);  // value T: slots default(int)\n    var s := buf.AsSpan();                      // Span<int>: borrow-bearing\n    _f := lambda() => s[0];\n    // A (§9.7 capture bullet; stdlib §4.16 \"capture it in a closure that\n    //    escapes\"): rejected.\n    // B (§28.3: \"a value-typed capture contributes nothing\"; §28.14 bound 1:\n    //    \"a value-typed local or parameter ... is not a captured source\"):\n    //    capture-free, stored. Contrast: a parameter declared\n    //    IReadOnlySpan<int> is interface-typed, so its capture is a tested\n    //    source and the same store is rejected under both readings.\n  end Arm;\n  public method Fire(): int => _f!();  // B: reads a freed buffer window,\nend Holder;                             // which has no per-access flag check (§9.7)",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "As R3/C7. Spans are borrow-bearing records (§9.7). Stdlib §4.16 adds that a method \"cannot ... capture it in a closure that escapes\", and §8.6 says a box captured \"in a closure that escapes the source scope is rejected by the same rules as the unboxed form\". Verdict: rejected at escaping sinks. The worst-case severity the lane noted (no per-access flag) moves to RC1's other routes."
+   },
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C7",
+   "verdict": "admitted-bounded",
+   "rule": "a captured function value its own set, transitively … A **plain function-typed parameter** of the enclosing body contributes itself … **Callee-side uses inside a nested closure are escaping uses**",
+   "cite": "§28.3 (closure bullet provenance clauses 1, 3, 4, 6; sink rule), §27.5 (ref/out captures), §28.14 (call-bounded default; v1 bound 6), v0.330",
+   "status": "decided",
+   "note": "A capturing closure inherits the captured function value's set (union, transitive); a captured plain function-typed parameter stays call-bounded; a captured `ref`/`out` parameter contributes the declaring body's scope; capturing a `scoped` parameter is rejected (v1 bound 6). The outer closure is then bounded by the sink rule like any other.",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R8",
+   "col": "C7",
+   "verdict": "conditional",
+   "rule": "**In a generic body** each bullet below is a requirement of the body's use of a type parameter … The generic body type-checks under the class-or-interface assumption … (a value-typed capture contributes nothing, living in its heap capture cell",
+   "cite": "§9.7 (generic-body paragraph; capture bullet), §28.1 item 3, §3.6 rule 2 vs §28.3 capture-set contribution, §28.14 bound 1, v0.330",
+   "status": "decided",
+   "note": "For an unconstrained or class-admitting T, the class-or-interface assumption makes a captured T a borrowed binding with a source, so escape is rejected (decided). Under `where T: value` the body captures a value: §28.3 says it contributes nothing, so the closure is storable at every instantiation. §9.7 reads its capture bullet at each holds-borrows instantiation and rejects. This is the R3/C7 conflict in generic form.",
+   "counterexample": "// spec v0.330 (HEAD 1ec0886)\nclass Keep<T> where T: value\n  private _f: (() -> string)? := null;\n  public method Arm(v: T): () => _f := lambda() => v.ToString();\n  public method Fire(): string => _f!();\nend Keep;\n// At Keep<Span<int>>, caller: `k.Arm(buf.AsSpan());` then disposes buf.\n// A (§9.7: \"In a generic body each bullet below is a requirement of the\n//    body's use of a type parameter\", read at Span<int>; its capture bullet):\n//    rejected wherever Keep<Span<int>> is named.\n// B (§28.3 capture-set contribution: a value-typed capture contributes\n//    nothing; the body under `where T: value` captures a value): the closure\n//    is capture-free, the field store admitted at every instantiation, and\n//    Fire() renders the span after buf's disposal.\n// (Unconstrained T is decided: the class-or-interface assumption makes `v`\n//  a plain-parameter borrow, a tested source, so the store is rejected.)",
+   "lane": "M3",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "§9.7's generic paragraph reads every bullet, the capture bullet included, per instantiation: each bullet \"is a requirement of the body's use of a type parameter\" and is \"read at each instantiation substituting arguments at which that type, after substitution, is a value type that holds borrows\". So Keep<Span<int>> is rejected wherever it is named, as §9.7's own Keep<Pair> field example is. DECLINED.md row 38 confirms the per-instantiation reading covers \"store, capture or box\". Reading B is not reachable."
+   },
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C7",
+   "verdict": "admitted",
+   "rule": "a `string` contributes nothing, a function value or deferred-activation frame its own sources … has unbounded lifetime by construction; neither carries a lifetime hazard",
+   "cite": "§28.14 v1 admission bound 1, §28.3 capture-set contribution, §28.9, K1.6, v0.330",
+   "status": "decided",
+   "note": "Runtime-managed captures (`string`, `Type`, a boxed primitive's payload copy) contribute no source, so a closure capturing only them is capture-free and admitted at every sink. A function value is not R9 here: it contributes its own set (R7).",
+   "counterexample": "",
+   "lane": "M3",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C8",
+   "verdict": "conditional",
+   "rule": "\"At a **class or interface** substitution the marker has its ordinary transfer meaning;\" | \"`Array<MyClass>` stores borrows of `MyClass` — references whose ownership remains with whoever passed them in.\" | \"is admitted at the call, for a local, virtual, interface or imported callee alike. Neither source is lifetime-extended\"",
+   "cite": "§28.1 clause 3, §14.4, §28.3 Borrow lifetime rules (field-store bullet clause 3), A14",
+   "status": "decided",
+   "note": "An owned value reaches a T slot either by transfer (an `owned T` parameter/return, ordinary meaning at a class substitution, erased at value ones) or as a borrow (unmarked read, K3.13); A14 bars `owned` type arguments. A plain T parameter the generic body stores holds the borrow under the field-store residual (K4.3, checked-mode backstop); an unbound temporary there is admitted but not extended (K8.1).",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C8",
+   "verdict": "admitted-bounded",
+   "rule": "\"a `class Keep<T>` whose `Put(a: T)` stores `a` into a `_last: T` field is admitted at the declaration and, under [§28.3](#sec-borrow-lifetime-rules)'s field-store bullet, at `Keep<Item>`\" | \"at a class or interface instantiation of the returned parameter the call produces a **borrow** carrying the **union of the source-liveness constraints** of the receiver and of every argument bound to a source parameter\"",
+   "cite": "§9.7 (generic-body paragraph), §28.3 Bare-type-parameter returns (caller side 1), §28.3 field-store bullet clauses 2–3, §28.1 clause 3",
+   "status": "decided",
+   "note": "The generic body is checked once under the class-or-interface assumption; a borrow stored in a T field holds under the field-store residual (K4.3, named backstop), and a borrow returned through a bare-T return is re-established at each caller as the union of receiver and source-argument sources.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C8",
+   "verdict": "conditional",
+   "rule": "\"and is rejected wherever `Keep<Pair>` is named, by the instance-field bullet, the diagnostic naming the store.\" | \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\" | \"// Intrinsic restriction: T must be a copyable value type, string, or other\" | \"`Task` and `Task<T>` for **copyable** value type ([§15.3](#sec-move-only-value-types)), `string`, or runtime-managed T: produced as today; no ownership obligation crosses the await boundary.\"",
+   "cite": "§9.7 (generic-body paragraph), §3.6 rule 2, §30.5 producer-side rows, §30.11; stdlib §6.6, §6.7",
+   "status": "missing",
+   "note": "User generics are decided: §9.7's bullets are requirements read at every instantiation where T holds borrows (Keep<Pair>, Wrap<Item>, Bag<Pair>). Standard-library generics are not: §3.6 rule 2 exempts their bodies, and TaskCompletionSource<T>.SetResult(result: T) admits every copyable value type, a borrow-bearing record included. The value is retained in the task past the call through a plain parameter that announces no retention and records no trust clause (Task.FromResult<T> is a sibling route, see C9).",
+   "counterexample": "class Item  public property Count: int => 1;  end Item;\nrecord Pair(Item: Item);\nclass Svc\n  private owned _tcs: TaskCompletionSource<Pair>;\n  public constructor() _tcs := new(); end;\n  public method Arm()\n    using var it := new Item();\n    _tcs.SetResult(new Pair(it));  // T = Pair: plain T param; stdlib body adds no requirement\n  end Arm;                         // `it` disposed; the task's result still borrows it\n  public async method Peek(): Task<int>\n    var p := await _tcs.Task;      // Pair carrying a borrow of the disposed `it`\n    return p.Item.Count;           // only the checked-mode flag catches it; §9.7 allows record borrows no residual\n  end Peek;\nend Svc;",
+   "lane": "M4",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "CONFIRMED",
+    "evidence": "Open as stated (missing). §3.6 rule 2: standard-library bodies \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\". `TaskCompletionSource<T>`'s intrinsic restriction admits every copyable value type and §30.5's row admits `Task<T>` \"for **copyable** value type\"; §30.5's move-only row and §30.1's async ban do not reach a non-async producer. §30.1's certification of `CancellationToken` cites §30.11 only as 'stdlib-certified footing', with no certified clause for a T that holds borrows. No K4.3 clause records the retention. Same route through `Task.FromResult<T>(value: T)` (stdlib §6.7). The lane's counterexamples stand; R6 (span) has no backstop at all."
+   },
+   "rc": [
+    "B1"
+   ]
+  },
+  {
+   "row": "R4",
+   "col": "C8",
+   "verdict": "conditional",
+   "rule": "\"In a generic body the bullet is read at each instantiation at which the stored value's type, after substitution, holds borrows\" | \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\" | \"// Intrinsic restriction: T must be a copyable value type, string, or other\" | \"`Task` and `Task<T>` for **copyable** value type ([§15.3](#sec-move-only-value-types)), `string`, or runtime-managed T: produced as today; no ownership obligation crosses the await boundary.\"",
+   "cite": "§9.7 (generic-body paragraph), §3.6 rule 2, §30.5 producer-side rows, §30.11; stdlib §6.6, §6.7, §15.1.2",
+   "status": "missing",
+   "note": "Same as R3. User generics over `[N]T`, or at an inline-array substitution, are covered by §9.7's per-instantiation reading (§15.1.2 applies §9.7 to the array as one source set). Dispatched generics exclude inline arrays (§14.2). A stdlib generic T slot such as TaskCompletionSource<[2]Item> has no rule: a non-owning inline array is a copyable value type.",
+   "counterexample": "class Item  public property Count: int => 1;  end Item;\nclass Svc\n  private owned _tcs: TaskCompletionSource<[2]Item>;\n  public constructor() _tcs := new(); end;\n  public method Arm()\n    var a := new Item();\n    var b := new Item();\n    var pair: [2]Item := [a, b];\n    _tcs.SetResult(pair);          // borrow-bearing inline array into a stdlib T slot\n  end Arm;                         // a, b disposed at scope end\n  public async method Peek(): Task<int>\n    var xs := await _tcs.Task;     // array whose slots borrow disposed objects\n    return xs[0].Count;\n  end Peek;\nend Svc;",
+   "lane": "M4",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "CONFIRMED",
+    "evidence": "Open as stated (missing). §3.6 rule 2: standard-library bodies \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\". `TaskCompletionSource<T>`'s intrinsic restriction admits every copyable value type and §30.5's row admits `Task<T>` \"for **copyable** value type\"; §30.5's move-only row and §30.1's async ban do not reach a non-async producer. §30.1's certification of `CancellationToken` cites §30.11 only as 'stdlib-certified footing', with no certified clause for a T that holds borrows. No K4.3 clause records the retention. Same route through `Task.FromResult<T>(value: T)` (stdlib §6.7). The lane's counterexamples stand; R6 (span) has no backstop at all."
+   },
+   "rc": [
+    "B1"
+   ]
+  },
+  {
+   "row": "R5",
+   "col": "C8",
+   "verdict": "conditional",
+   "rule": "\"**Choices that hold borrows** (every borrow-bearing choice, and any owning choice with a borrow-carrying payload beside its owned ones) are subject to this section's **borrow-lifetime rules**\" | \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\" | \"// Intrinsic restriction: T must be a copyable value type, string, or other\" | \"`Task` and `Task<T>` for **copyable** value type ([§15.3](#sec-move-only-value-types)), `string`, or runtime-managed T: produced as today; no ownership obligation crosses the await boundary.\"",
+   "cite": "§9.7 (generic-body paragraph), §3.6 rule 2, §30.5 producer-side rows, §30.11; stdlib §6.6, §6.7, §35.4, §35.11",
+   "status": "missing",
+   "note": "Same as R3. A generic choice is classified per instantiation (§35.11), and a choice that holds borrows at a user generic T slot gets §9.7's per-instantiation bullets. An owning choice cannot be a Task<T> argument (§30.5 move-only row). A borrow-bearing choice is copyable, so TaskCompletionSource<C> admits it and nothing bounds its retention.",
+   "counterexample": "class Item  public property Count: int => 1;  end Item;\nchoice Ref\n  Some(it: Item),\n  Empty;\nend Ref;\nclass Svc\n  private owned _tcs: TaskCompletionSource<Ref>;\n  public constructor() _tcs := new(); end;\n  public method Arm()\n    using var it := new Item();\n    _tcs.SetResult(Ref.Some(it));  // borrow-bearing choice into a stdlib T slot\n  end Arm;\n  public async method Peek(): Task<int>\n    var r := await _tcs.Task;\n    return (case r of Some(var i) => i.Count, Empty => 0);   // borrow of disposed `it`\n  end Peek;\nend Svc;",
+   "lane": "M4",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "CONFIRMED",
+    "evidence": "Open as stated (missing). §3.6 rule 2: standard-library bodies \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\". `TaskCompletionSource<T>`'s intrinsic restriction admits every copyable value type and §30.5's row admits `Task<T>` \"for **copyable** value type\"; §30.5's move-only row and §30.1's async ban do not reach a non-async producer. §30.1's certification of `CancellationToken` cites §30.11 only as 'stdlib-certified footing', with no certified clause for a T that holds borrows. No K4.3 clause records the retention. Same route through `Task.FromResult<T>(value: T)` (stdlib §6.7). The lane's counterexamples stand; R6 (span) has no backstop at all."
+   },
+   "rc": [
+    "B1"
+   ]
+  },
+  {
+   "row": "R6",
+   "col": "C8",
+   "verdict": "conditional",
+   "rule": "\"A value declared at the interface type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)) is **read as holding borrows** — those of the span it boxes.\" | \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\" | \"// Intrinsic restriction: T must be a copyable value type, string, or other\" | \"`Task` and `Task<T>` for **copyable** value type ([§15.3](#sec-move-only-value-types)), `string`, or runtime-managed T: produced as today; no ownership obligation crosses the await boundary.\"",
+   "cite": "§9.7 (generic-body paragraph), §3.6 rule 2, §30.5 producer-side rows, §30.11; stdlib §6.6, §6.7, stdlib §4.14, §4.16",
+   "status": "missing",
+   "note": "User generics are decided: a span substitution is a borrow-bearing record, and an IReadOnlySpan<X> substitution is read as the span it boxes. A dispatched body that stores its parameter is rejected at the body (DECLINED: the dispatched value-type exclusion was declined). Spans are the case where the stdlib-generic gap is unbacked. A ReadOnlySpan<byte> is a copyable value type, so TaskCompletionSource<ReadOnlySpan<byte>> admits it, and a read through its buffer window has no per-access disposed-flag check (§9.7).",
+   "counterexample": "class Svc\n  private owned _tcs: TaskCompletionSource<ReadOnlySpan<byte>>;\n  public constructor() _tcs := new(); end;\n  public method Arm()\n    using var buf := new OwningBuffer<byte>(16);\n    _tcs.SetResult(buf.AsReadOnlySpan());  // span into a stdlib generic T slot (plain param)\n  end Arm;                                  // buf freed here\n  public async method First(): Task<byte>\n    var s := await _tcs.Task;               // span over freed storage, no source tracked\n    return s[0];                            // buffer-window read: no flag check (§9.7)\n  end First;\nend Svc;",
+   "lane": "M4",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "CONFIRMED",
+    "evidence": "Open as stated (missing). §3.6 rule 2: standard-library bodies \"contribute no requirement of this kind, so such a type is rejected at an instantiation only by its declared constraints and the instantiation-site rules stated for it\". `TaskCompletionSource<T>`'s intrinsic restriction admits every copyable value type and §30.5's row admits `Task<T>` \"for **copyable** value type\"; §30.5's move-only row and §30.1's async ban do not reach a non-async producer. §30.1's certification of `CancellationToken` cites §30.11 only as 'stdlib-certified footing', with no certified clause for a T that holds borrows. No K4.3 clause records the retention. Same route through `Task.FromResult<T>(value: T)` (stdlib §6.7). The lane's counterexamples stand; R6 (span) has no backstop at all."
+   },
+   "rc": [
+    "B1"
+   ]
+  },
+  {
+   "row": "R7",
+   "col": "C8",
+   "verdict": "rejected",
+   "rule": "\"At every set-erasing position **a function value with a non-empty source set is rejected, and a capture-free one is admitted**\" | \"Function-type substitutions are excluded from type parameters in nested parameter slots\"",
+   "cite": "§28.3 Set-erasing positions; §28.3 nested-parameter-slot exclusion; §28.1 clause 3",
+   "status": "decided",
+   "note": "A bare-T field, parameter, return slot, ref/out location, component, payload or inline-array slot at a function-type substitution is a set-erasing position. Only a capture-free value enters, so inside the generic body every T-typed function value carries the empty set by induction. The T-in-nested-parameter-slot route is inadmissible at the instantiation. The `as`-to-Object laundering is recorded at R7×C11.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R8",
+   "col": "C8",
+   "verdict": "conditional",
+   "rule": "\"`Outer<R>` is rejected wherever it is named where `Bag<R>` would be\" | \"an argument whose type is a type parameter, or whose borrow-bearing or holds-borrows classification turns on one, contributes at every substitution the union of what each substitution its constraints admit would contribute\"",
+   "cite": "§3.6 rule 2, §14.1, §28.3 The sources an argument contributes (kind 4), §14.2 Dispatched generic methods",
+   "status": "decided",
+   "note": "A bare T passed into another generic T position defers that position's requirements to the enclosing declaration's instantiations, by chain. Its sources are counted under the weakest assumption its constraints establish. A dispatched generic body must establish the requirement by constraint or is rejected at the body.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C8",
+   "verdict": "admitted",
+   "rule": "\"Values of runtime-managed type (`string`, `Type`, boxed value types, function values) and of ordinary value type carry no classification and no obligation\" | \"and at every **other value or runtime-managed** substitution it is **erased by the substitution**\"",
+   "cite": "K1.6, §28.1 clause 3, §28.9",
+   "status": "decided",
+   "note": "string, Type and boxed primitives at a T slot carry no borrow, and the `owned` marker is erased. Function values are excluded here because they are R7.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C11",
+   "verdict": "conditional",
+   "rule": "\"For `as`, the result is additionally a *borrow* of `x` (more precisely, a borrow with the same source as `x`), regardless of whether `x` is owned or borrowed.\" | \"the bound name is a borrow whose source is the scrutinee's source\" | \"An argument to an **owned payload slot** is an owned-consuming position\" | \"A borrow-bearing record may not be **constructed from a temporary** bound to one of its borrow-carrying fields.\"",
+   "cite": "§17.4, §19.3, §35.3, §35.5 (owning match), §9.7, K8.3–K8.4",
+   "status": "decided",
+   "note": "`as`, `is` and pattern bindings never transfer and borrow from the operand's or scrutinee's source; over an owned temporary they are bounded by the full expression, or by the whole case construct (K8.3). In aggregation, an owned payload slot consumes (K3.3), while a record component or plain payload slot borrows the binding and rejects a temporary source. An owning match transfers the owned payloads into the arm's owned locals.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C11",
+   "verdict": "admitted-bounded",
+   "rule": "\"the bound name is a borrow whose source is the scrutinee's source\" | \"A borrow-bearing record value may not outlive the source of any borrow it contains.\" | \"An argument to a **plain class- or interface-typed payload slot** is a borrow\"",
+   "cite": "§19.3, §17.4, §9.7, §35.3–§35.4",
+   "status": "decided",
+   "note": "A binding or `as` result re-borrows with the same source set (K2.2). Aggregating the borrow makes the record borrow-bearing (or the choice hold borrows), and that value is then bounded by the borrow's source under §9.7's bullets. An owned payload slot rejects a borrow.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C11",
+   "verdict": "admitted-bounded",
+   "rule": "\"Its type is another borrow-bearing record, or a borrow-bearing choice ([§35.4](#sec-choice-classification)) (transitivity).\" | \"implicit or by an `as` ([§17.4](#sec-the-is-is-not-and-as-operators)) or a typed-pattern binding ([§19.3](#sec-patterns)) at such a type — is a **compile error at the conversion site**\" | \"For value-type scrutinees, the binding is a copy by the standard value-type rules\"",
+   "cite": "§9.7 (field predicate; borrow-erasing bullet), §19.3, §12.7, §8.6",
+   "status": "decided",
+   "note": "Destructuring copies, and the copy carries the same borrows. Nesting the record in another record or a choice propagates borrow-bearing status transitively. `is`/`as`/typed patterns against a reference target are rejected for a value operand (§12.7), and a conversion of a value that holds borrows to Object or a non-IReadOnlySpan interface by `as` or typed pattern is rejected at the conversion.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C11",
+   "verdict": "admitted-bounded",
+   "rule": "\"the check reads one **source set** per array value ([K2](#sec-kernel-k2)), for a class, interface, record or choice element alike: the union of the source sets of the borrows its slots carry\" | \"Its type is a borrow-bearing inline array ([§15.1.2](#sec-inline-array-members)):\"",
+   "cite": "§15.1.2, §9.7, §17.4 (degenerate as targets), §19.3",
+   "status": "decided",
+   "note": "Collection-literal construction and slot stores union the slots' sources into the array's one set. As a record component or choice payload the array makes the aggregate borrow-bearing. Inline arrays have no destructuring surface, an `as` to an inline-array target is a compile error, and a typed binding copies the array, set included.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C11",
+   "verdict": "admitted-bounded",
+   "rule": "\"for borrow-bearing and owning choices, class-typed payload bindings are borrows\" | \"constructing a choice that holds borrows ([§35.4](#sec-choice-classification)'s holds-borrows property — borrow-bearing or owning alike) from a temporary bound to a borrow-carrying payload is rejected\" | \"Orthogonally, a construction of any choice that holds borrows ([§35.4](#sec-choice-classification)'s holds-borrows property) is *additionally* a borrow-carrying value under §9.7's rules\"",
+   "cite": "§35.3, §35.4, §35.5, §19.3 (write-point rule), §9.7",
+   "status": "decided",
+   "note": "A borrowing match binds borrows of the scrutinee's source. A move-only payload binding is in place and barred across write points. An owning match moves the owned payloads, while the borrow payloads stay borrows. Construction from a temporary borrow source is rejected, and the constructed value carries §9.7's bounds in both regimes.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C11",
+   "verdict": "admitted-bounded",
+   "rule": "\"A value declared at the interface type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)) is **read as holding borrows** — those of the span it boxes.\" | \"implicit or by an `as` ([§17.4](#sec-the-is-is-not-and-as-operators)) or a typed-pattern binding ([§19.3](#sec-patterns)) at such a type — is a **compile error at the conversion site**\"",
+   "cite": "§9.7, §8.6, §12.7, §17.4, stdlib §4.14–§4.16, §3.3",
+   "status": "decided",
+   "note": "A span is a borrow-bearing record (R3 rules). An IReadOnlySpan<X> component, payload or binding is read as the span. Unboxing it by `as` or a typed pattern yields a span with the same sources, while `as Object` or a typed binding at another interface is rejected. ReadOnlyStringSpan is not borrow-bearing and is unrestricted.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C11",
+   "verdict": "conditional",
+   "rule": "\"A function value reaches such a position by implicit conversion — at an argument (a `ref` argument's current value reaching a `ref` location so declared included), an initializer, an assignment, a `return` (a lambda's included), a pattern binding, a collection-literal element or a `with` assignment\" | \"For `as`, the result is additionally a *borrow* of `x` (more precisely, a borrow with the same source as `x`), regardless of whether `x` is owned or borrowed.\"",
+   "cite": "§28.3 Set-erasing positions, Function-typed holders (clauses 2–3), closure bullet provenance; §17.4; §9.7 borrow-erasing bullet (contrast)",
+   "status": "missing",
+   "note": "Aggregation is decided: a function-typed record component or choice payload is a holder, and an Object or bare-T one is set-erasing, so capture-bearing values are rejected. A pattern binding at Object is listed. An explicit `f as Object` is not listed, though the borrow-erasing twin lists `as` explicitly, so the Object-typed result never meets a sink check for a function value. §17.4's 'same source as x' is written for classified references (K1.6 gives function values no classification). Reading it over the set either admits a plain-parameter capture under the field residual, against the categorical sink rule, or admits outright.",
+   "counterexample": "class Item  public property Count: int => 1;  end Item;\nclass Holder\n  private _o: Object?;\n  public method Keep()\n    var it := new Item();\n    var f: () -> int := lambda() => it.Count;  // source set: `it`'s scope\n    _o := f as Object;     // explicit `as`, not an implicit conversion: no set-erasing check\n  end Keep;                // `it` disposed at scope end\n  public method Use(): int\n    var g := _o as () -> int;   // provenance untraced: call-bounded, admitted\n    return g!();                // runs the closure over the disposed `it`\n  end Use;\nend Holder;",
+   "lane": "M4",
+   "xcheck": {
+    "by": "X1",
+    "verdict": "CONFIRMED",
+    "evidence": "Open (missing; arguably ambiguous). Set-erasing positions are reached \"by implicit conversion — at an argument ..., an initializer, an assignment, a `return` ..., a pattern binding, a collection-literal element or a `with` assignment\"; an explicit `as` is not listed, while the borrow-erasing twin lists it by name (\"implicit or by an `as` ... or a typed-pattern binding\"). §17.4 gives the result \"a borrow with the same source as `x`\", and Function-typed holders clause 1 \"keys on the assigned value's static type\", which is `Object`, so no function-value rule fires on the result. Three readings: the sink rule follows the runtime function value (rejected); §17.4 carries the source set into class-borrow rules (field-store clause 3 then admits a scope-bound source passed to a storing plain parameter, and a plain-parameter capture into a field, under a residual a captured span lacks); or the result is unclassified (admitted). The last two escape. The same gap reaches C1, C3, C4 and C5 (see new_open)."
+   },
+   "rc": [
+    "B2"
+   ]
+  },
+  {
+   "row": "R8",
+   "col": "C11",
+   "verdict": "conditional",
+   "rule": "\"in a generic body, a type parameter may be used as a pattern type — `var x: T` and bare `T` test against the **substituted** type argument, per instantiation\" | \"`as` against a reference target is rejected at the instantiation site whatever the answer\"",
+   "cite": "§19.3 (Type parameters as pattern types), §12.7, §17.4, §9.7 (generic-body paragraph), §28.3 Set-erasing positions",
+   "status": "decided",
+   "note": "Bindings and `as` over a T operand are decided per instantiation. A typed binding or `as` that would box a value substitution is rejected at the instantiation. Aggregation of T into a record component or choice payload (`new Box<T>(a)`) is read per instantiation by §9.7 (Wrap<Item>), and at function substitutions T values are capture-free by the set-erasing induction.",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C11",
+   "verdict": "admitted",
+   "rule": "\"for runtime-managed scrutinees (`string`, function values), the binding is a shared reference.\" | \"Reference-typed fields whose **declared** types are runtime-managed (`string`, `Type`, function types) do not make the record borrow-bearing\"",
+   "cite": "§19.3, §9.7, §35.4, §8.6, K1.6",
+   "status": "decided",
+   "note": "A string, Type or boxed-primitive binding or `as` result shares or copies with no borrow. As components or payloads they are classification-neutral. The one carve-out is a component declared Object, which is borrow-carrying by declared type even when it holds a box (#3281).",
+   "counterexample": "",
+   "lane": "M4",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C9",
+   "verdict": "conditional",
+   "rule": "\"An async method's `owned` parameters transfer into the state-machine frame at call time, exactly as an iterator's do\" | \"`return` under an `owned` return type, or under an unmarked **mint-announcing** return type — `Task`-family in a non-`async` body, iterable-family in a non-iterator body\" | \"**A fresh owned value** (a `return` of an owned expression): the task **owns the result** and its destructor disposes it directly\" | \"An **unmarked read of a class-typed binding never consumes**\"",
+   "cite": "§30.1, §28.3 K3.2/K3.13 (consume table), §30.5",
+   "status": "ambiguous",
+   "note": "Owned params/locals are frame-resident (§30.1) and fresh results fill Pattern A kind 1 / Pattern B; but `return x;` of a NAMED owned binding in an async body is in no consume-table row (K3.2 covers Task-family only in non-async bodies), so whether it consumes, borrows or is rejected is unstated.",
+   "counterexample": "class Conn\n  public method Ping(): int => 1;\nend Conn;\n\nclass Factory\n  public async method MakeAsync(): OwningTask<Conn>\n    var c := new Conn();\n    _ := c.Ping();\n    return c;   // async body: K3.2 lists `owned` returns and Task-family returns\n                // in NON-async bodies only; K3.13 says an unmarked read never consumes.\n  end MakeAsync;\nend Factory;\n// Reading 1: `return c;` is a marker-free consume into the task (Pattern B's\n//   'announcing return type may wrap owned T') -> c moved-from, task owns it.\n// Reading 2: it is a borrow (K3.13) -> rejected (or c is auto-dropped at the frame's\n//   scope end under a live result); `return move c;` is no K3.4 spelling either.\n// The same split holds for `Task<Conn>` (Pattern A kind 1 needs 'an owned expression').",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "K3.2 covers only \"`Task`-family in a non-`async` body\". §30.5 kind 1 needs \"a `return` of an owned expression\", and K3.13 says an unmarked read never consumes. No row makes `return c;` of a named owned local in an async OwningTask<C>/Task<C> body a consume. The intended reading is visible in the stdlib §6.7 WhenAll sketch (`return results; // ownership transfers to caller`), but that code is labelled illustrative (\"the code itself remains illustrative\"), so it decides nothing. Verdict-only: the alternative reading is a rejection, not a dangle."
+   },
+   "rc": [
+    "B8"
+   ]
+  },
+  {
+   "row": "R1",
+   "col": "C10",
+   "verdict": "admitted-bounded",
+   "rule": "\"A **named owned binding** as the yield operand is **consumed** here\" | \"in an iterator returning a **borrowing** enumeration interface the unmarked read is a **borrow** (nothing announces a kill)\" | \"An iterator method may take `owned` parameters. The state machine takes ownership at construction time.\"",
+   "cite": "§29.2 (Iterator yield ownership), §29.8, K3.7",
+   "status": "decided",
+   "note": "Owning iterator: yield consumes (frozen, K3.7); borrowing iterator: re-borrow of a frame-resident binding bounded by the enumerator; owned params move into the frame and are disposed at iterator disposal.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C12",
+   "verdict": "conditional",
+   "rule": "\"class-typed arguments are `owned` and are moved through the spawn into the entry's parameter.\" | \"the origin domain loses access **statically at the binding level** — the consumed binding is left moved-from\" | \"no non-`owned` class-typed fields other than `Type`-typed ones\" | \"a `Shared<T>`/`Locked<T>`/`RwLocked<T>` constructor whose result is then shared across domains\"",
+   "cite": "§30.14 (Sendable types, Spawning), §30.15, §30.12, §28.3 field-store clause 4",
+   "status": "decided",
+   "note": "Admitted only for sendable classes, moved (K3.3, frozen); a sendable class carries no borrow (rule 3). Pre-transfer indirect aliases (field/collection/frame-held) are the K4.3 domain-clause residual, explicitly unbackstopped.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R1",
+   "col": "C13",
+   "verdict": "admitted-bounded",
+   "rule": "\"A **fresh producer** argument is rejected\" | \"the source must satisfy the same declared-before/self/`this`-derived tests, and it is **frozen** until the bound's scope exits\" | \"`this` and the enclosing method's parameters count as declared before every local\"",
+   "cite": "§28.14 (Class- and interface-typed scoped parameters), §22.3",
+   "status": "decided",
+   "note": "An unmarked read of a named owned binding is a borrow argument (K3.13), tested declared-before and frozen to the bound's scope exit (dispose included); a fresh producer is rejected (§9.7 no-temporary-source).",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C9",
+   "verdict": "conditional",
+   "rule": "\"**Borrowed parameters, `this`, and captures are held until settlement\" | \"all held not for the duration of the synchronous call but until the task **settles**\" | \"Pattern A result slots are of three kinds\" | \"a **receiver-sourced** borrow from an instance method\"",
+   "cite": "§30.1, §30.5 (Producer-side return-type rules), §28.3 Borrow lifetime rules",
+   "status": "ambiguous",
+   "note": "Plain params, `this` and captures ride the frame to settlement under the K4.3 residual (decided). Open: a non-await borrow `return` into a `Task<C>` result — §28.3 admits receiver-sourced returns, while §30.5 enumerates three slot kinds (fresh owned, chained, borrowed-source chain) and none fits; the result's bound and teardown are unstated.",
+   "counterexample": "class Item\n  public method Use(): int => 1;\nend Item;\n\nclass Holder\n  private owned _item: Item := new Item();\n  public async method GetAsync(): Task<Item>\n    return _item;      // receiver-sourced borrow, NOT `return await`:\n  end GetAsync;        // none of §30.5's three result-slot kinds\nend Holder;\n\nclass Demo\n  public static async method Run(): Task\n    var h := new Holder();\n    using var t := h.GetAsync();\n    var r := await t;  // Pattern A: r's source is the task location `t`, not `h`\n    h.Dispose();       // nothing ties r to h\n    _ := r.Use();      // dangling unless rejected somewhere\n  end Run;             // and if kind 1 ('task owns the result') applies, t's teardown\nend Demo;              // disposes h's _item a second time\n// Reading 1: admitted by §28.3's receiver-sourced return bullet (slot kind unstated).\n// Reading 2: rejected — 'Pattern A result slots are of three kinds' is closed.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "§30.5: \"Pattern A result slots are of three kinds\". Kind 1 is \"A fresh owned value\", and kinds 2 and 3 are `return await` forms. A non-await receiver-sourced `return _item;` fits none of them. Row 2's callee side speaks only of the task frame (\"Every return path of a non-`async`, non-iterator body supplies a fresh or owned frame\"), not of the result value. Appendix C.6 also names no such slot. Soundness under the admitting reading: the awaiter's borrow is sourced at the task, and the teardown disposes h's field (K4.1 flag only)."
+   },
+   "rc": [
+    "B9"
+   ]
+  },
+  {
+   "row": "R2",
+   "col": "C10",
+   "verdict": "admitted-bounded",
+   "rule": "\"The returned state machine holds its factory's plain arguments' borrows\" | \"The lifetime constraint propagates: the iterator's enumerator may not outlive the source.\" | \"Frame-held borrows live in the frame, not in any local borrow binding, so K5 cannot see them\"",
+   "cite": "§29.4, §29.2, K6.1, K6.4",
+   "status": "decided",
+   "note": "Plain args are carried sources of the frame bounded by completion/disposal; borrowed yields re-borrow with enumerator-may-not-outlive-source. Moves of the source while the frame lives are invisible to K5 (K6.4); class referents keep the K4.1 flag backstop.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R2",
+   "col": "C12",
+   "verdict": "rejected",
+   "rule": "\"class-typed arguments are `owned` and are moved through the spawn into the entry's parameter.\" | \"public static method Spawn<A>(entry: (A) -> (), arg: A): owned Task\" | \"Non-nullable types only (value or reference)\"",
+   "cite": "§30.14 (Spawning) vs stdlib §6.8 (Domain), §14.2",
+   "status": "conflict",
+   "note": "§30.14 says class-typed spawn args are `owned` and moved; stdlib §6.8's plain-arg rows constrain `A: sendable, notnull`, and `notnull` admits classes, so a borrow of a sendable class crosses unmoved (same for Parallel's value-element rows). Channel `Send` and `Locked<T>` take `owned T` and reject borrows.",
+   "counterexample": "sealed class Counter\n  public N: int := 0;\nend Counter;\n\nclass Demo\n  public static method Bump(c: Counter)\n    c.N := c.N + 1;                        // runs in the spawned domain\n  end Bump;\n\n  public static async method Main(): Task\n    var c := new Counter();                // sealed, int field: sendable (§30.14)\n    using var t := Domain.Spawn<Counter>(Bump, c);\n        // stdlib §6.8 row `Spawn<A>(entry: (A) -> (), arg: A) where A: sendable, notnull`:\n        // `notnull` admits a class A, so a plain borrow crosses (no move, no freeze)\n    c.N := c.N + 1;                        // same object written from two domains: data race\n    await t;\n  end Main;\nend Demo;\n// §30.14: 'class-typed arguments are `owned` and are moved through the spawn'.\n// The same `notnull` hole: Parallel.Map/ForEach value-element rows (stdlib §6.12)\n// at `items: Array<Counter>` copy class references into worker domains.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Conflict stands. §30.14: \"class-typed arguments are `owned` and are moved through the spawn into the entry's parameter\" (a call-site rule). Stdlib §6.8: \"public static method Spawn<A>(entry: (A) -> (), arg: A): owned Task ... where A: sendable, notnull\", and \"The `where` clauses state the full requirement\". §14.2 notnull: \"Non-nullable types only (value or reference).\" A sealed sendable class satisfies the row. Entry `(Counter) -> ()` matches no `owned` row because modifier slots match exactly (§27.6), so overload resolution lands on the plain row. Parallel's value-element rows (`items: Array<A>`, `A: sendable, notnull`) contradict §30.14's \"class elements as owned transfers\". Soundness: a cross-domain race with no backstop. The same hole reaches R8/C12 (NEW-OPEN)."
+   },
+   "rc": [
+    "B5"
+   ]
+  },
+  {
+   "row": "R2",
+   "col": "C13",
+   "verdict": "admitted-bounded",
+   "rule": "\"the guarantee is fully static with **no residual trust**\" | \"a borrow of `obj.f`'s or `coll[i]`'s current value is invalidated by an overwrite or mutation of the slot under the runtime-checked posture\" | \"`this` and the enclosing method's parameters count as declared before every local\"",
+   "cite": "§28.14 (Class- and interface-typed scoped parameters) vs §28.3 (The consume-site freeze, Scope), K5.6",
+   "status": "conflict",
+   "note": "§28.14 claims a fully static bound with no residual for a stored scoped borrow; but an argument sourced at `this` or a parameter (a field read, a getter result) is admitted and its referent can be disposed by a field overwrite, which the freeze never covers (K5.6) — only the runtime flag catches it.",
+   "counterexample": "class Stream\n  public method Read(): int => 0;\nend Stream;\n\nclass Reader\n  private _s: Stream;\n  public constructor(scoped s: Stream)\n    _s := s;                                   // direct non-owned field of the bounding object\n  end constructor;\n  public method Next(): int => _s.Read();\nend Reader;\n\nclass Owner\n  private owned _s: Stream := new Stream();\n  public method Run()\n    using var r := new Reader(scoped _s);      // source `this`: 'declared before every local' -> admitted\n    _s := new Stream();                        // drop-on-overwrite disposes the old Stream;\n                                               // fields are not frozen (K5.6), `this` is not consumed\n    Console.WriteLine(r.Next());               // stored borrow dangles: only the checked-mode flag catches it\n  end Run;\nend Owner;\n// §28.14 promises 'fully static with no residual trust'; §28.3's freeze scope says a borrow of\n// a field's current value is invalidated by overwrite 'under the runtime-checked posture'.\n// Same with a local owner: `scoped owner.Child` then `owner.Reset()`.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Conflict stands. §28.14 tests and freezes only \"every captured **local** source\", with `this` and parameters counting \"as declared before every local\". So `scoped _s` (field path rooted at `this`) is admitted, and nothing freezes the field: \"a borrow of `obj.f`'s or `coll[i]`'s current value is invalidated by an overwrite or mutation of the slot under the runtime-checked posture\" (§28.3 Scope; K5.6). §28.14 nevertheless claims \"the guarantee is fully static with no residual trust\", and K5.7 says \"a runtime flag is not an admissible backstop\". The checked-mode flag is the only catch. Soundness (flag-only)."
+   },
+   "rc": [
+    "B7"
+   ]
+  },
+  {
+   "row": "R3",
+   "col": "C9",
+   "verdict": "conditional",
+   "rule": "\"may not declare a parameter whose type is a value type that **holds borrows**\" | \"It is admitted across the suspension **iff every borrow it carries has a frame-resident source**\" | \"a value-typed capture contributes nothing, living in its heap capture cell\" | \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\"",
+   "cite": "§30.1, §28.3 Deferred-activation callees, §9.7, §28.14",
+   "status": "ambiguous",
+   "note": "Params/results banned and locals across await need frame-resident sources (decided). Open: a closure capturing the record rides a task frame; the frame's capture-set contribution counts value-typed captures as nothing, while §9.7 rejects capture by a closure escaping the source's scope.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nrecord Pair(Item: Item);\nclass Runner\n  public async method RunAsync(f: () -> int): Task\n    await Task.Delay(10);\n    Console.WriteLine(f());\n  end RunAsync;\nend Runner;\nclass Demo\n  public method Start(r: Runner): Task\n    var it := new Item();\n    var p := new Pair(it);\n    return r.RunAsync(lambda() => p.Item.N());   // value-typed capture: contributes nothing to the frame\n  end Start;                                  // sources scope-bound: dead before the task runs\nend Demo;\n// Reading 1 (§9.7 closure bullet): the capture escapes its sources' scope -> rejected.\n// Reading 2 (§28.3 'a value-typed capture contributes nothing'; §28.14 'frame residence is\n// not an escape sink'): the returned frame carries no scope-bound source -> admitted.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "The direct routes are decided (§30.1 parameter/result ban; frame-resident-source rule for locals). Open: the closure-capture route into a frame. The frame's contribution says \"a value-typed capture contributes nothing, living in its heap capture cell\", and §28.14 says frame residence \"is not an escape sink\". Against that, §9.7: \"may not be captured by a closure that escapes its source's scope\", plus K2.3 (\"a frame\" is a holder the borrow may not reach unbounded). One passage, §9.7's \"escapes\", carries two readings: factual lifetime, or the term-of-art sinks. So ambiguous stands. Asymmetry evidence for the intended reading: the same value passed DIRECTLY as an argument \"contributes the sources of the borrows it carries\" (argument contributions item 3). Soundness: the frame-return check sees no source, and §30.1's settlement clause covers only sources \"reaching\" the call."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R3",
+   "col": "C10",
+   "verdict": "conditional",
+   "rule": "\"The returned state machine holds its factory's plain arguments' borrows\" | \"whose live range crosses a `yield return` is subject to the same frame-resident-source rule as\" | \"a value-typed capture contributes nothing, living in its heap capture cell\" | \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\" | \"frame residence is **not** an escape sink\"",
+   "cite": "§29.4, §29.2, §30.1, §28.3 Deferred-activation callees, §9.7",
+   "status": "ambiguous",
+   "note": "Sync-iterator params carry their record borrows in the frame (v0.317) and locals across yield need frame-resident sources (decided); the closure-capture route into an iterator frame is open as in R3xC9.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nrecord Pair(Item: Item);\nclass Gen\n  public static method Repeat(f: () -> int): IEnumerable<int>\n    for var i in 0..<3 do yield return f(); end for;\n  end Repeat;\nend Gen;\nclass Demo\n  public method Make(): IEnumerable<int>\n    var it := new Item();\n    var p := new Pair(it);\n    return Gen.Repeat(lambda() => p.Item.N());   // frame residence; capture contributes nothing\n  end Make;                                  // consumer enumerates after the sources died\nend Demo;\n// Reading 1 (§9.7 closure bullet): the capture escapes its sources' scope -> rejected.\n// Reading 2 (§28.3 'a value-typed capture contributes nothing'; §28.14 'frame residence is\n// not an escape sink'): the returned frame carries no scope-bound source -> admitted.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "The direct routes are decided (§30.1 parameter/result ban; frame-resident-source rule for locals). Open: the closure-capture route into a frame. The frame's contribution says \"a value-typed capture contributes nothing, living in its heap capture cell\", and §28.14 says frame residence \"is not an escape sink\". Against that, §9.7: \"may not be captured by a closure that escapes its source's scope\", plus K2.3 (\"a frame\" is a holder the borrow may not reach unbounded). One passage, §9.7's \"escapes\", carries two readings: factual lifetime, or the term-of-art sinks. So ambiguous stands. Asymmetry evidence for the intended reading: the same value passed DIRECTLY as an argument \"contributes the sources of the borrows it carries\" (argument contributions item 3). Soundness: the frame-return check sees no source, and §30.1's settlement clause covers only sources \"reaching\" the call. For a synchronous iterator the bound is completion or disposal (K6.1), on the same contribution."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R3",
+   "col": "C12",
+   "verdict": "rejected",
+   "rule": "\"**Value types** are sendable iff they are not borrow-bearing\"",
+   "cite": "§30.14 (Sendable types), §9.7",
+   "status": "decided",
+   "note": "A borrow-bearing record is never sendable, so it is no spawn arg/result, channel element, or (via a class field) `Locked<T>` interior.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R3",
+   "col": "C13",
+   "verdict": "conditional",
+   "rule": "\"A borrow-bearing value is rejected there, as at every parameter declared `Object` or an interface type other than `IReadOnlySpan<TElement>`, plain or `scoped`\" | \"**A capture contributing no borrow source is exempt, at both admission arms**\" | \"The captures that *are* tested are those contributing a source: class- and interface-typed ones, `owned` bindings, plain function-typed parameters\"",
+   "cite": "§28.14 (Class- and interface-typed scoped parameters; v1 admission bounds item 1), §9.7",
+   "status": "ambiguous",
+   "note": "As a scoped argument the record is rejected (borrow-erasing). Open: captured by a closure passed to a scoped function parameter — bound 1 exempts 'value-typed' captures while its headline exempts only captures 'contributing no borrow source'; a record carrying a class borrow contributes one.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nrecord Pair(Item: Item);\nclass Demo\n  public method Run()\n    var it := new Item();\n    var p := new Pair(it);\n    using var g := new ScopeGuard(lambda() => Console.WriteLine(p.Item.N()));\n    it.Dispose();       // frozen only if the value-typed capture is a 'tested' capture\n  end Run;              // g's action then reads a disposed Item\nend Demo;\n// Reading 1 (bound 1 headline): the capture contributes a borrow source -> tested, `it`\n//   frozen against Dispose (K5.7). Reading 2 (bound 1's closed tested list omits value types\n//   that hold borrows): exempt -> Dispose admitted; only the runtime flag remains, which\n//   K5.7 calls inadmissible for a storage admission.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Ambiguous stands. §28.14 bound 1's headline is \"A capture contributing no borrow source is exempt, at both admission arms\". Its enumeration says \"a captured value-typed local or parameter ... lives in its heap capture cell\", and the admission text says \"a capture that contributes no source — a value-typed local or parameter, or a `string` — is not a captured source\". Its closed tested list omits value types that hold borrows. Intent points the other way: DECLINED.md row 129 rejects a scoped-parameter admission \"its carried sources tested and frozen as a closure's captures are\", which presupposes that captured holds-borrows values are tested. The changelog ruling (\"the exclusion keys on the borrow source\") fits either reading. Soundness under the exempt reading: K5.7's static promise is broken (records: flag only; spans: nothing)."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R4",
+   "col": "C9",
+   "verdict": "conditional",
+   "rule": "\"may not declare a parameter whose type is a value type that **holds borrows**\" | \"It is admitted across the suspension **iff every borrow it carries has a frame-resident source**\" | \"a value-typed capture contributes nothing, living in its heap capture cell\" | \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\"",
+   "cite": "§30.1, §15.1.2, §28.3 Deferred-activation callees, §9.7",
+   "status": "ambiguous",
+   "note": "As R3xC9: inline-array params/results banned (v0.321) and locals need frame-resident sources; the closure-capture route into a task frame is open (value-typed capture contributes nothing vs §9.7/§15.1.2 capture rule).",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nclass Runner\n  public async method RunAsync(f: () -> int): Task\n    await Task.Delay(10);\n    Console.WriteLine(f());\n  end RunAsync;\nend Runner;\nclass Demo\n  public method Start(r: Runner): Task\n    var it := new Item();\n    var a: [2]Item := [it, it];\n    return r.RunAsync(lambda() => a[0].N());   // value-typed capture: contributes nothing to the frame\n  end Start;                                  // sources scope-bound: dead before the task runs\nend Demo;\n// Reading 1 (§9.7 closure bullet): the capture escapes its sources' scope -> rejected.\n// Reading 2 (§28.3 'a value-typed capture contributes nothing'; §28.14 'frame residence is\n// not an escape sink'): the returned frame carries no scope-bound source -> admitted.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "The direct routes are decided (§30.1 parameter/result ban; frame-resident-source rule for locals). Open: the closure-capture route into a frame. The frame's contribution says \"a value-typed capture contributes nothing, living in its heap capture cell\", and §28.14 says frame residence \"is not an escape sink\". Against that, §9.7: \"may not be captured by a closure that escapes its source's scope\", plus K2.3 (\"a frame\" is a holder the borrow may not reach unbounded). One passage, §9.7's \"escapes\", carries two readings: factual lifetime, or the term-of-art sinks. So ambiguous stands. Asymmetry evidence for the intended reading: the same value passed DIRECTLY as an argument \"contributes the sources of the borrows it carries\" (argument contributions item 3). Soundness: the frame-return check sees no source, and §30.1's settlement clause covers only sources \"reaching\" the call."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R4",
+   "col": "C10",
+   "verdict": "conditional",
+   "rule": "\"The returned state machine holds its factory's plain arguments' borrows\" | \"A **synchronous** iterator's `yield return` is subject to the same rule\" | \"a value-typed capture contributes nothing, living in its heap capture cell\" | \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\" | \"frame residence is **not** an escape sink\"",
+   "cite": "§29.4, §30.1, §15.1.2, §28.3 Deferred-activation callees, §9.7",
+   "status": "ambiguous",
+   "note": "As R3xC10 for a borrow-bearing inline array.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nclass Gen\n  public static method Repeat(f: () -> int): IEnumerable<int>\n    for var i in 0..<3 do yield return f(); end for;\n  end Repeat;\nend Gen;\nclass Demo\n  public method Make(): IEnumerable<int>\n    var it := new Item();\n    var a: [2]Item := [it, it];\n    return Gen.Repeat(lambda() => a[0].N());   // frame residence; capture contributes nothing\n  end Make;                                  // consumer enumerates after the sources died\nend Demo;\n// Reading 1 (§9.7 closure bullet): the capture escapes its sources' scope -> rejected.\n// Reading 2 (§28.3 'a value-typed capture contributes nothing'; §28.14 'frame residence is\n// not an escape sink'): the returned frame carries no scope-bound source -> admitted.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "The direct routes are decided (§30.1 parameter/result ban; frame-resident-source rule for locals). Open: the closure-capture route into a frame. The frame's contribution says \"a value-typed capture contributes nothing, living in its heap capture cell\", and §28.14 says frame residence \"is not an escape sink\". Against that, §9.7: \"may not be captured by a closure that escapes its source's scope\", plus K2.3 (\"a frame\" is a holder the borrow may not reach unbounded). One passage, §9.7's \"escapes\", carries two readings: factual lifetime, or the term-of-art sinks. So ambiguous stands. Asymmetry evidence for the intended reading: the same value passed DIRECTLY as an argument \"contributes the sources of the borrows it carries\" (argument contributions item 3). Soundness: the frame-return check sees no source, and §30.1's settlement clause covers only sources \"reaching\" the call. For a synchronous iterator the bound is completion or disposal (K6.1), on the same contribution."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R4",
+   "col": "C12",
+   "verdict": "rejected",
+   "rule": "\"**Value types** are sendable iff they are not borrow-bearing\" | \"An inline array without the `owned` marker is **borrow-bearing**\"",
+   "cite": "§30.14 (Sendable types), §15.1.2, §3.6",
+   "status": "decided",
+   "note": "A non-owning inline array of class/interface or borrow-holding elements is borrow-bearing, hence not sendable.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R4",
+   "col": "C13",
+   "verdict": "conditional",
+   "rule": "\"A borrow-bearing value is rejected there, as at every parameter declared `Object` or an interface type other than `IReadOnlySpan<TElement>`, plain or `scoped`\" | \"**A capture contributing no borrow source is exempt, at both admission arms**\" | \"The captures that *are* tested are those contributing a source: class- and interface-typed ones, `owned` bindings, plain function-typed parameters\"",
+   "cite": "§28.14 (v1 admission bounds item 1), §9.7, §15.1.2",
+   "status": "ambiguous",
+   "note": "As R3xC13 for a borrow-bearing inline array capture.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nclass Demo\n  public method Run()\n    var it := new Item();\n    var a: [2]Item := [it, it];\n    using var g := new ScopeGuard(lambda() => Console.WriteLine(a[0].N()));\n    it.Dispose();       // frozen only if the value-typed capture is a 'tested' capture\n  end Run;              // g's action then reads a disposed Item\nend Demo;\n// Reading 1 (bound 1 headline): the capture contributes a borrow source -> tested, `it`\n//   frozen against Dispose (K5.7). Reading 2 (bound 1's closed tested list omits value types\n//   that hold borrows): exempt -> Dispose admitted; only the runtime flag remains, which\n//   K5.7 calls inadmissible for a storage admission.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Ambiguous stands. §28.14 bound 1's headline is \"A capture contributing no borrow source is exempt, at both admission arms\". Its enumeration says \"a captured value-typed local or parameter ... lives in its heap capture cell\", and the admission text says \"a capture that contributes no source — a value-typed local or parameter, or a `string` — is not a captured source\". Its closed tested list omits value types that hold borrows. Intent points the other way: DECLINED.md row 129 rejects a scoped-parameter admission \"its carried sources tested and frozen as a closure's captures are\", which presupposes that captured holds-borrows values are tested. The changelog ruling (\"the exclusion keys on the borrow source\") fits either reading. Soundness under the exempt reading: K5.7's static promise is broken (records: flag only; spans: nothing)."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R5",
+   "col": "C9",
+   "verdict": "conditional",
+   "rule": "\"may not declare a parameter whose type is a value type that **holds borrows**\" | \"It is admitted across the suspension **iff every borrow it carries has a frame-resident source**\" | \"a value-typed capture contributes nothing, living in its heap capture cell\" | \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\"",
+   "cite": "§30.1, §35.4, §28.3 Deferred-activation callees, §9.7",
+   "status": "ambiguous",
+   "note": "As R3xC9 for a choice that holds borrows (any classification): params/results banned, locals frame-resident; the closure-capture route is open.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nchoice Ref\n  Some(item: Item),\n  Empty;\nend Ref;\nclass Runner\n  public async method RunAsync(f: () -> int): Task\n    await Task.Delay(10);\n    Console.WriteLine(f());\n  end RunAsync;\nend Runner;\nclass Demo\n  public method Start(r: Runner): Task\n    var it := new Item();\n    var c := Ref.Some(it);\n    return r.RunAsync(lambda() => (case c of Some(x) => x.N(), Empty => 0));   // value-typed capture: contributes nothing to the frame\n  end Start;                                  // sources scope-bound: dead before the task runs\nend Demo;\n// Reading 1 (§9.7 closure bullet): the capture escapes its sources' scope -> rejected.\n// Reading 2 (§28.3 'a value-typed capture contributes nothing'; §28.14 'frame residence is\n// not an escape sink'): the returned frame carries no scope-bound source -> admitted.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "The direct routes are decided (§30.1 parameter/result ban; frame-resident-source rule for locals). Open: the closure-capture route into a frame. The frame's contribution says \"a value-typed capture contributes nothing, living in its heap capture cell\", and §28.14 says frame residence \"is not an escape sink\". Against that, §9.7: \"may not be captured by a closure that escapes its source's scope\", plus K2.3 (\"a frame\" is a holder the borrow may not reach unbounded). One passage, §9.7's \"escapes\", carries two readings: factual lifetime, or the term-of-art sinks. So ambiguous stands. Asymmetry evidence for the intended reading: the same value passed DIRECTLY as an argument \"contributes the sources of the borrows it carries\" (argument contributions item 3). Soundness: the frame-return check sees no source, and §30.1's settlement clause covers only sources \"reaching\" the call."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R5",
+   "col": "C10",
+   "verdict": "conditional",
+   "rule": "\"The returned state machine holds its factory's plain arguments' borrows\" | \"A **synchronous** iterator's `yield return` is subject to the same rule\" | \"a value-typed capture contributes nothing, living in its heap capture cell\" | \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\" | \"frame residence is **not** an escape sink\"",
+   "cite": "§29.4, §30.1, §35.4, §28.3 Deferred-activation callees, §9.7",
+   "status": "ambiguous",
+   "note": "As R3xC10 for a choice that holds borrows.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nchoice Ref\n  Some(item: Item),\n  Empty;\nend Ref;\nclass Gen\n  public static method Repeat(f: () -> int): IEnumerable<int>\n    for var i in 0..<3 do yield return f(); end for;\n  end Repeat;\nend Gen;\nclass Demo\n  public method Make(): IEnumerable<int>\n    var it := new Item();\n    var c := Ref.Some(it);\n    return Gen.Repeat(lambda() => (case c of Some(x) => x.N(), Empty => 0));   // frame residence; capture contributes nothing\n  end Make;                                  // consumer enumerates after the sources died\nend Demo;\n// Reading 1 (§9.7 closure bullet): the capture escapes its sources' scope -> rejected.\n// Reading 2 (§28.3 'a value-typed capture contributes nothing'; §28.14 'frame residence is\n// not an escape sink'): the returned frame carries no scope-bound source -> admitted.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "The direct routes are decided (§30.1 parameter/result ban; frame-resident-source rule for locals). Open: the closure-capture route into a frame. The frame's contribution says \"a value-typed capture contributes nothing, living in its heap capture cell\", and §28.14 says frame residence \"is not an escape sink\". Against that, §9.7: \"may not be captured by a closure that escapes its source's scope\", plus K2.3 (\"a frame\" is a holder the borrow may not reach unbounded). One passage, §9.7's \"escapes\", carries two readings: factual lifetime, or the term-of-art sinks. So ambiguous stands. Asymmetry evidence for the intended reading: the same value passed DIRECTLY as an argument \"contributes the sources of the borrows it carries\" (argument contributions item 3). Soundness: the frame-return check sees no source, and §30.1's settlement clause covers only sources \"reaching\" the call. For a synchronous iterator the bound is completion or disposal (K6.1), on the same contribution."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R5",
+   "col": "C12",
+   "verdict": "rejected",
+   "rule": "\"Borrow-bearing choices are never sendable (they carry origin-domain borrows).\" | \"no non-`owned` class-typed fields other than `Type`-typed ones\"",
+   "cite": "§35.12, §30.14 rule 2",
+   "status": "decided",
+   "note": "Borrow-bearing choices are never sendable; an owning choice that holds borrows is excluded even as a field of a transfer-closed class.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R5",
+   "col": "C13",
+   "verdict": "conditional",
+   "rule": "\"A borrow-bearing value is rejected there, as at every parameter declared `Object` or an interface type other than `IReadOnlySpan<TElement>`, plain or `scoped`\" | \"**A capture contributing no borrow source is exempt, at both admission arms**\" | \"The captures that *are* tested are those contributing a source: class- and interface-typed ones, `owned` bindings, plain function-typed parameters\"",
+   "cite": "§28.14 (v1 admission bounds item 1), §9.7, §35.4",
+   "status": "ambiguous",
+   "note": "As R3xC13 for a choice that holds borrows.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nchoice Ref\n  Some(item: Item),\n  Empty;\nend Ref;\nclass Demo\n  public method Run()\n    var it := new Item();\n    var c := Ref.Some(it);\n    using var g := new ScopeGuard(lambda() => Console.WriteLine((case c of Some(x) => x.N(), Empty => 0)));\n    it.Dispose();       // frozen only if the value-typed capture is a 'tested' capture\n  end Run;              // g's action then reads a disposed Item\nend Demo;\n// Reading 1 (bound 1 headline): the capture contributes a borrow source -> tested, `it`\n//   frozen against Dispose (K5.7). Reading 2 (bound 1's closed tested list omits value types\n//   that hold borrows): exempt -> Dispose admitted; only the runtime flag remains, which\n//   K5.7 calls inadmissible for a storage admission.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Ambiguous stands. §28.14 bound 1's headline is \"A capture contributing no borrow source is exempt, at both admission arms\". Its enumeration says \"a captured value-typed local or parameter ... lives in its heap capture cell\", and the admission text says \"a capture that contributes no source — a value-typed local or parameter, or a `string` — is not a captured source\". Its closed tested list omits value types that hold borrows. Intent points the other way: DECLINED.md row 129 rejects a scoped-parameter admission \"its carried sources tested and frozen as a closure's captures are\", which presupposes that captured holds-borrows values are tested. The changelog ruling (\"the exclusion keys on the borrow source\") fits either reading. Soundness under the exempt reading: K5.7's static promise is broken (records: flag only; spans: nothing)."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R6",
+   "col": "C9",
+   "verdict": "conditional",
+   "rule": "\"may not declare a parameter whose type is a value type that **holds borrows**\" | \"a raw span window has no disposal-tracked object through which checked mode could catch the dangle\" | \"a value-typed capture contributes nothing, living in its heap capture cell\" | \"A borrow-bearing record may not be captured by a closure that escapes its source's scope.\" | \"frame residence is **not** an escape sink\"",
+   "cite": "§30.1, §9.7, §28.3 Deferred-activation callees, §28.14",
+   "status": "ambiguous",
+   "note": "Spans are banned as async params/results and as caller-sourced locals across await, on the ground that a span window has no flag backstop; a closure capturing a span still reaches a task frame, whose contribution counts the capture as nothing — rejected only on the §9.7 reading.",
+   "counterexample": "class Runner\n  public async method RunAsync(f: () -> int): Task\n    await Task.Delay(10);\n    Console.WriteLine(f());\n  end RunAsync;\nend Runner;\n\nclass Demo\n  public method Start(r: Runner): Task             // non-async: returns the minted frame\n    var xs: Array<int> := [1, 2, 3];\n    var s := xs.AsSpan();\n    return r.RunAsync(lambda() => s[0]);           // frame residence; capture-set contribution of the\n                                                   // span capture: 'a value-typed capture contributes nothing'\n  end Start;                                       // xs freed here; the pending task reads it through the span\nend Demo;\n// Reading 1 (§9.7): the closure escapes `xs`'s scope inside the returned task -> rejected.\n// Reading 2 (§28.3 contribution + §28.14 'frame residence is not an escape sink'): the\n// returned frame carries no source of `xs` -> the return check passes -> admitted.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "The direct routes are decided (§30.1 parameter/result ban; frame-resident-source rule for locals). Open: the closure-capture route into a frame. The frame's contribution says \"a value-typed capture contributes nothing, living in its heap capture cell\", and §28.14 says frame residence \"is not an escape sink\". Against that, §9.7: \"may not be captured by a closure that escapes its source's scope\", plus K2.3 (\"a frame\" is a holder the borrow may not reach unbounded). One passage, §9.7's \"escapes\", carries two readings: factual lifetime, or the term-of-art sinks. So ambiguous stands. Asymmetry evidence for the intended reading: the same value passed DIRECTLY as an argument \"contributes the sources of the borrows it carries\" (argument contributions item 3). Soundness: the frame-return check sees no source, and §30.1's settlement clause covers only sources \"reaching\" the call. Second route, same root cause: an `async lambda` that captures a local span and reads it after an `await`, invoked and abandoned (`using var t := f();` with no await). §27.5 makes the minted task inherit f's set (empty under the silent provenance clause 1). §30.1's across-suspension rule names \"A local\", and whether a captured enclosing local is one is itself unstated. No flag backs a span window (\"a raw span window has no disposal-tracked object through which checked mode could catch the dangle\", §30.1)."
+   },
+   "rc": [
+    "B4"
+   ]
+  },
+  {
+   "row": "R6",
+   "col": "C10",
+   "verdict": "admitted",
+   "rule": "\"The returned state machine holds its factory's plain arguments' borrows\" | \"Frame-held borrows live in the frame, not in any local borrow binding, so K5 cannot see them\" | \"a span's buffer window is the canonical case\" | \"a raw span window has no disposal-tracked object through which checked mode could catch the dangle\"",
+   "cite": "§29.4, K6.4, K4.3, §9.7, §30.1; changelog v0.317 (#5485)",
+   "status": "missing",
+   "note": "A sync iterator may take a span (v0.317 declined the ban), and the frame carries its source; but K5 cannot see frame-held borrows (K6.4), K6.4 records only the task settlement clause, and a span window has no flag check — moving and disposing the source under a live frame has neither a static check nor a recorded clause or backstop.",
+   "counterexample": "class Sink\n  public method Take(owned xs: Array<int>)\n    xs.Dispose();\n  end Take;\nend Sink;\n\nclass Demo\n  public static method Each(s: ArraySpan<int>): IEnumerable<int>\n    for var i in 0..<s.Length do\n      yield return s[i];                  // span parameter read after a suspension\n    end for;\n  end Each;\n\n  public method Run(sink: Sink)\n    var xs: Array<int> := [1, 2, 3];\n    var it := Each(xs.AsSpan());          // frame carries the span's source xs (§29.4, v0.317)\n    sink.Take(move xs);                   // K6.4: K5 cannot see frame-held borrows -> not frozen\n    for var x in it do                    // the span window reads the freed array:\n      Console.WriteLine(x);               // no per-access flag check (§9.7), no recorded clause\n    end for;\n  end Run;\nend Demo;\n// K6.4 names only the task settlement clause (§30.1) as frames' outlives-obligation; no\n// clause or backstop is recorded for an iterator frame's span borrows (cf. §30.1's own reason\n// for banning spans from async frames: 'a raw span window has no disposal-tracked object').",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Missing stands. K6.4: \"Frame-held borrows live in the frame, not in any local borrow binding, so K5 cannot see them; their outlives-obligation is the K4.3-recorded settlement clause\". That clause is §30.1's, for tasks only. K5.5's liveness list (using-var pins, live closures, locals of holds-borrows value types) has no frame locals. A span window has no flag. So moving or disposing a span's source under a live iterator frame has no static check, no recorded clause and no backstop. Aggravating: K5(ii) lists only two failing shapes (\"(ii) fails in exactly two recorded shapes, and in no other\"), yet span reads are not flag-checked (§9.7: \"a span's buffer window is the canonical case\"). See X2.md side finding S1."
+   },
+   "rc": [
+    "B6"
+   ]
+  },
+  {
+   "row": "R6",
+   "col": "C12",
+   "verdict": "rejected",
+   "rule": "\"**Value types** are sendable iff they are not borrow-bearing\" | \"**Interface types** are never sendable\" | \"A `CancellationToken` never crosses a domain boundary itself: it is a borrow-bearing record and not sendable.\"",
+   "cite": "§30.14 (Sendable types), §9.7, stdlib §6.8",
+   "status": "decided",
+   "note": "Buffer/array spans are borrow-bearing records (not sendable) and `IReadOnlySpan<TElement>` is an interface (never sendable); `ReadOnlyStringSpan` is not borrow-bearing and crosses as a copy of string-backed state.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R6",
+   "col": "C13",
+   "verdict": "conditional",
+   "rule": "\"A borrow-bearing value is rejected there, as at every parameter declared `Object` or an interface type other than `IReadOnlySpan<TElement>`, plain or `scoped`\" | \"**A capture contributing no borrow source is exempt, at both admission arms**\" | \"The captures that *are* tested are those contributing a source: class- and interface-typed ones, `owned` bindings, plain function-typed parameters\" | \"a span's buffer window is the canonical case\"",
+   "cite": "§28.14 (v1 admission bounds item 1), §9.7",
+   "status": "ambiguous",
+   "note": "A span argument at a scoped class/interface parameter is rejected (null-source only). A span captured by a storage-bounded callback is either tested and frozen or exempt; on the exempt reading its source can be disposed under the stored callback with no flag backstop.",
+   "counterexample": "class Demo\n  public method Run()\n    var xs: Array<int> := [1, 2, 3];\n    var s := xs.AsSpan();\n    using var g := new ScopeGuard(lambda() => Console.WriteLine(s[0]));\n        // bounding local g (form 1). Is the span capture tested and frozen?\n    xs.Dispose();                // site-announced kill; frozen only if `s` counts as a tested capture\n  end Run;                       // g's disposal runs the action through the span over a freed array\nend Demo;\n// Reading 1 (bound 1's headline): `s` contributes a borrow source (xs), so it is tested,\n//   xs is frozen (K5.7) and `xs.Dispose()` is rejected.\n// Reading 2 (bound 1's closed list of tested captures, which omits value types that hold\n//   borrows; 'a captured value-typed local ... lives in its heap capture cell'): exempt,\n//   nothing frozen, Dispose admitted, and the span read has no flag backstop.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Ambiguous stands. §28.14 bound 1's headline is \"A capture contributing no borrow source is exempt, at both admission arms\". Its enumeration says \"a captured value-typed local or parameter ... lives in its heap capture cell\", and the admission text says \"a capture that contributes no source — a value-typed local or parameter, or a `string` — is not a captured source\". Its closed tested list omits value types that hold borrows. Intent points the other way: DECLINED.md row 129 rejects a scoped-parameter admission \"its carried sources tested and frozen as a closure's captures are\", which presupposes that captured holds-borrows values are tested. The changelog ruling (\"the exclusion keys on the borrow source\") fits either reading. Soundness under the exempt reading: K5.7's static promise is broken (records: flag only; spans: nothing)."
+   },
+   "rc": [
+    "B4",
+    "B6"
+   ]
+  },
+  {
+   "row": "R7",
+   "col": "C9",
+   "verdict": "admitted-bounded",
+   "rule": "\"as is the capture-set contribution of a call's plain function-typed arguments\" | \"all held not for the duration of the synchronous call but until the task **settles**\" | \"may not be returned from the enclosing method (by `return`, or by `yield return` in an iterator, whose element type announces no source set either)\"",
+   "cite": "§30.1, §28.14 (Call-bounded × deferred activation), §28.3 closure bullet (sink rule)",
+   "status": "decided",
+   "note": "A capture-bearing argument rides the task frame (frame residence) with its capture sources held to settlement under the K4.3 residual; an async lambda's captures likewise; returning one as a `Task<() -> T>` result is the sink rule's rejected return.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C10",
+   "verdict": "admitted-bounded",
+   "rule": "\"an iterator or async-iterator callee — the returned enumerable or enumerator frame\" | \"The bound is the **frame's life**\" | \"may not be returned from the enclosing method (by `return`, or by `yield return` in an iterator, whose element type announces no source set either)\"",
+   "cite": "§28.14 (Call-bounded × deferred activation), §29.4, §28.3 closure bullet",
+   "status": "decided",
+   "note": "Plain function-typed iterator params reside in the frame, bounded by completion/disposal; yielding a capture-bearing value is rejected by the sink rule.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C12",
+   "verdict": "rejected",
+   "rule": "\"**Function-typed values are never sendable**\" | \"**The entry must be capture-free**\"",
+   "cite": "§30.14 (Sendable types, Spawning), §30.14 rule 3",
+   "status": "decided",
+   "note": "Function values are never sendable and spawn/Parallel entries must be capture-free; function-typed fields bar a class from sendability (so from `Locked<T>` interiors).",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R7",
+   "col": "C13",
+   "verdict": "admitted-bounded",
+   "rule": "\"a `scoped` parameter is **storage-bounded** — **a stored callback whose lifetime is bounded by the object that stores it**\" | \"the storage admission's promise is a fully static bound, so a runtime flag is not an admissible backstop for it\" | \"a borrow of `obj.f`'s or `coll[i]`'s current value is invalidated by an overwrite or mutation of the slot under the runtime-checked posture\"",
+   "cite": "§28.14, K5.7 vs §28.3 (The consume-site freeze, Scope), K5.6",
+   "status": "conflict",
+   "note": "Storage-bounded admission promises a fully static bound (K5.7 rejects the flag as backstop), yet a captured borrow whose source is a parameter or `this` can lose its referent through a field overwrite reached by a borrowing call — unfrozen by K5.6, caught only by the flag.",
+   "counterexample": "class Child\n  public method Ping(): int => 1;\nend Child;\n\nclass Owner\n  private owned _child: Child := new Child();\n  public property Child: Child => _child;\n  public method Reset()\n    _child := new Child();               // drop-on-overwrite disposes the old Child\n  end Reset;\nend Owner;\n\nclass Demo\n  public method Run(owner: Owner)\n    var c := owner.Child;                // source: parameter `owner`\n    using var g := new ScopeGuard(lambda() => Console.WriteLine(c.Ping()));\n        // form 1 -> bounding local g; captured source c declared before g: admitted, c frozen\n    owner.Reset();                       // a borrowing call: no freeze (K5.7) sees it\n  end Run;                               // g's disposal runs the action on a disposed Child\nend Demo;\n// K5.7: 'a runtime flag is not an admissible backstop' — yet the flag is the only thing\n// that catches this (K5.6 / §28.3 freeze scope: field overwrites are runtime-checked).",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "CONFIRMED",
+    "evidence": "Same root as R2/C13 (RC4). A capture sourced at a parameter or `this` through a getter or field read is admitted and frozen only as a local binding. The referent's field slot can be overwritten by a borrowing call (`owner.Reset()`), which no freeze sees (K5.6). The storage admission's \"fully static bound\" is then backstopped only by the flag that K5.7 calls inadmissible."
+   },
+   "rc": [
+    "B7"
+   ]
+  },
+  {
+   "row": "R8",
+   "col": "C9",
+   "verdict": "conditional",
+   "rule": "\"for a generic async method the check is re-applied after substitution\" | \"A requirement carried by a body's use of a type parameter — an interior use whose admissibility is read at the substitution, such as\" | \"It is admitted across the suspension **iff every borrow it carries has a frame-resident source**\"",
+   "cite": "§30.1, §3.6 rule 2, §9.7 (generic paragraph)",
+   "status": "decided",
+   "note": "Holds-borrows substitutions of async params/results are re-checked per instantiation (decided); whether §30.1's across-suspension local rule is likewise re-read at a substitution is not stated (§3.6 rule 2's list is illustrative).",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nrecord Pair(Item: Item);\n\nclass Demo\n  public static async method First<T>(xs: Array<T>): Task\n    var p := xs[0];          // at T = Pair: a borrow-bearing record sourced at plain parameter xs\n    await Task.Delay(10);    // the non-generic twin is rejected here (caller-side source, §30.1)\n    Console.WriteLine(p.ToString());\n  end First;\nend Demo;\n// Call: First<Pair>(pairs). Reading 1: §3.6 rule 2's illustrative 'such as' list reaches\n// §30.1's across-suspension rule -> First<Pair> rejected at the instantiation.\n// Reading 2: §30.1 states re-application after substitution only for parameter/result\n// types, and §9.7's generic paragraph covers only its own bullets -> admitted.\n// (Also: `return x;` of a bare-T plain parameter in an async `Task<T>` body is R2xC9's open\n// result-slot question.)",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "§3.6 rule 2's general sentence, not its 'such as' list, decides: \"For a generic type or member, the property is evaluated at each instantiation\" and \"an instantiation that violates a property-dependent requirement is rejected at the instantiation site\". §30.1's across-suspension rule keys on the holds-borrows derived property, so First<Pair> is rejected at the instantiation, as the non-generic twin is. §30.1's explicit parameter/result re-application is an instance, not a limit. (Appendix C.6 states the local rule unqualified.)"
+   },
+   "rc": []
+  },
+  {
+   "row": "R8",
+   "col": "C10",
+   "verdict": "conditional",
+   "rule": "\"The returned state machine holds its factory's plain arguments' borrows\" | \"A requirement carried by a body's use of a type parameter — an interior use whose admissibility is read at the substitution, such as\" | \"whose live range crosses a `yield return` is subject to the same frame-resident-source rule as\"",
+   "cite": "§29.4, §30.1, §3.6 rule 2, §28.3 argument contributions item 4",
+   "status": "decided",
+   "note": "Generic iterator params contribute under the weakest assumption (decided); the yield-crossing local rule at a holds-borrows substitution has the same open re-check question as R8xC9.",
+   "counterexample": "class Item\n  public method N(): int => 1;\nend Item;\nrecord Pair(Item: Item);\n\nclass Demo\n  public static method Firsts<T>(xs: Array<T>): IEnumerable<int>\n    var p := xs[0];          // at T = Pair: borrows sourced at plain parameter xs\n    yield return 1;          // §29.4 / §30.1: a borrow-bearing local across a yield needs\n    yield return 2;          //   frame-resident sources -- the non-generic twin is rejected\n    Console.WriteLine(p.ToString());\n  end Firsts;\nend Demo;\n// Same two readings as R8xC9: whether §3.6 rule 2's 'such as' list carries the\n// across-suspension rule to Firsts<Pair>, or only §30.1's parameter/result re-check does.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "DECIDED-BY",
+    "evidence": "As R8/C9: §3.6 rule 2 (\"an instantiation that violates a property-dependent requirement is rejected at the instantiation site\"). §29.4 applies \"the same frame-resident-source rule as §30.1's across-suspension rule\" to a sync iterator's yield, so Firsts<Pair> is rejected at the instantiation."
+   },
+   "rc": []
+  },
+  {
+   "row": "R8",
+   "col": "C12",
+   "verdict": "conditional",
+   "rule": "\"class-typed arguments are `owned` and are moved through the spawn into the entry's parameter\" | \"public static method Spawn<A>(entry: (A) -> (), arg: A): owned Task ... where A: sendable, notnull;\" | \"The `where` clauses state the full requirement\"",
+   "cite": "§30.14 (Spawning), stdlib §6.8, §14.2, §3.6 rule 2, v0.330",
+   "status": "conflict",
+   "note": "M5 treats this cell as decided: a bare T reaches a spawn only through its own `sendable` constraint. But `where T: sendable, notnull` satisfies the plain-arg row at the forming site, and a class substitution then sends a borrow. Same root as R2/C12 (RC2).",
+   "counterexample": "sealed class Counter  public N: int := 0;  end Counter;\nclass Fan<T> where T: sendable, notnull\n  public static method Use(x: T) end Use;\n  public method Go(x: T): owned Task => Domain.Spawn<T>(Use, x); // plain row; T: sendable, notnull\nend Fan;\n// At Fan<Counter>: `x` is a borrowed Counter, sent unmoved; the caller keeps writing c.N.\n// §30.14 says class-typed arguments are moved; stdlib §6.8 says the where clauses are the full requirement.",
+   "lane": "M5",
+   "xcheck": {
+    "by": "X2",
+    "verdict": "NEW-OPEN",
+    "evidence": "M5 treats this cell as decided: a bare T reaches a spawn only through its own `sendable` constraint. But `where T: sendable, notnull` satisfies the plain-arg row at the forming site, and a class substitution then sends a borrow. Same root as R2/C12 (RC2)."
+   },
+   "rc": [
+    "B5"
+   ]
+  },
+  {
+   "row": "R8",
+   "col": "C13",
+   "verdict": "conditional",
+   "rule": "\"On a **class- or interface-typed** parameter (except one whose declared type, nullability stripped, is `Object`\" | \"`scoped` on a bare-type-parameter parameter (`scoped x: T`) as the remedy for set erasure | `rejected`\" | \"At an argument whose type is a type parameter the condition is read at each instantiation\"",
+   "cite": "§22.3, §28.14, DECLINED.md (scoped x: T)",
+   "status": "decided",
+   "note": "`scoped x: T` is not declarable (class/interface or function types only; recorded decline); a `T` value reaching a concrete scoped parameter is judged at each instantiation.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C9",
+   "verdict": "admitted",
+   "rule": "\"no ownership obligation crosses the await boundary\"",
+   "cite": "§30.5 (Producer-side return-type rules), §30.1",
+   "status": "decided",
+   "note": "string/Type/boxed values carry no borrow: unrestricted as async params, locals across await, and `Task<T>` results.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C10",
+   "verdict": "admitted",
+   "rule": "\"**Value-typed, `string`-typed, or runtime-managed expression.** No ownership transfers.\"",
+   "cite": "§29.2 (Iterator yield ownership)",
+   "status": "decided",
+   "note": "Yielded by copy/shared reference with nothing to dispose; no lifetime constraint.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C12",
+   "verdict": "admitted",
+   "rule": "\"**`string`** and **`Type`** are sendable\"",
+   "cite": "§30.14 (Sendable types)",
+   "status": "decided",
+   "note": "string and Type are sendable and cross as shared immutable references; a boxed value is sendable iff its value type is.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  },
+  {
+   "row": "R9",
+   "col": "C13",
+   "verdict": "admitted",
+   "rule": "\"a `string` contributes nothing\" | \"any other admitted value's box carries no borrow, so the argument has no borrow source\"",
+   "cite": "§28.14 (v1 admission bounds item 1; scoped construction)",
+   "status": "decided",
+   "note": "A string capture contributes no source and is exempt; a boxed non-borrow-bearing value at an interface-typed scoped parameter carries no borrow and freezes nothing.",
+   "counterexample": "",
+   "lane": "M5",
+   "xcheck": null,
+   "rc": []
+  }
+ ],
+ "root_causes": [
+  {
+   "rid": "B1",
+   "id": "X1-A",
+   "statement": "A standard-library generic member that retains a value of its type parameter past the call (TaskCompletionSource<T>.SetResult/TrySetResult, Task.FromResult<T>) is exempt from §9.7's per-instantiation requirements by §3.6 rule 2, and no instantiation-site rule bars a T that holds borrows, so a record, inline array, choice or span carrying borrows is retained in a task with no bound.",
+   "severity": "soundness",
+   "fix": "Add a §30.5 row (and the matching stdlib §6.6/§6.7 restriction): `Task<T>`, `TaskCompletionSource<T>` and `Task.FromResult<T>` at a T that holds borrows are admitted by no row, a compile error at the instantiation site as the move-only row is, `CancellationToken` excepted under A10.",
+   "class": "ruling",
+   "cells": [
+    "R3/C8",
+    "R4/C8",
+    "R5/C8",
+    "R6/C8"
+   ]
+  },
+  {
+   "rid": "B2",
+   "id": "X1-B",
+   "statement": "Set-erasing positions are reached only 'by implicit conversion', so an explicit `f as Object` yields an Object-typed value that no function-value rule reads (holders key on static type), letting a capture-bearing closure into fields, collections, Object parameters and ref locations; the borrow-erasing twin in §9.7 already lists `as`.",
+   "severity": "soundness",
+   "fix": "Add 'or by an `as` (§17.4) at `Object`' to the set-erasing reach list (and to App. C.1's set-erasing row), so the conversion is the compile error at the `as`, mirroring §9.7's borrow-erasing bullet.",
+   "class": "clarification",
+   "cells": [
+    "R7/C11",
+    "R7/C1",
+    "R7/C3",
+    "R7/C4",
+    "R7/C5"
+   ]
+  },
+  {
+   "rid": "B3",
+   "id": "X1-C",
+   "statement": "A class-typed borrow stored into an admitted mutable static (form (i)/(ii)) is admitted under the field-store residual, but the domain clause bounds only transferring or consuming the source, not publishing the borrow itself to every domain, and K4.3's recorded set has no static-held clause; the owner domain's disposal can race another domain's use, where the flag backstop is not reliable.",
+   "severity": "soundness",
+   "fix": "Rule that a store of a class- or interface-typed borrow into a mutable static admits only a static-storage source (and fresh producers, which the store discharges), rejecting plain-parameter and receiver sources at the site, consistent with App. C.1's reference-free rule for the always-live holder.",
+   "class": "ruling",
+   "cells": [
+    "R2/C2"
+   ]
+  },
+  {
+   "rid": "B4",
+   "id": "RC1",
+   "statement": "A captured local or parameter of a value type that holds borrows (or declared IReadOnlySpan<TElement>) contributes no source: provenance clause 1 omits it, and two passages say it 'contributes nothing'. So any route that reads a closure's set (invocation, frame, scoped admission) loses the record-carried borrow.",
+   "severity": "soundness",
+   "fix": "Add 'a captured local or parameter of a value type that holds borrows (or declared IReadOnlySpan<TElement>): the sources of the borrows it carries' to provenance clause 1, and narrow the Deferred-activation 'value-typed capture contributes nothing' and §28.14 bound 1's exemption to value types that hold no borrows.",
+   "class": "ruling",
+   "cells": [
+    "R3/C6",
+    "R4/C6",
+    "R5/C6",
+    "R6/C6",
+    "R3/C9",
+    "R4/C9",
+    "R5/C9",
+    "R6/C9",
+    "R3/C10",
+    "R4/C10",
+    "R5/C10",
+    "R3/C13",
+    "R4/C13",
+    "R5/C13",
+    "R6/C13"
+   ]
+  },
+  {
+   "rid": "B5",
+   "id": "RC2",
+   "statement": "The plain-argument and value-element rows of Domain.Spawn and Parallel constrain `A`/`R` by `sendable, notnull`, which admits sendable classes, while §30.14 requires class-typed crossings to be owned moves.",
+   "severity": "soundness",
+   "fix": "State in stdlib §6.8/§6.12 (and §30.14's call-site list) that an instantiation of a plain `arg: A`, `items: Array<A>` or plain `R` row at a class type is rejected at the call site, re-read per instantiation under §3.6 rule 2, and drop 'the where clauses state the full requirement'.",
+   "class": "clarification",
+   "cells": [
+    "R2/C12",
+    "R8/C12"
+   ]
+  },
+  {
+   "rid": "B6",
+   "id": "RC3",
+   "statement": "Span-carried borrows have no per-access flag, yet the kernel treats them as flag-backstopped where K5 cannot see them: iterator frames (K6.4 records only the task settlement clause) and, per S1, site-announced kills (K5(ii) admits only two failing shapes).",
+   "severity": "soundness",
+   "fix": "Make a local holding an iterator frame a live local borrow of its carried sources for K5.5 (so moving them is frozen), and add 'a span-carried surviving borrow' as K5(ii)'s third failing shape so a site-announced Dispose of a span's source is frozen while the span or frame is live.",
+   "class": "design change",
+   "cells": [
+    "R6/C10",
+    "R6/C13"
+   ]
+  },
+  {
+   "rid": "B7",
+   "id": "RC4",
+   "statement": "§28.14's class/interface `scoped` admission claims 'fully static, no residual trust', but it admits sources reached through `this`, parameters, fields and getters, whose referents a field overwrite can kill under K5.6's runtime-checked posture.",
+   "severity": "soundness",
+   "fix": "Record the field-slot overwrite as a K4.3 residual of the storage-bounded admission (flag-backstopped) and strike 'no residual trust' and K5.7's 'not an admissible backstop' for non-local sources. Alternatively, admit only local, frozen sources at `scoped`.",
+   "class": "ruling",
+   "cells": [
+    "R2/C13",
+    "R7/C13"
+   ]
+  },
+  {
+   "rid": "B8",
+   "id": "RC5",
+   "statement": "In an async body, `return x;` of a named owned binding under OwningTask<C>/Task<C> is in no consume-table row (K3.2 names Task-family returns only in non-async bodies).",
+   "severity": "verdict-only",
+   "fix": "Extend K3.2 with 'or, in an async body, under an OwningTask<T> or class-T Task<T> return type, of the result expression' as a marker-free consume.",
+   "class": "clarification",
+   "cells": [
+    "R1/C9"
+   ]
+  },
+  {
+   "rid": "B9",
+   "id": "RC6",
+   "statement": "§30.5's closed list of three Pattern A result-slot kinds has no slot for a non-await borrow `return` (receiver-sourced) in an async Task<C> body, so its bound and teardown are unstated.",
+   "severity": "soundness",
+   "fix": "State that a non-await borrow return in an async Task<C> body is rejected (remedy: return a fresh owned value, or `return await` a borrowed task as kind 3).",
+   "class": "ruling",
+   "cells": [
+    "R2/C9"
+   ]
+  },
+  {
+   "rid": "B10",
+   "id": "RC7",
+   "statement": "It is unstated whether §9.7's 'read IReadOnlySpan<TElement> as the span' redirect reaches the announcement table's declared-type keying (row 4 static rejection vs row 7 plus §9.7's 'admissible at every member kind').",
+   "severity": "verdict-only",
+   "fix": "Add one sentence to §28.3 Factory methods saying whether an `IReadOnlySpan<TElement>` static return is row 4 (rejected at the declaration) or row 7.",
+   "class": "clarification",
+   "cells": [
+    "R6/C6"
+   ]
+  }
+ ]
+}

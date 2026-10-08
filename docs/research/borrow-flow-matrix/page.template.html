@@ -1,0 +1,208 @@
+<title>Borrow-Flow Matrix</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: audit sheet — summary strip, then the kind×position grid with a docked detail pane, then root causes. */
+:root{
+  --bg:#f6f7f4; --surface:#ffffff; --ink:#1d2321; --muted:#5d6763; --rule:#d9ddd8; --accent:#2f5d50;
+  --ok:#3d7a5a; --ok-bg:#e3efe7; --amb:#9a6a12; --amb-bg:#f8ecd2; --miss:#b2402e; --miss-bg:#f7dfd9; --conf:#7a3d8c; --conf-bg:#efe1f3;
+  --na:#7c8581; --na-bg:#eceeeb; --hi:#1f6f8b;
+  --f-display:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#141917; --surface:#1b211f; --ink:#e6ebe8; --muted:#9aa5a0; --rule:#2e3633; --accent:#8cc7b4;
+  --ok:#7cc59b; --ok-bg:#1f3329; --amb:#e0b45a; --amb-bg:#3a2f17; --miss:#f08c78; --miss-bg:#3e221d; --conf:#cf9be0; --conf-bg:#33233a;
+  --na:#8e9893; --na-bg:#232a27; --hi:#7cc4dd; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#141917; --surface:#1b211f; --ink:#e6ebe8; --muted:#9aa5a0; --rule:#2e3633; --accent:#8cc7b4;
+  --ok:#7cc59b; --ok-bg:#1f3329; --amb:#e0b45a; --amb-bg:#3a2f17; --miss:#f08c78; --miss-bg:#3e221d; --conf:#cf9be0; --conf-bg:#33233a;
+  --na:#8e9893; --na-bg:#232a27; --hi:#7cc4dd; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 var(--f-body);margin:0}
+.wrap{max-width:1280px;margin:0 auto;padding-inline:20px;padding-block:28px 56px;display:grid;gap:28px}
+h1,h2,h3{font-family:var(--f-display);font-weight:600;text-wrap:balance;margin:0;letter-spacing:.005em}
+h1{font-size:2rem;line-height:1.15}
+h2{font-size:1.3rem}
+.lede{max-width:68ch;color:var(--muted);margin:.4rem 0 0}
+.meta{font:12px/1.4 var(--f-mono);color:var(--muted);letter-spacing:.02em;margin-top:.6rem}
+.summary{display:flex;flex-wrap:wrap;gap:8px}
+.chip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--rule);background:var(--surface);color:var(--ink);border-radius:999px;padding:5px 12px;font:500 13px/1 var(--f-body);cursor:pointer}
+.chip[aria-pressed="true"]{border-color:var(--ink)}
+.chip .n{font:500 13px/1 var(--f-mono);font-variant-numeric:tabular-nums}
+.dot{width:10px;height:10px;border-radius:3px;display:inline-block;flex:none}
+.s-decided{--c:var(--ok);--cb:var(--ok-bg)} .s-ambiguous{--c:var(--amb);--cb:var(--amb-bg)}
+.s-missing{--c:var(--miss);--cb:var(--miss-bg)} .s-conflict{--c:var(--conf);--cb:var(--conf-bg)} .s-na{--c:var(--na);--cb:var(--na-bg)}
+.dot{background:var(--c)}
+.main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,400px);gap:20px;align-items:start}
+@media (max-width:1000px){.main{grid-template-columns:minmax(0,1fr)}}
+.gridbox{overflow-x:auto;border:1px solid var(--rule);background:var(--surface);border-radius:6px}
+table.m{border-collapse:separate;border-spacing:0;font-size:12px;min-width:860px;width:100%}
+table.m th{font:600 11px/1.25 var(--f-body);color:var(--muted);text-align:left;padding:8px 6px;border-bottom:1px solid var(--rule);vertical-align:bottom;letter-spacing:.02em}
+table.m thead th{position:sticky;top:0;background:var(--surface)}
+table.m th.rowh{font:500 12px/1.3 var(--f-body);color:var(--ink);width:170px;min-width:150px;border-right:1px solid var(--rule);vertical-align:middle;position:sticky;left:0;background:var(--surface);z-index:1}
+table.m th.rowh small{display:block;color:var(--muted);font:400 11px var(--f-mono)}
+table.m td{padding:3px;border-bottom:1px solid var(--rule)}
+.cell{all:unset;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center;gap:2px;width:100%;min-height:46px;border-radius:4px;padding:4px 6px;background:var(--cb);color:var(--ink);cursor:pointer;border:2px solid transparent}
+.cell .st{font:600 10px/1 var(--f-body);text-transform:uppercase;letter-spacing:.06em;color:var(--c)}
+.cell .vd{font:400 11px/1.2 var(--f-mono);color:var(--muted)}
+.cell:focus-visible{outline:2px solid var(--hi);outline-offset:1px}
+.cell[aria-current="true"]{border-color:var(--ink)}
+.cell.dim{opacity:.28}
+.cell.mark{border-color:var(--hi)}
+.colh abbr{text-decoration:none;cursor:help}
+.detail{position:sticky;top:calc(env(safe-area-inset-top,0px) + 12px);background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:16px 18px;display:grid;gap:12px;max-height:calc(100vh - 24px);overflow:auto;min-width:0}
+@media (max-width:1000px){.detail{position:static;max-height:none}}
+.detail .tag{display:inline-flex;align-items:center;gap:6px;font:600 11px/1 var(--f-body);text-transform:uppercase;letter-spacing:.06em;color:var(--c);background:var(--cb);border-radius:4px;padding:4px 7px}
+.detail h3{font-size:1.1rem}
+.kv{display:grid;gap:3px}
+.kv .k{font:600 11px/1.2 var(--f-body);text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.kv .v{margin:0;overflow-wrap:anywhere}
+blockquote{margin:0;padding:8px 12px;border-left:3px solid var(--rule);color:var(--ink);font-size:13.5px;overflow-wrap:anywhere}
+pre{margin:0;background:var(--bg);border:1px solid var(--rule);border-radius:4px;padding:10px 12px;font:12.5px/1.45 var(--f-mono);overflow-x:auto;white-space:pre}
+code{font-family:var(--f-mono);font-size:.92em}
+.rcref{all:unset;cursor:pointer;font:500 12px/1 var(--f-mono);color:var(--hi);text-decoration:underline;text-underline-offset:2px}
+.rcref:focus-visible{outline:2px solid var(--hi)}
+.rcs{display:grid;gap:10px}
+.rc{border:1px solid var(--rule);background:var(--surface);border-radius:6px;padding:14px 16px;display:grid;gap:8px;grid-template-columns:auto minmax(0,1fr);column-gap:14px}
+.rc .id{font:600 13px/1.4 var(--f-mono);color:var(--muted);grid-row:span 3}
+.rc .st{margin:0;max-width:90ch}
+.rc .fx{margin:0;color:var(--muted);font-size:14px;max-width:90ch}
+.rc .row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.pill{font:600 11px/1 var(--f-body);text-transform:uppercase;letter-spacing:.05em;padding:4px 7px;border-radius:4px;border:1px solid var(--rule);color:var(--muted)}
+.pill.sev-s{color:var(--miss);border-color:currentColor}
+.pill.sev-v{color:var(--amb);border-color:currentColor}
+.rc .cl{all:unset;cursor:pointer;font:400 12px/1 var(--f-mono);padding:4px 6px;border-radius:4px;background:var(--bg);border:1px solid var(--rule);color:var(--ink)}
+.rc .cl:focus-visible,.rc .show:focus-visible{outline:2px solid var(--hi)}
+.rc .show{all:unset;cursor:pointer;font:500 12px/1 var(--f-body);color:var(--hi)}
+.rc.active{border-color:var(--hi)}
+.was{font:500 10px/1 var(--f-mono);color:var(--muted)}
+.was b{font-weight:600;color:var(--c2,var(--muted))}
+a.iss{color:var(--hi);font:500 13px/1.4 var(--f-mono)}
+.legend{font-size:13px;color:var(--muted);max-width:90ch}
+.legend b{color:var(--ink);font-weight:600}
+@media (prefers-reduced-motion:no-preference){.cell{transition:opacity .15s,border-color .15s}}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Borrow-Flow Matrix</h1>
+    <p class="lede">Can a value of each kind reach each position, and if it does, is the borrow it carries bounded by its source? Every cell cites the spec text that decides it, or is marked open with a counterexample program.</p>
+    <p class="meta" id="meta"></p>
+    <div class="summary" id="runs" role="group" aria-label="Audit run" style="margin-top:12px"></div>
+  </header>
+
+  <section aria-label="Status filter">
+    <div class="summary" id="summary"></div>
+  </section>
+
+  <div class="main">
+    <section aria-label="Matrix" style="min-width:0;display:grid;gap:10px">
+      <p class="legend"><b>Decided</b>: one rule (or a consistent set) settles the verdict and the bound. <b>Missing</b>: no text decides it. <b>Ambiguous</b>: one passage, two readings with different verdicts. <b>Conflict</b>: two passages disagree. Select a cell for its rule, citation and counterexample.</p>
+      <div class="gridbox"><table class="m" id="grid"></table></div>
+    </section>
+    <aside class="detail" id="detail" aria-live="polite"></aside>
+  </div>
+
+  <section aria-labelledby="rch" style="display:grid;gap:12px">
+    <h2 id="rch">Root causes of the open cells</h2>
+    <p class="legend">Each open cell traces to one or more causes. <b>Soundness</b> means a borrow can outlive its source with no static check, or only a runtime flag. <b>Verdict-only</b> means readings differ but nothing escapes. Select <i>Show cells</i> to highlight a cause in the grid.</p>
+    <div class="rcs" id="rcs"></div>
+  </section>
+
+  <section aria-labelledby="rth" id="routesec" style="display:grid;gap:12px">
+    <h2 id="rth">Routes outside the grid</h2>
+    <p class="legend">Open escapes the re-run found that no single cell captures, each with its issue.</p>
+    <div class="rcs" id="routes"></div>
+  </section>
+</div>
+
+<script type="application/json" id="data">__DATA__</script>
+<script>
+(function(){
+const ALL=JSON.parse(document.getElementById('data').textContent);
+const ROWS=[["R1","Owned class/interface value","owned binding, owned param, fresh producer"],["R2","Borrowed class reference","plain param, borrow local, field/element read, this"],["R3","Borrow-bearing record","record with a class or borrow-bearing component"],["R4","Borrow-bearing inline array","[N]C, [N]Pair"],["R5","Choice that holds borrows","payload carries a borrow"],["R6","Span","Span<T>, ReadOnlySpan<T>, IReadOnlySpan<T>"],["R7","Capture-bearing function value","closure or bound method reference"],["R8","Bare type parameter T","value in a generic body"],["R9","Runtime-managed (control)","string, Type, boxed primitive"]];
+const COLS=[["C1","Field","Instance field store, incl. property/indexer setter"],["C2","Static","Static field or static property store"],["C3","Collection","Collection slot store: Add, indexer set, literal element, GetOrAdd"],["C4","Object/iface","Conversion to Object or an interface (boxing, upcast, as)"],["C5","ref/out","ref/out argument location written by the callee"],["C6","Return","Return from a method, getter or lambda; bare-T returns"],["C7","Capture","Closure capture, then the closure flows elsewhere"],["C8","Generic T","Stored at a generic T position (generic field, Box<T>, generic param)"],["C9","Async","Live across await, async parameter, Task<T> result"],["C10","Iterator","Live across yield return, iterator parameter, yielded value"],["C11","Pattern/aggregate","Pattern, as/is binding; record component or choice payload"],["C12","Cross-domain","Domain.Spawn argument/result, Channel<T> element, Locked<T>"],["C13","scoped","scoped parameter or field; call-bounded storage"]];
+const ST={decided:"Decided",ambiguous:"Ambiguous",missing:"Missing",conflict:"Conflict","n/a":"N/A"};
+const RUNS=Object.keys(ALL.runs).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+const PREV={}; RUNS.forEach((r,i)=>{if(i)PREV[r]=RUNS[i-1]});
+const FIRST=RUNS[0];
+const ISS=n=>`https://github.com/s8lap/bezel-lang/issues/${n}`;
+const cls=s=>"s-"+(s==="n/a"?"na":s);
+let run=RUNS[RUNS.length-1], filter=null, cur=null, mark=null, D, byKey, rcById;
+const esc=s=>String(s??"").replace(/[&<>"]/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
+const md=s=>esc(s).replace(/`([^`]+)`/g,"<code>$1</code>");
+function load(){D=ALL.runs[run]; byKey={}; D.cells.forEach(c=>byKey[c.row+"/"+c.col]=c);
+  rcById={}; (D.root_causes||[]).forEach(r=>rcById[r.rid]=r); (D.groups||[]).forEach(g=>rcById[g.issue]={rid:g.issue,statement:g.statement});}
+function runs(){const el=document.getElementById('runs'); el.innerHTML="";
+  RUNS.forEach(r=>{const b=document.createElement('button');b.className="chip";b.setAttribute('aria-pressed',run===r);
+    b.textContent=ALL.runs[r].label||r;
+    b.onclick=()=>{run=r;mark=null;filter=null;load();pickFirst();render()};el.appendChild(b)});
+  document.getElementById('meta').textContent=ALL.runs[run].meta||run;}
+function summary(){
+  const n={}; D.cells.forEach(c=>n[c.status]=(n[c.status]||0)+1);
+  const el=document.getElementById('summary'); el.innerHTML="";
+  const all=document.createElement('button'); all.className="chip"; all.setAttribute('aria-pressed',filter===null);
+  all.innerHTML=`All cells <span class="n">${D.cells.length}</span>`; all.onclick=()=>{filter=null;render()}; el.appendChild(all);
+  ["decided","conflict","missing","ambiguous","n/a"].filter(s=>n[s]).forEach(s=>{
+    const b=document.createElement('button'); b.className="chip "+cls(s); b.setAttribute('aria-pressed',filter===s);
+    b.innerHTML=`<span class="dot"></span>${ST[s]} <span class="n">${n[s]}</span>`;
+    b.onclick=()=>{filter=filter===s?null:s;render()}; el.appendChild(b);});
+  if(PREV[run]){const ch=D.cells.filter(c=>c.prev_status&&c.prev_status!==c.status).length;
+    const b=document.createElement('button'); b.className="chip"; b.setAttribute('aria-pressed',filter==="changed");
+    b.innerHTML=`Changed since ${PREV[run]} <span class="n">${ch}</span>`; b.onclick=()=>{filter=filter==="changed"?null:"changed";render()}; el.appendChild(b);}
+}
+function grid(){
+  const t=document.getElementById('grid');
+  let h="<thead><tr><th class='rowh'>Value kind ↓ · Position →</th>"+COLS.map(c=>`<th class="colh" scope="col"><abbr title="${esc(c[2])}">${esc(c[1])}</abbr><br><span style="font-family:var(--f-mono);font-weight:400">${c[0]}</span></th>`).join("")+"</tr></thead><tbody>";
+  ROWS.forEach(r=>{
+    h+=`<tr><th class="rowh" scope="row">${esc(r[1])}<small>${r[0]} · ${esc(r[2])}</small></th>`;
+    COLS.forEach(c=>{const x=byKey[r[0]+"/"+c[0]]; if(!x){h+="<td></td>";return}
+      const changed=x.prev_status&&x.prev_status!==x.status;
+      const hide=filter==="changed"?!changed:(filter&&x.status!==filter);
+      const dim=hide?" dim":""; const mk=(mark&&x.rc&&x.rc.includes(mark))?" mark":"";
+      const was=changed?`<span class="was">was <b>${ST[x.prev_status]||x.prev_status}</b></span>`:"";
+      h+=`<td><button class="cell ${cls(x.status)}${dim}${mk}" data-k="${r[0]}/${c[0]}" aria-current="${cur===r[0]+"/"+c[0]}" aria-label="${esc(r[1])}, ${esc(c[1])}: ${ST[x.status]}${changed?", was "+ST[x.prev_status]:""}"><span class="st">${ST[x.status]}</span><span class="vd">${esc(x.verdict)}</span>${was}</button></td>`;});
+    h+="</tr>";});
+  t.innerHTML=h+"</tbody>";
+  t.querySelectorAll('.cell').forEach(b=>b.onclick=()=>{cur=b.dataset.k;render()});
+}
+function rcLabel(id){return run!==FIRST?`#${id}`:id}
+function detail(){
+  const el=document.getElementById('detail');
+  const x=byKey[cur]; if(!x){el.innerHTML="<p class='legend'>Select a cell.</p>";return}
+  const r=ROWS.find(z=>z[0]===x.row), c=COLS.find(z=>z[0]===x.col);
+  let h=`<div class="${cls(x.status)}"><span class="tag"><span class="dot"></span>${ST[x.status]} · ${esc(x.verdict)}</span></div>
+  <h3>${esc(r[1])} → ${esc(c[1])}</h3><p class="meta" style="margin:0">${x.row}/${x.col} · ${esc(c[2])} · lane ${esc(x.lane)}${x.prev_status?` · at ${PREV[run]}: ${esc(ST[x.prev_status]||x.prev_status)}`:""}</p>`;
+  if(x.rc&&x.rc.length) h+=`<div class="kv"><span class="k">Root cause</span><p class="v">${x.rc.map(id=>`<button class="rcref" data-rc="${id}">${rcLabel(id)}</button> ${md(rcById[id].statement.slice(0,160))}${rcById[id].statement.length>160?"…":""}`).join("<br>")}</p></div>`;
+  h+=`<div class="kv"><span class="k">Deciding text · ${esc(x.cite||"")}</span>${String(x.rule||"").split(" | ").map(q=>`<blockquote>${md(q)}</blockquote>`).join("")}</div>`;
+  if(x.note) h+=`<div class="kv"><span class="k">Note</span><p class="v">${md(x.note)}</p></div>`;
+  if(x.xcheck) h+=`<div class="kv"><span class="k">Cross-check (${esc(x.xcheck.by)}): ${esc(x.xcheck.verdict)}</span><p class="v">${md(x.xcheck.evidence)}</p></div>`;
+  if(x.counterexample) h+=`<div class="kv"><span class="k">Counterexample</span><pre>${esc(x.counterexample)}</pre></div>`;
+  el.innerHTML=h;
+  el.querySelectorAll('.rcref').forEach(b=>b.onclick=()=>{mark=b.dataset.rc;render();document.getElementById('rc-'+mark)?.scrollIntoView({block:"nearest"})});
+}
+function rcs(){
+  const el=document.getElementById('rcs');
+  const list=run!==FIRST?D.groups.map(g=>({rid:g.issue,statement:g.statement,severity:g.severity,cells:g.cells,link:true})):D.root_causes;
+  el.innerHTML=list.map(r=>{const sv=String(r.severity).startsWith("sound");
+    return `<article class="rc${mark===r.rid?" active":""}" id="rc-${r.rid}"><span class="id">${r.link?`<a class="iss" href="${ISS(r.rid)}" target="_blank" rel="noopener">#${r.rid}</a>`:r.rid}</span>
+    <p class="st">${md(r.statement)}</p>
+    ${r.fix?`<p class="fx"><b style="color:var(--ink);font-weight:600">Narrowest fix:</b> ${md(r.fix)}</p>`:""}
+    <div class="row"><span class="pill ${sv?"sev-s":"sev-v"}">${esc(r.severity)}</span>${r.class?`<span class="pill">${esc(r.class)}</span>`:""}
+    ${r.cells.map(k=>`<button class="cl" data-k="${k}">${k}</button>`).join("")}
+    <button class="show" data-rc="${r.rid}">${mark===r.rid?"Clear highlight":"Show cells"}</button></div></article>`}).join("");
+  el.querySelectorAll('.cl').forEach(b=>b.onclick=()=>{cur=b.dataset.k;render();document.getElementById('grid').scrollIntoView({block:"nearest"})});
+  el.querySelectorAll('.show').forEach(b=>b.onclick=()=>{mark=mark===b.dataset.rc?null:b.dataset.rc;render()});
+  const rs=document.getElementById('routesec'); rs.hidden=run===FIRST;
+  if(run!==FIRST){document.getElementById('routes').innerHTML=D.routes.map(x=>`<article class="rc"><span class="id">${x.issue?`<a class="iss" href="${ISS(x.issue)}" target="_blank" rel="noopener">#${esc(x.issue)}</a>`:"—"}</span>
+    <p class="st"><b>${esc(x.row)} · ${esc(x.col)}</b>${x.route?" · "+md(x.route):""}. ${md(x.note||"")}</p>
+    <div class="row"><span class="pill sev-s">${esc(x.status)}</span></div>
+    ${x.counterexample?`<pre style="grid-column:1/-1">${esc(x.counterexample)}</pre>`:""}</article>`).join("");}
+}
+function pickFirst(){const f=D.cells.find(c=>c.status==="conflict")||D.cells.find(c=>c.status!=="decided"); cur=f?f.row+"/"+f.col:null;}
+function render(){runs();summary();grid();detail();rcs()}
+load();pickFirst();render();
+})();
+</script>
