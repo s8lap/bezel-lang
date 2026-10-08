@@ -1,5 +1,5 @@
 //! case: s9_7_0033
-//! doc: issue #5662
+//! doc: spec
 //! section: 9.7
 //! title: non-owning inline array of interface in instance field is not a span
 //! rule: A non-owning inline array ([N]T, [N]T?) is an ordinary value type. Its
