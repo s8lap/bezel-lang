@@ -3387,6 +3387,133 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
         // keyed on the introducing `IdentifierExpr` which IS the recipient's
         // `LocalSymbol::decl` for the inline form.
         registerCtorOutVarStringRelease(*id, loc, ctorDecl, ctorSym, pos, slot);
+        // fix #5672 (§22.4 / §28.3 / §28.11 / §28.1): the constructor twin of
+        // ensureOutVarSlots' `out var`-at-an-`out owned`-formal block (that
+        // function's final `if (loc && isOutOwnedArgPosition(call, pos))`,
+        // added by the #3842 fix-forward). Per §22.4 an `out var x` at an
+        // `out owned` formal "declares a fresh local that ADOPTS the
+        // classification the callee's declaration announces … against
+        // `out owned`, an OWNED LOCAL under the standard owned-local
+        // discharge rules, the must-use warning included" — the
+        // constructor's `out owned` formal is such a formal, and the
+        // ownership pass already honours it (Ownership_Checks.cpp's NewExpr
+        // arm calls `markOutOwnedArgs(ne->args, ctorParams)`, which is what
+        // makes `autoDropAtScopeEnd` come out true and emits the §28.3
+        // must-use warning — measured: the undischarged repro warns at the
+        // `x` column exactly as the method-path twin does, pinned by this
+        // fix's `undischarged_recipient_warns_must_use_spec_28_3` row).
+        // Codegen was the half that never followed, and the consequence is
+        // a heap leak:
+        //
+        //  • WITHOUT the `outOwnedRecipients_.insert`, an explicit
+        //    `x?.Dispose()` runs the destructor but never reclaims the block.
+        //  • WITHOUT the disposal registration, an UNdischarged `x` is never
+        //    disposed at all on the normal fall-off edge.
+        //
+        // Measured on the issue's own repro, 50 iterations, both directions
+        // ASan-armed: ctor path leaked 816 B in 51 objects (one per call plus
+        // the loop's) with an explicit `x?.Dispose()`, and the identical 816 B
+        // in 51 objects undischarged; the method-call twin of each compiled
+        // and ran clean (EXIT=0). The leak's ASan frame is the generated
+        // `bz$M.Widget$ctor` — the callee minted the object, and nothing on the
+        // caller's side reclaimed it.
+        //
+        // GATED ON THE FORMAL, never the call-site modifier: an ordinary
+        // `out var` against a BORROWING `out` constructor formal — or against
+        // a value-typed one — adopts a borrow and must keep registering
+        // nothing. Read the same way `registerCtorOutVarStringRelease` reads
+        // its own gate-2 formal (imported ParameterSymbol first, AST decl
+        // second with the AST winning), so the two ctor arms cannot drift on
+        // which position is `out owned`.
+        //
+        // `pt` — the constructor formal's type resolved FRESH from
+        // `ctorDecl->params[pos].type`, already computed above to size the
+        // slot — is the recip type here, NOT `loc->declType`: sema's
+        // constructor-out-var registration STRIPS declared-nullability off
+        // `lsym->declType` (see the long `pt`-vs-`loc->declType` note above
+        // this arm). `outOwnedRecipientDisposes` does not read nullability, so
+        // either source classifies identically TODAY; `pt` is used because it
+        // is the same value the slot itself is sized from, so the disposal can
+        // never be registered against a differently-shaped type than the
+        // storage it will free.
+        {
+            std::string_view formalMod;
+            const sema::TypeRef* formalTy = nullptr;
+            if (ctorSym && pos < ctorSym->params.size()) {
+                if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                        ctorSym->params[pos])) {
+                    formalMod = ps->modifier;
+                    formalTy = ps->resolvedDeclType;
+                }
+            }
+            if (ctorDecl && pos < ctorDecl->params.size()) {
+                formalMod = ctorDecl->params[pos].modifier;
+                if (!formalTy && ctorDecl->params[pos].type)
+                    formalTy = ctx_.resolvedType(*ctorDecl->params[pos].type);
+            }
+            if (formalMod == "out owned" && loc) {
+                const void* declKey = loc->decl
+                    ? static_cast<const void*>(loc->decl)
+                    : static_cast<const void*>(id);
+                // Exactly what the method-call arm inserts, for the same
+                // reason (§28.11 / #889): an explicit `x?.Dispose()` must
+                // RECLAIM the heap block and null the slot (so the scope-end
+                // disposal below finds null) rather than only dispatching the
+                // destructor.
+                outOwnedRecipients_.insert(declKey);
+                // `OutVarSlotCollector::considerArgs` reserves a ptr-wide frame
+                // field for EVERY `out var` recipient it meets (NewExpr
+                // arguments included), so this wiring is the same the method
+                // arm's does and the field it names is ptr-wide — which is
+                // also what `slotTy` is here, because a genuine `out owned`
+                // formal is a class/interface parameter (§22.4 / §28.1) and
+                // `lowerTypeRef` of one is a pointer. Only reached when the
+                // `outOwnedRecipientDisposes` conjunct below holds, so a
+                // value-substituted formal never wires a field.
+                //
+                // §28.1 (v0.196, #1860): at a value/runtime-managed
+                // substitution the `out owned T` marker is ERASED — the
+                // recipient owns nothing, so register NOTHING. This is the
+                // over-fire guard the method arm applies at §28.11/#3779: it
+                // is what keeps `new T()` against a value-typed `out owned`
+                // formal (and any value substitution of a generic class's
+                // `out owned T`) registering no disposal at all, which would
+                // otherwise dynamic-dispose an erased value as an object.
+                const sema::TypeRef* recipTy =
+                    formalTy ? formalTy
+                             : ((loc->declType) ? loc->declType
+                                                : ctx_.exprType(*id));
+                if (!disposeStack_.empty() &&
+                    currentFn_ == unwindIneligibleFn_ &&
+                    !emittingDisposerBody_ &&
+                    outOwnedRecipientDisposes(recipTy) &&
+                    !unwindIneligible_.count(declKey)) {
+                    // mapSuspendLocalSlot is INSIDE this gate, unlike the
+                    // method arm's (which calls it before its own predicate).
+                    // Same reasoning: only a ptr-wide slot may be wired to a
+                    // ptr-wide frame field, and only a genuine class/interface
+                    // recipient reaches here.
+                    mapSuspendLocalSlot(id, slot);
+                    // The same TWO-WAY choice the `out owned var` arm above
+                    // makes, and the same one ensureOutVarSlots' twin makes —
+                    // do not invent a third shape:
+                    //   • autoDropAtScopeEnd (the ownership pass proved the
+                    //     recipient is never discharged on any path) →
+                    //     dynamicDispose on BOTH the normal-exit and unwind
+                    //     edges: the §28.3 affine AUTO-DROP, null-guarded and
+                    //     nulled on disposal.
+                    //   • otherwise (discharged on some path — `x?.Dispose()`,
+                    //     `move`, a transfer) → unwindOnly, the exception-edge
+                    //     backstop only; the normal path is that explicit
+                    //     discharge's, which nulls the slot.
+                    // Both are null-guarded, so the pair cannot double-free.
+                    Disposal d{slot, nullptr};
+                    if (loc->autoDropAtScopeEnd) d.dynamicDispose = true;
+                    else d.unwindOnly = true;
+                    disposeStack_.back().push_back(d);
+                }
+            }
+        }
         pos++;
     }
 }
