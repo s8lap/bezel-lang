@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.326.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.327.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use after disposal is caught in layers: a borrow that would outlive its local source is rejected, a use of a variable after its explicit disposal is a warning on a straight line and a compile error after a conditional one, and in the default, checked build any member access through a disposed reference faults deterministically (spec §28.2). This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -356,7 +356,7 @@ x.Process();
 // `using var` discharges it at scope end.
 ```
 
-This works *precisely because both arms have the same ownership*. It is the same principle as the bad merge in §8, seen from the other side: a `(if c then value else value)` expression (and `??`, above) is only well-formed when both arms agree on ownership. Here they do — both are fresh owned producers — so there is nothing for the compiler to reject. (Write two *named* owned locals as **unmarked** arms and the expression becomes a borrow merge, exactly as with `??`. To coalesce them into one owned result, mark the arms: `using var best := (if a.Score() > b.Score() then move a else move b);` — each is consumed only on its selected path — or use the explicit `if`/`else` statement below.)
+This works *precisely because both arms have the same ownership*. It is the same principle as the bad merge in §8, seen from the other side: a `(if c then value else value)` expression (and `??`, above) is only well-formed when both arms agree on ownership. Here they do — both are fresh owned producers — so there is nothing for the compiler to reject. (Write two *named* owned locals as **unmarked** arms and the expression becomes a borrow merge, exactly as with `??` — and at a `using var` a compile error, since the declaration would say neither that it adopts the selected local nor that it views it (spec §28.10). To coalesce them into one owned result, mark the arms: `using var best := (if a.Score() > b.Score() then move a else move b);` — each is consumed only on its selected path — or use the explicit `if`/`else` statement below.)
 
 The statement form is equivalent and is what you fall back to when the branches need more than one expression each. Note it is a *statement* (`if … then … else … end;`), not the ternary above — declare the variable first, assign in each branch:
 

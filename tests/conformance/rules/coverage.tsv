@@ -27,7 +27,7 @@ spec	3.2	Reference vs. value types	0	0	2	0	0	0	0	2	covered
 spec	3.3	Nullability	0	0	0	0	0	0	0	0	n/a
 spec	3.4	Keyword aliases for built-in types	2	0	4	2	0	1	0	1	covered
 spec	3.5	Operators on primitive types	4	1	4	2	0	2	0	0	covered
-spec	3.6	Derived type properties	4	6	6	0	0	2	0	4	covered
+spec	3.6	Derived type properties	5	10	6	0	0	2	0	4	covered
 spec	4	Built-in Types	0	0	0	0	0	0	0	0	n/a
 spec	4.1	bool	0	0	3	1	0	1	0	1	covered
 spec	4.2	Integer types	3	0	7	0	0	3	0	4	covered
@@ -85,7 +85,7 @@ spec	10.1	Basic syntax	0	0	1	0	0	0	0	1	covered
 spec	10.2	Explicit values	4	1	4	1	1	1	0	1	covered
 spec	10.3	Underlying type	1	0	2	1	0	1	0	0	covered
 spec	10.4	Methods, properties, static members	2	0	8	1	1	1	1	4	covered
-spec	10.5	Restrictions	3	2	8	4	0	4	0	0	covered
+spec	10.5	Restrictions	5	3	8	4	0	4	0	0	covered
 spec	10.6	Case matching	0	0	1	0	0	0	0	1	covered
 spec	11	Classes and Interfaces	0	0	0	0	0	0	0	0	n/a
 spec	11.1	Class declaration	0	0	3	1	0	2	0	0	covered
@@ -100,7 +100,7 @@ spec	12	Inheritance and Dispatch	0	0	0	0	0	0	0	0	n/a
 spec	12.1	Members are non-virtual by default	9	1	6	2	0	2	0	2	covered
 spec	12.2	Hiding is not allowed	3	2	3	2	0	1	0	0	covered
 spec	12.3	base.Member	0	0	1	0	0	0	0	1	covered
-spec	12.4	Sealing	2	0	4	1	0	3	0	0	covered
+spec	12.4	Sealing	3	1	4	1	0	3	0	0	covered
 spec	12.5	Abstract classes and members	1	1	2	0	0	2	0	0	covered
 spec	12.6	async and abstract	1	0	1	0	0	1	0	0	covered
 spec	12.7	Type tests: is, is not, as	6	4	4	1	0	2	0	1	covered
@@ -117,13 +117,13 @@ spec	13.6	Accessor visibility	2	0	2	1	0	1	0	0	covered
 spec	13.7	Visibility and inheritance	5	0	6	3	0	3	0	0	covered
 spec	14	Generics	0	0	0	0	0	0	0	0	n/a
 spec	14.1	Generic declarations	2	3	1	0	0	0	0	1	covered
-spec	14.2	Constraints	6	10	20	7	0	11	0	2	covered
+spec	14.2	Constraints	6	12	20	7	0	11	0	2	covered
 spec	14.3	Variance	0	0	0	0	0	0	0	0	n/a
 spec	14.4	owned and generic type arguments	0	2	6	3	0	3	0	0	covered
 spec	14.5	Type-argument inference for generic methods	11	2	8	0	0	4	0	4	covered
 spec	14.6	Recursive instantiation	3	0	2	1	0	1	0	0	covered
 spec	15	Arrays	0	0	0	0	0	0	0	0	n/a
-spec	15.1	Inline arrays	9	3	6	0	0	4	0	2	covered
+spec	15.1	Inline arrays	12	4	6	0	0	4	0	2	covered
 spec	15.1.1	Owning inline arrays	3	1	8	0	0	2	0	6	covered
 spec	15.1.2	Members and operations	6	1	2	0	0	1	0	1	covered
 spec	15.1.3	FFI	1	0	1	1	0	0	0	0	covered
@@ -317,7 +317,7 @@ spec	33.6	Example	0	0	0	0	0	0	0	0	n/a
 spec	34	Comments and Documentation	2	0	4	3	0	0	0	1	covered
 spec	35	Choices	0	1	2	1	0	1	0	0	covered
 spec	35.1	Declaration	5	1	10	2	0	8	0	0	covered
-spec	35.2	Members	4	0	8	2	0	3	0	3	covered
+spec	35.2	Members	4	1	8	2	0	3	0	3	covered
 spec	35.3	Construction and payload ownership	2	0	8	1	0	5	0	2	covered
 spec	35.4	The classification	8	5	12	2	1	4	0	5	covered
 spec	35.5	Matching	0	5	13	0	2	5	1	5	covered
@@ -329,7 +329,7 @@ spec	35.10	default, with, and the small surface	2	1	3	0	0	2	0	1	covered
 spec	35.11	Generics	0	0	2	0	0	1	0	1	covered
 spec	35.12	Sendability	0	1	3	0	0	2	0	1	covered
 spec	35.13	FFI and serialization	0	0	1	0	0	1	0	0	covered
-stdlib	1	Conventions	6	0	6	0	0	0	0	6	covered
+stdlib	1	Conventions	7	0	6	0	0	0	0	6	covered
 stdlib	2	System (auto-imported)	0	0	0	0	0	0	0	0	n/a
 stdlib	2.1	Console	1	0	4	0	0	0	0	4	covered
 stdlib	2.2	Math	1	0	5	0	0	0	0	5	covered
