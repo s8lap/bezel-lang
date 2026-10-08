@@ -23845,18 +23845,55 @@ struct UnwindIneligibleWalker {
             bool branchSensitiveOwnedTransfer = false;
             if (untaintOwnedLocalTransfer && a.value &&
                 (a.modifier == "owned" || pm == "owned")) {
-                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                        a.value.get())) {
-                    sema::Symbol* asym = ctx.exprSymbol(*id);
-                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym))
-                        branchSensitiveOwnedTransfer = loc->decl && !loc->isUsing;
+                // Also handle `move x`: MoveExpr wrapping an IdentifierExpr.
+                // per §A.4 / proposal 0090 (v0.246): `owned` is not an
+                // ArgModifiers alternative; `move x` is the call-site transfer
+                // marker. Both forms need the same untaint treatment.
+                const ast::IdentifierExpr* localId =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+                if (!localId) {
+                    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(
+                            a.value.get()))
+                        if (u->op == "move")
+                            localId = dynamic_cast<const ast::IdentifierExpr*>(
+                                u->operand.get());
+                }
+                if (localId) {
+                    sema::Symbol* asym = ctx.exprSymbol(*localId);
+                    if (auto* loc =
+                            dynamic_cast<sema::LocalSymbol*>(asym))
+                        branchSensitiveOwnedTransfer =
+                            loc->decl && !loc->isUsing;
                     else if (auto* ps =
                                  dynamic_cast<sema::ParameterSymbol*>(asym))
-                        branchSensitiveOwnedTransfer = (ps->modifier == "owned");
+                        branchSensitiveOwnedTransfer =
+                            (ps->modifier == "owned");
                 }
             }
+            // For builtin collection transfers (OwningArray.Add / Push / Enqueue /
+            // Insert), `params` is null so `pm` is never set. But
+            // `untaintOwnedLocalTransfer=true` tells us this IS a collection
+            // transfer, and for these builtins the parameter is always `owned`.
+            // Handle `move x` here too — the move-to-owned-param transfer means
+            // the local should stay eligible for unwind disposal. // per §28.3
+            if (!branchSensitiveOwnedTransfer && untaintOwnedLocalTransfer &&
+                a.value) {
+                if (auto* u = dynamic_cast<const ast::UnaryExpr*>(
+                        a.value.get()))
+                    if (u->op == "move")
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                u->operand.get())) {
+                            sema::Symbol* asym = ctx.exprSymbol(*id);
+                            if (auto* loc =
+                                    dynamic_cast<sema::LocalSymbol*>(asym))
+                                branchSensitiveOwnedTransfer =
+                                    loc->decl && !loc->isUsing;
+                        }
+            }
             expr(a.value.get(),
-                 branchSensitiveOwnedTransfer ? /*consuming=*/false : consuming);
+                 branchSensitiveOwnedTransfer
+                     ? /*consuming=*/false
+                     : consuming);
         }
     }
 
@@ -23869,9 +23906,18 @@ struct UnwindIneligibleWalker {
             return;
         }
         if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
-            // `move x` always consumes its operand.
-            if (u->op == "move") markIdent(u->operand.get());
-            else expr(u->operand.get(), /*consuming=*/true);
+            // `move x` consumes its operand when passed to a non-owned param
+            // (ordinary borrow). When the param is `owned` and the call goes
+            // through buildOrderedArgs (user method or owning-collection transfer),
+            // branchSensitiveOwnedTransfer is true and `consuming=false` is passed
+            // here — the caller's slot will be nulled at transfer time, so the
+            // local stays eligible for unwind disposal if a throw PRECEDES the
+            // transfer. // per §28.3 / §A.4 (proposal 0090, v0.246)
+            if (u->op == "move") {
+                if (consuming) markIdent(u->operand.get());
+            } else {
+                expr(u->operand.get(), /*consuming=*/true);
+            }
             return;
         }
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {

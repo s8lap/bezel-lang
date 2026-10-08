@@ -14382,6 +14382,13 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // `var` owned local or an `owned` parameter of pointer (class/interface)
         // representation — exactly what those registrations cover; a `using var`,
         // collection, or value-typed binding is untouched. // per §28.3
+        // NOTE: `move x` is NOT added here for user methods. For user methods,
+        // the transfer happens INSIDE the callee, so if the call throws before
+        // it succeeds (e.g., a later argument throws), the transfer never
+        // happens and the slot should NOT be nulled. Builtin collection transfers
+        // (OwningArray.Add, etc.) are handled separately by
+        // nullTransferredOwnedLocalSlot in Calls.cpp, which is called AFTER
+        // the call succeeds. // per §A.4 (proposal 0090, v0.246)
         if (nullTransferredOwned && a.value && !a.isDiscard &&
             (a.modifier == "owned" || params[idx].modifier == "owned")) {
             if (auto* id =
@@ -15804,7 +15811,18 @@ bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
 // a `using var`, collection, or value-typed binding is untouched (no slot
 // nulled). // per §28.3
 void Emitter::nullTransferredOwnedLocalSlot(const ast::Expr* argValue) {
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(argValue);
+    // Also handle `move x`: MoveExpr wrapping an IdentifierExpr.
+    // per §A.4 / proposal 0090 (v0.246): `owned` is not an ArgModifiers
+    // alternative; `move x` is the call-site transfer marker. Both forms need
+    // the same slot-nulling treatment.
+    const ast::IdentifierExpr* id =
+        dynamic_cast<const ast::IdentifierExpr*>(argValue);
+    if (!id) {
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(argValue))
+            if (u->op == "move")
+                id = dynamic_cast<const ast::IdentifierExpr*>(
+                    u->operand.get());
+    }
     if (!id) return;
     sema::Symbol* asym = ctx_.exprSymbol(*id);
     bool eligible = false;
@@ -15827,7 +15845,7 @@ void Emitter::nullTransferredOwnedLocalSlot(const ast::Expr* argValue) {
     // element transfer Add / Insert / Set (form 5). Self-gating — no-op outside
     // a state-machine body, for non-parameter sources, for non-owned parameters.
     // per §29.8 / §30.1
-    nullStateMachineOwnedParamCapture(argValue);
+    nullStateMachineOwnedParamCapture(id);
 }
 
 
