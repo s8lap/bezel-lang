@@ -320,6 +320,10 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "Queue" || n == "OwningQueue" ||
         n == "Set" || n == "OwningSet" ||
         n == "LinkedList" || n == "OwningLinkedList" ||
+        // stdlib §4.21 (arity 1): OwningSlotMap<T> — registered here so that
+        // `new OwningSlotMap<T>()` and `OwningSlotMap<T>` as a type argument
+        // resolve without an explicit import. spec #7878 states it declares no indexer.
+        n == "OwningSlotMap" ||
         // §28.13 / stdlib §2.16: Shared<T> and Weak<T> (arity 1).
         n == "Shared" || n == "Weak" ||
         // §4.6: LinkedListNode<T> is the node handle returned by Add*/Find; it

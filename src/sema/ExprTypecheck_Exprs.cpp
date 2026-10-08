@@ -3673,6 +3673,30 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // indexer result type is the element T = genericArgs[0].
                         cn == "IReadOnlyList" || cn == "IList" ||
                         cn == "IOwningList";
+                    // fix #5588 (§23.4 / §28.11, v0.315): OwningStack<T>,
+                    // OwningQueue<T>, OwningLinkedList<T>, OwningSet<T>, and
+                    // OwningSlotMap<T> declare NO indexer — `stack[i]` etc. do
+                    // not parse (spec #7878). Without this arm, the `isArrLike`
+                    // / `isSpan` / `isDict` checks above all fail and the
+                    // IndexExpr is left untyped. Codegen's
+                    // lowerCollectionIndexerGet THEN picks it up via
+                    // isCollectionTypeName (BuiltinRegistry.cpp's
+                    // kArrayBackedCollections — Stack/Queue/LinkedList/Set and
+                    // their Owning... variants are registered there for
+                    // non-indexer operations like `.Count`), emits code, and
+                    // the program runs but produces wrong results
+                    // (IndexOutOfRangeException at runtime). Reject cleanly
+                    // at the type level with a §23.4 diagnostic.
+                    if (cn == "OwningStack" || cn == "OwningQueue" ||
+                        cn == "OwningLinkedList" || cn == "OwningSet" ||
+                        cn == "OwningSlotMap") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, e.span.begin,
+                            std::string("type `") +
+                                std::string(cn) +
+                                "<T>` does not declare an indexer — "
+                                "`a[i]` requires an indexer (§23.4)");
+                    }
                     // §4.15 (#549) / §4.14 (#779): ArraySpan/ReadOnlyArraySpan
                     // (borrowing) and Span/ReadOnlySpan (owning) indexer returns
                     // T = genericArgs[0].
