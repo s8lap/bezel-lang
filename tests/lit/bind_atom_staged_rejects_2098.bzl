@@ -43,8 +43,9 @@ class C
   end A;
 
   // (2) conditional consume of an atom binding.
+  // §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
   public static method B(): int
-    return (var c := new Res(1); (if C.T() then W.Sink(owned c) else 0));
+    return (var c := new Res(1); (if C.T() then W.Sink(move c) else 0));
     // CHECK: :[[@LINE-1]]:{{[0-9]+}}: this consume of binding-atom binding `c` is not supported inside the atom
     // CHECK-SAME: (§17.15 / §28.3 K8.5, v0.216)
   end B;

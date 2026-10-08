@@ -13,6 +13,7 @@
 // and the primary `(owned r: Res)` — same type and same modifier, differing
 // only by name — are a clash. This file is now a REJECT control that names
 // the §11.1 redeclares-primary diagnostic.
+// per §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
 
 // DIAG: body constructor redeclares the primary constructor
 // DIAG-SAME: (§11.1, v0.308)
@@ -26,7 +27,7 @@ end Res;
 class Base(owned r: Res)
   private owned _s: Res := r;
   public constructor(owned x: Res)
-    this(owned x);
+    this(move x);
   end constructor;
   public method Id(): int
     return _s.Id();

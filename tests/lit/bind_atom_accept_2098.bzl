@@ -27,7 +27,8 @@ class C
   // #2098 review F2 control: an expression-bodied member whose atom clause
   // is consumed UNCONDITIONALLY stays accepted (the `=>` staged rejections
   // fire only on the mismatch / conditional / closure shapes).
-  public static method Take(): int => (var c := new Res(8); W.Sink(owned c));
+  // §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
+  public static method Take(): int => (var c := new Res(8); W.Sink(move c));
 
   // §22.16: the motivating position — a clause names a subresult.
   private _capacity: int := 100;
@@ -44,10 +45,10 @@ class C
     var lg := (var n: long := 40; n + 2L);
     // §21.1 dead-null binding: legal with the nullable ascription.
     var z := (var s: Res? := null; (if s = null then 1 else 0));
-    // Marked-transfer clause in ordinary position (K3.4), consumed by an
-    // owned argument inside the atom (K3.3).
+    // Marked-transfer clause in ordinary position (K3.4), consumed by a
+    // move argument inside the atom (§A.4 / proposal 0090, v0.246).
     var r := new Res(9);
-    var got := (var t := owned r; W.Sink(owned t));
+    var got := (var t := owned r; W.Sink(move t));
     // Shadowing an outer local follows the §21.1 nested-scope rule.
     var n := 5;
     var sh := (var n := 100; n + 1);

@@ -7,6 +7,7 @@
 // rejected with the WRONG branch of the diagnostic ("this parameter position
 // does not take ownership") — false, the position IS `owned` — because the
 // chain had no formals to consult. It now names the actual rule.
+// per §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
 
 module M;
 class Res
@@ -17,11 +18,11 @@ end Res;
 class Base(owned r: Res)
   private owned _s: Res := r;
   public constructor(n: int)
-    this(owned new Res(n));
+    this(move new Res(n));
   end constructor;
   public method Id(): int
     return _s.Id();
   end Id;
 end Base;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `owned` call-site marker is not written on a fresh producer (a `new` expression, a call returning `owned T`, an operator result, or `move obj.f`) — no live binding is invalidated, so there is nothing to announce; remove `owned` (§22.3
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `move` call-site marker is not written on a fresh producer (a `new` expression or a call returning an owned result) — no live binding is invalidated, so there is nothing to announce; remove `move` (§22.3

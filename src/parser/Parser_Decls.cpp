@@ -3010,7 +3010,14 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
                 a.modifier = "out";
             }
         } else if (consumeKeyword("owned")) {
-            a.modifier = "owned";
+            // per §A.4 / proposal 0090 (v0.246): the bare `owned` ArgModifiers
+            // alternative was removed; the call-site transfer marker is the `move`
+            // keyword inside the argument expression (§22.3, §28.8.1), not a
+            // modifier.
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "invalid use of 'owned' at argument position (§A.4, proposal 0090, "
+                "v0.246): use 'move x' to transfer ownership at a call site");
         } else if (current_.kind == TokenKind::Identifier &&
                    current_.text == "scoped" &&
                    (peekAt(1).kind == TokenKind::Identifier ||

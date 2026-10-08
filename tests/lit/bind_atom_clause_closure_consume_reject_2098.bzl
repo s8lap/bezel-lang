@@ -25,17 +25,19 @@ class W
 end W;
 class C
   // (1) The closure consumes an EARLIER owned clause of the same atom.
+  // §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
   public static method A(): int
-    var v := (var c := new Res(1); var k := W.Run(lambda() => do _ := W.Sink(owned c); end); k + c.Id);
+    var v := (var c := new Res(1); var k := W.Run(lambda() => do _ := W.Sink(move c); end); k + c.Id);
     // CHECK: :[[@LINE-1]]:{{[0-9]+}}: cannot transfer captured owned binding `c` inside a closure
     // CHECK-SAME: (§28.3, v0.184)
     return v;
   end A;
 
   // (2) The closure consumes an OUTER owned local from a clause initializer.
+  // §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
   public static method B(): int
     var outer := new Res(2);
-    var v := (var k := W.Run(lambda() => do _ := W.Sink(owned outer); end); k);
+    var v := (var k := W.Run(lambda() => do _ := W.Sink(move outer); end); k);
     // CHECK: :[[@LINE-1]]:{{[0-9]+}}: cannot transfer captured owned binding `outer` inside a closure
     outer.Dispose();
     return v;

@@ -7,6 +7,7 @@
 // Before the fix this was rejected too, but for the wrong reason — no formals
 // at all — which is why the rejection was indistinguishable from the WRONG
 // rejection of `this(owned x)` against an `owned` slot.
+// per §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
 
 module M;
 class Res
@@ -17,8 +18,8 @@ end Res;
 class PB(n: Res)
   private _k: Res := n;
   public constructor(owned x: Res, tag: bool)
-    this(owned x);
+    this(move x);
   end constructor;
 end PB;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `owned` call-site marker is only valid on an argument to an `owned` parameter; this parameter position does not take ownership — remove `owned` (§22.3
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `move` call-site marker is only valid on an argument to an `owned` parameter; this parameter does not take ownership — remove `move` (§22.3

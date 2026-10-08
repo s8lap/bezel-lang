@@ -7,13 +7,14 @@
 // Since fix #3777 a `this(...)` chain to an explicit SIBLING across an omitted
 // §22.5 default really calls that sibling (`emitChainCall` selects with
 // `ctorForArgs` and fills the omitted tail), so the position is an owned sink
-// and §22.3's call-site marker is both REQUIRED and SUFFICIENT: `this(owned x)`
+// and §22.3's call-site marker is both REQUIRED and SUFFICIENT: `this(move x)`
 // transfers, `x` becomes moved-from, the §28.3 auto-drop does not fire, and the
 // object is disposed exactly once — by `B`'s own `_f`.
 //
 // This is the spelling that did not exist before #3769: the unmarked form was a
 // silent auto-drop and the marked form was rejected with "this parameter
 // position does not take ownership", naming a position that IS `owned`.
+// per §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
 
 module M;
 
@@ -31,7 +32,7 @@ class B
     _n := b;
   end constructor;
   public constructor(owned x: Res, y: bool)
-    this(owned x);
+    this(move x);
   end constructor;
   public method Id(): int
     return _n;

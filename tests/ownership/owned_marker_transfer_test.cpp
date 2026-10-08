@@ -17,8 +17,9 @@
 // ways, plus a codegen value test proving the marked transfer disposes exactly
 // once (identical runtime behaviour to the pre-v0.169 bare form).
 //
-// A.7 grammar: `ArgModifiers ::= ... | "owned"`; ref/out/owned arguments are
-// positional-only (the named `name := expr` form is for plain values).
+// per §A.4 / proposal 0090 (v0.246): `owned` is NOT an ArgModifiers
+// alternative; the call-site transfer marker is `move` (A.7 ArgExpression MoveExpr,
+// §22.3, §28.8.1). `ref`/`out`/`scoped` are the only valid ArgModifiers.
 
 #include <string>
 #include <string_view>
@@ -66,27 +67,29 @@ bool errorSays(const bezel::test::OwnershipResult& r, std::string_view needle) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// PARSER (A.7): a bare `owned` argument modifier parses.
+// PARSER (A.4): `owned` is NOT an ArgModifiers alternative.
 // ---------------------------------------------------------------------------
 
-// A.7 `ArgModifiers ::= ... | "owned"`: `M(owned x)` parses (no syntax error);
-// the argument binds positionally. A named `owned` form is not derivable.
-BEZEL_TEST(owned_marker, parses_bare_owned_argument_spec_a7) {
+// per §A.4 / proposal 0090 (v0.246): `owned` is NOT an ArgModifiers
+// alternative; `M(owned x)` is a parse error. Use `move x` (§22.3, §28.8.1).
+BEZEL_TEST(owned_marker, bare_owned_argument_rejected_spec_a4_0090) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
         "  var x := new T(); s.Add(owned x); "
         "end M; end C;"));
-    // No PARSE error (a syntax error would mention "expected"); ownership accepts.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // Parse error: invalid use of 'owned' at argument position (§A.4).
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
-// A.7 note: `ref`/`out`/`owned` arguments are positional-only. The named form
-// `name := owned x` is not admitted (the named form is for plain values).
-BEZEL_TEST(owned_marker, named_owned_argument_rejected_spec_a7) {
+// per §A.4 / proposal 0090 (v0.246): `owned` is NOT an ArgModifiers
+// alternative; `name := owned x` is a parse error. Use `name := move x`.
+BEZEL_TEST(owned_marker, named_owned_argument_rejected_spec_a4_0090) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
         "  var x := new T(); s.Add(item := owned x); "
         "end M; end C;"));
+    // Parse error on `owned`; the named-arg form is also invalid since
+    // `owned` is not an ArgModifiers alternative at all.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
@@ -94,20 +97,20 @@ BEZEL_TEST(owned_marker, named_owned_argument_rejected_spec_a7) {
 // SEMA — accept/reject matrix (§22.3, v0.169).
 // ---------------------------------------------------------------------------
 
-// ACCEPT: a named owned LOCAL marked `owned` transfers into the owned sink.
+// ACCEPT: a named owned LOCAL marked `move` transfers into the owned sink.
 BEZEL_TEST(owned_marker, named_owned_local_marked_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
-        "  var x := new T(); s.Add(owned x); "
+        "  var x := new T(); s.Add(move x); "
         "end M; end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// ACCEPT: an `owned` PARAMETER marked `owned` forward-transfers into the sink.
+// ACCEPT: an `owned` PARAMETER marked `move` forward-transfers into the sink.
 BEZEL_TEST(owned_marker, owned_param_marked_accepted) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink, owned p: T) "
-        "  s.Add(owned p); "
+        "  s.Add(move p); "
         "end M; end C;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -154,53 +157,61 @@ BEZEL_TEST(owned_marker, fresh_owned_call_unmarked_accepted) {
 }
 
 // REJECT: the marker on a `new` expression (fresh producer) is an error.
+// per §A.4 / proposal 0090 (v0.246): `owned` is not an ArgModifiers
+// alternative, so the error is at parse time (invalid `owned`), not sema.
 BEZEL_TEST(owned_marker, marker_on_new_expr_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
         "  s.Add(owned new T()); "
         "end M; end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "fresh producer"));
+    // The sema "fresh producer" check is unreachable — parse rejects first.
 }
 
 // REJECT: the marker on an owned-returning call (fresh producer) is an error.
+// per §A.4 / proposal 0090 (v0.246): `owned` is not an ArgModifiers
+// alternative, so the error is at parse time (invalid `owned`), not sema.
 BEZEL_TEST(owned_marker, marker_on_owned_call_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
         "  s.Add(owned s.MakeOwned()); "
         "end M; end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "fresh producer"));
+    // The sema "fresh producer" check is unreachable — parse rejects first.
 }
 
 // REJECT: the marker on a BORROW (a borrowed parameter) is an error — the
 // existing §28.8 borrow diagnostic names why (a borrow is owned elsewhere).
+// per §A.4 / proposal 0090 (v0.246): `owned` is not an ArgModifiers
+// alternative, so the error is at parse time (invalid `owned`), not sema.
 BEZEL_TEST(owned_marker, marker_on_borrow_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink, b: T) "
         "  s.Add(owned b); "
         "end M; end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "borrow"));
+    // The sema "borrow" check is unreachable — parse rejects first.
 }
 
 // REJECT: the marker on a NON-`owned` parameter position is an error naming it.
+// per §A.4 / proposal 0090 (v0.246): `owned` is not an ArgModifiers
+// alternative, so the error is at parse time (invalid `owned`), not sema.
 BEZEL_TEST(owned_marker, marker_on_non_owned_position_rejected) {
     auto r = parseAndCheckOwnership(mod(
         "class C public method M(s: Sink) "
         "  var x := new T(); s.Peek(owned x); x.Dispose(); "
         "end M; end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "does not take ownership"));
+    // The sema "does not take ownership" check is unreachable — parse rejects first.
 }
 
-// ACCEPT (constructor): a named owned local marked into an `owned` ctor param.
+// ACCEPT (constructor): a named owned local marked with `move` into an `owned` ctor param.
 BEZEL_TEST(owned_marker, ctor_owned_param_marked_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; class T end T; "
         "class Box public constructor(owned t: T) using var h := move t; end constructor; end Box; "
         "class C public method M() "
-        "  var x := new T(); using var b := new Box(owned x); "
+        "  var x := new T(); using var b := new Box(move x); "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
@@ -281,7 +292,7 @@ BEZEL_TEST(owned_marker, out_owned_var_unaffected) {
 }
 
 // §28.8 exception-edge example ("build then take then restore"): the taken value
-// `taken` is a named owned binding, so the forwarding call carries the marker.
+// `taken` is a named owned binding, so the forwarding call carries the `move` marker.
 BEZEL_TEST(owned_marker, spec_28_8_exception_edge_taken_marked_accepted) {
     auto r = parseAndCheckOwnership(
         "module M; class T end T; "
@@ -292,7 +303,7 @@ BEZEL_TEST(owned_marker, spec_28_8_exception_edge_taken_marked_accepted) {
         "    var fresh := new T(); "
         "    var taken := move this._resource; "
         "    this._resource := fresh; "               // restore before the call
-        "    s.Take(owned taken); "                    // §22.3 marker on named binding
+        "    s.Take(move taken); "                    // §22.3 marker on named binding
         "  end TransferSafe; "
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -321,11 +332,11 @@ BEZEL_TEST(owned_marker, marked_transfer_disposes_once_value) {
         "    using var u := move c; "
         "  end Take; "
         "  public static method Forward(owned c: Cell) "
-        "    C.Take(owned c); "                        // §22.3: forward the owned param
+        "    C.Take(move c); "                        // §22.3: forward the owned param
         "  end Forward; "
         "  public static method Main(): int "
         "    var x := new Cell(); "
-        "    C.Forward(owned x); "                      // §22.3: transfer the owned local
+        "    C.Forward(move x); "                      // §22.3: transfer the owned local
         "    return Cell.live; "                        // 0 — disposed exactly once
         "  end Main; "
         "end C;";
@@ -355,12 +366,12 @@ static std::string fafMod(const std::string& call) {
         "  end Main; end C;";
 }
 
-// ACCEPT: `Task.FireAndForget(owned t)` on a named owned task local — the §22.3
+// ACCEPT: `Task.FireAndForget(move t)` on a named owned task local — the §22.3
 // mandated spelling. Before the fix the `owned` marker was spuriously rejected
 // ("only valid on an argument to an `owned` parameter") because FireAndForget's
 // owned parameter was not modeled as an owned sink.
 BEZEL_TEST(owned_marker, fire_and_forget_owned_named_task_accepted_1890) {
-    auto r = parseAndCheckOwnership(fafMod("Task.FireAndForget(owned t);"));
+    auto r = parseAndCheckOwnership(fafMod("Task.FireAndForget(move t);"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -391,6 +402,8 @@ BEZEL_TEST(owned_marker, fire_and_forget_fresh_producer_unmarked_accepted_1890) 
 
 // REJECT: the marker on the fresh-producer form `Task.FireAndForget(owned
 // Ping())` is spurious — no named binding is left moved-from (§22.3).
+// per §A.4 / proposal 0090 (v0.246): `owned` is not an ArgModifiers
+// alternative, so the error is at parse time (invalid `owned`), not sema.
 BEZEL_TEST(owned_marker, fire_and_forget_marker_on_fresh_producer_rejected_1890) {
     auto r = parseAndCheckOwnership(
         "module M; class C "
@@ -402,5 +415,5 @@ BEZEL_TEST(owned_marker, fire_and_forget_marker_on_fresh_producer_rejected_1890)
         "    return 0; "
         "  end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(errorSays(r, "fresh producer"));
+    // The sema "fresh producer" check is unreachable — parse rejects first.
 }

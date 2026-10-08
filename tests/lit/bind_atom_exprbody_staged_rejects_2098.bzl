@@ -45,18 +45,21 @@ class C
   // CHECK-SAME: (§17.15 / §28.3 K8.5, v0.216)
 
   // (2) Conditional consume in a `=>` body.
-  public static method E(): int => (var c := new Res(1); (if C.T() then W.Sink(owned c) else 0));
+  // §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
+  public static method E(): int => (var c := new Res(1); (if C.T() then W.Sink(move c) else 0));
   // CHECK: :[[@LINE-1]]:{{[0-9]+}}: binding-atom binding `c` is consumed on only some paths inside the atom
   // CHECK-SAME: (§17.15 / §28.3 K8.5, v0.216)
 
   // (3) A closure referencing an owned clause binding in a `=>` body (the
   // IIFE-consume shape).
-  public static method F(): int => (var c := new Res(1); W.Run(lambda(): int => W.Sink(owned c)));
+  // §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
+  public static method F(): int => (var c := new Res(1); W.Run(lambda(): int => W.Sink(move c)));
   // CHECK: :[[@LINE-1]]:{{[0-9]+}}: a closure inside a binding atom may not reference the atom's owned binding `c` in an expression-bodied member
   // CHECK-SAME: use a block body
 
   // Control: the legal unconditional consume in a `=>` body compiles with no
   // diagnostic (nothing between (3)'s match and end of output names `G`).
-  public static method G(): int => (var c := new Res(1); W.Sink(owned c));
+  // §A.4 / proposal 0090 (v0.246): call-site transfer uses `move`, not `owned`.
+  public static method G(): int => (var c := new Res(1); W.Sink(move c));
   // CHECK-NOT: method G
 end C;
