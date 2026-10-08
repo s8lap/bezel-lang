@@ -20,14 +20,14 @@ spec	2.8.2	The artifact interface is a semantic requirement	2	2	6	1	0	1	0	4	cove
 spec	2.8.3	Transitive dependencies and cross-artifact type identity	0	4	8	0	0	4	0	4	covered
 spec	2.8.4	Program assembly: artifact kind, entry point, one copy per process	2	2	3	0	0	0	0	3	covered
 spec	2.8.5	Non-goals of this section	0	0	0	0	0	0	0	0	n/a
-spec	2.8.6	Interface delta classification	2	0	0	0	0	0	0	0	out-of-reach
+spec	2.8.6	Interface delta classification	5	0	0	0	0	0	0	0	out-of-reach
 spec	3	Type System	0	0	0	0	0	0	0	0	n/a
 spec	3.1	Type kinds	0	0	1	0	0	0	0	1	covered
 spec	3.2	Reference vs. value types	0	0	2	0	0	0	0	2	covered
 spec	3.3	Nullability	0	0	0	0	0	0	0	0	n/a
 spec	3.4	Keyword aliases for built-in types	2	0	4	2	0	1	0	1	covered
 spec	3.5	Operators on primitive types	4	1	4	2	0	2	0	0	covered
-spec	3.6	Derived type properties	5	10	6	0	0	2	0	4	covered
+spec	3.6	Derived type properties	5	11	6	0	0	2	0	4	covered
 spec	4	Built-in Types	0	0	0	0	0	0	0	0	n/a
 spec	4.1	bool	0	0	3	1	0	1	0	1	covered
 spec	4.2	Integer types	3	0	7	0	0	3	0	4	covered
@@ -39,7 +39,7 @@ spec	4.6	string	3	1	10	1	0	2	0	7	covered
 spec	4.7	The unit type	0	0	1	1	0	0	0	0	covered
 spec	4.8	FFI-only primitive types	0	0	1	1	0	0	0	0	covered
 spec	5	Type Conversions	0	0	0	0	0	0	0	0	n/a
-spec	5.1	Implicit conversions	2	2	24	12	0	12	0	0	covered
+spec	5.1	Implicit conversions	3	3	24	12	0	12	0	0	covered
 spec	5.2	Explicit conversions	9	1	14	0	0	4	0	10	covered
 spec	5.3	Nullable casts	3	1	6	0	0	1	0	5	covered
 spec	5.4	Enum casts	3	3	7	0	0	1	0	6	covered
@@ -77,7 +77,7 @@ spec	9.3	Combined form	7	1	5	0	0	3	0	2	covered
 spec	9.4	Mutability	0	3	7	2	0	3	0	2	covered
 spec	9.5	Non-destructive update: with	6	2	7	1	0	3	0	3	covered
 spec	9.6	Records and inheritance	1	1	4	1	0	2	0	1	covered
-spec	9.7	Records and disposal	13	4	16	6	0	9	0	1	covered
+spec	9.7	Records and disposal	15	5	16	6	0	9	0	1	covered
 spec	9.8	Serialization synthesis	1	8	8	4	0	4	0	0	covered
 spec	9.9	Constructor-only records	4	3	8	3	0	4	0	1	covered
 spec	10	Enums	0	0	0	0	0	0	0	0	n/a
@@ -116,8 +116,8 @@ spec	13.5	No combined visibilities	0	0	2	1	0	1	0	0	covered
 spec	13.6	Accessor visibility	2	0	2	1	0	1	0	0	covered
 spec	13.7	Visibility and inheritance	5	0	6	3	0	3	0	0	covered
 spec	14	Generics	0	0	0	0	0	0	0	0	n/a
-spec	14.1	Generic declarations	2	3	1	0	0	0	0	1	covered
-spec	14.2	Constraints	6	12	20	7	0	11	0	2	covered
+spec	14.1	Generic declarations	2	4	1	0	0	0	0	1	covered
+spec	14.2	Constraints	6	14	20	7	0	11	0	2	covered
 spec	14.3	Variance	0	0	0	0	0	0	0	0	n/a
 spec	14.4	owned and generic type arguments	0	2	6	3	0	3	0	0	covered
 spec	14.5	Type-argument inference for generic methods	11	2	8	0	0	4	0	4	covered
@@ -194,7 +194,7 @@ spec	22.4	Inline out declarations	6	3	9	2	0	4	0	3	covered
 spec	22.5	Optional parameters and named arguments	3	1	7	0	0	4	0	3	covered
 spec	22.6	Overloading	0	6	18	3	0	7	0	8	covered
 spec	22.7	Constructors	4	4	13	2	0	5	0	6	covered
-spec	22.8	Field initializers	4	2	8	3	0	5	0	0	covered
+spec	22.8	Field initializers	5	2	8	3	0	5	0	0	covered
 spec	22.9	Owned fields and exception safety	0	1	4	0	0	0	0	4	covered
 spec	22.10	Primary constructors	3	2	19	8	0	8	0	3	covered
 spec	22.11	Object initializer blocks (retired)	1	1	4	0	0	1	0	3	covered
@@ -231,12 +231,12 @@ spec	27.2	Nullable function types	0	0	3	0	0	1	0	2	covered
 spec	27.3	Lambda expressions	5	1	9	0	0	4	0	5	covered
 spec	27.4	Parameter type inference	1	0	6	0	0	3	0	3	covered
 spec	27.5	Closures	5	2	10	2	0	6	0	2	covered
-spec	27.6	Method references	5	2	6	0	0	1	0	5	covered
+spec	27.6	Method references	8	4	6	0	0	1	0	5	covered
 spec	27.7	Calling function values	1	0	3	0	0	0	0	3	covered
 spec	27.7.1	Equality of function values	2	0	3	0	0	0	0	3	covered
 spec	27.8	Type aliases	1	1	2	0	0	1	0	1	covered
 spec	28	Resource Management	2	0	2	0	1	0	0	1	covered
-spec	28.1	Where the owned modifier can appear	1	1	10	7	0	3	0	0	covered
+spec	28.1	Where the owned modifier can appear	1	3	10	7	0	3	0	0	covered
 spec	28.2	The IDisposable contract	0	4	12	4	0	4	2	2	covered
 spec	28.3	Local variables, ownership, and borrows	1	24	68	18	12	24	6	8	covered
 spec	28.4	The destructor	1	1	8	0	0	2	0	6	covered
@@ -248,7 +248,7 @@ spec	28.8.1	The move expression	1	2	16	5	0	7	0	4	covered
 spec	28.9	Runtime-managed types	7	5	18	1	5	5	4	3	covered
 spec	28.10	using var	5	3	12	2	0	3	0	7	covered
 spec	28.11	Collection element ownership	0	4	12	3	3	4	2	0	covered
-spec	28.12	Asynchronous disposal	0	2	6	0	0	0	1	5	covered
+spec	28.12	Asynchronous disposal	0	4	6	0	0	0	1	5	covered
 spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	0	8	0	0	3	0	5	covered
 spec	28.14	Scoped callback parameters: storage-bounded capture	19	8	22	0	0	14	0	8	covered
 spec	29	Iteration	0	0	0	0	0	0	0	0	n/a
@@ -391,7 +391,7 @@ stdlib	6.6	TaskCompletionSource<T> and OwningTaskCompletionSource<T>	2	0	6	1	0	2
 stdlib	6.7	Task static helpers	4	0	2	0	0	0	0	2	covered
 stdlib	6.8	Domain	3	0	5	1	0	1	0	3	covered
 stdlib	6.9	Channel<T> and ChannelSender<T>	7	0	13	1	0	2	1	9	covered
-stdlib	6.10	TaskScope (#808)	8	0	7	2	0	2	0	3	covered
+stdlib	6.10	TaskScope (#808)	9	0	7	2	0	2	0	3	covered
 stdlib	6.11	Locked<T> and RwLocked<T>	5	0	10	1	1	3	0	5	covered
 stdlib	6.12	Parallel	2	0	5	0	0	1	0	4	covered
 stdlib	7	System.IO	0	0	0	0	0	0	0	0	n/a

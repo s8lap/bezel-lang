@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.327.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.328.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -160,7 +160,7 @@ end RefreshBoth;           //   re-raises the FIRST fault (siblings cancelled)
 
 The mechanics worth knowing:
 
-- Consumption is `await using` **only** (a plain `using var` is a compile error — the drain must be awaitable).
+- Consumption is `await using` **only** (a plain `using var` is a compile error — the drain must be awaitable), and that binding is the scope's only owner: a `TaskScope` is never stored, passed or returned `owned`, used as a type argument (a generic call inferring `T` from it included), or converted to `Object` or an interface at an owning position. Pass it as a plain (borrowed) parameter of type `TaskScope` instead.
 - `await Join()` is mandatory on the normal path and is the *single* re-raise site.
 - The disposal edge (exception, early return) cancels, drains, and swallows — supervision lives at `Join`.
 
@@ -310,7 +310,7 @@ Static state is process-global — one instance across *all* domains — which m
 The **type-keyed** half of the taxonomy is four per-type stdlib **facts** — **synchronized**, **immutable**, **self-distributing**, **displacement-unbounded** — and three one-line derivations (spec §22.12/§28.13; stdlib §1): **form (i)** is warning-free when its type is *synchronized and not displacement-unbounded*; the `static readonly` warning is suppressed when it is *synchronized or immutable*; and `Shared<T>` is sendable when its payload is *(synchronized or immutable) and not self-distributing*. One **Facts** line at the type's stdlib section answers all three questions.
 
 - **`static readonly` of sendable-value-category value types, `string`, enums**, and **`const` of a primitive value type or `string`**: unrestricted — shared-immutable.
-- **`static readonly` of a class type**: admitted **with a warning** — the singleton is reachable from every domain, and confining it to one (or ensuring its own synchronization) is your obligation. The warning is suppressed exactly where the type's own fact line carries the guarantee — **synchronized** or **immutable**: the synchronized handles below, the data-owning locks, `FrozenArray<T>`, and `CancellationTokenSource`, the process-global shutdown source (spec §22.12 rule 4's machine-checked set).
+- **`static readonly` of a class type**: admitted **with a warning** — the singleton is reachable from every domain, and confining it to one (or ensuring its own synchronization) is your obligation. The warning is suppressed exactly where the type's own fact line carries the guarantee — **synchronized** or **immutable**: the synchronized handles below, the data-owning locks, `FrozenArray<T>`, `CancellationTokenSource`, the process-global shutdown source, and `Type`, the interned type token (spec §22.12 rule 4's machine-checked set).
 - **A mutable static** is a compile error unless it is one of four admitted forms: **(i)** an internally-synchronized handle — a type declaring **synchronized** and not **displacement-unbounded**: `Mutex`, `Semaphore`, the atomics, `ChannelSender<T>`, `SharedEventSource<T>`; **(ii)** the `Task?`/`Task<T>?` lazy cache (below); **(iii)** a value static of primitive or enum type — or the nullable form of either, or a plain (non-`owned`) inline array of those — admitted *with a warning* and no cross-domain promises; **(iv)** the owning-inline-array slot pool, likewise warned. (`Channel<T>` declares no facts — the channel is the single-consumer receiving end — publish a `ChannelSender<T>` static instead. The locks, `FrozenArray<T>`, and `CancellationTokenSource` are kept out of form (i) by **displacement-unbounded**: a mutable static's overwrite never disposes what it displaces, and stranding a lock's whole interior — or a whole frozen array — is the cost the fact names.)
 
 **The `Task?` cache** is the one admitted warning-free mutable static that holds a value your own code computes — form (i)'s members are all internally-synchronized handles. It exists because async values do not belong in static initializers (`await` is illegal there). Cache the *task*, not the value, and let every consumer await it — Pattern A fan-out through process-lived storage (spec §22.13):

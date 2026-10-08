@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.327. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.328. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.327 and `Bezel_Standard_Library.md` v0.327 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.328 and `Bezel_Standard_Library.md` v0.328 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -189,9 +189,10 @@ What a use of `T` in a generic body demands, and where its absence is rejected:
 | the same use in any member of a generic **type** you declare | `where T: hashable` on the type; to demand it of callers only, declare the member in `extension MyBag<T> where T: hashable` (public and same-module `internal` surface only) or as a generic method with its own type parameter. An override, interface implementation, operator, indexer, constructor, destructor, field initializer or settable property cannot move, so its use needs `where T: hashable` on the type | the constructed type, wherever it is named, whether or not that member is called | §3.6 rule 2 |
 | a use of the **method's own** parameter in a dispatched generic method — an interface method, a `virtual`/`abstract` method, an override or an implementation — beyond what the inherited constraints establish: `x = y`, `o as T`, a `Dictionary<T, int>` local | the constraint on the **interface or base** declaration (an implementation cannot add one); for `o as T`, an `is` test instead. Copying, boxing or `case`-binding the parameter, a `T?` local or a `[2]T` needs nothing: a dispatched method's `T` is never move-only and never an inline array | the declaring body itself, at its declaration — dispatch forms instantiations no call site sees; and any call of such a method at a move-only or inline-array type argument (`i.Put<[3]int>(v)`), at the call | §14.2 *Dispatched generic methods* |
 | a standard-library equality search at `T`: `Contains`, `Remove`, `IndexOf`, `LastIndexOf`, `LinkedList<T>.Find`, the span `IndexOf`/`Contains`/`SequenceEqual` | as the two rows above: in a generic body such a call counts as your own `Equals` use of `T` | your type or method at a `T` with no equality. `Array<T>` and the spans are not themselves rejected this way; at a concrete element type with no equality, the call is | §14.2, stdlib §4 |
-| another conditional member at `T`: `Array<T>.Sort()`; `Result<T, E>`'s `Map`/`MapError`/`AndThen`/`UnwrapOr` | its condition, read at your `T` the same way as the operation written on `T`: `Array<T>.Sort()` needs `where T: IComparable<T>` | `Sort()`: the call, in a body whose constraints on `T` do not establish it (as for `x.CompareTo(y)`); `Result<T, E>`'s four: your instantiations | §14.2 rule 2 |
+| another conditional member at `T`: `Array<T>.Sort()`; `Result<T, E>`'s `Map`/`MapError`/`AndThen`/`UnwrapOr` | its condition, read at your `T` the same way as the operation written on `T`: `Array<T>.Sort()` needs `where T: IComparable<T>` | `Sort()`: the call, in a body whose constraints on `T` do not establish it (as for `x.CompareTo(y)`); `Result<T, E>`'s four: your instantiations; a method reference over any of them (`var s: () -> () := xs.Sort;`): the formation, read as the call is | §14.2 rule 2, §27.6 |
 | naming `MyBag<T>` (a type of the second row), or calling such a generic method, at your own `T` | what `MyBag<T>` needs — wrapping does not hide the use | your type or method at its own instantiations, wherever `MyBag<R>` would be | §14.1 |
 | naming `C<T>` — or any argument whose fit depends on `T`: `C<T?>`, `C<Pair<T>>` — where `C` declares `where T: new()` (or any constraint); an extension head is such a naming | `T`'s own constraints must guarantee it, so restate it: `class Box<T> where T: new()`, `extension OwningArray<T> where T: class`. A declared `where` constraint is not carried the way the rows above carry a use | the naming | §14.2, §26.4 |
+| a `T`-typed value, or a `Box<T>` / `[2]T` value over one, stored in a field (an `Object?` field included), copied into a field-held or escaping collection, captured by an escaping closure, or returned carrying a plain parameter's or a local's borrow — §9.7's bullets | nothing at the declaration: each bullet is read at the instantiations whose `T` makes the value a value type that holds borrows (a record or inline array with a class component, a span, `CancellationToken`), so write the body for the class case; in a dispatched generic method (the dispatched-generic-method row) it is an error at the body unless the declaring method's constraints exclude such a `T` (`where T: class`; `where T: sendable` for a body over values, which also excludes function types) | the instantiation: `Wrap<Item>` over `static method Wrap<T>(a: T): Box<T> => new Box<T>(a);`, `Keep<Pair>` over a `_last := a` store; `Wrap<int>` and `Keep<Item>` are fine | §9.7, §3.6 rule 2 |
 | `new T()` under `where T: new()` | — | a substitution at a nullable reference type (`Widget?`); a nullable value type is admitted, and there `new T()` is `null` | §14.2 |
 
 **Visibility:** `public | internal | protected | private`. Top-level types default to `internal`; class members **must** state one, with exactly four exceptions (static constructor, destructor, `polymorphic`, `invariant`). No combined forms: ✗ `protected internal` (§13.2, §13.3, §13.5).
@@ -570,7 +571,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 |---|---|
 | a local, plain `var` or `using var`, whose scope does not strictly enclose a source's; an invocation; an argument to a function-typed parameter | **admitted**. A local helper lambda over a borrow needs no `using var`; reassigning a plain function-typed local is fine — each assignment is checked on its own; `using var` on a function-typed local adds only non-reassignability |
 | a store — a field or a collection, a property or indexer, a record component declared at a function type (at construction or in `with`), a choice payload declared at a function type, a slot of an inline array of function type (a local array included); a write through `out`/`ref`; a `return` (`yield return` included) | **rejected** — the only storage route is a `scoped` parameter (§28.14) |
-| a set-erasing position: a parameter declared `Object`, or one at a bare type parameter that your call instantiates at a function type — likewise a lambda or a function value passed to a parameter typed `() -> T` at such an instantiation | **rejected** — `x.Equals(f)`, and `Pick(f, g)` over `Pick<T>(a: T, b: T): T`; here a function-typed parameter of yours counts as capturing (it carries itself). Write `f = g` for equality and `(if c then f else g)` for a selector |
+| a set-erasing position: a parameter declared `Object`, or one at a bare type parameter that your call instantiates at a function type — likewise a lambda or a function value passed to a parameter typed `() -> T` at such an instantiation — or a field declared at a bare type parameter, written through a receiver instantiated at a function type (`b.V := f` at `b: Box<() -> int>`) | **rejected** — `x.Equals(f)`, and `Pick(f, g)` over `Pick<T>(a: T, b: T): T`; here a function-typed parameter of yours counts as capturing (it carries itself). Write `f = g` for equality and `(if c then f else g)` for a selector |
 
 Do not form a method reference whose parameter is a function type over such a parameter, an `out` one excepted (`var add := xs.Add;` with `xs: Array<() -> int>` is rejected; `var tg := d.TryGetValue;` with `d: Dictionary<string, () -> int>` is fine): write `lambda(g) => xs.Add(g)`. And a member taking `reg: ((T) -> ()) -> ()` cannot be used at a function-type `T` at all (§28.3, §28.14, v0.320).
 
@@ -664,7 +665,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.327 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.328 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1284,7 +1285,7 @@ public class Task
                                                                                           where T: class;
   static method FireAndForget(owned task: Task);
 end
-public class TaskScope: IAsyncDisposable                 // `await using` ONLY; not sendable
+public class TaskScope: IAsyncDisposable                 // `await using` ONLY, owned by that binding alone; not sendable
   constructor();
   readonly property Token: CancellationToken;
   method CancelAfter(delay: TimeSpan);   method Cancel();
@@ -2011,6 +2012,18 @@ var opt: Port? := null;            // where a zero value is genuinely wanted: Po
 public method WithValue(v: int): Port => new Port(v);      // the sanctioned update shape
 ```
 
+```bezel
+case h.Slots of                      // `h.Slots: [4 owned]Conn?` — a borrowing binding over an owning-inline-array FIELD
+  var a => do
+    var t := move h.Slots;           // the field is vacated; `a` now addresses storage holding no value
+    _ := a[0];                       // FAULT in checked mode: DisposedAccessException — the slots belong to `t` (§9.4, §15.3)
+    h.Slots := t;                    // restoration (§28.8.1); reads through `a` see the stored value again
+  end
+end;
+```
+
+> §15.3 / §9.4: a whole-value `move` out of a move-only **field** leaves the field's storage in the disposed state until the restoration store, and a `case` binding taken over the field before the move reads that state. Read what you need through the binding **before** the move, or move the field into a local first and match the local (`var t := move h.Slots; case t of …`).
+
 ### 7.4 Overloads and the `out` family
 
 ```bezel
@@ -2090,12 +2103,14 @@ var cfg := LoadAsync().Result;                            // ERROR inside async 
 using var j := Domain.Spawn(lambda() => Index(repo));     // ERROR: a spawn entry must be CAPTURE-FREE
 private static _cache: Dictionary<string, int> := new Dictionary<string, int>();   // ERROR: mutable static
 using var scope: TaskScope := new TaskScope();            // ERROR: TaskScope needs `await using`
+public static method Make(): owned TaskScope return new TaskScope(); end Make;   // ERROR: a TaskScope is owned only by its `await using var` binding
+await using var o: Object := new TaskScope();             // ERROR: same rule — no owned field, parameter, return slot, element, type argument or `Object`/interface conversion at an owning position
 using var g := mutex.Acquire();                           // ERROR inside an async body: it blocks
 public class FastBuilder: StringBuilder end FastBuilder;  // ERROR: a library class is closed to inheritance unless its section opens it
 sender.Send(move err);   // err: owned MyError, `sealed class MyError: Exception` — ERROR: not sendable (a compiler-known base)
 ```
 
-> §30.3: blocking waits are a compile error lexically inside `async` bodies. §30.14: a `Domain.Spawn` entry is a static method reference or a non-capturing lambda, and data enters only through the one explicit sendable argument. §22.12: a mutable static is an error outside four admitted forms (a synchronized handle; the `Task?`/`Task<T>?` lazy cache; a warned primitive/enum value static; the owning-inline-array slot pool). §12.4: only `Encoding`, `Stream`, `TextReader`/`TextWriter` and the exception family admit user subclasses; every other library class is closed, `sealed` written or not. §30.14: a class deriving from one of those is never sendable; `StringBuilder`, `Random`, `Stopwatch`, `Type` and `OwningBuffer<double>` are sendable; a comparer-built hash collection must not cross a domain (trust, not a check).
+> §30.3: blocking waits are a compile error lexically inside `async` bodies. §30.14: a `Domain.Spawn` entry is a static method reference or a non-capturing lambda, and data enters only through the one explicit sendable argument. §22.12: a mutable static is an error outside four admitted forms (a synchronized handle; the `Task?`/`Task<T>?` lazy cache; a warned primitive/enum value static; the owning-inline-array slot pool). §12.4: only `Encoding`, `Stream`, `TextReader`/`TextWriter` and the exception family admit user subclasses; every other library class is closed, `sealed` written or not. §30.14: a class deriving from one of those is never sendable; `StringBuilder`, `Random`, `Stopwatch`, `Type` and `OwningBuffer<double>` are sendable; a comparer-built hash collection must not cross a domain (trust, not a check). stdlib §6.10: a `TaskScope` is minted only as the initializer of an `await using var` binding at its own type and is owned by that binding alone — never an `owned` field, parameter or return slot, an owning element, a type argument, or an `owned Object`/interface conversion; pass it as a plain (borrowed) parameter typed `TaskScope`, `Object` or an interface (not a generic `T`), which is unrestricted.
 
 ```bezel
 await using var scope := new TaskScope();
@@ -2173,6 +2188,14 @@ case n of  1..5 => "small", _ => "other" end;  // ERROR when n is `int?`;  ✓ c
 invariant(_port <> null and _port! >= 0 and _port! <= 65535);
 ```
 
+```bezel
+public constructor()
+  _onReady := lambda() => do _ready := true; end;   // ERROR: a lambda body is outside the `readonly` assignment window, wherever the lambda is written (§22.8)
+end constructor;
+```
+
+> §22.8: a `readonly` field is assigned in a field initializer or in the constructor's own body (for `static readonly`, its static initializer or `static constructor()`), never inside a lambda, which can run after construction. Assign in the constructor; let the lambda read.
+
 ### 7.9 Small standard-library mistakes
 
 ```bezel
@@ -2182,6 +2205,7 @@ var l := new List<int>();          // no `List<T>` — the name is reserved
 arr.Count(pred);                   // does NOT reach the predicate count on an Array<T> receiver
 var s := "n = " + count;           // ERROR: no implicit ToString in `+`
 pool.Sorted();                     // OwningArray<T> declares no Sorted/Reversed copy-forms
+var sorter: () -> () := widgets.Sort;   // ERROR at the formation when `Widget` has no `IComparable<Widget>`: a reference over a conditional member is checked where it is formed, not where it is called
 var text := String.Format("{0}", x);   // no String.Format
 if a < b then ...                    // ERROR when either is `int?` (section 7.8)
 ```

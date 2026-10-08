@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.327 — October 2026**
+**Companion to the Bezel Language Specification, v0.328 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -12222,5 +12222,256 @@ Checked at the seams, with no edit needed:
     - #5509: the `IFinder` equality implementation with no `hashable` (reject at the body) and with it (accept); `i.Put<[2 owned]Node>(arr)` (reject at the call).
     - #5511: `Box<[3]int>` (reject); `FirstOrNull()` on `Array<[3]int>` (reject); `Array<[3]int>` constructed, indexed and iterated (run); `Stack<[3]int>.Pop()` (run) beside `TryPop` (reject).
     - #5554: the checked-mode fault after a holder kill (run, expect `DisposedAccessException`), with its control.
+
+---
+
+### v0.328 changelog (v0.327 → v0.328)
+
+**The questions v0.326 and v0.327 surfaced, decided under the owner's delegation.** On 2026-10-08 the owner directed: "Please resolve and decide all known spec related issues. Do proposals for issues that need them." v0.327 acted on that direction for every issue that carried `needs-owner-decision`. This revision acts on it for the questions those two revisions' lanes surfaced and did not file, and for the three `spec-question` issues filed beside them. Each decision is a delegated ruling (process §8, `accepted (delegated)`). A decision that changes what compiles went through a proposal, which graduates here. The decisions:
+- **Proposal [0143](proposals/0143-move-only-field-move-disposed-state.md)** (a whole-value `move` of a move-only field leaves its storage in the disposed state): the v0.327 #5554 critique's filing.
+- **Proposal [0144](proposals/0144-await-using-yield-key-object-and-interfaces.md)** (`Object` and every interface join §30.7's `yield return` key): raised by this revision's own ruling on the run-time `DisposeAsync`.
+- **Proposal [0145](proposals/0145-taskscope-owned-by-its-await-using-binding.md)** (a `TaskScope` is owned by its `await using var` binding alone): the question 0144 filed.
+- **Rulings, no proposal:**
+  - [#5629](https://github.com/s8lap/bezel-lang/issues/5629) (§9.7's bullets are read per instantiation in a generic body);
+  - a class field at a bare type parameter is a set-erasing position (the v0.327 `dM` critique);
+  - a lambda body is outside the `readonly` assignment window (the v0.327 `dE` lane);
+  - the `DisposeAsync` an `await using` awaits is the run-time object's (the v0.327 `dU` lane, under [#5592](https://github.com/s8lap/bezel-lang/issues/5592));
+  - the synchronous fallback is read per level (0144's question);
+  - `Type` carries the **immutable** and **self-distributing** facts (proposal 0138 §13);
+  - [#5634](https://github.com/s8lap/bezel-lang/issues/5634) (a method reference over a conditionally-admitted member is rejected where it is formed).
+- **Clarifications:** [#5635](https://github.com/s8lap/bezel-lang/issues/5635) (a dispatched generic method's requirement summary is its constraint set), with two §2.8.6 rows for a member's kind change; Guide 02 §7's typed-exception row.
+- **Already landed, no edit:** the other five entries on the run's list. §30.2's await-of-a-class sentence, stdlib §2.21's two bullets and the rationale's Guide 01 citation, and the #5606 decline row's group landed in v0.326. The enum and choice `Equals(Object?)` question was #5598, and the Guide 04 `Type` edits landed with it, both in v0.327.
+
+Four lanes:
+- `L1`: #5629, the bare-type-parameter field, the `readonly` lambda window, and proposal 0143.
+- `L2`: the run-time `DisposeAsync`, proposal 0144, `Type`'s facts, and the Guide 02 row.
+- `L3`: #5634, #5635 and the two §2.8.6 kind-change rows.
+- `L4`: proposal 0145, and the per-level synchronous fallback.
+
+Each lane passed its author's adversarial pass and an independent critique (`L2` two rounds): 15 blocking and 23 non-blocking findings, all resolved or recorded (`L1` 2 and 6, `L2` 4 and 8, `L3` 4 and 4, `L4` 5 and 5). The 87 edits (`L1` 30, `L2` 21, `L3` 18, `L4` 18 — three of `L4`'s anchored on `L2`'s inserted text) were applied as one sequence. A composition check added 19: 8 in the documents (1 spec, 4 stdlib, 1 rationale, 2 guide pins) and 11 in the proposals folder and the decline index.
+
+The critics' blocking findings were these:
+- `L1`:
+  - #5629's composition with proposal 0141 was misattributed and hidden from the owner. Two banked tests flip through v0.327's own text. The flip is now an outcome stated below, and the sound alternative that keeps the tests is a `rejected` row with a reopening bar.
+  - Proposal 0143 missed a read route: a direct read of the field through an alias of its holder, which the moved-from tracking does not see. Its encoding was also unstated, and the obvious one (`null` in the first slot) would fault on a live array. Both are added.
+- `L2`, round 1:
+  - Once the path is the run-time object's, a `TaskScope` held at `Object` or `IDisposable` escaped §30.7 and skipped its drain on abandonment. Proposal 0144 closes that face.
+  - One rationale anchor no longer matched after v0.327's composition. It is re-anchored.
+- `L2`, round 2:
+  - "The compiler already rejects both shapes" was false for `Object`, which resolves to a primitive type ref the check skips. The `Object` shape is spec-ahead-of-impl.
+  - 0144's example was rejected anyway by stdlib §6.10's `Join` check, and "closes the hole completely" overstated it. A converted `TaskScope` still reached a plain `using var`. 0144 gained a *Scope* section and filed the question, which proposal 0145 decides.
+- `L3`:
+  - #5634's overload posture contradicted §14.2's opening sentence ("only the member is absent") and proposal 0116's note. Its real precedent, §14.5 *Constraints* and the #5406 decline, went uncited. The opening sentence is amended.
+  - §22.6's *Method-reference arguments* would have read the new formation rejection as a candidate dropping out. It now says the condition is no formation criterion.
+  - #5635's paragraph covered the inherited witness, contradicting 0141's witness clause. The witness is carved out.
+  - "No edit changes the exclusion" was false, because adding `virtual` makes a method dispatched. It became the two kind-change rows.
+- `L4`:
+  - "A borrow reaches no disposal path" was false, because a direct `DisposeAsync()` has no receiver condition. It now reads "no synchronous disposal path".
+  - The owning-position list named record components, which are never owned. It missed `out` and lambda parameters and function-type slots. It now cites §28.1.
+  - The per-instantiation alternative's decline cited the wrong precedent. Its true grounds are §28.1's erasure clauses and `new T()`.
+  - The type-argument ban silently rejected borrows at generic parameters. It is now stated.
+  - An `abstract` `DisposeAsync` level made every subclass fallback-less. Such a level now performs no cleanup and needs no fallback.
+
+**Outcomes the owner should see.**
+- **Two banked tests flip under #5629, through proposal 0141.** `codegen_5129/named_closure_local_virtual_callee_not_released_no_uaf` and `codegen_5216/lambda_literal_virtual_callee_not_released_no_uaf` override `virtual method Keep<U>(x: U)` with `F := x;` into `public F: Object?` and call at `U = () -> int`.
+  - That store is §8.6's box of a value that may hold borrows. 0141 rule 2 makes such a requirement a compile error at a dispatched body, and #5629 says it is one. 0141's survey recorded the two bodies as unchanged, having weighed only §8.6's move-only half.
+  - **The declined alternative:** widen 0141's exclusion to value types that hold borrows at every dispatched call. It is sound and has zero measured call sites, and it keeps both tests unchanged. It is declined because it reverses 0141's recorded choice, made a week earlier, and rejects read-only dispatched bodies at ordinary record arguments. Its `rejected` row's bar is a program neither bound serves, or an owner direction; it would then be a proposal amending 0141.
+  - **The remedy's cost:** `where U: class` keeps each test's subject, since `() -> int` satisfies it. But it closes such a body to every value-type argument, `int` included. `where U: sendable` admits values without borrows but excludes function types and open classes. No constraint means exactly "holds no borrows".
+  - A residual stays open under either option: `b.Keep<Object>(span)` launders the store through a plain `Object` parameter. That is filed as a question ([#5645](https://github.com/s8lap/bezel-lang/issues/5645)).
+- **Proposal 0145's restrictions are wider than "no upcast".**
+  - A `TaskScope` is minted only as the initializer of an `await using var` binding whose static type is `TaskScope`. It is never an `owned` parameter, field, return slot, choice payload or function-type slot, never an owning element or `Shared<T>` payload, and never converted to `Object` or an interface at an owning position.
+  - It is **no type argument at all, explicit or inferred**, because §14.1 counts an inferred argument as an instantiation site. So `Log(scope)` over `Log<T>(x: T)` is rejected although it passes a borrow. The remedy is a plain parameter of type `TaskScope`. `List<TaskScope>`, a borrowing collection, is rejected too, and its per-instantiation admission is declined with a reopening bar.
+  - Measured reach: zero sites.
+- **0144's `Object` case is ahead of the compiler.** The compiler already rejects every interface-typed `await using var` live across a `yield return`. It **admits** the `Object`-typed one, because `Object` resolves to a primitive type ref that `awaitUsingYieldSensitive` skips. The interface half flips nothing; the `Object` half is tracked ([#5654](https://github.com/s8lap/bezel-lang/issues/5654), item 1). Under 0145, a `TaskScope` can no longer be held at `Object` by an `await using var` at all. 0144's key still covers a program's own class without a synchronous fallback held at `Object`.
+- **#5634 cannot be observed yet.** The compiler forms no bare reference over a compiler-known collection member: each is "not yet supported" (#2470/#2537's interim). The ruling's first visible effect will be on that implementation.
+- **`Type` gains two facts, and one verdict moves.** A `static readonly` of type `Type` is warning-free under §22.12 rule 4. The compiler never warned on it, because it emits rule 4's warning only for user types and `Channel<T>`. No program's diagnostics change.
+
+A composition check over the union then fixed six seams:
+- Proposal 0144 cited Appendix C.11 for the §30.7 `yield return` row, in its *Target modules*, its §5 and its README row. The row is in C.6 (*Async*; C.11 is *Static initialization*). All three now say C.6. Proposal 0145 §6 kept a bare "component" that its critique had removed from the owning-position list elsewhere.
+- #5629 was named nowhere in the documents: not in rationale §5.7's paragraph, nor in its two decline rows. All three now cite it. Appendix C had no row for the per-instantiation reading of §9.7's bullets, nor for v0.326's two-return form. C.4 now has one, including the dispatched-body and declaration-held cases.
+- `L3`'s #5634 ruling retired the "absent member" reading of §14.2. Two stdlib sentences from v0.327's #5511 register row still used it: stdlib §1's Try convention ("Neither … exists") and §6.9 ("there is no `TryReceive`"). Both now say the member is not admissible. Stdlib §4's `Sort()` note and §4.14's `DangerousPointer()` paragraph named the call as the only rejection site, and now name the formation of a method reference too.
+- Proposals 0143–0145 flip to `graduated-v0.328`, and their README rows move from the live queue to *Graduated*, in number order. 0144's status line records two facts. Its §30.7 clause and C.6 row read *without a synchronous fallback* at landing, through `L4`'s per-level ruling. And proposal 0145 decides its *Scope* question.
+- Guides 02 and 04 are edited, so their pins move to v0.328.
+- The decline index's size line is recomputed for the revision (below).
+
+Checked at the seams, with no edit needed:
+- **`L2` × `L4` × 0144.**
+  - §28.12's run-time paragraph, §30.7's class clause and Appendix C.6's row each read *without a synchronous fallback*, defined once in §28.12. `L4`'s three edits rewrite `L2`'s three phrasings.
+  - `TaskScope` declares no destructor, so it is without a synchronous fallback and stays rejected across a `yield return` at its own type. 0145 rejects it at the initializer at `Object` or an interface, so §30.7's sentence naming those faces "rejected above" holds twice over.
+  - 0145's quiescence ground does not depend on the open question of who may call `DisposeAsync()` through a borrow, because that call awaits the drain.
+  - One divergence is filed, not fixed: step 2 still skips the destructor of a level declaring an `abstract` `DisposeAsync`, while the new definition treats that level as performing no cleanup ([#5647](https://github.com/s8lap/bezel-lang/issues/5647)).
+- **`L1` × 0141 × `L3`.**
+  - #5629 decides §9.7's bullets at a dispatched body. #5635 makes that body's requirement summary its constraint set. The two compose: the store is a compile error in the declaring module, not a delta.
+  - A non-dispatched public generic's §9.7 requirement is an ordinary rule-2 requirement under §2.8.6's existing summary rows.
+  - The new kind row says that a method becoming dispatched turns such a requirement into an error in the edited module.
+  - The bare-type-parameter field ruling cites 0140's induction and does not restate it.
+- **`L3`'s §14.2, §15.1, §22.6 and §27.6 edits × v0.327's #5511 register rows.**
+  - Appendix C.1's nullable row and §15.1's sentence now name the property read and the formation.
+  - The code-generation reference's §7.3 `FirstOrNull()` pair says the member's `T?` "has no form", which stays true.
+  - Guide 05 §5's "the `*OrNull` members do not exist" at an inline-array element is left. Every `*OrNull` overload is conditional, so no reading can re-route a call there. The guide is not otherwise touched, and its pin stays at v0.327.
+- **The code-generation reference.** Every new rule has a table row or a *Looks right, is rejected* pair, with no pin in prose:
+  - #5629: a generics-table row.
+  - The bare-type-parameter field: the *Closures by position* set-erasing cell.
+  - The `readonly` lambda window: a §7.8 pair.
+  - 0143: a §7.3 pair.
+  - #5634: the conditional-member row's cell and a §7.9 line.
+  - 0145: the `TaskScope` listing comment, two §7.6 lines and a note sentence.
+
+  Needing none: the run-time `DisposeAsync` (no verdict moves), `Type`'s facts (the reference carries no statics table), #5635 (doc-only), and 0144 and the per-level fallback. The reference states neither §30.7's rule nor §28.12's warning anywhere, so there is no row to amend. A row for them is a gap for a later pass, not a seam.
+- **Appendix C.** The rows are:
+  - C.1: #5634's use-site rule.
+  - C.3: the set-erasing field and the per-level warning row.
+  - C.4: #5629's row (composition).
+  - C.5: the `readonly` lambda window and 0143's moved-field state.
+  - C.6: the run-time `DisposeAsync`, 0144's key and 0145's holder rule.
+  - C.11: `Type` in the suppression set.
+
+  #5635 is doc-only and §2.8.6 has no Appendix C row.
+- **`scripts/check_docs.sh`.** `EXPECT_TYPED` moves from 12 to 13: the 11 fact-granted types (`Type` added) plus `Channel<T>`'s and `ScopeGuard`'s explicit `— none` lines. `FACTS` recomputes all three derived sets clean. Rule 4's set gains `Type`; form (i) and the `Shared`-payload set are unchanged.
+
+- **§9.7, §3.6 rule 2, Appendix C.4, rationale §5.7, the code-generation reference — a generic body's borrow-lifetime bullets are read per instantiation, for every bullet and for a type formed over a parameter (clarification, gated as a ruling; [#5629](https://github.com/s8lap/bezel-lang/issues/5629)).** v0.326 read §9.7's return bullet at each borrow-bearing instantiation of an `owned T` or `where T: value` return. It left open whether the other bullets, and a `Box<T>` over `record Box<T>(V: T)`, take the same reading or the declaration reading under §28.1's class-or-interface assumption.
+  - **They take the same reading.** In a generic body each bullet is a requirement of the body's use of a type parameter wherever the value's type is or is formed over one. It is checked at each instantiation at which that type holds borrows, and at none where it does not. The class-or-interface assumption governs the body's uses of a bare `T` as a reference, not this list.
+  - Over `record Pair(Item: Item)`: `static method Wrap<T>(a: T): Box<T> => new Box<T>(a);` is admitted at `Wrap<int>` and rejected at `Wrap<Item>`. A `class Keep<T>` storing `Put(a: T)` into `_last: T` is rejected wherever `Keep<Pair>` is named. A `class Bag<T>` copying into a field-held `Array<T>` is rejected at `Bag<Pair>`. A bare `T` stored into an `Object?` field is the same store, through §8.6's box.
+  - A type that holds borrows at every substitution (`record Tag<T>(Src: Item, V: T)`) is checked at the declaration. A dispatched generic method decides the requirement at its body (§14.2), so an override storing its bare-`T` parameter into an `Object?` field is rejected there unless the declaring method is bounded `where T: class`, or `where T: sendable` over values.
+
+  **Declined** (two `rejected` rows): the declaration reading, which rejects `Wrap<int>` and every generic pair-builder for a borrow no value substitution carries; and excluding value types that hold borrows at every dispatched call (above). Kernel: derivation (K2.4, via §9.7). Body-locality: carve-out (generic instantiation); at a dispatched body, 0141's local rule. **Compiler (tracked, [#5649](https://github.com/s8lap/bezel-lang/issues/5649), beside [#5630](https://github.com/s8lap/bezel-lang/issues/5630)):** `recordFieldIsBorrowCarrying` (`src/ownership/Ownership_Checks.cpp:5662–5690`) reads a type-parameter field as not borrow-carrying, and no per-instantiation re-run of the return, field-store or collection checks was located. HYPOTHESIS: `Wrap<Item>`, `Keep<Pair>` and `Bag<Pair>` compile today.
+- **§28.3 *Set-erasing positions*, *Function-typed holders*, the closure bullet, Appendix C.3, rationale §4.2, the code-generation reference — a class field declared at a bare type parameter is a set-erasing position (ruling, soundness; filed from the v0.327 `dM` critique, N6).** The holder definition keys on a field whose declared type is a function type. The set-erasing list named parameters, return slots, `ref`/`out` locations, record components, choice payloads and inline-array slots at a bare type parameter, but not fields. So `b.V := f` through a `Box<() -> int>` receiver, over `class Box<T> public V: T; end Box;`, sat in neither list, while a read `_g := b.V` carried the empty set.
+  - The field, instance or static, joins the set-erasing list. At a function-type substitution, a store through such a receiver, or in a class deriving from the instantiation, admits a capture-free function value and rejects a capture-bearing one, checked at the writer.
+  - Inside the generic body every value of that type the body can store there arrived capture-free (0140's induction), so the read's empty set is now grounded at every instantiation.
+  - A `scoped` field is declared only at a function type, so the exclusion that names it is vacuous and kept for symmetry with the holder list.
+
+  **Declined** (one `rejected` row): making such a field a function-typed holder at the substitution, the same verdict keyed on the wrong list. Kernel: derivation (K2.3 + K2.4). Body-locality: local, enforced per instantiation category. **Compiler (tracked, [#5650](https://github.com/s8lap/bezel-lang/issues/5650), with [#5514](https://github.com/s8lap/bezel-lang/issues/5514)):** no set-erasing check exists.
+- **§22.8, Appendix C.5, rationale §9.16, the code-generation reference — a lambda body is outside the `readonly` assignment window (ruling; the v0.327 `dE` lane's surfaced question).** §22.8 admitted a `readonly` field's assignment "in a constructor body", and nothing said whether a lambda written there counts. Read lexically it did. A function value could then assign the field after construction, or twice during it, against the premise §7.4 and §22.8 both state: no writer on any path outside the window.
+  - The window is lexical and excludes nested function bodies. An assignment to a `readonly` field, or to a `readonly` auto-property (§23.1), inside a lambda written in a constructor body, a field initializer, a static constructor or a static field initializer is a compile error wherever the lambda stands. So is binding the field to a `ref`/`out` parameter there.
+  - The remedy is to assign in the constructor and let the lambda read.
+
+  **Declined** (one `rejected` row): the lexical-inclusion reading, and admitting the assignment where the lambda is invoked only within the window, since a function value's invocation sites are not a body-local fact. Liftable, recorded in the rationale: §7.4 still refuses narrowing a `readonly` field inside such a lambda. Kernel: no contact. Body-locality: local. **Compiler (tracked, [#5651](https://github.com/s8lap/bezel-lang/issues/5651)):** sema never resets `inConstructor_` for a lambda body (`src/sema/ExprTypecheck.cpp:17826–17855`), so the store compiles today.
+- **§9.4, §15.1.1, §15.3, §19.3, §28.3 *Scope*, Appendix C.5, rationale §9.15, the code-generation reference — a whole-value `move` of a move-only field leaves its storage in the disposed state (design change, [proposal 0143](proposals/0143-move-only-field-move-disposed-state.md); filed from the v0.327 #5554 critique, NB5).** A borrowing-match binding over an owning-inline-array or owning-choice instance field addresses the field's storage in place. A whole-value `move` of the field during the arm left the binding reading storage whose slots the taker owns: released, if the taker was disposed, and for a boxed slot with no flag. Fields are not frozen (K5.6). §19.3's write-point rule does not reach a whole-scrutinee binding over a field. §28.3's slot-kill-by-move clause is the domain clause. The read was neither rejected, nor backstopped, nor recorded trust.
+  - In checked mode the move now leaves the vacated storage in §9.4's disposed state until the restoration store, which replaces it with a value visible whole.
+  - A read through the binding in between faults as `DisposedAccessException`. So does a read of the field itself through an alias of its holder, which the moved-from tracking does not see.
+  - The state lives in the field's own storage, with no layout change: a reserved tombstone address in the array's first slot, or an unused tag for an owning choice. Unchecked mode elides both the write and the test.
+
+  **Declined** (three `declined-at-proposal` rows): extending §19.3's write-point rule to the field binding, which is blind to an alias and would reject the binding across every non-pure call; a recorded K4.3 trust clause, which K4 refuses where a backstop exists; and a K5.6 freeze exception, also blind to an alias. Kernel: K4.1's flag tier at one more site, no new axiom. Body-locality: local. **Compiler (tracked, [#5652](https://github.com/s8lap/bezel-lang/issues/5652), the companion of [#5642](https://github.com/s8lap/bezel-lang/issues/5642)):** no disposed-state encoding exists for either move-only kind.
+- **§28.12, Appendix C.6 — the `DisposeAsync` an `await using` awaits is the run-time object's (ruling; the question v0.327's `dU` lane left under [#5592](https://github.com/s8lap/bezel-lang/issues/5592)).** `await using` selects the logical-disposal path by the class of the object the binding holds, as the synchronous path selects the destructor chain it runs (§28.4), never by the binding's static type.
+  - This holds through a base class that does not implement `IAsyncDisposable`: `await using var b: Base := new Der();` with `class Der: Base, IAsyncDisposable` awaits `Der.DisposeAsync`, skips `Der`'s destructor and runs `Base`'s, the hierarchy step 2 already traces. It holds through `Object`, and through any interface, `IDisposable` included.
+  - Only an object whose class does not implement `IAsyncDisposable` takes the synchronous disposal.
+  - The static type decides only what is known before run time, which is what §30.7 reads (the next two bullets).
+
+  **Declined** (one `rejected` row): keying the path on the static type. The cleanup that runs would depend on an annotation the `await` cannot see, and it would not cover an `IAsyncDisposable`-typed binding at all. Kernel: no contact. Body-locality: local. **Compiler (tracked, [#5653](https://github.com/s8lap/bezel-lang/issues/5653)):** the resolution is keyed on the static class (`src/codegen/LlvmBackend_Setup.cpp:21142–21152`), and a static class without `DisposeAsync` takes the synchronous fallback. The interface-typed shape is [#3483](https://github.com/s8lap/bezel-lang/issues/3483) (measured), and reclamation keyed on the declared class is [#3515](https://github.com/s8lap/bezel-lang/issues/3515).
+- **§30.7, §28.12, Appendix C.6 — `Object` and every interface join §30.7's `yield return` key (design change, [proposal 0144](proposals/0144-await-using-yield-key-object-and-interfaces.md)).** With the path now the run-time object's, a `TaskScope` held at `Object` or `IDisposable` static type awaited its drain on the normal path and skipped it on abandonment at a `yield return`. That breaks stdlib §6.10's quiescence guarantee.
+  - An `await using var` of any interface or `Object` static type may not be live across a `yield return` in an async iterator, on the interface clause's own ground: neither can promise a destructor.
+  - Any other class static type stays admitted. A program's own subclass without a synchronous fallback, held at its base, takes the degraded path §28.12's warning names, as every implicit synchronous discharge of it already does.
+
+  **Declined** (two `declined-at-proposal` rows): the status quo, and widening the key to every non-`sealed` class, which rejects most typed `await using var` bindings in async iterators for a rare shape. Keying the path statically only at yield-crossing bindings is declined under the run-time ruling's row. Kernel: no contact. Body-locality: local. **Compiler (tracked, [#5654](https://github.com/s8lap/bezel-lang/issues/5654), three items, each probed before filing):** the `Object` head is admitted (`src/ownership/Ownership_Checks.cpp:20025`; `src/sema/TypeResolution.cpp:127`). A no-destructor class without `IAsyncDisposable`, and a compiler-known head, are over-rejected. An inherited destructor is counted (the next bullet).
+- **§28.12, §30.7, Appendix C.3, C.6, stdlib §2.10 — the synchronous fallback is per level (ruling; the question proposal 0144 §5 filed).** §30.7 keyed on a class that "declares no destructor", and §28.12's warning on one "without a destructor". Neither said whether a destructor the class only inherits counts.
+  - It does not. An inherited destructor is a base level's cleanup: §28.4's chain runs each level's own body, and §28.12 step 2 supersedes per level. It stands in for nothing declared above it.
+  - A class is **without a synchronous fallback** when any level of its chain declares or overrides a non-`abstract` `DisposeAsync` and declares no destructor of its own. So `class Der: Base, IAsyncDisposable`, with only `Base` declaring a destructor, draws §28.12's warning and may not be live across a `yield return`.
+  - A class that only inherits a `DisposeAsync` together with the destructor paired with it at that level has its fallback, and is neither warned nor rejected. A literal "declares no destructor" would warn every subclass of a correctly written async-disposable base.
+  - An `abstract` `DisposeAsync` performs no cleanup and needs no fallback.
+  - §28.12's run-time paragraph, §30.7's class clause and Appendix C.6's row read the defined term, and stdlib §2.10 says the destructor belongs at the level that declares `DisposeAsync`.
+
+  **Declined** (one `rejected` row): the inherits reading, under which `Base`'s destructor would discharge `Der`'s asynchronous cleanup. Kernel: no contact. Body-locality: local. **Compiler (tracked, item 3 of [#5654](https://github.com/s8lap/bezel-lang/issues/5654)):** `awaitUsingClassHasSyncDisposeFallback` (`src/ownership/Ownership_Checks.cpp:19990–20013`) returns at the first destructor at any level and admits `Der`. The §28.12 warning is unimplemented (`s28_12_0003`, a banked `fail`), and its implementation takes the per-level fact.
+- **Stdlib §6.10, §5.1, Appendix C.6, Guide 04 §4, rationale §12.12, the code-generation reference — a `TaskScope` is owned by its `await using var` binding alone (design change, [proposal 0145](proposals/0145-taskscope-owned-by-its-await-using-binding.md)).** Stdlib §6.10's "consumption is `await using` only" was stated by binding form, which is checkable only while the static type is `TaskScope`. A scope reaching another owning position was discharged on §28.12's implicit synchronous path, which skips the drain while children hold the frame's borrows: an `owned` field, parameter or return slot, an owning element, a `Shared<T>` payload, or an owning position of `Object` or an interface through a §5.1 upcast (`Make(): owned Object` returning `new TaskScope()`, bound by `using var o := Make();`).
+  - A `TaskScope` is minted only as the initializer of an `await using var` binding whose static type is `TaskScope`, and that binding owns it alone. A `using var` is never moved out of (§28.10).
+  - Every other owning position is a compile error at the site: a plain, `using` or `const` binding; an undisposed drop; any §28.1 `owned` position; an owning element or slot; a `Shared<T>` payload; and an owning position of `Object` or an interface reached by conversion. `TaskScope?` reads as `TaskScope`.
+  - `TaskScope` is no type argument, explicit or inferred (§14.1). That also stops `new T()` under `where T: new()` from minting one.
+  - Other borrows are unrestricted: a plain parameter at `TaskScope`, `Object` or an interface, a pattern binding, a child's self-capture. No implicit discharge runs on a borrow, and `Dispose()` through one is already a compile error (§28.6), so no borrow reaches a synchronous disposal path.
+  - §5.1 now says that a reference conversion into an owning position of the wider type is an owning position of the source's type.
+
+  **Declined** (three `declined-at-proposal` rows): the status quo; a bare conversion ban, which closes only the upcast faces and rejects harmless borrows; and a per-instantiation check admitting `TaskScope` as a type argument. No borrowing collection of scopes exists to admit, and the check would need reject-at-substitution clauses where §28.1 erases `owned T`, plus a `new T()` check. The whole-argument ban is §14.2's existing shape. The degraded synchronous destructor stays `deferred` on its own row, its condition unmet. Kernel: no contact. Body-locality: local. **Compiler (tracked, [#5657](https://github.com/s8lap/bezel-lang/issues/5657), six items, probed before filing):** `checkTaskScopeConsumption` (`src/ownership/Ownership_Checks.cpp:23680–23810`) checks locals, `const`, discards and `scope.Dispose()` only. It also over-rejects a borrow alias `var s2 := scope;`, and sema calls `DisposeAsync` on a `TaskScope` "no member"; both are pre-existing.
+- **Stdlib §2.13; spec §22.12 rules 2 and 4 and note (a), Appendix C.11; rationale §12.13; Guide 04 §8; `scripts/check_docs.sh` — `Type` is granted the immutable and self-distributing facts (ruling; proposal [0138](proposals/0138-compiler-known-sendability.md) §13's filed question).**
+  - `Type` gains a **Facts** line. It is **immutable**: the one interned, never-written instance per type (§28.9). It is **self-distributing**: `typeof` is the type's own distribution channel, and since `owned Type` is inadmissible, no `Shared<Type>` could exist. **Displacement-unbounded** is not granted, because an overwrite strands nothing.
+  - **The consequence:** `Type` joins §22.12 rule 4's warning-suppression set, so a `static readonly` field or auto-property of type `Type` is warning-free. It takes a row beside `string` in the first verdict table.
+  - The form-(i) set is unchanged: `Type` is not **synchronized**, so a mutable `static` of `Type` stays rule 2's closing error, now stated at note (a). The `Shared`-payload set is unchanged.
+
+  **Declined** (two `rejected` rows): classifying `Type` under rule 3's immutable content beside `string` with rule 4 excepting it, which gives one type two carriers and confronts no derived set; and an admitted mutable-`static` form for `Type`, which would be sound but which no program needs, since `typeof`, the warning-free `static readonly` and the `Locked<T>` registry spell every use found. Kernel: contact, no movement (§28.13 derives). Body-locality: local. **Compiler (tracked, [#5655](https://github.com/s8lap/bezel-lang/issues/5655)):** rule 4's warning is emitted only for user types and `Channel<T>` (`src/sema/TypeResolution_Checks.cpp:14503–14517`). Its deferred built-in-head form, the #1393 residual, which no open issue carried, is filed with `Type` in its suppression list.
+- **§14.2 (opening sentence, rules 2 and 4), §15.1, §22.6 *Method-reference arguments*, §27.6, Appendix C.1, rationale §10, stdlib §1, §4, the code-generation reference — a method reference over a conditionally-admitted member is rejected where it is formed (ruling; [#5634](https://github.com/s8lap/bezel-lang/issues/5634)).** Rule 2 said "a call … is rejected at the call". A use of a register member at a receiver instantiation that fails its row's condition is now rejected at the use. A call is rejected at the call, and a property read at the read (`LinkedList<[3]int>.First`). A method or property reference, bound or unbound, is rejected at the formation. Nothing is rejected at an invocation through the formed value, which reads a function type and never the receiver's type arguments.
+  - **Selection comes first.** The reference's overload is selected against its target, and the condition is read on the overload selected. The condition never makes an overload inapplicable or selects another: not at a call, not at a reference, and not at §22.6's per-candidate formation. §14.5 *Constraints* reads a generic method's own constraints the same way.
+  - So `var s := xs.Sort;` is §27.6's ambiguity between `Sort()` and `Sort(comparer)` at every element type. `var s: () -> () := xs.Sort;` at an unordered element is the register rejection, naming the comparer-taking overload.
+  - `var tg := d.TryGetValue;` at `Dictionary<string, [3]int>` is rejected by the nullable-companion row. In a generic body the formation reads the condition as rule 2 reads a call.
+  - §14.2's opening sentence now says an inadmissible member is absent as a use, not as an overload. Proposal 0116's note "the compiler decides admissibility before it ranks" is superseded.
+
+  **Declined** (two `rejected` rows): reading the condition at the invocation, where no site sees the receiver's arguments; and reading a failing condition as the overload's absence from the candidate set. That second reading is the register's form of the constraint-filtered applicability v0.316 declined (#5406): a conformance edit would re-route a reference that compiles, and a generic body's resolution would vary by instantiation. Kernel: no contact. Body-locality: local. **Compiler (tracked, [#5656](https://github.com/s8lap/bezel-lang/issues/5656)):** every bare reference over a compiler-known collection member is rejected today as "not yet supported" (`src/sema/ExprTypecheck_Calls.cpp:25262`, `:25536`, `:25926`), so nothing flips.
+- **§2.8.6, §14.2 — a dispatched generic method's requirement summary is its constraint set (clarification; [#5635](https://github.com/s8lap/bezel-lang/issues/5635)).**
+  - The declared bodies of a dispatched generic method contribute no requirement to a requirement summary, other than an inherited witness's. Over the method's own type parameters the summary is its constraint set alone, so no edit to the declaring body, an override or an implementation is a summary delta. An edit that newly needs a requirement is a compile error in the edited module.
+  - A requirement on an enclosing type's parameter stays the type's, as §3.6 rule 2 reads every member body.
+  - The move-only and inline-array exclusion is a rule of the method kind, derivable from the carried signature, and is in no summary.
+  - The inherited witness reads the base method's own summary. A requirement that summary gains is breaking for every conforming class in another module as well as for callers.
+
+  **Declined** (one `rejected` row): a dedicated summary row, with no delta to classify. Doc-only.
+- **§2.8.6 — a member's kind change is classified (clarification; #5635's item 3, decided by `L3`'s critique).** The signature-delta table gains two rows.
+  - A member's `abstract`, `virtual` or `sealed override` modifier changed is **breaking**. `virtual` or `abstract` added rejects a non-sealed derived class's constructor that calls the member on `this` (§22.7 rule 2). `abstract` added also obliges every concrete derived class to override it (§12.5). Dropping the modifier or sealing an override breaks every override (§12.1). The reverse moves are **widening**: `abstract` made `virtual`, and `sealed override` made `override`.
+  - A public generic method becoming a dispatched generic method is **breaking** for its callers at a move-only or inline-array type argument, unless its constraint sets already exclude both. That holds whichever delta made it dispatched, an *implemented interface added* included.
+
+  Both verdicts follow from §2.8.6's definitions; no row named them. Doc-only.
+- **Guide 02 §7 — the typed-exception row states band 4's own test (guide).** The row named only "its payload is an owned resource". Stdlib §1's band 4 reads "its payload cannot be value-like", which also covers a payload that carries a borrow (§35.4). The row now says "its payload cannot be a plain value shape (it owns a resource, or carries a borrow; spec §35.4)". It now agrees with §7's closing paragraph.
+
+- **Migration.** *Newly rejected (spec-ahead-of-impl):*
+  - **#5629.** At an instantiation substituting a value type that holds borrows, a generic body's return of a `Box<T>`, `[2]T` or generic-choice value carrying a parameter's, local's or temporary's borrow (`Wrap<Item>`). Also its store of a bare-`T` or `Box<T>` value into an instance field, `Object?` fields included (`Keep<Pair>`); its copy into a field-held or escaping collection (`Bag<Pair>`); its capture by an escaping closure; and its store into a static field other than in the null-source form. Through §3.6 rule 2's chain, a declaration forming such an instantiation. At a dispatched body, the same store is rejected at the body. Measured reach: zero generic-type or static-method sites. The two banked tests above flip through 0141.
+  - **The bare-type-parameter field.** `b.V := f` at `b: Box<() -> int>`, or in a class deriving from `Box<() -> int>`, for an `f` with a non-empty source set. Measured reach: zero. The three such stores in `tests/` store a static method reference.
+  - **The `readonly` lambda window.** Every store form to a `readonly` field or auto-property inside a lambda written in a constructor, a field initializer, a static constructor or a static initializer, and a `ref`/`out` binding of one there. Measured reach: zero.
+  - **Proposal 0144.** An `Object`- or interface-typed `await using var` live across a `yield return` in an async iterator, `IDisposable` included. Measured reach: zero. The compiler already rejects the interface shapes and admits the `Object` one.
+  - **The per-level fallback.** An `await using var` of a class that declares or overrides `DisposeAsync` with no destructor of its own while inheriting one, live across a `yield return`. Measured reach: zero. The two such hierarchies in `tests/` declare the destructor at `Der`'s level, or use no iterator.
+  - **Proposal 0145.** A §28.1 `owned` position of type `TaskScope` or `TaskScope?`. `TaskScope` as a type argument, explicit or inferred (`OwningArray<TaskScope>`, `Shared<TaskScope>`, `Task<TaskScope>`, `Log(scope)` at `Log<T>(x: T)`, `Make<TaskScope>()` at `where T: new()`). An owning conversion (`return new TaskScope();` under `owned Object`; `await using var o: Object := new TaskScope();`). An unbound `new TaskScope();` statement. Measured reach: zero sites in `tests/`, the documents and both corpora.
+  - **#5634.** A method or property reference formed over a register member at a non-satisfying receiver instantiation: `var s: () -> () := xs.Sort;` at an unordered element, `var c: (R) -> bool := xs.Contains;` at an `R` with no equality, `var tg := d.TryGetValue;` at `Dictionary<string, [3]int>`. Measured reach: zero. It cannot be observed until such references are formed at all.
+
+  *Newly warned (spec-ahead-of-impl):* the per-level fallback's `Der` at its declaration.
+
+  *Newly warning-free:* a `static readonly` field or auto-property of type `Type` (no compiler change: it never warned); a class that only inherits a paired `DisposeAsync` and destructor.
+
+  *Newly defined:*
+  - 0143: the checked-mode `DisposedAccessException` on a read through a borrowing-match binding, or through an alias, of a move-only field's storage between a whole-value `move` and its restoration.
+  - The run-time `DisposeAsync` path, through a base, `Object` or an interface. No verdict changes.
+
+  *Doc-only:*
+  - #5635's paragraph and §14.2 clauses, and the two §2.8.6 kind rows.
+  - 0145's §5.1 sentence.
+  - Guide 02 §7's row and Guide 04's two bullets (§4's holder clause and §8's suppression list).
+  - The rationale records: §4.2, §5.7, §9.15, §9.16, §10 (two paragraphs), §12.12 and §12.13.
+  - Every code-generation reference row and pair named above.
+  - `DECLINED.md` gains 19 rows: 11 `rejected` and 8 `declined-at-proposal`. No row moves group. The index size is recomputed once: 744 rows — 421 · 132 · 144 · 7 · 40 · 0.
+  - Proposals 0143–0145 are `graduated-v0.328`, and their README rows are in *Graduated*, in number order.
+
+  *Spec-ahead-of-impl (tracking issues filed at landing):*
+  - #5629: §9.7's bullets per instantiation ([#5649](https://github.com/s8lap/bezel-lang/issues/5649), beside [#5630](https://github.com/s8lap/bezel-lang/issues/5630); the two flipping tests noted on [#5639](https://github.com/s8lap/bezel-lang/issues/5639)).
+  - The bare-type-parameter field ([#5650](https://github.com/s8lap/bezel-lang/issues/5650); a note on [#5514](https://github.com/s8lap/bezel-lang/issues/5514)).
+  - The `readonly` lambda window ([#5651](https://github.com/s8lap/bezel-lang/issues/5651)).
+  - 0143: the moved-field disposed state ([#5652](https://github.com/s8lap/bezel-lang/issues/5652); a note on [#5642](https://github.com/s8lap/bezel-lang/issues/5642)).
+  - The run-time `DisposeAsync` at an open base ([#5653](https://github.com/s8lap/bezel-lang/issues/5653); notes on [#3483](https://github.com/s8lap/bezel-lang/issues/3483) and [#3493](https://github.com/s8lap/bezel-lang/issues/3493)).
+  - 0144 and the per-level fallback: §30.7's check ([#5654](https://github.com/s8lap/bezel-lang/issues/5654), three items, probe first).
+  - `Type`'s facts: rule 4's built-in-head warning with `Type` in the suppression set ([#5655](https://github.com/s8lap/bezel-lang/issues/5655)).
+  - #5634: the formation path ([#5656](https://github.com/s8lap/bezel-lang/issues/5656)).
+  - 0145: the holder rule ([#5657](https://github.com/s8lap/bezel-lang/issues/5657), six items, probe first).
+  - The per-level reading at an abstract head is noted on [#3516](https://github.com/s8lap/bezel-lang/issues/3516).
+
+  *Owner decisions recorded:* the owner's 2026-10-08 delegation, under which every decision above is a delegated ruling. Proposals 0143, 0144 and 0145 were accepted under it and graduate here. #5629, #5634 and #5635 close with this revision.
+
+  *Filed as questions:*
+  - §8.6 / §28.3: may a callee store a plain `Object` or interface parameter that holds a boxed borrow-bearing value? `method K(x: Object) F := x;` called with a span keeps a dangling view with no rejection, backstop or recorded clause, and `b.Keep<Object>(span)` launders #5629's store through it ([#5645](https://github.com/s8lap/bezel-lang/issues/5645)).
+  - §28.6 / K3.9: may a borrow call `DisposeAsync()` directly? Recommended: extend §28.6's owner-only rule to it, exempting `base.DisposeAsync()` in an override ([#5646](https://github.com/s8lap/bezel-lang/issues/5646)).
+  - §28.12 step 2, a spec defect: a base that declares an `abstract` `DisposeAsync` and a destructor has the destructor skipped on the `await using` path, and its cleanup runs on neither path ([#5647](https://github.com/s8lap/bezel-lang/issues/5647)).
+  - §14.2: which calls does 0141's "a call of one — through … the base" reach, once another module makes a non-virtual base method an inherited witness ([#5648](https://github.com/s8lap/bezel-lang/issues/5648))?
+
+  *Decided by reading, not filed:*
+  - A `T?`-declared field, component, payload or slot at a function-type substitution (`L1`'s critic, NB6). Chapter 28's *Nullability in type keying* reads `T?` as `T`, so the position is on the set-erasing list.
+  - Whether a `TaskScope` converts to a supertype, and "declares" or "inherits" a destructor (`L2`'s second critique). These are decided by 0145 and the per-level ruling above.
+  - The condition at an overloaded callee's parameter, and a `Result` combinator reference in a generic body (`L3`). These are decided in the #5634 text.
+  - A `closed` static class type's path, and an overriding level below a `virtual` `DisposeAsync` base: no text change is needed.
+
+  *Guides:* Guides 02 and 04 are edited and re-checked against v0.328, and their pins move. Guides 01 and 05 stay at v0.327, and Guides 03, 06 and 07 at v0.326; no rule here touches them. No guide example changes verdict. No guide instantiates a user generic at a value type that holds borrows, stores a function value through a bare-type-parameter field, assigns a `readonly` field in a lambda, moves a move-only field under a borrowing `case`, or holds an `await using var` of `Object`, interface or inherited-destructor type across a `yield return`. Guide 04's `RefreshBoth` holds its scope at its own type and passes it as a borrow.
+
+  *Corpus:*
+  - The rule corpus stays at 2,195 cases, and no verdict or `baseline.tsv` row changes. `s30_7_0006` quotes the edited §30.7 sentence and still lints clean, and its `TaskScope`-free program is unaffected. `s28_12_0003` stays a banked `fail` until the warning lands. `l6_10_0001`/`0002` state the binding-form arms 0145 keeps.
+  - The doc-example corpus is unedited (#1380). The extraction gains `L1`'s two fenced pairs in the code-generation reference (§7.3 and §7.8), which renumber the reference's later fragments in a fresh extraction. Both are recorded for a corpus pass.
+  - Coverage gaps recorded, not written:
+    - #5629: `Wrap<Item>` (reject) and `Wrap<int>` (accept); `Keep<Pair>` and `Bag<Pair>` (reject); the `Der.Keep<U>` body (reject) and its `where U: class` twin (accept).
+    - The bare-type-parameter field: a capture-bearing `b.V := …` (reject) and a static method reference (accept).
+    - The `readonly` lambda window: the constructor and static-constructor stores (reject) and the read (accept).
+    - 0143: the fault, its before-the-move and after-restoration controls, and the owning-choice twin.
+    - The run-time `DisposeAsync`: `s28_12_0007` (run).
+    - 0144 and the per-level fallback: `s30_7_0007` (reject), `s28_12_0008`/`0009` (warn, quiet), and the `Object` head (reject).
+    - 0145: `l6_10_0008`–`0012` (reject) and a borrow alias (accept).
+    - #5634: `var s: () -> () := xs.Sort;` (reject).
+    - `Type`: a `quiet` `static readonly` case, once `typeof` runs.
 
 ---
