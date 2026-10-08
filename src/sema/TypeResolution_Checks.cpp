@@ -1118,11 +1118,35 @@ void Resolver::checkTypeAbstractPropertyBodies(TypeSymbol* t) {
 // sharing it would mean threading a "which members" parameter through an
 // unrelated loop for one caller — a new, narrower predicate is the
 // smaller change.
-static bool isObjectVirtualReplacementMember(const MethodSymbol* ms) {
+//
+// fix #5610 (§10.5 / §35.2, v0.315): `Equals` arity-1 admission now also
+// checks the parameter type — it must be the owner type (the enum or
+// choice itself) or `Object?`. The comment above said both arity-1
+// spellings were admitted "alike"; that covered `Equals(E)` and
+// `Equals(Object?)`, not `Equals(x: int)` or any other parameter type.
+// The #3837 openness the old comment cited covers `Equals(Object?)` only,
+// not an arbitrary parameter type.
+static bool isObjectVirtualReplacementMember(
+    const MethodSymbol* ms, const SemaContext& sema, TypeSymbol* owner) {
     if (!ms || ms->isOperator) return false;
     if (ms->name == "GetHashCode" || ms->name == "ToString")
         return ms->params.empty();
-    if (ms->name == "Equals") return ms->params.size() == 1;
+    if (ms->name == "Equals" && ms->params.size() == 1) {
+        auto* param = dynamic_cast<ParameterSymbol*>(ms->params.front());
+        if (!param || !param->declType) return false;
+        const TypeRef* paramTy = sema.resolvedType(*param->declType);
+        if (!paramTy) return false;
+        // Valid: Equals(E) where E is the owner type
+        if (paramTy->kind == TypeRef::Kind::Named &&
+            paramTy->declaration == owner)
+            return true;
+        // Valid: Equals(Object?) — nullable Object
+        if (paramTy->kind == TypeRef::Kind::Primitive &&
+            paramTy->primitive == PrimitiveType::Object &&
+            paramTy->nullable)
+            return true;
+        return false;
+    }
     return false;
 }
 
@@ -1331,7 +1355,7 @@ void Resolver::checkEnumRestrictions() {
                 // double-report that case.
                 bool overrideAdmitted = hasMod(ms, "override") &&
                     !hasMod(ms, "sealed") &&
-                    isObjectVirtualReplacementMember(ms);
+                    isObjectVirtualReplacementMember(ms, ctx_, t);
                 if (hasMod(ms, "virtual") || hasMod(ms, "abstract") ||
                     (hasMod(ms, "override") && !overrideAdmitted)) {
                     ctx_.diagnostics().report(
@@ -1599,7 +1623,7 @@ void Resolver::checkChoiceDispatchModifiers() {
             // `sealed`, already caught by checkTypeStaticNotVirtual).
             bool overrideAdmitted = hasMod(ms, "override") &&
                 !hasMod(ms, "sealed") &&
-                isObjectVirtualReplacementMember(ms);
+                isObjectVirtualReplacementMember(ms, ctx_, t);
             if (hasMod(ms, "virtual") || hasMod(ms, "abstract") ||
                 (hasMod(ms, "override") && !overrideAdmitted)) {
                 ctx_.diagnostics().report(
