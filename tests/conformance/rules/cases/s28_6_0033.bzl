@@ -7,7 +7,7 @@
 //!   no other `this`-rooted disposal call is, in that body or elsewhere.
 //! cites: 28.6, 28.12, C.3
 //! expect: reject
-//! diagnostic: borrow
+//! diagnostic: dispose itself
 //! issue: 5660
 module Conf;
 
