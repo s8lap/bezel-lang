@@ -335,3 +335,32 @@ each is v0.307 outrunning the implementation, confirmed by re-deriving the
 observed behaviour on this batch's own `bezelc` rather than trusting the
 issue's numbers. Re-run after banking: `2184 cases: 1758 ok, 426
 known-divergent, 0 unclassified, 0 REGRESSION, 0 UNBANKED`.
+
+### v0.324–v0.329 catch-up — 2026-10-08 (unclassified)
+
+Spec revisions v0.324–v0.329 landed with their coverage gaps recorded in each
+changelog entry ("Coverage gaps recorded, not written"). This entry writes
+them: **120 new cases** (2195 → 2315), authored from the v0.329 text with no
+`bezelc` available, so **none is banked** — every new case is UNCLASSIFIED
+(green in the `rule-corpus-baseline` phase; `--strict-new` lists them). They
+were deliberately not hand-banked as `fail`: several of the rules they pin are
+already enforced by the compiler, and a hand-banked `fail` that the compiler
+passes is an UNBANKED gate failure. The next classification on a development
+box banks them from observed verdicts, per the triage rule above.
+
+Each case was written by one lane and verified by an independent reader against
+the spec text (no compiler run); spec-ahead cases carry an `issue:` header
+naming their implementing tracker.
+
+| area | sections | cases |
+|---|---|---|
+| bare-type-parameter and borrow soundness (#5595, #5599–#5602, #5607, #5608, #5616, #5617, #5619, #5620, #5629, 0146, #5526) | 28.3, 28.11, 28.14, 9.7, 8.6, 22.16 | 52 |
+| disposal and async (0139, #5592, 0144, 0145, 0147, #5647, the run-time `DisposeAsync`, the per-level fallback) | 28.6, 28.10, 28.12, 30.7, stdlib 6.10 | 21 |
+| sendability and stdlib (0138, #5593, #5594, `Type`'s facts) | 12.4, 30.14, stdlib 2.7, 2.13, 3.1, 4.9, 4.14, 4.20, 8.1 | 15 |
+| generics and declarations (0141, #5511, #5554, 0143, 0142, the `readonly` lambda window, #5598, #5628, #5634, #5648) | 14.2, 15.1, 15.1.1, 9.4, 22.8, 10.5, 35.2, 22.6, 27.6 | 32 |
+
+Not written, and why: the #5604 comparer-held case (a §12.2 question blocks
+every comparer-implementing class), the §2.8.6 compatibility rows (they need
+two versions of one module), and `s28_3_0022`'s rewrite (parked with its
+compiler fix). Two existing cases, `s20_0013` and `s20_0014`, move out of a
+`using var` and are left unedited pending re-classification ([#5663](https://github.com/s8lap/bezel-lang/issues/5663)).
