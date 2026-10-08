@@ -77,7 +77,7 @@ spec	9.3	Combined form	7	1	5	0	0	3	0	2	covered
 spec	9.4	Mutability	0	3	7	2	0	3	0	2	covered
 spec	9.5	Non-destructive update: with	6	2	7	1	0	3	0	3	covered
 spec	9.6	Records and inheritance	1	1	4	1	0	2	0	1	covered
-spec	9.7	Records and disposal	15	5	16	6	0	9	0	1	covered
+spec	9.7	Records and disposal	17	6	16	6	0	9	0	1	covered
 spec	9.8	Serialization synthesis	1	8	8	4	0	4	0	0	covered
 spec	9.9	Constructor-only records	4	3	8	3	0	4	0	1	covered
 spec	10	Enums	0	0	0	0	0	0	0	0	n/a
@@ -248,7 +248,7 @@ spec	28.8.1	The move expression	1	2	16	5	0	7	0	4	covered
 spec	28.9	Runtime-managed types	7	5	18	1	5	5	4	3	covered
 spec	28.10	using var	5	3	12	2	0	3	0	7	covered
 spec	28.11	Collection element ownership	0	4	12	3	3	4	2	0	covered
-spec	28.12	Asynchronous disposal	0	4	6	0	0	0	1	5	covered
+spec	28.12	Asynchronous disposal	0	5	6	0	0	0	1	5	covered
 spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	0	8	0	0	3	0	5	covered
 spec	28.14	Scoped callback parameters: storage-bounded capture	19	8	22	0	0	14	0	8	covered
 spec	29	Iteration	0	0	0	0	0	0	0	0	n/a
@@ -373,7 +373,7 @@ stdlib	4.12	Borrowing enumeration interfaces	0	0	3	0	0	0	0	3	covered
 stdlib	4.13	Owning enumeration interfaces	1	0	6	0	0	0	1	5	covered
 stdlib	4.14	OwningBuffer<T>, Span<T>, ReadOnlySpan<T>	2	0	13	0	0	8	0	5	covered
 stdlib	4.15	ArraySpan<T>, ReadOnlyArraySpan<T>	0	0	6	0	0	3	0	3	covered
-stdlib	4.16	IReadOnlySpan<TElement>	0	0	4	0	0	2	0	2	covered
+stdlib	4.16	IReadOnlySpan<TElement>	1	0	4	0	0	2	0	2	covered
 stdlib	4.17	SortedDictionary<K, V>	1	0	6	0	0	0	0	6	covered
 stdlib	4.18	SortedSet<T>	0	0	4	0	0	0	0	4	covered
 stdlib	4.19	FrozenArray<T>	3	0	6	0	0	2	0	4	covered

@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.328. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.329. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.328 and `Bezel_Standard_Library.md` v0.328 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.329 and `Bezel_Standard_Library.md` v0.329 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -40,7 +40,7 @@ Read this page first. Every row is a habit that produces broken Bezel.
 | 10 | `x => x * 2` | `lambda(x) => x * 2` — the keyword is required; `lambda() => 0` needs the empty parens | §27.3 |
 | 11 | `(int)d`, `d as int` | `int(d)` — casts are call syntax on the type name. `as` yields `T?` and is a type test only | §5.2, §17.4 |
 | 12 | `var xs = [1,2,3];` | A collection literal has **no standalone type**: `var xs: Array<int> := [1, 2, 3];` or pass it where a parameter supplies the target | §15.4 |
-| 13 | `if (x is Dog d)` | `is` **does not bind**. `var d := x as Dog; if d <> null then …` or a `case` arm `var d: Dog`. Over a **value**-typed `x` (primitive, record, enum, choice, inline array, `()`), a class, interface, `string` or `Object` target is rejected — box first: `(var o: Object := p; o is IShape)` — and so is a different value type (`i is long` over an `int`: `is` tests the type, not whether the value fits) | §12.7, §19.3 |
+| 13 | `if (x is Dog d)` | `is` **does not bind**. `var d := x as Dog; if d <> null then …` or a `case` arm `var d: Dog`. Over a **value**-typed `x` (primitive, record, enum, choice, inline array, `()`), a class, interface, `string` or `Object` target is rejected — box first: `(var o: Object := p; o is IShape)`, unless `p` holds borrows (a span, a record with a class-typed field), which reaches no `Object` local (§9.7) and whose static type already answers the test — and so is a different value type (`i is long` over an `int`: `is` tests the type, not whether the value fits) | §12.7, §19.3 |
 | 14 | `if (count)` truthiness | Conditions are `bool`. Write `count <> 0` | §4.1 |
 | 15 | `i++` as an expression, `++i` | `++`/`--` are **postfix-only statements**: `i++;` on its own line, over an integer, floating-point, `decimal` or `char` operand only (§6.6's set — `char++` works). They are not overloadable: declare `operator +(c: Counter, n: int)` and write `c := c + 1;`, or use a named method. Assignments are statements too and produce no value | §17.6, §17.2, §6.6 |
 | 16 | `int? + int?` lifts | **Retired at v0.267.** Arithmetic, bitwise, shift, relational, compound and `++`/`--` over a nullable operand are a compile error — a §7.4-narrowed local counts as non-nullable at every one of them (`if n <> null then n += 1; end;` is fine). `=`/`<>`/`??`/`?.`/`?(args)`/`??=` still work | §7.11, §6.6 |
@@ -571,7 +571,7 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 |---|---|
 | a local, plain `var` or `using var`, whose scope does not strictly enclose a source's; an invocation; an argument to a function-typed parameter | **admitted**. A local helper lambda over a borrow needs no `using var`; reassigning a plain function-typed local is fine — each assignment is checked on its own; `using var` on a function-typed local adds only non-reassignability |
 | a store — a field or a collection, a property or indexer, a record component declared at a function type (at construction or in `with`), a choice payload declared at a function type, a slot of an inline array of function type (a local array included); a write through `out`/`ref`; a `return` (`yield return` included) | **rejected** — the only storage route is a `scoped` parameter (§28.14) |
-| a set-erasing position: a parameter declared `Object`, or one at a bare type parameter that your call instantiates at a function type — likewise a lambda or a function value passed to a parameter typed `() -> T` at such an instantiation — or a field declared at a bare type parameter, written through a receiver instantiated at a function type (`b.V := f` at `b: Box<() -> int>`) | **rejected** — `x.Equals(f)`, and `Pick(f, g)` over `Pick<T>(a: T, b: T): T`; here a function-typed parameter of yours counts as capturing (it carries itself). Write `f = g` for equality and `(if c then f else g)` for a selector |
+| a set-erasing position: a parameter declared `Object` (the receiver of an `extension Object` call included), or one at a bare type parameter that your call instantiates at a function type — likewise a lambda or a function value passed to a parameter typed `() -> T` at such an instantiation — or a field declared at a bare type parameter, written through a receiver instantiated at a function type (`b.V := f` at `b: Box<() -> int>`) | **rejected** — `x.Equals(f)`, and `Pick(f, g)` over `Pick<T>(a: T, b: T): T`; here a function-typed parameter of yours counts as capturing (it carries itself). Write `f = g` for equality and `(if c then f else g)` for a selector |
 
 Do not form a method reference whose parameter is a function type over such a parameter, an `out` one excepted (`var add := xs.Add;` with `xs: Array<() -> int>` is rejected; `var tg := d.TryGetValue;` with `d: Dictionary<string, () -> int>` is fine): write `lambda(g) => xs.Add(g)`. And a member taking `reg: ((T) -> ()) -> ()` cannot be used at a function-type `T` at all (§28.3, §28.14, v0.320).
 
@@ -665,7 +665,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.328 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.329 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1844,9 +1844,10 @@ for var conn in pool do
   conn.Dispose();                  // ERROR: only owners dispose
 end;
 method Close(s: Stream)  s.Dispose();  end Close;              // ERROR: `s` is borrowed
+async method CloseAsync(d: IAsyncDisposable): Task  await d.DisposeAsync();  end CloseAsync;   // ERROR: same rule — `d` is borrowed
 ```
 
-> §28.6: `Dispose()` needs a receiver you own. A borrowed parameter, `this`, a getter result, a `catch` binding, a pattern binding and an element borrow of *either* family are all rejected, with no exception.
+> §28.6: `Dispose()` needs a receiver you own. A borrowed parameter, `this`, a getter result, a `catch` binding, a pattern binding and an element borrow of *either* family are all rejected, with no exception. `DisposeAsync()` takes the same rule, awaited or not; the one `this`-rooted call admitted is `base.DisposeAsync()` inside your own `DisposeAsync` override.
 
 ```bezel
 pool.Clear();                                                  // disposes every element through the owner
@@ -2023,6 +2024,21 @@ end;
 ```
 
 > §15.3 / §9.4: a whole-value `move` out of a move-only **field** leaves the field's storage in the disposed state until the restoration store, and a `case` binding taken over the field before the move reads that state. Read what you need through the binding **before** the move, or move the field into a local first and match the local (`var t := move h.Slots; case t of …`).
+
+```bezel
+public static method Show(o: Object)
+  Console.WriteLine(o.ToString());
+end Show;
+
+using var buf := new OwningBuffer<int>(4);
+Show(buf.AsSpan());                           // ERROR: a span converts to `Object` only as a member-call receiver — the callee could store the box
+Console.WriteLine(buf.AsSpan());              // ERROR: the same position, in a standard-library signature
+var o: Object := buf.AsSpan();                // ERROR: a local declared `Object` is the same position
+Console.WriteLine(buf.AsSpan().ToString());   // OK — a member call on the value; so is `$"{buf.AsSpan()}"`
+var n := Sum(buf.AsReadOnlySpan());           // OK over `Sum(s: IReadOnlySpan<int>)` — the one interface a span passes to
+```
+
+> §9.7 / §8.6: a value that holds borrows (a span; a record or choice with a class-, interface- or `Object`-typed field; an inline array of them) reaches no position declared `Object` or an interface other than `IReadOnlySpan<TElement>` — not a parameter (`b.Keep<Object>(span)` included), a local, a field, a collection or a return — because the box announces no borrow and a callee could store it. It boxes as the receiver of a member call (`span.ToString()`, `$"{span}"`) — not of an extension on `Object` or a user interface — and at `IReadOnlySpan<TElement>`, whose values are read as holding the span's borrows and follow the span's rules: no field store, no return past the source, no `Object`, no `async` parameter. Remedies: a parameter at the value's own type or at `IReadOnlySpan<TElement>`, or a class implementing the interface.
 
 ### 7.4 Overloads and the `out` family
 

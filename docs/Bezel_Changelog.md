@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.328 — October 2026**
+**Companion to the Bezel Language Specification, v0.329 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -12473,5 +12473,189 @@ Checked at the seams, with no edit needed:
     - 0145: `l6_10_0008`–`0012` (reject) and a borrow alias (accept).
     - #5634: `var s: () -> () := xs.Sort;` (reject).
     - `Type`: a `quiet` `static readonly` case, once `typeof` runs.
+
+---
+
+### v0.329 changelog (v0.328 → v0.329)
+
+**The questions v0.328 filed, decided under the owner's delegation.** On 2026-10-08 the owner directed: "Please resolve and decide all known spec related issues. Do proposals for issues that need them." v0.327 and v0.328 acted on that direction. This revision acts on it for the four issues v0.328's lanes filed, and for one older `spec-question` that the text already decided. Each decision is a delegated ruling (process §8, `accepted (delegated)`). A decision that changes what compiles went through a proposal, which graduates here. The decisions:
+- **Proposal [0146](proposals/0146-borrow-erasing-positions.md)** (a value that holds borrows reaches no `Object` or interface position other than `IReadOnlySpan<TElement>`): [#5645](https://github.com/s8lap/bezel-lang/issues/5645), the v0.328 `L1` critique's filing.
+- **Proposal [0147](proposals/0147-direct-disposeasync-takes-the-owned-receiver-rule.md)** (a direct `DisposeAsync()` call takes §28.6's owned-receiver rule): [#5646](https://github.com/s8lap/bezel-lang/issues/5646), the v0.328 `L4` lane's filing.
+- **Rulings, no proposal:**
+  - [#5647](https://github.com/s8lap/bezel-lang/issues/5647), a spec defect (§28.12 step 2 skips no destructor at an `abstract` `DisposeAsync` level);
+  - the receiver of an extension call headed `Object` is a set-erasing position (decided by reading in the composition check; `N1`'s critique, NB5).
+- **Clarifications:** [#5648](https://github.com/s8lap/bezel-lang/issues/5648) (§14.2's exclusion reaches the calls dispatch can route to an inherited witness, not a base class's own generic method).
+- **Decided by reading, no doc change:** [#5628](https://github.com/s8lap/bezel-lang/issues/5628) (a record's primary constructor is a §22.6 candidate at `new`). It was closed before this revision, and its compiler delta is [#5658](https://github.com/s8lap/bezel-lang/issues/5658).
+
+Three lanes:
+- `N1`: proposal 0146 and #5648.
+- `N2`: proposal 0147 and #5647.
+- `N3`: #5628.
+
+`N1` and `N2` each passed their author's adversarial pass and an independent critique: 5 blocking and 8 non-blocking findings, all resolved (`N1` 4 and 5, `N2` 1 and 3). `N3` makes no edit and took its author's adversarial pass. The 40 edits (`N1` 19, `N2` 21) were applied as one sequence. A composition check added 15: 10 in the documents (3 spec, 4 stdlib, 1 rationale, 2 code-generation reference) and 5 in the proposals folder and the decline index.
+
+The critics' blocking findings were these:
+- `N1`:
+  - The receiver admission covered every interface-headed extension call. An extension on `Object` or a user interface reads `this` at the head type and may pass it to a parameter that stores it, so a borrow-bearing record escaped through `p.Leak(k)`. The receiver admission is now a member call or an extension call headed `IReadOnlySpan<TElement>`. The receiver of an extension call headed `Object` or another interface is borrow-erasing.
+  - `s as Object` over an `IReadOnlySpan<int>` parameter, and a typed-pattern binding at `Object`, reached a storing `Object` parameter with no conversion at the call. The bullet now names both conversions.
+  - The drafted rule said an `IReadOnlySpan<TElement>` value **holds borrows**, against §3.6 and §35.4, which define the property for value types only. It now says such a value is **read as holding borrows**, and §3.6's row points there.
+  - #5648's clarification left §2.8.6's *becomes a dispatched generic method* row rejecting a call "wherever written", the literal reading #5648 declines. The row now reads "wherever §14.2's exclusion reaches it".
+- `N2`:
+  - The drafted §28.12 and K3.9 text left the chained `base.DisposeAsync()` inside "a direct `DisposeAsync()` call", the clause that triggers physical reclamation. Read that way, the chain would reclaim the object while the override is still running, and K3.9 would kill a binding that does not exist. The chain is now neither a reclaiming direct call nor a K3.9 position.
+
+**Outcomes the owner should see.**
+- **`Console.WriteLine(span)` stops compiling** on a buffer- or array-backed span, and so do `Console.Write`, `TextWriter.Write`/`WriteLine` and `StringBuilder.Append` at their `Object` parameters. The remedy is `Console.WriteLine(span.ToString())` or `Console.WriteLine($"{span}")`. Both print the same text, which `span_interpolation_agrees_with_call` pins, and the diagnostic must name them (0146 §5.4). A record's `Equals(Object?)` called on a borrow-bearing record is rejected the same way; its `Equals(T)` and `=` are the spelling.
+- **Five banked tests flip under 0146** when its check lands. Each must be updated in the fixing commit:
+  - `span_range_tostring_2661.span_console_argument_renders` (`tests/codegen/span_range_tostring_2661_test.cpp:178`): `Console.WriteLine(sp)` is rejected at the call. The rendering it guarded stays pinned by `span_tostring_in_statement_position` and `span_interpolation_agrees_with_call`.
+  - `xmod_imported_span_box_vtable_3358.local_single_module_control`, `.is_string_on_dependency_boxed_span`, `.whole_object_surface_on_dependency_boxed_span` and `.dependency_with_span_box_links_and_runs` (`:150–231`): `var o: Object := irs;` is rejected at the initializer. Three of them also return that box past its `using var` buffer, which v0.328 already rejected and the compiler misses. The cross-module box-vtable linking they guard is to be re-pinned on an admitted shape.
+- **The Console allowlist is declined, although it is sound.** Stdlib §2.1, §3.1 and §7.4 state that the `Object` overloads of `Console.Write`/`WriteLine`, `TextWriter.Write`/`WriteLine` and `StringBuilder.Append` render by `ToString()` and keep nothing. Admitting a span there would be sound. It is declined, on three grounds:
+  - It is a per-member allowlist that user rendering APIs could not share, which is the ground v0.320 gave for declining `Raise` by name.
+  - The closure twin declined the same rendering admission at v0.320, so the two rules would disagree at one position.
+  - The spelling exists, and one test flips.
+
+  The `IReadOnlySpan<TElement>`-typed overload variant is declined with it: six new stdlib members for one test, a generic-versus-`Object` ranking question at every span argument, and spans only. The `rejected` row's reopening bar is either a non-rendering standard-library `Object` position whose call-bounded use has no spelling at the value's own type, or a signature-level announcement that a parameter is not retained, usable by user members alike (the `Raise` row's bar).
+- **0147 rejects `DisposeAsync()` through a borrow.** `await d.DisposeAsync()` on a plain `IAsyncDisposable` parameter, a pattern or `catch` binding, a field read, a getter result, an element borrow, or `this` in a `CloseAsync()`-style helper is a compile error, as `Dispose()` there already was. The one admitted `this`-rooted call is `base.DisposeAsync()` directly in the body of a `DisposeAsync` override. A second explicit `DisposeAsync()` on the same owned binding now draws §28.2's use-after-dispose warning: `s28_12_0006` gains `warns: yes`, and its `run` verdict and banked baseline row are unchanged. Measured reach: zero.
+- **Every 0146 and 0147 verdict is ahead of the compiler.** No conversion to `Object` or an interface is checked for a borrow today, except the boxed-record field store (#4478) and the `IReadOnlySpan<TElement>` field store (#4751). The `Dispose()` receiver check and its post-state bookkeeping match the `Dispose` spelling only. Both are tracked ([#5659](https://github.com/s8lap/bezel-lang/issues/5659), [#5660](https://github.com/s8lap/bezel-lang/issues/5660)).
+
+A composition check over the union then fixed five seams:
+- **0146 × the text that restated §8.6's former admission.** §21.10's local-record paragraph said a borrow-bearing local record's "short-lived, call-bounded box is admitted". It now names §8.6's two positions, with every other conversion §9.7's borrow-erasing position. Stdlib §4.14's byte read tier and §4.16's *Extensions on the interface* cited §8.6 as stating "the bound for the receiver of an interface-headed extension call", and rationale §5.15's v0.290 paragraph did the same. All three now cite §8.6's admission of the receiver of an extension call headed `IReadOnlySpan<TElement>`, which is the read tier's own head.
+- **0146 × the code-generation reference's fact 13.** It told every value-typed `x` to "box first: `(var o: Object := p; o is IShape)`". The cell now excepts a `p` that holds borrows, which reaches no `Object` local and whose static type already answers the test.
+- **0146's owner-visible outcome.** Stdlib §2.1 now states that a value that holds borrows is not passed to `Console`'s `Object` overloads, and that `x.ToString()` or an interpolation hole prints the same text.
+- **0146 × 0133, the closure twin's receiver (`N1`'s critique, NB5).** 0146 makes the receiver of an extension call headed `Object` borrow-erasing. The same receiver is a set-erasing position for a capture-bearing function value, decided by reading:
+  - §3.1 says a function type reaches `Object` through its inheritance chain, so §26.5 rule 2 reaches an `extension Object` block from a function-typed receiver.
+  - The extension's receiver parameter (§28.3's announcement table, row 5) is declared at the head, which is `Object`, the set-erasing definition's first clause. The only receiver exemption the text stated was "a member `Object` declares".
+
+  §28.3 now says so, as does Appendix C.3's set-erasing row and the code-generation reference's *Closures by position* cell. No verdict moves, and measured reach is zero: every `extension Object` call in `tests/` is on a class or interface receiver.
+- **0147 × 0145.** Stdlib §6.10's "No borrow reaches a *synchronous* disposal path" was v0.328's correction for an unrestricted direct `DisposeAsync()`. With 0147 it now reads "No borrow reaches a disposal path … `Dispose()` or a direct `DisposeAsync()` through one is a compile error". This is a pure consequence: no implicit discharge runs on a borrow, an `await using var` over a borrow assumes no obligation (§28.10), and both explicit calls are owner-only.
+
+The check also graduated 0146 and 0147 to `graduated-v0.329`, moved their README rows from the live queue to *Graduated* in number order, and recomputed the decline index's size line (below).
+
+Checked at the seams, with no edit needed:
+- **0146's `IReadOnlySpan<TElement>` reading × v0.327's holds-borrows widening ([#5603](https://github.com/s8lap/bezel-lang/issues/5603)), §3.6, §35.4 and Appendix C.**
+  - §35.4 defines **holds borrows** for every value type, and *a value type that holds borrows* names the union of the three value kinds. The interface is no value type and gains no property. §9.7 states once how every rule keyed on the union reads a value declared at it, and §3.6's row points there.
+  - So §35.4's definition, the static-field row (C.3), the `async` parameter and suspension rows (C.6, §30.1) and the choice row (C.3) need no per-row edit. Each reaches an `IReadOnlySpan<TElement>` value through that one statement, which C.3's boxing bullet restates.
+  - Stdlib §7.1 already bars `async` span overloads, and spec §29's `IReadOnlySpan<TElement>` row already names the span's source.
+  - The code-generation reference's §7.3 pair states the reading, the remedies and the excluded extension receivers.
+- **0146 × v0.328.** #5629's per-instantiation reading supplies the rejection of `b.Keep<IReadOnlySpan<int>>(span)` at the instantiation. 0146's caller-side check closes the `b.Keep<Object>(span)` laundering v0.328 filed. The #5629 decline (excluding values that hold borrows at every dispatched call) is not contradicted: a span at `i.Show<Span<int>>(span)` is span-typed after substitution.
+- **0146's decline rows are `rejected`, not `declined-at-proposal`.** Each row's authoritative record is the spec bullet and the rationale paragraph, as for its twin 0133 (8 `rejected`, 2 `deferred`) and for 0140 and 0141.
+- **0147 × §28.6, K3.9, 0144 and 0145.**
+  - §28.6's owned and borrowed lists are unchanged, and the calls share the one consume-table row. K3's preamble still counts eleven positions. `N2`'s three kernel edits move K4's keyword-visible bit, K4.2's closed set and §28.3's *explicitly-disposed* state with the row.
+  - §28.6's heading, *Who may call `Dispose()`*, keeps its anchor.
+  - Under 0144, an `await using var` held at `Object` or an interface is an owner, so its direct `DisposeAsync()` is admitted.
+  - Under 0145, `await scope.DisposeAsync()` on the scope's own binding is an owned receiver. A child's self-capture of the scope is a captured borrow and is rejected. The `Join` obligation is unaffected.
+  - `GetAsyncEnumerator`/`GetOwningAsyncEnumerator` return `owned`, so a manual `await e.DisposeAsync()` on an enumerator stays admitted.
+- **#5647 × v0.328's per-level fallback.** Step 2's qualifier is the definition's own "non-`abstract`", which §30.7, Appendix C.6 and stdlib §2.10 already read. 0147's exemption cannot reach an `abstract` base, because the chain to one cannot be written.
+- **#5648 × #5635 and 0141.** The discharge clause removes only the summary entries the exclusion makes unreachable through the interface and the conforming class. A `B`-typed call is checked per instantiation against the same summary. The code-generation reference's dispatched-generic row states the kind without the inherited witness and so cannot be over-applied to a base-typed receiver; it needs no edit.
+- **The guides.** No guide teaches `Console.WriteLine(span)`, passes a span or a borrow-bearing record at `Object` or an interface, calls an `extension Object` or user-interface extension on one, or calls `DisposeAsync()` at all. No guide names `DisposeAsync` or `IAsyncDisposable`. Guide 05 §7 passes spans down as `IReadOnlySpan<T>`, the admitted position. No guide is edited, and no pin moves.
+- **The code-generation reference.** Every new rule has a row or a *Looks right, is rejected* pair, with no pin in prose:
+  - 0146: a §7.3 pair, plus the fact-13 cell (composition).
+  - 0147: one `// ERROR` line and one note sentence in §7.2's `Dispose()` pair.
+  - The extension receiver: the *Closures by position* cell (composition).
+
+  Needing none: #5647 (the reference teaches no `DisposeAsync` hierarchy) and #5648 (above).
+- **Appendix C.** All new rows are in C.3: 0146's boxing bullet, 0147's `Dispose()` row, and the set-erasing row's extension receiver (composition). #5647 is a run-time path rule, and #5648 is doc-only.
+- **`scripts/check_docs.sh`** passes in full on the applied tree: ANCHOR, VERSION, FACTS, TABLE, SETS, REGISTER, STYLE and EXTRACT are clean (522 fragments). The one CITATION advisory, `§4.12`, was already present at v0.328. `scripts/check_proposals.sh` passes (147 ↔ 147; live 48, graduated 99). `corpus.py lint --strict` and `check` are clean (2,195 cases), and `coverage.py` regenerates `coverage.tsv` unchanged.
+
+- **§8.6, §9.7, §3.6, §28.3, §28.14, Appendix C.3, stdlib §4.16, rationale §4.2, the code-generation reference — borrow-erasing positions: a value that holds borrows reaches no `Object` or interface position other than `IReadOnlySpan<TElement>` (design change, [proposal 0146](proposals/0146-borrow-erasing-positions.md); [#5645](https://github.com/s8lap/bezel-lang/issues/5645)).** §8.6 admitted boxing a borrow-bearing record "for a short-lived interface call (e.g. passing to a method accepting `Object`)". §28.3's field-store residual then admitted the callee's store of a plain `Object` parameter under K4.1's backstop, a backstop a span's buffer window does not have (§9.7's instance-field bullet). `method K(x: Object) F := x;` called with a span, and `b.Keep<Object>(span)` over `Keep<T>(x: T) F := x;`, kept a dangling view with no rejection, no backstop and no recorded clause.
+  - **The rule.** A value that holds borrows (§3.6) is converted to `Object` or to an interface type at two positions only. One is the receiver of a member call (§8.6, §9.4) or of an extension call headed `IReadOnlySpan<TElement>`; the other is a position declared `IReadOnlySpan<TElement>`. Every other conversion is a compile error at the conversion site, checked by the caller over the callee's declared signature, per instantiation (§9.7's *borrow-erasing position* bullet; K2.3 + K2.4, the twin of §28.3's *Set-erasing positions*). That covers:
+    - a parameter, plain or `scoped`, declared `Object` or any other interface, or at a bare type parameter the call substitutes with one;
+    - a local, a field, a collection slot or literal element, a record component, a choice payload, an inline-array slot, a `ref`/`out` location, and a return;
+    - the receiver of an extension call headed `Object` or another interface, whose body reads `this` at the head type;
+    - an `as` or typed-pattern binding of an `IReadOnlySpan<TElement>` value at such a type.
+  - **`IReadOnlySpan<TElement>` values are read as holding borrows.** A value declared at that interface type, nullable or not, is read as holding the borrows of the span it boxes, by declared type. A boxed `ReadOnlyStringSpan` is included. The interface gets no holds-borrows property, which §3.6 keeps for value types; §3.6's row points at the reading. So a callee's parameter of that type cannot be stored in a field (the #4751 compiler leg, now the spec's), returned past its source, captured by an escaping closure, passed at `Object`, or declared on an `async` method. It is the one reference type so read, and stdlib §4.16 says the same of its parameter.
+  - Rejected with it, as the set-erasing rule rejects a capture-bearing closure there: `Console.WriteLine(span)` and `StringBuilder.Append(span)`, whose spelling is `span.ToString()` or an interpolation hole, and a record's `Equals(Object?)`, which its `Equals(T)` and `=` replace.
+
+  **Declined** (four `rejected` rows and one `deferred`):
+  - a recorded K4.3 trust clause for the store, which would reverse §9.7's no-backstop ground;
+  - a callee-side rule forbidding the store of every plain `Object` or interface parameter, which retires §28.3's back-reference idiom and, keyed on an interface's implementers, is not modular (§2.8.3);
+  - the Console allowlist and its overload variant (above);
+  - `Object` locals with tracked sources.
+
+  The `deferred` row is a user-declared borrow-view interface in `IReadOnlySpan<TElement>`'s role; no program needs one. Kernel: derivation (K2.3 + K2.4). Body-locality: local at the conversion; carve-out, confinement (i), for the type-parameter twin. **Compiler (tracked, [#5659](https://github.com/s8lap/bezel-lang/issues/5659), five items, probe first):** the conversion is identified by `isBoxingTargetType` (`src/sema/ExprTypecheck.cpp:4434`), and the only borrow checks on it are the boxed-record field store (`src/ownership/Ownership_Checks.cpp:9846–9900`, #4478) and the `IReadOnlySpan<TElement>` field store (`:9697–9838`, #4751). §28.14's `scoped` interface clause has no implementing leg.
+- **§28.3 *Set-erasing positions*, Appendix C.3, the code-generation reference — the receiver of an extension call headed `Object` is a set-erasing position (clarification, decided by reading in the composition check; `N1`'s critique, NB5).** §28.3 exempted a function value as the receiver of "a member `Object` declares" (`f.ToString()`). Nothing said whether the receiver of an `extension Object` call, which §26.5 rule 2 reaches from a function-typed receiver, is such a position.
+  - **It is.** The extension's receiver parameter is declared at the head, which is `Object`, and the body may pass `this` on to a parameter that stores it.
+  - A capture-bearing function value there is rejected, and a capture-free one is admitted. This is the closure twin of 0146's receiver clause.
+
+  Kernel: derivation (K2.3 + K2.4). Body-locality: local. **Compiler:** a note on [#5514](https://github.com/s8lap/bezel-lang/issues/5514), whose caller-side check takes the position.
+- **§28.2, §28.6, §28.12, Appendix C.3, kernel K3.9 and K4, stdlib §2.10 and §6.10, the code-generation reference §7.2 — a direct `DisposeAsync()` call takes §28.6's owned-receiver rule (design change, [proposal 0147](proposals/0147-direct-disposeasync-takes-the-owned-receiver-rule.md); [#5646](https://github.com/s8lap/bezel-lang/issues/5646)).** §28.12 admitted "a direct `DisposeAsync()` call awaited outside `await using` (legal; … reclamation follows exactly as if `await using` had issued it)" with no receiver condition. §28.6 *Who may call `Dispose()`* and K3.9 enumerated `x.Dispose()`, `x?.Dispose()`, `x!.Dispose()` and the discard. So a borrow could await the call and reclaim the heap block of an object its owner still held: a plain parameter, a pattern or `catch` binding, a field read, a getter result, an `IAsyncDisposable`-typed view, or `this` in a `CloseAsync()`-style method. §28.6 closes that hazard for `Dispose()` with no exception.
+  - **The rule.** The direct call, in the same three spellings and awaited or not, requires a receiver the caller owns by §28.6's classification. Through a borrow it is a compile error, `this` included.
+  - **The chain.** `base.DisposeAsync()` directly in the body of a `DisposeAsync` override (not in a lambda nested in it) is §28.12 step 2's chain, not a disposal of `this`. It is admitted, and it triggers no reclamation of its own.
+  - **The post-state.** The call is K3.9's row. The binding is explicitly-disposed afterward, so the scope-end machinery of a `using var` or `await using var` whose `DisposeAsync()` was called directly skips it. A straight-line use afterward, a second explicit call included, is §28.2's use-after-dispose warning. §28.12's "a second call … is a no-op" now says it is the runtime contract. The disposal moment is the call; logical disposal completes at the returned task's terminal state, and reclamation follows there.
+
+  **Declined** (three `declined-at-proposal` rows): the status quo; logical-only disposal through a borrow with reclamation deferred to the owner, which still runs the cleanup out from under the owner and splits §28.12's object-central reclamation by receiver; and a warning in place of the error, since §28.6 is exception-free for the synchronous call. Kernel: derivation (K3.9's row widened by a spelling; no new axiom; eleven positions). Body-locality: local. **Compiler (tracked, [#5660](https://github.com/s8lap/bezel-lang/issues/5660), five items, probe first):** the receiver check and the explicitly-disposed bookkeeping match the `Dispose` spelling only (`src/ownership/Ownership_Checks.cpp:2592`, `:2130`, `:2203`, `:2629`, `:4653`; `src/ownership/Ownership.cpp:14085`). `DisposeAsync` on a `TaskScope` receiver is "no member" ([#5657](https://github.com/s8lap/bezel-lang/issues/5657) item 6).
+- **§28.12 step 2 — an `abstract` `DisposeAsync` supersedes no destructor (spec defect, ruling; [#5647](https://github.com/s8lap/bezel-lang/issues/5647)).** Step 2 skipped a level's destructor "if that level declares or overrides `DisposeAsync`". The same section's definition of *without a synchronous fallback* already read an `abstract` declaration as performing no cleanup. Take `abstract class Base: IAsyncDisposable`, declaring `abstract method DisposeAsync(): Task;` and a destructor, overridden in `Der`. `await using` skipped `Base`'s destructor, and `Der.DisposeAsync` could not chain to an abstract `base.DisposeAsync()`, so `Base`'s cleanup ran on neither path.
+  - **Decided:** at each level, the destructor body is skipped only if that level declares or overrides a **non-`abstract`** `DisposeAsync`. An `abstract` level is cleaned up exactly as on the synchronous path.
+  - Chaining to `base.DisposeAsync()` is the override's obligation only where the base level declares a non-`abstract` one.
+  - So the hierarchy above runs `Der.DisposeAsync`, skips `Der`'s destructor if it declares one, and runs `Base`'s destructor, on both paths.
+
+  **Declined** (one `rejected` row): keying the skip on any `DisposeAsync` declaration, `abstract` included. Kernel: no contact. **Compiler:** the `await using` reclamation chain (`bz$<C>$DisposeReclaim`, `src/codegen/LlvmBackend_Disposal.cpp:529–620`) chains through `emitBaseDisposeChain` (`:6458`), which runs every base level's destructor body (source-read). So for this shape it already runs the abstract base's destructor, once [#3516](https://github.com/s8lap/bezel-lang/issues/3516)'s abstract-head bug is fixed. The same unconditional chain is the divergence [#3838](https://github.com/s8lap/bezel-lang/issues/3838) tracks at a non-`abstract` base. Both issues get a note; there is no new tracker.
+- **§14.2 *Dispatched generic methods*, §2.8.6, rationale §10 — the exclusion reaches the calls dispatch can route to an inherited witness, not a base class's own generic method (clarification, gated as a ruling; [#5648](https://github.com/s8lap/bezel-lang/issues/5648)).** Take `class D: B, I`, which uses `B.M<T>`, an ordinary generic method of `B`, as the inherited witness of `I.M<T>`.
+  - The move-only and inline-array exclusion reaches a call that names `I.M`, and a call on a receiver typed `D` or a class deriving from `D`.
+  - A call on a `B`-typed receiver names no dispatched declaration. It is an ordinary generic call, checked per instantiation, so a module that cannot see `D` (§2.8.3) is never asked to reject it.
+  - The conforming class's check against `B.M`'s requirement summary (v0.328) discharges the entries keyed on a move-only or inline-array substitution, which the exclusion makes unreachable through `I` and `D`. It rejects the class for the rest.
+  - §2.8.6 says the same of a summary gain's audience. Its *becomes a dispatched generic method* row's "rejected wherever written" now reads "wherever §14.2's exclusion reaches it".
+
+  **Declined** (one `rejected` row): the literal reading, under which every call of `B.M` is excluded once any class makes it a witness. Kernel: no contact. Body-locality: local at the call; the witness discharge is fact-discharged (the summary). Measured reach: zero (no inherited witness of a generic interface method exists in `tests/` or `docs/`). Doc-only.
+- **Constructor resolution between a record's primary and a body constructor (ruling by reading, no doc change; [#5628](https://github.com/s8lap/bezel-lang/issues/5628)).** The text decides it.
+  - The auto-generated primary is a §22.6 candidate at `new` (§9.3, §11.1). An exact match selects it over a converting body constructor, with no diagnostic (`new R(5)` over `record R(X: int)` with `constructor(x: int?)`).
+  - A primary and a body constructor that both convert at every position are the stage-8 ambiguity error.
+  - [#5102](https://github.com/s8lap/bezel-lang/issues/5102)'s two oracle options are both declined by the text. A diagnostic on a call with a unique winner states a rule no section has. "Uniformly dominated, therefore inapplicable" moves stage 5's ranking into stage 3's applicability.
+
+  No decline row: neither option is a design alternative the documents weighed (process §7, *Impl divergence is not a spec defect*). #5628 was closed as answered before this revision. **Compiler (tracked, [#5658](https://github.com/s8lap/bezel-lang/issues/5658)):** the record-side ambiguity is not reported. HYPOTHESIS: the record arm defers to codegen at `src/sema/ExprTypecheck_Calls.cpp:18014`, before #5099's class-only check. #4838's observable defect is already pinned by `ctor_overload_exact_match_ranking_4853_test.cpp:254`.
+
+- **Migration.** *Newly rejected (spec-ahead-of-impl):*
+  - **Proposal 0146.** A value that holds borrows converted to `Object`, or to an interface other than `IReadOnlySpan<TElement>`, anywhere but as the receiver of a member call or of an extension call headed `IReadOnlySpan<TElement>`. Examples: `Console.WriteLine(span)`, `K(span)` over `K(x: Object)`, `b.Keep<Object>(span)`, `xs.Add(span)` at `Array<Object>`, `var o: Object := span;`, `new Holder(span)` over `record Holder(O: Object)`, and a borrow-bearing record passed at a user interface it implements, or as the receiver of an extension call on `Object` or such an interface. Also an `IReadOnlySpan<TElement>` value returned past its source, captured by an escaping closure, passed at `Object` (`s as Object` included), or declared on an `async` method. Measured reach: five tests in two files (above); no document, guide or rule-corpus example; zero for the extension receiver and the `as`.
+  - **The extension receiver.** A capture-bearing function value as the receiver of an extension call headed `Object`. Measured reach: zero.
+  - **Proposal 0147.** A direct `DisposeAsync()` call, awaited or not, through any borrow §28.6 lists, `this` included, and `base.DisposeAsync()` anywhere but directly in the body of a `DisposeAsync` override. Measured reach: zero. Every direct call in `tests/`, the documents and the rule corpus is on a `using var` (`s28_12_0005`, `s28_12_0006`), and no `base.DisposeAsync()` chain exists anywhere.
+
+  *Newly warned (spec-ahead-of-impl):* a second explicit `DisposeAsync()` on the same owned binding (`s28_12_0006`), and a read of an owned binding after a dominating direct `DisposeAsync()` on it.
+
+  *Newly defined:* the `await using` path over a hierarchy with an `abstract` `DisposeAsync` level that declares a destructor: that destructor runs. Measured reach: zero.
+
+  *Newly admitted:* nothing. `base.DisposeAsync()` in an override, which no text rejected, is now exempted expressly.
+
+  *Doc-only:*
+  - #5648's §14.2 and §2.8.6 clauses.
+  - The §28.3 and §28.14 sentences and the Appendix C.3 bullets.
+  - Stdlib §2.1, §2.10, §4.14, §4.16 and §6.10.
+  - The rationale records: §4.2, §5.15 and §10.
+  - Every code-generation reference row, cell and pair named above.
+  - `DECLINED.md` gains 10 rows: 6 `rejected`, 1 `deferred` and 3 `declined-at-proposal`. No row moves group. The index size is recomputed once: 754 rows — 427 · 133 · 147 · 7 · 40 · 0.
+  - Proposals 0146 and 0147 are `graduated-v0.329`, and their README rows are in *Graduated*, in number order.
+
+  *Spec-ahead-of-impl (tracking issues filed at landing):*
+  - 0146: the borrow-erasing check, the `IReadOnlySpan<TElement>` reading at §9.7's other bullets, §28.14's `scoped` clause, and the five test flips ([#5659](https://github.com/s8lap/bezel-lang/issues/5659), five items, probe first).
+  - The extension receiver: a note on [#5514](https://github.com/s8lap/bezel-lang/issues/5514).
+  - 0147: the receiver rule and the K3.9 post-state ([#5660](https://github.com/s8lap/bezel-lang/issues/5660), five items, probe first).
+  - #5647: notes on [#3516](https://github.com/s8lap/bezel-lang/issues/3516) and [#3838](https://github.com/s8lap/bezel-lang/issues/3838).
+  - #5628: [#5658](https://github.com/s8lap/bezel-lang/issues/5658), filed before this revision.
+
+  *Owner decisions recorded:* the owner's 2026-10-08 delegation, under which every decision above is a delegated ruling. Proposals 0146 and 0147 were accepted under it and graduate here. #5645, #5646, #5647 and #5648 close with this revision.
+
+  *Filed as questions:* none. Every question the lanes surfaced is decided by reading, and the composition check found no undecided seam.
+
+  *Decided by reading, not filed:*
+  - The receiver of an extension call headed `Object` for a function value (`N1`'s critique, NB5): a set-erasing position, now stated (above).
+  - A record's `Equals(Object?)` on a borrow-bearing record (`N1`): rejected by the borrow-erasing bullet, as `x.Equals(f)` is by the set-erasing rule. §9.2's `Equals(T)` and `=` are the spelling, and no text change is needed.
+  - An `IReadOnlySpan<TElement>`-typed field (`N1`): no induction sentence is needed. The reading's null-source form is `null` alone, so §9.7's instance-field bullet admits only `null` into a class field of that type, and a record component of that type makes the record borrow-bearing.
+  - `x?.DisposeAsync()` (`N2`): the spelling is listed for parity only. `await` takes a task, and `Task?` has no implicit conversion to `Task` (§5.1), so the awaited spelling is a `null` test first. The compiler's verdict was not probed.
+  - An unawaited direct `DisposeAsync()` through an owner, then a read before the task completes (`N2`): K3.9's row makes the read the use-after-dispose warning, with K4.1's backstop behind it.
+  - A `virtual` `DisposeAsync` with an empty body at a base (`N2`): a non-`abstract` level, so its destructor is skipped and the override must chain.
+  - An `abstract` level with no destructor (`N2`): it performs no cleanup, is neither warned nor without a synchronous fallback, and runs nothing on either path.
+
+  *Guides:* no guide is edited and no pin moves. Guides 02 and 04 stay at v0.328, Guides 01 and 05 at v0.327, and Guides 03, 06 and 07 at v0.326. No guide example changes verdict (above).
+
+  *Corpus:*
+  - The rule corpus stays at 2,195 cases, and no verdict or `baseline.tsv` row changes.
+  - `s28_12_0006` gains `warns: yes` and its manifest `warns` cell; its `run` verdict and banked `fail divergence` row are unchanged. `coverage.tsv` is regenerated: the §9.7 and §28.12 rows count the new rules.
+  - `s8_6_0004` keeps its `rule:` sentence, which §8.6 keeps verbatim. `l4_16_0001`, `0003` and `0004` state the admitted position and the callee-side field rule. `l2_1_0002` boxes a class, so it is unaffected.
+  - The doc-example corpus is unedited (#1380). The extraction gains 0146's §7.3 pair in the code-generation reference.
+  - Coverage gaps recorded, not written:
+    - 0146: `K(span)`, `b.Keep<Object>(span)`, `xs.Add(span)` at `Array<Object>`, `var o: Object := span;`, `Console.WriteLine(span)`, `method F(s: IReadOnlySpan<int>): Object => s;`, `Keep(s as Object)`, `async method F(s: IReadOnlySpan<int>)` and the `IShow` extension receiver (all reject); `Console.WriteLine(span.ToString())`, a borrow-free extension receiver and the `IReadOnlySpan<byte>` read tier (all run).
+    - The extension receiver: `f.Leak(k)` over `extension Object` (reject) beside a static method reference (accept).
+    - 0147: `s28_6_0031` (reject), `s28_6_0032` (accept) and `s28_6_0033` (reject).
+    - #5647: `s28_12_0009` (run) and its synchronous twin.
+    - #5648: `d.M<[2 owned]Node>()` (reject) beside `b.M<[2 owned]Node>()` (accept).
+    - #5628: the record twin of #5099's ambiguity row, with #5658.
 
 ---
