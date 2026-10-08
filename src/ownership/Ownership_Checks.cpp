@@ -16016,6 +16016,35 @@ void MethodOwnership::checkRecordWithFromTemporary(const ast::WithExpr& we) {
     }
 }
 
+// fix #5626 (§9.7, v0.315): recursively check NewExpr/WithExpr nodes for
+// the no-temporary-source rule inside container expressions that can appear in
+// a return statement (ArrayLiteralExpr, ConditionalExpr). This closes the gap
+// where `return [new Str2(new Box(s))]` bypassed the check because the
+// dynamic_cast in handleReturn returned nullptr for the ArrayLiteralExpr wrapper.
+// The walker mirrors the same recursion pattern checkClosureEscapesOnReturn
+// uses for LambdaExpr/CallExpr. // per §9.7
+void MethodOwnership::checkRecordAndWithFromTemporaryRecursive(const ast::Expr& e) {
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        checkRecordFromTemporary(*ne);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        checkRecordWithFromTemporary(*we);
+        return;
+    }
+    if (auto* cle = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& elem : cle->elements) {
+            if (elem) checkRecordAndWithFromTemporaryRecursive(*elem);
+        }
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->thenValue) checkRecordAndWithFromTemporaryRecursive(*ce->thenValue);
+        if (ce->elseValue) checkRecordAndWithFromTemporaryRecursive(*ce->elseValue);
+        return;
+    }
+}
+
 // §28.11 (issue #780): an owning inline-array slot `a[i]`. See the header for
 // the contract.
 bool MethodOwnership::targetIsOwningInlineArraySlot(

@@ -698,6 +698,17 @@ public:
     // for the asymmetry rationale and #4330's
     // `positional_field_conforming_accepted_control` test pin.
     void checkRecordWithFromTemporary(const ast::WithExpr& we);
+    // fix #5626 (§9.7, v0.315): `handleReturn` calls checkRecordFromTemporary
+    // only when the return expression IS a NewExpr/WithExpr directly. When
+    // one is nested inside an ArrayLiteralExpr (e.g. `return [new Str2(new
+    // Box(s))]`), the dynamic_cast returns nullptr and the check is skipped —
+    // the same borrow-bearing record construction from a temporary escapes the
+    // method without diagnosis. This walker recurs into ArrayLiteralExpr and
+    // ConditionalExpr (the only expression forms that can appear in a return and
+    // contain a NewExpr/WithExpr as a sub-expression) and calls the existing
+    // checks on each found node, matching the same recursion pattern that
+    // checkClosureEscapesOnReturn uses for LambdaExpr/CallExpr. // per §9.7
+    void checkRecordAndWithFromTemporaryRecursive(const ast::Expr& e);
     // True when `ft` is a borrow-carrying field type (a class/interface
     // reference — including the BUILTIN heap collections Array/Dictionary/… that
     // carry no user TypeDecl — an inline array of references, or a transitively

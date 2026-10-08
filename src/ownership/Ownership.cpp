@@ -9054,14 +9054,12 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
     // #1066 / §9.7 (v0.153): `return new Bag([…])` from a temporary is a
     // dangling borrow exactly as a local-decl initializer is.
-    if (const auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
-        checkRecordFromTemporary(*ne);
-    // fix #4344 (§9.7 / §28.3, v0.298): the `with(...)` sibling of the
-    // `new Record(...)` check above — `return r with(...)` carries the same
-    // risk when an override value is a temporary bound to a borrow-carrying
-    // field. Mirrors handleLocalDecl's arm exactly.
-    if (const auto* we = dynamic_cast<const ast::WithExpr*>(&e))
-        checkRecordWithFromTemporary(*we);
+    // fix #5626 (§9.7, v0.315): the direct dynamic_cast matched only when the
+    // return expression WAS a NewExpr/WithExpr (top-level), missing cases like
+    // `return [new Str2(new Box(s))]` where the NewExpr is inside an
+    // ArrayLiteralExpr. The recursive walker catches all nested NewExpr/WithExpr
+    // nodes so every construction site in the return expression is checked.
+    checkRecordAndWithFromTemporaryRecursive(e);
     checkIndirectEscapeOnReturn(e);       // §28.9/§9.7 indirect-via-local
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S3): `return
     // Identity(new C());` launders a fresh owned temporary out through the borrow

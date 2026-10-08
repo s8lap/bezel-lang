@@ -43,12 +43,16 @@
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"   // fix #5626: failedAtCompileTimeWithRealLocation
 #include "support/codegen_support.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
+using bezel::test::failedAtCompileTimeWithRealLocation;
+using bezel::test::diagnosticMessageContains;
 
 // Strict oracle: compiled, ran, exited cleanly, no ASan/UAF finding.
 // AOT harness fork-isolates each compile+run; leak detection is on.
@@ -59,17 +63,24 @@ int runChecked(const std::string& program) {
 
 // ===========================================================================
 // PRIMARY PIN — Record containing a Class-typed field (no string field).
-// FAIL-WITHOUT: ASan leak (62 B / 3 alloc).
-// PASS-WITH: exit 5, ASan clean.
+// fix #5626 (§9.7, v0.315): the Helper.Wrap form `return [new Str2(new
+// Box(s))]` is now correctly rejected at the construction site inside Wrap,
+// with the §9.7 no-temporary-source diagnostic — the bug allowed it to
+// compile and produce a dangling borrow at runtime. The pre-fix accept
+// (exit 5) pinned the buggy behaviour; this row now pins the correct
+// rejection. The control row (record_with_direct_string_field) is
+// unaffected: it has a direct string field and the raw fast path is correct.
 // ===========================================================================
 BEZEL_TEST(record_choice_class_field_over_suppress_4301,
            record_containing_class_field_no_string_leak) {
     // Str2 is a Record with a Class field B (Box), no direct string field.
     // Helper.Wrap returns [1]Str2, embedding the string through Box's
-    // constructor into Box.V.  With the bug, isRecordOrChoiceDeclared fires
-    // for Str2 (Record-declared) and suppresses Main's release of s; with
-    // the fix it does not (Str2 has no string field), and s is freed.
-    const char* prog =
+    // constructor into Box.V.  fix #5626 (§9.7, v0.315) closes the gap
+    // where the no-temporary-source check fired only on the direct
+    // NewExpr and missed nested constructions inside an ArrayLiteralExpr
+    // return — the same `new Str2(new Box(s))` construction is now
+    // rejected wherever it appears in a returning context.
+    std::string prog =
         "module M; "
         "class Box "
         "  public V: string; "
@@ -93,7 +104,13 @@ BEZEL_TEST(record_choice_class_field_over_suppress_4301,
         "    return outer[0].B.V.Length; "
         "  end Main; "
         "end C;";
-    BEZEL_EXPECT_EQ(runChecked(prog), 5);
+    // fix #5626 (§9.7, v0.315): reject with the no-temporary-source
+    // diagnostic — the NewExpr is inside an ArrayLiteralExpr in the return,
+    // and the recursive walker now catches it.
+    auto r = runAot(prog);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "a borrow-bearing record may not be constructed from a temporary"));
 }
 
 // ===========================================================================
