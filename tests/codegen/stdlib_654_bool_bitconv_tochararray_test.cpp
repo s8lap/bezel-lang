@@ -106,8 +106,9 @@ BEZEL_TEST(codegen_654_bool_tryparse, tryparse_garbage_returns_false) {
 }
 
 // stdlib §9.4: TryParse("1") → ok=false (only "true"/"false", not "1").
-// Per §9.4: only the two canonical spellings; "1" is accepted by Convert.ToBoolean
-// but NOT by Boolean.TryParse.
+// Per §9.4: only the two canonical spellings. "1" is rejected by
+// Convert.ToBoolean too — it raises FormatException (stdlib §2.3, v0.315),
+// which TryParse reports as ok=false rather than throwing.
 BEZEL_TEST(codegen_654_bool_tryparse, tryparse_one_is_not_accepted) {
     BEZEL_EXPECT_EQ(run(prog(
         "var result: bool; "
