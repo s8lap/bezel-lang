@@ -15903,8 +15903,18 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
         const sema::TypeRef* fieldType =
             fd.type ? ctx_.resolvedType(*fd.type) : nullptr;
         const bool initIsRecord = isBorrowBearingRecord(fieldType);
-        const bool initIsSpan =
-            !initIsRecord && isBorrowBearingRecordOrSpan(fieldType);
+        // fix #5662 (§9.7, v0.326): read the span form off the BUILTIN-span
+        // predicate, not off isBorrowBearingRecordOrSpan. Or-Span deliberately
+        // admits Span/ReadOnlySpan/ArraySpan/ReadOnlyArraySpan (§9.7 reads each as
+        // a borrow-bearing record), so `!OrSpan` is FALSE for a builtin span
+        // and printed the record wording where #4679's rows pin the span
+        // wording. The diagnostic's two forms split on "is this one of the four
+        // builtin span views", which is exactly isBuiltinSpanTypeRef (the
+        // #3022/#2997-hardened form). An inline array of borrow-bearing records
+        // is not a builtin span, so it takes the record wording — the #5627
+        // classification this flag was widened for, without reclassifying
+        // spans. // per §9.7 / §4.14 / §4.15
+        const bool initIsSpan = isBuiltinSpanTypeRef(fieldType);
         const bool initIsChoice =
             !initIsRecord && !initIsSpan && isBorrowBearingChoice(fieldType);
         if (initIsSpan) {
