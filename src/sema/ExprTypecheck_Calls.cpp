@@ -18078,7 +18078,51 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     if (!cs->isStatic) { hasExplicitCtor = true; break; }
                 }
             }
-            if (hasExplicitCtor) return;
+            if (hasExplicitCtor) {
+                // fix #5658 (§22.6 stage 8, v0.326): the LOCAL combined-form
+                // record must check for primary/body constructor ambiguity, the
+                // same check the class combined-form path runs ~180 lines below
+                // (fix #5099). Without it, `new R(3)` against
+                // `record R(X: long) constructor(y: double) X := 1;` compiles
+                // clean and codegen silently picks a candidate — §22.6 requires
+                // an ambiguity diagnostic instead.
+                //
+                // fix #5121 (§22.5, v0.307) — the same §22.5 diagnostic
+                // emission the class fix performs: bind the arguments against
+                // every candidate with emit=false; if NONE bind, re-emit the
+                // primary's binding with emit=true to surface the §22.5
+                // diagnostic (unknown name / missing required / duplicate named
+                // arg). `recordPositionalFieldSymbols` is the record equivalent
+                // of the class-side `recordPositionalFieldSymbols`.
+                const std::vector<const Symbol*> primaryFormals5658 =
+                    recordPositionalFieldSymbols(t);
+                if (!primaryFormals5658.empty()) {
+                    bool anyBind = bindArgsToParams(
+                        sema::FormalsView::of(primaryFormals5658),
+                        ne.args, ne.span.begin, std::string(),
+                        /*emit=*/false).ok;
+                    for (Symbol* m : t->members) {
+                        if (anyBind) break;
+                        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+                        if (!cs || cs->isStatic) continue;
+                        if (bindArgsToParams(sema::FormalsView::of(*cs),
+                                             ne.args, ne.span.begin,
+                                             std::string(),
+                                             /*emit=*/false).ok) {
+                            anyBind = true; break;
+                        }
+                    }
+                    if (!anyBind) {
+                        (void)bindArgsToParams(
+                            sema::FormalsView::of(primaryFormals5658),
+                            ne.args, ne.span.begin,
+                            std::string("`new ") + std::string(t->name) + "`",
+                            /*emit=*/true);
+                    }
+                }
+                (void)reportPrimaryBodyCtorAmbiguity(ne, t);
+                return;
+            }
             // The positional fields are the constructor's parameter list
             // (one per field, declaration order). Reuse the same arity +
             // named-argument binding + per-argument assignability check the
