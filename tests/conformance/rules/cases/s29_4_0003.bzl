@@ -2,8 +2,11 @@
 //! doc: spec
 //! section: 29.4
 //! title: a borrow-bearing record local crossing a yield must have a frame-resident source
-//! rule: A borrow-bearing record local (§9.7) whose live range crosses a
-//!   `yield return` is subject to the same frame-resident-source rule as
+//! rule: A local of a value type that holds borrows (§3.6's holds-borrows
+//!   property: a borrow-bearing record (§9.7) or inline array, or a choice
+//!   that holds borrows), or one declared `IReadOnlySpan<TElement>`, read as
+//!   the span it boxes (§9.7), whose live range crosses a `yield return` is
+//!   subject to the same frame-resident-source rule as
 //!   §30.1's across-suspension rule: every borrow the local carries must
 //!   have a source the frame itself owns — an owned local, a `using var`, or
 //!   an `owned` parameter of the iterator body.

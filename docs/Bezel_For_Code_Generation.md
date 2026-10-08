@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.332. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.333. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.332 and `Bezel_Standard_Library.md` v0.332 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.333 and `Bezel_Standard_Library.md` v0.333 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -641,7 +641,7 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 ### 4.6 The diagnostics you will actually hit
 
-Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **field moved and not restored** on some exit path; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** and the **element-borrow use-after-removal warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode, v0.307) and every borrow you store in a plain field, a borrowing collection, or an abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all.
+Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **field moved and not restored** on some exit path; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** and the **element-borrow use-after-removal warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode, v0.307) and every borrow of a parameter, `this` or a field you store in a plain field or a collection, every transfer of a local or `owned` parameter that a collection may still hold a borrow of, and every abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all.
 
 <a id="sec-recommended-diagnostic-wordings"></a>
 **Recommended wordings.** The spec fixes what each of these diagnostics names (spec §28.3 *Diagnostics*, §28.10's adoption rule, §30.5's near-miss forms, §35.5); the words below are its recommendations, kept here as teaching text. The compiler's own text may differ: match a diagnostic by what it names, not by its words.
@@ -665,7 +665,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.332 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.333 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1951,7 +1951,7 @@ class Keeper
 end Keeper;
 ```
 
-> §9.7 / §28.11: `ToArray`, `Sorted`, `Reversed`, slicing, `AddRange`, `UnionWith`, `new Array<T>(size, fill)`, `LinkedList<T>(source)`, LINQ's `ToArray`/`ToSet`/`ToDictionary` and the span views' `Fill`/`CopyFrom`/`CopyTo` copy each element **with its borrows**, sourced at the source expression, and the copy is a store into wherever the result lands — checked as your own `Add` of each element would be. A local copy is fine; a field, a return or a wider collection is not: at a value element that holds borrows with no residual, and at a class element whenever the source is a scope-bound local.
+> §9.7 / §28.11: the value-copy members, each marked `value-copy (§4)` in the stdlib — `ToArray`, `Sorted`, `Reversed`, slicing, `AddRange`, `UnionWith`, `new Array<T>(size, fill)`, `LinkedList<T>(source)`, a direct `FromCollectionLiteral` call, LINQ's `ToArray`/`ToSet`/`ToDictionary` and the span views' `Fill`/`CopyFrom`/`CopyTo` — copy each element **with its borrows**, sourced at the source expression, and the copy is a store into wherever the result lands — checked as your own `Add` of each element would be. A local copy is fine; a field, a return or a wider collection is not: at a value element that holds borrows with no residual, and at a class element whenever the source is a scope-bound local.
 
 ```bezel
 using var ys := xs.ToArray();                                  // a local copy: admitted where `ys.Add(xs[0])` would be
@@ -2113,6 +2113,17 @@ end;
 > §15.3 / §9.4: a whole-value `move` out of a move-only **field** leaves the field's storage in the disposed state until the restoration store, and a `case` binding taken over the field before the move reads that state. Read what you need through the binding **before** the move, or move the field into a local first and match the local (`var t := move h.Slots; case t of …`). A slot read through an inline-array binding (`a[0]`) is an indexer access, throwable under §28.8.1, so any such read between the move and the restoration needs the restoration in a `finally` — a restoration after it leaves the read's exception edge unrestored, a compile error (K9.2).
 
 ```bezel
+// In `record Box` with `public property Item: Item?;` (a settable member) over a class `Item`:
+var b := new Box();
+do
+  using var it := new Item();
+  b.Item := it;                      // ERROR: `b` outlives `it` — a member store adds `it` to `b`'s borrows
+end;
+```
+
+> §9.7 / §15.1.2: a store into a record's settable member (`b.Item := e`, `b.Slots[i] := e`) adds the borrows `e` carries to the record's one source set — a later store never removes one — and is checked as an assignment of the whole record: at a local, rejected where the local is declared in a block that strictly encloses a source's; at a class instance or static field, admitted only in the null-source form, every reference-typed member `null`. Declare the record inside the source's block, or keep the source and build the record where it is used.
+
+```bezel
 public static method Show(o: Object)
   Console.WriteLine(o.ToString());
 end Show;
@@ -2126,6 +2137,20 @@ var n := Sum(buf.AsReadOnlySpan());           // OK over `Sum(s: IReadOnlySpan<i
 ```
 
 > §9.7 / §8.6: a value that holds borrows (a span; a record or choice with a class-, interface- or `Object`-typed field; an inline array of them) reaches no position declared `Object` or an interface other than `IReadOnlySpan<TElement>` — not a parameter (`b.Keep<Object>(span)` included), a local, a field, a collection or a return — because the box announces no borrow and a callee could store it. It boxes as the receiver of a member call (`span.ToString()`, `$"{span}"`) — not of an extension on `Object` or a user interface — and at `IReadOnlySpan<TElement>`, whose values are read as holding the span's borrows and follow the span's rules: no field store, no return past the source, no `Object`, no `async` parameter. Remedies: a parameter at the value's own type or at `IReadOnlySpan<TElement>`, or a class implementing the interface.
+
+```bezel
+public static method Keep(s: IReadOnlySpan<int>)
+  var id: (IReadOnlySpan<int>) -> IReadOnlySpan<int> := lambda(x) => x;
+  var up: (IReadOnlySpan<int>) -> Object := id;     // ERROR: a span return slot does not vary to `Object`
+end Keep;
+
+public static method Put(xs: IReadOnlyList<IReadOnlySpan<int>>)
+  var v: IReadOnlyList<Object> := xs;               // ERROR: a span type argument does not vary to `Object`
+  var n := xs.Count;                                // OK — the list itself, at its own type
+end Put;
+```
+
+> §9.7 / §12.9 / §27.1.1: `IReadOnlySpan<TElement>` is an interface, but no retyping carries it to `Object` or another interface: not as a covariant type argument or return slot, not as a contravariant type argument or parameter slot (an `(Object) -> ()` value at `(IReadOnlySpan<int>) -> ()`), and not through a method reference whose callee declares `Object` at that slot. Each would put a span at a type that announces none of its borrows, and each is the borrow-erasing conversion, rejected where it is written. In a generic body the same retyping over `T` is rejected at an instantiation substituting `IReadOnlySpan<…>` or a value type, and a type test does not recover the variance: `o as IReadOnlyList<Object>` over an `Object` holding a list of spans is `null`. Keep the span type at every slot and type argument.
 
 ### 7.4 Overloads and the `out` family
 
@@ -2157,6 +2182,7 @@ public class Point: IEquatable<Point>
 end Point;
 var same := p.Equals(sub);   // ERROR at `sub: Point3`, a subclass of Point: converts to `Point` and to `Object?`, exact at neither — ambiguous (§22.6)
 var eq := p = sub;           // ERROR: the same ambiguity — `=` is the call `p.Equals(sub)` (§8.4)
+var seen := new Set<Point3>();   // ERROR: Point3 is not hashable — the set's comparison is the same ambiguity (§3.6, §9.2)
 public class Tag: IEquatable<Tag>
   public method Equals(other: Tag): bool => true;   // ERROR: an own-typed Equals obliges `override GetHashCode()` (§8.3)
 end Tag;
@@ -2172,6 +2198,7 @@ public class Point: IEquatable<Point>
 end Point;
 var pp: Point := sub;  var same := p.Equals(pp);                         // the argument at `Point`: exact
 var eq := p = pp;                                                        // `=` is the same call: Equals(Point) (§8.4)
+var seen := new Set<Point>();  seen.Add(sub);                            // a Point3 held at Point: compares by Equals(Point) (§9.2)
 
 public class Money: IFormattable
   public readonly property Cents: long;
@@ -2273,6 +2300,16 @@ await f();
 ```
 
 > §30.1: a span, a borrow-bearing record or inline array, or a choice that holds borrows captured by an `async` lambda is a local of that lambda's body, and its sources are the enclosing scope's, never frame-resident — so any use of it after one of the body's own `await`s is rejected (a `CancellationToken` is the one exception). Read it before the first `await`, or copy what the body needs — `var first := s[0];` — before suspending.
+
+```bezel
+public static async method First(xs: Array<int>): Task<int>
+  var s: IReadOnlySpan<int> := xs.AsSpan();
+  await Task.Delay(10);              // ERROR: `s` is live across the `await`, and its source `xs` is a plain parameter
+  return s[0];
+end First;
+```
+
+> §30.1 / §29.4 / §9.7: a local declared `IReadOnlySpan<TElement>` is read as the span it boxes, so it crosses a suspension point — an `await`, or a `yield return` in any iterator — only where every borrow it carries has a frame-resident source: an owned local, a `using var` or an `owned` parameter of the same body. The same holds for a capture of one in an `async` lambda and for an `async` parameter, result or element type declared at the interface. Index it before the suspension (`var first := s[0];`), or re-derive the view after it.
 
 ### 7.7 Contracts used as input validation
 
