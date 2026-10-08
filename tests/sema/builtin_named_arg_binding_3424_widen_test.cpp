@@ -49,6 +49,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/test_data_paths.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -62,13 +63,18 @@ namespace {
 const char* kSerializationImport = "import System.Serialization; ";
 
 std::string prog(const std::string& body) {
-    return "module M; "
-           "class C "
-           "  public static method Main(): int " +
-           body +
-           "    return 0; "
-           "  end Main; "
-           "end C;";
+    // #5230: `@DATA@` splices to a per-process dir under wtScratchDir(). The
+    // FileStream rows below name a data path, so a fixed one would both break
+    // the /tmp scratch policy and race with a concurrent test process.
+    return bezel::test::spliceDataPaths(
+        "module M; "
+        "class C "
+        "  public static method Main(): int " +
+            body +
+            "    return 0; "
+            "  end Main; "
+            "end C;",
+        "bzt3424");
 }
 
 std::string serProg(const std::string& body) {
@@ -278,7 +284,7 @@ BEZEL_TEST(builtin_named_arg_3424_widen,
            accepts_named_args_on_filestream_2_param_ctor) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
-            "    using var f := new FileStream(path := \"/tmp/bezel_test_fs.tmp\", "
+            "    using var f := new FileStream(path := \"@DATA@/bezel_test_fs.tmp\", "
             "mode := FileMode.Create); "
             "    Console.WriteLine(0); ")),
         std::string("0"));
@@ -289,7 +295,7 @@ BEZEL_TEST(builtin_named_arg_3424_widen,
            accepts_named_args_on_filestream_3_param_ctor) {
     BEZEL_EXPECT_EQ(
         runAotOut(prog(
-            "    using var f := new FileStream(path := \"/tmp/bezel_test_fs2.tmp\", "
+            "    using var f := new FileStream(path := \"@DATA@/bezel_test_fs2.tmp\", "
             "mode := FileMode.Create, access := FileAccess.ReadWrite); "
             "    Console.WriteLine(0); ")),
         std::string("0"));
