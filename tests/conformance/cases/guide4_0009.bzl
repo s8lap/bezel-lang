@@ -1,4 +1,4 @@
-var cfg := await FetchConfigAsync();    // works (v0.249): the task is pinned to a
+var cfg := await FetchConfigAsync();    // works: the task is pinned to a
                                         //   hidden slot until the end of this block;
                                         //   cfg borrows the Config through it
 Render(await FetchConfigAsync());       // also fine: borrow confined to the statement,

@@ -1,6 +1,6 @@
 # Bezel Guide 7: Style
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.295.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.326.*
 
 Nothing in this guide is enforced. The compiler checks none of the naming conventions — spec §1.3 states them and says in the same breath that it does not enforce them — no formatter ships with the toolchain, and every layout rule below compiles identically when it is ignored. What the conventions buy is that a reader recognizes a declaration's shape before reading its words, and that a diff shows the change rather than the reflow. Where a rule of style touches a rule of the language — the closers of §1.6, `_` as the reserved discard (§17.13), the no-hiding rule (§12.2), the field order that §28.4's reverse-order disposal makes load-bearing (§4) — the language rule is cited and never bent. The worked reference is the tour in `docs/proposals/0002-http-server.md` §2; the sections below generalize from it, and a formatter, when one exists, should encode them.
 
@@ -37,9 +37,9 @@ end IPostingRule;
 
 **Constants split by kind.** A class-level `const` and a compile-time `const` local are PascalCase — `const MaxUsers := 1000;` is spec §21.1's own example. A **runtime** `const` local (§21.1) is an ordinary local that happens not to be reassignable, and takes camelCase: `const openingBalance := account.Balance;`, matching §21.1's `const n := items.Count + 1;`.
 
-**The three access tiers have three names** (stdlib §1). One lookup, three spellings, and the name is what tells them apart: the **plain** name throws and so treats absence as a bug (`Parse`, the `[key]` indexer); **`XOrNull`** returns `T?` for direct `??`/`?.` composition (`ParseOrNull`, `GetOrNull`); **`TryX`** is the only shape that distinguishes outcomes a collapsed `T?` cannot, in one of the four sanctioned forms (stdlib §1's table). Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the tier names do not. Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
+**The three access tiers have three names** — plain (`Parse`), `XOrNull` (`ParseOrNull`), `TryX` (`TryParse`) — and stdlib §1 defines what each name promises (taught in Guide 2 §2). Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the tier names do not. Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
 
-**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1, v0.195) is narrower than the habit: the suffix marks the asynchronous half of a **sync/async pair** — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists **only** asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
+**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a **sync/async pair** — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists **only** asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
 
 **Booleans read as predicates.** `IsEmpty`, `HasEntries`, `CanPost`, `Done` — or a verb the caller can read as a question: `Contains`, `TryAdd`, `Admits`. Never a noun that reads as data (`Status`, `Flag`).
 
@@ -71,15 +71,18 @@ using var settled := postings.Where(                              // anything mo
 
 ```bezel
 module Ledger.Accounts.Tests;
+import Ledger.Accounts;             // the module under test
 import System.Diagnostics;          // Debug.Assert (stdlib §8.2)
 
-public static method PostRejectsAnUnknownAccount()
-  using var ledger := new Ledger(["ada"]);                     // arrange
+public static class LedgerTests
+  public static method PostRejectsAnUnknownAccount()
+    using var ledger := new Ledger(["ada"]);                     // arrange
 
-  var posted := ledger.Post(new Posting("bob", 25m));          // act
+    var posted := ledger.Post(new Posting("bob", 25m));          // act
 
-  Debug.Assert(not posted, "an unknown account is declined");  // assert
-end PostRejectsAnUnknownAccount;
+    Debug.Assert(not posted, "an unknown account is declined");  // assert
+  end PostRejectsAnUnknownAccount;
+end LedgerTests;
 ```
 
 Blank lines separate members too, and separate a clause region from the body it guards — spec §22.16's own recommended style: the promises above the gap, the doing below it.
@@ -96,7 +99,7 @@ public constructor(owners: Array<string>,
 end constructor;
 ```
 
-**Keep code within 110 columns.** The tour's longest code line is 103. A trailing-comment block picks one column for the whole block and may carry a line past the ceiling — the tour's comments start at column 78 and its longest line is 135. Align the comments; do not reflow working code to hide them.
+**Keep code within 110 columns.** The tour's longest code line is 103. A trailing-comment block picks one column for the whole block and may carry a line past the ceiling — the tour's comment blocks start at columns 76 and 77 and its longest line is 133. Align the comments; do not reflow working code to hide them.
 
 **Align a run, never a body.** Where consecutive lines have the same shape — a table of registrations, a run of `case` arms, a wrapped named-argument list — align the columns, so a wrong entry shows up as the ragged one:
 
@@ -146,7 +149,7 @@ public sealed class Ledger
 end Ledger;
 ```
 
-The worked case is `0002-http-server.md` §4.1: the root service declares `_deps` — whose store the mounted children borrow — and then `_routes`, which *owns* those children. `_routes` is disposed first, the children die while `_deps` is intact, and §28.3's back-reference residual ("the source outlives the object") is discharged **structurally**, by declaration order, with no runtime backstop. Swap the two lines and the borrow outlives its source — a residual §28.3 places on the field order, reported at disposal if at all, never at either declaration. Where the ordering carries this weight, say so in a trailing comment — the reader cannot see it, which is §3's whole test.
+The worked case is `0002-http-server.md` §4.1: the root service declares `_deps` — whose store the mounted children borrow — and then `_routes`, which *owns* those children. `_routes` is disposed first, the children die while `_deps` is intact, and §28.3's back-reference residual (the programmer's obligation that the source outlive the object) is discharged **structurally**, by declaration order, with no runtime backstop. Swap the two lines and the borrow outlives its source — a residual §28.3 places on the field order, reported at disposal if at all, never at either declaration. Where the ordering carries this weight, say so in a trailing comment — the reader cannot see it, which is §3's whole test.
 
 ---
 
@@ -210,7 +213,7 @@ public class ledger                                          // 1 — a type is 
 end;
 ```
 
-The same class, written to this guide. Three differences change what the program *does* — the field order (§4), the `requires` clause, and `sealed`; every other one changes only what a reader has to reconstruct:
+The same class, written to this guide. Three differences change what the program *does* — the field order (§4), the `requires` clause, and `sealed` — and one adds surface, the `Count` property, placed where §4's order puts properties; every other one changes only what a reader has to reconstruct:
 
 ```bezel
 public sealed class Ledger

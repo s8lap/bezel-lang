@@ -1,8 +1,10 @@
 extension IEnumerable<T> where T: value
   // where T: value — the for-based body returns the iteration variable, which
   // at a class or interface substitution would be an enumerator-sourced borrow
-  // that may not escape the loop (§28.3, §29.2, v0.235); at value substitutions
-  // the return copies the value and the admission is vacuous.
+  // that may not escape the loop (§28.3, §29.2, v0.235); at a value substitution
+  // that carries no borrow the return copies the value; at a borrow-bearing
+  // one the copy's borrows are sourced, as the variable is, at the loop's
+  // implicit enumerator, and §9.7's return bullet rejects the instantiation.
   public method First(): T
     for var item in this do return item; end;
     throw new InvalidOperationException("empty sequence");

@@ -267,7 +267,7 @@ spec	29.12	Mutation during iteration	2	1	10	0	4	0	1	5	covered
 spec	29.13	Async iterators	0	0	0	0	0	0	0	0	n/a
 spec	30	Asynchronous Programming	0	0	0	0	0	0	0	0	n/a
 spec	30.1	async methods	13	5	17	6	0	10	1	0	covered
-spec	30.2	await	3	0	2	1	0	1	0	0	covered
+spec	30.2	await	2	0	2	1	0	1	0	0	covered
 spec	30.3	The Task, Task<T>, and OwningTask<T> types	7	1	5	0	0	2	0	3	covered
 spec	30.4	Multiple awaiters	2	0	2	0	0	0	0	2	covered
 spec	30.5	Result lifetime and task disposal	0	3	13	7	0	6	0	0	covered
