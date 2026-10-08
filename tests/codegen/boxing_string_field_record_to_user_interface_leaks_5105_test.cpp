@@ -35,6 +35,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -42,13 +43,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // T1 — THE PIN. Record with string fields boxed to user interface parameter.
 // LSan: Direct 6400 B (200×24B box) + Indirect 890 B (200×string headers).
@@ -124,7 +118,7 @@ const char* kIntFieldRecordViaInterface =
 BEZEL_TEST(codegen_boxing_string_field_record_to_user_interface_leaks_5105,
            string_field_record_via_interface_no_leak_spec_8_6_28_2) {
     JitResult r = runAotChecked(kStringFieldRecordViaInterface);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // pre-fix: LSan flips false
     BEZEL_EXPECT_EQ(r.exitCode, 200);
 }
@@ -135,7 +129,7 @@ BEZEL_TEST(codegen_boxing_string_field_record_to_user_interface_leaks_5105,
 BEZEL_TEST(codegen_boxing_string_field_record_to_user_interface_leaks_5105,
            string_field_record_via_object_no_leak_spec_8_6) {
     JitResult r = runAotChecked(kStringFieldRecordViaObject);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // pre-fix: LSan flips false
     BEZEL_EXPECT_EQ(r.exitCode, 200);
 }
@@ -147,7 +141,7 @@ BEZEL_TEST(codegen_boxing_string_field_record_to_user_interface_leaks_5105,
 BEZEL_TEST(codegen_boxing_string_field_record_to_user_interface_leaks_5105,
            int_field_record_via_interface_control_spec_8_6) {
     JitResult r = runAotChecked(kIntFieldRecordViaInterface);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 200);
 }
