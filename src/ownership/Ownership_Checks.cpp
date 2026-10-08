@@ -6207,12 +6207,7 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     if (!isBorrowBearingRecordOrSpan(rt)) return;
     // A builtin span view (no user Record decl) vs a user borrow-bearing
     // record — selects the diagnostic wording and the projection-branch gate.
-    // fix #4811 (§4.14/§4.15, v0.330): ArraySpan / ReadOnlyArraySpan are builtin
-    // spans but ARE user Records per isBorrowBearingRecord. Include them by name.
-    const bool builtinSpan = rt->declaration &&
-        (rt->declaration->name == "ArraySpan" ||
-         rt->declaration->name == "ReadOnlyArraySpan");
-    const bool typeIsSpan = !isBorrowBearingRecord(rt) || builtinSpan;
+    const bool typeIsSpan = !isBorrowBearingRecord(rt);
 
     // Shared: if `root` names a tracked scope-bound OWNED local (a `using var`
     // or a plain `var` owned local — both Owned in `states_`), report the
@@ -6541,35 +6536,6 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // are excluded (their borrow-lifetime model is frame-based, not scope-based).
     if (const auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
         if (isDeferredActivationCallResult(e)) return;
-        // fix #4811 (§9.7, v0.330): a CallExpr whose callee is a member-access
-        // expression — e.g. `return local.AsSpan()` — carries the borrow in the
-        // RECEIVER, not in any argument. Check it before scanning the args.
-        if (const auto* ma =
-                dynamic_cast<const ast::MemberAccessExpr*>(&*call->callee)) {
-            if (const ast::IdentifierExpr* recvRoot =
-                    identifierRoot(*ma->target)) {
-                if (sema::Symbol* s = ctx_.exprSymbol(*recvRoot)) {
-                    // fix #4811: parameters use the dedicated param message
-                    if (methodParamSet_.count(s)) {
-                        if (reportIfParameterRoot(recvRoot, e.span.begin,
-                                                  /*spanForm=*/true))
-                            return;
-                    } else if (isEscapeBoundLocal(s)) {
-                        report(
-                            Severity::Error, e.span.begin,
-                            std::string("returned span views `") +
-                            std::string(s->name) +
-                            "` whose backing storage is disposed at scope end — "
-                            "a span (§4.14/§4.15) is a borrow of its backing Array "
-                            "/ OwningBuffer and may not outlive it, but returning "
-                            "it from this method does (§9.7 borrow-lifetime rule; "
-                            "bind the source in the caller's scope and return the "
-                            "span from there instead)");
-                        return;
-                    }
-                }
-            }
-        }
         // Helper: find an escape-bound local source in a NewExpr's arguments.
         // Mirrors carriedBorrowSourceOfValueExpr's NewExpr arm but with recursive
         // tracing for nested non-identifier args.
@@ -6642,10 +6608,7 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // might borrow a source that DOES outlive the frame) is not newly rejected —
     // and require the receiver ROOT (`identifierRoot` peels the member/call/
     // index chain) to be a tracked owned local. // per §9.7, §4.14, §4.15
-    // fix #4811 (§4.14/§4.15, v0.330): ArraySpan / ReadOnlyArraySpan are builtin
-    // spans but ARE user Records per isBorrowBearingRecord, so typeIsSpan is
-    // false for them. The by-name check lets the projection branch through.
-    if (!typeIsSpan && !builtinSpan) return;  // a user record → not the span gap
+    if (!typeIsSpan) return;  // a user record → not the span gap
     const ast::IdentifierExpr* projRoot = identifierRoot(e);
     // fix #4428 (§9.7, v0.301): the parameter arm. Today, `local.AsSpan()` /
     // `local[i]` with `local` a tracked owned local is rejected; with `local`
