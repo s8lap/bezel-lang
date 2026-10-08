@@ -2,7 +2,7 @@
 //   (BEZEL_TEST ctor_out_owned_var_dropped_2429,
 //    dropped_on_the_floor_disposes_exactly_once_spec_28_3).
 //
-// §28.3 / §22.4 / #2429 (constructor `out owned var` recipient dropped on
+// §28.3 / §22.4 / #2429 (constructor `out var` recipient dropped on
 // the floor, spec v0.235): before this fix, no diagnostic at all was
 // emitted for this program — `MethodOwnership::recordMovesIn`'s NewExpr
 // branch never wired the recipient into the ownership dataflow's `states_`
@@ -22,7 +22,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class Item end Item; class Widget public constructor(s: string, out owned n: Item) n := new Item(); end constructor; end Widget; class C public static method Main(): int var w := new Widget("x", out owned var n); w.Dispose(); return 0; end Main; end C;
+module M; class Item end Item; class Widget public constructor(s: string, out owned n: Item) n := new Item(); end constructor; end Widget; class C public static method Main(): int var w := new Widget("x", out var n); w.Dispose(); return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned value in `n` is implicitly disposed at the end of its scope
 // CHECK-SAME: (§28.3 must-use / auto-drop)
