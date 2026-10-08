@@ -1066,8 +1066,15 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
             return false;
         }
         if (t.kind == TokenKind::Identifier) continue; // type name component
-        // Numeric/char/string literals cannot be type args.
-        return false;
+        // IntLiteral (the size in an inline-array type: `[2]T`, `[2 owned]U`)
+        // is valid in a type-arg list; the `> ... (` check below correctly
+        // distinguishes a generic call from a relational chain.  FloatLiteral,
+        // CharLiteral and StringLiteral are rejected — they cannot appear in
+        // any valid type argument.
+        if (t.kind == TokenKind::IntLiteral) continue;
+        if (t.kind == TokenKind::FloatLiteral || t.kind == TokenKind::CharLiteral ||
+            t.kind == TokenKind::StringLiteral)
+            return false;
     }
     return false; // exceeded scan limit
 }

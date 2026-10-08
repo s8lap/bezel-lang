@@ -4272,18 +4272,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // unconditionally.
         std::size_t declaredArity =
             md ? md->genericParams.size() : ms->genericParams.size();
+        // Populate callTypeArgs (the explicit type arguments from the AST)
+        // unconditionally so subsequent checks can all reference it.
+        const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
+            nullptr;
+        if (auto* cma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            callTypeArgs = &cma->typeArgs;
+        else if (auto* cncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     ce.callee.get()))
+            callTypeArgs = &cncm->typeArgs;
+        else if (auto* cid =
+                     dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
+            callTypeArgs = &cid->typeArgs;
         if (declaredArity > 0) {
-            const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs =
-                nullptr;
-            if (auto* cma =
-                    dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
-                callTypeArgs = &cma->typeArgs;
-            else if (auto* cncm = dynamic_cast<const ast::NullCondMemberExpr*>(
-                         ce.callee.get()))
-                callTypeArgs = &cncm->typeArgs;
-            else if (auto* cid =
-                         dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
-                callTypeArgs = &cid->typeArgs;
             if (callTypeArgs && !callTypeArgs->empty() &&
                 callTypeArgs->size() != declaredArity) {
                 ctx_.diagnostics().report(
@@ -4297,6 +4299,134 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     "must supply exactly as many arguments as the method "
                     "declares type parameters; there are no partial lists "
                     "(§14.5)");
+            }
+        }
+        // §14.2 (v0.327, #5640): a dispatched generic method's call rejects a
+        // move-only value type (§15.3) and an inline array of any form (§15.1)
+        // as a type argument — a copy-for-dispatch is the operation move-only
+        // forbids, and an inline array has no stable vtable slot for a dispatched
+        // override.  Fires for explicit type arguments on any method that is
+        // dispatched: an interface method, or a virtual/abstract/override class
+        // method, or a class method that satisfies an interface requirement
+        // (inherited witness — §14.2 / §11.2, v0.327).
+        if (declaredArity > 0 && callTypeArgs && !callTypeArgs->empty()) {
+            bool isDispatched = false;
+            // A static method (§22.12) is not dispatched — it is called by
+            // direct address, never through a vtable/itable.
+            bool isStatic = false;
+            for (std::string_view mod : ms->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (!isStatic && ms->parent &&
+                ms->parent->kind == ast::TypeDeclKind::Interface)
+                isDispatched = true;
+            else {
+                for (std::string_view mod : ms->modifiers)
+                    if (mod == "virtual" || mod == "abstract" ||
+                        mod == "override") { isDispatched = true; break; }
+                // inherited interface witness: a class method that satisfies an
+                // interface requirement (§11.2) is dispatched through that
+                // interface even without an explicit `override` modifier.
+                // Also check the receiver type's interface conformance: the same
+                // method `B.M` is dispatched when called on `D` (which implements
+                // `IProbe`) but not when called on `B` (which does not).
+                if (!isDispatched && ms->parent) {
+                    for (TypeSymbol* base : ms->parent->baseTypes) {
+                        if (!base || base->kind != ast::TypeDeclKind::Interface)
+                            continue;
+                        for (Symbol* m : base->members) {
+                            if (m->name == ms->name) {
+                                isDispatched = true;
+                                break;
+                            }
+                        }
+                        if (isDispatched) break;
+                    }
+                    // §11.2 inherited witness: check if the RECEIVER type (the
+                    // actual class at the call site) puts this method in its
+                    // itable.  Walk the receiver's type hierarchy and check each
+                    // base for an interface that has a method with this name.
+                    if (!isDispatched) {
+                        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                                ce.callee.get())) {
+                            if (ma->target) {
+                                if (TypeRef* recvTy =
+                                        ctx_.exprType(*ma->target)) {
+                                    // Resolve the receiver's declared type to a
+                                    // TypeSymbol, then walk its base hierarchy.
+                                    TypeSymbol* recvTS = recvTy->declaration;
+                                    if (!recvTS) {
+                                        // Bare type param (e.g. `x.M<...>()` where
+                                        // `x: T`): conservatively assume dispatched.
+                                        if (recvTy->kind ==
+                                                TypeRef::Kind::Named &&
+                                            !recvTy->declaration)
+                                            isDispatched = true;
+                                    } else {
+                                        // Walk the receiver's class hierarchy and
+                                        // check each base's interfaces.
+                                        std::vector<TypeSymbol*> work{recvTS};
+                                        std::unordered_set<TypeSymbol*> seen;
+                                        while (!work.empty() && !isDispatched) {
+                                            TypeSymbol* cur = work.back();
+                                            work.pop_back();
+                                            if (!seen.insert(cur).second) continue;
+                                            for (TypeSymbol* base : cur->baseTypes) {
+                                                if (!base) continue;
+                                                if (base->kind ==
+                                                    ast::TypeDeclKind::Interface) {
+                                                    for (Symbol* mem : base->members) {
+                                                        if (mem->name == ms->name) {
+                                                            isDispatched = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if (!seen.count(base))
+                                                    work.push_back(base);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (isDispatched) {
+                for (std::size_t i = 0; i < callTypeArgs->size(); ++i) {
+                    const auto& argType = (*callTypeArgs)[i];
+                    if (!argType) continue;
+                    TypeRef* resolved = ctx_.resolvedType(*argType);
+                    if (!resolved) continue;
+                    // §14.2 (v0.327, #5640): reject BOTH an owning inline array
+                    // (checked via isMoveOnlyValueType, which returns true for
+                    // InlineArray + arrayOwned) AND any other inline array form
+                    // (InlineArray with arrayOwned == false), since §15.1 excludes
+                    // "inline array of any form".
+                    bool isInlineArray =
+                        (resolved->kind == TypeRef::Kind::InlineArray);
+                    const char* moveOnlyKind = nullptr;
+                    bool isMoveOnly = common::isMoveOnlyValueType(
+                        resolved, ctx_, moveOnlyKind);
+                    if (isInlineArray || isMoveOnly) {
+                        std::string kindStr;
+                        if (isInlineArray && !isMoveOnly)
+                            kindStr = "an inline array";
+                        else
+                            kindStr = moveOnlyKind ? std::string(moveOnlyKind)
+                                                 : std::string("move-only");
+                        ctx_.diagnostics().report(
+                            Severity::Error, argType->span.begin,
+                            kindStr +
+                            " may not be used as a type argument at a "
+                            "dispatched generic method call (\xc2\xa7""14.2, "
+                            "v0.327; the vtable slot for a move-only or "
+                            "inline-array type argument would carry a "
+                            "wrong layout for the copy-for-dispatch that "
+                            "move-only forbids)");
+                        return;
+                    }
+                }
             }
         }
         // §14.5 (v0.184, #1686): ref/out inference positions must unify
