@@ -15086,6 +15086,29 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 if (v != carrier && isBareTypeParamRef(formalTy))
                     bareTParamNarrowUnwraps_.push_back({idx, v, carrier});
             }
+            // fix #5105 (§8.6 / §28.2, v0.315): a record with string fields
+            // that is boxed loses its scope-end string-release disposal — the
+            // box holds a COPY of the record bytes, so the original record's
+            // string fields are never released. Emit the string field releases
+            // BEFORE boxing (using a temp stack slot to hold the record address)
+            // so the strings are freed while the record struct is still live.
+            // Only for records (not primitives — they have no string fields).
+            // Gated on `formalTy` being Object/interface
+            // (the only case that triggers boxForTarget).
+            if (formalTy && isObjectOrInterfaceTarget(formalTy) && v &&
+                a.value) {
+                const sema::TypeRef* argTy = ctx_.exprType(*a.value);
+                if (argTy && argTy->kind == sema::TypeRef::Kind::Named &&
+                    argTy->declaration &&
+                    argTy->declaration->kind == ast::TypeDeclKind::Record &&
+                    recordHasStringFields(argTy)) {
+                    // `v` is the loaded record struct value. Allocate a temp
+                    // slot, store the value, and use its address for the release.
+                    llvm::AllocaInst* tmpSlot = entryAlloca(v->getType());
+                    builder_.CreateStore(v, tmpSlot);
+                    emitRecordStringFieldReleases(tmpSlot, argTy);
+                }
+            }
             // §8.6: a value-typed argument bound to an Object/interface
             // parameter is boxed, so a later `is`/`as` or virtual dispatch on
             // that parameter (which lowers to a descriptor walk through the
