@@ -1547,7 +1547,8 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             return builder_.CreateCall(atofFn, {data}, "atof.ret");
         }
         if (method == "ToBoolean") {
-            // "true" → true, "1" → true, anything else → false
+            // per stdlib §2.3, v0.315: accepts exactly "true"/"false" (case-insensitive).
+            // Anything else raises FormatException.
             auto* strcmpFn = module_->getFunction("strcasecmp");
             if (!strcmpFn) {
                 auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
@@ -1560,13 +1561,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             llvm::Value* cmpTrue = builder_.CreateICmpEQ(
                 builder_.CreateCall(strcmpFn, {data, trueGV}),
                 llvm::ConstantInt::get(i32(), 0));
-            llvm::Constant* oneStr = llvm::ConstantDataArray::getString(llvm_, "1", true);
-            auto* oneGV = new llvm::GlobalVariable(*module_, oneStr->getType(), true,
-                llvm::GlobalValue::PrivateLinkage, oneStr, ".bz.bool.one." + std::to_string(tid));
-            llvm::Value* cmpOne = builder_.CreateICmpEQ(
-                builder_.CreateCall(strcmpFn, {data, oneGV}),
+            llvm::Constant* falseStr = llvm::ConstantDataArray::getString(llvm_, "false", true);
+            auto* falseGV = new llvm::GlobalVariable(*module_, falseStr->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, falseStr, ".bz.bool.false." + std::to_string(tid));
+            llvm::Value* cmpFalse = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcmpFn, {data, falseGV}),
                 llvm::ConstantInt::get(i32(), 0));
-            return builder_.CreateOr(cmpTrue, cmpOne, "tobool");
+            // Neither "true" nor "false" → raise FormatException.
+            llvm::Value* notTrueOrFalse = builder_.CreateNot(
+                builder_.CreateOr(cmpTrue, cmpFalse), "tobool.invalid");
+            emitGuardThrow(notTrueOrFalse, "FormatException");
+            return cmpTrue;
         }
         // stdlib §9.6, #882: GetHashCode(): int — content-based hash consistent
         // with string Equals/`=` (two content-equal strings hash equal).

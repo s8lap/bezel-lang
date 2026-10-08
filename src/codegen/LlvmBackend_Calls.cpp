@@ -11348,7 +11348,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 emitPendingCheck();
                 return builder_.CreateLoad(dst, slot, "cvtdec.val");
             }
-            // Convert.ToBoolean(s: string): bool — "true"/"1" → true
+            // per stdlib §2.3, v0.315: Convert.ToBoolean(s: string) accepts exactly
+            // "true"/"false" (case-insensitive). Anything else raises FormatException.
             if (m == "ToBoolean") {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
@@ -11364,12 +11365,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::GlobalValue::PrivateLinkage, trueStr, ".bz.bool.true." + std::to_string(tid));
                 llvm::Value* cmpTrue = builder_.CreateICmpEQ(
                     builder_.CreateCall(strcmpFn, {data, trueGV}), builder_.getInt32(0));
-                llvm::Constant* oneStr = llvm::ConstantDataArray::getString(llvm_, "1", true);
-                auto* oneGV = new llvm::GlobalVariable(*module_, oneStr->getType(), true,
-                    llvm::GlobalValue::PrivateLinkage, oneStr, ".bz.bool.one." + std::to_string(tid));
-                llvm::Value* cmpOne = builder_.CreateICmpEQ(
-                    builder_.CreateCall(strcmpFn, {data, oneGV}), builder_.getInt32(0));
-                return builder_.CreateOr(cmpTrue, cmpOne, "tobool");
+                llvm::Constant* falseStr = llvm::ConstantDataArray::getString(llvm_, "false", true);
+                auto* falseGV = new llvm::GlobalVariable(*module_, falseStr->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, falseStr, ".bz.bool.false." + std::to_string(tid));
+                llvm::Value* cmpFalse = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcmpFn, {data, falseGV}), builder_.getInt32(0));
+                // Neither "true" nor "false" → raise FormatException.
+                llvm::Value* notTrueOrFalse = builder_.CreateNot(
+                    builder_.CreateOr(cmpTrue, cmpFalse), "tobool.invalid");
+                emitGuardThrow(notTrueOrFalse, "FormatException");
+                return cmpTrue;
             }
             // Convert.ToString(n: int): string — alias for n.ToString()
             if (m == "ToString") {

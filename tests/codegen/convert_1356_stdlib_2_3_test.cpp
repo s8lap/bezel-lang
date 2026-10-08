@@ -150,3 +150,64 @@ BEZEL_TEST(codegen_convert_1356_stdlib_2_3, try_to_int64_out_var_inline) {
         "return 0;"
     )), 1);
 }
+
+// fix #5502 (§2.3, v0.315): Convert.ToBoolean — per stdlib §2.3 accepts exactly
+// "true"/"false" (case-insensitive).  Anything else raises FormatException.
+// Previously accepted "1" (should not) and returned false for all other strings
+// (should raise FormatException instead).  Each test loops to prevent an early
+// return from masking a missing raise on the leak oracle.
+BEZEL_TEST(codegen_convert_1356_stdlib_2_3, to_boolean_one_raises_format_exception) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "for var i in 0..100 do "
+        "  try "
+        "    _ := Convert.ToBoolean(\"1\"); "
+        "  catch FormatException => return 0; "  // fix applied: raised and caught
+        "  end try; "
+        "end for; "
+        "return 1; "  // bug present: "1" returned normally instead of raising
+    )), 0);
+}
+
+BEZEL_TEST(codegen_convert_1356_stdlib_2_3, to_boolean_yes_raises_format_exception) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "for var i in 0..100 do "
+        "  try "
+        "    _ := Convert.ToBoolean(\"yes\"); "
+        "  catch FormatException => return 0; "
+        "  end try; "
+        "end for; "
+        "return 1; "
+    )), 0);
+}
+
+BEZEL_TEST(codegen_convert_1356_stdlib_2_3, to_boolean_empty_raises_format_exception) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "for var i in 0..100 do "
+        "  try "
+        "    _ := Convert.ToBoolean(\"\"); "
+        "  catch FormatException => return 0; "
+        "  end try; "
+        "end for; "
+        "return 1; "
+    )), 0);
+}
+
+BEZEL_TEST(codegen_convert_1356_stdlib_2_3, to_boolean_false_string_returns_false) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "for var i in 0..100 do "
+        "  var r := Convert.ToBoolean(\"False\"); "
+        "  if not r then return 0; end; "
+        "end for; "
+        "return 1; "
+    )), 0);
+}
+
+BEZEL_TEST(codegen_convert_1356_stdlib_2_3, to_boolean_true_string_returns_true) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "for var i in 0..100 do "
+        "  var r := Convert.ToBoolean(\"true\"); "
+        "  if r then return 0; end; "
+        "end for; "
+        "return 1; "
+    )), 0);
+}
