@@ -508,7 +508,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
             msg = d.message;
     BEZEL_EXPECT_TRUE(!msg.empty());
     // The remedy names the marked adoption, spelled with this parameter's name.
-    BEZEL_EXPECT_TRUE(msg.find("using var elements2 := owned elements;") !=
+    BEZEL_EXPECT_TRUE(msg.find("using var elements2 := move elements;") !=
                       std::string::npos);
     // ...and says why the marker is required, citing §28.10.
     BEZEL_EXPECT_TRUE(msg.find("borrow-pin") != std::string::npos);

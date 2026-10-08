@@ -33,4 +33,4 @@ module M; class Foo end Foo; class C public static method Test(owned s: Shared<F
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned parameter `s` is implicitly disposed at the end of the method
 // CHECK-SAME: (§28.3 must-use / auto-drop)
-// CHECK-SAME: using var s2 := owned s;
+// CHECK-SAME: using var s2 := move s;

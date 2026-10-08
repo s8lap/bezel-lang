@@ -33,4 +33,4 @@ module M; class Foo end Foo; class C public static method Test(owned w: Weak<Foo
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} owned parameter `w` is implicitly disposed at the end of the method
 // CHECK-SAME: (§28.3 must-use / auto-drop)
-// CHECK-SAME: using var w2 := owned w;
+// CHECK-SAME: using var w2 := move w;

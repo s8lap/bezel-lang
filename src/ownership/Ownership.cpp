@@ -1167,9 +1167,9 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             "` is implicitly disposed at the end of the method "
                             "(§28.3 must-use / auto-drop); `move` / `return` / `.Dispose()` "
                             "it, or adopt it with `using var " +
-                            std::string(sym->name) + "2 := owned " +
+                            std::string(sym->name) + "2 := move " +
                             std::string(sym->name) +
-                            ";` (the `owned` marker is required — an unmarked "
+                            ";` (the `move` marker is required — an unmarked "
                             "`using var` rebind is a borrow-pin, §28.10), to "
                             "discharge it explicitly");
                         }

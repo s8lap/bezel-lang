@@ -1710,7 +1710,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         if (&e == caseScrutineeSlot_) {
             ctx_.diagnostics().report(
                 Severity::Error, e.span.begin,
-                "the owning-match consuming scrutinee (`case owned " +
+                "the owning-match consuming scrutinee (`case move " +
                 std::string(mt->name) +
                 " of \xe2\x80\xa6`) is not implemented in this version "
                 "\xe2\x80\x94 match on a borrow (`case " +
@@ -1720,7 +1720,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         } else if (&e != markedArmSlot_) {
             ctx_.diagnostics().report(
                 Severity::Error, e.span.begin,
-                "the transfer marker `owned " + std::string(mt->name) +
+                "the transfer marker `move " + std::string(mt->name) +
                 "` is admitted only as an if-expression branch, an "
                 "expression-`case`/`when` arm result, or the entire "
                 "right-hand side of a binding or assignment \xe2\x80\x94 "

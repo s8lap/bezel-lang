@@ -36,7 +36,7 @@ class C
   public static method A(): int
     var a := new Res(1);
     var q := a ?? owned a;
-    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the transfer marker `owned a` is admitted only as
+    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the transfer marker `move a` is admitted only as
     // CHECK-SAME: (axiom A7, narrowed v0.209; §28.3 / A.7 MarkedTransfer)
     return 0;
   end A;
@@ -46,14 +46,14 @@ class C
   public static method B(): owned Res
     var a := new Res(1);
     return owned a;
-    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the transfer marker `owned a` is admitted only as
+    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the transfer marker `move a` is admitted only as
   end B;
 
   // (3) A7: a guard is not an admission position.
   public static method E(n: int): int
     var b := new Res(1);
     var v := (case n of _ when owned b <> null => 1, _ => 0);
-    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the transfer marker `owned b` is admitted only as
+    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the transfer marker `move b` is admitted only as
     b.Dispose();
     return v;
   end E;
@@ -62,7 +62,7 @@ class C
   // draws its own targeted rejection until the consuming lowering lands.
   public static method I(o: Opt): int
     var r := (case owned o of None => 0, _ => 1);
-    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the owning-match consuming scrutinee (`case owned o of {{.*}}`) is not implemented in this version
+    // CHECK: :[[@LINE-1]]:{{[0-9]+}}: the owning-match consuming scrutinee (`case move o of {{.*}}`) is not implemented in this version
     // CHECK-SAME: (§35.5, v0.200; #2124)
     return r;
   end I;
