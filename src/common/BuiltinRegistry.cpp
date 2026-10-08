@@ -760,6 +760,30 @@ constexpr std::array<BuiltinParamNameRow, 35> kBuiltinCtorParamNames = {{
     {"Channel", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
 }};
 
+// fix #3534 (stdlib §2.14 / §2.15 / §7.2 / spec §22.5, v0.315): add
+// FileStream, JsonSerializer, JsonDeserializer, and BinaryDeserializer
+// constructor rows.  FileStream's 2-param form defaults `access` to
+// FileAccess.ReadWrite, so the row says total=2, required=2 (all positional
+// args must be supplied by the caller; the default is applied post-binding).
+// JsonSerializer has two arity-1 candidates (no-arg and options); overload
+// resolution picks the no-arg form when no argument is given, the options form
+// when JsonOptions is passed.  Each JsonDeserializer input form and each
+// BinaryDeserializer form has its own row; the 2-param forms use the partial
+// naming shape (one param named, one positional).
+constexpr std::array<BuiltinParamNameRow, 6> kBuiltinSerializationCtorParamNames = {{
+    // stdlib §7.2 — FileStream.
+    {"FileStream", "", 2, 2, {"path", "mode", "", "", "", "", "", ""}},
+    {"FileStream", "", 3, 3, {"path", "mode", "access", "", "", "", "", ""}},
+    // stdlib §2.15 — JsonSerializer.
+    {"JsonSerializer", "", 1, 1, {"options", "", "", "", "", "", "", ""}},
+    // stdlib §2.15 — JsonDeserializer.
+    {"JsonDeserializer", "", 1, 1, {"input", "", "", "", "", "", "", ""}},
+    {"JsonDeserializer", "", 2, 2, {"input", "options", "", "", "", "", "", ""}},
+    // stdlib §2.14 — BinaryDeserializer.
+    // BinaryDeserializer(input, ignoreUnknownFields) — both named.
+    {"BinaryDeserializer", "", 2, 2, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}},
+}};
+
 // fix #3425 — the built-in EXCEPTION constructors (spec §31.4). `Exception`
 // declares `(message)` and `(message, cause)`; `ArgumentException` and
 // `ArgumentOutOfRangeException` declare `(message, paramName)` instead
@@ -1579,6 +1603,8 @@ std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
     std::vector<BuiltinFormals> out;
     collectRows(kBuiltinCtorParamNames, typeHead, /*member=*/"", argCount, out);
     collectRows(kBuiltinExceptionCtorParamNames, typeHead, /*member=*/"",
+                argCount, out);
+    collectRows(kBuiltinSerializationCtorParamNames, typeHead, /*member=*/"",
                 argCount, out);
     // Spec §31.4: every standard exception type declares `constructor(message:
     // string)`; the arity-2 forms disagree across the family and are the rows
