@@ -548,7 +548,7 @@ struct BuiltinParamNameRow {
     std::string_view member;   // empty for a CONSTRUCTOR row
     std::uint8_t total;
     std::uint8_t required;
-    std::array<std::string_view, 4> names;
+    std::array<std::string_view, 8> names;
 };
 
 // stdlib §9.6 `String` (v0.283). The STATIC members are keyed under the same
@@ -562,51 +562,51 @@ struct BuiltinParamNameRow {
 // members carry no parameters and so cannot take a named argument at all.
 constexpr std::array<BuiltinParamNameRow, 37> kStringParamNames = {{
     // Construction (static)
-    {"string", "From", 1, 1, {"value", "", "", ""}},
-    {"string", "From", 3, 3, {"buffer", "start", "length", ""}},  // renamed v0.282 (§1)
-    {"string", "FromCStringPointer", 1, 1, {"p", "", "", ""}},
-    {"string", "FromWStringPointer", 1, 1, {"p", "", "", ""}},
-    {"string", "Join", 2, 2, {"separator", "items", "", ""}},
+    {"string", "From", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"string", "From", 3, 3, {"buffer", "start", "length", "", "", "", "", ""}},  // renamed v0.282 (§1)
+    {"string", "FromCStringPointer", 1, 1, {"p", "", "", "", "", "", "", ""}},
+    {"string", "FromWStringPointer", 1, 1, {"p", "", "", "", "", "", "", ""}},
+    {"string", "Join", 2, 2, {"separator", "items", "", "", "", "", "", ""}},
     // §9.6 declares two arity-2 `Repeat` overloads that disagree (#3424).
-    {"string", "Repeat", 2, 2, {"c", "count", "", ""}},
-    {"string", "Repeat", 2, 2, {"unit", "count", "", ""}},
+    {"string", "Repeat", 2, 2, {"c", "count", "", "", "", "", "", ""}},
+    {"string", "Repeat", 2, 2, {"unit", "count", "", "", "", "", "", ""}},
     // Inspection (static). fix #3854 (stdlib §9.6, v0.290): `IsNullOrEmpty`
     // was impl-ahead-of-spec surface (retired at v0.290, proposal 0123 R6) —
     // deleted, not just left unregistered here, so its row does not silently
     // resurrect a named-argument binding for a call the sema layer now rejects.
-    {"string", "IsNullOrWhiteSpace", 1, 1, {"value", "", "", ""}},
+    {"string", "IsNullOrWhiteSpace", 1, 1, {"value", "", "", "", "", "", "", ""}},
     // Inspection (instance)
-    {"string", "Contains", 1, 1, {"value", "", "", ""}},
-    {"string", "StartsWith", 1, 1, {"value", "", "", ""}},
-    {"string", "EndsWith", 1, 1, {"value", "", "", ""}},
-    {"string", "IndexOf", 1, 1, {"value", "", "", ""}},
-    {"string", "IndexOf", 2, 2, {"value", "startIndex", "", ""}},
-    {"string", "LastIndexOf", 1, 1, {"value", "", "", ""}},
+    {"string", "Contains", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"string", "StartsWith", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"string", "EndsWith", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"string", "IndexOf", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"string", "IndexOf", 2, 2, {"value", "startIndex", "", "", "", "", "", ""}},
+    {"string", "LastIndexOf", 1, 1, {"value", "", "", "", "", "", "", ""}},
     // Substring / span views
-    {"string", "Substring", 1, 1, {"startIndex", "", "", ""}},
-    {"string", "Substring", 2, 2, {"startIndex", "length", "", ""}},
+    {"string", "Substring", 1, 1, {"startIndex", "", "", "", "", "", "", ""}},
+    {"string", "Substring", 2, 2, {"startIndex", "length", "", "", "", "", "", ""}},
     // §9.6 declares `AsSpan(start)` and `AsSpan(r: Range<int>)` (#3424).
-    {"string", "AsSpan", 1, 1, {"start", "", "", ""}},
-    {"string", "AsSpan", 1, 1, {"r", "", "", ""}},
-    {"string", "AsSpan", 2, 2, {"start", "length", "", ""}},
+    {"string", "AsSpan", 1, 1, {"start", "", "", "", "", "", "", ""}},
+    {"string", "AsSpan", 1, 1, {"r", "", "", "", "", "", "", ""}},
+    {"string", "AsSpan", 2, 2, {"start", "length", "", "", "", "", "", ""}},
     // Modification
-    {"string", "Trim", 1, 1, {"chars", "", "", ""}},
-    {"string", "PadLeft", 1, 1, {"totalWidth", "", "", ""}},
-    {"string", "PadLeft", 2, 2, {"totalWidth", "paddingChar", "", ""}},
-    {"string", "PadRight", 1, 1, {"totalWidth", "", "", ""}},
-    {"string", "PadRight", 2, 2, {"totalWidth", "paddingChar", "", ""}},
-    {"string", "PadCenter", 1, 1, {"totalWidth", "", "", ""}},
-    {"string", "PadCenter", 2, 2, {"totalWidth", "paddingChar", "", ""}},
-    {"string", "Insert", 2, 2, {"startIndex", "value", "", ""}},
-    {"string", "Remove", 1, 1, {"startIndex", "", "", ""}},
-    {"string", "Remove", 2, 2, {"startIndex", "length", "", ""}},  // renamed v0.282 (§1)
+    {"string", "Trim", 1, 1, {"chars", "", "", "", "", "", "", ""}},
+    {"string", "PadLeft", 1, 1, {"totalWidth", "", "", "", "", "", "", ""}},
+    {"string", "PadLeft", 2, 2, {"totalWidth", "paddingChar", "", "", "", "", "", ""}},
+    {"string", "PadRight", 1, 1, {"totalWidth", "", "", "", "", "", "", ""}},
+    {"string", "PadRight", 2, 2, {"totalWidth", "paddingChar", "", "", "", "", "", ""}},
+    {"string", "PadCenter", 1, 1, {"totalWidth", "", "", "", "", "", "", ""}},
+    {"string", "PadCenter", 2, 2, {"totalWidth", "paddingChar", "", "", "", "", "", ""}},
+    {"string", "Insert", 2, 2, {"startIndex", "value", "", "", "", "", "", ""}},
+    {"string", "Remove", 1, 1, {"startIndex", "", "", "", "", "", "", ""}},
+    {"string", "Remove", 2, 2, {"startIndex", "length", "", "", "", "", "", ""}},  // renamed v0.282 (§1)
     // §9.6 declares two arity-2 `Replace` overloads that disagree (#3424).
-    {"string", "Replace", 2, 2, {"oldChar", "newChar", "", ""}},
-    {"string", "Replace", 2, 2, {"oldValue", "newValue", "", ""}},
+    {"string", "Replace", 2, 2, {"oldChar", "newChar", "", "", "", "", "", ""}},
+    {"string", "Replace", 2, 2, {"oldValue", "newValue", "", "", "", "", "", ""}},
     // §9.6 declares `Split(separator: char)`, `Split(separator: string)` and
     // `Split(separators: Array<char>)` — two candidate names at arity 1.
-    {"string", "Split", 1, 1, {"separator", "", "", ""}},
-    {"string", "Split", 1, 1, {"separators", "", "", ""}},
+    {"string", "Split", 1, 1, {"separator", "", "", "", "", "", "", ""}},
+    {"string", "Split", 1, 1, {"separators", "", "", "", "", "", "", ""}},
     // Comparison and equality. fix #3853 (stdlib §9.6, v0.290, proposal 0123
     // R6): the static `Compare(a, b)` / `Compare(a, b, ignoreCase)` rows this
     // table used to carry were RETIRED — deleted, not just left unregistered,
@@ -614,12 +614,12 @@ constexpr std::array<BuiltinParamNameRow, 37> kStringParamNames = {{
     // the sema layer now rejects outright (the #3854 `IsNullOrEmpty` pattern
     // above). The instance replacement is the 2-arg `CompareTo` row below,
     // parallel to `Equals`'s.
-    {"string", "CompareTo", 1, 1, {"other", "", "", ""}},
-    {"string", "CompareTo", 2, 2, {"other", "ignoreCase", "", ""}},
+    {"string", "CompareTo", 1, 1, {"other", "", "", "", "", "", "", ""}},
+    {"string", "CompareTo", 2, 2, {"other", "ignoreCase", "", "", "", "", "", ""}},
     // §9.6 declares BOTH `Equals(other: string?)` and the `Object?` override
     // at arity 1, and they AGREE on the name, so the single row answers both.
-    {"string", "Equals", 1, 1, {"other", "", "", ""}},
-    {"string", "Equals", 2, 2, {"other", "ignoreCase", "", ""}},
+    {"string", "Equals", 1, 1, {"other", "", "", "", "", "", "", ""}},
+    {"string", "Equals", 2, 2, {"other", "ignoreCase", "", "", "", "", "", ""}},
 }};
 
 // stdlib §3.2 `Encoding` (v0.290). No overload at a shared arity disagrees on
@@ -634,22 +634,22 @@ constexpr std::array<BuiltinParamNameRow, 37> kStringParamNames = {{
 // coverage: a 3-argument `GetString` call never reaches
 // `checkBuiltinNamedArgs` un-rejected.
 constexpr std::array<BuiltinParamNameRow, 4> kEncodingParamNames = {{
-    {"Encoding", "GetBytes", 1, 1, {"s", "", "", ""}},
-    {"Encoding", "GetBytes", 2, 2, {"s", "destination", "", ""}},
-    {"Encoding", "GetString", 1, 1, {"bytes", "", "", ""}},
-    {"Encoding", "GetByteCount", 1, 1, {"s", "", "", ""}},
+    {"Encoding", "GetBytes", 1, 1, {"s", "", "", "", "", "", "", ""}},
+    {"Encoding", "GetBytes", 2, 2, {"s", "destination", "", "", "", "", "", ""}},
+    {"Encoding", "GetString", 1, 1, {"bytes", "", "", "", "", "", "", ""}},
+    {"Encoding", "GetByteCount", 1, 1, {"s", "", "", "", "", "", "", ""}},
 }};
 
 // fix #3424 — stdlib §3.1 `StringBuilder` (v0.283). Every `Append` /
 // `AppendLine` overload declares its single parameter `value`, so one row per
 // argument count answers all of them.
 constexpr std::array<BuiltinParamNameRow, 6> kStringBuilderParamNames = {{
-    {"StringBuilder", "Append", 1, 1, {"value", "", "", ""}},
-    {"StringBuilder", "AppendLine", 1, 1, {"value", "", "", ""}},
-    {"StringBuilder", "AppendFormat", 2, 2, {"format", "args", "", ""}},
-    {"StringBuilder", "Insert", 2, 2, {"index", "value", "", ""}},
-    {"StringBuilder", "Remove", 2, 2, {"startIndex", "length", "", ""}},
-    {"StringBuilder", "Replace", 2, 2, {"oldValue", "newValue", "", ""}},
+    {"StringBuilder", "Append", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"StringBuilder", "AppendLine", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"StringBuilder", "AppendFormat", 2, 2, {"format", "args", "", "", "", "", "", ""}},
+    {"StringBuilder", "Insert", 2, 2, {"index", "value", "", "", "", "", "", ""}},
+    {"StringBuilder", "Remove", 2, 2, {"startIndex", "length", "", "", "", "", "", ""}},
+    {"StringBuilder", "Replace", 2, 2, {"oldValue", "newValue", "", "", "", "", "", ""}},
 }};
 
 // fix #3425 — the built-in CONSTRUCTOR rows (§17.7's closed constructor
@@ -664,57 +664,58 @@ constexpr std::array<BuiltinParamNameRow, 6> kStringBuilderParamNames = {{
 // task-completion sources, …) carry no row for the same reason `Trim/0`
 // carries none: a nullary constructor cannot take a named argument.
 //
-// `DateTime`'s eight-parameter overload (§2.5) is deliberately ABSENT: it
-// declares two trailing defaults AND exceeds this row's four-name capacity,
-// so it would need a wider row shape; a named argument on it is rejected
-// rather than mis-bound (issue 3533).
-constexpr std::array<BuiltinParamNameRow, 34> kBuiltinCtorParamNames = {{
+// fix #3533 (stdlib §2.5 / spec §22.5, v0.315): DateTime's eight-parameter
+// constructor (year, month, day, hour, minute, second, millisecond, kind) — all
+// eight parameters are named in the table. The row uses the 8-element names array
+// (wider than the pre-#3533 four-element limit).
+constexpr std::array<BuiltinParamNameRow, 35> kBuiltinCtorParamNames = {{
     // stdlib §2.5 — the temporal value records.
-    {"DateTime", "", 3, 3, {"year", "month", "day", ""}},
-    {"DateOnly", "", 3, 3, {"year", "month", "day", ""}},
-    {"TimeOnly", "", 4, 2, {"hour", "minute", "second", "millisecond"}},
+    {"DateTime", "", 3, 3, {"year", "month", "day", "", "", "", "", ""}},
+    {"DateTime", "", 8, 6, {"year", "month", "day", "hour", "minute", "second", "millisecond", "kind"}},
+    {"DateOnly", "", 3, 3, {"year", "month", "day", "", "", "", "", ""}},
+    {"TimeOnly", "", 4, 2, {"hour", "minute", "second", "millisecond", "", "", "", ""}},
     // stdlib §3.1 — `StringBuilder(capacity)` and `StringBuilder(initial)`
     // share an argument count and disagree on names: two candidates (#3424's
     // overload-aware lookup is what admits them).
-    {"StringBuilder", "", 1, 1, {"capacity", "", "", ""}},
-    {"StringBuilder", "", 1, 1, {"initial", "", "", ""}},
+    {"StringBuilder", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
+    {"StringBuilder", "", 1, 1, {"initial", "", "", "", "", "", "", ""}},
     // stdlib §3.3 / §31.4 — the two record-shaped reserved builtins whose
     // `lowerNew` arm honours the binding BY NAME (#3098); see
     // `isBuiltinCtorLoweredByName`.
-    {"ReadOnlyStringSpan", "", 3, 3, {"Source", "Start", "Length", ""}},
-    {"ExceptionInfo", "", 3, 3, {"TypeName", "Message", "StackTrace", ""}},
+    {"ReadOnlyStringSpan", "", 3, 3, {"Source", "Start", "Length", "", "", "", "", ""}},
+    {"ExceptionInfo", "", 3, 3, {"TypeName", "Message", "StackTrace", "", "", "", "", ""}},
     // stdlib §4.14 / §4.15 — the span records' direct constructors. Lowered
     // by POSITION (LlvmBackend_Exprs2.cpp), so a reorder stays rejected.
-    {"Span", "", 3, 3, {"Buffer", "Start", "Length", ""}},
-    {"ReadOnlySpan", "", 3, 3, {"Buffer", "Start", "Length", ""}},
-    {"ArraySpan", "", 3, 3, {"Source", "Start", "Length", ""}},
-    {"ReadOnlyArraySpan", "", 3, 3, {"Source", "Start", "Length", ""}},
+    {"Span", "", 3, 3, {"Buffer", "Start", "Length", "", "", "", "", ""}},
+    {"ReadOnlySpan", "", 3, 3, {"Buffer", "Start", "Length", "", "", "", "", ""}},
+    {"ArraySpan", "", 3, 3, {"Source", "Start", "Length", "", "", "", "", ""}},
+    {"ReadOnlyArraySpan", "", 3, 3, {"Source", "Start", "Length", "", "", "", "", ""}},
     // stdlib §4.2 / §4.5 / §4.6 / §4.8 / §4.14 — the collections.
-    {"Array", "", 1, 1, {"capacity", "", "", ""}},
-    {"Array", "", 2, 2, {"size", "fill", "", ""}},
-    {"OwningArray", "", 1, 1, {"capacity", "", "", ""}},
-    {"OwningBuffer", "", 1, 1, {"length", "", "", ""}},
-    {"OwningBuffer", "", 2, 2, {"length", "init", "", ""}},
-    {"LinkedList", "", 1, 1, {"source", "", "", ""}},
-    {"Dictionary", "", 1, 1, {"capacity", "", "", ""}},
-    {"Dictionary", "", 1, 1, {"comparer", "", "", ""}},
-    {"Dictionary", "", 2, 2, {"capacity", "comparer", "", ""}},
-    {"OwningDictionary", "", 1, 1, {"capacity", "", "", ""}},
-    {"OwningDictionary", "", 1, 1, {"comparer", "", "", ""}},
-    {"OwningDictionary", "", 2, 2, {"capacity", "comparer", "", ""}},
-    {"Set", "", 1, 1, {"capacity", "", "", ""}},
-    {"Set", "", 1, 1, {"comparer", "", "", ""}},
-    {"Set", "", 2, 2, {"capacity", "comparer", "", ""}},
-    {"OwningSet", "", 1, 1, {"capacity", "", "", ""}},
-    {"OwningSet", "", 1, 1, {"comparer", "", "", ""}},
-    {"OwningSet", "", 2, 2, {"capacity", "comparer", "", ""}},
+    {"Array", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
+    {"Array", "", 2, 2, {"size", "fill", "", "", "", "", "", ""}},
+    {"OwningArray", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
+    {"OwningBuffer", "", 1, 1, {"length", "", "", "", "", "", "", ""}},
+    {"OwningBuffer", "", 2, 2, {"length", "init", "", "", "", "", "", ""}},
+    {"LinkedList", "", 1, 1, {"source", "", "", "", "", "", "", ""}},
+    {"Dictionary", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
+    {"Dictionary", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
+    {"Dictionary", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
+    {"OwningDictionary", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
+    {"OwningDictionary", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
+    {"OwningDictionary", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
+    {"Set", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
+    {"Set", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
+    {"Set", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
+    {"OwningSet", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
+    {"OwningSet", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
+    {"OwningSet", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
     // stdlib §2.16 / §6.3 / §6.4 / §6.7 / §7.2 / §8.2 — the remaining
     // argument-taking reserved heads.
-    {"Shared", "", 1, 1, {"value", "", "", ""}},
-    {"Random", "", 1, 1, {"seed", "", "", ""}},
-    {"Semaphore", "", 1, 1, {"initialCount", "", "", ""}},
-    {"Semaphore", "", 2, 2, {"initialCount", "maxCount", "", ""}},
-    {"Channel", "", 1, 1, {"capacity", "", "", ""}},
+    {"Shared", "", 1, 1, {"value", "", "", "", "", "", "", ""}},
+    {"Random", "", 1, 1, {"seed", "", "", "", "", "", "", ""}},
+    {"Semaphore", "", 1, 1, {"initialCount", "", "", "", "", "", "", ""}},
+    {"Semaphore", "", 2, 2, {"initialCount", "maxCount", "", "", "", "", "", ""}},
+    {"Channel", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
 }};
 
 // fix #3425 — the built-in EXCEPTION constructors (spec §31.4). `Exception`
@@ -726,10 +727,10 @@ constexpr std::array<BuiltinParamNameRow, 34> kBuiltinCtorParamNames = {{
 // answered generically in the lookup below from `isBuiltinExceptionName`, so
 // only the arity-2 forms — where the family DISAGREES — need rows here.
 constexpr std::array<BuiltinParamNameRow, 4> kBuiltinExceptionCtorParamNames = {{
-    {"Exception", "", 2, 2, {"message", "cause", "", ""}},
-    {"ArgumentException", "", 2, 2, {"message", "paramName", "", ""}},
-    {"ArgumentOutOfRangeException", "", 2, 2, {"message", "paramName", "", ""}},
-    {"TimeoutException", "", 2, 2, {"message", "inner", "", ""}},
+    {"Exception", "", 2, 2, {"message", "cause", "", "", "", "", "", ""}},
+    {"ArgumentException", "", 2, 2, {"message", "paramName", "", "", "", "", "", ""}},
+    {"ArgumentOutOfRangeException", "", 2, 2, {"message", "paramName", "", "", "", "", "", ""}},
+    {"TimeoutException", "", 2, 2, {"message", "inner", "", "", "", "", "", ""}},
 }};
 
 // fix #3425: the two record-shaped builtins whose `lowerNew` arm resolves each
