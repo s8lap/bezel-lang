@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.330 — October 2026**
+**Companion to the Bezel Language Specification, v0.331 — October 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3342,7 +3342,7 @@ end;
 <a id="sec-ireadonlyspantelement"></a>
 ### 4.16 `IReadOnlySpan<TElement>`
 
-An interface unifying the read-only access surface of every span type in the standard library. Implemented by all five concrete span types — `Span<T>`, `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan` — with the element type parameterized to match each concrete type's natural indexer return type.
+An interface unifying the read-only access surface of every span type in the standard library. Implemented by all five concrete span types — `Span<T>`, `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan` — with the element type parameterized to match each concrete type's natural indexer return type. A member declared to return it, a `static` method included, is classified as a span return (spec §28.3's announcement table, row 7), each return expression checked by spec §9.7's return bullet.
 
 ```bezel
 public interface IReadOnlySpan<TElement>
@@ -3521,7 +3521,8 @@ synchronized operations, and the last handle — from whichever domain — dispo
 var raw := LoadSamples();                                        // owned OwningBuffer<double>
 using var input := new Shared<FrozenArray<double>>(
     FrozenArray<double>.From(move raw));                         // O(1) freeze
-using var t1 := Domain.Spawn(Program.ScanLow,  input.Clone());   // Shared<FrozenArray<double>>: sendable
+using var t1 := Domain.Spawn(Program.ScanLow,  input.Clone());   // Shared<FrozenArray<double>>: sendable;
+                                                                 //   ScanLow(owned h: Shared<FrozenArray<double>>): double — a handle takes the owned row (§6.8)
 using var t2 := Domain.Spawn(Program.ScanHigh, input.Clone());
 var answer := await t1 + await t2;                               // zero bytes copied
 ```
@@ -4191,7 +4192,7 @@ public class TickObserver
 end TickObserver;
 ```
 
-A captured constructor parameter other than `this` is not admitted **where it contributes a borrow source** (spec [§28.3](Bezel_Language_Spec.md#sec-borrow-lifetime-rules)) — a class-, interface-, or plain function-typed parameter, or an `owned` one: such a parameter is a borrow of a caller local (or a callback the call bounds) and does not provably outlive the constructed object. A parameter contributing **no** source — a value-typed one, or a runtime-managed `string` (spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)) — carries no lifetime hazard and *is* admitted: the admission is keyed on borrow sources, not on the capture's being a parameter (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters), *v1 admission bounds* item 1). A raise cannot reach the handler before the constructor completes unless the constructor itself — directly or transitively — raises the subscribed event: instance sources are domain-serial (below) and no other continuation runs during construction. A constructor that does so observes `this` partially initialized — the construction-time-observation residual of spec §22.7, with the runtime bound recorded there. For handlers that must not capture `this`, `using var sub := …` remains the scope-bound alternative (spec §28.14 form 2).
+A captured constructor parameter other than `this` is not admitted **where it contributes a borrow source** (spec [§28.3](Bezel_Language_Spec.md#sec-borrow-lifetime-rules)) — a class-, interface-, or plain function-typed parameter, or an `owned` one: such a parameter is a borrow of a caller local (or a callback the call bounds) and does not provably outlive the constructed object. A parameter contributing **no** source — a value-typed one that holds no borrows, or a runtime-managed `string` (spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)) — carries no lifetime hazard and *is* admitted, while a value-typed parameter that holds borrows (a span, a borrow-bearing record, a `CancellationToken`) contributes the sources of the borrows it carries (spec [§28.3](Bezel_Language_Spec.md#sec-borrow-lifetime-rules)'s provenance clause 1) and is not: the admission is keyed on borrow sources, not on the capture's being a parameter (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters), *v1 admission bounds* item 1). A raise cannot reach the handler before the constructor completes unless the constructor itself — directly or transitively — raises the subscribed event: instance sources are domain-serial (below) and no other continuation runs during construction. A constructor that does so observes `this` partially initialized — the construction-time-observation residual of spec §22.7, with the runtime bound recorded there. For handlers that must not capture `this`, `using var sub := …` remains the scope-bound alternative (spec §28.14 form 2).
 
 **Raising.** `Raise` and `RaiseAsync` invoke handlers in subscription order, over a **snapshot of the subscriber list taken when the raise begins**: a handler that subscribes or unsubscribes during the raise affects the *next* raise, never the in-flight pass — snapshot rather than fault, because self-unsubscribing one-shot listeners are a legitimate idiom (spec §29.12's loud-mutation discipline is the contrasting response to mutation mid-traversal; the correction of the former spec §24.5 "same posture" comparison is recorded in rationale §13.6). With zero subscribers, both methods are no-ops — no null check, no `?.`, no `Invoke` indirection. Handlers execute **on the raising domain's thread** (normative): for an instance source this is invisible (all access is domain-serial); for a shared source (below) a handler subscribed from one domain runs on whichever domain raises — which is why shared-source handlers must be capture-free. The synchronous `Raise` returns `()` and runs each handler to completion before invoking the next. `RaiseAsync` returns a `Task` that completes when every handler's task completes; **each handler's task is awaited before the next is invoked.**
 
@@ -4300,7 +4301,8 @@ See [§30.11](Bezel_Language_Spec.md#sec-taskcompletionsourcet-and-ownedtaskcomp
 ```bezel
 // For non-class T (copyable value types, string, runtime-managed reference types).
 // Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>;
-// a move-only value T is rejected per spec §30.5 (its Task<T> is itself ill-formed).
+// a move-only value T, or a value type that holds borrows (CancellationToken excepted),
+// is rejected per spec §30.5 (its Task<T> is itself ill-formed).
 public class TaskCompletionSource<T>
   public constructor();
   public readonly property Task: Task<T>;
@@ -4361,15 +4363,15 @@ Language spec [§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers
 ```bezel
 public class Task
   // For non-class T (copyable value types, string, runtime-managed reference types).
-  // For class T, use FromOwnedResult instead; a move-only value T is rejected
-  // per spec §30.5.
+  // For class T, use FromOwnedResult instead; a move-only value T, or a value
+  // type that holds borrows, is rejected per spec §30.5 (its Task<T> is ill-formed).
   public static method FromResult<T>(value: T): Task<T>;
 
   // For class T. Produces a Pattern B task; awaiters consume under `using var x := await ...`.
   public static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
 
-  // For any T over which Task<T> is well-formed (spec §30.5 — move-only value T
-  // is not): a faulted task never produces its result, so the Pattern A vs
+  // For any T over which Task<T> is well-formed (spec §30.5 — a move-only value T,
+  // or a value type that holds borrows, is not): a faulted task never produces its result, so the Pattern A vs
   // Pattern B distinction does not apply. `FromException<MyClass>(ex)` is correctly
   // typed as Task<MyClass> even when MyClass is a class type — there is no value
   // to transfer ownership of, only an exception to re-raise on await.
@@ -4547,6 +4549,8 @@ public static class Domain
       where A: sendable, class;
   public static method Spawn<A>(entry: (A) -> (), arg: A): owned Task
       where A: sendable, notnull;
+      // every plain `arg: A` and plain `R` row: a sendable value type, string or Type
+      // only — a class A or R is a compile error at the call site (below)
 
   // Class-typed result: ownership transfers to the awaiter (Pattern B).
   public static method Spawn<R>(entry: () -> owned R): owned OwningTask<R>
@@ -4573,7 +4577,7 @@ public static class Domain
 end Domain;
 ```
 
-The `where` clauses state the full requirement: `sendable` is checked per instantiation by the §30.14 computation (language spec §14.2's derived-property constraints), diagnosed at the caller's site naming the failing component. The kind constraints (`class`/`notnull`) remain alongside `sendable` — they select each row's ownership shape, which sendability alone does not determine. For more than one argument, pass a sendable class aggregating them, an `OwningArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
+`sendable` is checked per instantiation by the §30.14 computation (language spec §14.2's derived-property constraints), diagnosed at the caller's site naming the failing component. The kind constraints (`class`/`notnull`) select each row's ownership shape, which sendability alone does not determine, and the plain rows carry one requirement their `where` clauses do not spell: **a plain `arg: A` row and a plain `R` result row admit no class type other than `string` and `Type`.** At those positions a `notnull` argument is a sendable value type, `string` or `Type` — spec §30.5's non-class category — and an instantiation at any other class type, explicit, inferred, or reached through a user generic's substitution (`class Fan<T> where T: sendable, notnull` forwarding `x: T` to `Domain.Spawn<T>(Use, x)` is rejected at `Fan<Counter>` wherever it is named, spec §3.6 rule 2), is a **compile error at the call site** naming the `owned` row as the remedy: a class instance crosses a domain only as an owned transfer (spec §30.14), and the plain row would carry a borrow of an object the origin domain keeps using. A `Shared<T>` handle is a class and takes the `owned` row too — clone, then move the clone. For more than one argument, pass a sendable class aggregating them, an `OwningArray<T>` of sendable elements, or a `ChannelSender<T>` ([§6.9](#sec-channel)) and send the rest.
 
 **Async entries.** The nine async rows — elided from the listing above, each the twin of a synchronous row with a `Task`-family entry return, on the terms the marker comment states — mirror the nine synchronous rows. The entry is a capture-free `async` lambda or a static `async` method reference; the runtime runs it as the spawned domain's first continuation and awaits the returned task **within that domain** (the `async Main` analog, spec §33.2). The join handle completes when that task settles; a fault anywhere in the entry's async chain surfaces at the join as `DomainFaultedException`. The entry's task object never crosses the boundary; for the `OwningTask<R>` rows the runtime is the single Pattern B consumer, and only the sendable result crosses. Overload resolution prefers the async rows for any entry whose return type is in the `Task` family; the synchronous generic rows never bind `R` to a task type (spec §30.14).
 
@@ -4922,9 +4926,12 @@ public static class Parallel
 end Parallel;
 ```
 
-As with `Domain.Spawn` (§6.8), the `where` clauses state the full requirement: `sendable` is checked
-per instantiation by the §30.14 computation (language spec §14.2's derived-property constraints), diagnosed at
-the call site naming the failing rule, and the kind constraints (`class`/`notnull`) remain alongside it. (Return types spell the
+As with `Domain.Spawn` (§6.8), `sendable` is checked per instantiation by the §30.14 computation (language
+spec §14.2's derived-property constraints), diagnosed at the call site naming the failing rule, and the kind
+constraints (`class`/`notnull`) select each row's ownership shape. §6.8's instantiation-site rule applies
+unchanged: the value-element rows (`items: Array<A>`, `items: Shared<FrozenArray<A>>`, and every plain `R`)
+admit no class type other than `string` and `Type` at `A` or `R` — a class element or result crosses only through the owned rows — and the
+rejection is re-read per instantiation through a user generic's substitution (spec §3.6 rule 2). (Return types spell the
 `owned` marker out, as `Domain.Spawn` does — emphasis at the domain boundary; the same contract as the
 unmarked async forms, §6.7.)
 
