@@ -4534,9 +4534,20 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     llvm::Value* savedThis = currentThis_;
     auto savedLocals = locals_;
     auto savedParams = paramSlots_;
+    SavedReceiverSubst savedSubstPair;
     currentThis_ = obj;
     locals_.clear();
     paramSlots_.clear();
+    // fix #5341 (§14.1 / §23.4, v0.315): install the receiver's generic
+    // substitution before inlining the setter body, mirroring lowerIndexerSet's
+    // line 3500. Without it, the setter body (`do _w := value; end;`) is
+    // lowered against the erased T->i32 layout: `_w` is at offset 0 in both
+    // the erased and the concrete layout, but `_v: T` is at offset 0 in the
+    // erased struct — `lowerFieldAddr` returns the wrong pointer, corrupting
+    // the adjacent T-typed field on store. For Holder<string> this corrupts
+    // the string pointer and SEGVs bz_string_release; for Holder<long> it
+    // silently writes the wrong offset and the value is unchanged.
+    savedSubstPair = setupReceiverGenericSubst(ix->target.get(), ps->parent);
     // Bind each index param from its pre-computed slot.
     for (std::size_t k = 0; k < ps->indexerParams.size() &&
          k < idxSlots.size(); ++k) {
@@ -4619,6 +4630,12 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
+    // fix #5341 (§14.1 / §23.4, v0.315): restore genericSubst_ so the
+    // substitution installed before the setter body does not leak into the
+    // surrounding scope — mirroring the save/restore pattern lowerIndexerSet
+    // uses (line 2615 / line ~2635).
+    genericSubst_ = std::move(savedSubstPair.subst);
+    genericSubstSemaTy_ = std::move(savedSubstPair.semaTy);
     return true;
 }
 
