@@ -2632,7 +2632,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call->callee.get())) {
-            if (ma->member == "Dispose") {
+            if (ma->member == "Dispose" || ma->member == "DisposeAsync") {
                 // §28.6 "Who may call Dispose()" (v0.184, #1653): the
                 // receiver must be owned (or transit-eligible) — checked
                 // BEFORE the by-name discharge below so a rejected borrow
@@ -2643,8 +2643,13 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 // at the receiver's OWN span (not the enclosing MemberAccess-
                 // Expr's, which the parser does not populate) so the
                 // diagnostic points at the borrow expression. // per §28.6
-                if (const ast::Expr* recv =
-                        lookThroughForceUnwrap(ma->target.get()))
+                // For `await x.DisposeAsync()` the callee MemberAccessExpr's target
+                // is the await expression. Unwrap it to get the real receiver.
+                const ast::Expr* recv = lookThroughForceUnwrap(ma->target.get());
+                if (auto* awaitExpr = dynamic_cast<const ast::UnaryExpr*>(recv))
+                    if (awaitExpr->op == "await" && awaitExpr->operand)
+                        recv = awaitExpr->operand.get();
+                if (recv)
                     checkDisposeReceiverOwnership(*recv, recv->span.begin);
                 // §28.3 (#1500): the null-forgiving receiver spelling
                 // `x!.Dispose()` — required to discharge a NULLABLE owned
@@ -2662,21 +2667,26 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             }
         }
         // §28.2 / §28.3 (#860): a null-conditional dispose `local?.Dispose()`
-        // parses as a CallExpr whose callee is a NullCondMemberExpr
-        // (`local ?. Dispose`). It is the canonical null-safe discharge of a
-        // conservatively-Owned local (e.g. an `out owned` item that is null on
-        // the Try* false path): `?.` no-ops when null and disposes otherwise.
-        // Recognise it the same as a plain `.Dispose()`. // per §28.2, §28.3
+        // or `local?.DisposeAsync()` parses as a CallExpr whose callee is a
+        // NullCondMemberExpr (`local ?. Dispose` / `DisposeAsync`). It is the
+        // canonical null-safe discharge of a conservatively-Owned local (e.g.
+        // an `out owned` item that is null on the Try* false path): `?.` no-ops
+        // when null and disposes otherwise. Recognise it the same as a plain
+        // `.Dispose()` / `.DisposeAsync()`. // per §28.2, §28.3, §28.6
         if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(
                 call->callee.get())) {
-            if (nm->member == "Dispose") {
+            if (nm->member == "Dispose" || nm->member == "DisposeAsync") {
                 // §28.6 "Who may call Dispose()" (v0.184, #1653): same
                 // receiver-ownership rule as the `.Dispose()` / `!.Dispose()`
-                // forms above, applied to the `?.Dispose()` spelling.
-                // // per §28.6
-                if (nm->target)
-                    checkDisposeReceiverOwnership(*nm->target,
-                                                   nm->target->span.begin);
+                // forms above, applied to the `?.Dispose()` / `?.DisposeAsync()`
+                // spellings. // per §28.6
+                const ast::Expr* nmRecv = nm->target.get();
+                if (auto* awaitExpr =
+                        dynamic_cast<const ast::UnaryExpr*>(nmRecv))
+                    if (awaitExpr->op == "await" && awaitExpr->operand)
+                        nmRecv = awaitExpr->operand.get();
+                if (nmRecv)
+                    checkDisposeReceiverOwnership(*nmRecv, nmRecv->span.begin);
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                         nm->target.get())) {
                     markExplicitDisposeReclaimIfReassignedBorrow(*id);
@@ -2736,6 +2746,17 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             awaitTaskKind(*un) == AwaitTaskKind::PatternB) {
             recordAwaitOperandConsume(*un->operand, un->span.begin);
             return;  // operand was the task local; consume is its handling
+        }
+        // fix #5660 (§28.6, v0.329): for `await x.DisposeAsync()` the
+        // disposal receiver-ownership check must fire on the call expression
+        // inside the await. The generic read check below skips the
+        // handleDischarge arm that checks Dispose/DisposeAsync receiver
+        // ownership. Route the await operand (the CallExpr) through
+        // handleDischarge explicitly so the ownership check fires. // per §28.6
+        if (un->op == "await" && un->operand) {
+            handleDischarge(*un->operand);
+            if (un->operand) checkRead(*un->operand, /*selfTarget=*/false);
+            return;
         }
         // Other unary ops — sub-expression is a regular read.
         if (un->operand) checkRead(*un->operand, /*selfTarget=*/false);
