@@ -168,7 +168,7 @@ BEZEL_TEST(channel_634_uaf, p3_sender_outlives_channel_domain_send_raises_cce_30
         // Dispose the channel BEFORE spawning so the sender sees a disposed channel.
         "    ch.Dispose(); "
         // Spawn: sender is now the only live ref to the core (fix #634 refcount).
-        "    using var t := Domain.Spawn(Worker.TrySend, owned tx); "
+        "    using var t := Domain.Spawn(Worker.TrySend, move tx); "
         "    using var result := await t; "
         "    return result; "
         "  end Main; "
