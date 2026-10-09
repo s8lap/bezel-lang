@@ -3259,6 +3259,35 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // this fix, so a rejected program cannot reach a shape they
                 // have never handled. The error stops the compile before
                 // codegen either way.
+                // fix #5659 (§9.7 / §8.6, v0.330): the `as` ROUTE of the
+                // borrow-erasing rule. §9.7 names it verbatim — "the reference
+                // conversion of an `IReadOnlySpan<TElement>` value to `Object`
+                // or another interface type, implicit or by an `as` (§17.4)
+                // or a typed-pattern binding (§19.3) at such a type — is a
+                // compile error at the conversion".
+                //
+                // MEASURED on 35759e44 (staging), the whole arm below ran its
+                // §17.4 value-type mismatch, its degenerate-target reject, its
+                // collection-literal re-visit and its generic-parameter
+                // obligation, and NEVER consulted the conversion's source type
+                // — so the `as` spelling of a conversion the IMPLICIT route
+                // rejects on that same tree (`Sink.K(s)` at `s:
+                // IReadOnlySpan<int>`, rejected at the callee's `Object`
+                // parameter) compiled clean. `s8_6_0009` is that program:
+                // `Sink.K(s as Object)`.
+                //
+                // This is a SEPARATE call, not a `checkAssignable`:
+                // checkAssignable re-types an integer constant in place
+                // (§5.1 narrowing, #2925) and performs §27.6 overload
+                // selection over a bare method-group source, neither of which
+                // belongs to a reference cast whose target is already fixed.
+                // checkBorrowErasingPosition is the conversion-site predicate
+                // with no side effects, shared verbatim with the implicit
+                // route. It reads no-op for a bare type-parameter target
+                // (`isBoxingTargetType` needs a declaration), leaving the
+                // #3044 instantiation obligation below to own that case.
+                checkBorrowErasingPosition(ctx_.exprType(*te->operand), tt,
+                                           e.span.begin);
                 if (std::string degenerate = degenerateAsTargetReason(tt);
                     !degenerate.empty()) {
                     ctx_.diagnostics().report(Severity::Error, e.span.begin,
@@ -12642,6 +12671,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                           : scrutTy;
                 armScope.names[bp->name] = lsym;
+                // fix #5659 (§9.7 / §19.3, v0.330): the TYPED-PATTERN-BINDING
+                // route of the borrow-erasing rule, named verbatim alongside
+                // the implicit and `as` routes — "implicit or by an `as`
+                // (§17.4) or a typed-pattern binding (§19.3) at such a type —
+                // is a compile error at the conversion". `var o: Object` over
+                // an `IReadOnlySpan<int>` scrutinee boxes the span exactly as
+                // `var o: Object := s;` does, and §9.7 admits it at neither.
+                //
+                // MEASURED on 35759e44: `case s of var o: Object => …` over
+                // `s: IReadOnlySpan<int>` compiled clean — the block below
+                // decided the #5176 generic-parameter case and the §19.5
+                // never-matches shape, and never read `scrutTy` against
+                // `bndTy` for borrows.
+                //
+                // The SOURCE is the scrutinee, not the arm's body: a binding
+                // pattern copies the matched value into a fresh local, so the
+                // conversion happens where the scrutinee meets the declared
+                // type. An UNTYPED binding (`var o`, §19.5's irrefutable form)
+                // declares no type, so `lsym->declType` is the scrutinee's own
+                // and the predicate reads it as the identity conversion.
+                checkBorrowErasingPosition(scrutTy, lsym->declType,
+                                           bp->span.begin);
                 // §19.5 (#1203, #1936, #5188): a typed binding pattern
                 // `var n: T` is a type-test + binding. If T is a reference
                 // type (class, interface, string, Object, or a BUILT-IN

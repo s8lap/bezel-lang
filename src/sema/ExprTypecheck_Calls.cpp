@@ -6713,6 +6713,39 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     const std::size_t nargs = ce.args.size();
                     bool arityOk = isWrite ? (nargs == 1)
                                            : (nargs == 0 || nargs == 1);
+                    // fix #5659 (§9.7 / §8.6, v0.330): the borrow-erasing
+                    // receiver of these calls' `Object` parameter. stdlib §2.1
+                    // declares `Write(value: Object)` and
+                    // `WriteLine(value: Object)`, and §9.7 names the shape
+                    // outright — "rejects the same short list of non-storing
+                    // calls: `Console.WriteLine(span)` and
+                    // `StringBuilder.Append(span)` at their `Object`
+                    // parameters, whose spelling is `span.ToString()` or an
+                    // interpolation hole".
+                    //
+                    // These builtins carry NO MethodSymbol, so their overload
+                    // set is never reconstructed and the imported
+                    // per-argument `checkAssignable` (line 15130) never runs
+                    // for them — the block below is the whole of their
+                    // argument checking. MEASURED on 35759e44: `s8_6_0007`
+                    // (`Console.WriteLine(s)` at `s: Span<int>`) compiled
+                    // clean while the character-identical argument at a
+                    // user-declared `Object` parameter was rejected.
+                    //
+                    // Only the `Object` overload is checked, and only a
+                    // BORROW-BEARING argument is rejected — `checkBorrow
+                    // ErasingPosition` is a no-op for anything else — so the
+                    // `string` overload and every non-borrow argument stay
+                    // admitted, and the spec's own remedies (`s.ToString()`,
+                    // an interpolation hole, which reach `WriteLine(string)`)
+                    // are untouched.
+                    if (nargs == 1 && ce.args[0].value &&
+                        !ce.args[0].isDiscard && ce.args[0].modifier.empty()) {
+                        checkBorrowErasingPosition(
+                            ctx_.exprType(*ce.args[0].value),
+                            ctx_.primitiveTypeRef(PrimitiveType::Object),
+                            ce.args[0].value->span.begin);
+                    }
                     if (!arityOk) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
@@ -11004,6 +11037,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  m == "Remove" || m == "Replace" ||
                                  m == "AppendFormat")
                             ctx_.setExprType(&ce, recvTy);  // returns same StringBuilder (chaining, §3.1)
+                        // fix #5659 (§9.7 / §8.6, v0.330): the OTHER half of
+                        // §9.7's named short list — "`StringBuilder.Append
+                        // (span)` at their `Object` parameters". stdlib §3.1
+                        // declares `Append(value: Object)`; `AppendLine`
+                        // declares only `AppendLine(value: string)`, so it is
+                        // NOT a borrow-erasing position and is deliberately
+                        // left out of this arm.
+                        //
+                        // MEASURED on 35759e44, and this one was not merely
+                        // admitted — it reached codegen and DIED there: an
+                        // `sb.Append(s)` at `s: ArraySpan<int>` emitted
+                        // `sext %bz.arrayspan %13 to i64` ("SExt only operates
+                        // on integer") and aborted with "IR verification
+                        // failed (malformed IR emitted)". §9.7 requires a
+                        // compile error at the CONVERSION, so rejecting it in
+                        // sema is also the fix for the malformed IR: the
+                        // program never reaches the backend.
+                        //
+                        // As with the Console arm, only a BORROW-BEARING
+                        // argument is rejected, so the `string`, `char`,
+                        // numeric, `ReadOnlyStringSpan` and record overloads
+                        // stay admitted.
+                        if (m == "Append" && ce.args.size() == 1 &&
+                            ce.args[0].value && !ce.args[0].isDiscard &&
+                            ce.args[0].modifier.empty()) {
+                            checkBorrowErasingPosition(
+                                ctx_.exprType(*ce.args[0].value),
+                                ctx_.primitiveTypeRef(P::Object),
+                                ce.args[0].value->span.begin);
+                        }
                     }
                     // Random instance methods
                     if (colName == "Random") {
@@ -14781,6 +14844,41 @@ void ExprTC::checkCallArity(
                 dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             recvTarget = ma->target.get();
             extBinding = ctx_.exprExtBinding(*ma);
+            // fix #5659 (§9.7 / §8.6 / §26.5, v0.330): the extension
+            // RECEIVER — the one borrow-erasing POSITION no conversion-site
+            // check runs through, because `checkArgsAgainstParams` below is
+            // handed `md->params`, which does not include `this`. §9.7:
+            // "The receiver of an extension call whose head is `Object` or
+            // another interface type is borrow-erasing: the extension body
+            // reads `this` at the head type and may pass it on to a parameter
+            // that stores it." §28.3's Set-erasing bullet (line 6754) states
+            // the same for a function value and calls this clause its twin.
+            //
+            // MEASURED on 35759e44: `s8_6_0010` — a borrow-bearing record
+            // `Tagged(Src: Item): IShow` calling `t.Leak(k)` over an
+            // `extension IShow` whose body does `k.Put(this)`, storing the
+            // box in a `Keeper` field — compiled clean. The extension body is
+            // itself type-checked once, at the declaration, against the
+            // parameter type `IShow`; nothing re-checked the CALL SITE.
+            //
+            // §9.7's exception is honored by the target predicate itself: a
+            // head declared `IReadOnlySpan<TElement>` is exactly the position
+            // §9.7 admits ("a position declared `IReadOnlySpan<TElement>`"),
+            // so it is not a boxing target here. A CLASS head is not either —
+            // `isBoxingTargetType` reads `Object` or an INTERFACE only —
+            // which matches §9.7's wording exactly. A receiver that holds no
+            // borrows (`Plain(N: int)` over the same `IShow` head, or any
+            // class) stays admitted.
+            // `ma->target` can be null for a bare member access — the arity
+            // block below guards for exactly that (`&& consoleMA->target`) —
+            // and there is no receiver to convert without it.
+            if (recvTarget && ms->extensionDecl &&
+                ms->extensionDecl->targetType) {
+                checkBorrowErasingPosition(
+                    ctx_.exprType(*recvTarget),
+                    ctx_.resolvedType(*ms->extensionDecl->targetType),
+                    recvTarget->span.begin);
+            }
         }
         checkArgsAgainstParams(
             md->params, ce.args, ce.span.begin,

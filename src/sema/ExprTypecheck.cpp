@@ -4975,6 +4975,81 @@ bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
 }
 
 
+// fix #5659 (§9.7 *borrow-erasing position* / §8.6, v0.330). The ONE
+// definition of the rule, for every route a value that holds borrows can take
+// to a position declared `Object` or an interface type other than
+// `IReadOnlySpan<TElement>`. §9.7, verbatim:
+//
+//   "A value that holds borrows may not reach a **borrow-erasing position**: a
+//    position declared `Object`, or an interface type other than
+//    `IReadOnlySpan<TElement>` — a parameter, plain or `scoped`, a local, a
+//    field, a record component, a choice payload, an inline-array slot, a
+//    collection slot or collection-literal element, a `ref` or `out`
+//    location, a return slot — or a position declared at a bare type parameter
+//    that the instantiation substitutes with such a type. The conversion —
+//    §8.6's box, or the reference conversion of an `IReadOnlySpan<TElement>`
+//    value to `Object` or another interface type, implicit or by an `as`
+//    (§17.4) or a typed-pattern binding (§19.3) at such a type — is a **compile
+//    error at the conversion site**."
+//
+// It names three ROUTES — implicit, `as`, typed-pattern binding — and one
+// POSITION no conversion-site checkAssignable reaches: "The receiver of an
+// extension call whose head is `Object` or another interface type is
+// borrow-erasing". Both are wired through THIS function rather than through a
+// second, competing "holds borrows" predicate: `isBorrowBearingRecordOrSpan`
+// and `isIReadOnlySpanType` are §3.6's and stdlib §4.16's own definitions and
+// are the same two the general conversion path reads.
+//
+// §28.3's *Set-erasing positions* (line 6754) is the twin for a function value
+// and states the polarity this mirrors: "a function value with a non-empty
+// source set is rejected, and a capture-free one is admitted". The same holds
+// here — a value that does NOT hold borrows reaching `Object` stays ADMITTED,
+// which is why `sourceIsBorrowBearing` gates the whole thing and why the
+// `string`/`Object`-parameter and record-of-`int` admit-rows exist.
+void ExprTC::checkBorrowErasingPosition(TypeRef* from, TypeRef* to,
+                                       SourceLocation loc) {
+    if (!from || !to || !isBoxingTargetType(to)) return;
+    // §9.7: "A value declared at the interface type `IReadOnlySpan<TElement>`
+    // ... is **read as holding borrows** — those of the span it boxes." It is
+    // not a value type and carries no holds-borrows property of its own
+    // (§3.6 rule 1), so it needs its own disjunct.
+    const bool sourceIsIReadOnlySpan = common::isIReadOnlySpanType(from);
+    const bool sourceIsBorrowBearing =
+        sourceIsIReadOnlySpan ||
+        common::isBorrowBearingRecordOrSpan(from, ctx_);
+    // fix #5659 (v0.315): §8.6 says non-owning inline arrays (`[N]T` and
+    // `[N]T?`) are ordinary value types and box per the general rule. They
+    // are not rejected at the boxing site, even when their element type is
+    // a reference type. (The elements' borrows, if any, are subject to
+    // lifetime constraints after boxing; the box itself is allowed.)
+    const bool sourceIsNonOwningInlineArray =
+        from->kind == TypeRef::Kind::InlineArray && !from->arrayOwned;
+    // The target guard applies to an IReadOnlySpan source too — an
+    // `IReadOnlySpan -> IReadOnlySpan` conversion is legal, and that declared
+    // position is one of §9.7's two admitted ones. The source predicate needs
+    // no separate IReadOnlySpan disjunct: `sourceIsBorrowBearing` already
+    // includes `sourceIsIReadOnlySpan`.
+    if (!sourceIsBorrowBearing || sourceIsNonOwningInlineArray ||
+        common::isIReadOnlySpanType(to))
+        return;
+    std::string fromName(namedTypeSimpleName(from));
+    if (fromName.empty()) fromName = spellMoveOnlySource(from);
+    std::string toName =
+        to->kind == TypeRef::Kind::Primitive
+            ? std::string("Object")
+            : std::string(namedTypeSimpleName(to));
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        std::string("the expression has type `") + fromName +
+            "`, a borrow-bearing type, and may not be converted to `" +
+            toName +
+            "`: a value that holds borrows may not reach a "
+            "borrow-erasing position — a position declared `Object` or "
+            "an interface type other than `IReadOnlySpan<TElement>` "
+            "(§9.7; use the span directly, call `.ToString()` on it, "
+            "or store its backing buffer instead)");
+}
+
 void ExprTC::checkAssignable(
     TypeRef* from, TypeRef* to, SourceLocation loc, const std::string& what,
     const ast::Expr* fromExpr,
@@ -5059,60 +5134,17 @@ void ExprTC::checkAssignable(
             return;  // reported; the checks below would only cascade
         }
     }
-    // fix #5659 (§9.7 / §8.6, proposal 0146, v0.315): a borrow-bearing value
-    // at a borrow-erasing position. A value that holds borrows (a borrow-bearing
-    // record, inline array, choice, or a value declared IReadOnlySpan<TElement>)
-    // may not be converted to Object or an interface type other than
-    // IReadOnlySpan<TElement>. The exception: a concrete span (Span /
-    // ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) may be passed to an
-    // IReadOnlySpan<TElement> position without borrow-erasing, because
-    // IReadOnlySpan is the unifying read-only surface for concrete spans.
-    // This check fires for every conversion site: local init, call argument,
-    // field store (though field store has its own more specific check), return,
-    // collection element, etc.
-    if (isBoxingTargetType(to)) {
-        const bool sourceIsIReadOnlySpan = common::isIReadOnlySpanType(from);
-        // IReadOnlySpan<TElement> is itself borrow-bearing per §9.7 ("read
-        // IReadOnlySpan<TElement> as holding borrows"). A concrete span is also
-        // borrow-bearing. Both should error at non-IReadOnlySpan positions.
-        const bool sourceIsBorrowBearing =
-            sourceIsIReadOnlySpan ||
-            common::isBorrowBearingRecordOrSpan(from, ctx_);
-        // fix #5659 (v0.315): §8.6 says non-owning inline arrays (`[N]T` and
-        // `[N]T?`) are ordinary value types and box per the general rule. They
-        // are not rejected at the boxing site, even when their element type is
-        // a reference type. (The elements' borrows, if any, are subject to
-        // lifetime constraints after boxing; the box itself is allowed.)
-        const bool sourceIsNonOwningInlineArray =
-            from->kind == TypeRef::Kind::InlineArray && !from->arrayOwned;
-        // Error if: the source holds borrows AND the target is not
-        // IReadOnlySpan AND the source is not a non-owning inline array.
-        // §8.6 / §9.7: a position declared `IReadOnlySpan<TElement>` is one of
-        // the two ADMITTED positions for a value that holds borrows, so the
-        // target guard must apply to an IReadOnlySpan source too — an
-        // `IReadOnlySpan -> IReadOnlySpan` conversion is legal. The source
-        // predicate needs no separate IReadOnlySpan disjunct:
-        // `sourceIsBorrowBearing` already includes `sourceIsIReadOnlySpan`.
-        if (sourceIsBorrowBearing && !sourceIsNonOwningInlineArray &&
-            !common::isIReadOnlySpanType(to)) {
-            std::string fromName(namedTypeSimpleName(from));
-            if (fromName.empty()) fromName = spellMoveOnlySource(from);
-            std::string toName =
-                to->kind == TypeRef::Kind::Primitive
-                    ? std::string("Object")
-                    : std::string(namedTypeSimpleName(to));
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                std::string("the expression has type `") + fromName +
-                "`, a borrow-bearing type, and may not be converted to `" +
-                toName +
-                "`: a value that holds borrows may not reach a "
-                "borrow-erasing position — a position declared `Object` or "
-                "an interface type other than `IReadOnlySpan<TElement>` "
-                "(§9.7; use the span directly, call `.ToString()` on it, "
-                "or store its backing buffer instead)");
-        }
-    }
+    // fix #5659 (§9.7 / §8.6, v0.330): a borrow-bearing value at a
+    // borrow-erasing position. §9.7 names THREE routes — implicit conversion,
+    // `as` (§17.4), a typed-pattern binding (§19.3) — and ONE position no
+    // conversion-site check runs through at all: the receiver of an extension
+    // call whose head is `Object` or another interface type. The IMPLICIT arm
+    // is this call; the other three are wired to the same helper
+    // (checkBorrowErasingPosition) from their own sites, so all four report
+    // one rule in one wording. This fires for every conversion site: local
+    // init, call argument, field store (though field store has its own more
+    // specific check), return, collection element, etc.
+    checkBorrowErasingPosition(from, to, loc);
     // §7.4 / §12.7 (#914): a value-type (primitive) nullable simple variable
     // proved non-null by null-flow narrowing (`if x is null then return; end`,
     // `is not null`, else-of-`is null`, or initialization with a non-null value)
@@ -23858,6 +23890,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 lsym->declType = bp->type ? ctx_.resolvedType(*bp->type)
                                           : scrutTy;
                 armScope.names[bp->name] = lsym;
+                // fix #5659 (§9.7 / §19.3, v0.330): the TYPED-PATTERN-BINDING
+                // route of the borrow-erasing rule — the CaseStmt twin of the
+                // CaseExpr arm at ExprTypecheck_Exprs.cpp:12693, which is a
+                // separate copy of this scope-building block and needed the
+                // same call. §9.7 names the route verbatim: "implicit or by an
+                // `as` (§17.4) or a typed-pattern binding (§19.3) at such a
+                // type — is a compile error at the conversion".
+                //
+                // The SOURCE is the scrutinee, not the arm body: a binding
+                // pattern copies the matched value into a fresh local, so the
+                // conversion is where the scrutinee meets the declared type.
+                // An UNTYPED binding declares no type, so `declType` is the
+                // scrutinee's own and the predicate reads the identity
+                // conversion. §19.5 already rejects a value-shaped scrutinee
+                // against a reference-typed binding, so the only scrutinees
+                // that reach here are reference-typed — a span among them,
+                // which is what the rule is about.
+                checkBorrowErasingPosition(scrutTy, lsym->declType,
+                                           bp->span.begin);
                 // §19.5 (#1203, #1936, #5188): a typed binding pattern
                 // `var n: T` is a type-test + binding. If T is a reference
                 // type (class, interface, string, Object, or a BUILT-IN

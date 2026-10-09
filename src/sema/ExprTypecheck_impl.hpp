@@ -1955,6 +1955,21 @@ private:
     // single-candidate semantics now that `freshReferenceFormation` alone
     // triggers the overload search for every bare/qualified method-group
     // `fromExpr`, formation site or not.
+    // §9.7 *borrow-erasing position* (fix #5659, v0.330) — the ONE definition
+    // of "a value that holds borrows may not reach a position declared
+    // `Object` or an interface type other than `IReadOnlySpan<TElement>`",
+    // reached by every route §9.7 names: the implicit conversion
+    // (`checkAssignable`), `as` (§17.4), a typed-pattern binding (§19.3), and
+    // the receiver of an extension call whose head is `Object` or another
+    // interface type. `from`/`to` are the two sides of that conversion; the
+    // call is a NO-OP unless `to` is a boxing target (`Object` or an
+    // interface) and `from` holds borrows, so an admitted conversion — a
+    // `string` at an `Object` parameter, a span at an `IReadOnlySpan<TElement>`
+    // position — passes silently. Reports §9.7's own diagnostic, unchanged
+    // from the pre-extraction inline form, so every site shares ONE needle.
+    void checkBorrowErasingPosition(TypeRef* from, TypeRef* to,
+                                    SourceLocation loc);
+
     void checkAssignable(
         TypeRef* from, TypeRef* to, SourceLocation loc,
         const std::string& what, const ast::Expr* fromExpr = nullptr,
