@@ -28387,6 +28387,64 @@ struct StringEscapeWalker {
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
             }
+            // fix #5441 (§28.3 "Plain parameters are borrows" / §28.9, v0.330):
+            // the #1430 relaxation's CLOSURE-CALLEE twin. The block above is
+            // `ms`-gated, and a lambda / function-typed-local callee has NO
+            // MethodSymbol — `plainBorrowAnalysisCallee` dynamic_casts the
+            // callee's symbol to `sema::MethodSymbol` and returns nullptr for
+            // a `LocalSymbol` holding a function TypeRef. So EVERY argument of
+            // EVERY closure or IIFE call fell through to the conservative
+            // ESCAPE above, and a +1 string producer local passed to a closure
+            // was excluded from `stringReleaseEligible_`: its scope-end release
+            // never armed and its +1 leaked. MEASURED on the staging tip
+            // (35759e44) at 500 iterations, ASan/LSan clean elsewhere:
+            //   `var pl := "p"+"q"; f(pl);`                       17500 B
+            //   `var pl := "p"+"q"; (lambda(s: string) => 7)(pl);` same
+            //   `var pl := "p"+"q"; d.Take(pl);` (method callee)   CLEAN
+            //   `var pl := "p"+"q"; d.Id<string>(pl);` (generic)   CLEAN
+            // The method and generic twins are clean because #5275/#5300 gave
+            // them their own admissions; the closure spelling was simply
+            // missing, so the leak was reachable through the one call shape
+            // that had none.
+            //
+            // WHY THE CLOSURE ARGUMENT IS CALL-BOUNDED. §28.3 makes a plain
+            // (no-modifier) parameter a BORROW SOURCE — the callee receives a
+            // +0 reference into the caller's storage and owns no +1 of its own
+            // — and every channel that could extend the argument's lifetime
+            // past the call mints its OWN +1 from the callee's side: a field
+            // store retains (lowerStringFieldStore), a `return` of the param
+            // mints, a closure capture retains, and an onward pass repeats
+            // this rule one level down. That is the same exhaustiveness
+            // argument the #1430 SOUNDNESS note makes for a resolved method,
+            // and it holds identically for a lambda body, which is lowered
+            // under the same §28.3 / §28.9 / §28.11 discipline. A lambda
+            // parameter additionally cannot be `owned` (§28.1: "`owned` is
+            // not admissible on a lambda parameter of type `string` (a
+            // runtime-managed reference type)", the diagnostic this arm's
+            // shape provokes) and `ref`/`out` are excluded by this arm's
+            // `a.modifier.empty()` gate, so a closure formal the argument
+            // reaches is always the plain by-value borrow.
+            //
+            // The formal list is read from the callee's own function TypeRef
+            // (`funcParams`), which is where the #1430 method twin reads its
+            // `ms->params` — the same information, for the call shape that
+            // carries no symbol table. Gated on `stringReleaseMode` alone (not
+            // `borrowingArrayMode`): the borrowing-Array/Set/Dictionary walks
+            // reuse this walker but their release targets are collection
+            // backings, and no test asserts a closure-arg relaxation for them,
+            // so they keep the conservative ESCAPE. Only the string-release
+            // analysis — whose armed release is exactly what was missing —
+            // gains the closure spelling, and its escape exclusion remains a
+            // leak-over-UAF fallback for every other shape.
+            if (!safeArg && stringReleaseMode && ms == nullptr && !xd &&
+                !calleeReturnMayAliasArgUnretained &&
+                a.modifier.empty() && a.name.empty() && callee) {
+                const sema::TypeRef* ct = ctx.exprType(*callee);
+                if (ct && ct->kind == sema::TypeRef::Kind::Function &&
+                    i < ct->funcParams.size() &&
+                    ct->funcParams[i].modifier.empty())
+                    safeArg = true;
+            }
             // fix #2824 / §10.1-§10.3 / §28.3 (v0.278): an instance method on
             // an FFI-buffer receiver (CString.ToBytes / WString. ... /
             // RawBytes.CopyTo) — `rb.CopyTo(dst, 0)` over `dst: Array<byte>` —
