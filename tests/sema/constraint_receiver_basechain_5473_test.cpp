@@ -421,7 +421,7 @@ BEZEL_TEST(constraint_receiver_basechain_5473,
         "end CD; "
         "public static class H "
         "  public static method F<T>(a: T): bool "
-        "    where T: IDer<Other> => a.Move(owned new Other(\"ab\")); "
+        "    where T: IDer<Other> => a.Move(move new Other(\"ab\")); "
         "end H; ",
         "using var c := new CD(); "
         "Console.WriteLine(H.F(c)); "

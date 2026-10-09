@@ -344,7 +344,7 @@ BEZEL_TEST(constraint_receiver_sigsub_5469,
         "end CM; "
         "public static class H "
         "  public static method F<T>(a: T): bool "
-        "    where T: IMove<Other> => a.Move(owned new Other(\"ab\")); "
+        "    where T: IMove<Other> => a.Move(move new Other(\"ab\")); "
         "end H; ",
         "using var c := new CM(); "
         "Console.WriteLine(H.F(c)); "
