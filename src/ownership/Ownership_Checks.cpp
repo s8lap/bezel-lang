@@ -11302,7 +11302,32 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         }
     }
 
-    if (kind == RecvKind::Unknown) return;
+    if (kind == RecvKind::Unknown) {
+        // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605):
+        // the spec reports the collection store "including a store whose
+        // receiver the structural check leaves unclassified". `RecvKind::
+        // Unknown` is exactly that case — the receiver identifier resolves to
+        // no symbol and is neither `this` nor `base` — and the bail below would
+        // otherwise return before any admission could be named. The report
+        // therefore runs here, ahead of the bail, for the same elements the
+        // classified path reports (an `owned`/modifier-bearing argument and a
+        // value-typed carrier are both excluded by `trustFieldStoreCarrier`).
+        // Under the default mode this is a no-op: the bail still runs, exactly
+        // as before. // per §28.3, §28.11
+        if (ctx_.reportTrustAdmissions()) {
+            for (const ast::CallArgument& a : call.args) {
+                if (!a.value || !a.modifier.empty()) continue;
+                if (trustFieldStoreCarrier(*a.value))
+                    reportTrustAdmission(
+                        Severity::Warning, a.value->span.begin,
+                        "§28.11 borrowing-collection store "
+                        "(receiver unclassified)",
+                        "the receiver or a plain (non-`owned`, non-`scoped`) "
+                        "parameter");
+            }
+        }
+        return;
+    }
 
     auto depthOf = [&](const ast::Node* declNode) -> int {
         auto it = localDepth_.find(declNode);
