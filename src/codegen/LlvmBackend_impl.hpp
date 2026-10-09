@@ -9977,10 +9977,18 @@ private:
         const std::vector<ast::ContractClause>& clauses);
 
     // §22.16 (v0.250, #3038): emit the entry-time evaluation and store
-    // of every `old(E)` operand. Called from `emitFunctionBody` right
-    // after the requires prologue. The builder must be positioned in the
-    // entry block on entry; on exit the caller's insertion point is
-    // restored. No-op if no `old` clauses are present in the method.
+    // of every `old(E)` operand, run BEFORE the requires prologue at both
+    // call sites (method body and constructor body).
+    //
+    // fix #5686 (§22.16 / §6.1, v0.330): on entry the builder must be in an
+    // UNTERMINATED block. The captures are emitted in a fresh `old.cap` block
+    // the caller's block branches into, and on exit the insertion point is
+    // deliberately NOT restored — it is left on the last block of whatever
+    // chain the walk produced (which may be a `chk.cont` from an operand's
+    // §6.1/§6.5 overflow guard), and the caller continues from there. A
+    // caller that needs its own insert point back must snapshot it itself;
+    // restoring to a pre-walk block would append after a terminator.
+    // No-op if this member has no `old(E)` operand.
     void captureOldOperands(
         llvm::Function* fn,
         const std::vector<ast::ContractClause>& clauses);

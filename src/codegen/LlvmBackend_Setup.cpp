@@ -7124,17 +7124,44 @@ void Emitter::allocateOldCaptureSlots(
 // always evaluates before the body). On a rejected call (a failed
 // `requires`) the captures are dead but harmless: the throw goes out
 // before any return edge could read them.
+//
+// fix #5686 (§22.16 / §6.1 / §6.5, v0.330): the captures run in a DEDICATED
+// `old.cap` block that the current block branches into, and the builder is
+// left wherever the walk ended — the caller continues from there. The
+// previous spelling did `SetInsertPoint(entryBB)` and restored `savedBB`
+// afterwards, which is unsound the moment an operand needs CODE rather than
+// a load: `old(E)`'s E is an arbitrary pure expression (§22.16), so
+// `old(a / b)` routes through `lowerBinary`'s CHECKED path, whose
+// `emitGuardThrow` terminates the block it is emitted into and leaves the
+// insert point in an unterminated `chk.cont`. The subsequent `CreateStore`
+// then landed in `chk.cont` with no terminator, and the restore sent the
+// caller back into the already-terminated entry block — "Basic Block in
+// function ... does not have terminator! label %chk.cont".
+//
+// A dedicated block fixes both halves at once and is the same structure
+// `emitRequiresPrologue` already uses for the identical guard-split: the
+// entry block's `br` terminates it, the walk's own `emitGuardThrow` blocks
+// chain inside `old.cap`, and the last block of that chain is unterminated
+// and open for the caller to continue into.
+//
+// No arithmetic is re-implemented here: the operand is lowered by
+// `lowerExpr`, which dispatches to `lowerBinary`/`lowerUnary` and so keeps
+// §6.1's checked `+ - * / mod` (OverflowException on overflow,
+// DivideByZeroException on a zero divisor) and §6.5's shift-domain
+// OverflowException — the faults §22.16 requires a clause evaluation to
+// propagate as itself. An operand that is NOT arithmetic lowers exactly as
+// before (a bare parameter is a load), so this changes only the shapes that
+// were previously malformed.
 void Emitter::captureOldOperands(
     llvm::Function* fn,
     const std::vector<ast::ContractClause>& clauses) {
     if (oldCaptureSlots_.empty()) return;
-    // Snapshot the entry state — the builder was positioned in the
-    // entry block by the caller (armEnsuresEpilogue / emitFunctionBody
-    // driver). We emit stores here in the entry block, after the
-    // requires checks have all branched past.
-    llvm::BasicBlock* entryBB = &fn->getEntryBlock();
-    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
-    builder_.SetInsertPoint(entryBB);
+    // fix #5686 (§22.16 / §6.1, v0.330): collect the capture sites FIRST,
+    // without emitting anything. `oldCaptureSlots_` is not cleared between
+    // members, so a non-empty map does NOT imply this member has an `old(E)`
+    // — and an `old.cap` block with no store and no terminator would be
+    // malformed IR in its own right.
+    std::vector<std::pair<llvm::AllocaInst*, const ast::Expr*>> sites;
     // Walk the clauses in textual order so captures happen in spec
     // order (textual position across the member's ensures clauses).
     for (const auto& c : clauses) {
@@ -7149,12 +7176,9 @@ void Emitter::captureOldOperands(
                         if (id->name == "old" && ce->args.size() == 1 &&
                             ce->args[0].value) {
                             auto it = oldCaptureSlots_.find(ce);
-                            if (it != oldCaptureSlots_.end()) {
-                                llvm::Value* v = lowerExpr(*ce->args[0].value);
-                                if (v) {
-                                    builder_.CreateStore(v, it->second);
-                                }
-                            }
+                            if (it != oldCaptureSlots_.end())
+                                sites.emplace_back(it->second,
+                                                   ce->args[0].value.get());
                             return;  // don't descend into the operand
                         }
                     }
@@ -7182,7 +7206,26 @@ void Emitter::captureOldOperands(
         };
         walk(*c.expr);
     }
-    builder_.SetInsertPoint(savedBB);
+    if (sites.empty()) return;
+    // Branch into a fresh block for the captures. `SetInsertPoint` on the
+    // entry block would append AFTER its terminator once any operand has
+    // emitted a guard — the defect #5686 reports.
+    auto* capBB = llvm::BasicBlock::Create(llvm_, "old.cap", fn);
+    builder_.CreateBr(capBB);
+    builder_.SetInsertPoint(capBB);
+    // §22.16: "evaluated exactly once per invocation". Each operand is
+    // lowered by `lowerExpr` — the SAME lowering a body-statement operand
+    // gets, so an arithmetic operand carries §6.1's / §6.5's checked
+    // faults rather than an unchecked wrap.
+    for (const auto& [slot, operand] : sites) {
+        llvm::Value* v = lowerExpr(*operand);
+        if (v) builder_.CreateStore(v, slot);
+    }
+    // fix #5686 (§22.16 / §6.1, v0.330): deliberately NO restore of the
+    // caller's insert block. The walk may have terminated `old.cap` (or a
+    // `chk.cont` it chained into) and the last block of that chain is where
+    // the caller's next instruction belongs; restoring would append after a
+    // terminator. The caller continues from `builder_.GetInsertBlock()`.
 }
 
 void Emitter::finalizeEnsuresEpilogue() {
@@ -10900,16 +10943,21 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // the entry block (LLVM's alloca-required-in-entry rule).
             allocateOldCaptureSlots(fn, md->contractClauses);
             // fix #5187 (§28.2 / §22.16, v0.330): capture every `old(E)`
-            // operand into its slot, in the entry block, BEFORE the requires
-            // prologue and BEFORE the checked-disposal guard (emitGuardThrow).
-            // LLVM requires all allocas in the entry block; captureOldOperands
-            // uses SetInsertPoint(entryBB) which appends after existing
-            // instructions. Placing captures here, before any terminator is
-            // set, ensures the stores land in the right place. A failed
+            // operand into its slot, BEFORE the requires prologue and BEFORE
+            // the checked-disposal guard (emitGuardThrow). A failed
             // requires skips the captures — correct, because ensures clauses
             // are never evaluated on a throws path (§22.16 "no clause
             // evaluation of any kind; the ordinary exception-path discharge
             // unwinds the frame").
+            //
+            // fix #5686 (§22.16 / §6.1, v0.330): #5187's stated REASON for
+            // this position ("captureOldOperands uses SetInsertPoint(entryBB)
+            // which appends after existing instructions") no longer holds —
+            // captureOldOperands now runs in its own `old.cap` block and
+            // leaves the builder on the last block of its own chain, so it
+            // is safe from any position whose block is unterminated. The
+            // ordering is retained because it is the method path's twin of
+            // the constructor path's, and both were changed together.
             captureOldOperands(fn, md->contractClauses);
             if (!md->contractClauses.empty()) {
                 std::vector<const ast::ContractClause*> localPtrs;
@@ -12548,12 +12596,20 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         // forbidden in constructor clauses (fields sit at the §22.7
         // null watermark, no pre-state exists for `old`, and constructors
         // return no value for `result` to denote). The sema path rejects
-        // any such use, so `allocateOldCaptureSlots` will simply find no
-        // `old(E)` operands in the constructor's ensures — a no-op
-        // call. We still need to invoke it before the requires prologue
-        // for code uniformity, and the empty `oldCaptureSlots_` map is
-        // harmless when the constructor's ensures clause is evaluated.
+        // any such use (ExprTypecheck_Exprs.cpp's `old` arm gates on
+        // `!inConstructor_`), so `allocateOldCaptureSlots` finds no
+        // `old(E)` operands in the constructor's ensures and
+        // `captureOldOperands` is a no-op.
+        //
+        // fix #5686 (§22.16 / §6.1, v0.330): the captures must run BEFORE
+        // `emitRequiresPrologue`, matching the method-body site. The prose
+        // above used to claim this ordering and then call it afterwards,
+        // which was the method path's #5187 defect repeated: the prologue's
+        // `CreateCondBr` terminates the block, and a capture emitted after
+        // it lands past a terminator. The ordering is now the same at both
+        // sites, so the twin cannot drift.
         allocateOldCaptureSlots(fn, cd->contractClauses);
+        captureOldOperands(fn, cd->contractClauses);
         std::vector<const ast::ContractClause*> localPtrs;
         localPtrs.reserve(cd->contractClauses.size());
         for (const auto& c : cd->contractClauses) localPtrs.push_back(&c);
@@ -12561,7 +12617,6 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                              cs->parent ? cs->parent->name
                                         : std::string_view{},
                              "constructor");
-        captureOldOperands(fn, cd->contractClauses);
         // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
         // epilogue for the ctor (return type is null — ctor's return is
         // void, so no result temp). Finalized at body-end (below). The
