@@ -8,7 +8,8 @@ This matrix asks whether every disposal obligation the spec creates is discharge
 
 | Run | Spec | Base cells open | Route cells open | Outcome |
 |---|---|---|---|---|
-| 1 | v0.333 | 51 of 140 | 6 of 16 | 21 root causes, each filed as an issue (listed in the run file's `groups`) |
+| 1 | v0.333 | 51 of 140 | 6 of 16 | 21 root causes, each filed as an issue (listed in the run file's `groups`); all decided in v0.334 (proposals 0159–0169) |
+| 2 | v0.334 | 12 of 140 | 6 of 22 | 8 issues: explicitly-disposed reassignment vs 0162 (#5832), the collection window (#5833), borrowed/static `OwningTask` await (#5834), return-slot timing (#5840), `Environment.Exit` in the exit pass (#5841), in-flight async advance (#5842), and existing #5796, #5800 |
 
 ## Files
 
@@ -43,7 +44,7 @@ Exactly-once is K1.1 and §28.3: "An owned local is disposed exactly once on eve
 | **R6** | **Move-only value.** An owning inline array `[N owned]T(?)` (local, parameter, instance field, payload) and its slots; an owning-classified choice (incl. `C?`) and its `owned` and move-only payloads. | §15.1.1, §15.3, K3.12, §35.3–§35.5 (owning match, disposal traces), §35.9, §9.4 (move-only receivers; disposed state), §19.3 |
 | **R7** | **Runtime-held owned value.** A task's result slot (Pattern A kinds 1–3, Pattern B), the task object a completion source owns, the in-flight thrown exception (K3.8), a faulted task's owned fault exception, a superseded exception. | §30.3–§30.5, §30.9, §30.10, §30.11, §31.1 (throw operand; exception ownership), §31.2 (supersession, record-before-drop), A3, A6 |
 | **R8** | **Deferred-activation frame state.** What an iterator, async or async-iterator state machine owns: `owned` parameters transferred into the frame, frame-resident owned locals across suspensions, enumerator-owned yields (minting and adopting), and the frame as an owned value (K6.3: calls mint). | K6, §29.2–§29.8, §29.11, §30.1, §30.6, §30.7, A15, §28.12 (implicit discharge is synchronous) |
-| **R9** | **Static owned storage.** A `static owned readonly` field, a static owning-inline-array field (form (iv) mutable, or (h) readonly), and, for (a)'s waiver, admitted non-`owned` statics holding fresh values (the §22.13 exemption). | §22.12 (rules 1–5, forms (i)–(iv), notes (g)–(i)), §22.13 (*Disposal of static owned fields*; exemption; abnormal termination), K9.4, §28.3 *Static stores*, §33.3 |
+| **R9** | **Static owned storage.** A `static owned readonly` field, a `static readonly` owning-inline-array field (note (h); the mutable form (iv) was retired at v0.334, so its cells read n/a from the second run), and, for (a)'s waiver, admitted non-`owned` statics holding fresh values (the §22.13 exemption). | §22.12 (rules 1–5, forms (i)–(iv), notes (g)–(i)), §22.13 (*Disposal of static owned fields*; exemption; abnormal termination), K9.4, §28.3 *Static stores*, §33.3 |
 | **R10** | **Control: runtime-managed value.** `string`, `Type`, boxed value types, function values. Expected to be uniformly decided as *exempt* or *n/a* (K1.6, §28.9). A non-trivial cell here means the exemption leaks into an obligation-bearing path. Hunt for that, e.g. a box or closure that keeps an owned referent reachable. | K1.6, §28.1 clauses 2–3, §28.9, §8.6, §27.5 |
 
 Not separate rows, by design (decided by the pilot pass):

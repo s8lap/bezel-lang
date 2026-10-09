@@ -46,7 +46,7 @@
   [
    "R9",
    "Static owned storage",
-   "A static owned readonly field, a static owning-inline-array field (form (iv) mutable, or (h) readonly),…"
+   "A static owned readonly field or a static readonly owning inline array (form (iv) mutable static owning inline arrays are retired at v0.334)"
   ],
   [
    "R10",
