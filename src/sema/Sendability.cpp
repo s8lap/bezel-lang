@@ -205,6 +205,15 @@ bool forEachInheritedStorageMember(
     for (size_t i = 0; i < ts->baseTypes.size(); ++i) {
         const TypeSymbol* base = ts->baseTypes[i];
         if (!base || base->kind != ast::TypeDeclKind::Class) continue;
+        // fix #5637 / s30_14_0007 (§30.14 / §12.4, v0.330): the inherited
+        // state of a compiler-known class is not read as fields (§30.14 rule 2).
+        // Builtin exceptions (§1) are compiler-known and their inherited state is
+        // not stated as transfer-compatible — a class that derives from a builtin
+        // exception FAILS the rule, not merely skips inherited fields (§30.14
+        // verbatim: "and fails it otherwise"). Since no builtin exception declares
+        // its inherited state transfer-compatible, any class with a builtin
+        // exception base is non-sendable.
+        if (!builtinExceptionBaseOf(base).empty()) continue;
         // Seed the env for this base from the use-site generic args.
         // `baseTypeRefs[i]` is parallel to `baseTypes[i]` (#3145 / Symbol.hpp)
         // and carries the instantiated arguments (e.g. `Container<int>` ->
@@ -341,6 +350,17 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                 // Both K and V must be sendable.
                 if (rt->genericArgs.size() < 2) return false;
                 if (!rt->genericArgs[0] || !rt->genericArgs[1]) return false;
+                // fix #5597 / l4_9_0009 (§4.9 / §30.14, v0.330):
+                // "Its keys are held as a borrowing map's are (spec §28.11), so
+                // the borrowing condition applies to them as well: K's category is
+                // sendable-value, string or Type. At a class- or interface-typed
+                // K the map carries borrows and is not sendable, whatever K's own
+                // sendability." §30.14.
+                const TypeRef* K = rt->genericArgs[0];
+                if (K->kind == TypeRef::Kind::Named && K->declaration &&
+                    (K->declaration->kind == ast::TypeDeclKind::Class ||
+                     K->declaration->kind == ast::TypeDeclKind::Interface))
+                    return false;
                 return isSendableType(rt->genericArgs[0], ctx, inProgress) &&
                        isSendableType(rt->genericArgs[1], ctx, inProgress);
             }
@@ -639,6 +659,32 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                 // declaration-template parameter. The walk threads this env
                 // into both the own-member pass and the inherited-base pass
                 // (each base re-seeds its own env from `baseTypeRefs[i]`).
+                //
+                // fix #5637 / s30_14_0007 (§30.14 / §12.4, v0.330): a class that
+                // derives from a builtin exception (§1) is not sendable: the builtin
+                // exception's inherited state is not stated as transfer-compatible,
+                // so the class FAILS the rule (verbatim: "and fails it otherwise").
+                // Walk the whole base chain; if any base is a builtin exception,
+                // the class is non-sendable.
+                {
+                    unsigned guard = 0;
+                    for (const TypeSymbol* p = decl; p && guard < 256u;
+                         ++guard) {
+                        if (!p->builtinExceptionBase.empty()) {
+                            inProgress.erase(decl);
+                            return false;
+                        }
+                        // Advance to the next CLASS base.
+                        const TypeSymbol* next = nullptr;
+                        for (const TypeSymbol* b : p->baseTypes) {
+                            if (b && b->kind == ast::TypeDeclKind::Class) {
+                                next = b;
+                                break;
+                            }
+                        }
+                        p = next;
+                    }
+                }
                 common::RecordSubstEnv selfEnv;
                 common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr,
                                            selfEnv);
