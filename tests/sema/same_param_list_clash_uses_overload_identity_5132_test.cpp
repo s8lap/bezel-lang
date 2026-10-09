@@ -260,7 +260,7 @@ BEZEL_TEST(same_param_list_clash_uses_overload_identity_5132,
         "class Base(owned r: Res) "
         "  private owned _s: Res := r; "
         "  public constructor(owned x: Res) "
-        "    this(owned x); "
+        "    this(move x); "
         "  end constructor; "
         "  public method Id(): int return _s.Id(); end Id; "
         "end Base;",
