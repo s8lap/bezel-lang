@@ -8947,7 +8947,7 @@ bool Emitter::argsCanFillSymbolic(
 llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         llvm::Value* v, const sema::TypeRef* targetTy,
         const ast::Expr* srcExpr, bool ownLazyPipeline,
-        bool* outWrapMade, bool srcOwnedByCallee) {
+        bool* outWrapMade, bool srcOwnedByCallee, bool lazyArgDeferred) {
     if (outWrapMade) *outWrapMade = false;
     if (!v || !targetTy || !srcExpr) return v;
     // fix #3355 / §29.2 / §23.2 (v0.278) — interim SIGSEGV-elimination fix:
@@ -9026,6 +9026,21 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // temporary-disposal contract and is deferred (#1916).
     if (ownLazyPipeline && isLazyEnumerableType(actualTy)) {
         if (outWrapMade) *outWrapMade = true;
+        // fix #5612 / §29.11 item 3 (v0.330): at an ARGUMENT position the frame is
+        // a BORROW — "the frame's disposal obligation stays with the caller, the
+        // plain argument being an ordinary borrow" — so it must stay DEFERRED
+        // across the boundary rather than being drained here. Draining spends the
+        // single-enumeration right at the call site and hands the callee a
+        // re-enumerable Array<T>, which left §29.11's runtime
+        // InvalidOperationException guard with no subject (issue #5612): the
+        // callee's own second enumeration silently re-read the snapshot. Here the
+        // wrapper keeps the frame deferred and its slot-4 GetEnumerator is
+        // single-consumption, so the FIRST enumeration in the callee works (item 3
+        // transfers the right to it) and a SECOND raises, exactly where the spec
+        // designates the enforcement. A RETURN site keeps the owning drain: there
+        // the caller owns the result and materialising it is the contract (#1916).
+        if (lazyArgDeferred)
+            return wrapLazyFrameAsSingleUseIEnumerable(v, targetTy);
         return drainLazyPipelineToOwnedIEnumerable(v, targetTy);
     }
     // fix #5329 (§29.2 / §2.5 / stdlib §4, v0.313): the SOURCE axis of the
@@ -10323,6 +10338,261 @@ llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
     llvm::Value* arr = builder_.CreateCall(
         toArrFn, {lazyVal, builder_.getInt64(esz)}, "lazy.mat");
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
+}
+
+// fix #5612 / §29.11 item 3 (v0.330): the ARGUMENT-position counterpart of
+// drainLazyPipelineToOwnedIEnumerable, which SPENDS the lazy frame's enumeration
+// right at the call site — bz_lazy_to_array walks the pipeline to completion and
+// the owning wrapper's slot-4 GetEnumerator then hands out a FRESH enumerator on
+// every call, so a callee that enumerates its `IEnumerable<T>` parameter twice
+// silently re-reads a materialised Array<T> and §29.11's runtime guard has no
+// subject (issue #5612). The spec keeps the frame DEFERRED across this boundary:
+//
+//   §29.11: "Passing the query as an `IEnumerable<T>` argument: the single-
+//   enumeration right transfers to the callee; the frame's disposal obligation
+//   stays with the caller, the plain argument being an ordinary borrow."
+//   "Inside a callee, a plain `IEnumerable<T>` parameter is statically untracked
+//   ... so a violation there is enforced only by the runtime
+//   `InvalidOperationException` guard."
+//
+// So this builds a source whose slot-4 GetEnumerator is SINGLE-CONSUMPTION: the
+// first call hands back a clone that drives the still-deferred frame through the
+// lazy vtable (slot 2 MoveNext / slot 3 Current), a SECOND call raises
+// InvalidOperationException and returns NULL — which the callee's ordinary
+// post-GetEnumerator emitPendingCheck() gate turns into the throw (§29.8, #2154 /
+// #973a — the same gate a raising iterator GetEnumerator already traverses). The
+// first enumeration still WORKS (item 3 transfers the right to the callee; it does
+// not arrive spent), so only the callee's own re-enumeration raises.
+//
+// Disposal: the wrapper OWNS the frame's disposal. bz_lazy_to_array walks the
+// frame to completion and DISPOSES it (releasing its inline-lambda closures), so
+// slot 1 discharges the frame exactly once — then frees that discarded snapshot
+// with bz_array_free and frees the wrapper struct. The callee never disposes a
+// borrowed argument, and the CALLER's own `using var` disposal is suppressed once
+// the right is spent at this call site (the coupling the owning drain already had,
+// since bz_lazy_to_array disposed the frame there too), so exactly one disposal
+// runs either way. MEASURED: leaving the drain out of slot 1 leaks 116 800 B in
+// 1 000 allocations over a 200-iteration lazy-argument loop, because nothing then
+// discharges the frame.
+llvm::Value* Emitter::wrapLazyFrameAsSingleUseIEnumerable(
+        llvm::Value* lazyVal, const sema::TypeRef* iEnumTy) {
+    llvm::Type* et =
+        (!iEnumTy || iEnumTy->genericArgs.empty() || !iEnumTy->genericArgs[0])
+            ? i32() : lowerTypeRef(iEnumTy->genericArgs[0]);
+    int64_t esz = 8;
+    if (et->isIntegerTy(32) || et->isFloatTy()) esz = 4;
+    else if (et->isIntegerTy(1) || et->isIntegerTy(8)) esz = 1;
+    else if (et->isIntegerTy(16)) esz = 2;
+    else if (et->isStructTy())
+        esz = (int64_t)module_->getDataLayout().getTypeAllocSize(et);
+    // Element-name key shared with the sibling wraps so every call site with the
+    // same element T mints ONE set of functions/vtables (#3570 / #3419 grid).
+    std::string elemName = enumMachineryElementName(et);
+    std::string prefix = "bz$lazyarg$" + elemName + "$";
+    // Struct { vt, frame, spent, esz } — its own named type rather than the
+    // shared array-enumerator struct: field 2 means "right spent" here, not "cursor".
+    std::string stName = "lazyarg." + elemName;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy)
+        stTy = llvm::StructType::create(llvm_,
+            {ptrTy(), ptrTy(), i64(), i64()}, stName);
+
+    // MoveNext / Current forward to the LAZY vtable, loaded from the frame at
+    // runtime (the frame is opaque here — 4 slots, Current returns a POINTER).
+    auto* mnFn = module_->getFunction(prefix + "MoveNext");
+    if (!mnFn) {
+        mnFn = llvm::Function::Create(
+            llvm::FunctionType::get(i1(), {ptrTy()}, false),
+            llvm::GlobalValue::InternalLinkage, prefix + "MoveNext", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", mnFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* frame = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, mnFn->arg_begin(), 1));
+        llvm::Value* vt = b.CreateLoad(ptrTy(), frame);
+        llvm::Value* fptr = b.CreateLoad(ptrTy(),
+            b.CreateGEP(ptrTy(), vt, {llvm::ConstantInt::get(i32(), 2)}));
+        // bz_lazy_movenext returns i32 (0 = exhausted); the protocol slot wants i1.
+        llvm::Value* r = b.CreateCall(
+            llvm::FunctionType::get(i32(), {ptrTy()}, false), fptr, {frame}, "lz.mn");
+        b.CreateRet(b.CreateICmpNE(r, llvm::ConstantInt::get(i32(), 0)));
+    }
+    auto* curFn = module_->getFunction(prefix + "Current");
+    if (!curFn) {
+        curFn = llvm::Function::Create(
+            llvm::FunctionType::get(et, {ptrTy()}, false),
+            llvm::GlobalValue::InternalLinkage, prefix + "Current", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", curFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* frame = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, curFn->arg_begin(), 1));
+        llvm::Value* vt = b.CreateLoad(ptrTy(), frame);
+        llvm::Value* fptr = b.CreateLoad(ptrTy(),
+            b.CreateGEP(ptrTy(), vt, {llvm::ConstantInt::get(i32(), 3)}));
+        // The lazy Current (slot 3) hands back a POINTER to the element bytes;
+        // the §29.11 enumerable protocol's slot 3 returns the element BY VALUE.
+        llvm::Value* ep = b.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false), fptr, {frame}, "lz.cur");
+        b.CreateRet(b.CreateLoad(et, ep));
+    }
+
+    // Slot-1 Dispose: drain the frame (which disposes it) exactly once, free that
+    // discarded snapshot, then free the wrapper struct.
+    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    if (!dispFn) {
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::GlobalValue::InternalLinkage, prefix + "Dispose", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* frame = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, dispFn->arg_begin(), 1));
+        // The drain's only purpose here is to DISCHARGE the frame; its materialised
+        // array is discarded, so free it — a null element disposer is correct because
+        // the drained snapshot holds VALUES (the same reasoning
+        // wrapOwnedArrayAsIEnumerable's dispose path gives for a value element type).
+        llvm::Value* drained = b.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), i64()}, false),
+            declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()}),
+            {frame, llvm::ConstantInt::get(i64(), esz)});
+        b.CreateCall(llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
+            declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy(), ptrTy()}),
+            {drained, llvm::ConstantPointerNull::get(ptrTy())});
+        b.CreateCall(llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            module_->getOrInsertFunction("free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee(),
+            {dispFn->arg_begin()});
+        b.CreateRetVoid();
+    }
+
+    // Clone vtable FIRST — GetEnumerator stamps the clone with it, and the clone's
+    // Dispose must free the clone alone so the loop-owned enumerator disposal
+    // never drains the source's frame. Built before the source vtable so the
+    // GetEnumerator body can reference it as a constant.
+    std::string clVtName = prefix + "clonevtable";
+    auto* clVtGV = module_->getNamedGlobal(clVtName);
+    if (!clVtGV) {
+        // The clone's Dispose is free-self ONLY: the loop-owned enumerator the
+        // callee disposes must never drain the source's frame — the source's own
+        // slot-1 Dispose does that, once.
+        auto* clDispFn = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::GlobalValue::InternalLinkage, prefix + "CloneDispose", module_.get());
+        {
+            auto* cbb = llvm::BasicBlock::Create(llvm_, "entry", clDispFn);
+            llvm::IRBuilder<> cb(cbb);
+            cb.CreateCall(llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+                module_->getOrInsertFunction("free", llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee(),
+                {clDispFn->arg_begin()});
+            cb.CreateRetVoid();
+        }
+        auto* clVtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self (below)
+            clDispFn, mnFn, curFn,
+            // slot 4 on a CLONE is never dispatched — the loop calls
+            // GetEnumerator on the SOURCE, then drives slots 2/3 on the clone.
+            // A null Constant* here would be a null Constant* in the array and
+            // the module verifier walks it; spell it as a typed null pointer.
+            llvm::ConstantPointerNull::get(ptrTy())
+        };
+        clVtGV = new llvm::GlobalVariable(*module_, clVtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(clVtTy, elems), clVtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(clVtGV, ptrTy());
+        clVtGV->setInitializer(llvm::ConstantArray::get(clVtTy, elems));
+    }
+
+    // Slot-4 GetEnumerator: SINGLE-CONSUMPTION. First call spends the right and
+    // returns a clone over the deferred frame; a second call raises
+    // InvalidOperationException and returns NULL for the caller's pending check.
+    auto* geFn = module_->getFunction(prefix + "GetEnumerator");
+    if (!geFn) {
+        geFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::GlobalValue::InternalLinkage, prefix + "GetEnumerator", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        auto* ioeBB = llvm::BasicBlock::Create(llvm_, "lza.ioe", geFn);
+        auto* okBB  = llvm::BasicBlock::Create(llvm_, "lza.ok", geFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = geFn->arg_begin();
+        llvm::Value* spentF = b.CreateStructGEP(stTy, self, 2);
+        b.CreateCondBr(
+            b.CreateICmpNE(b.CreateLoad(i64(), spentF),
+                           llvm::ConstantInt::get(i64(), 0)),
+            ioeBB, okBB);
+        // Re-enumeration: the uniform kExcObjSize exception block (§31.4), the
+        // InvalidOperationException vtable, the bz_exc_addr signal, and a null
+        // return — the same four steps emitOwningDrainTakeCurrentBody performs.
+        b.SetInsertPoint(ioeBB);
+        auto* callocTy = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        llvm::Value* excObj = b.CreateCall(callocTy,
+            module_->getOrInsertFunction("calloc", callocTy).getCallee(),
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), kExcObjSize)}, "lza.excobj");
+        auto vit = builtinVtable_.find("InvalidOperationException");
+        if (vit != builtinVtable_.end()) b.CreateStore(vit->second, excObj);
+        auto* excAddrTy = llvm::FunctionType::get(ptrTy(), {}, false);
+        llvm::Value* excSlot = b.CreateCall(excAddrTy,
+            module_->getOrInsertFunction("bz_exc_addr", excAddrTy).getCallee(),
+            {}, "lza.exc");
+        b.CreateStore(excObj, excSlot);
+        b.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+        // First enumeration: spend the right, hand back a clone over the frame.
+        b.SetInsertPoint(okBB);
+        b.CreateStore(llvm::ConstantInt::get(i64(), 1), spentF);
+        llvm::Value* clone = b.CreateCall(callocTy,
+            module_->getOrInsertFunction("calloc", callocTy).getCallee(),
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(),
+                 (int64_t)module_->getDataLayout().getTypeAllocSize(stTy))});
+        b.CreateStore(clVtGV, b.CreateStructGEP(stTy, clone, 0));
+        b.CreateStore(b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1)),
+                      b.CreateStructGEP(stTy, clone, 1));
+        b.CreateStore(llvm::ConstantInt::get(i64(), 0),
+                      b.CreateStructGEP(stTy, clone, 2));
+        b.CreateStore(llvm::ConstantInt::get(i64(), esz),
+                      b.CreateStructGEP(stTy, clone, 3));
+        b.CreateRet(clone);
+    }
+
+    // Source vtable [0]=self, [1]=Dispose, [2]=MoveNext, [3]=Current,
+    // [4]=single-consumption GetEnumerator. #3477: getNamedGlobal, NOT the
+    // one-argument getGlobalVariable — that overload is AllowInternal=false and
+    // declines a LOCAL-linkage global, which is every vtable here, so the guard
+    // would never fire and each wrap site would mint a fresh vtable.
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getNamedGlobal(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self (below)
+            dispFn, mnFn, curFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate the source { sourceVt, frame, spent=0, esz } and register it for
+    // scope-end disposal by the CALLER (the argument arm does that when
+    // wrapMade is reported) — the callee never disposes a borrowed argument.
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* src = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1),
+         builder_.getInt64((int64_t)module_->getDataLayout().getTypeAllocSize(stTy))},
+        "lazyargsrc");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, src, 0));
+    builder_.CreateStore(lazyVal, builder_.CreateStructGEP(stTy, src, 1));
+    builder_.CreateStore(builder_.getInt64(0), builder_.CreateStructGEP(stTy, src, 2));
+    builder_.CreateStore(builder_.getInt64(esz), builder_.CreateStructGEP(stTy, src, 3));
+    return src;
 }
 
 // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: wrap a bz_array_t*-backed owning
@@ -15232,7 +15502,14 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             bool wrapMade = false;
             v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get(),
                                            /*ownLazyPipeline=*/lazyArgWrapped,
-                                           &wrapMade);
+                                           &wrapMade,
+                                           /*srcOwnedByCallee=*/false,
+                                           // fix #5612 / §29.11 item 3 (v0.330):
+                                           // an argument is an ordinary BORROW, so
+                                           // the lazy frame stays deferred behind a
+                                           // single-consumption wrapper rather than
+                                           // being drained at the call site.
+                                           /*lazyArgDeferred=*/lazyArgWrapped);
             if (wrapMade && v && v->getType()->isPointerTy() &&
                 !disposeStack_.empty()) {
                 llvm::AllocaInst* eslot = entryAlloca(v->getType());

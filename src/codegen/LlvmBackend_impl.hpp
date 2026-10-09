@@ -11234,7 +11234,19 @@ private:
                                             const ast::Expr* srcExpr,
                                             bool ownLazyPipeline = false,
                                             bool* outWrapMade = nullptr,
-                                            bool srcOwnedByCallee = false);
+                                            bool srcOwnedByCallee = false,
+                                            // fix #5612 / §29.11 item 3 (v0.330):
+                                            // the lazy wrap is POSITION-dependent.
+                                            // A RETURN site owns its result, so the
+                                            // owning drain is right there. An
+                                            // ARGUMENT site is a BORROW (§29.11
+                                            // item 3: "the plain argument being an
+                                            // ordinary borrow"), so the frame stays
+                                            // deferred behind a single-consumption
+                                            // wrapper and the callee's re-enumeration
+                                            // raises. Only the two argument arms pass
+                                            // true; every other site keeps the drain.
+                                            bool lazyArgDeferred = false);
 
     // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): an
     // INTERFACE-dispatched computed `IEnumerable<T>`-family property read —
@@ -11406,6 +11418,17 @@ private:
     // target `IEnumerable<T>` type; its genericArgs[0] supplies the element
     // stride. Shared by lowerLocalDecl and wrapAsIEnumerableForTarget.
     llvm::Value* drainLazyPipelineToOwnedIEnumerable(
+        llvm::Value* lazyVal, const sema::TypeRef* iEnumTy);
+
+    // fix #5612 / §29.11 item 3 (v0.330): the ARGUMENT-position lazy wrap. Keeps
+    // the lazy frame DEFERRED across the `IEnumerable<T>` boundary instead of
+    // draining it at the call site, and makes the wrapper's slot-4 GetEnumerator
+    // single-consumption: first call returns a clone that drives the frame through
+    // the lazy vtable, a second raises InvalidOperationException for the callee's
+    // post-GetEnumerator pending check. The frame's disposal obligation stays with
+    // the caller (slot 1 drains and frees it exactly once). `iEnumTy` is the
+    // target `IEnumerable<T>`; its genericArgs[0] supplies the element type.
+    llvm::Value* wrapLazyFrameAsSingleUseIEnumerable(
         llvm::Value* lazyVal, const sema::TypeRef* iEnumTy);
 
     // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: wrap a bz_array_t*-backed

@@ -13713,7 +13713,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     bool wrapMade = false;
                     v = wrapAsIEnumerableForTarget(
                         v, formalTy, a.value.get(),
-                        /*ownLazyPipeline=*/lazyArgWrapped, &wrapMade);
+                        /*ownLazyPipeline=*/lazyArgWrapped, &wrapMade,
+                        /*srcOwnedByCallee=*/false,
+                        // fix #5612 / §29.11 item 3 (v0.330): the imported-callee
+                        // twin of the local arm's deferral. An argument is an
+                        // ordinary borrow, so the lazy frame stays deferred behind
+                        // a single-consumption wrapper instead of being drained
+                        // here — the callee's second enumeration then raises
+                        // InvalidOperationException, which is the enforcement point
+                        // §29.11 designates for a statically untracked parameter.
+                        /*lazyArgDeferred=*/lazyArgWrapped);
                     if (wrapMade && v && v->getType()->isPointerTy() &&
                         !disposeStack_.empty()) {
                         llvm::AllocaInst* eslot = entryAlloca(v->getType());
