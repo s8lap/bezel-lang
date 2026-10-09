@@ -415,6 +415,30 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             if (bname == "Semaphore")
                 return true;
 
+            // stdlib §2.7: Random is sendable — copy-state ground (§30.14).
+            if (bname == "Random")
+                return true;
+
+            // stdlib §3.1: StringBuilder is sendable — copy-state ground (§30.14).
+            if (bname == "StringBuilder")
+                return true;
+
+            // stdlib §2.13: Type is sendable — shared reference across domains
+            // (§30.14: interned immutable; crosses as a shared reference, like string).
+            if (bname == "Type")
+                return true;
+
+            // stdlib §4.14: OwningBuffer<T> is sendable iff its element type is
+            // sendable — either a sendable value type (primitive, string) or a
+            // sendable class/record. Per spec: "a buffer of a borrow-bearing
+            // record is not" sendable. Uses the same element-check as OwningArray:
+            // the element's own sendability determines the buffer's.
+            if (bname == "OwningBuffer") {
+                if (rt->genericArgs.empty() || !rt->genericArgs[0])
+                    return false;
+                return isSendableType(rt->genericArgs[0], ctx, inProgress);
+            }
+
             // Other builtin types with no user TypeDecl: conservatively
             // not sendable unless on the explicit list above.
             return false;
