@@ -14,7 +14,8 @@ Some escapes are specific routes inside a cell (a stdlib copy member, a span ove
 |---|---|---|---|---|
 | 1 | v0.330 | 32 of 117 | — | 10 root causes (#5674–#5683), all decided in v0.331 (proposals 0148–0151) |
 | 2 | v0.331 | 21 of 117 | 7 of 7 | #5688, #5708, #5709 and the span routes (#5691, #5693, #5706, #5710), all decided in v0.332 (proposals 0152–0155) |
-| 3 | v0.332 | 3 of 117 | 0 of 7 | R6/C4 (#5726, new), R6/C9 and R6/C10 (#5715); also the editorial issue #5727 |
+| 3 | v0.332 | 3 of 117 | 0 of 7 | R6/C4 (#5726, new), R6/C9 and R6/C10 (#5715); also the editorial issue #5727; all decided in v0.333 (proposals 0156–0158) |
+| 4 | v0.333 | 2 of 117 | 2 of 10 | R3/C4 and R6/C4 (#5739 equality search into `Equals(Object?)`, #5740 generic `as T` over a span), routes R6/C3·equality (#5739) and R2–R6/C11·loopvar (#5741); editorial items #5742 |
 
 Each run re-derives every cell from the text current at that revision, rather than carrying the previous verdict forward, and records `prev_status` against the run before.
 
