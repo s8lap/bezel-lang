@@ -11051,7 +11051,12 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
     const bool storing = m == "Add" || m == "Insert" || m == "TryAdd" ||
                           m == "AddFirst" || m == "AddLast" ||
                           m == "AddBefore" || m == "AddAfter" ||
-                          m == "Push" || m == "Enqueue";
+                          m == "Push" || m == "Enqueue" ||
+                          // fix #5631 (§28.11, v0.330): `GetOrAdd(key, factory)`
+                          // stores BOTH the key AND the factory's result (which
+                          // carries the factory's sources, including what the key
+                          // contributes) into borrowing slots. Neither was checked.
+                          m == "GetOrAdd";
     // §28.11 (#1886): `AddRange` is a BULK store — it copies every element of
     // its argument collection into the receiver, so an element borrow whose
     // source does not outlive the receiver escapes exactly as a single `.Add`
