@@ -2891,6 +2891,9 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // leave the binding Owned — the very regression this fix targets.
     for (const ast::ForStmt* fs : block.forOrigins) {
         if (!fs) continue;
+        // fix #4603 (§29.12, v0.330): mutation-during-iteration lint A.
+        // Walk the for-stmt body checking for structural mutations of the iterable.
+        checkForStmtStructuralMutation(*fs);
         // fix #3977 (§28.3 K1.3/§28.2, v0.294): the for-loop source and its
         // optional `with` cancellation-token expression are READ positions
         // like any other, but neither one is part of `block.stmts` (the
@@ -6931,6 +6934,86 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                     bs.sym = src;
                     states_[lsym].source = bs;
                 }
+                // fix #4603 (§28.11, v0.330): element-borrow use-after-removal
+                // lint B. When a local is initialized from an indexer-get on an
+                // owning collection (`var w := xs[0]`), record the collection
+                // symbol as the element borrow source, AND the index expression
+                // it was taken at — §28.11 scopes the `RemoveAt(i)` leg to "the
+                // borrow was taken as `coll[i]` with the same index expression —
+                // a constant, or a local read not reassigned between".
+                if (auto* ix = dynamic_cast<const ast::IndexExpr*>(ld.initializer.get())) {
+                    if (ix->target) {
+                        if (const ast::IdentifierExpr* targetId =
+                                identifierRoot(*ix->target)) {
+                            if (sema::Symbol* collSym = ctx_.exprSymbol(*targetId)) {
+                                const sema::TypeRef* tt = ctx_.exprType(*ix->target);
+                                if (tt && tt->kind == sema::TypeRef::Kind::Named) {
+                                    std::string_view head;
+                                    if (tt->astNode && tt->astNode->name &&
+                                        !tt->astNode->name->parts.empty())
+                                        head = tt->headName();
+                                    else if (!tt->importedName.empty())
+                                        head = tt->importedName;
+                                    if (common::isOwningCollectionHead(head)) {
+                                        states_[lsym].elementBorrowSourceColl = collSym;
+                                        // Classify the index expression now, so
+                                        // the kill can compare against it
+                                        // without re-deriving it. Only the two
+                                        // shapes §28.11 names are given a
+                                        // precise kind; everything else is Opaque
+                                        // and draws nothing.
+                                        if (ix->indices.size() == 1 &&
+                                            ix->indices[0].value) {
+                                            const ast::Expr& idxExpr =
+                                                *ix->indices[0].value;
+                                            if (auto* intLit =
+                                                    dynamic_cast<const ast::IntLiteralExpr*>(
+                                                        &idxExpr)) {
+                                                if (!intLit->text.empty())
+                                                    states_[lsym].elementBorrowIndexValue =
+                                                        std::strtoll(
+                                                            std::string(intLit->text)
+                                                                .c_str(),
+                                                            nullptr, 10);
+                                                states_[lsym].elementBorrowIndexKind =
+                                                    LocalOwnership::ElementBorrowIndexKind::Constant;
+                                            } else if (const ast::IdentifierExpr*
+                                                           idxId =
+                                                           dynamic_cast<const ast::IdentifierExpr*>(
+                                                               &idxExpr)) {
+                                                // A local READ. It stays the
+                                                // same index expression unless
+                                                // the local is written between
+                                                // the borrow and the kill —
+                                                // handleAssignment clears the
+                                                // kind on that write.
+                                                if (sema::Symbol* idxSym =
+                                                        ctx_.exprSymbol(*idxId)) {
+                                                    states_[lsym].elementBorrowIndexLocal =
+                                                        idxSym;
+                                                    states_[lsym].elementBorrowIndexKind =
+                                                        LocalOwnership::ElementBorrowIndexKind::LocalRead;
+                                                } else {
+                                                    states_[lsym].elementBorrowIndexKind =
+                                                        LocalOwnership::ElementBorrowIndexKind::Opaque;
+                                                }
+                                            } else {
+                                                states_[lsym].elementBorrowIndexKind =
+                                                    LocalOwnership::ElementBorrowIndexKind::Opaque;
+                                            }
+                                        } else {
+                                            // Multi-dimensional index, or no
+                                            // index at all: no precision to
+                                            // compare, so no `RemoveAt` leg.
+                                            states_[lsym].elementBorrowIndexKind =
+                                                LocalOwnership::ElementBorrowIndexKind::Opaque;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // fix #4236 / §28.3, §28.6 (v0.298), widened by fix #4268 (§28.10,
             // v0.298): `disposeAliasSource` — see its header comment
@@ -7793,6 +7876,11 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
                     st.maybeConsumed = false;
                     st.disposedOnSomePath = false;
                     st.awaitSpent = false;
+                    // fix #4603 (§28.11, v0.330): element-borrow use-after-removal lint B.
+                    // A reassignment severs the element-borrow relationship — the new
+                    // value has no connection to the old one.
+                    st.elementBorrowSourceColl = nullptr;
+                    st.elementBorrowKilledByRemoval = false;
                     // §28.3 (#1900): the scope-end auto-drop's "definitely
                     // holds a fresh value" marker, used by the
                     // consume-and-restore idiom. // per §28.3, #1900
@@ -7849,6 +7937,30 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // may not be REASSIGNED until the bounding scope exits.
     if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))
         checkScopedFreeze(tid->name, as.target->span.begin, "reassign", ctx_.exprSymbol(*tid));
+
+    // fix #4603 (§28.11, v0.330): element-borrow use-after-removal lint B —
+    // the "not reassigned between" half of the index-precision rule. §28.11
+    // scopes the `RemoveAt(i)` kill to a borrow taken at "the same index
+    // expression — a constant, or a local read not reassigned between", so a
+    // WRITE to that index local between the borrow and the kill means the two
+    // expressions no longer name the same slot, and the kill must not fire.
+    // Without this, `var idx := 0; var w := xs[idx]; idx := 1;
+    // xs.RemoveAt(idx); w.Ping()` warns — an over-warn, since index 1 is not
+    // the borrowed slot. Clearing the kind (rather than the whole borrow) keeps
+    // the `Clear()` leg correct: the element is still there, only the index
+    // precision is gone. // per §28.11
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+        if (sema::Symbol* written = ctx_.exprSymbol(*tid)) {
+            for (auto& [sym, st] : states_) {
+                if (st.elementBorrowIndexKind !=
+                    LocalOwnership::ElementBorrowIndexKind::LocalRead)
+                    continue;
+                if (st.elementBorrowIndexLocal != written) continue;
+                st.elementBorrowIndexKind =
+                    LocalOwnership::ElementBorrowIndexKind::Opaque;
+            }
+        }
+    }
     // §28.3 / §28.7 / §28.10 (v0.180, #1965): the assignment-position `owned`
     // transfer marker — `y := owned x;`. A MARKED read of a named owned binding
     // is a MOVE (the source is left moved-from; the target adopts owned and
@@ -8350,6 +8462,13 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // definite fresh value, not the conditionally-disposed one.
             st.disposedOnSomePath = false;
             st.awaitSpent = false;  // #1869: fresh value — not an await-spend
+            // fix #4603 (§28.11, v0.330): element-borrow use-after-removal lint B.
+            st.elementBorrowSourceColl = nullptr;
+            st.elementBorrowKilledByRemoval = false;
+            st.elementBorrowIndexKind =
+                LocalOwnership::ElementBorrowIndexKind::None;
+            st.elementBorrowIndexLocal = nullptr;
+            st.elementBorrowIndexInvalidatedByStructuralOp = false;
             // fix #4246 (§28.3 / §28.6, v0.298): the reassignment overwrites
             // the slot's CONTENT, so any earlier "an explicit dispose on
             // this local already reclaimed" fact is stale — see the field
@@ -16365,6 +16484,423 @@ void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
 }
 
 } // namespace
+
+namespace {
+
+// Structural mutation members for owning collection families.
+const std::string_view kStructuralMutationMembers[] = {
+    "Add", "AddRange", "Insert", "Remove", "RemoveAt",
+    "Clear", "Sort", "Reverse",
+    "AddFirst", "AddLast",
+};
+
+bool isStructuralMutationMember(std::string_view member) {
+    for (auto m : kStructuralMutationMembers) {
+        if (member == m) return true;
+    }
+    return false;
+}
+
+// True if `s` unconditionally exits the containing loop (no conditional path).
+bool isUnconditionalLoopExit(const bezel::ast::Stmt& s) {
+    if (dynamic_cast<const bezel::ast::BreakStmt*>(&s)) return true;
+    if (dynamic_cast<const bezel::ast::ReturnStmt*>(&s)) return true;
+    if (dynamic_cast<const bezel::ast::ThrowStmt*>(&s)) return true;
+    return false;
+}
+
+using StmtList = std::vector<std::unique_ptr<bezel::ast::Stmt>>;
+
+// fix #4603 (§29.12, v0.330): true when control cannot fall out of `s` — every
+// path through it exits the loop (break / return / throw), so whatever follows
+// it is unreachable. The conditional arm mirrors §29.12's "followed on EVERY
+// path by an exit": an if whose then AND else branches each exit exits on
+// every path. A branchless `if` cannot — the absent else falls through. // per §29.12
+bool exitsOnAllPaths(const bezel::ast::Stmt& s) {
+    if (isUnconditionalLoopExit(s)) return true;
+    if (auto* ifs = dynamic_cast<const bezel::ast::IfStmt*>(&s)) {
+        if (!ifs->hasElse) return false;
+        bool thenExits = !ifs->ifBranch.body.empty() && exitsOnAllPaths(*ifs->ifBranch.body.back());
+        bool elseExits = !ifs->elseBody.empty() && exitsOnAllPaths(*ifs->elseBody.back());
+        return thenExits && elseExits;
+    }
+    if (auto* dob = dynamic_cast<const bezel::ast::DoEndBlock*>(&s)) {
+        if (dob->body.empty()) return false;
+        for (const auto& inner : dob->body)
+            if (!exitsOnAllPaths(*inner)) return false;
+        return true;
+    }
+    return false;
+}
+
+// True when control can reach the END of `body` starting at index `from`,
+// i.e. the statements after that point do not all exit. §29.12: the call is
+// exempt when "a structural call followed on every path by an exit from the
+// loop" — so a `break` anywhere on the continuation kills the advance. // per §29.12
+bool canFallOutOf(const StmtList& body, size_t from) {
+    for (size_t i = from; i < body.size(); ++i)
+        if (exitsOnAllPaths(*body[i])) return false;
+    return true;
+}
+
+// One enclosing block level, recorded while walking: the statement list and the
+// index within it of the child construct that contains the call.
+struct BlockLevel {
+    const StmtList* body;
+    size_t childIndex;
+};
+
+// fix #4603 (§29.12, v0.330): can control reach the loop's NEXT ADVANCE from
+// the call? §29.12's exemption is exactly the negation: "a structural call
+// followed on every path by an exit from the loop ... is exempt, no advance
+// following it; an exit on only some paths exempts nothing, and the call is
+// warned whether or not it is conditional."
+//
+// The question is asked of the paths leaving the CALL, not of the paths leaving
+// the loop: a call inside `if c then xs.Add(9); break; end;` runs only when `c`
+// holds, and every path out of it exits, so the absent else is irrelevant and
+// the call is exempt. The advance is unreachable as soon as ANY enclosing level
+// cannot fall out; only if every level can does control reach the end of the
+// loop body — which is exactly the next advance. `chain` runs innermost-first,
+// but the test is an AND over the levels, so the early return is a
+// short-circuit only.
+bool advanceReachableFromCall(const std::vector<BlockLevel>& chain) {
+    for (const BlockLevel& lv : chain) {
+        if (!lv.body) continue;
+        if (!canFallOutOf(*lv.body, lv.childIndex + 1)) return false;
+    }
+    return true;
+}
+
+// Locates `callSite` in the statement tree under `body`, filling `chain` with
+// the enclosing levels. Returns false when the call is not under `body` at all.
+bool buildCallChain(const bezel::ast::Stmt& body, const bezel::ast::Stmt& callSite,
+                    std::vector<BlockLevel>& chain) {
+    if (auto* block = dynamic_cast<const bezel::ast::DoEndBlock*>(&body)) {
+        for (size_t i = 0; i < block->body.size(); ++i) {
+            if (block->body[i].get() == &callSite) {
+                chain.push_back(BlockLevel{&block->body, i});
+                return true;
+            }
+        }
+        for (size_t i = 0; i < block->body.size(); ++i) {
+            if (buildCallChain(*block->body[i], callSite, chain)) {
+                chain.push_back(BlockLevel{&block->body, i});
+                return true;
+            }
+        }
+        return false;
+    }
+    // A conditional, loop, try or block-bodied child: recurse, then record this
+    // level with the index the child actually occupies.
+    auto tryChild = [&](const StmtList* list) -> bool {
+        if (!list) return false;
+        for (size_t i = 0; i < list->size(); ++i) {
+            if (list->at(i).get() == &callSite) {
+                chain.push_back(BlockLevel{list, i});
+                return true;
+            }
+            if (buildCallChain(*list->at(i), callSite, chain)) {
+                chain.push_back(BlockLevel{list, i});
+                return true;
+            }
+        }
+        return false;
+    };
+    if (auto* ifs = dynamic_cast<const bezel::ast::IfStmt*>(&body)) {
+        if (tryChild(&ifs->ifBranch.body)) return true;
+        for (const auto& eb : ifs->elifBranches)
+            if (tryChild(&eb.body)) return true;
+        if (ifs->hasElse && tryChild(&ifs->elseBody)) return true;
+        return false;
+    }
+    if (auto* ws = dynamic_cast<const bezel::ast::WhileStmt*>(&body))
+        return tryChild(&ws->body);
+    if (auto* fs = dynamic_cast<const bezel::ast::ForStmt*>(&body))
+        return tryChild(&fs->body);
+    if (auto* ts = dynamic_cast<const bezel::ast::TryStmt*>(&body)) {
+        if (tryChild(&ts->body)) return true;
+        if (tryChild(&ts->finallyBody)) return true;
+        for (const auto& arm : ts->catches) {
+            if (!arm.body) continue;
+            // A catch arm's body is ONE statement, not a list. When that single
+            // statement IS the call there is nothing after it at this level —
+            // the arm ends and control resumes after the `try` — so this level
+            // contributes "falls out" and records nothing. Otherwise recurse
+            // into it as a nested block.
+            if (arm.body.get() == &callSite) return true;
+            if (buildCallChain(*arm.body, callSite, chain)) return true;
+        }
+    }
+    return false;
+}
+
+// True if `callSite` is unconditionally followed by a loop exit before the
+// loop body ends — §29.12's exemption. Thin wrapper over the chain analysis.
+bool isCallExempt(const bezel::ast::Stmt& body, const bezel::ast::Stmt& callSite) {
+    std::vector<BlockLevel> chain;
+    if (!buildCallChain(body, callSite, chain)) return false;
+    return !advanceReachableFromCall(chain);
+}
+
+bool sameBinding(const bezel::ast::Expr& e, std::string_view iterName) {
+    if (auto* id = dynamic_cast<const bezel::ast::IdentifierExpr*>(&e))
+        return id->name == iterName;
+    if (auto* ma = dynamic_cast<const bezel::ast::MemberAccessExpr*>(&e))
+        if (ma->target) return sameBinding(*ma->target, iterName);
+    return false;
+}
+
+// fix #4603 (§29.12's list, v0.330): the structural-operation vocabulary the
+// §28.11 element-borrow kill must test for "between the borrow and the kill".
+// The two lints share one operation vocabulary (§28.11: "the two warnings share
+// one operation vocabulary"), so this is the SAME list Lint A warns on, plus the
+// egress members §29.12 names (`Push`/`Pop`, `Enqueue`/`Dequeue`).
+const std::string_view kElemBorrowInvalidatingMembers[] = {
+    "Add", "AddRange", "Insert", "Remove", "RemoveAt",
+    "Clear", "Sort", "Reverse",
+    "AddFirst", "AddLast",
+    "Push", "Pop", "Enqueue", "Dequeue", "Drain",
+};
+
+bool isElemBorrowInvalidatingMember(std::string_view member) {
+    for (auto m : kElemBorrowInvalidatingMembers) {
+        if (member == m) return true;
+    }
+    return false;
+}
+
+} // anonymous namespace
+
+// fix #4603 (§28.11, v0.330): element-borrow use-after-removal lint B.
+//
+// A call on the same collection binding that DISPOSES THE BORROWED ELEMENT kills
+// the borrow; the next checkRead of the local holding it draws the warning.
+//
+// §28.11 enumerates the kill set, and the legs are NOT interchangeable:
+//   - `Clear()` disposes EVERY element — unconditional. // per §28.11
+//   - `Remove(b)` fires "where the argument is the borrow itself" — an
+//     identity test against the local holding the borrow, not a member-name
+//     test. §28.11 records that where the element type overrides `Equals` this
+//     may dispose an equal-but-not-identical element; "the warning is stated as
+//     certain there regardless — an over-warn, recorded". Warn anyway.
+//   - `RemoveAt(i)` fires only where the borrow was taken at "the same index
+//     expression — a constant, or a local read not reassigned between" AND "no
+//     structural operation of §29.12's list on the same collection binding
+//     between the borrow and the kill: a reposition or removal ahead of the
+//     slot would change which element the index names". Anything not one of
+//     those two index shapes, or with a structural op in between, draws
+//     nothing — §28.11's own "a chosen silence, liftable" clause, with the
+//     checked-mode backstop standing behind it.
+//   - A KEYED removal (`OwningDictionary<K,V>.Remove(k)`) is explicitly OUTSIDE
+//     the kill set in this revision and is not implemented here. // per §28.11
+void MethodOwnership::markElementBorrowKilledByRemoval(const ast::CallExpr& call,
+                                                   SourceLocation killLoc) {
+    // Find the collection symbol the call is made on.
+    if (!call.callee) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return;
+    const ast::IdentifierExpr* targetId = identifierRoot(*ma->target);
+    if (!targetId) return;
+    sema::Symbol* collSym = ctx_.exprSymbol(*targetId);
+    if (!collSym) return;
+
+    const bool isClear = (ma->member == "Clear");
+    const bool isRemoveAt = (ma->member == "RemoveAt");
+    const bool isRemove = (ma->member == "Remove");
+
+    // `Remove(b)` — the argument must BE the borrow. A keyed removal
+    // (`od.Remove(1)`) passes a key, never the borrow local, so it is not a
+    // kill and is outside the kill set this revision. Resolve the argument's
+    // root symbol once and test identity per candidate local.
+    sema::Symbol* removeArgSym = nullptr;
+    if (isRemove && !call.args.empty() && call.args[0].value) {
+        if (const ast::IdentifierExpr* argId =
+                identifierRoot(*call.args[0].value))
+            removeArgSym = ctx_.exprSymbol(*argId);
+        // A non-identifier argument (a key, a computed value) leaves
+        // removeArgSym null, so no `Remove` leg fires at all.
+    }
+
+    // `RemoveAt(i)` — classify the index expression at the kill.
+    long long removeAtIndexValue = 0;
+    LocalOwnership::ElementBorrowIndexKind removeAtIndexKind =
+        LocalOwnership::ElementBorrowIndexKind::Opaque;
+    sema::Symbol* removeAtIndexLocal = nullptr;
+    if (isRemoveAt) {
+        if (call.args.size() == 1 && call.args[0].value) {
+            const ast::Expr& idxExpr = *call.args[0].value;
+            if (auto* intLit =
+                    dynamic_cast<const ast::IntLiteralExpr*>(&idxExpr)) {
+                if (!intLit->text.empty())
+                    removeAtIndexValue =
+                        std::strtoll(std::string(intLit->text).c_str(), nullptr, 10);
+                removeAtIndexKind =
+                    LocalOwnership::ElementBorrowIndexKind::Constant;
+            } else if (auto* idxId =
+                           dynamic_cast<const ast::IdentifierExpr*>(&idxExpr)) {
+                if (sema::Symbol* s = ctx_.exprSymbol(*idxId)) {
+                    removeAtIndexLocal = s;
+                    removeAtIndexKind =
+                        LocalOwnership::ElementBorrowIndexKind::LocalRead;
+                }
+            }
+            // anything else stays Opaque
+        }
+        // A `RemoveAt` with a malformed arg list stays Opaque.
+    }
+
+    for (auto& [sym, st] : states_) {
+        if (st.elementBorrowSourceColl != collSym) continue;
+        if (st.elementBorrowKilledByRemoval) continue;  // already killed
+
+        if (isClear) {
+            // Disposes every element — unconditional.
+        } else if (isRemove) {
+            // Only where the argument IS the borrow.
+            if (!removeArgSym || removeArgSym != sym) continue;
+        } else if (isRemoveAt) {
+            // §28.11's fourth condition: a structural op between the borrow
+            // and the kill means the index may no longer name the borrowed
+            // slot.
+            if (st.elementBorrowIndexInvalidatedByStructuralOp) continue;
+            // "the same index expression — a constant, or a local read not
+            // reassigned between".
+            if (removeAtIndexKind != st.elementBorrowIndexKind) continue;
+            if (removeAtIndexKind ==
+                LocalOwnership::ElementBorrowIndexKind::Constant) {
+                if (removeAtIndexValue != st.elementBorrowIndexValue) continue;
+            } else if (removeAtIndexKind ==
+                       LocalOwnership::ElementBorrowIndexKind::LocalRead) {
+                // Same local, and still holding the value it had at the borrow
+                // (a write between the two cleared the borrow's index kind).
+                if (!removeAtIndexLocal || removeAtIndexLocal != st.elementBorrowIndexLocal)
+                    continue;
+            } else {
+                // Opaque on either side: no provable equality, so no warning.
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        st.elementBorrowKilledByRemoval = true;
+        st.elementBorrowRemovalKillLoc = killLoc;
+        st.elementBorrowKillMember = ma->member;
+    }
+}
+
+// fix #4603 (§28.11, v0.330): the fourth condition's predicate. A structural
+// operation of §29.12's list on the same collection binding, seen AFTER a
+// borrow was taken and BEFORE the kill, means the index may no longer name the
+// borrowed slot ("a reposition or removal ahead of the slot would change which
+// element the index names"). Recorded on the borrow, not acted on here — the
+// `RemoveAt` leg tests it.
+// // per §28.11, §29.12
+void MethodOwnership::noteElementBorrowStructuralOpOn(const ast::CallExpr& call) {
+    if (!call.callee) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return;
+    if (!isElemBorrowInvalidatingMember(ma->member)) return;
+    const ast::IdentifierExpr* targetId = identifierRoot(*ma->target);
+    if (!targetId) return;
+    sema::Symbol* collSym = ctx_.exprSymbol(*targetId);
+    if (!collSym) return;
+    for (auto& [sym, st] : states_) {
+        if (st.elementBorrowSourceColl != collSym) continue;
+        // Already killed stays killed; an invalidation after the kill is moot.
+        if (st.elementBorrowKilledByRemoval) continue;
+        st.elementBorrowIndexInvalidatedByStructuralOp = true;
+    }
+}
+
+// fix #4603 (§29.12, v0.330): mutation-during-iteration lint A.
+// A structural operation (Add/Remove/Clear/etc.) called on the same collection
+// binding the enclosing for loop iterates, from which the loop's next advance
+// is reachable, draws the warning. The call is exempt if unconditionally
+// followed by a loop exit (break/return/throw/labeled-jump on all paths).
+// // per §29.12
+void MethodOwnership::checkForStmtStructuralMutation(const ast::ForStmt& fs) {
+    if (suppressDiag_) return;
+    if (!fs.iterable) return;
+    const sema::TypeRef* tt = ctx_.exprType(*fs.iterable);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named) return;
+    std::string_view head;
+    if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty())
+        head = tt->headName();
+    else if (!tt->importedName.empty())
+        head = tt->importedName;
+    if (!common::isIterFormatEnumerableHead(head) &&
+        !common::isOwningCollectionHead(head) &&
+        !common::isPlainBuiltinCollectionHead(head)) return;
+
+    const bezel::ast::IdentifierExpr* iterId = identifierRoot(*fs.iterable);
+    if (!iterId) return;
+    if (iterId->name == "this" || iterId->name == "base") return;
+
+    // Walk the for-stmt body recursively.
+    struct BodyWalker {
+        MethodOwnership& self;
+        std::string iterName;
+
+        void walk(const std::vector<std::unique_ptr<bezel::ast::Stmt>>& body,
+                  const bezel::ast::Stmt& containingStmt) {
+            for (const auto& s : body) {
+                if (!s) continue;
+                if (auto* es = dynamic_cast<const bezel::ast::ExpressionStmt*>(s.get())) {
+                    if (auto* call = dynamic_cast<const bezel::ast::CallExpr*>(es->expr.get())) {
+                        if (call->callee) {
+                            if (auto* ma = dynamic_cast<const bezel::ast::MemberAccessExpr*>(call->callee.get())) {
+                                std::string_view member = ma->member;
+                                if (isStructuralMutationMember(member) &&
+                                    ma->target && sameBinding(*ma->target, iterName)) {
+                                    if (!isCallExempt(containingStmt, *s)) {
+                                        std::string memberStr(member);
+                                        self.report(
+                                            bezel::Severity::Warning, ma->span.begin,
+                                            "`" + memberStr + "` on `" + iterName +
+                                            "` modifies the collection this `for` is "
+                                            "iterating; the enumerator is invalidated and "
+                                            "the loop's next advance raises "
+                                            "`InvalidOperationException` (§29.12). "
+                                            "Collect the matches and remove them after the "
+                                            "loop, or consume the collection with "
+                                            "`PopAt`/`Pop` in a loop that does not "
+                                            "iterate it.");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (auto* ifs = dynamic_cast<const bezel::ast::IfStmt*>(s.get())) {
+                    walk(ifs->ifBranch.body, *s);
+                    if (ifs->hasElse) walk(ifs->elseBody, *s);
+                }
+                if (auto* ws = dynamic_cast<const bezel::ast::WhileStmt*>(s.get()))
+                    walk(ws->body, *s);
+                if (auto* fs2 = dynamic_cast<const bezel::ast::ForStmt*>(s.get()))
+                    walk(fs2->body, *s);
+                if (auto* dob = dynamic_cast<const bezel::ast::DoEndBlock*>(s.get()))
+                    walk(dob->body, *s);
+                if (auto* ts = dynamic_cast<const bezel::ast::TryStmt*>(s.get())) {
+                    walk(ts->body, *s);
+                    for (const auto& arm : ts->catches) {
+                        if (arm.body) {
+                            std::vector<std::unique_ptr<bezel::ast::Stmt>> bodyVec;
+                            bodyVec.push_back(std::unique_ptr<bezel::ast::Stmt>(arm.body.get()));
+                            walk(bodyVec, *s);
+                        }
+                    }
+                    if (ts->hasFinally) walk(ts->finallyBody, *s);
+                }
+            }
+        }
+    };
+
+    BodyWalker walker{*this, std::string(iterId->name)};
+    walker.walk(fs.body, fs);
+}
 
 bool checkOwnership(const ast::SourceFile& src, sema::SemaContext& ctx) {
     for (const auto& d : src.topDecls) {

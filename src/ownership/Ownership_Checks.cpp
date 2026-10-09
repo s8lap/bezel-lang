@@ -2664,6 +2664,26 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                     markExplicitDisposeReclaimIfReassignedBorrow(*id);
                     markDisposedByName(id->name, id->span.begin, id);
                 }
+            } else if (ma->member == "RemoveAt" || ma->member == "Clear" ||
+                       ma->member == "Remove") {
+                // fix #4603 (§28.11, v0.330): a call on an owning collection
+                // that disposes the borrowed element kills any local holding
+                // an element borrow of that collection (taken via
+                // `var w := xs[0]`), so the subsequent checkRead warns. The
+                // three legs differ — `Clear()` unconditional, `Remove(b)`
+                // only where the argument IS the borrow, `RemoveAt(i)` only at
+                // the same index expression with no intervening structural op
+                // — so the per-leg predicate lives in the callee. Keyed removal
+                // is outside the kill set this revision. // per §28.11
+                markElementBorrowKilledByRemoval(*call, ma->span.begin);
+            } else {
+                // fix #4603 (§28.11, v0.330): the other structural operations
+                // of §29.12's list. None of them is itself the kill, but one
+                // landing on the borrow's collection between the borrow and a
+                // later `RemoveAt` means the index may no longer name the
+                // borrowed slot — record that so the `RemoveAt` leg declines.
+                // // per §28.11, §29.12
+                noteElementBorrowStructuralOpOn(*call);
             }
         }
         // §28.2 / §28.3 (#860): a null-conditional dispose `local?.Dispose()`
@@ -3244,6 +3264,43 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // binding or slot is unreadable until reassigned") and K7.4's "no
         // flow around a back edge into a use" require of a read reached
         // around a back edge. // per §28.2, §28.3 K1.3/K7, v0.294, #3931
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
+        } else if (st->elementBorrowKilledByRemoval) {
+            // fix #4603 (§28.11, v0.330): element-borrow use-after-removal lint B.
+            // A local holding an element borrow of an owning collection — taken by
+            // indexer-get (`var w := xs[0]`) — is used after a call on the same
+            // collection binding disposed THAT element. The kill that got here is
+            // one of §28.11's three legs, already narrowed by the per-leg
+            // predicate in `markElementBorrowKilledByRemoval` (Clear is
+            // unconditional; Remove(b) only where the argument IS the borrow;
+            // RemoveAt(i) only at the same index expression with no intervening
+            // structural op). §28.11: "The warning NAMES THE DISPOSING CALL and
+            // the remedies" — so the recorded member is named, not all three.
+            // The program stays accepted; the checked-mode backstop handles the
+            // runtime fault.
+            std::string srcName =
+                st->elementBorrowSourceColl
+                    ? std::string(st->elementBorrowSourceColl->name)
+                    : std::string("?");
+            std::string killMember =
+                st->elementBorrowKillMember.empty()
+                    ? std::string("RemoveAt")
+                    : std::string(st->elementBorrowKillMember);
+            report(
+                Severity::Warning, id->span.begin,
+                std::string("`") + std::string(id->name) +
+                "` borrows an element of `" + srcName +
+                "` that `" + srcName + "." + killMember +
+                "()` disposed (§28.11); "
+                "this use raises `DisposedAccessException` in checked disposal mode "
+                "and is undefined behaviour unchecked. Re-take the borrow after "
+                "the mutation, take the element out first with `PopAt` / `Pop` / "
+                "`PopValue`, or mutate after the last use.");
+            if (st->elementBorrowRemovalKillLoc.line != 0) {
+                report(Severity::Note, st->elementBorrowRemovalKillLoc,
+                       std::string("disposing call on `") + srcName +
+                           "` was here");
+            }
             if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         } else if (st->state == OwnershipState::Disposed) {
             // §28.2 v0.131: emit a compile-time warning (not an error) when a
@@ -12203,6 +12260,16 @@ void MethodOwnership::joinInto(std::unordered_map<sema::Symbol*, LocalOwnership>
             // // per §28.3, v0.298
             if (!st.disposedOnSomePath && o.disposedOnSomePath)
                 st.disposedOnSomePath = true;
+            // fix #4603 (§28.11, v0.330): OR-merge the element-borrow-kill
+            // fact across a same-state join. If either path killed the element
+            // borrow, the merged local is also killed. Keep the kill location
+            // and the disposing call's member from whichever path set it
+            // first, so the §28.11 diagnostic still names the disposing call.
+            if (!st.elementBorrowKilledByRemoval && o.elementBorrowKilledByRemoval) {
+                st.elementBorrowKilledByRemoval = true;
+                st.elementBorrowRemovalKillLoc = o.elementBorrowRemovalKillLoc;
+                st.elementBorrowKillMember = o.elementBorrowKillMember;
+            }
             continue;
         }
         // PolyNull absorbs: PolyNull ⊓ X = X.

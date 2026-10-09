@@ -2112,6 +2112,31 @@ private:
     void checkBorrowedOwningCollectionCapability(
         const ast::MemberAccessExpr& callee);
 
+    // fix #4603 (§28.11, v0.330): element-borrow use-after-removal lint B.
+    // A call on the same collection binding that DISPOSES THE BORROWED ELEMENT
+    // marks every local holding an element borrow of that collection as killed.
+    // The three legs are NOT interchangeable — see the definition for §28.11's
+    // enumeration (`Clear()` unconditional; `Remove(b)` where the argument IS the
+    // borrow; `RemoveAt(i)` only at the same index expression and with no
+    // intervening §29.12 structural op on the binding). Keyed removal is
+    // explicitly outside the kill set in this revision. // per §28.11
+    void markElementBorrowKilledByRemoval(const ast::CallExpr& call,
+                                           SourceLocation killLoc);
+
+    // fix #4603 (§28.11, v0.330): the fourth condition's predicate. A structural
+    // operation of §29.12's list on the borrow's collection binding, seen after
+    // the borrow and before the kill, means the index may no longer name the
+    // borrowed slot — recorded on the borrow, tested by the `RemoveAt` leg.
+    // // per §28.11, §29.12
+    void noteElementBorrowStructuralOpOn(const ast::CallExpr& call);
+
+    // fix #4603 (§29.12, v0.330): mutation-during-iteration lint A.
+    // When a structural operation (Add/Remove/Clear/etc.) is called on the same
+    // binding the enclosing for loop iterates, from which the loop's next advance
+    // is reachable, emit the warning. Called from the ForStmt arm of visitStmt.
+    // // per §29.12
+    void checkForStmtStructuralMutation(const ast::ForStmt& fs);
+
     // §28.6 (#1005): reject returning an OWNED FIELD's `move`d value through a
     // method return type that is NOT declared `owned`. The leak is the `move`
     // form: `move this.f` / `move f` transfers the owned field's value out

@@ -253,6 +253,48 @@ struct LocalOwnership {
     // own new `maybeConsumedAtLiteral` gate (see that flag's field comment
     // above) to also fire on `state == Borrowed`.
     bool disposedOnSomePath = false;
+
+    // fix #4603 (§28.11, v0.330): element-borrow use-after-removal lint B.
+    // When a local is initialized from an indexer-get on an owning collection
+    // (`var w := xs[0]`), this field records the collection symbol the
+    // element borrow was taken from. When a call on that collection DISPOSES
+    // THE BORROWED ELEMENT, elementBorrowKilledByRemoval is set and
+    // checkRead draws the warning. // per §28.11
+    sema::Symbol* elementBorrowSourceColl = nullptr;
+    bool elementBorrowKilledByRemoval = false;
+    SourceLocation elementBorrowRemovalKillLoc;
+    // §28.11 (v0.330): "The warning NAMES THE DISPOSING CALL and the
+    // remedies". The three kill legs are different calls, so the member is
+    // recorded rather than the diagnostic listing all three. A `std::string_view`
+    // into the AST (the member name is a view there) — copied through joins.
+    std::string_view elementBorrowKillMember;
+
+    // §28.11 (v0.330) scopes the `RemoveAt(i)` leg of that warning to the
+    // removal of "the element that was actually borrowed": it fires only where
+    // the borrow was taken as `coll[i]` "with the same index expression — a
+    // constant, or a local read not reassigned between". These three fields
+    // carry that per-slot precision, reusing the same two index shapes the
+    // moved-from tracking names ("a compile-time constant or a local read",
+    // §28.11 line 7524):
+    //   - Constant: elementBorrowIndexKind == Constant and
+    //     elementBorrowIndexValue holds the literal slot number.
+    //   - LocalRead: elementBorrowIndexLocal names the local that was read;
+    //     a write to that local between the borrow and the kill makes the
+    //     two expressions name different slots, so the kill no longer applies.
+    //   - Opaque: anything else (a call, a field read, an unfoldable
+    //     arithmetic expression) — no index leg is attempted at all, which
+    //     §28.11's "a chosen silence, liftable" clause covers.
+    enum class ElementBorrowIndexKind : unsigned char { None, Constant, LocalRead, Opaque };
+    ElementBorrowIndexKind elementBorrowIndexKind = ElementBorrowIndexKind::None;
+    long long elementBorrowIndexValue = 0;
+    sema::Symbol* elementBorrowIndexLocal = nullptr;
+
+    // §28.11 (v0.330): the warning requires "no structural operation of
+    // §29.12's list on the same collection binding between the borrow and the
+    // kill: a reposition or removal ahead of the slot would change which
+    // element the index names". Set when such a call is seen on
+    // elementBorrowSourceColl after this borrow was taken.
+    bool elementBorrowIndexInvalidatedByStructuralOp = false;
 };
 
 // Spelled state for diagnostics + tests.
