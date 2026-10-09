@@ -21451,9 +21451,80 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
         callee = nc->callee.get();
     if (const auto* args = scopedArgsOf(e)) {
+        // §28.3 closure bullet *Set-erasing positions* (v0.330): reject a
+        // function value with a non-empty source set at a parameter declared
+        // Object, or a bare type parameter substituted with a function type.
+        // The check is the caller's, over its own flow analysis and the
+        // callee's declared signature. Derive CalleeFormals once for the call.
+        CalleeFormals f;
+        if (ne)
+            f = resolveCtorParams(*ne, ctx_);
+        else if (callee)
+            f = calleeOrChainFormals(callee, *args);
         for (std::size_t i = 0; i < args->size(); ++i) {
             const auto& a = (*args)[i];
             if (!a.value) continue;
+            const std::size_t bp = boundFormalIndex(*args, i, f);
+            if (bp < f.size()) {
+                const ast::Type* dType = f.declType(bp);
+                const sema::TypeRef* pt = nullptr;
+                if (dType)
+                    pt = ctx_.resolvedType(*dType);
+                else
+                    pt = f.resolvedType(bp);
+                // Set-erasing position: a parameter declared at Object, or a bare
+                // type parameter (the declared type is the type parameter, not a
+                // function type).  Per §28.3 closure bullet *Set-erasing
+                // positions*: a function value reaching such a position converts
+                // to a non-function type and erases its set.
+                // A bare type parameter: kind=Named with declaration=nullptr per
+                // resolveNamed's type-param marker (TypeResolution_Names.cpp:2793-2796).
+                // Object is set-erasing as a Primitive.
+                bool isSetErasing = false;
+                bool isObject = pt &&
+                    pt->kind == sema::TypeRef::Kind::Primitive &&
+                    pt->primitive == sema::PrimitiveType::Object;
+                if (pt && pt->kind == sema::TypeRef::Kind::Named && !pt->declaration) {
+                    isSetErasing = true;  // bare type parameter
+                } else if (isObject) {
+                    isSetErasing = true;  // Object parameter
+                }
+                if (isSetErasing) {
+                    if (pt && pt->kind == sema::TypeRef::Kind::Named && !pt->declaration) {
+                        // bare type parameter
+                        if (exprIsFunctionValueWithNonEmptyCaptureSet(*a.value))
+                            report(Severity::Error, a.value->span.begin,
+                                   std::string("function value carries "
+                                               "captured borrow(s) and may "
+                                               "not be passed where the "
+                                               "parameter is declared at a bare "
+                                               "type parameter (here substituted "
+                                               "with a function type) — the "
+                                               "parameter's type announces no "
+                                               "source set; pass a capture-free "
+                                               "function value, declare the "
+                                               "parameter at a function type, "
+                                               "or declare it `scoped` "
+                                               "(§28.3 closure bullet, "
+                                               "*Set-erasing positions*, "
+                                               "v0.330)"));
+                    } else if (isObject) {
+                        if (exprIsFunctionValueWithNonEmptyCaptureSet(*a.value))
+                            report(Severity::Error, a.value->span.begin,
+                                   std::string("function value carries "
+                                               "captured borrow(s) and may "
+                                               "not be passed where the "
+                                               "parameter is declared Object — "
+                                               "Object announces no source set; "
+                                               "pass a capture-free function "
+                                               "value, declare the parameter "
+                                               "at a function type, or "
+                                               "declare it `scoped` (§28.3 "
+                                               "closure bullet, *Set-erasing "
+                                               "positions*, v0.330)"));
+                    }
+                }
+            }
             // An `out`/`ref` argument overwrites its identifier — a lambda-
             // literal local passed that way is no longer verifiable.
             if (!a.modifier.empty() &&
@@ -21911,6 +21982,102 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
     else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
         recv = nm->target.get();
     return resolveChainHead(recv);
+}
+
+// §28.3 closure bullet *Set-erasing positions* (v0.330): a function value
+// with a non-empty source set may not be passed to a set-erasing parameter.
+// This helper determines whether `arg` is a function value with captures
+// (non-empty source set).  A capture-free function value carries the empty
+// set and is admitted at a set-erasing position.  Captures are: a local
+// variable captured by a lambda, or `this` captured by an instance method
+// reference.
+bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
+    const ast::Expr& arg) {
+    // Lambda: check if it captures anything.  scopedCollectCaptures collects
+    // all identifiers including the lambda's own params — filter those out.
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
+        std::vector<const ast::IdentifierExpr*> rawCaps;
+        scopedCollectCaptures(*lam, rawCaps);
+        if (!rawCaps.empty()) {
+            std::unordered_set<const sema::Symbol*> paramSet;
+            if (const std::vector<sema::Symbol*>* ps = ctx_.lambdaParams(lam))
+                for (sema::Symbol* p : *ps) paramSet.insert(p);
+            for (const ast::IdentifierExpr* id : rawCaps) {
+                if (const sema::Symbol* s = ctx_.exprSymbol(*id))
+                    if (!paramSet.count(s)) return true;
+            }
+        }
+        return false;
+    }
+    // Method reference: a static method has no captures; an instance method
+    // reference captures its receiver (the spec's provenance clause 2).
+    // Per the spec, only a method member (not a property, field, etc.) is
+    // a function value in this sense. Check the resolved symbol.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
+        // No target → static member reference: no captures.
+        if (!ma->target) return false;
+        // Check if the resolved symbol is actually a method (not a property,
+        // field, etc.). A property access like `CancellationToken.None` is
+        // not a function value even though it has a target.
+        sema::Symbol* sym = ctx_.exprSymbol(*ma);
+        if (!sym) return false;  // Unresolved
+        if (dynamic_cast<sema::MethodSymbol*>(sym))
+            return true;  // Instance method reference: receiver is a capture
+        return false;  // Property, field, etc.: not a function value
+    }
+    // Identifier: a local carrying captures, or a parameter whose initializer
+    // is a capture-bearing lambda.  A plain function-typed parameter binding
+    // itself is not a capture — the captures come from the lambda that provided
+    // its value.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&arg)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!sym) return false;
+        // A local that aliases a call-bounded parameter carries the alias's
+        // captures.
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            // The local's initializer: trace through it.
+            auto it = scopedLambdaLocalInit_.find(sym);
+            if (it != scopedLambdaLocalInit_.end()) {
+                // Initialized from a lambda: check the lambda's captures.
+                // scopedCollectCaptures walks the body and collects all
+                // identifiers, INCLUDING the lambda's own params.  Filter
+                // those out — a lambda param is not a capture of the outer
+                // scope.
+                std::vector<const ast::IdentifierExpr*> rawCaps;
+                scopedCollectCaptures(*it->second, rawCaps);
+                if (!rawCaps.empty()) {
+                    // Build the set of this lambda's own params to filter.
+                    std::unordered_set<const sema::Symbol*> paramSet;
+                    if (const std::vector<sema::Symbol*>* ps =
+                            ctx_.lambdaParams(it->second))
+                        for (sema::Symbol* p : *ps) paramSet.insert(p);
+                    for (const ast::IdentifierExpr* id : rawCaps) {
+                        if (const sema::Symbol* s = ctx_.exprSymbol(*id))
+                            if (!paramSet.count(s)) return true;
+                    }
+                }
+            }
+            // Alias chain: does it ultimately alias a call-bounded parameter?
+            if (callBoundedAlias_.count(sym)) return true;
+        }
+        return false;
+    }
+    // Conditional: check both arms.
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&arg)) {
+        bool thenHas = cd->thenValue
+                           ? exprIsFunctionValueWithNonEmptyCaptureSet(*cd->thenValue)
+                           : false;
+        bool elseHas = cd->elseValue
+                           ? exprIsFunctionValueWithNonEmptyCaptureSet(*cd->elseValue)
+                           : false;
+        return thenHas || elseHas;
+    }
+    // Postfix-bang: delegate to the operand.
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&arg))
+        return pb->operand
+                   ? exprIsFunctionValueWithNonEmptyCaptureSet(*pb->operand)
+                   : false;
+    return false;
 }
 
 void MethodOwnership::scopedCollectCaptures(

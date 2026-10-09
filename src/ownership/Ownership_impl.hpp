@@ -5892,6 +5892,10 @@ private:
     // walks every statement/expression form — a missed capture would be a
     // silently-admitted escape. `declared` accumulates the lambda's own
     // params/locals so uses of lambda-internal names are not captures.
+    // §28.3 closure bullet *Set-erasing positions* (v0.330): a function value
+    // with a non-empty source set may not be passed to a set-erasing
+    // parameter.  Determines whether `arg` is a function value with captures.
+    bool exprIsFunctionValueWithNonEmptyCaptureSet(const ast::Expr& arg);
     void scopedCollectCaptures(const ast::LambdaExpr& lam,
                                std::vector<const ast::IdentifierExpr*>& out);
     void scopedCaptureWalkStmt(const ast::Stmt& s,
