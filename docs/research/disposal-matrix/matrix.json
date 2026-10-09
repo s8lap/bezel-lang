@@ -125,5 +125,6 @@
    "Async disposal",
    "await using, a direct DisposeAsync() call, per-level supersession of the destructor body, the synchronous…"
   ]
- ]
+ ],
+ "corner": "Holder ↓ · Path →"
 }

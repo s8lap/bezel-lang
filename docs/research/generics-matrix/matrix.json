@@ -125,5 +125,6 @@
    "Dispatched generic methods and override/implementation constraints",
    "Requirements decided at the body; the move-only/inline-array exclusion; inherited witnesses; constraint…"
   ]
- ]
+ ],
+ "corner": "Type argument ↓ · Construct →"
 }

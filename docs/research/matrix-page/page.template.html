@@ -156,7 +156,7 @@ function summary(){
 }
 function grid(){
   const t=document.getElementById('grid');
-  let h="<thead><tr><th class='rowh'>Value kind ↓ · Position →</th>"+COLS.map(c=>`<th class="colh" scope="col"><abbr title="${esc(c[2])}">${esc(c[1])}</abbr><br><span style="font-family:var(--f-mono);font-weight:400">${c[0]}</span></th>`).join("")+"</tr></thead><tbody>";
+  let h="<thead><tr><th class='rowh'>"+esc(ALL.matrix.corner||"Row ↓ · Column →")+"</th>"+COLS.map(c=>`<th class="colh" scope="col"><abbr title="${esc(c[2])}">${esc(c[1])}</abbr><br><span style="font-family:var(--f-mono);font-weight:400">${c[0]}</span></th>`).join("")+"</tr></thead><tbody>";
   ROWS.forEach(r=>{
     h+=`<tr><th class="rowh" scope="row">${esc(r[1])}<small>${r[0]} · ${esc(r[2])}</small></th>`;
     COLS.forEach(c=>{const x=byKey[r[0]+"/"+c[0]]; if(!x){h+="<td></td>";return}
