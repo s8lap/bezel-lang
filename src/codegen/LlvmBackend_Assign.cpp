@@ -9026,7 +9026,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // temporary-disposal contract and is deferred (#1916).
     if (ownLazyPipeline && isLazyEnumerableType(actualTy)) {
         if (outWrapMade) *outWrapMade = true;
-        // fix #5612 / §29.11 item 3 (v0.330): at an ARGUMENT position the frame is
+        // fix #5612 / §29.11 item 3 (v0.333): at an ARGUMENT position the frame is
         // a BORROW — "the frame's disposal obligation stays with the caller, the
         // plain argument being an ordinary borrow" — so it must stay DEFERRED
         // across the boundary rather than being drained here. Draining spends the
@@ -10340,7 +10340,7 @@ llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
 }
 
-// fix #5612 / §29.11 item 3 (v0.330): the ARGUMENT-position counterpart of
+// fix #5612 / §29.11 item 3 (v0.333): the ARGUMENT-position counterpart of
 // drainLazyPipelineToOwnedIEnumerable, which SPENDS the lazy frame's enumeration
 // right at the call site — bz_lazy_to_array walks the pipeline to completion and
 // the owning wrapper's slot-4 GetEnumerator then hands out a FRESH enumerator on
@@ -15504,7 +15504,7 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                                            /*ownLazyPipeline=*/lazyArgWrapped,
                                            &wrapMade,
                                            /*srcOwnedByCallee=*/false,
-                                           // fix #5612 / §29.11 item 3 (v0.330):
+                                           // fix #5612 / §29.11 item 3 (v0.333):
                                            // an argument is an ordinary BORROW, so
                                            // the lazy frame stays deferred behind a
                                            // single-consumption wrapper rather than

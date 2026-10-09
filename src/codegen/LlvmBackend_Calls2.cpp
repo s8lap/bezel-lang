@@ -13715,7 +13715,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         v, formalTy, a.value.get(),
                         /*ownLazyPipeline=*/lazyArgWrapped, &wrapMade,
                         /*srcOwnedByCallee=*/false,
-                        // fix #5612 / §29.11 item 3 (v0.330): the imported-callee
+                        // fix #5612 / §29.11 item 3 (v0.333): the imported-callee
                         // twin of the local arm's deferral. An argument is an
                         // ordinary borrow, so the lazy frame stays deferred behind
                         // a single-consumption wrapper instead of being drained

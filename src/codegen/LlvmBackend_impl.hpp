@@ -11235,7 +11235,7 @@ private:
                                             bool ownLazyPipeline = false,
                                             bool* outWrapMade = nullptr,
                                             bool srcOwnedByCallee = false,
-                                            // fix #5612 / §29.11 item 3 (v0.330):
+                                            // fix #5612 / §29.11 item 3 (v0.333):
                                             // the lazy wrap is POSITION-dependent.
                                             // A RETURN site owns its result, so the
                                             // owning drain is right there. An
@@ -11420,7 +11420,7 @@ private:
     llvm::Value* drainLazyPipelineToOwnedIEnumerable(
         llvm::Value* lazyVal, const sema::TypeRef* iEnumTy);
 
-    // fix #5612 / §29.11 item 3 (v0.330): the ARGUMENT-position lazy wrap. Keeps
+    // fix #5612 / §29.11 item 3 (v0.333): the ARGUMENT-position lazy wrap. Keeps
     // the lazy frame DEFERRED across the `IEnumerable<T>` boundary instead of
     // draining it at the call site, and makes the wrapper's slot-4 GetEnumerator
     // single-consumption: first call returns a clone that drives the frame through

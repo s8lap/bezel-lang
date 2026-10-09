@@ -13,7 +13,7 @@
 // a lazy query, and §29.11's runtime guard had no subject: `l5_0003` declared
 // `stdout: caught` and printed nothing.
 //
-// FIX (spec §29.11, v0.330 — consumption point 3 and the paragraph after it):
+// FIX (spec §29.11, v0.333 — consumption point 3 and the paragraph after it):
 //
 //   "Passing the query as an `IEnumerable<T>` argument: the single-enumeration
 //   right transfers to the callee; the frame's disposal obligation stays with
@@ -55,7 +55,7 @@
 // a double-free or a use-after-free in the new wrapper flips r.ran and yields
 // -999 — never a legal value.
 //
-// Spec: §29.11 (v0.330) consumption point 3 and the runtime-guard paragraph;
+// Spec: §29.11 (v0.333) consumption point 3 and the runtime-guard paragraph;
 // §28.3 (owned-local discharge); §29.8 / stdlib §5.
 
 #include <string>
@@ -81,7 +81,7 @@ std::string runStdout(const std::string& src) {
     return r.ran ? r.stdoutText : std::string("<DID-NOT-RUN>");
 }
 
-// §29.11 item 3 (v0.330): the issue's canonical case — a lazy query passed to a
+// §29.11 item 3 (v0.333): the issue's canonical case — a lazy query passed to a
 // same-CU callee whose `IEnumerable<int>` parameter is enumerated TWICE. The
 // callee is statically untracked (§29.11's stated parameter boundary), so the
 // violation is enforced ONLY by the runtime guard. Before the fix the call site
@@ -116,7 +116,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_arg_5612,
     BEZEL_EXPECT_EQ(runStdout(src), "caught\n");
 }
 
-// §29.11 item 3 (v0.330): the right TRANSFERS to the callee — it does not arrive
+// §29.11 item 3 (v0.333): the right TRANSFERS to the callee — it does not arrive
 // spent. A callee that enumerates its parameter ONCE must still see every element
 // with the correct value. This is the control that keeps the fix from being a
 // silent-acceptance inversion in the other direction: a guard that threw on the
@@ -145,7 +145,7 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_arg_5612,
     BEZEL_EXPECT_EQ(run(src), 7);
 }
 
-// §29.11 item 3 (v0.330): a CHAINED deferred operator (`Where(...).Select(...)`)
+// §29.11 item 3 (v0.333): a CHAINED deferred operator (`Where(...).Select(...)`)
 // crossing the same boundary — the issue's "sibling shapes in the same arm". The
 // composed frame is still a lazy frame, so it is still deferred and still
 // single-consumption: the callee's one enumeration reads {2,3} * 10 = {20,30},
@@ -174,13 +174,13 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_arg_5612,
     BEZEL_EXPECT_EQ(run(src), 50);
 }
 
-// §29.11 / §28.3 (v0.330): the disposal contract for the argument position. The
+// §29.11 / §28.3 (v0.333): the disposal contract for the argument position. The
 // same lazy-argument shape run in a loop pins that the wrapper's slot-1 Dispose
 // discharges the frame EXACTLY once per iteration — a leak or a double-free shows
 // up here as runAotChecked's LSan/ASan net flipping r.ran to -999. Pre-fix this
 // shape was drained at the call site and was clean; the fix moved the drain into
 // the wrapper's Dispose, so this row is what keeps that move honest. 200
-// iterations, each reading {3,4} = 7 -> 1400.
+// iterations, each reading {3,4} = 7 -> 210.
 BEZEL_TEST(codegen_lazy_linq_ienumerable_arg_5612,
            loop_disposes_frame_exactly_once_spec_28_3) {
     std::string src =
