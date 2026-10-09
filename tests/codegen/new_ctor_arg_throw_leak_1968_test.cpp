@@ -31,12 +31,12 @@
 // so a leak, double-free, or use-after-free FAILS via r.ran=false):
 //   T1 — plain `new C(1, MakeIntOrThrow())` (no owned arg): arg-throw is LSan-
 //        clean, exception caught, rc=0.  (was a 24-byte LSan leak before the fix)
-//   T2 — `new Pair(owned x, MakeIntOrThrow())`: BOTH the raw instance block is
+//   T2 — `new Pair(move x, MakeIntOrThrow())`: BOTH the raw instance block is
 //        freed (this fix) AND the transferred owned `x` is disposed EXACTLY ONCE
 //        (pre-existing buildOrderedArgs machinery) — proven by LSan-cleanliness
 //        (a leak = not disposed; a double-free = disposed twice).  (was a 32-byte
 //        LSan leak of the Pair block before the fix.)
-//   T3 — successful `new Pair(owned x, 7)`: constructed + disposed normally, no
+//   T3 — successful `new Pair(move x, 7)`: constructed + disposed normally, no
 //        double-free / no premature free (X disposed once at scope end), rc=0.
 //   T4 — generic `new G<Cell>(1, MakeIntOrThrow())` (inline-ctor path): arg-throw
 //        LSan-clean, rc=0 (regression guard for the generic construction path).
@@ -112,7 +112,7 @@ const char* kOwnedArgThenLaterArgThrows =
     "  public static method Main(): int "
     "    var caught := 0; "
     "    var x := new X(); "
-    "    try using var p := new Pair(owned x, P.MakeIntOrThrow()); "
+    "    try using var p := new Pair(move x, P.MakeIntOrThrow()); "
     "    catch Exception => caught := 1; end; "
     "    if caught <> 1 then return 2; end; "
     "    return 0; "
@@ -141,7 +141,7 @@ const char* kSuccessfulConstruction =
     "  public static method Main(): int "
     "    var x := new X(); "
     "    do "
-    "      using var p := new Pair(owned x, P.Ident(7)); "
+    "      using var p := new Pair(move x, P.Ident(7)); "
     "      if p._b <> 7 then return 4; end; "
     "    end; "                                 // p disposed here → X._n==1
     "    if X._n <> 1 then return 5; end; "
