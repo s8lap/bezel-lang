@@ -1,9 +1,11 @@
 //! case: s29_8_0003
 //! doc: spec
 //! section: 29.8
-//! title: iterator disposal disposes an owned parameter the body did not move out of
-//! rule: When the iterator is disposed, the state machine disposes any
-//!   `owned` parameter that has not been moved out of by the body.
+//! title: the one enumerator disposes an owned parameter the body did not move out of
+//! rule: The first `GetEnumerator()` transfers the frame's `owned` and
+//!   move-only parameters to the enumerator it produces; that enumerator
+//!   disposes any such parameter the body has not moved out of when it
+//!   completes or is disposed.
 //! cites: 29.8
 //! expect: run
 //! output: closed

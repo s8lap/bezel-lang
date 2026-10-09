@@ -1,10 +1,10 @@
 //! case: s28_12_0005
 //! doc: spec
 //! section: 28.12
-//! title: a direct DisposeAsync call awaited outside await using is legal and reclamation follows
+//! title: a direct DisposeAsync call awaited outside await using is legal and the cascade follows
 //! rule: A direct DisposeAsync() call awaited outside await using is legal;
-//!   the awaited task's completion is logical-disposal completion, and
-//!   reclamation follows exactly as if await using had issued it.
+//!   the awaited task's completion is logical-disposal completion, and the
+//!   cascade and the chain follow exactly as if await using had issued it.
 //! cites: 28.12
 //! expect: run
 //! output: async cleanup

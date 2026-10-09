@@ -1,7 +1,7 @@
 //! case: s15_1_1_0009
 //! doc: spec
 //! section: 15.1.1
-//! title: a binding read of an owning inline array field faults after a whole-value move of the field
+//! title: a binding read of an owning inline array field faults inside the field's restoration window
 //! rule: A whole-value `move` of an owning-inline-array **field** (`var t :=
 //!   move h.Slots;`) takes K9.2's restoration rule at the field (§15.3
 //!   *Local lifetime*) and leaves the field's storage in §9.4's disposed
@@ -30,17 +30,17 @@ end Holder;
 public class Program
   public static method Main()
     using var h := new Holder();
-    case h.Slots of
-      var a => do
-        var t := move h.Slots;
-        try
-          Console.WriteLine(a[0] <> null);
-        catch
-          DisposedAccessException => Console.WriteLine("faulted"),
-        finally
+    try
+      case h.Slots of
+        var a => do
+          var t := move h.Slots;
+          var n := a.Length;
           h.Slots := t;
-        end try;
-      end
-    end case;
+          Console.WriteLine(n);
+        end
+      end case;
+    catch
+      DisposedAccessException => Console.WriteLine("faulted"),
+    end try;
   end Main;
 end Program;

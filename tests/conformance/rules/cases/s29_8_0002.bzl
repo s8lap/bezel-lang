@@ -2,10 +2,10 @@
 //! doc: spec
 //! section: 29.8
 //! title: an undischarged owned iterator parameter carries the must-use warning
-//! rule: If the body does not move ownership out, the state machine
-//!   disposes the parameter at iterator disposal ... This implicit frame
-//!   disposal carries the §28.3 must-use warning, attached at the parameter
-//!   declaration.
+//! rule: If the body does not move ownership out, the one enumerator
+//!   disposes the parameter when it completes or is disposed ... This
+//!   implicit frame disposal carries the §28.3 must-use warning, attached at
+//!   the parameter declaration.
 //! cites: 29.8, 28.3
 //! expect: warn
 //! diagnostic: must use

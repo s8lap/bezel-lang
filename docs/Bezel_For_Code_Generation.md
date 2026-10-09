@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.333. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.334. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.333 and `Bezel_Standard_Library.md` v0.333 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.334 and `Bezel_Standard_Library.md` v0.334 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -157,7 +157,7 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
 | Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). Declaring `Equals` at all obliges `GetHashCode` beside it — on an enum or choice in either spelling, except on a choice owning at every instantiation (v0.317). | §25.2, §9.2, §8.3 |
-| `override` on a value kind | only `Equals`, `GetHashCode` and `ToString` take it (§9.2); on an enum or a choice the `Equals` is the one taking the type's **own** type — `public override method Equals(other: Priority): bool` — and an `Equals(o: Object?)` is **rejected** there, `override` or plain (a record's `Equals` is `Equals(Object?)` plus `Equals(T)`) | §10.5, §35.2 |
+| `override` on a value kind | only `Equals`, `GetHashCode` and `ToString` take it (§9.2); on an enum or a choice the `Equals` is the one taking the type's **own** type — `public override method Equals(other: Priority): bool` — and an `Equals(o: Object?)` is **rejected** there, `override` or plain (a record's `Equals` is `Equals(Object?)` plus `Equals(T)` — but on a record that **holds borrows**, one with a class-, interface- or `Object`-typed component, a span included, `Equals(Object?)` is rejected too: declare `Equals(T)` and `GetHashCode`) | §10.5, §35.2, §9.2 |
 | Invariant | `invariant(_bal + _limit >= 0m);` — class bodies only, no visibility, keeps its `;` | §22.16 |
 | Nested type | `public record Token(…);` inside a class body — visibility **required**; one type per declaration, blind to an enclosing generic's type parameters (declare its own: `Node<U>` inside `Tree<T>`, used there as `Node<T>`); outside `Tree` and the bodies of types deriving from it, it has no type spelling (`Tree.Node<int>` is an arity error and `Tree<int>.Node<int>` does not parse in a type): reach it through a chain head (`Tree<int>.Node<int>.Create()`) or an inferred local, or declare it top-level | §11.6 |
 
@@ -187,13 +187,20 @@ What a use of `T` in a generic body demands, and where its absence is rejected:
 |---|---|---|---|
 | `x.Equals(y)`, `x.GetHashCode()` or `x = y` on a `T`-typed value, in a generic **method** | `where T: hashable`, to say so in the signature | the instantiation at a record or choice with no equality of its own (not auto-hashable, member undeclared); the use itself compiles in the body | §9.2 |
 | the same use in any member of a generic **type** you declare | `where T: hashable` on the type; to demand it of callers only, declare the member in `extension MyBag<T> where T: hashable` (public and same-module `internal` surface only) or as a generic method with its own type parameter. An override, interface implementation, operator, indexer, constructor, destructor, field initializer or settable property cannot move, so its use needs `where T: hashable` on the type | the constructed type, wherever it is named, whether or not that member is called | §3.6 rule 2 |
-| a use of the **method's own** parameter in a dispatched generic method — an interface method, a `virtual`/`abstract` method, an override or an implementation — beyond what the inherited constraints establish: `x = y`, `o as T`, a `Dictionary<T, int>` local | the constraint on the **interface or base** declaration (an implementation cannot add one); for `o as T`, an `is` test instead. Copying, boxing or `case`-binding the parameter, a `T?` local or a `[2]T` needs nothing: a dispatched method's `T` is never move-only and never an inline array | the declaring body itself, at its declaration — dispatch forms instantiations no call site sees; and any call of such a method at a move-only or inline-array type argument (`i.Put<[3]int>(v)`), at the call | §14.2 *Dispatched generic methods* |
+| a use of the **method's own** parameter in a dispatched generic method — an interface method, a `virtual`/`abstract` method, an override or an implementation — beyond what the inherited constraints establish: `x = y`, `o as T`, a `Dictionary<T, int>` local | the constraint on the **interface or base** declaration (an implementation cannot add one); for `o as T`, an `is` test instead. Copying or `case`-binding the parameter, a `T?` local or a `[2]T` needs nothing from the move-only rules: a dispatched method's `T` is never move-only and never an inline array; boxing it still meets §9.7's borrow-erasing bullet at the body (the row below) | the declaring body itself, at its declaration — dispatch forms instantiations no call site sees; and any call of such a method at a move-only or inline-array type argument (`i.Put<[3]int>(v)`), at the call | §14.2 *Dispatched generic methods* |
 | a standard-library equality search at `T`: `Contains`, `Remove`, `IndexOf`, `LastIndexOf`, `LinkedList<T>.Find`, the span `IndexOf`/`Contains`/`SequenceEqual` | as the two rows above: in a generic body such a call counts as your own `Equals` use of `T` | your type or method at a `T` with no equality. `Array<T>` and the spans are not themselves rejected this way; at a concrete element type with no equality, the call is | §14.2, stdlib §4 |
 | another conditional member at `T`: `Array<T>.Sort()`; `Result<T, E>`'s `Map`/`MapError`/`AndThen`/`UnwrapOr` | its condition, read at your `T` the same way as the operation written on `T`: `Array<T>.Sort()` needs `where T: IComparable<T>` | `Sort()`: the call, in a body whose constraints on `T` do not establish it (as for `x.CompareTo(y)`); `Result<T, E>`'s four: your instantiations; a method reference over any of them (`var s: () -> () := xs.Sort;`): the formation, read as the call is | §14.2 rule 2, §27.6 |
+| a method reference over a **generic method**, or over a member of a **generic extension block** | its type-argument list — `Util.Keep<Pair>`, `xs.Select(Util.Id<int>)`, `IEnumerable<Pair>.KeepAll` (the qualifier binds the block's parameters; a member's own list follows the name); a reference to a generic method with no list does not compile, and nothing is inferred from the target | the formation, read as the call with that list would be: the body's requirements at `T`, the constraints, the dispatched exclusion, §28.3's `Task`-family and exported-mint exclusions; never the invocation of the formed value | §27.6, §14.1 |
+| a static member of a generic type reached as `G<Arg>.M(…)` or `G<Arg>.P` | nothing: naming the type instantiates it, so every requirement of `G<Arg>` — its statics' bodies included — is read at the access | the access | §14.1, §22.12 |
+| a member of a generic **extension block** called on a receiver (`ps.KeepAll(sink)` over `extension IEnumerable<T>`) | what the member's body needs of the block's `T`, read at your receiver's element type exactly as a generic method's own parameter is read at a call | the call | §26.4, §3.6 rule 2 |
 | naming `MyBag<T>` (a type of the second row), or calling such a generic method, at your own `T` | what `MyBag<T>` needs — wrapping does not hide the use | your type or method at its own instantiations, wherever `MyBag<R>` would be | §14.1 |
 | naming `C<T>` — or any argument whose fit depends on `T`: `C<T?>`, `C<Pair<T>>` — where `C` declares `where T: new()` (or any constraint); an extension head is such a naming | `T`'s own constraints must guarantee it, so restate it: `class Box<T> where T: new()`, `extension OwningArray<T> where T: class`. A declared `where` constraint is not carried the way the rows above carry a use | the naming | §14.2, §26.4 |
-| a `T`-typed value, or a `Box<T>` / `[2]T` value over one, stored in a field (an `Object?` field included), copied into a field-held or escaping collection, captured by an escaping closure, or returned carrying a plain parameter's or a local's borrow — §9.7's bullets | nothing at the declaration: each bullet is read at the instantiations whose `T` makes the value a value type that holds borrows (a record or inline array with a class component, a span, `CancellationToken`), so write the body for the class case; in a dispatched generic method (the dispatched-generic-method row) it is an error at the body unless the declaring method's constraints exclude such a `T` (`where T: class`; `where T: sendable` for a body over values, which also excludes function types) | the instantiation: `Wrap<Item>` over `static method Wrap<T>(a: T): Box<T> => new Box<T>(a);`, `Keep<Pair>` over a `_last := a` store; `Wrap<int>` and `Keep<Item>` are fine | §9.7, §3.6 rule 2 |
+| a `T`-typed value, or a `Box<T>` / `[2]T` value over one, stored in a field (an `Object?` field included), copied into a field-held or escaping collection, captured by an escaping closure, or returned carrying a plain parameter's or a local's borrow — §9.7's bullets | nothing at the declaration: each bullet is read at the instantiations whose `T` makes the value a value type that holds borrows (a record or inline array with a class component, a span, `CancellationToken`), so write the body for the class case; in a dispatched generic method (the dispatched-generic-method row) it is an error at the body unless the declaring method's constraints exclude such a `T` (a class bound; `where T: sendable` for a body over values, which also excludes function types; not `where T: class`, which admits `IReadOnlySpan<…>`) | the instantiation: `Wrap<Item>` over `static method Wrap<T>(a: T): Box<T> => new Box<T>(a);`, `Keep<Pair>` over a `_last := a` store; `Wrap<int>` and `Keep<Item>` are fine | §9.7, §3.6 rule 2 |
 | `new T()` under `where T: new()` | — | a substitution at a nullable reference type (`Widget?`); a nullable value type is admitted, and there `new T()` is `null` | §14.2 |
+| `default(T)` under an unconstrained `T` | `default(T?)` where absence is meant — `null` of type `T?` at every substitution | the instantiation at a non-defaultable type: a class, interface, `Object`, `string`, function or task type, a choice, a zero-less enum, a constructor-only record, a record or inline array with a non-defaultable component (`default(T)` is that type's zero value, `null` only at a nullable substitution) | §17.11 |
+| a record component typed `T` (`record Box<T>(V: T)`), `IEnumerable<T>`/`IEnumerator<T>` or their async forms, or `EventSource<T>`/`AsyncEventSource<T>` named at your own `T` | `where T: class` (or a class or interface bound) to exclude the move-only value types; nothing else stops the chain | your type or method at every instantiation substituting an owning choice or an owning inline array — a record copies, an enumerator's `Current` lends, a raise moves to each subscriber | §15.3, §28.11, stdlib §4.12, §6.5 |
+| a copy of a `T`-typed value out of a borrowed binding — the result of `x as T`, a `case` or typed-pattern binding, a capture, a `ref` referent — in a generic body | an owned operand instead: the parameter or local itself (`_f := v;` moves at a move-only `T`) | your type or method at every move-only instantiation (the §7.10 copy demand, read whatever the constraints admit) | §7.10 |
+| `OwningBuffer<T>`, `Span<T>` or `ReadOnlySpan<T>` named at your own `T` | nothing at the declaration; write the body against the members both presentations share | the instantiation at a value `T` for a class-only use (`move buf[i]`, `set(owned)`, a reliance on `IEnumerable<T?>`), and at a non-defaultable value `T` for `new OwningBuffer<T>(n)`; the presentation is read per instantiation | §14.2, stdlib §4.14 |
 
 **Visibility:** `public | internal | protected | private`. Top-level types default to `internal`; class members **must** state one, with exactly four exceptions (static constructor, destructor, `polymorphic`, `invariant`). No combined forms: ✗ `protected internal` (§13.2, §13.3, §13.5).
 
@@ -426,7 +433,7 @@ Records, enums, primitives and inline arrays are **value types**: no disposal, n
 
 **You never write `Dispose()` as plumbing.** An owned value reaching its scope's end undischarged is disposed *there*, automatically, on the normal edge **and** the exception edge — no `try`/`finally` for a value, ever, and a written `x.Dispose();` means *release early*. The only difference between the edges is a lint: a plain-`var` implicit drop on normal exit raises the **must-use warning**; the exception edge is silent (§28.3). **Never declare a member named `Dispose`** on a class or a record — at any parameter list, it is a compile error at the declaration (§28.2); disposal has exactly two customization points: a `destructor` (only for native or foreign resources) and `owned` **fields**, auto-disposed with their container in reverse declaration order (§28.4, §28.5). The generated `Dispose()` is public, idempotent and non-overridable — no `disposing` parameter, no `_disposed` flag, no `base.Dispose()` call.
 
-**Trivial-dispose classes** are exempt from ceremony, not from tracking (§28.9): a class with no destructor, no `owned` field of non-trivial type, no owning-inline-array field, on a trivial-dispose base. `Array<T>`, `Set<T>`, `Dictionary<K,V>`, `StringBuilder`, `Random` qualify — no must-use warning anywhere the warning would otherwise attach: a plain `var`, an undischarged `owned` parameter (a method's, an iterator's, an async method's), an owning iteration variable. An **interface**-typed binding is never exempt — unless its initializer is a producer of a trivial-dispose **class** (`var t: IThing := new TrivialThing();`), the exemption being keyed on the value, not the annotation. `OwningArray<T>` and anything holding a resource do not. **Every borrow rule still applies to trivial-dispose references.**
+**Trivial-dispose classes** are exempt from ceremony, not from tracking (§28.9): a class with no destructor, no `owned` field of non-trivial type, no field of move-only type (an owning inline array or an owning choice — both are disposed by the generated `Dispose()`), on a trivial-dispose base. `Array<T>`, `Set<T>`, `Dictionary<K,V>`, `StringBuilder`, `Random` qualify — no must-use warning anywhere the warning would otherwise attach: a plain `var`, an undischarged `owned` parameter (a method's, an iterator's, an async method's), an owning iteration variable. An **interface**-typed binding is never exempt — unless its initializer is a producer of a trivial-dispose **class** (`var t: IThing := new TrivialThing();`), the exemption being keyed on the value, not the annotation. `OwningArray<T>` and anything holding a resource do not. **Every borrow rule still applies to trivial-dispose references.**
 
 **The default build is checked disposal mode** (§28.2): any member access through a reference to a logically-disposed instance raises `DisposedAccessException` (§31.4). The release relaxation — the same access undefined — is selected explicitly per build (`--unchecked-disposal`); never write a program that depends on it. Every "faults in checked mode" below is therefore the default behaviour.
 
@@ -462,11 +469,11 @@ The declared type, nullability stripped, must be a class type, an interface type
 - **Pattern B `await`** on an owned `OwningTask<T>` binding: `using var r := await t;` — ✗ `await move t`
 - **owning iterator `yield return`**: `yield return x;` — ✗ `yield return move x;`
 
-`move` is *also* an error on a **fresh producer** (`M(move new T())` — nothing is being invalidated), on a **borrow**, in a **`??` operand** (a named owned binding written bare as a `??` arm is a *borrow* arm), inside a **closure** over a captured owned binding (captured owned bindings are uniformly in borrow state — move, reassign, dispose and discard of them are all errors), and on a **move-only value** argument or binding (§15.3's owning inline arrays and owning choices — the unmarked read already moves, at `(x: V)` and `(owned x: V)` alike; the owning-match scrutinee `case move c of …` is the one marked move-only position), and on a **`static` field**.
+`move` is *also* an error on a **fresh producer** (`M(move new T())` — nothing is being invalidated), on a **borrow**, in a **`??` operand** (a named owned binding written bare as a `??` arm is a *borrow* arm), inside a **closure** over a captured owned binding (captured owned bindings are uniformly in borrow state — move, reassign, dispose and discard of them are all errors), and on a **move-only value** argument, binding, if-expression branch, expression-`case` arm or `??` operand (§15.3's owning inline arrays and owning choices — the unmarked read already moves, at `(x: V)` and `(owned x: V)` alike; the owning-match scrutinee `case move c of …` is the one marked move-only position), and on a **`static` field**.
 
 **The no-silent-consume rule.** An unmarked read of a class-typed binding *never* consumes. `var b := a;` is always a borrow of `a`. This is the single most important spelling fact in the language (§28.3).
 
-**Field and slot moves carry a restoration obligation** (§28.8.1). Every path from a `move obj.f` to *any* method exit — normal return, fall-through, `throw`, `yield break` — must execute an assignment `obj.f := value;`. The spec's worked rejection is `return move _transactions;` from a method whose return type is **not** `owned` — the moved field escapes with no owner. A **terminal** move is rejected at *every* return type, `owned` included: §28.8.1 admits "no terminal-move dispensation", the return edge being itself an unrestored exit (ruled at v0.223, #1814, the permissive option declined as unsound). Always write §28.8.1's take-restore-return idiom — `var fresh := new …; var taken := move _f; _f := fresh; return taken;`. Only a `destructor` body is exempt from restoration. Restoration must not go through something that can throw, hence **build the replacement first, then take**. A nullable owned field may be restored with `null`.
+**Field and slot moves carry a restoration obligation** (§28.8.1). Every path from a `move obj.f` to *any* method exit — normal return, fall-through, `throw`, `yield break`, a `yield return`'s abandonment edge — must execute an assignment `obj.f := value;`. The spec's worked rejection is `return move _transactions;` from a method whose return type is **not** `owned` — the moved field escapes with no owner. A **terminal** move is rejected at *every* return type, `owned` included: §28.8.1 admits "no terminal-move dispensation", the return edge being itself an unrestored exit (ruled at v0.223, #1814, the permissive option declined as unsound). Always write §28.8.1's take-restore-return idiom — `var fresh := new …; var taken := move _f; _f := fresh; return taken;`. Only a `destructor` body is exempt from restoration. Restoration must not go through something that can throw, hence **build the replacement first, then take**. A nullable owned field may be restored with `null`.
 
 **`using var`** (§28.10): owned, disposed at the block's end on **every** exit edge, non-reassignable, and **never movable out of**. `using var fresh := new Buffer(); … return fresh;` is a compile error; a factory uses plain `var`.
 
@@ -573,13 +580,13 @@ A borrow is valid only where **every** source in its source set is live; joins, 
 | a store — a field or a collection, a property or indexer, a record component declared at a function type (at construction or in `with`), a choice payload declared at a function type, a slot of an inline array of function type (a local array included); a write through `out`/`ref`; a `return` (`yield return` included) | **rejected** — the only storage route is a `scoped` parameter (§28.14) |
 | a set-erasing position: a parameter declared `Object` (the receiver of an `extension Object` call, an explicit `f as Object`, and `f as T` in your own generic body, included), or one at a bare type parameter that your call instantiates at a function type or at `Object` (`k.Put(f)` at `k: Keep<Object>`, `new Box<Object>(f)`) — likewise a lambda or a function value passed to a parameter typed `() -> T` at such an instantiation — or a field declared at a bare type parameter, written through a receiver instantiated at a function type or at `Object` (`b.V := f` at `b: Box<() -> int>` or at `b: Box<Object>`) | **rejected** — `x.Equals(f)`, and `Pick(f, g)` over `Pick<T>(a: T, b: T): T`; here a function-typed parameter of yours counts as capturing (it carries itself). Write `f = g` for equality and `(if c then f else g)` for a selector |
 
-Do not form a method reference whose parameter is a function type over such a parameter, an `out` one excepted (`var add := xs.Add;` with `xs: Array<() -> int>` is rejected; `var tg := d.TryGetValue;` with `d: Dictionary<string, () -> int>` is fine): call `xs.Add(f)` directly at each site; a lambda `lambda(g) => xs.Add(g)` is rejected too, since its own function-typed parameter carries itself (the set-erasing row above). And a member taking `reg: ((T) -> ()) -> ()` cannot be used at a function-type `T` at all (§28.3, §28.14, v0.320).
+Do not form a method reference whose parameter is a function type over such a parameter, an `out` one excepted (`var add := xs.Add;` with `xs: Array<() -> int>` is rejected; `var tg := d.TryGetValue;` with `d: Dictionary<string, () -> int>` is fine): call `xs.Add(f)` directly at each site; a lambda `lambda(g) => xs.Add(g)` is rejected too, since its own function-typed parameter carries itself (the set-erasing row above). And a generic declaration never nests a type parameter inside a function type inside a function type, in its signature or in a type its body writes — `reg: ((T) -> ()) -> ()` and `reg: (() -> T) -> ()` are errors; take `(T) -> ()` or `() -> T` directly (§28.3).
 
 **Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case` arms identically.
 
 **The consume-site freeze** (§28.3). Consuming an owned **binding** while a **live local borrow of its current value** exists is a compile error. Frozen: every transfer (a `move` at an argument, binding, assignment or arm; a store into an `owned` field, an owning slot or a `set(owned)`; a `return` under an `owned` or mint-announcing return, or of an `async` body's result under `OwningTask<T>` or a class- or interface-typed `Task<T>`; an owning iterator's `yield return`) and drop-on-overwrite. **Not** frozen — these are site-announced kills, permitted while borrows live: an explicit `Dispose()` (including `x?.Dispose()`), the discard `_ := x;`, `throw x`, and a Pattern B `await` on an owned `OwningTask<T>` binding — a span over the binding's value included: a span read goes through the buffer's or array's own indexer, so after the kill it faults in checked mode like any other stale read (§28.2). A local holding an iterator frame or a lazy query (`var it := Each(xs)`, `var q := xs.Where(f)`) is a live borrow of every source it carries, like a closure, until the frame is disposed (its disposal may run the iterator's pending `finally`). Fields and collection slots are **not** frozen. The mechanical rewrite for the frozen case is **transfer first, then re-borrow from the new owner**.
 
-**Borrow-bearing records** (§9.7). A record is borrow-bearing if it has at least one **borrow-carrying** field: one whose declared type is a reference type (class or interface, nullable or not), an inline array whose element type is a reference type or a borrow-bearing record or choice (`[2]Pair` for a borrow-bearing `Pair`; v0.322), or another borrow-bearing record or choice. The predicate reads **declared field types**, never runtime contents — so `string`-, `Type`- and function-typed fields are *not* borrow-carrying, while a field declared `Object` or an interface type **is**, nullable or not. Such a value may not outlive the source of any borrow it carries; may **not be constructed from a temporary** (bind the source to a named local first); may **not** be stored in a class instance field — store the *source* (an `owned CancellationTokenSource`, not a `CancellationToken`) and re-derive the view at the use site; may sit in a **static** field only in the null-source form (every reference-typed field, active-case payload and inline-array slot `null`, so a payload-free choice case is null-source, through nested records and choices too — a spelling **no span has**, its `Buffer`/`Source` being non-nullable, so spans go in neither static nor instance fields); may be **returned** from a member only when every borrow it carries is **receiver-sourced** — the span shape `public method Header(): Span<byte> => _buf.AsSpan(0, 64);` over an `owned _buf: OwningBuffer<byte>` field is admitted, while a return carrying a borrow of a local, a `using var`, an `owned` parameter, or a **plain parameter** is rejected at the return site (declare it as an instance or extension member of the source's own type instead, whose receiver the caller re-establishes); and may not be an `async` parameter, result or element type, a local of such a type crossing a suspension point being admitted only if every borrow it carries has a frame-resident source (`CancellationToken` is the single stdlib-certified exception). An inline array whose slots carry borrows (`[2]Item` for a class `Item`, `[2]Pair` for a borrow-bearing record `Pair`) is under the same `async` rules (§15.1, §30.1, v0.322): pass an `Array<Item>`, or the elements as separate parameters. Such an array's borrows are checked as **one set**: a slot store `xs[i] := e` adds `e`'s sources and never removes one, so overwriting a slot does not release the borrow it held; a slot read carries the whole set, and a live array local freezes every source in it against a consume (§15.1.2, v0.323).
+**Borrow-bearing records** (§9.7). A record is borrow-bearing if it has at least one **borrow-carrying** field: one whose declared type is a reference type (class or interface, nullable or not), an inline array whose element type is a reference type or a borrow-bearing record or choice (`[2]Pair` for a borrow-bearing `Pair`; v0.322), or another borrow-bearing record or choice. The predicate reads **declared field types**, never runtime contents — so `string`-, `Type`- and function-typed fields are *not* borrow-carrying, while a field declared `Object` or an interface type **is**, nullable or not. A nullable `Pair?` holds exactly what `Pair` holds, written or reached by substitution (§3.6 *Nullable forms*). Such a value may not outlive the source of any borrow it carries; may **not be constructed from a temporary** (bind the source to a named local first); may **not** be stored in a class instance field — store the *source* (an `owned CancellationTokenSource`, not a `CancellationToken`) and re-derive the view at the use site; may sit in a **static** field only in the null-source form (every reference-typed field, active-case payload and inline-array slot `null`, so a payload-free choice case is null-source, through nested records and choices too — a spelling **no span has**, its `Buffer`/`Source` being non-nullable, so spans go in neither static nor instance fields); may be **returned** from a member only when every borrow it carries is **receiver-sourced** — the span shape `public method Header(): Span<byte> => _buf.AsSpan(0, 64);` over an `owned _buf: OwningBuffer<byte>` field is admitted, while a return carrying a borrow of a local, a `using var`, an `owned` parameter, or a **plain parameter** is rejected at the return site (declare it as an instance or extension member of the source's own type instead, whose receiver the caller re-establishes); and may not be an `async` parameter, result or element type, a local of such a type crossing a suspension point being admitted only if every borrow it carries has a frame-resident source (`CancellationToken` is the single stdlib-certified exception). An inline array whose slots carry borrows (`[2]Item` for a class `Item`, `[2]Pair` for a borrow-bearing record `Pair`) is under the same `async` rules (§15.1, §30.1, v0.322): pass an `Array<Item>`, or the elements as separate parameters. Such an array's borrows are checked as **one set**: a slot store `xs[i] := e` adds `e`'s sources and never removes one, so overwriting a slot does not release the borrow it held; a slot read carries the whole set, and a live array local freezes every source in it against a consume (§15.1.2, v0.323).
 
 Records also cannot have destructors, `owned` fields, owning-inline-array fields, or implement `IDisposable`. The spans are the canonical borrow-bearing records; `ReadOnlyStringSpan` is the deliberate exception — its only reference field is a `string`, so it may sit in fields and cross `await`.
 
@@ -665,7 +672,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.333 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.334 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -756,7 +763,8 @@ public static class Environment
   public static method GetInt(name: string): int?;   GetBool(name: string): bool?;
   public static method Set(name: string, value: string?);      // null removes
   public static method Variables(): owned Dictionary<string, string>;
-  public static method Exit(exitCode: int);
+  public static method Exit(exitCode: int);   // never returns and unwinds nothing: no `finally`, no `using var` of any live frame
+                                              //   runs; only the static `owned` exit pass runs (§33.3)
 end
 ```
 
@@ -1048,7 +1056,7 @@ end
 
 ```bezel
 public class OwningBuffer<T>                    // class T: conforms to IEnumerable<T?>; value T: to nothing
-  constructor(length: int);                     // class T: all slots null;  value T: all slots default(T)
+  constructor(length: int);                     // class T: all slots null;  value T: all slots default(T) — T must be defaultable, read per instantiation in a generic body
   constructor(length: int, init: (int) -> owned T);      // value T: init is (int) -> T
   readonly property Length: int;                // immutable after construction
   property [i: int]: T? { get;  set(owned); }   // class T: set disposes previous, `move buf[i]` ADMITTED
@@ -1076,7 +1084,7 @@ end
 public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnlySpan<T>
   // read surface + CopyTo(destination: ArraySpan<T>).  No ToArray() (neither span family has one)
 end
-public interface IReadOnlySpan<TElement>        // implemented by all five span types
+public interface IReadOnlySpan<TElement>        // implemented by the five stdlib span records only — closed to user types
   readonly property Length: int;   readonly property IsEmpty: bool;
   property [i: int]: TElement { get }
   method IndexOf(value: TElement): int;   Contains(value: TElement): bool;
@@ -1428,8 +1436,8 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   method Split(separator: string): owned Array<string>;
   method Split(separators: Array<char>): owned Array<string>;
   pure CompareTo(other: string): int;   pure CompareTo(other: string, ignoreCase: bool): int;   // no static string.Compare — `a.CompareTo(b, ignoreCase := true)`
-  pure Equals(other: string): bool;   pure Equals(other: string?, ignoreCase: bool): bool;   // `s.Equals(n)` at `n: string?` is the content-based Equals(Object?)
-  pure override Equals(other: Object?): bool;   pure override GetHashCode(): int;   pure override ToString(): string;
+  pure Equals(other: string): bool;   pure Equals(other: string?, ignoreCase: bool): bool;   // Equals(string) is the Object slot (§8.3): a `string?` or `Object?` argument reaches it, null and non-strings unequal
+  pure override GetHashCode(): int;   pure override ToString(): string;
   method ToCharArray(): owned Array<char>;      method GetEnumerator(): owned IEnumerator<char>;
   static pure operator +(left: string, right: string): string;
 end
@@ -1756,6 +1764,22 @@ Also absent, with the landed spelling beside it: `goto`/`break 2`/labels on non-
 ### 7.2 Ownership shapes that look fine
 
 ```bezel
+class Box<T>
+  private _o: Object?;
+  public method Put(): (T) -> ()
+    return lambda(t) => Registry.Take(t);        // ERROR: a lambda over the body's `T` is never returned (§28.3)
+  end Put;
+  public method Stash() => _o := lambda(t: T) => Registry.Take(t);   // ERROR: nor converted to Object
+  public method Each(xs: Array<T>, visit: (T) -> ())
+    var f := lambda(t: T) => visit(t);           // fine: bound to a local and invoked here
+    for var x in xs do f(x); end;
+  end Each;
+end Box;
+```
+
+> §28.3 (*Function values a generic body forms over its type parameters*): a lambda, method reference or retyped value you form **inside a generic body** at a function type with the body's `T` in a parameter slot is invoked, bound to a local, captured or passed to a function-typed parameter only — never returned (from a lambda either), stored (a `scoped` field excepted), converted to `Object` or to another generic's bare-`T` slot, or varied away as a type argument: at a function-type `T` the caller would invoke what you handed out with a closure your body never checked. Declaring a `(T) -> ()` field or return is fine; filling it from the generic body is not. A `() -> T` return is fine, except at a `Task`- or iterable-family `T`, where `Holder<Task>` is rejected wherever it is named (the caller would mint what the body lends).
+
+```bezel
 method CloneBuffer(): Buffer                     // WRONG
   var fresh := new Buffer();
   return fresh;                                  // ERROR: a fresh owned value through a non-`owned` return
@@ -1775,6 +1799,39 @@ end CloneBuffer;
 
 public static method Create(host: string): owned Connection
 public static method Make<T>(): owned T where T: new() => new T();
+```
+
+```bezel
+class Registry
+  private static owned readonly _m: Mutex := new Mutex();
+  public static method Shutdown()
+    _m.Dispose();                  // ERROR: a `static owned` field read is a borrow of always-live storage
+  end Shutdown;
+end Registry;
+
+static class Pool
+  public static Slots: [4 owned]Conn?;          // ERROR at the DECLARATION: a mutable static holding owned referents
+  public static readonly Fixed: [2 owned]Conn := [new Conn(), new Conn()];
+  public static method Swap()
+    var t := move Fixed[0];        // ERROR: a `static readonly` owning inline array's slots are fixed
+    Fixed[0] := new Conn();        // ERROR: same
+  end Swap;
+end Pool;
+```
+
+> §28.6, §22.12 note (h), K9.4: static owned storage — a `static owned` field, a `static readonly` owning inline array's slots — admits no `move`, no slot store and no explicit disposal; only the program-exit pass (§22.13) disposes it. An early shutdown is a `Close()`/`Flush()` method on the type, a `Locked<T>` registry whose guarded value is replaced, or a `Shared<T>` handle; a replaceable process-global pool is `private static owned readonly _pool: OwningArray<Conn>`, whose indexer store disposes the displaced element (§28.11), or `Locked<OwningArray<Conn>>`.
+
+```bezel
+class Registry
+  private static owned readonly _m: Mutex := new Mutex();   // disposed by the exit pass, and only there
+end Registry;
+
+static class Pool
+  private static owned readonly _pool: OwningArray<Conn> := new OwningArray<Conn>();
+  public static method Swap(i: int)
+    _pool[i] := new Conn();        // the store disposes the displaced element
+  end Swap;
+end Pool;
 ```
 
 ```bezel
@@ -1914,6 +1971,34 @@ end GetAsync;
 ```
 
 ```bezel
+var t := move xs[Pick()];          // ERROR: a slot move at a computed index — bind it to a local first (§28.11)
+using var taken := move d[$"m{i}"]; // ERROR: same — an interpolated key is not a trackable index
+var u := move pool[k];
+k := k + 1;
+pool[k] := u;                      // ERROR: the index was reassigned; slot k-1 is still moved-from at the exit
+var v := move _r;
+try Log("taken"); finally _r := v; end;   // ERROR: a call inside the restoration window — the finally does not cover it (§28.8.1)
+Sink(x, move x);                   // ERROR: the first argument is a live borrow of `x` at the consume (§28.3, K5)
+Keep(new Pool().First());          // ERROR: `First()` lends from an unbound temporary; a borrow of a temporary feeds no owned parameter (§28.3, K8.4)
+```
+
+> §28.11: `move coll[e]` takes a constant or an unreassigned local; the restoration is a store at that same index, `Clear()`, the collection's disposal (a `using var`'s scope end included) or, for an inline array, a whole-value reassignment. §28.8.1: the window is straight-line. §28.3: an argument evaluated before a consuming argument of the same call is live at the consume. §28.6: a chain over a `new` root is a borrow of that temporary, usable inside its full expression only — the builder idiom binds the root (`using var sb := new StringBuilder(); sb.Append("a").Append("b");`).
+
+```bezel
+var k := Pick();
+var t := move xs[k];
+xs[k] := new Res(9);               // restored at the same index; `Pick()` ran before the move
+var key := $"m{i}";
+using var taken := move d[key];    // `d` is a `using var`: its scope-end disposal restores
+var v := move _r;
+_r := fresh;                       // restore first …
+Log("taken");                      // … then call
+Sink(move x);                      // transfer first; borrow from the new owner afterwards if needed
+using var p := new Pool();
+Use(p.First());                    // a plain parameter: the borrow is bounded by `p`
+```
+
+```bezel
 var it := Each(xs.AsSpan());       // an iterator over the span; or: var q := xs.Where(f);
 sink.Take(move xs);                // ERROR: it is still live — a frame local is a live borrow of its carried sources (K5.5)
 for var x in it do Console.WriteLine(x); end;
@@ -1951,7 +2036,7 @@ class Keeper
 end Keeper;
 ```
 
-> §9.7 / §28.11: the value-copy members, each marked `value-copy (§4)` in the stdlib — `ToArray`, `Sorted`, `Reversed`, slicing, `AddRange`, `UnionWith`, `new Array<T>(size, fill)`, `LinkedList<T>(source)`, a direct `FromCollectionLiteral` call, LINQ's `ToArray`/`ToSet`/`ToDictionary` and the span views' `Fill`/`CopyFrom`/`CopyTo` — copy each element **with its borrows**, sourced at the source expression, and the copy is a store into wherever the result lands — checked as your own `Add` of each element would be. A local copy is fine; a field, a return or a wider collection is not: at a value element that holds borrows with no residual, and at a class element whenever the source is a scope-bound local.
+> §9.7 / §28.11: the value-copy members — read off the stdlib signature, no marker: a member returning an `owned` collection (`ToArray`, `Sorted`, `Reversed`, slicing, `new Array<T>(size, fill)`, `LinkedList<T>(source)`, a direct `FromCollectionLiteral` call, LINQ's `ToArray`/`ToSet`/`ToDictionary`), a borrowing-family or span member taking `IEnumerable<T>`, a read-only span or a `T` and returning nothing (`AddRange`, `UnionWith`, `Fill`, `CopyFrom`, `Counter<K>.Increment`), or one writing a span argument (`CopyTo`) — copy each element **with its borrows**, sourced at the source expression, and the copy is a store into wherever the result lands — checked as your own `Add` of each element would be. A local copy is fine; a field, a return or a wider collection is not: at a value element that holds borrows with no residual, and at a class element whenever the source is a scope-bound local.
 
 ```bezel
 using var ys := xs.ToArray();                                  // a local copy: admitted where `ys.Add(xs[0])` would be
@@ -2101,16 +2186,13 @@ public method WithValue(v: int): Port => new Port(v);      // the sanctioned upd
 case h.Slots of                      // `h.Slots: [4 owned]Conn?` — a borrowing binding over an owning-inline-array FIELD
   var a => do
     var t := move h.Slots;           // the field is vacated; `a` now addresses storage holding no value
-    try
-      _ := a[0];                     // FAULT in checked mode: DisposedAccessException — the slots belong to `t` (§9.4, §15.3)
-    finally
-      h.Slots := t;                  // restoration on every edge, the fault's included (§28.8.1, K9.2); reads through `a` see the stored value again
-    end;
+    _ := a[0];                       // ERROR: an indexer access inside the restoration window (§28.8.1) — and it would fault in checked mode (§9.4)
+    h.Slots := t;
   end
 end;
 ```
 
-> §15.3 / §9.4: a whole-value `move` out of a move-only **field** leaves the field's storage in the disposed state until the restoration store, and a `case` binding taken over the field before the move reads that state. Read what you need through the binding **before** the move, or move the field into a local first and match the local (`var t := move h.Slots; case t of …`). A slot read through an inline-array binding (`a[0]`) is an indexer access, throwable under §28.8.1, so any such read between the move and the restoration needs the restoration in a `finally` — a restoration after it leaves the read's exception edge unrestored, a compile error (K9.2).
+> §15.3 / §9.4 / §28.8.1: a whole-value `move` out of a move-only **field** leaves the field's storage in the disposed state until the restoration store, and a `case` binding taken over the field before the move reads that state; the window between the move and the restoring store is straight-line, so a slot read through the binding (`a[0]`, an indexer access), a call or an `await` inside it is a compile error at that expression (a restoration placed in a `finally` does not cover it). Read what you need through the binding **before** the move, or move the field into a local first and match the local (`var t := move h.Slots; case t of …`). The non-throwable reads — `a.Length`, a `case` over the binding — are admitted in the window and fault in checked mode.
 
 ```bezel
 // In `record Box` with `public property Item: Item?;` (a settable member) over a class `Item`:
@@ -2136,7 +2218,7 @@ Console.WriteLine(buf.AsSpan().ToString());   // OK — a member call on the val
 var n := Sum(buf.AsReadOnlySpan());           // OK over `Sum(s: IReadOnlySpan<int>)` — the one interface a span passes to
 ```
 
-> §9.7 / §8.6: a value that holds borrows (a span; a record or choice with a class-, interface- or `Object`-typed field; an inline array of them) reaches no position declared `Object` or an interface other than `IReadOnlySpan<TElement>` — not a parameter (`b.Keep<Object>(span)` included), a local, a field, a collection or a return — because the box announces no borrow and a callee could store it. It boxes as the receiver of a member call (`span.ToString()`, `$"{span}"`) — not of an extension on `Object` or a user interface — and at `IReadOnlySpan<TElement>`, whose values are read as holding the span's borrows and follow the span's rules: no field store, no return past the source, no `Object`, no `async` parameter. Remedies: a parameter at the value's own type or at `IReadOnlySpan<TElement>`, or a class implementing the interface.
+> §9.7 / §8.6: a value that holds borrows (a span; a record or choice with a class-, interface- or `Object`-typed field; an inline array of them) reaches no position declared `Object` or an interface other than `IReadOnlySpan<TElement>` — not a parameter (`b.Keep<Object>(span)` included), a local, a field, a collection or a return — because the box announces no borrow and a callee could store it. It boxes as the receiver of a member call (`span.ToString()`, `$"{span}"`) — not of an extension on `Object` or a user interface — and at `IReadOnlySpan<TElement>`, whose values are read as holding the span's borrows and follow the span's rules: no field store, no return past the source, no `Object`, no `async` parameter. Remedies: a parameter at the value's own type or at `IReadOnlySpan<TElement>`, or a class implementing the target interface (`IReadOnlySpan<TElement>` itself is closed to user types).
 
 ```bezel
 public static method Keep(s: IReadOnlySpan<int>)
@@ -2150,9 +2232,17 @@ public static method Put(xs: IReadOnlyList<IReadOnlySpan<int>>)
 end Put;
 ```
 
-> §9.7 / §12.9 / §27.1.1: `IReadOnlySpan<TElement>` is an interface, but no retyping carries it to `Object` or another interface: not as a covariant type argument or return slot, not as a contravariant type argument or parameter slot (an `(Object) -> ()` value at `(IReadOnlySpan<int>) -> ()`), and not through a method reference whose callee declares `Object` at that slot. Each would put a span at a type that announces none of its borrows, and each is the borrow-erasing conversion, rejected where it is written. In a generic body the same retyping over `T` is rejected at an instantiation substituting `IReadOnlySpan<…>` or a value type, and a type test does not recover the variance: `o as IReadOnlyList<Object>` over an `Object` holding a list of spans is `null`. Keep the span type at every slot and type argument.
+> §9.7 / §12.9 / §27.1.1: `IReadOnlySpan<TElement>` is an interface, but no retyping carries it to `Object` or another interface: not as a covariant type argument or return slot, not as a contravariant type argument or parameter slot (an `(Object) -> ()` value at `(IReadOnlySpan<int>) -> ()`), and not through a method reference whose callee declares `Object` at that slot. Each would put a span at a type that announces none of its borrows, and each is the borrow-erasing conversion, rejected where it is written. In a generic body the same retyping over `T` is rejected at an instantiation substituting `IReadOnlySpan<…>` or a value type; `_v := x as T` (or `case x of var t: T`) over an `x: IReadOnlySpan<int>` is rejected wherever `T` is `Object` or another interface; and a type test does not recover the variance: `o as IReadOnlyList<Object>` over an `Object` holding a list of spans is `null`. Keep the span type at every slot and type argument.
 
 ### 7.4 Overloads and the `out` family
+
+```bezel
+var ids := xs.Select(Util.Id);                   // ERROR: a reference to a generic method names its type arguments
+var ids := xs.Select(Util.Id<int>);              // the formation is the instantiation `Id<int>`, checked as the call would be
+var keep: (Array<Object>, Pair) -> () := Util.Keep<Pair>;   // ERROR at the formation: Keep's `sink.Add(x)` boxes a Pair (§9.7), as `Keep<Pair>(…)` would
+```
+
+> §27.6 / §14.1: a method reference over a generic method, or over a member of a generic extension block (`IEnumerable<Pair>.KeepAll`, the qualifier binding the block's `T`), carries an explicit type-argument list; nothing is inferred from the target, and the formation is checked as the call with that list would be — the body's requirements at `T`, the constraints, the dispatched exclusion. Invoking the formed value reads only its function type. `numbers.OrderBy(Math.Abs)` is unaffected: `Abs` is not generic.
 
 ```bezel
 method TryGet(k: string, out v: Conn?): bool;
@@ -2177,18 +2267,20 @@ return fresh;
 public class Point: IEquatable<Point>
   public readonly property X: int;
   public method Equals(other: Object?): bool => ReferenceEquals(this, other);   // ERROR: `Object`'s own signature without `override` is §12.2 hiding
-  public method Equals(other: Point): bool => X = other.X;                      // fine: another parameter list overloads the inherited member
+  public method Equals(other: Point): bool => X = other.X;                      // fine: the Object slot's own-typed spelling (§8.3)
   public override method GetHashCode(): int => X;                               // required beside the own-typed Equals (§8.3)
 end Point;
-var same := p.Equals(sub);   // ERROR at `sub: Point3`, a subclass of Point: converts to `Point` and to `Object?`, exact at neither — ambiguous (§22.6)
-var eq := p = sub;           // ERROR: the same ambiguity — `=` is the call `p.Equals(sub)` (§8.4)
-var seen := new Set<Point3>();   // ERROR: Point3 is not hashable — the set's comparison is the same ambiguity (§3.6, §9.2)
+public class Both: IEquatable<Both>
+  public method Equals(other: Both): bool => true;
+  public override method Equals(other: Object?): bool => true;   // ERROR: the own-typed Equals already fills the Object slot — one spelling, never both (§8.3)
+  public override method GetHashCode(): int => 0;
+end Both;
 public class Tag: IEquatable<Tag>
   public method Equals(other: Tag): bool => true;   // ERROR: an own-typed Equals obliges `override GetHashCode()` (§8.3)
 end Tag;
 ```
 
-> §12.2: `Object`'s `Equals(Object?)`, `GetHashCode()` and `ToString()` block only their **own signature**, which `override` reaches. A class declares `Equals(other: T)` (`IEquatable<T>`), `Equals(a: T, b: T)` and `GetHashCode(value: T)` (`IEqualityComparer<T>`) or `ToString(format: string)` (`IFormattable`) as plain members beside the inherited ones. `p.Equals(q)` and `p = q` at `Point` operands pick the own-typed overload, and so does a `Set<Point>`; an `Object`-typed receiver or argument reaches `Object`'s identity `Equals`. An argument of a subclass type converts to both, at `p.Equals(sub)` and at `p = sub` alike, `=` being the call (§8.4): bind it to a `Point` local first. The plain own-typed `Equals(T)` obliges `override GetHashCode()`, to agree with it, as an `Equals` override does (§8.3); override `Equals(Object?)` too when a boxed comparison must agree. A static `Equals`, and `Equals(T)` in a subclass of a class that already declares one, stay rejected.
+> §12.2: `Object`'s `Equals(Object?)`, `GetHashCode()` and `ToString()` block only their **own signature**, which `override` reaches. A class declares `Equals(a: T, b: T)` and `GetHashCode(value: T)` (`IEqualityComparer<T>`) or `ToString(format: string)` (`IFormattable`) as plain members beside the inherited ones. `Equals(other: T)` at the class's own type is the `Object` slot's second spelling (§8.3): one virtual member, reached by `p.Equals(q)`, `p = q`, a `Set<Point>`, `IEquatable<Point>`, an `Object`-typed receiver or argument (a non-`Point` argument compares unequal) and a subclass operand alike; a subclass overrides it as `override Equals(other: Sub)` or `override Equals(other: Object?)`. It obliges `override GetHashCode()`, to agree with it, as an `Equals` override does (§8.3), and a class writes one spelling of the slot, never both. A static `Equals` stays rejected.
 
 ```bezel
 public class Point: IEquatable<Point>
@@ -2196,9 +2288,9 @@ public class Point: IEquatable<Point>
   public method Equals(other: Point): bool => X = other.X;
   public override method GetHashCode(): int => X;                        // agrees with Equals(Point): §8.3
 end Point;
-var pp: Point := sub;  var same := p.Equals(pp);                         // the argument at `Point`: exact
-var eq := p = pp;                                                        // `=` is the same call: Equals(Point) (§8.4)
-var seen := new Set<Point>();  seen.Add(sub);                            // a Point3 held at Point: compares by Equals(Point) (§9.2)
+var same := p.Equals(sub);                                               // a Point3 argument: the one slot member, Equals(Point) (§8.3)
+var eq := p = sub;                                                       // `=` is the same call (§8.4)
+var seen := new Set<Point3>();  seen.Add(sub);                           // Point3 is hashable: the inherited slot and hash, virtual (§3.6, §9.2)
 
 public class Money: IFormattable
   public readonly property Cents: long;
@@ -2207,6 +2299,16 @@ end Money;
 ```
 
 ### 7.5 Iterators, queries, liveness
+
+```bezel
+choice Slot  Full(owned c: Conn), Empty;  end Slot;
+public static method Once<T>(owned x: T): IEnumerable<T>
+  yield return x;
+end Once;
+for var s in Once<Slot>(Slot.Full(new Conn())) do … end;   // ERROR: IEnumerable<Slot> — a move-only element type, rejected at the instantiation
+```
+
+> §28.11 / stdlib §4.12: the borrowing enumeration interfaces (and `EventSource<T>`/`AsyncEventSource<T>`) admit no owning choice and no owning inline array as `T`; an iterator declared over one, or a generic iterator instantiated at one, is rejected at the instantiation site. Yield the owning *class* that holds the choice, or drain an `OwningArray<Holder>`.
 
 ```bezel
 public static method Tail(lines: Array<string>, n: int): IEnumerable<string>
@@ -2255,6 +2357,21 @@ for var p in OwningProbes(8) do                  // OwningProbes(...): IOwningEn
   kept.Add(move p);
 end;
 var idle := kept.FirstOrNull(lambda(p) => not p.IsBusy());   // collection-backed ⇒ sound
+```
+
+```bezel
+using var xs := Echo(new Res());        // Echo(owned r: Res): IEnumerable<int> — an iterator over an `owned` argument
+var n := xs.Count();                    // spends the single enumeration right
+for var x in xs do Plot(x); end;        // ERROR (§29.8, §29.11): an iterable over an `owned` argument is single-consumption
+```
+
+> §29.8: an iterator method that takes an `owned` (or move-only) argument mints a **single-consumption** iterable — the body runs once over the argument, and the consumption points, the static error, the run-time `InvalidOperationException` and the remedies are §29.11's, as for a lazy query; the argument is disposed when that one enumeration completes or is disposed. To re-enumerate, lend a class-typed resource instead of transferring it: a plain parameter keeps the iterable re-iterable, and the resource's own `using var` outlives every enumeration.
+
+```bezel
+using var r := new Res();
+using var xs := Echo(r);                // Echo(r: Res): IEnumerable<int> — re-iterable; `r` outlives every enumeration
+var n := xs.Count();
+for var x in xs do Plot(x); end;
 ```
 
 ### 7.6 Concurrency
@@ -2400,6 +2517,8 @@ pool.Sorted();                     // OwningArray<T> declares no Sorted/Reversed
 var sorter: () -> () := widgets.Sort;   // ERROR at the formation when `Widget` has no `IComparable<Widget>`: a reference over a conditional member is checked where it is formed, not where it is called
 var text := String.Format("{0}", x);   // no String.Format
 if a < b then ...                    // ERROR when either is `int?` (section 7.8)
+var cbs := new Set<(int) -> int>();   // ERROR: a function type is not hashable (§3.6) — its hash is identity, its equality is §27.7.1's
+public static method Keep<T>(x: T): int where T: Object => 1;   // ERROR: `Object` is not a bound (§14.2) — unconstrained `T`, or `where T: notnull`
 ```
 
 ```bezel
@@ -2410,6 +2529,8 @@ arr.Where(pred).Count();
 var s := $"n = {count}";
 pool.Reverse();                    // in place; or Drain() into a new owning collection
 var text := $"{x}";
+var cbs := new Array<(int) -> int>();  var hit := cbs.Contains(Demo.Twice);   // §27.7.1 equality: a static reference equals every reference to the same method
+public static method Keep<T>(x: T): int where T: notnull => 1;
 ```
 
 ```bezel

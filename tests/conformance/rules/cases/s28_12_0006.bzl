@@ -1,10 +1,10 @@
 //! case: s28_12_0006
 //! doc: spec
 //! section: 28.12
-//! title: a second call to DisposeAsync after the first has run is a no-op
-//! rule: A second call to Dispose() or DisposeAsync() after either has run
-//!   is a no-op — the runtime tracks completion at the granularity of the
-//!   object, not per-method.
+//! title: a second call to DisposeAsync after the first has begun is a no-op
+//! rule: A second call to `Dispose()` or `DisposeAsync()` after either has
+//!   **begun** is a no-op (§28.2's idempotence rule): the per-instance flag
+//!   records the beginning of logical disposal.
 //! cites: 28.12, 28.2
 //! expect: run
 //! warns: yes
