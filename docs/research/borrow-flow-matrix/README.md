@@ -26,7 +26,7 @@ Each run re-derives every cell from the text current at that revision, rather th
   - `routes`: route cells, with `route` and `issue` fields.
   - Open issues: `root_causes` (run 1) or `groups` (later runs), each listing the cells it opens.
   - `label` and `meta` for the page.
-- `page.template.html` and `build_page.py`: the interactive page. `python3 docs/research/borrow-flow-matrix/build_page.py scratch/borrow-flow-matrix.html` builds it from every run file. The page offers:
+- `matrix.json`: the page's title, rows and columns. The interactive page is built by the shared builder in `../matrix-page/`: `python3 docs/research/matrix-page/build_page.py docs/research/borrow-flow-matrix scratch/borrow-flow-matrix.html` builds it from every run file. The page offers:
   - a run toggle;
   - a status filter and a "changed since the previous run" filter;
   - per-cell deciding text, notes and counterexamples;

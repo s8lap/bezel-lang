@@ -1,4 +1,4 @@
-<title>Borrow-Flow Matrix</title>
+<title>__TITLE__</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
@@ -87,8 +87,8 @@ a.iss{color:var(--hi);font:500 13px/1.4 var(--f-mono)}
 
 <div class="wrap">
   <header>
-    <h1>Borrow-Flow Matrix</h1>
-    <p class="lede">Can a value of each kind reach each position, and if it does, is the borrow it carries bounded by its source? Every cell cites the spec text that decides it, or is marked open with a counterexample program.</p>
+    <h1 id="mtitle"></h1>
+    <p class="lede" id="mlede"></p>
     <p class="meta" id="meta"></p>
     <div class="summary" id="runs" role="group" aria-label="Audit run" style="margin-top:12px"></div>
   </header>
@@ -99,7 +99,7 @@ a.iss{color:var(--hi);font:500 13px/1.4 var(--f-mono)}
 
   <div class="main">
     <section aria-label="Matrix" style="min-width:0;display:grid;gap:10px">
-      <p class="legend"><b>Decided</b>: one rule (or a consistent set) settles the verdict and the bound. <b>Missing</b>: no text decides it. <b>Ambiguous</b>: one passage, two readings with different verdicts. <b>Conflict</b>: two passages disagree. Select a cell for its rule, citation and counterexample.</p>
+      <p class="legend" id="mlegend"></p>
       <div class="gridbox"><table class="m" id="grid"></table></div>
     </section>
     <aside class="detail" id="detail" aria-live="polite"></aside>
@@ -122,8 +122,9 @@ a.iss{color:var(--hi);font:500 13px/1.4 var(--f-mono)}
 <script>
 (function(){
 const ALL=JSON.parse(document.getElementById('data').textContent);
-const ROWS=[["R1","Owned class/interface value","owned binding, owned param, fresh producer"],["R2","Borrowed class reference","plain param, borrow local, field/element read, this"],["R3","Borrow-bearing record","record with a class or borrow-bearing component"],["R4","Borrow-bearing inline array","[N]C, [N]Pair"],["R5","Choice that holds borrows","payload carries a borrow"],["R6","Span","Span<T>, ReadOnlySpan<T>, IReadOnlySpan<T>"],["R7","Capture-bearing function value","closure or bound method reference"],["R8","Bare type parameter T","value in a generic body"],["R9","Runtime-managed (control)","string, Type, boxed primitive"]];
-const COLS=[["C1","Field","Instance field store, incl. property/indexer setter"],["C2","Static","Static field or static property store"],["C3","Collection","Collection slot store: Add, indexer set, literal element, GetOrAdd"],["C4","Object/iface","Conversion to Object or an interface (boxing, upcast, as)"],["C5","ref/out","ref/out argument location written by the callee"],["C6","Return","Return from a method, getter or lambda; bare-T returns"],["C7","Capture","Closure capture, then the closure flows elsewhere"],["C8","Generic T","Stored at a generic T position (generic field, Box<T>, generic param)"],["C9","Async","Live across await, async parameter, Task<T> result"],["C10","Iterator","Live across yield return, iterator parameter, yielded value"],["C11","Pattern/aggregate","Pattern, as/is binding; record component or choice payload"],["C12","Cross-domain","Domain.Spawn argument/result, Channel<T> element, Locked<T>"],["C13","scoped","scoped parameter or field; call-bounded storage"]];
+const ROWS=ALL.matrix.rows;
+document.getElementById("mtitle").textContent=ALL.matrix.title;document.getElementById("mlede").textContent=ALL.matrix.lede;document.getElementById("mlegend").innerHTML=ALL.matrix.legend;
+const COLS=ALL.matrix.cols;
 const ST={decided:"Decided",ambiguous:"Ambiguous",missing:"Missing",conflict:"Conflict","n/a":"N/A"};
 const RUNS=Object.keys(ALL.runs).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
 const PREV={}; RUNS.forEach((r,i)=>{if(i)PREV[r]=RUNS[i-1]});
@@ -159,7 +160,7 @@ function grid(){
   ROWS.forEach(r=>{
     h+=`<tr><th class="rowh" scope="row">${esc(r[1])}<small>${r[0]} · ${esc(r[2])}</small></th>`;
     COLS.forEach(c=>{const x=byKey[r[0]+"/"+c[0]]; if(!x){h+="<td></td>";return}
-      const changed=x.prev_status&&x.prev_status!==x.status;
+      const changed=!!PREV[run]&&x.prev_status&&x.prev_status!==x.status;
       const hide=filter==="changed"?!changed:(filter&&x.status!==filter);
       const dim=hide?" dim":""; const mk=(mark&&x.rc&&x.rc.includes(mark))?" mark":"";
       const was=changed?`<span class="was">was <b>${ST[x.prev_status]||x.prev_status}</b></span>`:"";
@@ -168,14 +169,14 @@ function grid(){
   t.innerHTML=h+"</tbody>";
   t.querySelectorAll('.cell').forEach(b=>b.onclick=()=>{cur=b.dataset.k;render()});
 }
-function rcLabel(id){return run!==FIRST?`#${id}`:id}
+function rcLabel(id){return D.groups?`#${id}`:id}
 function detail(){
   const el=document.getElementById('detail');
   const x=byKey[cur]; if(!x){el.innerHTML="<p class='legend'>Select a cell.</p>";return}
   const r=ROWS.find(z=>z[0]===x.row), c=COLS.find(z=>z[0]===x.col);
   let h=`<div class="${cls(x.status)}"><span class="tag"><span class="dot"></span>${ST[x.status]} · ${esc(x.verdict)}</span></div>
-  <h3>${esc(r[1])} → ${esc(c[1])}</h3><p class="meta" style="margin:0">${x.row}/${x.col} · ${esc(c[2])} · lane ${esc(x.lane)}${x.prev_status?` · at ${PREV[run]}: ${esc(ST[x.prev_status]||x.prev_status)}`:""}</p>`;
-  if(x.rc&&x.rc.length) h+=`<div class="kv"><span class="k">Root cause</span><p class="v">${x.rc.map(id=>`<button class="rcref" data-rc="${id}">${rcLabel(id)}</button> ${md(rcById[id].statement.slice(0,160))}${rcById[id].statement.length>160?"…":""}`).join("<br>")}</p></div>`;
+  <h3>${esc(r[1])} → ${esc(c[1])}</h3><p class="meta" style="margin:0">${x.row}/${x.col} · ${esc(c[2])} · lane ${esc(x.lane)}${x.prev_status&&PREV[run]?` · at ${PREV[run]}: ${esc(ST[x.prev_status]||x.prev_status)}`:""}</p>`;
+  const rcs_=(x.rc||[]).filter(id=>rcById[id]); if(rcs_.length) h+=`<div class="kv"><span class="k">Root cause</span><p class="v">${rcs_.map(id=>`<button class="rcref" data-rc="${id}">${rcLabel(id)}</button> ${md(rcById[id].statement.slice(0,160))}${rcById[id].statement.length>160?"…":""}`).join("<br>")}</p></div>`;
   h+=`<div class="kv"><span class="k">Deciding text · ${esc(x.cite||"")}</span>${String(x.rule||"").split(" | ").map(q=>`<blockquote>${md(q)}</blockquote>`).join("")}</div>`;
   if(x.note) h+=`<div class="kv"><span class="k">Note</span><p class="v">${md(x.note)}</p></div>`;
   if(x.xcheck) h+=`<div class="kv"><span class="k">Cross-check (${esc(x.xcheck.by)}): ${esc(x.xcheck.verdict)}</span><p class="v">${md(x.xcheck.evidence)}</p></div>`;
@@ -185,7 +186,7 @@ function detail(){
 }
 function rcs(){
   const el=document.getElementById('rcs');
-  const list=run!==FIRST?D.groups.map(g=>({rid:g.issue,statement:g.statement,severity:g.severity,cells:g.cells,link:true})):D.root_causes;
+  const list=D.groups?D.groups.map(g=>({rid:g.issue,statement:g.statement,severity:g.severity,cells:g.cells,link:true})):(D.root_causes||[]);
   el.innerHTML=list.map(r=>{const sv=String(r.severity).startsWith("sound");
     return `<article class="rc${mark===r.rid?" active":""}" id="rc-${r.rid}"><span class="id">${r.link?`<a class="iss" href="${ISS(r.rid)}" target="_blank" rel="noopener">#${r.rid}</a>`:r.rid}</span>
     <p class="st">${md(r.statement)}</p>
@@ -195,8 +196,8 @@ function rcs(){
     <button class="show" data-rc="${r.rid}">${mark===r.rid?"Clear highlight":"Show cells"}</button></div></article>`}).join("");
   el.querySelectorAll('.cl').forEach(b=>b.onclick=()=>{cur=b.dataset.k;render();document.getElementById('grid').scrollIntoView({block:"nearest"})});
   el.querySelectorAll('.show').forEach(b=>b.onclick=()=>{mark=mark===b.dataset.rc?null:b.dataset.rc;render()});
-  const rs=document.getElementById('routesec'); rs.hidden=run===FIRST;
-  if(run!==FIRST){document.getElementById('routes').innerHTML=D.routes.map(x=>`<article class="rc"><span class="id">${x.issue?`<a class="iss" href="${ISS(x.issue)}" target="_blank" rel="noopener">#${esc(x.issue)}</a>`:"—"}</span>
+  const rs=document.getElementById('routesec'); const hasR=!!(D.routes&&D.routes.length); rs.hidden=!hasR;
+  if(hasR){document.getElementById('routes').innerHTML=D.routes.map(x=>`<article class="rc"><span class="id">${x.issue?`<a class="iss" href="${ISS(x.issue)}" target="_blank" rel="noopener">#${esc(x.issue)}</a>`:"—"}</span>
     <p class="st"><b>${esc(x.row)} · ${esc(x.col)}</b>${x.route?" · "+md(x.route):""}. ${md(x.note||"")}</p>
     <div class="row"><span class="pill sev-s">${esc(x.status)}</span></div>
     ${x.counterexample?`<pre style="grid-column:1/-1">${esc(x.counterexample)}</pre>`:""}</article>`).join("");}
