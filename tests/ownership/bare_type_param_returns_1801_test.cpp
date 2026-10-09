@@ -117,7 +117,7 @@ BEZEL_TEST(bare_type_param_returns,
         "    var b := new C(); "
         "    var m := Util.Pick(a, b); "
         "    var p := m.Poke(); "            // `m`'s last use, before the consume
-        "    _ := Util.Sink(owned a); "  // now safe — `m` is dead
+        "    _ := Util.Sink(move a); "  // now safe — `m` is dead
         "    b.Dispose(); "
         "    return p; "
         "  end Main; "
