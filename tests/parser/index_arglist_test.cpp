@@ -58,11 +58,15 @@ BEZEL_TEST(parser_index_args, ref_modifier_on_index) {
         std::string("arr[ref i]"));
 }
 
-// per §A.4 / proposal 0090 (v0.246): bare `owned` is not an ArgModifiers
-// alternative; `arr[owned r]` is a parse error. Use `move`.
+// fix #3097 (§23.5, v0.249): the parser now accepts bare `owned` at index
+// positions and passes it through to sema. The sema check checkIndexArgsPositional
+// (§23.5) rejects it there with the correct diagnostic. The parser test verifies
+// successful parsing; the sema test
+// (index_arg_ownership_modifier_3097.owned_index_argument_is_rejected_spec_23_5)
+// verifies the semantic rejection.
 BEZEL_TEST(parser_index_args, owned_modifier_on_index) {
     BEZEL_EXPECT_EQ(render("arr[owned r]"),
-                    std::string("<errors>"));
+                    std::string("arr[owned r]"));
 }
 
 BEZEL_TEST(parser_index_args, named_index) {
