@@ -6,7 +6,8 @@
 //!   slot of the formed function type is, nullability stripped, a function
 //!   type and binds to a callee parameter, other than an `out` parameter,
 //!   that is a set-erasing position (... `var put: (ref () -> int) -> () :=
-//!   b.Put;` over `Put<T>(ref x: T)`): a call through the formed value passes
+//!   b.Put<() -> int>;` over `Put<T>(ref x: T)`): a call through the formed
+//!   value passes
 //!   its argument to a plain or `ref` function-typed parameter
 //! cites: 28.14, 28.3, 27.6
 //! expect: reject
@@ -25,6 +26,6 @@ end Bin;
 public class Client
   public static method Form()
     using var b := new Bin();
-    var put: (ref () -> int) -> () := b.Put;
+    var put: (ref () -> int) -> () := b.Put<() -> int>;
   end Form;
 end Client;

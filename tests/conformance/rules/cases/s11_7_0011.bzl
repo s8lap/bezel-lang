@@ -3,7 +3,7 @@
 //! section: 11.7
 //! title: a static owned readonly field on a static class is permitted
 //! rule: Static `owned` fields are permitted: `static owned readonly` fields
-//!   and static owning-inline-array fields participate in §22.13's
+//!   and `static readonly` owning-inline-array fields participate in §22.13's
 //!   program-exit disposal exactly as on any other type — that mechanism is
 //!   runtime-driven and independent of instance `Dispose()`.
 //! cites: 11.7, 22.13, 28.5

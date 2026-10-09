@@ -53,8 +53,9 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollec
     var taken := move _storage[index];             // taken: T? (owned)
     _storage[index] := null;                        // restore slot
     for var j in index..<(_count - 1) do
-      var shifted := move _storage[j + 1];          // shifted: T? (owned)
-      _storage[j + 1] := null;                       // restore shifted-from slot
+      var k := j + 1;                                // the moved index, bound first (spec §28.11)
+      var shifted := move _storage[k];               // shifted: T? (owned)
+      _storage[k] := null;                            // restore the shifted-from slot, at k
       _storage[j] := shifted;                        // setter on moved-from slot;
                                                       //   no previous to dispose
     end;

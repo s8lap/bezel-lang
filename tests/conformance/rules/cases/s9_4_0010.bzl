@@ -1,7 +1,7 @@
 //! case: s9_4_0010
 //! doc: spec
 //! section: 9.4
-//! title: a binding read of an owning choice field faults between a whole-value move and its restoration
+//! title: a binding read of an owning choice field faults inside its straight-line restoration window
 //! rule: and so is the storage an **instance field** of either kind vacates
 //!   under a whole-value `move` (`var t := move h.Slots;` ...), from the move
 //!   until the restoration store replaces the value ... In checked disposal
@@ -37,17 +37,17 @@ end Holder;
 public class Program
   public static method Main()
     using var h := new Holder();
-    case h.C of
-      var c => do
-        var t := move h.C;
-        try
-          Console.WriteLine(c.IsFull());
-        catch
-          DisposedAccessException => Console.WriteLine("faulted"),
-        finally
+    try
+      case h.C of
+        var c => do
+          var t := move h.C;
+          var full := (case c of Full(_) => true, Empty => false);
           h.C := t;
-        end try;
-      end
-    end case;
+          Console.WriteLine(full);
+        end
+      end case;
+    catch
+      DisposedAccessException => Console.WriteLine("faulted"),
+    end try;
   end Main;
 end Program;
