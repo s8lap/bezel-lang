@@ -3,9 +3,10 @@
 //! section: 28.3
 //! title: under the trust-admission report mode, a scoped construction reports nothing
 //! rule: A class- or interface-typed `scoped` parameter upgrades the
-//!   residual-trust back-reference admission to a static bound with no
-//!   residual trust (spec §28.14); the trust-admission report mode reports only
-//!   admissions that rest on a K4.3-recorded trust clause.
+//!   residual-trust back-reference admission to a static bound on the
+//!   source, with no K4.3-recorded trust clause (spec §28.14); the
+//!   trust-admission report mode reports only admissions that rest on such a
+//!   clause.
 //! cites: 28.3, 28.14
 //! expect: quiet
 //! flags: --report-trust-admissions

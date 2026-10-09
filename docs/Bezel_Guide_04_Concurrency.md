@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.328.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.331.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -164,7 +164,7 @@ The mechanics worth knowing:
 - `await Join()` is mandatory on the normal path and is the *single* re-raise site.
 - The disposal edge (exception, early return) cancels, drains, and swallows — supervision lives at `Join`.
 
-Captures have their own admission test. Child captures are admitted when their sources are declared *before* the scope (parameters always qualify) or derive from the scope itself (`scope.Token`). A **class- or interface-typed** local declared after the scope is rejected at the `Spawn` call — value-typed captures are exempt from the declared-before test, so an `int` loop index is fine (spec §28.14). This is the `scoped` admission: `Spawn`'s `body` parameter is declared `scoped`, the scope is the bounding object, and the captured sources stay frozen until it is disposed — the same storage-bounded contract Guide 1 §9 teaches for your own callback-holding classes. For per-element fan-out, declare the source collection *before* the scope and capture a value-typed index, or reach for `Parallel`.
+Captures have their own admission test. Child captures are admitted when their sources are declared *before* the scope (parameters always qualify) or derive from the scope itself (`scope.Token`). A **class- or interface-typed** local declared after the scope is rejected at the `Spawn` call, and so is a span or a record holding a borrow whose source is declared after it: such a capture counts by the sources of the borrows it carries. Value-typed captures that carry no borrow are exempt from the declared-before test, so an `int` loop index is fine (spec §28.14). This is the `scoped` admission: `Spawn`'s `body` parameter is declared `scoped`, the scope is the bounding object, and the captured sources stay frozen until it is disposed — the same storage-bounded contract Guide 1 §9 teaches for your own callback-holding classes. For per-element fan-out, declare the source collection *before* the scope and capture a value-typed index, or reach for `Parallel`.
 
 **`Parallel`** is the uniform-work tool: the same capture-free function over every element of a collection, on a process-wide team of worker domains (stdlib §6.12; spec §30.14). It is also your second rehearsal of the Pattern A consumer shape (`Parallel` is not yet implemented, [#3557](https://github.com/s8lap/bezel-lang/issues/3557); the example shows the specified surface):
 
@@ -226,6 +226,9 @@ using var j2 := Domain.Spawn(Work, move sessions);       // ERROR when sessions 
                                                          //   Dictionary<string, Session>:
                                                          //   borrowing slots of class
                                                          //   elements are not sendable
+using var j3 := Domain.Spawn(Bump, counter);             // ERROR: a class argument crosses
+                                                         //   only through the owned row —
+                                                         //   Bump(owned c: Counter), move counter
 ```
 
 The diagnostics name the failing rule. The fixes are always the same two moves: own what crosses (`OwningDictionary`, an `owned` field) or copy value-shaped data.

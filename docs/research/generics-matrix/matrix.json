@@ -1,0 +1,130 @@
+{
+ "title": "Generics Matrix",
+ "lede": "A generic body is checked once and never re-checked: for each kind of type argument and each generic construct, does that one check hold, or does a rule reject the substitution at a stated site? Every cell cites the spec text that decides it, or is marked open with a counterexample program.",
+ "legend": "<b>Decided</b>: one rule (or a consistent set) settles the verdict and the bound. <b>Missing</b>: no text decides it. <b>Ambiguous</b>: one passage, two readings with different verdicts. <b>Conflict</b>: two passages disagree. Select a cell for its rule, citation and counterexample.",
+ "rows": [
+  [
+   "R1",
+   "Class",
+   "a user class (trivial-dispose, or with a destructor or owned fields); a borrowing stdlib class (Array<X>);…"
+  ],
+  [
+   "R2",
+   "Interface or Object",
+   "a user interface; an IDisposable-extending one; Object itself, where a bare-T position becomes set-erasing…"
+  ],
+  [
+   "R3",
+   "Borrow-free value type",
+   "primitive; enum with / without a zero constant; record or value-like choice holding no borrow…"
+  ],
+  [
+   "R4",
+   "Value that holds borrows",
+   "(a) borrow-bearing record (record Pair(Item: Item), CancellationToken) or a choice that holds borrows; (b)…"
+  ],
+  [
+   "R5",
+   "Inline arrays and move-only value types",
+   "[N]X (borrow-free or borrow-bearing); [N owned]C, [N owned]C?; owning-classified choice"
+  ],
+  [
+   "R6",
+   "Function type",
+   "a capture-free value vs a capturing one (same type, different source set); an owned-slot or mint-returning…"
+  ],
+  [
+   "R7",
+   "Nullable U?",
+   "nullable reference (Widget?, IFoo?, string?); nullable value (int?, C? for a choice, R?)"
+  ],
+  [
+   "R8",
+   "Task family",
+   "Task, Task<X>, OwningTask<X>"
+  ],
+  [
+   "R9",
+   "Another type parameter",
+   "the argument *is* a parameter in scope (Bag<T> in Outer<T>, G<U>(…) in F<U>); the argument *contains* one…"
+  ],
+  [
+   "R10",
+   "Control: string (and Type)",
+   "runtime-managed reference; expected decided almost everywhere"
+  ]
+ ],
+ "cols": [
+  [
+   "C1",
+   "Storage typed at T",
+   "An instance field of a generic class, a record component, a choice payload, a [N]T slot; the derived…"
+  ],
+  [
+   "C2",
+   "Parameters and returns at T",
+   "Plain, owned, ref, out, out owned parameters at T/T?; bare-type-parameter returns; owned T returns;…"
+  ],
+  [
+   "C3",
+   "Locals, default(T), new T(), definite assignment, forming T?",
+   "§7.9, §7.10, §17.11, §14.2 new(), §15.1 *No nullable inline-array types*, §9.9"
+  ],
+  [
+   "C4",
+   "Constraints",
+   "Satisfaction and in-body guarantee of class, value, notnull, type bounds, where T: U, new(), hashable and…"
+  ],
+  [
+   "C5",
+   "Equality and hashing through T",
+   "=/<>/Equals/GetHashCode on T operands (the three kinds); the hashable property vs where T: hashable;…"
+  ],
+  [
+   "C6",
+   "Type tests at T",
+   "is/is not/as with T as carrier or target; typed pattern var t: T; narrowing; typeof(T)"
+  ],
+  [
+   "C7",
+   "Conversions over T",
+   "T to Object or an interface (boxing), variance at a type argument formed over T, function-type…"
+  ],
+  [
+   "C8",
+   "owned T and disposal of T",
+   "Meaning of the marker per instantiation (transfer / redundant / erased); using var and move over T;…"
+  ],
+  [
+   "C9",
+   "Type-argument inference",
+   "The three phases, nullability in a binding, unique instantiation, agreement, constraints checked after…"
+  ],
+  [
+   "C10",
+   "Generic extension blocks",
+   "Head binding; the head checked against the extended type's constraints; the block's where as an…"
+  ],
+  [
+   "C11",
+   "Static members of generic types",
+   "Per-instantiation static cells; statics at a bare T (mutable: rejected; static readonly: classified per…"
+  ],
+  [
+   "C12",
+   "Collections of T and stdlib generic members",
+   "Element category at T; the conditionally-admitted register (sorting, equality search, the *OrNull tier);…"
+  ],
+  [
+   "C13",
+   "Async, iterator and cross-domain generic bodies",
+   "T-typed locals and parameters across await/yield; Task<T>/OwningTask<T> formed at T; async iterators of T;…"
+  ],
+  [
+   "C14",
+   "Dispatched generic methods and override/implementation constraints",
+   "Requirements decided at the body; the move-only/inline-array exclusion; inherited witnesses; constraint…"
+  ]
+ ],
+ "corner": "Type argument ↓ · Construct →"
+}

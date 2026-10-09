@@ -1,0 +1,130 @@
+{
+ "title": "Disposal Matrix",
+ "lede": "Is every disposal obligation discharged exactly once on every path, and is every use after disposal or transfer rejected or caught by a recorded runtime check? Every cell cites the spec text that decides it, or is marked open with a counterexample program.",
+ "legend": "<b>Decided</b>: one rule (or a consistent set) settles the verdict and the bound. <b>Missing</b>: no text decides it. <b>Ambiguous</b>: one passage, two readings with different verdicts. <b>Conflict</b>: two passages disagree. Select a cell for its rule, citation and counterexample.",
+ "rows": [
+  [
+   "R1",
+   "Owned binding",
+   "A plain owned local (fresh-produced, adopted by K1/§28.3's adoption clause, an out owned recipient, an…"
+  ],
+  [
+   "R2",
+   "Scope-pinned binding",
+   "using var, await using var, anonymous using var _, and compiler-introduced slots of the same kind: the…"
+  ],
+  [
+   "R3",
+   "Unbound owned temporary",
+   "A full-expression temporary, a binding-atom named temporary (K8.5), a case scrutinee temporary (K8.3), an…"
+  ],
+  [
+   "R4",
+   "Owned instance field",
+   "A class- or interface-typed owned field, an owned primary-constructor capture field, an owning-wrapper…"
+  ],
+  [
+   "R5",
+   "Owning-collection slot",
+   "An element of the owning family (OwningArray, OwningDictionary values, OwningSet, stacks and queues,…"
+  ],
+  [
+   "R6",
+   "Move-only value",
+   "An owning inline array [N owned]T(?) (local, parameter, instance field, payload) and its slots; an…"
+  ],
+  [
+   "R7",
+   "Runtime-held owned value",
+   "A task's result slot (Pattern A kinds 1–3, Pattern B), the task object a completion source owns, the…"
+  ],
+  [
+   "R8",
+   "Deferred-activation frame state",
+   "What an iterator, async or async-iterator state machine owns: owned parameters transferred into the frame,…"
+  ],
+  [
+   "R9",
+   "Static owned storage",
+   "A static owned readonly field, a static owning-inline-array field (form (iv) mutable, or (h) readonly),…"
+  ],
+  [
+   "R10",
+   "Control: runtime-managed value",
+   "string, Type, boxed value types, function values. Expected to be uniformly decided as *exempt* or *n/a*…"
+  ]
+ ],
+ "cols": [
+  [
+   "C1",
+   "Normal release",
+   "The holder's ordinary end on the fall-through path: scope end and auto-drop (K3.14), object teardown…"
+  ],
+  [
+   "C2",
+   "Early structured exit",
+   "return, break, continue, yield break, including through nested try/finally and out of a catch arm; K9.2…"
+  ],
+  [
+   "C3",
+   "Exception unwind",
+   "Edge parity, the establishment-ordered cleanup stack with finally, a raise from inside the holder's scope,…"
+  ],
+  [
+   "C4",
+   "Failed construction",
+   "Instance construction that throws (base/this chain, field initializer, body, captures, ensures/invariant,…"
+  ],
+  [
+   "C5",
+   "Transfer",
+   "The consume positions that move the obligation (K3.1–K3.4, K3.6, K3.7, K3.12): owned argument and return,…"
+  ],
+  [
+   "C6",
+   "Displacement",
+   "Reassignment and drop-on-overwrite (K3.11): state match, RHS-first, null and moved-from targets, the…"
+  ],
+  [
+   "C7",
+   "Join",
+   "Statement merges and expression arm-meets (if, case, ??), K7's meet, maybe-consumed, per-path adoption and…"
+  ],
+  [
+   "C8",
+   "Loop",
+   "The back edge: a move, kill or reassignment inside a loop body, a loop-carried owned binding,…"
+  ],
+  [
+   "C9",
+   "Explicit kill and use-after",
+   "The K4.2 site-announced kills (Dispose(), direct DisposeAsync(), discard, throw x, Pattern B await) and…"
+  ],
+  [
+   "C10",
+   "Await and cancellation",
+   "A holder live across await: the Pattern A/B result obligation, a faulted or cancelled outcome, a task…"
+  ],
+  [
+   "C11",
+   "Iteration",
+   "yield return and the advance boundary, enumerator-owned versus transferred yields, partial consumption and…"
+  ],
+  [
+   "C12",
+   "Multi-value cleanup pass",
+   "Order and a throwing disposer when one event disposes several values: the destructor body then owned…"
+  ],
+  [
+   "C13",
+   "Cross-domain",
+   "Domain.Spawn owned arguments and results, channel Send, sendable Shared<T> handles and the last drop in…"
+  ],
+  [
+   "C14",
+   "Async disposal",
+   "await using, a direct DisposeAsync() call, per-level supersession of the destructor body, the synchronous…"
+  ]
+ ],
+ "corner": "Holder ↓ · Path →"
+}
