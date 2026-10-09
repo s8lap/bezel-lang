@@ -22014,16 +22014,31 @@ bool MethodOwnership::exprIsFunctionValueWithNonEmptyCaptureSet(
     // Per the spec, only a method member (not a property, field, etc.) is
     // a function value in this sense. Check the resolved symbol.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
-        // No target → static member reference: no captures.
+        // An incomplete member access carries nothing: no receiver, so
+        // nothing to capture.
         if (!ma->target) return false;
-        // Check if the resolved symbol is actually a method (not a property,
-        // field, etc.). A property access like `CancellationToken.None` is
-        // not a function value even though it has a target.
+        // Only a method member is a function value here. A property access
+        // like `CancellationToken.None` has a target too but is not a
+        // function value.
         sema::Symbol* sym = ctx_.exprSymbol(*ma);
         if (!sym) return false;  // Unresolved
-        if (dynamic_cast<sema::MethodSymbol*>(sym))
-            return true;  // Instance method reference: receiver is a capture
-        return false;  // Property, field, etc.: not a function value
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+        if (!ms) return false;  // Property, field, const: not a function value
+        // A STATIC method has no receiver, so `TypeName.Method` carries the
+        // EMPTY source set and is admitted at a set-erasing position per
+        // §28.3's binary rule. Only an INSTANCE method reference captures its
+        // receiver: per §27.6 (v0.330), method references work for "instance
+        // methods (the instance is captured at formation — by reference for
+        // class-typed receivers, by copy for value-shaped (record) receivers)"
+        // while a static method's reference captures nothing. Staticness is the
+        // declaring member's `static` modifier — MethodSymbol carries no
+        // `isStatic` field of its own (only ConstructorSymbol and
+        // ConstMemberSymbol do), and this is the same modifier list
+        // `exprIsStaticMemberRead` (Ownership.cpp) and §2.7's
+        // `hasMod(ms->modifiers, "static")` test (ExprTypecheck.cpp) read.
+        for (std::string_view mod : ms->modifiers)
+            if (mod == "static") return false;
+        return true;  // Instance method reference: the receiver is a capture
     }
     // Identifier: a local carrying captures, or a parameter whose initializer
     // is a capture-bearing lambda.  A plain function-typed parameter binding

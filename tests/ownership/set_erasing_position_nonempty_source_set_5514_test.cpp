@@ -11,6 +11,8 @@
 //   capture-free lambda → bare T:          ACCEPTED
 //   plain function-typed param → bare T:  ACCEPTED
 //   property access → Object:              ACCEPTED
+//   static method reference → bare T:      ACCEPTED   (empty set: no receiver)
+//   instance method reference → bare T:    REJECTED   (the receiver is a capture)
 
 #include <string>
 
@@ -41,6 +43,15 @@ const char* kKeeperObjectClass =
 // Helper: Util with bare type param, for bare-T tests.
 const char* kUtilTakeClass =
     "class Util "
+    "  public static method Take<T>(x: T) "
+    "    Console.WriteLine(\"took\"); "
+    "  end Take; "
+    "end Util; ";
+
+// Helper: Util with a STATIC method, for the static-method-reference row.
+const char* kUtilStaticClass =
+    "class Util "
+    "  public static method One(): int => 1; "
     "  public static method Take<T>(x: T) "
     "    Console.WriteLine(\"took\"); "
     "  end Take; "
@@ -166,6 +177,45 @@ BEZEL_TEST(set_erasing_position_5514,
         "    using var item := new Item(); "
         "    var f: () -> int := lambda() => item.Value(); "
         "    Util.Take<() -> int>(f); "
+        "    return 0; "
+        "  end Main; "
+        "end Test;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+}
+
+// ACCEPT: a STATIC method reference → bare type parameter.
+// `Util.One` has no receiver, so the function value carries the EMPTY source
+// set and §28.3's binary rule admits it.  This is the row the §28.3
+// Set-erasing check must NOT over-reject: a static member reference reaches
+// the argument as a `MemberAccessExpr` WITH a target (the type name), so
+// "it has a target" does not imply "it captures that target" — the
+// STATICNESS of the resolved method is what decides it.
+BEZEL_TEST(set_erasing_position_5514,
+           static_method_reference_to_bare_type_param_accepted) {
+    auto r = runAot(
+        std::string("module M; ") + kUtilStaticClass +
+        "class Test "
+        "  public static method Main(): int "
+        "    Util.Take<() -> int>(Util.One); "
+        "    return 0; "
+        "  end Main; "
+        "end Test;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// REJECT: an INSTANCE method reference → bare type parameter.
+// The receiver is the capture, so the source set is non-empty and the
+// position is set-erasing.  This is the polarity twin of the static row
+// above: same callee, same argument shape, differing only in staticness.
+BEZEL_TEST(set_erasing_position_5514,
+           instance_method_reference_to_bare_type_param_rejected) {
+    auto r = runAotChecked(
+        std::string("module M; ") + kUtilTakeClass + kItemClass +
+        "class Test "
+        "  public static method Main(): int "
+        "    using var item := new Item(); "
+        "    Util.Take<() -> int>(item.Value); "
         "    return 0; "
         "  end Main; "
         "end Test;");
