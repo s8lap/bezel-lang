@@ -2159,7 +2159,7 @@ l4_21_0010	pass
 l4_21_0011	fail	#4604
 l5_0001	pass	
 l5_0002	pass	
-l5_0003	fail	divergence
+l5_0003	pass	
 l5_0004	pass	
 l5_0005	pass	
 l5_0006	pass	
