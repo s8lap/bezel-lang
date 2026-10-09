@@ -512,6 +512,10 @@ CompileResult Driver::compileExecutableObject(
         // type resolution, expression typecheck. Each pass annotates
         // the AST via side-tables on SemaContext.
         sema::SemaContext semaCtx(diagnostics);
+        // §28.3 *Diagnostics* trust-admission report mode (v0.307, #4605).
+        // Off by default; set before any pass runs so every admission site in
+        // the ownership pass can consult it.
+        semaCtx.setReportTrustAdmissions(opts.reportTrustAdmissions);
         sema::collectSymbols(*unit, semaCtx);
         // §2.8.1 rule 5 (#1729, v0.188): the root compilation's module name
         // must not collide with an implementation-provided stdlib module.
@@ -709,6 +713,10 @@ CompileResult Driver::compileObject(const std::string& path,
         // (the library/object path mirrors compileFile).
         injectStdlibPrelude(*unit);
         sema::SemaContext semaCtx(diagnostics);
+        // §28.3 *Diagnostics* trust-admission report mode (v0.307, #4605).
+        // Off by default; set before any pass runs so every admission site in
+        // the ownership pass can consult it.
+        semaCtx.setReportTrustAdmissions(opts.reportTrustAdmissions);
         sema::collectSymbols(*unit, semaCtx);
         // §2.8.1 rule 5 (#1729, v0.188): impl-provided-name check (mirrors
         // compileExecutableObject). The SemaContext's ModuleSymbol carries

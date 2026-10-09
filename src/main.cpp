@@ -26,6 +26,7 @@ void printUsage(std::ostream& out) {
     out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
            "[--import <artifact>]... [--checked-disposal] [--checked-contracts] "
            "[--sanitize=address] [--experimental-scoped-await-bind] "
+           "[--report-trust-admissions] "
            "<source-file>\n"
            "  -c                 compile to a native object (a library, §2.4) "
            "with embedded\n"
@@ -70,7 +71,18 @@ void printUsage(std::ostream& out) {
            "                     PROTOTYPE (proposal 0082 §3, issue #3048; not a\n"
            "                     language feature): admit `var x := await\n"
            "                     <fresh Task<T> producer>;` by desugaring it to\n"
-           "                     `using var $t := <producer>; var x := await $t;`\n";
+           "                     `using var $t := <producer>; var x := await $t;`\n"
+           "  --report-trust-admissions\n"
+           "                     §28.3 *Diagnostics* trust-admission report mode\n"
+           "                     (v0.307, issue #4605; off by default): emit a\n"
+           "                     warning at every site where the compiler makes an\n"
+           "                     admission resting on a K4.3-recorded trust clause —\n"
+           "                     a parameter-/receiver-sourced borrow stored into a\n"
+           "                     non-owned field, a borrowing-family collection or\n"
+           "                     an OwningDictionary key slot, or held by a pending\n"
+           "                     frame past its call. Informative only: no verdict\n"
+           "                     and no generated code changes, and a `scoped`\n"
+           "                     parameter's statically-bounded twin stays silent\n";
 }
 
 // Default executable name from the source path: drop the directory and the
@@ -150,6 +162,14 @@ int main(int argc, char** argv) {
             // Proposal 0082 §3 stage-1 prototype (#3048). Off by default; with
             // the flag absent the compiler is bit-for-bit what it was.
             codegenOpts.scopedAwaitBind = true;
+            continue;
+        }
+        if (arg == "--report-trust-admissions") {
+            // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605).
+            // Off by default and selected explicitly; with the flag absent the
+            // compiler is bit-for-bit what it was (the spec's "the default
+            // build's diagnostics are unchanged").
+            codegenOpts.reportTrustAdmissions = true;
             continue;
         }
         if (arg == "--sanitize=address") {

@@ -6784,6 +6784,94 @@ bool MethodOwnership::isPlainBorrowParam(sema::Symbol* sym) {
     return isBorrowableType(declTy);
 }
 
+// §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605): is this
+// expression's borrow carrier one the mode REPORTS — the implicit receiver, or
+// a plain (non-`owned`, non-`scoped`, non-`ref`/`out`) reference-typed
+// parameter of the body being analysed?
+//
+// `isPlainBorrowParam` is reused deliberately rather than re-derived: it is the
+// file's settled statement of "a plain reference-typed parameter of THIS body"
+// and already carries the two guards that matter here — the empty-modifier
+// test (which is what excludes `owned`, `scoped`, `ref` and `out` alike: an
+// `owned` parameter is a transfer, not a borrow, and §28.14's `scoped` twin is
+// a static bound with no residual trust) and the #4757 `methodParamSet_` gate
+// (a lambda's own parameter is re-bound per invocation, not a carry).
+//
+// A member-access receiver (`this.x`, `base.f`, `obj.g`) is the "receiver" arm
+// of the spec's rule; it is admitted here on the AST shape alone, because at
+// this point the check has already established the store is one §28.3/§28.11
+// admits (a source that would die in this frame was rejected above).
+//
+// The parameter arm adds the CLASS/INTERFACE-typed requirement on top of
+// `isPlainBorrowParam`, and it is load-bearing rather than decorative. The
+// spec's rule is about BORROWED references: §28.3's report reaches "a
+// non-`owned` class- or interface-typed field" and §28.11's a borrow stored in
+// a collection slot. A value-typed parameter contributes no borrow and so
+// carries no clause — the canonical case is `s28_3_0092`, where a `SlotHandle`
+// key parameter (a §4.21 body record, a VALUE) is stored into a field and an
+// `Array<SlotHandle>`, and the case's own rule text says so: "a SlotHandle
+// stored in a field or a collection is a value, not a borrow, and no K4.3
+// clause attaches to it". `isPlainBorrowParam` alone would not separate the
+// two: `isBorrowableType` answers `true` for a null TypeRef ("unknown →
+// conservative"), so a type the resolver could not name — and `SlotHandle`
+// today has no type-resolution arm at all — would be reported as a borrow.
+// `scopedArgIsClassBorrow` is the file's settled class/interface-typed test
+// (Named + a real declaration + not a value builtin + Class or Interface), so
+// reuse it rather than re-deriving. // per §28.3, §28.11, §28.14
+bool MethodOwnership::trustFieldStoreCarrier(const ast::Expr& e) {
+    if (dynamic_cast<const ast::MemberAccessExpr*>(&e)) return true;
+    // The implicit receiver as a bare `this`/`base` identifier, if the AST
+    // spells it that way.
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (id->name == "this" || id->name == "base") return true;
+    }
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (isPlainBorrowParam(ctx_.exprSymbol(*id))) {
+            const sema::TypeRef* pt =
+                ctx_.exprType(*id);  // the parameter's DECLARED type
+            if (pt && pt->kind == sema::TypeRef::Kind::Named &&
+                pt->declaration && !pt->declaration->isValueBuiltin &&
+                (pt->declaration->kind == ast::TypeDeclKind::Class ||
+                 pt->declaration->kind == ast::TypeDeclKind::Interface))
+                return true;
+            // An unresolvable declared type is NOT evidence of a borrow; the
+            // class test above is the only thing that admits a parameter.
+        }
+    }
+    return false;
+}
+
+// §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605): the single
+// emission point for the mode. The spec requires the warning to name "the rule
+// and its clause, the borrow and its source, the holder, the obligation … and
+// the static remedies available at that site: `scoped`, a `SlotHandle` key …,
+// a `Shared<T>` handle, an owning-family holder, or awaiting the frame to
+// settlement"; one shared body states them once, identically at every site, so
+// a remedy cannot drift between the field, collection and frame placements.
+//
+// Emitting only under the mode is what makes the default build's diagnostics
+// unchanged — the spec's own guarantee, and the only thing that keeps the
+// three `quiet` conformance rows quiet. // per §28.3 v0.307
+void MethodOwnership::reportTrustAdmission(Severity sev, SourceLocation loc,
+                                           const char* clause,
+                                           const std::string& carrier) {
+    if (!ctx_.reportTrustAdmissions()) return;
+    report(sev, loc,
+           std::string("trust admission recorded (") + clause +
+               "): the compiler is admitting a borrow of " + carrier +
+               " whose source the caller must keep alive for as long as the "
+               "holder uses it — this build's trust-admission report mode "
+               "(§28.3 *Diagnostics*, v0.307) lists the site so it can be "
+               "checked by hand. The obligation is that the source outlives "
+               "the holder's use of it and is neither transferred to another "
+               "domain nor consumed into a domain-reachable construction "
+               "while held. Static remedies: declare the parameter `scoped` "
+               "(§28.14), store a `SlotHandle` key instead of the borrow "
+               "(stdlib §4.21), hold it through `Shared<T>` (§28.13), store "
+               "it in an owning-family holder (§28.11), or await the frame to "
+               "settlement (§30.1)");
+}
+
 // §27.5 / §28.6 (#1217): when a lambda is stored into a FIELD or written
 // through an OUT-PARAM assignment target, and the lambda captures a ref/out
 // parameter, the captured pointer lives on the caller's stack; the field or
@@ -10597,7 +10685,29 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
         src = enclosingFrameOwnedLocalBorrowSource(*as.value, srcKinds);
         srcFromEnclosingFrame = src != nullptr;
     }
-    if (!src) return false;
+    if (!src) {
+        // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605).
+        // Reaching here with no owned-local source is exactly the SPEC'S OWN
+        // ADMISSION: §28.3's borrowed-field store rule admits a borrow whose
+        // source is a parameter, the receiver, or a field path — the checks
+        // above reject only a source that dies inside this frame. So this
+        // field store rests on a K4.3-recorded trust clause, and under the
+        // report mode it is reported. Outside the mode nothing changes.
+        //
+        // The `scoped` twin is NOT an admission: §28.14 upgrades a
+        // class/interface-typed `scoped` parameter's residual-trust
+        // back-reference store to a STATIC bound with no residual trust.
+        // `trustFieldStoreCarrier` restricts the test to a parameter of the
+        // body being analysed (a lambda's own parameter resolves inside its
+        // own body and is re-bound per invocation — the #4757 gate the same
+        // file's `isPlainBorrowParam` uses).
+        if (dest == Dest::Field && trustFieldStoreCarrier(*as.value))
+            reportTrustAdmission(Severity::Warning, as.value->span.begin,
+                                 "§28.3 borrowed-field store",
+                                 "the receiver or a plain (non-`owned`, "
+                                 "non-`scoped`) parameter");
+        return false;
+    }
 
     // §28.3 (#861, generalized under v0.180 / #1539): resolve a plain-local
     // target into an OuterLocal escape whenever the target local's declaring
@@ -11380,7 +11490,25 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         // measured argument — see the bulk-storing branch's own comment).
         if (!src && fromLambdaBody && !bulkStoring)
             src = enclosingFrameOwnedLocalBorrowSource(*a.value, elemKinds);
-        if (!src) continue;
+        if (!src) {
+            // §28.3 *Diagnostics* "The trust-admission report" (v0.307,
+            // #4605). §28.11's store rule admits a borrow whose source is the
+            // receiver, a parameter, or a field path — the rejections above
+            // fire only for a source that dies inside this frame — so this
+            // store rests on a K4.3-recorded trust clause. The spec reports it
+            // "including a store whose receiver the structural check leaves
+            // unclassified", so the report does not re-test `kind`.
+            //
+            // §28.14's `scoped` twin stays silent: the `scoped` parameter's
+            // admission is upgraded to a static bound, leaving no residual
+            // trust to record.
+            if (trustFieldStoreCarrier(*a.value))
+                reportTrustAdmission(Severity::Warning, a.value->span.begin,
+                                     "§28.11 borrowing-collection store",
+                                     "the receiver or a plain (non-`owned`, "
+                                     "non-`scoped`) parameter");
+            continue;
+        }
         bool reject = false;
         if (kind == RecvKind::Escapes) {
             reject = true;
@@ -18492,6 +18620,55 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
         // losers) through the receiver-sourced-borrow result classification.
         // // per §28.3 / stdlib §5 (#1915)
         checkMinMaxMintingSelector(*ce);
+        // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605):
+        // a borrow held by a PENDING FRAME past the call that minted it.
+        //
+        // `Task.FireAndForget(call)` is the spec's named pending-frame
+        // position (§30.10, §30.1's settlement obligation): its sole argument
+        // is abandoned rather than awaited, so the frame outlives the call.
+        // The detection is HERE, above the `escaping` gate, because the
+        // statement-level walk reaches `Task.FireAndForget(...)` as a
+        // non-escaping ExpressionStmt — the `escaping` bit that the tail of
+        // this function computes for the ARGUMENTS is derived from this very
+        // callee, one level too late to gate this call. Recognising the
+        // callee here is also what keeps the awaited twin silent by
+        // construction rather than by a special case: `await c.PingAsync()`
+        // is a UnaryExpr, never a `Task.FireAndForget` call, so it never
+        // reaches this arm at all.
+        //
+        // Only a frame over a BORROWED receiver carries an admission — the
+        // frame borrows the receiver and the sources its plain arguments
+        // contribute (§28.3 "Deferred-activation callees"). A `scoped`
+        // receiver is excluded by `trustFieldStoreCarrier` (§28.14 upgrades it
+        // to a static bound). The frame's receiver is the INNER call's callee
+        // target (`c` in `c.PingAsync()`).
+        if (!escaping && !forSource) {
+            if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    ce->callee.get())) {
+                const bool isFaF =
+                    ma->member == "FireAndForget" && ma->target &&
+                    dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()) &&
+                    static_cast<const ast::IdentifierExpr*>(ma->target.get())
+                            ->name == "Task";
+                if (isFaF && !ce->args.empty() && ce->args[0].value) {
+                    if (const auto* inner =
+                            dynamic_cast<const ast::CallExpr*>(
+                                ce->args[0].value.get())) {
+                        const auto* frameRecv =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                inner->callee.get());
+                        if (frameRecv && frameRecv->target &&
+                            trustFieldStoreCarrier(*frameRecv->target))
+                            reportTrustAdmission(
+                                Severity::Warning,
+                                ce->args[0].value->span.begin,
+                                "§30.1 pending-frame settlement obligation",
+                                "the receiver or a plain (non-`owned`, "
+                                "non-`scoped`) parameter");
+                    }
+                }
+            }
+        }
         if (escaping && isDeferredActivationCallResult(*ce)) {
             std::size_t pos = 0;
             for (const auto& a : ce->args) {

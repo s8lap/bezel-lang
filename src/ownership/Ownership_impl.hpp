@@ -4130,6 +4130,16 @@ private:
     // #2342/#2527 already settled for the §28.14 capture walk.
     bool isPlainBorrowParam(sema::Symbol* sym);
 
+    // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605).
+    // `trustFieldStoreCarrier` — is this borrow carrier one the report mode
+    // names (the receiver, or a plain reference-typed parameter of this body)?
+    // `reportTrustAdmission` — the single emission point for the mode; a no-op
+    // unless `--report-trust-admissions` is set, which is what leaves the
+    // default build's diagnostics unchanged.
+    bool trustFieldStoreCarrier(const ast::Expr& e);
+    void reportTrustAdmission(Severity sev, SourceLocation loc,
+                              const char* clause, const std::string& carrier);
+
     // §27.5 / §28.6 (#1217): reject a lambda stored to a FIELD or OUT-PARAM
     // (both escaping locations that outlive the method call) when the lambda
     // captures a ref/out parameter. The captured pointer is to the caller's

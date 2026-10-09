@@ -1148,7 +1148,21 @@ BEZEL_TEST(aot_cache_key, live_keys_separate_the_two_checked_contracts_modes_287
 // it, and someone adding an option in src/codegen will not see it fire until
 // the support area is built. That is still strictly better than the
 // hand-enumerated mode rows above, which fire for nobody.
-static_assert(sizeof(CodegenOptions) == 5,
+// 5 -> 6 (#4605, v0.307): `reportTrustAdmissions` was added to CodegenOptions
+// and is DELIBERATELY ABSENT from both modeString() and codegenModeString().
+// The ratchet's rule is scoped to options that "alter the emitted object or the
+// link line", and this one provably does neither — §28.3's report mode "is
+// informative: it changes no verdict and no generated code", so the object
+// under either setting is byte-identical and one cache entry may serve both.
+// Putting it in the key would orphan every entry for no soundness gain, and
+// would be the wrong fix for the real hazard: a cache HIT skips the compile
+// entirely, so it cannot produce a diagnostic. A test that wants to OBSERVE
+// this mode's warnings must use a front-end oracle (`compileObject`), not a
+// cached `runAot` — the same trap `BEZEL_DUMP_IR` already dodges by forcing
+// the real compile path. Adding it to the composers instead is the mistake
+// this exemption exists to prevent, so it is recorded here rather than left to
+// be re-derived.
+static_assert(sizeof(CodegenOptions) == 6,
               "CodegenOptions changed shape. Every option that alters the "
               "emitted object or the link line MUST appear in BOTH "
               "aot_support.hpp modeString() and codegenModeString(), or the "

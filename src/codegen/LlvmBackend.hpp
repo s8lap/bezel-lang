@@ -94,6 +94,19 @@ struct CodegenOptions {
     // (a program that did not compile now does), so the AOT test harness's
     // content-addressed cache keys on it exactly as on the three bits above.
     bool scopedAwaitBind = false;
+
+    // §28.3 *Diagnostics* — "The trust-admission report" (v0.307, #4605),
+    // OFF BY DEFAULT. CLI: `--report-trust-admissions`.
+    //
+    // The same front-end-knob-in-a-codegen-named-struct precedent as
+    // `scopedAwaitBind` above, and for a stronger reason: the spec states the
+    // report "is informative: it changes no verdict and no generated code",
+    // so it does NOT belong in the AOT harness's codegen-mode cache key
+    // (that key's set is "every CodegenOptions bit that alters the EMITTED
+    // OBJECT"). A cache hit skips the compile entirely and therefore cannot
+    // report a diagnostic, so a *test* driving this mode must go through a
+    // front-end oracle (`compileObject`) rather than a cached `runAot`.
+    bool reportTrustAdmissions = false;
 };
 
 // Build an LLVM module for `src` (already checked, using `ctx`'s side tables),

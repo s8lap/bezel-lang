@@ -74,6 +74,14 @@ public:
 
     DiagnosticEngine& diagnostics() { return diagnostics_; }
 
+    // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605): when
+    // true, the ownership pass emits a Warning at every site where it makes an
+    // admission resting on a K4.3-recorded trust clause. Set from
+    // `--report-trust-admissions` by the driver before the pipeline runs;
+    // false (the default) leaves every diagnostic exactly as it was.
+    bool reportTrustAdmissions() const { return reportTrustAdmissions_; }
+    void setReportTrustAdmissions(bool v) { reportTrustAdmissions_ = v; }
+
     // Allocate-and-own a symbol of the requested kind. Returns a raw pointer
     // that's stable for the lifetime of the context. The new symbol is
     // appended to the global symbol list (queryable via symbols()).
@@ -1435,6 +1443,8 @@ private:
     // Scope IDs are assigned in DFS order. `kModuleScope` (=1) is the
     // initial module scope; everything nested gets a fresh ID > 1.
     ScopeId nextScope_ = kModuleScope + 1;
+    // §28.3 *Diagnostics* trust-admission report mode (v0.307, #4605).
+    bool reportTrustAdmissions_ = false;
 };
 
 inline TypeRef* SemaContext::primitiveTypeRef(PrimitiveType p, bool nullable) {
