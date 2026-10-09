@@ -111,7 +111,7 @@ BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Conn(); "
-        "    var n := P.Take(owned w); "
+        "    var n := P.Take(move w); "
         "    return Conn.live; "               // 0 — disposed exactly once (by fs)
         "  end Main; "
         "end P;");
@@ -141,7 +141,7 @@ BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new Conn(); "
-        "    var n := P.Take(owned w); "
+        "    var n := P.Take(move w); "
         "    return Conn.live; "               // 0 — disposed exactly once (by y)
         "  end Main; "
         "end P;");

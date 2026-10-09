@@ -224,7 +224,7 @@ BEZEL_TEST(own_maybe_consumed, disposed_on_both_branches_clean_28_3) {
 BEZEL_TEST(own_maybe_consumed, reassign_after_join_clears_marker_clean_28_3) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Stream(); "
-        "if cond then sink.Take(owned x); x := new Stream(); else end; "
+        "if cond then sink.Take(move x); x := new Stream(); else end; "
         "x.Dispose();"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

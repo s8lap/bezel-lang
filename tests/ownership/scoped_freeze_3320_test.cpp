@@ -86,7 +86,7 @@ BEZEL_TEST(scoped_freeze_3320, do_end_lift_unfreezes_after_block_exit_accepted) 
         "    do "
         "      using var run := new Runner(lambda() => res.Ping()); "
         "    end; "
-        "    Prog.Sink(owned res); "
+        "    Prog.Sink(move res); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }

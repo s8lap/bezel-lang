@@ -202,7 +202,7 @@ BEZEL_TEST(scoped_freeze_3337, mutation_after_loop_end_accepted) {
         "      using var run := new Runner(lambda() => res.Ping()); "
         "      break; "
         "    end; "
-        "    Prog.Sink(owned res); "
+        "    Prog.Sink(move res); "
         "    return 0; "));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
