@@ -639,6 +639,7 @@ stdlib_0125	stdlib	68-Domain	skip	n/a	skip:signature-listing (DomainFaultedExcep
 stdlib_0126	stdlib	69-ChannelT-and-ChannelSenderT	skip	n/a	skip:signature
 stdlib_0127	stdlib	69-ChannelT-and-ChannelSenderT	fragment	compiles	
 stdlib_0128	stdlib	69-ChannelT-and-ChannelSenderT	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
+stdlib_0157	stdlib	69-ChannelT-and-ChannelSenderT	program	compiles	#1807: Channel<T>.Close() — receiver-initiated graceful close
 stdlib_0129	stdlib	610-TaskScope-v0175-808	skip	n/a	skip:signature
 stdlib_0130	stdlib	611-LockedT-and-RwLockedT-v0186	skip	n/a	skip:signature
 stdlib_0131	stdlib	611-LockedT-and-RwLockedT-v0186	skip	n/a	skip:signature-listing
