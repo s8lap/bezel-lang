@@ -24165,9 +24165,35 @@ struct UnwindIneligibleWalker {
                     continue;
                 }
                 bool untaint = false;
-                if (nullingCtor && a.modifier == "owned" && a.value) {
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                            a.value.get())) {
+                if (nullingCtor && a.value) {
+                    // #1970 / §28.3: the transfer marker at an argument position is
+                    // `move x` (part of the argument EXPRESSION) — per §A.4 /
+                    // proposal 0090 (v0.246) the bare-`owned` `ArgModifiers`
+                    // alternative was DELETED from the grammar, so `a.modifier ==
+                    // "owned"` no longer holds for ANY spelled program and this
+                    // untaint had become dead: `new Shared<T>(move b)` left `b`
+                    // TAINTED, so registerUnwindOwnedLocal registered nothing and a
+                    // throw BEFORE the ctor leaked b (LSan, 16 bytes, measured).
+                    // The nulling side already unwraps `move x`
+                    // (nullTransferredOwnedLocalSlot), so `eligible => nulled`
+                    // holds for BOTH nulling shapes newExprRoutesThroughNullingCtor
+                    // admits: the builtin Shared ctor (calls that helper) and the
+                    // explicit user ctor (buildOrderedArgs, which unwraps `move x`
+                    // to the same identifier). The operand is unwrapped to the
+                    // IDENTIFIER and tested by the same eligibility rule
+                    // nullTransferredOwnedLocalSlot applies, so the walker claims
+                    // eligibility for exactly the slots that get nulled. Any other
+                    // source shape stays tainted — a safe residual leak, never a
+                    // double-free. per §28.3 / §A.4
+                    const ast::IdentifierExpr* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+                    if (!id)
+                        if (auto* un =
+                                dynamic_cast<const ast::UnaryExpr*>(a.value.get()))
+                            if (un->op == "move")
+                                id = dynamic_cast<const ast::IdentifierExpr*>(
+                                    un->operand.get());
+                    if (id) {
                         sema::Symbol* asym = ctx.exprSymbol(*id);
                         if (auto* loc =
                                 dynamic_cast<sema::LocalSymbol*>(asym))

@@ -14652,17 +14652,39 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // `var` owned local or an `owned` parameter of pointer (class/interface)
         // representation — exactly what those registrations cover; a `using var`,
         // collection, or value-typed binding is untouched. // per §28.3
-        // NOTE: `move x` is NOT added here for user methods. For user methods,
-        // the transfer happens INSIDE the callee, so if the call throws before
-        // it succeeds (e.g., a later argument throws), the transfer never
-        // happens and the slot should NOT be nulled. Builtin collection transfers
-        // (OwningArray.Add, etc.) are handled separately by
-        // nullTransferredOwnedLocalSlot in Calls.cpp, which is called AFTER
-        // the call succeeds. // per §A.4 (proposal 0090, v0.246)
+        // `move x` IS unwrapped here. Per §A.4 (proposal 0090, v0.246) the
+        // bare-`owned` ArgModifiers alternative was DELETED from the grammar —
+        // `move x` is the ONLY surviving call-site transfer marker — so
+        // UnwindIneligibleWalker leaves a `move x` source unwind-ELIGIBLE for
+        // this path (see its walkCallArgs). That untaint is licensed by ONE
+        // invariant: `eligible => nulled` — the walker may leave a symbol
+        // eligible only because THIS nulling makes the caller's null-guarded
+        // unwindOnly disposal skip the transferred value. Not nulling a `move x`
+        // source broke the premise and produced a DOUBLE-FREE with the callee's
+        // own owned-param disposal (ASan heap-use-after-free, measured).
+        //
+        // The store lands at the "call about to run" point — AFTER every
+        // argument is evaluated — so a LATER argument that throws unwinds with
+        // the slot still LIVE and the disposal still correct (the sibling-throw
+        // leak this mechanism exists to fix, #1918). Builtin collection
+        // transfers (OwningArray.Add, etc.) do not come through here; they are
+        // nulled by nullTransferredOwnedLocalSlot in Calls.cpp AFTER the call
+        // succeeds. // per §A.4 (proposal 0090, v0.246), §28.3
+        bool transferredOwnedSlotNulled = false;
         if (nullTransferredOwned && a.value && !a.isDiscard &&
             (a.modifier == "owned" || params[idx].modifier == "owned")) {
-            if (auto* id =
-                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+            // `move x` wraps its operand identifier; per §A.4 the transfer
+            // marker is part of the argument EXPRESSION, so both spellings
+            // name the same slot and must be unwrapped identically.
+            const ast::IdentifierExpr* id =
+                dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (!id)
+                if (auto* un =
+                        dynamic_cast<const ast::UnaryExpr*>(a.value.get()))
+                    if (un->op == "move")
+                        id = dynamic_cast<const ast::IdentifierExpr*>(
+                            un->operand.get());
+            if (id) {
                 sema::Symbol* asym = ctx_.exprSymbol(*id);
                 bool eligible = false;
                 if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym))
@@ -14671,8 +14693,14 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                     eligible = (ps->modifier == "owned");
                 if (eligible)
                     if (llvm::AllocaInst* s = localSlot(*id)) {
-                        transferredOwnedArgSlots.emplace_back(
-                            s, a.value.get());
+                        transferredOwnedSlotNulled = true;
+                        // Record the UNWRAPPED identifier, not `a.value`:
+                        // nullStateMachineOwnedParamCapture dynamic_casts its
+                        // argument to IdentifierExpr and would no-op on a
+                        // MoveExpr, leaving a `move p` state-machine parameter's
+                        // frame capture un-nulled. For the bare-identifier
+                        // spelling the two are the same pointer.
+                        transferredOwnedArgSlots.emplace_back(s, id);
                         // #1990 / #1992 / §28.3: a bare owned local/param whose
                         // ownership transfers into an `owned` argument has its
                         // auto-dispose registered by registerUnwindOwnedLocal /
@@ -15591,9 +15619,23 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // heap instance with a disposal obligation) and a non-null pointer value —
         // a record/value-type, a move-only inline array, or a null literal is not a
         // heap-owned class instance and is excluded.
+        //
+        // fix #1918 / §28.3: form (b) is suppressed when this argument's source is
+        // a plain owned local/param whose OWN slot buildOrderedArgs records in
+        // `transferredOwnedArgSlots` (transferredOwnedSlotNulled). That source
+        // keeps its declaring-scope unwindOnly disposal — UnwindIneligibleWalker
+        // leaves it eligible precisely because the slot is NULLED at the transfer —
+        // so registering a SECOND transient disposal here on a spill copy made the
+        // SAME object reachable from two unwindOnly entries, and both fired on a
+        // later-argument throw: a double free (ASan heap-use-after-free, measured
+        // in `bz$M.Program$OrphanArg`). The source's own null-guarded disposal is
+        // the single correct site. `move x.F` / a `using var` source is NOT in
+        // `transferredOwnedArgSlots` and still needs this transient. per §28.3
         const ast::Expr* av = a.value.get();
         bool isOwnedTempArg = false;
-        if (dynamic_cast<const ast::NewExpr*>(av)) {
+        if (transferredOwnedSlotNulled) {
+            isOwnedTempArg = false;
+        } else if (dynamic_cast<const ast::NewExpr*>(av)) {
             isOwnedTempArg = true;
         } else if (auto* un = dynamic_cast<const ast::UnaryExpr*>(av)) {
             // `move x` / `move x.f` of an owned reference (not a value-type move).
