@@ -159,13 +159,6 @@ std::string prog(const std::string& mainBody) {
            " end Main; end C;";
 }
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
 }
@@ -234,7 +227,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_first_empty_throws_5) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -253,7 +245,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_last_empty_throws_5) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -273,7 +264,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_element_at_oor_throws_5) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -293,7 +283,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_element_at_negative_throws
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -336,7 +325,6 @@ BEZEL_TEST(dict_first_last_elementat_3576,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x 7 == 1400; disposed exactly once per iteration == 200.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1400 n=200"));
@@ -375,7 +363,6 @@ BEZEL_TEST(dict_first_last_elementat_3576,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x 9 == 1800; disposed exactly once per iteration == 200.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1800 n=200"));
@@ -415,7 +402,6 @@ BEZEL_TEST(dict_first_last_elementat_3576,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1400"));  // 200 x 7
 }
@@ -442,7 +428,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_generic_key_snapshot_no_le
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x (3 + 2) == 1000 (insertion order: First key=3, Last key=2).
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1000"));
@@ -467,7 +452,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_record_key_snapshot_no_lea
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=2200"));  // 200 x (1 + 10)
 }
@@ -505,7 +489,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_first_last_elem
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x 3 x (2 + 15) == 10200.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=10200"));
@@ -529,7 +512,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_single_no_leak_
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1800"));  // 200 x (2 + 7)
 }
@@ -553,7 +535,6 @@ BEZEL_TEST(dict_first_last_elementat_3576, sorted_dictionary_string_key_ascendin
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x (100 + 10 + 100 + 30) == 48000; a wrong (unsorted) order drops
     // one or both `int(... = ...)` terms to 0.

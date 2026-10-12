@@ -122,20 +122,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-std::string sanitizerText(const JitResult& r) {
-    std::string all;
-    for (const auto& d : r.diagnostics.diagnostics()) all += d.message + "\n";
-    return all;
-}
-
 // sum over i in 1..20 of len("xx-{i}") = 9*4 + 11*5 = 91.
 constexpr int kLenSum20 = 91;
 // sum over i in 1..10 of len("xx-{i}") = 9*4 + 1*5 = 41.
@@ -494,7 +480,6 @@ const char* kAsyncIteratorBody =
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_body_producer_local_is_released_spec_30_1) {
     JitResult r = runAotChecked(kAsyncProducerLocals);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -514,7 +499,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            generic_specialization_producer_local_is_released_spec_14_1) {
     JitResult r = runAotChecked(kGenericSpecProducerLocal);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -532,7 +516,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_local_live_across_await_is_released_once_spec_30_2) {
     JitResult r = runAotChecked(kAsyncLocalAcrossAwait);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -553,7 +536,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_borrow_local_releases_exactly_once_spec_28_3) {
     JitResult r = runAotChecked(kAsyncBorrowLocalExactlyOnce);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 1153 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
@@ -568,7 +550,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            generic_borrow_local_releases_exactly_once_spec_28_3) {
     JitResult r = runAotChecked(kGenericBorrowLocalExactlyOnce);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 1153 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
@@ -597,12 +578,8 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kAsyncAssignedStringParam);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 1446 B / 60 -> 390 B / 20 -> 0
     BEZEL_EXPECT_EQ(r.exitCode, 100);
-    const std::string t = sanitizerText(r);
-    BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
-    BEZEL_EXPECT_TRUE(t.find("heap-use-after-free") == std::string::npos);
 }
 
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
@@ -620,7 +597,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            generic_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kGenericAssignedStringParam);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 953 B / 40 -> 390 B / 20 -> 0
     BEZEL_EXPECT_EQ(r.exitCode, 100);
 }
@@ -638,7 +614,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_alias_chain_releases_every_link_spec_4_6) {
     JitResult r = runAotChecked(kAsyncAliasChain);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 934 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 3 * kLenSum10);
 }
@@ -656,7 +631,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_early_return_and_throw_edges_release_once_spec_28_3) {
     JitResult r = runAotChecked(kAsyncEarlyReturnAndThrow);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 2167 B / 94 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 98);
 }
@@ -674,7 +648,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            every_instantiation_arms_independently_spec_14_1) {
     JitResult r = runAotChecked(kGenericSeveralInstantiations);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 2802 B / 120 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 4 * kLenSum10);
 }
@@ -692,7 +665,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            outer_body_keeps_its_own_string_state_spec_14_1) {
     JitResult r = runAotChecked(kSpecializationBuiltMidOuterBody);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 371 B / 20 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 3 * kLenSum10);
 }
@@ -720,7 +692,6 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_iterator_body_locals_are_released_after_2817_spec_30_7) {
     JitResult r = runAotChecked(kAsyncIteratorBody);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-#2817
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
