@@ -24146,6 +24146,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             visitExpr(*cs->scrutinee);
             caseScrutineeSlot_ = savedScrutSlot;
         }
+        // §19.3 (v0.334, #5870): record this construct's pattern bindings
+        // against ITS scrutinee BEFORE the arms are walked, so a NESTED
+        // construct's check — which runs while this one is still mid-walk —
+        // can resolve an outer binding's own source (§19.3's last
+        // provably-unwritten case: "a borrowing-match binding whose own
+        // scrutinee's source is provably unwritten"). The CaseExpr twin is
+        // ExprTypecheck_Exprs.cpp's `visitExpr` CaseExpr arm.
+        {
+            std::vector<const ast::Node*> wpAnchors;
+            for (const auto& arm : cs->arms)
+                wpCollectBindingAnchors(arm.pattern.get(), wpAnchors);
+            for (const ast::Node* a : wpAnchors)
+                caseBindingSource_[a] = cs->scrutinee.get();
+        }
         validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
@@ -25311,8 +25325,825 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         nullNarrowed_ = std::move(caseRunningNull);    // §7.4 #2164
         currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope
         inEnumScrutineeCaseArms_ = savedEnumArms;
+        // §19.3 (v0.334, #5870): the arm loop above registered every arm
+        // binding and typed every guard and body, so the rule runs here — the
+        // LAST statement of the handler, scopes restored.
+        checkMoveOnlyPayloadBindingWritePoints(cs->scrutinee.get(), cs->arms);
     }
     // Break, Continue have no expressions.
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// §19.3 (v0.334, #5870) — *Move-only payload bindings across a write point*.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// QUOTED (:4039):
+//
+//   "Such a binding may therefore not be **live at a write point** of the
+//    construct, **unless the scrutinee's source is provably unwritten during
+//    the construct**."
+//
+// QUOTED (:2891, §15.3 *Pattern binding* — the restatement):
+//
+//   "A borrowing-match binding of a move-only payload may not be live at a
+//    write point of the construct unless the scrutinee's source is provably
+//    unwritten."
+//
+// QUOTED (:1407, §9.4 *Move-only receivers* — the router, naming BOTH shapes
+// this check reaches):
+//
+//   "What such a store must never do is leave a borrow addressing bytes it has
+//    rewritten. Two borrows could. One is a payload binding of a borrowing
+//    match over `this`. The other is a `this` that addresses payload bytes
+//    inside another value, because the receiver expression was such a binding.
+//    §19.3's rule *Move-only payload bindings across a write point* rejects
+//    both: `this`'s source is the caller's, which no member body sees, so it is
+//    never provably unwritten, and a binding used as a receiver is live across
+//    the call."
+//
+// WHY A COMPILE-TIME REJECTION AND NOT A RUNTIME FAULT. A borrowing-match
+// binding of a move-only payload "borrows the payload **in place**. It
+// addresses storage inside the scrutinee's source, and a store to that source
+// while the binding is live would leave it addressing another case's bytes, a
+// confusion no disposed flag backstops (§K4.1)". The binding is a SNAPSHOT COPY
+// of the payload value (`lowerCaseStmt` does `CreateStore(scrut, slot)`), so
+// after the store it does not read the field's current value — it reads
+// whatever the old bytes were overwritten with. Commit 591fe224 tried to
+// reroute the binding through `fieldAddr` to make it track the field; that
+// premise is wrong (§19.3 asks for a REJECTION, and rerouting a snapshot cannot
+// change what the copy holds) and it is DECLINED. This check is the other half
+// and is sema-side.
+//
+// SHAPE OF THE CHECK. §19.3 defines a violation as a triple — a binding of a
+// move-only payload, LIVE at a write point of the construct, where the
+// scrutinee's source is NOT provably unwritten. The three are decided in that
+// order, and the FIRST one that answers "no" short-circuits:
+//
+//   1. is any arm binding of move-only kind?      (§3.6 rule 2, substitution)
+//   2. is the scrutinee's source provably unwritten?  (§19.3's four cases)
+//   3. is such a binding used at-or-after a write point, in evaluation order?
+//
+// (2) runs over the construct's WHOLE body — §7.4 gives §19.3's provably
+// unwritten sources "the region of the whole construct" — so the walk that
+// answers (3) collects the same three sets (written / ref-out / captured) in
+// one traversal and (2) reads them. (3) then replays the same event log.
+
+// Every pattern-binding anchor reachable from `p`: the `BindingPattern` nodes,
+// and the `PositionalPattern` naked anchors that `LocalSymbol::decl` points at
+// for a case binding. Both are `ast::Node`s, so the set is keyed by address and
+// a `LocalSymbol::decl` membership test is the identity the analyzer uses to
+// recognise "this identifier is one of THIS construct's bindings".
+void ExprTC::wpCollectBindingAnchors(const ast::Pattern* p,
+                                     std::vector<const ast::Node*>& out) {
+    if (!p) return;
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(p)) {
+        out.push_back(bp);
+        return;
+    }
+    if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
+        for (const auto& sp : dp->subPatterns) {
+            if (sp.nakedAnchor) out.push_back(sp.nakedAnchor.get());
+            wpCollectBindingAnchors(sp.pattern.get(), out);
+        }
+        return;
+    }
+    if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+        for (const auto& m : ap->members)
+            wpCollectBindingAnchors(m.get(), out);
+        return;
+    }
+    if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) return;
+}
+
+// §3.6 rule 2: "the binding's kind is read at the substitution". The arm
+// binding handler already substituted the slot type (§14.1 generic
+// substitution runs through `substituteGenericFieldType` before `declType` is
+// assigned), so `isMoveOnlyValueType` on `LocalSymbol::declType` answers
+// per-instantiation — the same authority §8.6's boxing rejection consults.
+bool ExprTC::wpIsMoveOnlyCaseBinding(
+        const Symbol* sym, const std::vector<const ast::Node*>& anchors) {
+    auto* loc = dynamic_cast<const LocalSymbol*>(sym);
+    if (!loc || !loc->decl) return false;
+    bool mine = false;
+    for (const ast::Node* a : anchors)
+        if (a == loc->decl) { mine = true; break; }
+    if (!mine) return false;
+    const char* kind = nullptr;
+    return common::isMoveOnlyValueType(loc->declType, ctx_, kind);
+}
+
+// §7.4 *Stable locals*, over the region §19.3 names for its provably unwritten
+// sources — the WHOLE construct. Three of the four conditions are read from the
+// sets the construct walk filled; the fourth (`ref`/`out` parameter) is a
+// property of the symbol.
+bool ExprTC::caseLocalIsStableSource(
+        const Symbol* sym,
+        const std::unordered_set<const Symbol*>& written,
+        const std::unordered_set<const Symbol*>& refOut,
+        const std::unordered_set<const Symbol*>& captured) const {
+    if (!sym) return false;
+    if (written.count(sym) || refOut.count(sym) || captured.count(sym))
+        return false;
+    if (auto* loc = dynamic_cast<const LocalSymbol*>(sym)) {
+        // "other than a binding a borrowing match introduces (the last case
+        // below)" — a case binding is admitted only through the recursion in
+        // `caseSourceProvablyUnwritten`, which resolves ITS OWN scrutinee.
+        if (dynamic_cast<const ast::BindingPattern*>(loc->decl)) return false;
+        // `LocalSymbol::isConst` / `isBindAtomClause` are single-assignment
+        // positions (a `const` local, a §17.15 binding-atom clause): nothing
+        // can write them, which is the §7.4 shape, and it falls out of the
+        // `written` test above.
+        return true;
+    }
+    if (auto* ps = dynamic_cast<const ParameterSymbol*>(sym)) {
+        // §7.4's explicit exclusion: "not a parameter that binds the caller's
+        // storage: a `ref` parameter, written or inferred (§27.1), or a
+        // move-only operator operand or `Equals(T)` parameter (§25.2)". The
+        // `ref` / `out` spellings are on the symbol; an INFERRED `ref` is not,
+        // so a parameter-typed name that is also named by a `ref`/`out`
+        // argument anywhere in the construct (recorded in `refOut`) is
+        // excluded too — that is the `refOut.count` test above.
+        if (ps->modifier == "ref" || ps->modifier == "out") return false;
+        return true;
+    }
+    return false;
+}
+
+// §19.3's provably-unwritten whitelist (:4046 / :4053), verbatim:
+//
+//   - a stable local of the body over the construct, other than a binding a
+//     borrowing match introduces; an owning match's transferred binding is
+//     such a local.
+//   - storage inside such a local's value, reached from it without leaving
+//     the value (§9.4's key: no hop through a class- or interface-typed
+//     member).
+//   - a `readonly` field outside its construction window.
+//   - a borrowing-match binding whose own scrutinee's source is provably
+//     unwritten.
+//
+//   "`this` in a value-kind member body is never such a source; neither is any
+//    other field, an element, a static, or a property or indexer read."
+bool ExprTC::caseSourceProvablyUnwritten(const ast::Expr* scrutinee,
+                                         unsigned depth) const {
+    // A chain of members cannot bottom out in a cycle, but a chain of CASE
+    // bindings can (`case (case a of var x => x) of var y => …`), so the
+    // recursion is bounded rather than trusted.
+    if (!scrutinee || depth > 8) return false;
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(scrutinee))
+        return caseSourceProvablyUnwritten(pb->operand.get(), depth + 1);
+
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(scrutinee)) {
+        auto* fs = dynamic_cast<const FieldSymbol*>(ctx_.exprSymbol(*ma));
+        // "a property or indexer read" is never such a source, and neither is
+        // any other member (a method reference, a const). Only a FIELD.
+        if (!fs) return false;
+        if (fs->decl) {
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                for (auto m : fd->modifiers)
+                    if (m == "readonly")
+                        return true;  // outside its construction window
+            }
+        }
+        // Otherwise the field is mutable, so the question is whether the store
+        // that could rewrite it can land: it needs the RECEIVER's storage, and
+        // that is provably unwritten only when the receiver is itself one of
+        // the admitted sources AND the chain does not leave the value.
+        const TypeRef* rt = ctx_.exprType(*ma->target);
+        if (!rt) return false;
+        if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+            (rt->declaration->kind == ast::TypeDeclKind::Class ||
+             rt->declaration->kind == ast::TypeDeclKind::Interface))
+            return false;  // a hop through a reference-typed member
+        return caseSourceProvablyUnwritten(ma->target.get(), depth + 1);
+    }
+
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(scrutinee)) {
+        // An inline array's index is storage INSIDE the array value (§15.1.1
+        // stores it inline), so it reaches the same admission. Any other
+        // indexer is a call, and "an element" / "an indexer read" is not an
+        // admitted source.
+        const TypeRef* tt = ctx_.exprType(*ix->target);
+        if (!tt || tt->kind != TypeRef::Kind::InlineArray) return false;
+        return caseSourceProvablyUnwritten(ix->target.get(), depth + 1);
+    }
+
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(scrutinee)) {
+        Symbol* sym = ctx_.exprSymbol(*id);
+        auto* loc = dynamic_cast<const LocalSymbol*>(sym);
+        if (loc && dynamic_cast<const ast::BindingPattern*>(loc->decl)) {
+            // "a borrowing-match binding whose own scrutinee's source is
+            // provably unwritten. A pattern binding's source is its scrutinee's
+            // source, so a binding is never a source in its own right."
+            auto it = caseBindingSource_.find(loc->decl);
+            if (it == caseBindingSource_.end() || !it->second) return false;
+            return caseSourceProvablyUnwritten(it->second, depth + 1);
+        }
+        // §7.4's "stable local of the body over the construct" — a local OR
+        // a parameter, minus the exclusions `caseLocalIsStableSource` reads.
+        return caseLocalIsStableSource(sym, wpWritten_, wpRefOut_,
+                                       wpCaptured_);
+    }
+
+    // `this`, a static, a call, an element of a reference-typed collection, a
+    // temporary: none is an admitted source. Reject-by-default is the
+    // spec's shape here — the four cases above are an exhaustive whitelist.
+    return false;
+}
+
+namespace {
+
+// (unused placeholder removed)
+
+}  // namespace
+
+// §19.3's write-point bullet 1: "a call in any spelling whose statically
+// resolved declaration is not `pure`". Resolution mirrors `PureChecker's`
+// `callTargetIsPure` (the ONE authority for §22.15): the symbol side first,
+// then the AST node. An UNRESOLVED callee is treated as NOT pure — the typecheck
+// pass has already reported the lookup failure, and §19.3's bullet keys on
+// "not `pure`", so the conservative reading is the specified one.
+static bool wpCallIsPure(SemaContext& ctx, const ast::CallExpr& ce) {
+    Symbol* calleeSym = ce.callee ? ctx.exprSymbol(*ce.callee) : nullptr;
+    if (!calleeSym) return false;
+    if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym))
+        return memberIsPure(ms);
+    if (auto* cs = dynamic_cast<ConstructorSymbol*>(calleeSym))
+        return constructorIsPure(cs);
+    if (auto* ps = dynamic_cast<PropertySymbol*>(calleeSym))
+        return propertyGetterIsPure(ps);
+    // A function VALUE (§27) carries no effect information; §22.15 admits it
+    // only in a `pure` body, so at this site it is a call, not a pure one.
+    return false;
+}
+
+// One construct's walk. Statements and expressions are traversed in EVALUATION
+// ORDER (§22.5 / K9.5), because §19.3 keys the violation on a use that is live
+// AT a write point — an ordering fact, not a set-membership one.
+void ExprTC::wpWalkStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) wpWalkStmt(s.get());
+}
+
+void ExprTC::wpWalkStmt(const ast::Stmt* s) {
+    if (!s) return;
+    auto pushWrite = [&](SourceLocation loc, std::string what) {
+        CaseWritePointEvent ev;
+        ev.isWrite = true;
+        ev.loc = loc;
+        ev.what = std::move(what);
+        ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = 0;  // a statement write point is at depth 0
+        wpEvents_.push_back(std::move(ev));
+    };
+
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+        // §19.3 bullet 2/3: "a store of a move-only value to, or a `move` out
+        // of, storage other than a local of the body"; "a store that disposes
+        // a displaced value". A store is a write point whatever it stores.
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+            if (Symbol* ts = ctx_.exprSymbol(*id)) wpWritten_.insert(ts);
+        wpWalkExpr(as->target.get(), 0, nullptr);
+        wpWalkExpr(as->value.get(), 0, nullptr);
+        pushWrite(as->span.begin,
+                  std::string("the store `") +
+                      (as->op == ":=" ? std::string(":=") : std::string(as->op)));
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(is->target.get()))
+            if (Symbol* ts = ctx_.exprSymbol(*id)) wpWritten_.insert(ts);
+        wpWalkExpr(is->target.get(), 0, nullptr);
+        // §17.6: `x++` desugars to `x := x + 1` — a store.
+        pushWrite(is->span.begin,
+                  std::string("the update `") + std::string(is->op) + "`");
+        return;
+    }
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+        if (ld->initializer) wpWalkExpr(ld->initializer.get(), 0, nullptr);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+        if (lc->value) wpWalkExpr(lc->value.get(), 0, nullptr);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+        wpWalkExpr(es->expr.get(), 0, nullptr);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+        wpWalkExpr(ds->value.get(), 0, nullptr);
+        // §19.3 bullet 1 names "a disposal … by a discard".
+        pushWrite(ds->span.begin, "the discard");
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        wpWalkExpr(rs->value.get(), 0, nullptr);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+        wpWalkExpr(ts->value.get(), 0, nullptr);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+        if (ys->value) wpWalkExpr(ys->value.get(), 0, nullptr);
+        // §19.3 bullet 4: "`await` or a `yield return`".
+        if (!ys->isBreak)
+            pushWrite(ys->span.begin, "the `yield return`");
+        return;
+    }
+    if (auto* iff = dynamic_cast<const ast::IfStmt*>(s)) {
+        wpWalkExpr(iff->ifBranch.condition.get(), 0, nullptr);
+        wpWalkStmts(iff->ifBranch.body);
+        for (const auto& br : iff->elifBranches) {
+            wpWalkExpr(br.condition.get(), 0, nullptr);
+            wpWalkStmts(br.body);
+        }
+        if (iff->hasElse) wpWalkStmts(iff->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+        wpWalkExpr(ws->condition.get(), 0, nullptr);
+        wpWalkStmts(ws->body);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+        wpWalkExpr(fs->iterable.get(), 0, nullptr);
+        // `await for` is §19.3's `await` bullet; the common lowering makes it a
+        // call anyway, so this only covers the loop-head form.
+        if (fs->isAwait)
+            pushWrite(fs->span.begin, "the `await for`");
+        wpWalkStmts(fs->body);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+        wpWalkStmts(db->body);
+        return;
+    }
+    if (auto* tss = dynamic_cast<const ast::TryStmt*>(s)) {
+        wpWalkStmts(tss->body);
+        for (const auto& arm : tss->catches) {
+            wpWalkExpr(arm.guard.get(), 0, nullptr);
+            wpWalkStmt(arm.body.get());
+        }
+        wpWalkStmts(tss->finallyBody);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        // A NESTED construct inside this arm is part of this construct's
+        // write points (§19.3: "in the arm"). Its own bindings are its own
+        // handler's business.
+        wpWalkExpr(cs->scrutinee.get(), 0, nullptr);
+        wpWalkCaseArms(cs->arms);
+        return;
+    }
+    // Break / Continue / LocalTypeDecl: no expression, no store.
+}
+
+void ExprTC::wpWalkCaseArms(const std::vector<ast::CaseArm>& arms) {
+    for (const auto& arm : arms) {
+        if (arm.guard) wpWalkExpr(arm.guard.get(), 0, nullptr);
+        if (arm.exprBody) wpWalkExpr(arm.exprBody.get(), 0, nullptr);
+        wpWalkStmts(arm.stmts);
+    }
+}
+
+void ExprTC::wpWalkExpr(const ast::Expr* e, int callDepth,
+                        const ast::Expr* receiverOf) {
+    if (!e) return;
+
+    // ── USES ────────────────────────────────────────────────────────────────
+    // A binding USE, recorded where §19.3 can see it: at-or-after a write point
+    // in this evaluation order is the violation. `receiverOf` is non-null when
+    // this occurrence sits in RECEIVER position, which §19.3 makes live ACROSS
+    // the call.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        Symbol* sym = ctx_.exprSymbol(*id);
+        if (sym) {
+            auto* loc = dynamic_cast<const LocalSymbol*>(sym);
+            if (loc && dynamic_cast<const ast::BindingPattern*>(loc->decl)) {
+                CaseWritePointEvent ev;
+                ev.isWrite = false;
+                ev.loc = id->span.begin;
+                ev.bind = loc;
+                ev.bindName = std::string(id->name);
+                ev.bindLoc = id->span.begin;
+                ev.liveAcrossCall = receiverOf;
+                ev.enclosingCallDepth = callDepth;
+                ev.armIndex = wpArmIndex_;
+                wpEvents_.push_back(std::move(ev));
+            } else if (auto* ps = dynamic_cast<const ParameterSymbol*>(sym)) {
+                if (ps->modifier == "ref" || ps->modifier == "out") {
+                    // `ref` / `out` argument positions are recorded as CALLER
+                    // side by `wpCallIsPure`'s sibling below; a bare `ref`
+                    // parameter READ is not a binding use.
+                }
+            }
+        }
+        for (const auto& ta : id->typeArgs) (void)ta;
+        return;
+    }
+
+    // ── CALLS ───────────────────────────────────────────────────────────────
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        // Evaluation order (§22.5): the callee expression, then the arguments
+        // in textual order.
+        wpWalkExpr(ce->callee.get(), callDepth + 1, ce);
+        for (const auto& a : ce->args) {
+            if (!a.value) continue;
+            const bool byRefOrOut = a.modifier == "ref" || a.modifier == "out" ||
+                                    a.modifier == "out var" ||
+                                    a.modifier == "out using var";
+            if (byRefOrOut) {
+                // §7.4 / §19.3: a local "named by a `ref` or `out` argument
+                // in the region" is not stable, and §9.4 routes a chain passed
+                // as a `ref`/`out` argument as "the same store by other
+                // syntax" — so this position is a write point too.
+                if (auto* aid =
+                        dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                    if (Symbol* s = ctx_.exprSymbol(*aid))
+                        wpRefOut_.insert(s);
+                CaseWritePointEvent ev;
+                ev.isWrite = true;
+                ev.loc = a.value->span.begin;
+                ev.what = std::string("the `") + std::string(a.modifier) +
+                          "` argument";
+                ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = callDepth;
+        wpEvents_.push_back(std::move(ev));
+                wpWalkExpr(a.value.get(), callDepth, nullptr);
+                continue;
+            }
+            wpWalkExpr(a.value.get(), callDepth, nullptr);
+        }
+        if (!wpCallIsPure(ctx_, *ce)) {
+            CaseWritePointEvent ev;
+            ev.isWrite = true;
+            ev.loc = ce->span.begin;
+            std::string name;
+            if (ce->callee) {
+                if (auto* mid =
+                        dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get()))
+                    name = std::string(mid->member);
+                else if (auto* cid =
+                             dynamic_cast<const ast::IdentifierExpr*>(
+                                 ce->callee.get()))
+                    name = std::string(cid->name);
+            }
+            ev.what = name.empty() ? std::string("the call")
+                                   : ("the call `" + name + "`");
+            ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = callDepth;
+        wpEvents_.push_back(std::move(ev));
+        }
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        wpWalkExpr(nc->callee.get(), callDepth + 1, e);
+        for (const auto& a : nc->args)
+            if (a.value) wpWalkExpr(a.value.get(), callDepth, nullptr);
+        CaseWritePointEvent ev;
+        ev.isWrite = true;
+        ev.loc = nc->span.begin;
+        ev.what = "the null-conditional call";
+        ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = callDepth;
+        wpEvents_.push_back(std::move(ev));
+        return;
+    }
+
+    // ── MEMBER / INDEX CHAINS ───────────────────────────────────────────────
+    // The receiver propagates: `a[i].M()` has `a[i]` in receiver position, and
+    // §19.3 makes a receiver use live across the call.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        wpWalkExpr(ma->target.get(), callDepth, receiverOf);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        wpWalkExpr(nm->target.get(), callDepth, receiverOf);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        wpWalkExpr(ix->target.get(), callDepth, receiverOf);
+        for (const auto& a : ix->indices)
+            if (a.value) wpWalkExpr(a.value.get(), callDepth, nullptr);
+        // An indexer READ is a call (a getter); an inline-array index is
+        // compiler-provided storage. The former is a write point.
+        const TypeRef* tt = ix->target ? ctx_.exprType(*ix->target) : nullptr;
+        if (!tt || tt->kind != TypeRef::Kind::InlineArray) {
+            CaseWritePointEvent ev;
+            ev.isWrite = true;
+            ev.loc = ix->span.begin;
+            ev.what = "the indexer read";
+            ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = callDepth;
+        wpEvents_.push_back(std::move(ev));
+        }
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        wpWalkExpr(pb->operand.get(), callDepth, receiverOf);
+        return;
+    }
+
+    // ── OPERATORS ───────────────────────────────────────────────────────────
+    // §19.3 names "an operand … of an operator (§25.2)" live across the
+    // operator's activation, and §15.3 says an operator on a move-only value
+    // binds borrows — so a `BinaryExpr` on a move-only operand is a call.
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        wpWalkExpr(be->left.get(), callDepth, receiverOf);
+        wpWalkExpr(be->right.get(), callDepth, nullptr);
+        const TypeRef* lt = be->left ? ctx_.exprType(*be->left) : nullptr;
+        const char* kind = nullptr;
+        if (common::isMoveOnlyValueType(lt, ctx_, kind)) {
+            CaseWritePointEvent ev;
+            ev.isWrite = true;
+            ev.loc = be->span.begin;
+            ev.what = std::string("the `") + std::string(be->op) +
+                      "` operator on the move-only value";
+            ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = callDepth;
+        wpEvents_.push_back(std::move(ev));
+        }
+        return;
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        wpWalkExpr(ue->operand.get(), callDepth, receiverOf);
+        if (ue->op == "move") {
+            // §19.3 bullet 2: "a `move` out of storage other than a local of
+            // the body". The common case — a `move` out of a field — is the
+            // one the rule exists for; a `move` out of a local is already
+            // governed by §28.3's consume-site freeze, so it is admitted here
+            // to avoid a duplicate diagnostic.
+            const ast::Expr* root = ue->operand.get();
+            while (auto* m2 =
+                       dynamic_cast<const ast::MemberAccessExpr*>(root))
+                root = m2->target.get();
+            if (!dynamic_cast<const ast::IdentifierExpr*>(root)) {
+                CaseWritePointEvent ev;
+                ev.isWrite = true;
+                ev.loc = ue->span.begin;
+                ev.what = "the `move` out of non-local storage";
+                ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = callDepth;
+        wpEvents_.push_back(std::move(ev));
+            }
+        }
+        return;
+    }
+
+    // ── REMAINING EXPRESSION FORMS ──────────────────────────────────────────
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (const auto& a : ne->args)
+            if (a.value) wpWalkExpr(a.value.get(), callDepth, nullptr);
+        CaseWritePointEvent ev;
+        ev.isWrite = true;
+        ev.loc = ne->span.begin;
+        ev.what = "the constructor call";
+        ev.armIndex = wpArmIndex_;
+        ev.enclosingCallDepth = callDepth;
+        wpEvents_.push_back(std::move(ev));
+        return;
+    }
+    if (auto* te = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        wpWalkExpr(te->operand.get(), callDepth, nullptr);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        wpWalkExpr(tt->operand.get(), callDepth, nullptr);
+        return;
+    }
+    if (auto* ce2 = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        // §20: the condition is evaluated first, then exactly one branch.
+        wpWalkExpr(ce2->condition.get(), callDepth, nullptr);
+        wpWalkExpr(ce2->thenValue.get(), callDepth, nullptr);
+        wpWalkExpr(ce2->elseValue.get(), callDepth, nullptr);
+        return;
+    }
+    if (auto* is2 = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        bool hasHole = false;
+        for (const auto& part : is2->parts)
+            if (part.expr) hasHole = true;
+        for (const auto& part : is2->parts)
+            wpWalkExpr(part.expr.get(), callDepth, nullptr);
+        // §19.3 bullet 1 names "an interpolation's `ToString`" among the calls a
+        // construct invokes implicitly. Gated on there being at least one
+        // `{…}` hole: `$"literal"` renders no operand and calls nothing, and
+        // treating it as a write point would be a rejection the rule does not
+        // ask for (a superset here denies valid programs).
+        if (hasHole) {
+            CaseWritePointEvent ev;
+            ev.isWrite = true;
+            ev.loc = is2->span.begin;
+            ev.what = "the interpolated string's `ToString`";
+            ev.armIndex = wpArmIndex_;
+            ev.enclosingCallDepth = callDepth;
+            wpEvents_.push_back(std::move(ev));
+        }
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys) wpWalkExpr(k.get(), callDepth, nullptr);
+        for (const auto& el : cl->elements)
+            wpWalkExpr(el.get(), callDepth, nullptr);
+        return;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
+        wpWalkExpr(re->lo.get(), callDepth, nullptr);
+        wpWalkExpr(re->hi.get(), callDepth, nullptr);
+        wpWalkExpr(re->step.get(), callDepth, nullptr);
+        return;
+    }
+    if (auto* le = dynamic_cast<const ast::LambdaExpr*>(e)) {
+        // §19.3: "a live closure that captured the binding included". Every
+        // local the closure body reads is captured by it, so each is recorded
+        // as CAPTURED — a closure is the one construct through which a body
+        // outside this construct's arms can reach a binding, so the walk
+        // descends and the reads it finds count as uses.
+        auto noteCaptured = [&](const ast::Expr* x) {
+            if (auto* lid = dynamic_cast<const ast::IdentifierExpr*>(x))
+                if (Symbol* s = ctx_.exprSymbol(*lid)) wpCaptured_.insert(s);
+        };
+        for (const auto& p : le->params)
+            if (p.defaultValue) noteCaptured(p.defaultValue.get());
+        wpWalkExpr(le->exprBody.get(), callDepth, nullptr);
+        wpWalkStmts(le->stmts);
+        return;
+    }
+    if (auto* be2 = dynamic_cast<const ast::BindExpr*>(e)) {
+        for (const auto& cl2 : be2->clauses) wpWalkStmt(cl2.get());
+        wpWalkExpr(be2->body.get(), callDepth, nullptr);
+        return;
+    }
+    if (auto* wex = dynamic_cast<const ast::WithExpr*>(e)) {
+        if (wex->source) wpWalkExpr(wex->source.get(), callDepth, nullptr);
+        for (const auto& ia : wex->assigns)
+            wpWalkExpr(ia.value.get(), callDepth, nullptr);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
+        wpWalkExpr(cx->scrutinee.get(), callDepth, nullptr);
+        wpWalkCaseArms(cx->arms);
+        return;
+    }
+    // Literals, `default`, `()`, type-only nodes: no use, no write point.
+}
+
+// Record this arm's binding anchors, then walk the guard and body recording
+// USE and WRITE POINT events. The walk is over the WHOLE construct (every arm),
+// so §7.4's region — and therefore §19.3's provably-unwritten answer — is the
+// whole construct.
+void ExprTC::wpWalkArmRegion(const ast::CaseArm& arm,
+                             const std::vector<const ast::Node*>& anchors,
+                             int armIndex) {
+    (void)anchors;
+    const int savedArm = wpArmIndex_;
+    wpArmIndex_ = armIndex;
+    if (arm.guard) wpWalkExpr(arm.guard.get(), 0, nullptr);
+    if (arm.exprBody) wpWalkExpr(arm.exprBody.get(), 0, nullptr);
+    wpWalkStmts(arm.stmts);
+    wpArmIndex_ = savedArm;
+}
+
+void ExprTC::checkMoveOnlyPayloadBindingWritePoints(
+        const ast::Expr* scrutinee, const std::vector<ast::CaseArm>& arms) {
+    if (!scrutinee || arms.empty()) return;
+
+    // §35.5's OWNING match: a positional or marked named slot of a move-only
+    // payload TRANSFERS into its binding at arm selection (§15.3 *Pattern
+    // binding*), so the binding is an owning local of the arm body's scope
+    // under §15.3's own rules — "An owning match's transferred binding is such
+    // a local" (§19.3's first whitelist case), and it is not a borrow of
+    // payload storage at all. `owningMatchScrutineeForm` is the ONE authority
+    // for "owning match" (§35.5); this is the same shape it tests.
+    {
+        const TypeRef* st = ctx_.exprType(*scrutinee);
+        if (st && st->kind == TypeRef::Kind::Named && st->declaration &&
+            st->declaration->kind == ast::TypeDeclKind::Choice) {
+            auto verdict = common::classifyChoiceType(st, ctx_);
+            if (verdict && *verdict == common::ChoiceClassification::Owning) {
+                bool owning = false;
+                if (dynamic_cast<const ast::CallExpr*>(scrutinee)) owning = true;
+                if (auto* un =
+                        dynamic_cast<const ast::UnaryExpr*>(scrutinee))
+                    if (un->op == "move" && un->operand &&
+                        dynamic_cast<const ast::IdentifierExpr*>(
+                            un->operand.get()))
+                        owning = true;
+                if (owning) return;
+            }
+        }
+    }
+
+    // ── Step 1: does ANY arm introduce a move-only binding? ────────────────
+    std::vector<const ast::Node*> allAnchors;
+    for (const auto& arm : arms)
+        wpCollectBindingAnchors(arm.pattern.get(), allAnchors);
+    if (allAnchors.empty()) return;
+    // The kind test runs lazily, at each USE (`wpIsMoveOnlyCaseBinding`): a
+    // binding's type is reachable only through a use of it, and a binding with
+    // no use is not live at any write point — so an unreferenced move-only
+    // binding admits the construct.
+
+    // ── Step 2 + 3: walk the construct once ────────────────────────────────
+    // The walk fills BOTH the per-construct stable-source sets (read by
+    // `caseSourceProvablyUnwritten`, whose region §7.4 fixes at the WHOLE
+    // construct) and the ordered event log the violation replays.
+    wpEvents_.clear();
+    wpWritten_.clear();
+    wpRefOut_.clear();
+    wpCaptured_.clear();
+    for (std::size_t ai = 0; ai < arms.size(); ++ai)
+        wpWalkArmRegion(arms[ai], allAnchors, static_cast<int>(ai));
+
+    // The scrutinee's source answers the whitelist. Computed AFTER the walk so
+    // a local written anywhere in the construct is excluded.
+    if (caseSourceProvablyUnwritten(scrutinee, 0)) return;
+
+    if (wpEvents_.empty()) return;
+
+    // Replay: a USE is a violation when a WRITE POINT precedes it in
+    // evaluation order, or — for a use §19.3 makes live ACROSS its enclosing
+    // call (a receiver) — when a write point falls lexically inside that call.
+    //
+    // The write points considered are the USE'S OWN ARM'S (:4046). The arms
+    // are mutually exclusive and each arm's case test reads the source as it
+    // stands when THAT arm is tried (§19.4), so a declined arm's guard write
+    // point is explicitly "not a write point for a later arm's bindings" —
+    // the later binding is made after that write already ran, and reads the
+    // post-write value. Counting another arm's writes would be a superset of
+    // the rule, and a superset here is a silent denial of valid programs.
+    for (std::size_t i = 0; i < wpEvents_.size(); ++i) {
+        const CaseWritePointEvent& use = wpEvents_[i];
+        if (use.isWrite || !use.bind) continue;
+        if (!wpIsMoveOnlyCaseBinding(use.bind, allAnchors)) continue;
+
+        // Report AT MOST ONE diagnostic per binding per construct: the FIRST
+        // use that is live at a write point is the one the spec anchors the
+        // error to, and repeating it per use would flood the arm.
+        bool reported = false;
+        for (std::size_t j = 0; j < i && !reported; ++j)
+            if (wpEvents_[j].isWrite && wpEvents_[j].armIndex == use.armIndex)
+                reported = true;
+        if (reported) {
+            // §19.3: "The violation is a compile error at the use, naming the
+            // binding, the write point and the remedies: read what the arm
+            // needs before the point; or match the value where the construct
+            // owns it — the owning match over the take, `case move h.C of …`"
+            // (§35.5; §K9.2's restoration applies).
+            //
+            // Name the binding, the write point, and both remedies. The
+            // IMMEDIATELY preceding write point is the one named — an
+            // earlier one in the same arm is true but not what the reader
+            // needs to move.
+            std::string what;
+            for (std::size_t j = i; j-- > 0;)
+                if (wpEvents_[j].isWrite &&
+                    wpEvents_[j].armIndex == use.armIndex) {
+                    what = wpEvents_[j].what;
+                    break;
+                }
+            if (what.empty()) what = "a write point";
+            ctx_.diagnostics().report(
+                Severity::Error, use.bindLoc,
+                "`" + use.bindName +
+                    "` borrows its payload IN PLACE from the scrutinee's "
+                    "storage, and it is live across " + what +
+                    ", which can write that storage \xe2\x80\x94 so the read "
+                    "would address bytes the store overwrote, a confusion no "
+                    "disposed flag backstops. Read what the arm needs before "
+                    "the write point, or match the value where the construct "
+                    "owns it \xe2\x80\x94 `case move <scrutinee> of \xe2\x80\xa6` "
+                    "(\xc2\xa7""35.5's owning match; \xc2\xa7""19.3)");
+            continue;
+        }
+        // Live ACROSS the call: any write point inside the enclosing call's
+        // argument evaluation runs while the callee holds the borrow.
+        if (use.liveAcrossCall && use.enclosingCallDepth > 0) {
+            for (std::size_t j = i + 1; j < wpEvents_.size(); ++j) {
+                if (!wpEvents_[j].isWrite) continue;
+                if (wpEvents_[j].armIndex != use.armIndex) continue;
+                // Stop at the end of this use's call: a write point in a
+                // LATER, sibling call is a different point in evaluation
+                // order and is handled by the `j < i` replay.
+                if (wpEvents_[j].enclosingCallDepth >= 0 &&
+                    wpEvents_[j].enclosingCallDepth >= use.enclosingCallDepth)
+                    break;
+                ctx_.diagnostics().report(
+                    Severity::Error, use.bindLoc,
+                    "`" + use.bindName +
+                        "` is used as a RECEIVER here, so the callee holds the "
+                        "borrow for its whole activation \xe2\x80\x94 and " +
+                        wpEvents_[j].what +
+                        " runs inside that activation and can write the "
+                        "storage this binding addresses in place. Read what "
+                        "the arm needs before the call, or match the value "
+                        "where the construct owns it \xe2\x80\x94 `case move "
+                        "<scrutinee> of \xe2\x80\xa6` (\xc2\xa7""9.4's move-only "
+                        "receivers; \xc2\xa7""19.3)");
+                break;
+            }
+        }
+    }
 }
 
 bool typecheckExpressions(const ast::SourceFile& src, SemaContext& ctx) {

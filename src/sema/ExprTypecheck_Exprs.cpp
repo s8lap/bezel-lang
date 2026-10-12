@@ -12515,6 +12515,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             visitExpr(*ce->scrutinee);
             caseScrutineeSlot_ = savedScrutSlot;
         }
+        // §19.3 (v0.334, #5870): record this construct's pattern bindings
+        // against ITS scrutinee BEFORE the arms are walked, so a NESTED
+        // construct's check — which runs while this one is still mid-walk —
+        // can resolve an outer binding's own source (§19.3's last
+        // provably-unwritten case: "a borrowing-match binding whose own
+        // scrutinee's source is provably unwritten").
+        {
+            std::vector<const ast::Node*> wpAnchors;
+            for (const auto& arm : ce->arms)
+                wpCollectBindingAnchors(arm.pattern.get(), wpAnchors);
+            for (const ast::Node* a : wpAnchors)
+                caseBindingSource_[a] = ce->scrutinee.get();
+        }
         validateCaseArms(ce->arms);  // §16.4 / §19.6 (#738)
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
@@ -13743,6 +13756,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         fieldNarrowed_ = std::move(caseRunningField);  // §7.4 #2116
         currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope
         inEnumScrutineeCaseArms_ = savedEnumArms;
+        // §19.3 (v0.334, #5870): the CaseStmt twin of this call — same rule,
+        // same position in the handler, so the two spellings of `case` cannot
+        // drift.
+        checkMoveOnlyPayloadBindingWritePoints(ce->scrutinee.get(), ce->arms);
         // §19.6: an expression-position `case` whose value cannot be proven
         // to be covered by some arm raises MatchFailureException at runtime;
         // the compiler emits a non-exhaustiveness warning here. Statement-

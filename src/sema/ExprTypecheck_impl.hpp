@@ -2540,6 +2540,124 @@ private:
     // replace a downstream codegen IR failure / silently-unreachable arms.
     void validateCaseArms(const std::vector<ast::CaseArm>& arms);
 
+    // ── §19.3 (v0.334, #5870) *Move-only payload bindings across a write
+    // point* ──────────────────────────────────────────────────────────────────
+    //
+    // "Such a binding may therefore not be live at a write point of the
+    // construct, unless the scrutinee's source is provably unwritten during
+    // the construct." The rule spans §15.3's restatement (:2891) and §9.4's
+    // *Move-only receivers* (:1407), which routes two shapes into it — a `this`
+    // that addresses payload bytes, and a binding used as a receiver.
+    //
+    // ONE checker, called from BOTH `case` handlers (CaseStmt in
+    // ExprTypecheck.cpp, CaseExpr in ExprTypecheck_Exprs.cpp) at the same
+    // point in each — after every arm has been visited, so every binding has
+    // been registered and every arm body typed. Two call sites, one
+    // implementation, so the two spellings cannot drift.
+    void checkMoveOnlyPayloadBindingWritePoints(
+        const ast::Expr* scrutinee, const std::vector<ast::CaseArm>& arms);
+
+    // §19.3's "provably unwritten" whitelist (:4046/:4053), asked of the
+    // scrutinee's SOURCE: a stable local of the body over the construct
+    // (§7.4), storage inside such a local's value reached without leaving the
+    // value, a `readonly` field outside its construction window, or a
+    // borrowing-match binding over one of those. `this`, any other field, an
+    // element, a static and a property/indexer read are NOT such a source.
+    bool caseSourceProvablyUnwritten(const ast::Expr* scrutinee,
+                                     unsigned depth) const;
+
+    // §7.4 *Stable locals* over the whole construct (the region §19.3 names):
+    // a local or parameter of the body that is not written, not named by a
+    // `ref`/`out` argument, not a `ref`/`out` parameter, and not mutably
+    // captured — all three predicates read the per-construct sets the walker
+    // fills.
+    //
+    // §7.4's definition covers "a local variable OR PARAMETER of that body",
+    // and a `case` scrutinee is very often a formal — so this takes the
+    // `Symbol*` a name resolves to, not a `LocalSymbol*`. Taking the narrower
+    // type made every parameter-sourced construct take the reject-by-default
+    // branch, which is a silent denial of valid programs (MEASURED: `case p of
+    // var a => …` over a `[2 owned]Cell` parameter, with an unrelated write in
+    // the arm, was rejected on this tree).
+    bool caseLocalIsStableSource(const Symbol* sym,
+                                 const std::unordered_set<const Symbol*>&
+                                     written,
+                                 const std::unordered_set<const Symbol*>& refOut,
+                                 const std::unordered_set<const Symbol*>&
+                                     captured) const;
+
+    // The evaluation-order event log §19.3's write-point and liveness rules
+    // are decided on. `isWrite` false marks a USE of a pattern binding (K5.5
+    // "some later use"); `isWrite` true marks a write point, carrying the
+    // `what` the diagnostic names.
+    struct CaseWritePointEvent {
+        bool isWrite = false;
+        SourceLocation loc{};
+        std::string what;
+        const LocalSymbol* bind = nullptr;   // USE only
+        std::string bindName;
+        SourceLocation bindLoc{};
+        // A USE that §19.3 makes live ACROSS its enclosing call — a receiver,
+        // an operator / `Equals(T)` operand, or the operand of a
+        // compiler-provided inline-array operation — carries the call node, so
+        // a write point lexically INSIDE that call still counts against it.
+        const ast::Expr* liveAcrossCall = nullptr;
+        // Index of this event's enclosing call in `events`, or -1. Only the
+        // innermost is recorded; the outer calls' spans are recovered from the
+        // event log itself (`callSpanBegin` / `callSpanEnd` are the bounds of
+        // the contiguous run of events each call contributed).
+        int enclosingCallDepth = -1;
+        // Which arm's region this event is in. §19.3: "Each arm's case test
+        // reads the source as it stands when that arm is tried (§19.4), so a
+        // write point in a declined arm's guard is not a write point for a
+        // later arm's bindings." The arms are mutually exclusive, so the write
+        // points that can invalidate a binding are its OWN arm's — the guard
+        // runs after that arm's test made the binding, and a LATER arm's
+        // binding is made after the declined arm's guard already ran.
+        int armIndex = -1;
+    };
+
+    // Per-construct analysis state, reset at the entry of every construct
+    // `checkMoveOnlyPayloadBindingWritePoints` examines. `wpArmIndex_` is the
+    // arm whose region the walk is currently inside, and is -1 outside any arm.
+    std::vector<CaseWritePointEvent> wpEvents_;
+    int wpArmIndex_ = -1;
+    std::unordered_set<const Symbol*> wpWritten_;
+    std::unordered_set<const Symbol*> wpRefOut_;
+    std::unordered_set<const Symbol*> wpCaptured_;
+    // Pattern-binding anchor (a `BindingPattern` node or a `PositionalPattern`
+    // naked anchor) -> the scrutinee expression of the construct that
+    // introduced it. Filled at the TOP of each `case` handler, before the arms
+    // are visited, so a NESTED construct's check — which runs while the
+    // enclosing one is still mid-walk — can resolve an outer binding's own
+    // source (§19.3's last whitelist case).
+    std::unordered_map<const ast::Node*, const ast::Expr*> caseBindingSource_;
+
+    void wpWalkStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void wpWalkStmt(const ast::Stmt* s);
+    // `receiverOf` is non-null when this occurrence sits in RECEIVER position
+    // of that call, which §19.3 makes live ACROSS the call's activation.
+    void wpWalkExpr(const ast::Expr* e, int callDepth,
+                    const ast::Expr* receiverOf);
+    void wpWalkCaseArms(const std::vector<ast::CaseArm>& arms);
+    // Every pattern-binding anchor reachable from `p` — the `BindingPattern`
+    // nodes and the `PositionalPattern` naked anchors `LocalSymbol::decl`
+    // points at for a case binding.
+    static void wpCollectBindingAnchors(
+        const ast::Pattern* p,
+        std::vector<const ast::Node*>& out);
+    // Record the WRITE POINT / USE events for one arm's guard and body, with
+    // the arm's move-only binding set.
+    void wpWalkArmRegion(const ast::CaseArm& arm,
+                         const std::vector<const ast::Node*>& anchors,
+                         int armIndex);
+    // Is `sym` one of this construct's MOVE-ONLY pattern bindings? The kind is
+    // read at the substitution (§3.6 rule 2) — `isMoveOnlyValueType` is
+    // per-instantiation — so this answers from `LocalSymbol::declType`, which
+    // the arm-binding handler already substituted.
+    bool wpIsMoveOnlyCaseBinding(const Symbol* sym,
+                                 const std::vector<const ast::Node*>& anchors);
+
     // §19.3 (v0.167, #1371): every member of a `|` pattern-alternative list must
     // resolve to a CONSTANT — a type member is a compile error "in any
     // position", at arm level or inside a positional destructuring slot.
