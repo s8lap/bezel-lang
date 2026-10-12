@@ -216,6 +216,60 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
 }
 
 // =====================================================================
+// #5852 / §30.15 v0.334 — the SECOND HALF of the #1957 channel row, which the
+// plain no-leak row above cannot see. #5852: the vtableless-builtin release arm
+// that an auto-dropped `owned Channel<T>` PARAMETER takes declared
+// bz_channel_dispose with ONE parameter and passed ONE argument, while the
+// runtime takes (ch, cce_vtable). Two consequences, both measured:
+//   (a) when a 2-param declaration already existed in the module the call failed
+//       IR verification and the whole program was REJECTED — that is the
+//       channel_owned_param_autodrop_no_leak row above (r.ran false);
+//   (b) when that arm declared the function FIRST, declareC (which reuses the
+//       first declaration of a name) installed the 1-param type and the call
+//       site set up NO %rsi at all — the callee read whatever stale non-null
+//       pointer happened to be in the second argument register.
+// (b) is the live hazard: that second parameter is the vtable the runtime uses
+// to fault PENDING RECEIVERS, and channel_close_and_drain_pending
+// (bezel_runtime_concurrency.cpp) does `if (cce_vtable) memcpy(excObj, &cce_vtable,
+// sizeof(void*))` — it tolerates NULL but faithfully copies a garbage pointer
+// into the exception object a parked receiver is completed with.
+//
+// So this row parks a receiver (`inbox.Receive()` on an empty, still-open
+// channel) and THEN lets the `owned ch` parameter auto-drop. A correctly formed
+// bz_channel_dispose faults the parked task with ChannelClosedException and the
+// catch fires → got == 1. A garbage vtable produces a fault through a bogus
+// vtable instead, so this row is an end-to-end oracle on the SECOND argument,
+// not merely on the call arity. It also fails without the fix, because that
+// same program does not compile at all (IR verification).
+// =====================================================================
+BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
+           channel_owned_param_autodrop_faults_pending_receiver_spec_30_15) {
+    JitResult r = runAotChecked(
+        std::string("module M; import System.Threading; ") + kR +
+        "class C "
+        "  public static method Consume(owned ch: Channel<R>) "
+        "  end Consume; "              // auto-drop of `ch` disposes the channel
+        "  public static async method Main(): Task<int> "
+        "    var inbox := new Channel<R>(); "
+        "    using var tx := inbox.NewSender(); "
+        "    using var t := inbox.Receive(); "   // parks: empty + still open
+        "    Consume(move inbox); "     // dispose faults the parked receiver
+        "    var got := 0; "
+        "    try "
+        "      _ := await t; "
+        "    catch ChannelClosedException => do "
+        "      got := 1; "              // ONLY a real CCE vtable gets here
+        "    end "
+        "    end try; "
+        "    return got; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// =====================================================================
 // #1957 generalization: an `owned sm: Shared<T>` PARAMETER auto-dropped must run
 // bz_shared_release (decrement the strong count; dispose the inner value at 0),
 // not a generic vtable dispose. Same root cause. Clean under ASan/LSan.

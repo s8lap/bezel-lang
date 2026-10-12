@@ -3245,10 +3245,20 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
         return true;
     }
     // §30.15: a ChannelSender<T>. bz_channel_sender_release decrements the
-    // sender count (may close the channel if it reaches zero).
-    case VtablelessBuiltinReleaseArm::ChannelSender:
-        callVoid("bz_channel_sender_release", {recv});
+    // sender count (may close the channel if it reaches zero). fix #5852 /
+    // §30.15 v0.334: the runtime takes (tx, cce_vtable) — the vtable is used to
+    // fault PENDING RECEIVERS when this release closes the channel. This arm
+    // passed {recv} alone; declareC reuses the first declaration of the name, so
+    // declaring it 1-param here also poisoned every other call site in the
+    // module. Mirrors the Channel arm directly above.
+    case VtablelessBuiltinReleaseArm::ChannelSender: {
+        llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
+        {   auto vit = builtinVtable_.find("ChannelClosedException");
+            if (vit != builtinVtable_.end()) cceVt = vit->second;
+        }
+        callVoid("bz_channel_sender_release", {recv, cceVt});
         return true;
+    }
     // §8.1 / #646: a Stopwatch — a `bz_stopwatch_t*` freed via
     // bz_stopwatch_free (null-safe). Same release the `using var` arm emits.
     case VtablelessBuiltinReleaseArm::Stopwatch:
@@ -8161,13 +8171,38 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(fn, {obj});
             } else if (it->channel) {
+                // fix #5852 / §30.15 v0.334: bz_channel_dispose takes
+                // (ch, cce_vtable) — the second parameter is the vtable the
+                // runtime faults PENDING RECEIVERS with (§30.15 "Closing"). The
+                // arm declared {ptrTy()} and passed {obj} alone, so (a) when a
+                // 2-param declaration already existed in the module the call
+                // failed IR verification (rejected program), and (b) when this
+                // arm declared the function first, declareC reused the 1-param
+                // type and %rsi held whatever the previous call left there —
+                // a garbage vtable memcpy'd into a live receiver's exception
+                // object. Same 2-param + builtinVtable_ idiom as the
+                // non-unwindOnly channel arm below.
+                llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
+                {   auto vit = builtinVtable_.find("ChannelClosedException");
+                    if (vit != builtinVtable_.end()) cceVt = vit->second;
+                }
                 auto* fn = declareC("bz_channel_dispose",
-                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(fn, {obj});
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {obj, cceVt});
             } else if (it->channelSender) {
+                // fix #5852 / §30.15 v0.334: same defect, same arm chain —
+                // bz_channel_sender_release(tx, cce_vtable) takes two params and
+                // closes the channel with that vtable when it was the last
+                // sender. Was {ptrTy()} / {obj}.
+                llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
+                {   auto vit = builtinVtable_.find("ChannelClosedException");
+                    if (vit != builtinVtable_.end()) cceVt = vit->second;
+                }
                 auto* fn = declareC("bz_channel_sender_release",
-                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(fn, {obj});
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {obj, cceVt});
             } else if (it->weakHandle) {
                 auto* fn = declareC("bz_weak_release",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
