@@ -4783,9 +4783,23 @@ MethodOwnership::analyzeBareBorrowCall(const ast::CallExpr& ce) {
     // S3 laundering shape. A bare identifier binding is NOT a temporary (its owner
     // persists — S1's consume-freeze governs it), so producerState leaves it
     // Borrowed and it is not caught here.
+    //
+    // fix (§29.11, v0.334 narrowing): skip a deferred-activation call result
+    // (§29.11) used as an argument (receiver or explicit). Such a result is
+    // always immediately consumed within the callee's frame — the argument
+    // contributes its BORROWED sources to the frame and the callee produces a
+    // lazy sequence that the caller then uses. The borrowing never escapes the
+    // callee even if the result does; the laundering rule's "fresh owned temp
+    // bounds the bare-T result to the full expression" assumption (the temp
+    // outlives the result's uses) does not hold when the temp is a deferred
+    // activation whose frame is still alive and consuming the borrow when the
+    // result is used. The §28.3 deferred-activation argument check at
+    // checkDeferredActivationTempSitesExpr handles that case correctly. // per
+    // §28.3, §29.11
     auto noteTemp = [&](const ast::Expr* arg) {
         if (arg && !info.unboundOwnedTemp &&
-            producerState(*arg) == OwnershipState::Owned)
+            producerState(*arg) == OwnershipState::Owned &&
+            !isDeferredActivationCallResult(*arg))
             info.unboundOwnedTemp = arg;
     };
     // The receiver expression of an instance/extension call (for the temp scan).
