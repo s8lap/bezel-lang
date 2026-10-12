@@ -73,14 +73,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
     for (std::size_t p = hay.find(needle); p != std::string::npos;
@@ -136,7 +128,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return bg.Total; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     // WITHOUT the fix: LSan "184 byte(s) leaked in 2 allocation(s)" (the
     // bz_array_t header + its slot storage) → r.ran false.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -172,7 +163,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Consume(move arr); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
@@ -195,7 +185,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Consume(move arr); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     // WITHOUT the fix: LSan leaks the backing AND both Cell instances.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
@@ -229,7 +218,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Take(move xs); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
@@ -253,7 +241,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Take(move d); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
@@ -278,7 +265,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Take(move s); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -307,7 +293,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Take(move a); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     // WITHOUT the fix: LSan "120 byte(s) leaked in 2 allocation(s)".
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
@@ -331,7 +316,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Take(move a); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -363,7 +347,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     // WITHOUT the fix: the backing and both elements leak out the throw edge.
     // A double-registration would instead be an ASan heap-use-after-free here.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -405,7 +388,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Disp(move c2) + b.Count + 41; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     // A registration on the discharged path would be an ASan
     // heap-use-after-free / double-free here → r.ran false.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -434,7 +416,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Take(null); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -539,7 +520,6 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "    return C.Take(move a); "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
