@@ -54,7 +54,7 @@ bool accepted(const std::string& program) {
 // "The names in one type-parameter list are distinct"
 // ══════════════════════════════════════════════════════════════════════════════
 
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            duplicate_type_param_name_in_class_rejected_spec_14_1) {
     // class Box<T, T> — duplicate name in class type-parameter list
     bool rejected = rejectedWithDiag(R"BZ(
@@ -69,7 +69,7 @@ end Program;
     BEZEL_EXPECT_TRUE(rejected);
 }
 
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            duplicate_type_param_name_in_method_rejected_spec_14_1) {
     // method Foo<U, U> — duplicate name in method type-parameter list
     bool rejected = rejectedWithDiag(R"BZ(
@@ -94,7 +94,7 @@ end Program;
 //  in scope at the method's declaration, including its enclosing type's"
 // ══════════════════════════════════════════════════════════════════════════════
 
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            method_type_param_shadowing_enclosing_type_param_rejected_spec_14_1) {
     // class Container<T> { method Foo<T>(x: T) } — method T shadows class T
     bool rejected = rejectedWithDiag(R"BZ(
@@ -113,7 +113,7 @@ end Program;
     BEZEL_EXPECT_TRUE(rejected);
 }
 
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            method_type_param_bound_to_enclosing_type_param_accepted_spec_14_1) {
     // class Container<T> { method Store<U>(item: U) where U: T } — ok, different name
     bool ok = accepted(R"BZ(
@@ -141,7 +141,7 @@ end Program;
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Bare reference to generic class in variable declaration.
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            bare_generic_type_ref_in_var_decl_rejected_spec_14_1) {
     bool rejected = rejectedWithDiag(R"BZ(
 module Conf;
@@ -158,7 +158,7 @@ end Program;
 }
 
 // Bare reference to generic class in field declaration.
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            bare_generic_type_ref_in_field_decl_rejected_spec_14_1) {
     bool rejected = rejectedWithDiag(R"BZ(
 module Conf;
@@ -178,7 +178,7 @@ end Program;
 }
 
 // Bare reference to generic class in parameter declaration.
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            bare_generic_type_ref_in_param_decl_rejected_spec_14_1) {
     bool rejected = rejectedWithDiag(R"BZ(
 module Conf;
@@ -200,7 +200,7 @@ end Program;
 }
 
 // Differential control: explicit type arguments still accepted.
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            explicit_type_args_still_accepted_spec_14_1) {
     bool ok = accepted(R"BZ(
 module Conf;
@@ -217,7 +217,7 @@ end Program;
 }
 
 // Differential control: bare reference to non-generic class still accepted.
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            bare_ref_to_non_generic_class_still_accepted_spec_14_1) {
     bool ok = accepted(R"BZ(
 module Conf;
@@ -237,7 +237,7 @@ end Program;
 // even though List (builtin, arity 1) is always-available.
 // This exercises the #5172 builtin-fallback path: builtinAr=1 != t.genericArgs.size()=0,
 // so it falls through to the arity error — NOT the misleading builtin diagnostic.
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            user_generic_shadowing_builtin_bare_ref_rejected_spec_14_1) {
     bool rejected = rejectedWithDiag(R"BZ(
 module Conf;
@@ -254,7 +254,7 @@ end Program;
 }
 
 // User generic shadowing builtin: explicit type args still accepted.
-BEZEL_TEST(sema_generic_type_param_scope_5880,
+BEZEL_TEST(sema_bare_generic_type_ref_14_1,
            user_generic_shadowing_builtin_explicit_args_accepted_spec_14_1) {
     bool ok = accepted(R"BZ(
 module Conf;
