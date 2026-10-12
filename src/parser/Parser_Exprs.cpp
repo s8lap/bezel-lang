@@ -1665,6 +1665,15 @@ ast::PositionalPattern Parser::parsePositionalPattern() {
     if (current_.kind == TokenKind::Identifier &&
         peekAt(1).kind == TokenKind::Punctuator && peekAt(1).text == "=") {
         pp.slotName = current_.text;
+        // §19.3 "Named-slot bindings and ownership" (v0.334): the OWNERSHIP
+        // class of the binding is keyed on the slot's SPELLING, and sema's
+        // normalization clears `slotName` once it has resolved the name to a
+        // declaration index. Record the spelling in a field that survives, or
+        // every downstream consumer reads the named slot as the positional one
+        // sitting at the same index — and the two differ exactly where §19.3
+        // says they do: a positional slot transfers, an unmarked named slot
+        // "never transfers". // per §19.3, §35.5, v0.334
+        pp.namedSlot = true;
         advance();  // the Identifier naming the member
         advance();  // `=`
         pp.pattern = parsePattern(/*inPositional=*/false);

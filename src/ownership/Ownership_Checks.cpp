@@ -8068,6 +8068,30 @@ void MethodOwnership::collectOwningMatchTransferBindings(
     for (std::size_t j = 0;
          j < dp->subPatterns.size() && j < cc->caseDecl->payload.size(); ++j) {
         const ast::PositionalPattern& sp = dp->subPatterns[j];
+        // §19.3 "Named-slot bindings and ownership" (v0.334): an UNMARKED
+        // named slot NEVER transfers. This is the one place the transfer set
+        // differs from the positional spelling, and it differs at exactly the
+        // index `normalizeNamedDestructureSlots` resolved the name to: it
+        // REORDERS the named slots into declaration order and clears
+        // `slotName`, so before `namedSlot` was recorded this loop read
+        // `Fetched(response = var r)` as the positional `Fetched(var r)` and
+        // put `r` in the transfer set — which is what admitted `move r` on a
+        // binding the spec says is a borrow (#4763, corpus row s35_5_0010).
+        //
+        // §19.3: "An **unmarked** named slot never transfers: a getter may
+        // not return a fresh owned value (§28.6), so no slot read can mint
+        // an obligation, and in an **owning match** an owned or move-only
+        // value payload matched by an unmarked named slot is borrowed during
+        // the arm and disposed at construct completion ... exactly as a
+        // discarded slot." §35.5 names the same slot in its un-transferred
+        // remainder ("unlisted fields, unmarked named slots, discarded
+        // siblings").
+        //
+        // A slot reaching here with `namedSlot` set is necessarily UNMARKED:
+        // sema rejects every marked named slot outright, so the marker never
+        // survives to this pass. Whoever implements that admission must
+        // revisit this line — a MARKED named slot does transfer.
+        if (sp.namedSlot) continue;
         // §35.5: only a WHOLE-slot binding receives the transfer. A discard,
         // a constant, a range, and a nested pattern beneath the slot are "the
         // un-transferred remainder", disposed at construct completion — and a
@@ -8895,6 +8919,32 @@ void MethodOwnership::collectArmBindingAnchors(
     // introduce no binding.
 }
 
+// §19.3 "Named-slot bindings and ownership" (v0.334): the WHOLE-SLOT anchors
+// of `p`'s UNMARKED NAMED slots — exactly the set
+// `collectOwningMatchTransferBindings` now skips, so the two agree on which
+// bindings the owning match does NOT transfer into. Only a whole-slot binding
+// is collected, matching §35.5's own boundary ("only a WHOLE-slot binding
+// receives the transfer"): a binding nested beneath a named slot is a borrow
+// at every level already (§19.3), independently of its spelling, so it needs
+// no named-slot explanation.
+//
+// Used only to word the diagnostic, so a missing entry costs a less precise
+// message, never a wrong verdict. // per §19.3, §35.5, v0.334
+void MethodOwnership::collectNamedSlotAnchors(const ast::Pattern* p,
+                                             std::vector<const ast::Node*>& out) {
+    const auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p);
+    if (!dp) return;   // a BindingPattern / AltPattern head names no slot
+    for (const ast::PositionalPattern& sp : dp->subPatterns) {
+        if (!sp.namedSlot) continue;
+        if (!sp.nakedBinding.empty()) {
+            if (sp.nakedAnchor) out.push_back(sp.nakedAnchor.get());
+        } else if (auto* bp =
+                       dynamic_cast<const ast::BindingPattern*>(sp.pattern.get())) {
+            out.push_back(bp);
+        }
+    }
+}
+
 // fix #4664 (§35.5 *The borrowing match*, §19.3, §28.3 K8.3/K3.1, v0.307):
 // see the declaration in Ownership_impl.hpp.
 //
@@ -8935,6 +8985,12 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
         std::vector<const ast::Node*> anchors;
         collectArmBindingAnchors(arm.pattern.get(), anchors);
         if (anchors.empty()) continue;
+        // §19.3 "Named-slot bindings and ownership" (v0.334): which of THIS
+        // arm's bindings came from an unmarked named slot. Diagnostic wording
+        // only — the verdict below is unchanged either way. Built once per
+        // arm, beside the transfer set it explains.
+        std::vector<const ast::Node*> namedAnchors;
+        collectNamedSlotAnchors(arm.pattern.get(), namedAnchors);
         // The exemption set. Over-collecting here only admits more, so the
         // BROAD form (class and move-only value payloads alike) is the right
         // one: a slot §35.5 genuinely transfers must never be rejected.
@@ -8948,6 +9004,13 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
                     if (ls->decl == anchor) { bindSym = ls; break; }
             }
             if (!bindSym) continue;
+            // §19.3 "Named-slot bindings and ownership" (v0.334): did this
+            // binding come from an unmarked named slot? Diagnostic wording
+            // only (see `collectNamedSlotAnchors`); the verdict below is the
+            // same either way.
+            const bool isNamedSlot =
+                std::find(namedAnchors.begin(), namedAnchors.end(), anchor) !=
+                namedAnchors.end();
             // Which binding TYPES can carry a disposal obligation to double.
             // A copyable value payload "binds as a copy" (§35.5) and a
             // `string`/runtime-managed one a shared reference — neither can.
@@ -8973,9 +9036,13 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
                     bool moTransfers = false;
                     for (const sema::Symbol* t : transferred)
                         if (t == bindSym) { moTransfers = true; break; }
-                    if (!moTransfers)
-                        borrowOnlyMoveOnlyArmBindings_[bindSym] =
-                            BorrowOnlyArmBinding{bindSym->name, owning};
+                    if (!moTransfers) {
+                        BorrowOnlyArmBinding bob;
+                        bob.name = bindSym->name;
+                        bob.owningMatch = owning;
+                        bob.namedSlot = isNamedSlot;
+                        borrowOnlyMoveOnlyArmBindings_[bindSym] = bob;
+                    }
                 }
             }
             if (!bt || bt->kind != sema::TypeRef::Kind::Named ||
@@ -9015,8 +9082,11 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
                 if (classValued) owningMatchTransferBindings_.insert(bindSym);
                 continue;
             }
-            borrowOnlyArmBindings_[bindSym] =
-                BorrowOnlyArmBinding{bindSym->name, owning};
+            BorrowOnlyArmBinding bob;
+            bob.name = bindSym->name;
+            bob.owningMatch = owning;
+            bob.namedSlot = isNamedSlot;
+            borrowOnlyArmBindings_[bindSym] = bob;
         }
     }
 }
@@ -9054,16 +9124,36 @@ void MethodOwnership::reportIfBorrowOnlyArmBindingMove(
     auto it = borrowOnlyArmBindings_.find(sym);
     if (it == borrowOnlyArmBindings_.end()) return;
     const std::string name(it->second.name);
+    // §19.3 "Named-slot bindings and ownership" (v0.334) gets its own text.
+    // The generic owning-match clause below would be self-contradictory here:
+    // it reads "only a whole-slot binding of an `owned` or move-only value
+    // payload receives the transfer at arm selection", and a named slot's
+    // `var r` IS a whole-slot binding of an `owned` payload — what keeps the
+    // transfer from happening is the slot's SPELLING, not its shape (#4763).
+    // Naming the rule is also what the corpus row's `diagnostic:` needle
+    // (`never transfers`) asks for.
     const std::string why =
-        it->second.owningMatch
+        it->second.namedSlot
             ? std::string(
-                  "this slot is not one the owning match transfers \xe2\x80\x94 "
-                  "only a whole-slot binding of an `owned` or move-only value "
-                  "payload receives the transfer at arm selection")
-            : std::string(
-                  "an unmarked named owned binding, or a borrowed scrutinee of "
-                  "any provenance, in scrutinee position stays a BORROWING "
-                  "match, which transfers nothing");
+                  "an UNMARKED named slot never transfers \xe2\x80\x94 a slot "
+                  "read is a property read, and \xc2\xa7""28.6 admits no getter "
+                  "that returns a fresh owned value, so no named slot can mint "
+                  "a disposal obligation; in an owning match the payload it "
+                  "names is borrowed for the arm and disposed at construct "
+                  "completion, exactly as a discarded slot "
+                  "(\xc2\xa7""19.3, \xc2\xa7""35.5)")
+            : it->second.owningMatch
+                ? std::string(
+                      "this slot is not one the owning match transfers "
+                      "\xe2\x80\x94 "
+                      "only a whole-slot binding of an `owned` or move-only "
+                      "value "
+                      "payload receives the transfer at arm selection")
+                : std::string(
+                      "an unmarked named owned binding, or a borrowed "
+                      "scrutinee of "
+                      "any provenance, in scrutinee position stays a BORROWING "
+                      "match, which transfers nothing");
     const std::string remedy =
         it->second.owningMatch
             ? std::string(

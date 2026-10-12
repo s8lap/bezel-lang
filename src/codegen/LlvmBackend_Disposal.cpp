@@ -7233,6 +7233,20 @@ bool Emitter::markOwningMatchTransferredSlots(llvm::Value* choiceAddr,
          j < dp->subPatterns.size() && j < cc->caseDecl->payload.size(); ++j) {
         if (j >= payloadTy->getNumElements()) break;
         const auto& sp = dp->subPatterns[j];
+        // §19.3 "Named-slot bindings and ownership" (v0.334): an UNMARKED
+        // named slot NEVER transfers, so it is part of the un-transferred
+        // remainder §35.5 disposes at construct completion — "unlisted
+        // fields, unmarked named slots, discarded siblings" — and NOT part of
+        // the slots this mark discharges.
+        //
+        // This MUST agree with `collectOwningMatchTransferBindings`, which
+        // skips the same slots. The two error directions of this function are
+        // not symmetric (see the caller's note): marking a slot the arm did
+        // not adopt LEAKS it, and here ownership has already been told the
+        // binding is a borrow that owns nothing, so nothing else reclaims it.
+        // Skipping leaves the payload for the completion reclaim, which is
+        // what §19.3/§35.5 state.
+        if (sp.namedSlot) continue;
         // §35.5: a slot that binds nothing — `_`, a constant, a range — is
         // "the un-transferred remainder"; leave it for the completion reclaim.
         // THIS IS THE FIX: before #4617 the loop did not exist and every slot

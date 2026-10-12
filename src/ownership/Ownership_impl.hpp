@@ -3558,6 +3558,14 @@ private:
         // unmarked named slot, a non-`owned` payload, or a non-destructuring
         // arm. The two cases differ only in the diagnostic's explanation.
         bool owningMatch = false;
+        // §19.3 "Named-slot bindings and ownership" (v0.334): THIS binding
+        // came from an UNMARKED NAMED slot (`Fetched(response = var r)`). It
+        // gets its own explanation because the generic one is self-contradictory
+        // here: that text reads "only a whole-slot binding of an `owned` or
+        // move-only value payload receives the transfer", and a named slot's
+        // `var r` IS a whole-slot binding of an `owned` payload — the reason it
+        // does not transfer is the slot's SPELLING, not its shape (#4763).
+        bool namedSlot = false;
     };
     std::unordered_map<const sema::Symbol*, BorrowOnlyArmBinding>
         borrowOnlyArmBindings_;
@@ -3613,6 +3621,13 @@ private:
     // for the naked `W(w, _)` spelling). // per §19.3, v0.307
     static void collectArmBindingAnchors(const ast::Pattern* p,
                                          std::vector<const ast::Node*>& out);
+    // §19.3 "Named-slot bindings and ownership" (v0.334): the whole-slot
+    // anchors of `p`'s UNMARKED NAMED slots — the exact set
+    // `collectOwningMatchTransferBindings` skips, so the two agree on which
+    // bindings the owning match does not transfer into. Diagnostic wording
+    // only; see the definition. // per §19.3, §35.5, v0.334
+    static void collectNamedSlotAnchors(const ast::Pattern* p,
+                                        std::vector<const ast::Node*>& out);
     // fix #4664: the check point — one `move` the pre-pass walk reached.
     // Reports iff its operand is a bare identifier resolving to a
     // `borrowOnlyArmBindings_` entry. // per §35.5, §28.3 K3.1, v0.307
