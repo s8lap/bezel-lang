@@ -2429,6 +2429,78 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             return es;
         }(),
         isGenericCand);
+    // fix #5859 (§22.6 / §5.1 / §31.4, v0.334): §22.6's ranking is
+    // `Undecidable` — and so decides NOTHING — whenever an ARGUMENT's type is
+    // a BUILT-IN CLASS REFERENCE. Such a type is a `TypeRef::Kind::Named`
+    // with `declaration == nullptr` (§2.3/§31.4 make `Exception` and its
+    // family always-available with no user `TypeSymbol`), and
+    // `resolveOverload`'s `judgeable` predicate admits a `Named` type only
+    // when `t->declaration != nullptr`, so it rejects every built-in class
+    // reference. `resolveOverload` then returns `Undecidable` with
+    // `res.applicable.assign(nCand, false)` — EVERY candidate marked
+    // inapplicable without a single `classifyArg` cell being evaluated — and
+    // the `Undecidable` arm below finds nothing applicable and falls through
+    // to `return initial`, i.e. `lookupMember`'s FIRST-IN-SOURCE candidate.
+    //
+    // MEASURED on the issue's repro (`Log(message: string)` declared before
+    // `Log(ex: Exception)`, called as `Log(ex)` with `var ex: Exception`):
+    // an instrumented `judgeable` reports the argument as
+    // `kind=Named decl=nullptr`, and resolution lands on the `string`
+    // candidate — which `checkCallArity` → `checkArgsAgainstParams` then
+    // rejects, emitting a §5.1 diagnostic about a call the user did not
+    // write. Reversing the two declarations makes the identical call
+    // compile, which is what pins the defect to SELECTION rather than to the
+    // argument check: `Log(ex: Exception)` ALONE with the same `Exception`
+    // argument already compiles cleanly (the per-argument §5.1 check admits
+    // the built-in class reference through `checkAssignable`'s own
+    // builtin-ancestor walk).
+    //
+    // THE FIX is a §22.6 tie-break applied ONLY on the `Undecidable` path,
+    // restoring the one comparison `Undecidable` abandoned: identity, then
+    // the §12 supertype relation. It is deliberately NOT a widening of
+    // `judgeable` / `classifyArg`: those two are shared with the constructor
+    // -overload path (#4853/#5213) and the `new`-expression path, and making
+    // a declaration-less `Named` type generally judgeable there would newly
+    // emit "no overload … is applicable" / "ambiguous call" diagnostics for
+    // shapes that resolve fine today — a verdict flip on programs nobody
+    // reported as broken. Scoping the correction to the one case that is
+    // MEASURED wrong, and expressing it with the SAME `hasNamedAncestor`
+    // walk `checkAssignable` already uses for built-in class references
+    // (`commonTypeOf`'s `convertsInto` arm is the same predicate), keeps the
+    // change additive: it can only turn a first-in-source guess into the
+    // candidate the argument actually matches, and it can only ever do so
+    // when exactly ONE candidate matches — never emitting a diagnostic of
+    // its own, so no call that compiles today can start failing.
+    auto builtinRefPrefers = [&](std::size_t x, std::size_t y) -> bool {
+        // `x` is strictly better than `y` iff every argument position `x`
+        // binds EXACTLY is at least as good in `y`, and one position is
+        // strictly better — §22.6's own "better than" relation, restricted to
+        // the Exact/Convert distinction these built-in references support.
+        bool anyStrict = false;
+        for (std::size_t i = 0; i < argTypes.size(); ++i) {
+            const TypeRef* at = argTypeRows[x][i];
+            const TypeRef* px = paramTypes[x][i];
+            const TypeRef* py = paramTypes[y][i];
+            const auto grade = [&](const TypeRef* pt) {
+                if (!at || !pt) return 1;  // can't judge → treat as equal
+                if (typeRefEqual(at, pt)) return 2;
+                // §7: a nullable reference does not convert to a non-nullable
+                // target; §12: subtype → supertype does. Both go through the
+                // sanctioned ancestor walk, which resolves built-ins BY NAME
+                // (they carry no TypeSymbol to compare).
+                if (at->nullable && !pt->nullable) return 0;
+                return hasNamedAncestor(const_cast<TypeRef*>(at),
+                                        namedRefSimpleName(pt))
+                           ? 1
+                           : 0;
+            };
+            const int gx = grade(px);
+            const int gy = grade(py);
+            if (gx < gy) return false;
+            if (gx > gy) anyStrict = true;
+        }
+        return anyStrict;
+    };
     switch (r.outcome) {
         case OverloadOutcome::Resolved:
             return cands[r.winnerIndex];
@@ -2446,6 +2518,40 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             // is indexed by candidate position in cands (not by overloads[]).
             // cands[c] IS the MethodSymbol* so we can directly use cands[c]
             // with r.applicable[c].
+            //
+            // fix #5859 (§22.6 / §5.1 / §31.4, v0.334): `Undecidable` also
+            // arrives with EVERY candidate marked inapplicable when the
+            // ARGUMENT's type is a built-in class reference (see
+            // `builtinRefPrefers` above for the measurement). The two loops
+            // below both gate on `r.applicable[c]`, so they select nothing and
+            // the arm falls through to `return initial` — the first-declared
+            // overload, which is wrong whenever a LATER candidate is the one
+            // the argument matches. Run the §22.6 identity-then-supertype
+            // tie-break FIRST, but only to break a STRICT ordering: it is
+            // applied only when exactly one candidate beats every other, so
+            // a genuine tie still takes the pre-existing first-in-source path
+            // and NO new diagnostic is emitted on any shape.
+            {
+                std::size_t best = cands.size();
+                bool contested = false;
+                for (std::size_t cx = 0; cx < cands.size(); ++cx) {
+                    bool dominatesAll = true;
+                    for (std::size_t cy = 0; cy < cands.size(); ++cy) {
+                        if (cx == cy) continue;
+                        if (!builtinRefPrefers(cx, cy)) {
+                            dominatesAll = false;
+                            break;
+                        }
+                    }
+                    if (!dominatesAll) continue;
+                    if (best != cands.size()) {
+                        contested = true;
+                        break;
+                    }
+                    best = cx;
+                }
+                if (best != cands.size() && !contested) return cands[best];
+            }
             if (!hasNamed) {
                 for (std::size_t c = 0; c < cands.size(); ++c) {
                     if (sema::formalParamCount(*cands[c]) == ce.args.size() &&
