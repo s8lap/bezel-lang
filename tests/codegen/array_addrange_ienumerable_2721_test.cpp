@@ -71,13 +71,6 @@ int run(const std::string& src) {
 
 // A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
 // runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // Builds [1,2,3] at runtime, then AddRanges `expr` into a fresh Array<int> and
 // returns a caller-chosen encoding of the result.
 std::string prog(const std::string& body) {
@@ -154,7 +147,6 @@ BEZEL_TEST(array_addrange_ienumerable_2721, linkedlist_source_is_memory_safe) {
         "  using var b: Array<int> := new Array<int>(); "
         "  b.AddRange(ll); "
         "  return b.Count; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }
@@ -220,7 +212,6 @@ BEZEL_TEST(array_addrange_ienumerable_2721, set_of_string_source_contents) {
         "    if not b.Contains(\"v-1\") then return 92; end; "
         "    return 42; "
         "  end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -333,7 +324,6 @@ BEZEL_TEST(array_addrange_ienumerable_2721, class_element_owning_set_source) {
         "    if b[1].V <> 8 then return 92; end; "
         "    return 42; "
         "  end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -370,7 +360,6 @@ BEZEL_TEST(array_addrange_ienumerable_2721, string_elements_balance_under_asan) 
         "    if src.Count = 3 and src.Contains(\"v-1\") then score := score + 4; end; "
         "    return score; "
         "  end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
