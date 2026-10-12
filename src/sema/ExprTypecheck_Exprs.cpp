@@ -6003,6 +6003,49 @@ bool ExprTC::primitiveOperandMatchesParam(const ast::Expr* operandExpr,
 // class of that type (§25.2, v0.181, #1562) — declares one. `=`/`<>` on
 // classes are excluded (they invoke Equals, §25.2).
 MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
+    // fix #357 (§22.6 / §25.2, v0.334): an operand's static type, recovered for
+    // the one spelling the resolver deliberately leaves WITHOUT an exprType —
+    // `this` / `base` ("Slice 3b ... leave them unresolved" in
+    // ExprTypecheck_Exprs.cpp, which keeps `ctx_.exprType(*this)` null in every
+    // ordinary body; only a PRIMITIVE-extension body gets one).
+    // `memberTargetType` already resolves these spellings to `currentType_`
+    // (that is why collectInheritedOperators below FINDS a choice's declared
+    // `=`/`<>`), but the per-position match reads `ctx_.exprType` directly, so
+    // `quality()` returned Inapplicable, the candidate set emptied, and §35.7's
+    // use-site fallback then rejected a choice whose operators it DECLARES — a
+    // self-contradicting diagnostic ("Declare `=` and `<>` overloads" when they
+    // are declared). Per §22.6, applicability is decided on the operand's static
+    // type, and the receiver's static type here IS `currentType_`.
+    //
+    // Deliberately NOT a general exprType assignment: `this` stays untyped
+    // everywhere else, and only the binary-operator per-position match needs the
+    // receiver's type. Keyed on the SPELLING (an IdentifierExpr named
+    // this/base), never on `memberTargetType`, so an operand that resolves
+    // through any other route is untouched.
+    sema::TypeRef thisRefStorage;
+    auto staticTypeOf = [&](const ast::Expr* operand) -> const sema::TypeRef* {
+        if (const sema::TypeRef* t = operand ? ctx_.exprType(*operand) : nullptr)
+            return t;
+        auto* id = operand
+                       ? dynamic_cast<const ast::IdentifierExpr*>(operand)
+                       : nullptr;
+        if (!id || (id->name != "this" && id->name != "base") || !currentType_)
+            return nullptr;
+        // `base` names the BASE class (§12.3) — the same recovery
+        // memberTargetType performs, so the two spellings agree.
+        TypeSymbol* ts = currentType_;
+        if (id->name == "base")
+            for (TypeSymbol* b : currentType_->baseTypes)
+                if (b && b->kind == ast::TypeDeclKind::Class) {
+                    ts = b;
+                    break;
+                }
+        if (!ts) return nullptr;
+        thisRefStorage = sema::TypeRef{};
+        thisRefStorage.kind = sema::TypeRef::Kind::Named;
+        thisRefStorage.declaration = ts;
+        return &thisRefStorage;
+    };
     // §22.6 / §25 (#1131): collect ALL binary-operator overloads of `be.op`
     // declared on the operand's type. A type may declare several overloads of the
     // same operator symbol (e.g. `operator +(V, int)` and `operator +(V, V)`);
@@ -6054,8 +6097,10 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         std::unordered_map<std::string_view, TypeRef*> solved;
         TypeRef* p0 = declTypeOf(m->params[0]);
         TypeRef* p1 = declTypeOf(m->params[1]);
-        TypeRef* a0 = be.left ? ctx_.exprType(*be.left) : nullptr;
-        TypeRef* a1 = be.right ? ctx_.exprType(*be.right) : nullptr;
+        TypeRef* a0 =
+            const_cast<TypeRef*>(staticTypeOf(be.left.get()));
+        TypeRef* a1 =
+            const_cast<TypeRef*>(staticTypeOf(be.right.get()));
         if (p0 && a0 && !unifyReturnAgainstTarget(p0, a0, paramNames, solved))
             return false;
         if (p1 && a1 && !unifyReturnAgainstTarget(p1, a1, paramNames, solved))
@@ -6087,7 +6132,7 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     // narrowing is re-applied once, below.
     auto quality = [&](const ast::Expr* operand, Symbol* paramSym) -> Quality {
         TypeRef* pt = paramTypeOf(paramSym);
-        TypeRef* at = operand ? ctx_.exprType(*operand) : nullptr;
+        TypeRef* at = const_cast<TypeRef*>(staticTypeOf(operand));
         if (!pt || !at) return Quality::Inapplicable;
         // §7.11 (#1132, #5053): user-defined operator lifting over a nullable
         // operand is deferred — a `T?` operand does not match a non-nullable

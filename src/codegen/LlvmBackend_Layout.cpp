@@ -2557,7 +2557,19 @@ const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
     if (currentFn_) {
         for (const auto& [ms, fn] : methodFns_)
             if (fn == currentFn_ && ms->parent &&
-                ms->parent->kind == ast::TypeDeclKind::Record)
+                (ms->parent->kind == ast::TypeDeclKind::Record ||
+                 // fix #357 (§35.7, v0.334): a CHOICE receiver is a
+                 // value-type sum for the same reason a record is (§35.8: a
+                 // value-like choice boxes only on demand, and the choice's own
+                 // storage IS its cases' payloads), so inside a choice method
+                 // `this` is a POINTER to the by-value receiver exactly as
+                 // CG29 makes it for a record. Without this arm a choice's
+                 // `this` never loads, and a by-value parameter taking the
+                 // choice receives the raw pointer — an IR verification
+                 // failure ("Call parameter type does not match function
+                 // signature", `ptr` where `%choice.C` is wanted). See
+                 // coerceThisRecordValue below.
+                 ms->parent->kind == ast::TypeDeclKind::Choice))
                 return ms->parent;
     }
     if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent &&
@@ -2588,9 +2600,19 @@ llvm::Value* Emitter::coerceThisRecordValue(llvm::Value* v,
                                             llvm::Type* expectedTy) {
     if (!v || v != currentThis_ || !v->getType()->isPointerTy() || !expectedTy)
         return v;
-    if (const sema::TypeSymbol* rec = currentReceiverRecordType())
-        if (expectedTy == recordStruct(rec))
+    if (const sema::TypeSymbol* rec = currentReceiverRecordType()) {
+        // fix #357 (§35.7, v0.334): the receiver may be a CHOICE, whose
+        // value-type sum layout is `choiceStruct`, not `recordStruct`. The
+        // identity guard below is what keeps this sound: the load fires only
+        // when `expectedTy` IS the receiver's own struct, so a class/enum
+        // receiver, an unrelated struct destination, or a nullable-tagged
+        // {i8, T} destination (whose type differs) is still rejected.
+        llvm::StructType* recvSt =
+            rec->kind == ast::TypeDeclKind::Choice ? choiceStruct(rec)
+                                                   : recordStruct(rec);
+        if (expectedTy == recvSt)
             return builder_.CreateLoad(expectedTy, v);
+    }
     return v;
 }
 
