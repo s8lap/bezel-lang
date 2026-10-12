@@ -2721,28 +2721,71 @@ bool ExprTC::caseArmsExhaustive(
         std::unordered_set<std::string_view> covered;
         // §35.6: a destructuring slot is irrefutable per `slotsIrrefutable`
         // (hoisted above, function scope).
-        for (const auto& arm : arms) {
-            // §19.6 / §35.6: a guarded arm contributes nothing.
-            if (arm.guard) continue;
-            if (auto* np = dynamic_cast<const ast::NamedPattern*>(
-                    arm.pattern.get())) {
+        //
+        // §35.5 *Case patterns*, last bullet: "Payload-free case names are
+        // admissible members of `|` alternative lists (and count toward
+        // exhaustiveness, §19.6)". §35.6 spells the same thing from the
+        // coverage side: "a payload-free case by a constant-style pattern
+        // naming it (directly or in a `|` list)". An arm's pattern may
+        // therefore be an `AltPattern`, whose members are the cases that arm
+        // covers — so the walk has to RECURSE into it rather than matching
+        // only the two top-level shapes. The payload-free restriction is
+        // enforced by sema at pattern resolution (§19.3 rejects a payload-
+        // carrying case pattern in a `|` list, even all-discard), so the
+        // `payload.empty()` test below is a second gate on the same rule,
+        // not the only one.
+        //
+        // This mirrors the enum branch's `collectEnumPatternNames`
+        // (above), which already handles `ConstantPattern` under §10.6 /
+        // §19.3 — the choice branch was the only one of the two missing it.
+        //
+        // The node a `Red | Green` arm arrives as is a CONSTANT PATTERN, not
+        // an AltPattern: the parser (src/parser/Parser_Exprs.cpp
+        // `parsePattern`, §19.3 v0.183 #1584) collapses a `|` list whose
+        // members are all constant-shaped into one ConstantPattern, keeping
+        // AltPattern only for a heterogeneous list containing a range or
+        // relational member. §35.5's payload-free case names are exactly the
+        // constant-shaped case, so the ConstantPattern arm below is the one
+        // that carries the rule; the AltPattern arm keeps a
+        // range-containing list walking its members rather than vanishing.
+        // Each constant is admitted to coverage ONLY if it names a declared
+        // payload-free case, so a literal or an unrelated name contributes
+        // nothing — the same per-name gate the NamedPattern arm applies.
+        auto coverPayloadFreeCase = [&](std::string_view name) {
+            for (Symbol* m : sub->members) {
+                if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m)) {
+                    if (cc->name == name && cc->caseDecl &&
+                        cc->caseDecl->payload.empty())
+                        covered.insert(name);
+                }
+            }
+        };
+        std::function<void(const ast::Pattern*)> collectChoicePattern =
+            [&](const ast::Pattern* p) {
+            if (auto* np = dynamic_cast<const ast::NamedPattern*>(p)) {
                 // A bare case name — payload-free case only. (A payload
                 // case matched bare was rejected by sema at checkTopLevel
                 // NamedPattern; here it would not be in `covered` either
                 // way, and the warn-missing path below reports it.)
-                if (np->name && !np->name->parts.empty()) {
-                    std::string_view last = np->name->parts.back();
-                    for (Symbol* m : sub->members) {
-                        if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m)) {
-                            if (cc->name == last &&
-                                cc->caseDecl &&
-                                cc->caseDecl->payload.empty())
-                                covered.insert(last);
-                        }
-                    }
+                if (np->name && !np->name->parts.empty())
+                    coverPayloadFreeCase(np->name->parts.back());
+            } else if (auto* cp =
+                           dynamic_cast<const ast::ConstantPattern*>(p)) {
+                // §35.5: "Payload-free case names are admissible members of
+                // `|` alternative lists (and count toward exhaustiveness,
+                // §19.6)". Each member names one case.
+                for (const auto& c : cp->constants) {
+                    if (!c) continue;
+                    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            c.get()))
+                        coverPayloadFreeCase(ma->member);
+                    else if (auto* id =
+                                 dynamic_cast<const ast::IdentifierExpr*>(
+                                     c.get()))
+                        coverPayloadFreeCase(id->name);
                 }
-            } else if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(
-                           arm.pattern.get())) {
+            } else if (auto* dp =
+                           dynamic_cast<const ast::DestructuringPattern*>(p)) {
                 // A payload case by destructuring — covers the case iff
                 // every slot is irrefutable (§35.6).
                 if (dp->typeName && !dp->typeName->parts.empty() &&
@@ -2754,7 +2797,18 @@ bool ExprTC::caseArmsExhaustive(
                         }
                     }
                 }
+            } else if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+                // A heterogeneous list (a range/relational member present).
+                // §19.3 admits ranges only where a case name cannot appear,
+                // so this walk is a guard against silently dropping an arm;
+                // each member is judged by the same per-name rule.
+                for (const auto& m : ap->members) collectChoicePattern(m.get());
             }
+        };
+        for (const auto& arm : arms) {
+            // §19.6 / §35.6: a guarded arm contributes nothing.
+            if (arm.guard) continue;
+            collectChoicePattern(arm.pattern.get());
         }
         std::vector<std::string_view> missingCases;
         for (std::string_view cn : allCases)
