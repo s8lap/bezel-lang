@@ -387,9 +387,9 @@ BEZEL_TEST(xmod_method_owned_param_3176, t2_unmarked_owned_arg_rejected_22_3) {
     BEZEL_EXPECT_TRUE(mentions3176(err, "this call consumes `r`"));
     BEZEL_EXPECT_TRUE(mentions3176(err, "move r"));
     BEZEL_EXPECT_TRUE(mentions3176(err, "§22.3"));
-    // And specifically NOT the pre-fix spurious-marker complaint.
-    BEZEL_EXPECT_TRUE(!mentions3176(err, "this parameter position does not "
-                                         "take ownership"));
+    // And specifically NOT the §22.3 spurious-marker complaint (either the
+    // v0.169 `owned`-marker or v0.314 `move`-marker wording).
+    BEZEL_EXPECT_TRUE(!mentions3176(err, "does not take ownership"));
 }
 
 // ===========================================================================

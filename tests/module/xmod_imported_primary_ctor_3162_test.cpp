@@ -524,11 +524,11 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
     BEZEL_EXPECT_EQ(r, kRejected3162);
     BEZEL_EXPECT_TRUE(mentions3162(diag, "this call consumes `r`"));
     BEZEL_EXPECT_TRUE(mentions3162(diag, "\xC2\xA7""22.3"));
-    // And specifically NOT the pre-#3164 spurious-marker complaint, which would
+    // And specifically NOT the §22.3 spurious-marker complaint (either the
+    // v0.169 `owned`-marker or v0.314 `move`-marker wording), which would
     // mean the modifier is still answering "" and this rejection came from
     // somewhere else.
-    BEZEL_EXPECT_TRUE(!mentions3162(diag, "this parameter position does not "
-                                          "take ownership"));
+    BEZEL_EXPECT_TRUE(!mentions3162(diag, "does not take ownership"));
 }
 
 // ===========================================================================
@@ -562,8 +562,7 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
     BEZEL_EXPECT_EQ(r, kRejected3162);
     BEZEL_EXPECT_TRUE(mentions3162(
         diag, "a borrow cannot be passed where an `owned` value is required"));
-    BEZEL_EXPECT_TRUE(!mentions3162(diag, "this parameter position does not "
-                                          "take ownership"));
+    BEZEL_EXPECT_TRUE(!mentions3162(diag, "does not take ownership"));
 }
 
 // ===========================================================================

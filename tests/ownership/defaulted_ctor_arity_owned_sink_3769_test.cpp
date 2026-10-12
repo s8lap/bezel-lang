@@ -140,15 +140,17 @@ bool hasMissingOwnedMarker(const OwnershipResult& r, const std::string& name) {
     return false;
 }
 
-// The §22.3 SPURIOUS-marker rejection — "this parameter position does not take
-// ownership". Pre-fix this fired on the CORRECT spelling `new Base(owned x)`,
-// naming a position that is in fact `owned`; its absence is half of R2/R4's
-// proof and its presence is what R9/R11 keep for the positions that really are
-// not owned sinks.
+// The §22.3 SPURIOUS-marker rejection. Pre-fix this fired on the CORRECT
+// spelling `new Base(owned x)`, naming a position that is in fact `owned`;
+// its absence is half of R2/R4's proof and its presence is what R9/R11 keep
+// for the positions that really are not owned sinks.  The diagnostic appears
+// in two forms: the v0.169 `owned`-marker text ("this parameter position
+// does not take ownership") and the v0.314 `move`-marker text ("this
+// parameter does not take ownership").  Both contain "does not take ownership"
+// as a substring, so the broadened needle covers both.
 bool hasSpuriousOwnedMarkerReject(const OwnershipResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("this parameter position does not take ownership") !=
-                std::string::npos &&
+        if (d.message.find("does not take ownership") != std::string::npos &&
             d.message.find("§22.3") != std::string::npos)
             return true;
     return false;
