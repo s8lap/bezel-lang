@@ -558,6 +558,12 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticIndexers();
     // §23.5 (v0.241, #2758): indexer parameters may not declare defaults.
     checkIndexerParamDefaults();
+    // §23.4 / §1.6 (v0.334): an indexer's end clause may not carry an
+    // identifier label.
+    checkIndexerEndLabel();
+    // §23.5 (v0.334): ref and out parameters are not allowed in indexer
+    // parameter lists.
+    checkIndexerRefOutParams();
     // §22.5 (v0.306, #4494): every parameter after the first defaulted
     // parameter must itself have a default.
     checkParamDefaultOrdering();

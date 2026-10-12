@@ -668,6 +668,12 @@ private:
     // values" — the declaration-side premise of the positional-only index-
     // argument rule (A.4 IndexerDecl records the ParamList over-admission).
     void checkIndexerParamDefaults();
+    // §23.4 / §1.6: an indexer's `end` clause may not carry an identifier label
+    // — an indexer has no name to reference.
+    void checkIndexerEndLabel();
+    // §23.5: `ref` and `out` parameters are not allowed in indexer parameter
+    // lists.
+    void checkIndexerRefOutParams();
     // fix #4494 (§22.5 "Defaults and modifiers", v0.306): "Every parameter
     // after the first defaulted parameter must itself have a default." Runs
     // over every LOCAL formal list that admits a default, reading the rule's

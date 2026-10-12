@@ -14046,6 +14046,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     "runtime is still permitted, and raises "
                     "`OverflowException` at the range expression if it "
                     "evaluates to zero");
+            // §16.4 (v0.334): "`step` may not be applied to open-ended ranges."
+            // An open-ended range is one where lo or hi (or both) is absent.
+            if (!re->lo || !re->hi)
+                ctx_.diagnostics().report(
+                    Severity::Error, re->step->span.begin,
+                    "a step may not be applied to an open-ended range (§16.4)");
         }
         // fix #3247 / §16.3 (v0.277): `Range<T>`'s T is restricted by the
         // compiler to the integer types (byte, sbyte, short, ushort, int, uint,

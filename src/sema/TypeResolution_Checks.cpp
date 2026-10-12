@@ -3854,6 +3854,54 @@ void Resolver::checkIndexerParamDefaults() {
     }
 }
 
+// §23.4 / §1.6 (v0.334): an indexer's `end` clause may not carry an identifier
+// label. An `end`-label that is supplied must match the construct it closes; an
+// indexer has no name to reference, so a supplied identifier is a mismatch.
+void Resolver::checkIndexerEndLabel() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        for (Symbol* m : t->members) {
+            auto* ps = dynamic_cast<PropertySymbol*>(m);
+            if (!ps || !ps->isIndexer) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd || pd->blockEndLabel.empty()) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, pd->span.begin,
+                "an indexer has no name to label `end` with — write `end;` "
+                "without an identifier (§23.4, §1.6)");
+        }
+    }
+}
+
+// §23.5 (v0.334): `ref` and `out` parameters are not allowed in indexer
+// parameter lists.
+void Resolver::checkIndexerRefOutParams() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        for (Symbol* m : t->members) {
+            auto* ps = dynamic_cast<PropertySymbol*>(m);
+            if (!ps || !ps->isIndexer) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            for (const auto& p : pd->indexerParams) {
+                if (p.modifier == "ref" || p.modifier == "out" ||
+                    p.modifier == "out owned") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, p.loc,
+                        "an indexer parameter may not be declared with `" +
+                        std::string(p.modifier) +
+                        "` — ref and out parameters are not allowed in "
+                        "indexer parameter lists (§23.5)");
+                }
+            }
+        }
+    }
+}
+
 // fix #4494 (§22.5 "Defaults and modifiers", v0.306). The paragraph's closing
 // sentence, verbatim: "Every parameter after the first defaulted parameter must
 // itself have a default."
