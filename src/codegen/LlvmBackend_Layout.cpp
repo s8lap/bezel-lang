@@ -7937,6 +7937,11 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
         llvm::Value* caseEq = builder_.getInt1(true);
         for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
             const ast::Param& pf = cc->caseDecl->payload[pi];
+            // §9.2 / §35.7 (v0.307, #4652): a payload field marked `equality
+            // skip` is excluded from the auto-equality membership computation.
+            // The physical layout slot is still present (layout is unchanged),
+            // but the field takes no part in the `=` comparison.
+            if (pf.equality && pf.equality->isSkip) continue;
             llvm::Value* lf = builder_.CreateExtractValue(
                 l, {static_cast<unsigned>(1 + ci),
                     static_cast<unsigned>(pi)}, "cheq.lf");
@@ -8050,6 +8055,11 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
         llvm::Value* caseH = tagMix;  // base: tag folded in once.
         for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
             const ast::Param& pf = cc->caseDecl->payload[pi];
+            // §9.2 / §35.7 (v0.307, #4652): a payload field marked `equality
+            // skip` is excluded from the hash. The physical layout slot is
+            // still present (layout is unchanged), but the field is not folded
+            // into the case hash accumulator.
+            if (pf.equality && pf.equality->isSkip) continue;
             sema::TypeRef pTy;
             if (pf.type) {
                 // fix #4278: same substitution logic as emitChoiceEquality.
