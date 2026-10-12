@@ -64,25 +64,29 @@ int run(const std::string& src) {
 }
 
 // stdlib §5 / §29.11 (#1916): the issue's canonical Repro A — a block-body
-// method returns `xs.Select(...)` widened to `IEnumerable<int>`, and the caller
-// enumerates the `Make()` CallExpr temporary directly (the loop-owned dispose
-// path). The callee's `using var xs` is BORROWED by the pipeline; the drain must
-// snapshot its values BEFORE the callee's scope-end disposal of xs (no
-// use-after-free). {2,3} +1 -> {3,4} -> sum 7. Before the fix: SIGSEGV (-999).
+// method takes a source array as a PARAMETER (the caller owns it, so the #5624
+// borrow-escape check does not fire), returns `xs.Select(...)` widened to
+// `IEnumerable<int>`, and the caller enumerates the `Make()` CallExpr
+// temporary directly (the loop-owned dispose path). The pipeline borrows the
+// caller's array; the drain snapshots its values before the caller disposes the
+// array at its scope end (no use-after-free). {2,3} +1 -> {3,4} -> sum 7.
+// Before the fix: SIGSEGV (-999).  (The `using var` form `return
+// xs.Select(lambda(n) => n + 1)` inside `Make` triggers the #5624 borrow-lifetime
+// check — the spec's diagnostic directs "bind the source in the caller's scope
+// and return the borrow from there instead"; the parameter form is that reshape.)
 BEZEL_TEST(codegen_lazy_linq_ienumerable_return_forin_1916,
            select_returned_as_ienumerable_forin_temporary_spec_5) {
     std::string src =
         "module M; "
         "import System.Collections.Linq; "
         "class C "
-        "  public static method Make(): IEnumerable<int> "
-        "    using var xs: Array<int> := new Array<int>(); "
-        "    xs.Add(2); xs.Add(3); "
+        "  public static method Make(xs: Array<int>): IEnumerable<int> "
         "    return xs.Select(lambda(n) => n + 1); "
         "  end Make; "
         "  public static method Main(): int "
+        "    using var xs: Array<int> := [2, 3]; "
         "    var sum: int := 0; "
-        "    for var x in Make() do sum := sum + x; end for; "  // 3 + 4 = 7
+        "    for var x in Make(xs) do sum := sum + x; end for; "  // 3 + 4 = 7
         "    return sum; "
         "  end Main; "
         "end C;";
@@ -91,23 +95,23 @@ BEZEL_TEST(codegen_lazy_linq_ienumerable_return_forin_1916,
 
 // stdlib §5 / §29.11 (#1916): a lazy `Select` over a STRING source producing
 // `int` lengths, returned (block body) as `IEnumerable<int>` and enumerated over
-// the call temporary. Mirrors #1911's canonical case but in RETURN position.
-// The callee's `using var strings` (holding the heap strings) is disposed once
-// at the callee's scope end; the returned int snapshot owns no heap elements.
-// Lengths {2,3} -> sum 5. Before the fix: SIGSEGV (-999).
+// the call temporary. The source is passed as a PARAMETER (the caller owns it;
+// #5624 borrow-lifetime check does not fire). The returned int snapshot owns no
+// heap elements. Lengths {2,3} -> sum 5. Before the fix: SIGSEGV (-999).
+// (The `using var` form triggers #5624; the parameter form is used instead,
+// mirroring `where_returned_via_expression_body_forin_spec_5`.)
 BEZEL_TEST(codegen_lazy_linq_ienumerable_return_forin_1916,
            select_lengths_returned_as_ienumerable_forin_spec_5) {
     std::string src =
         "module M; "
         "import System.Collections.Linq; "
         "class C "
-        "  public static method Lens(): IEnumerable<int> "
-        "    using var strings: Array<string> := [\"ab\", \"cde\"]; "
+        "  public static method Lens(strings: Array<string>): IEnumerable<int> "
         "    return strings.Select(lambda(s) => s.Length); "
         "  end Lens; "
         "  public static method Main(): int "
         "    var sum: int := 0; "
-        "    for var x in Lens() do sum := sum + x; end for; "  // 2 + 3 = 5
+        "    for var x in Lens([\"ab\", \"cde\"]) do sum := sum + x; end for; "  // 2 + 3 = 5
         "    return sum; "
         "  end Main; "
         "end C;";
