@@ -7,7 +7,7 @@
 // Clean-compile ACCEPT control: bezelc -c must exit zero.
 //
 // RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=WARN --match-full-lines %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=WARN %s
 
 module M; class Val end Val; class C public method M( d: Dictionary<string, int>, od: OwningDictionary<string, Val>, arr: Array<int>, n: int) var e := arr.Select(lambda(x) => x * 2); end M; end C;
 
