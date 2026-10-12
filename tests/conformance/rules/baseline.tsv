@@ -964,10 +964,10 @@ s22_8_0005	pass
 s22_8_0006	pass	
 s22_8_0007	pass	
 s22_8_0008	pass	
-s22_8_0009	fail	compiled but spec rejects this (static readonly in instance ctor)
+s22_8_0009	pass	
 s22_8_0010	pass	
-s22_8_0011	fail	compiled but spec rejects this (readonly in lambda in ctor)
-s22_8_0012	fail	compiled but spec rejects this (static readonly in lambda in static ctor)
+s22_8_0011	pass	
+s22_8_0012	pass	
 s22_8_0013	pass	
 s22_9_0001	pass	
 s22_9_0002	pass	
