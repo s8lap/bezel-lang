@@ -884,6 +884,67 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                     if (llvm::Value* addr = implicitFieldAddr(*id, fty))
                         nullMovedFieldStorage(addr, fty);
                 }
+                // fix #5652 (§15.3 *Local lifetime* / §9.4 / §28.8.1, v0.334):
+                // the OWNING CHOICE field — the third move-only kind, and the
+                // one neither arm above reaches: an owning choice is stored
+                // INLINE as a `{ i32 tag, case payloads… }` struct, so it is
+                // neither `isPointerTy()` (the three pointer-typed predicates)
+                // nor an `ArrayType` of pointers (`nullMovedFieldStorage`), and
+                // there was no owning-CHOICE predicate in the guard at all.
+                //
+                // §9.4 states the requirement for the INSTANCE FIELD of either
+                // move-only kind: it is "the storage an **instance field** of
+                // either kind vacates under a whole-value `move` … from the move
+                // until the restoration store replaces the value". §15.3's
+                // *Local lifetime* bullet repeats it for a field source. §28.8.1
+                // *The vacated location* generalizes the posture.
+                //
+                // THE MARK IS A RUNTIME ZERO-STORE over the whole choice struct
+                // — the SAME encoding `markOwningChoiceMovedFromCore`
+                // (LlvmBackend_Disposal.cpp) already uses for the SOURCE LOCAL,
+                // and for the same reason, which is why this is neither a new
+                // encoding nor a tombstone: that helper's rationale states the
+                // scope-end pass "reads tag 0, enters case 0's arm, and finds
+                // payload pointers its EXISTING null-guard skips". The field's
+                // §28.4 step-2 pass reaches the same per-tag switch through
+                // `emitOwningChoiceLocationDisposal` →
+                // `emitOwningChoiceActiveCaseDisposal`, whose payload store is
+                // likewise guarded
+                // (`icmp eq <payload>, null → contBB`, LlvmBackend_Disposal.cpp
+                // "Null-guard: a never-bound arm … or a payload-defaulted
+                // construction"). So a zeroed field disposes NOTHING there, the
+                // §28.7 drop-on-overwrite at the restoration store reads the same
+                // zeros through `lowerOwnedChoiceFieldStore` ("a moved-from
+                // choice field holds zeroed bytes … is safe"), and the taker
+                // stays the SOLE owner — exactly-once, NOT a leak, and with no
+                // consumer of the field needing a new predicate.
+                //
+                // A nullable `C?` field lowers to `{ i8 hasValue, <choice> }`;
+                // zeroing clears `hasValue` too, which is the guard
+                // `emitOwningChoiceLocationDisposal` already tests before the
+                // walk (§35.9).
+                //
+                // `!emittingDisposerBody_` mirrors the two arms above for the
+                // same reason: inside a destructor the sole disposal site for an
+                // owned field is the auto-dispose pass, so vacating here would
+                // make it skip a still-owned payload (a LEAK).
+                //
+                // MEASURED without this (ASan on the generated code):
+                // heap-use-after-free, READ of size 8 in bz$Conf.Holder$
+                // DisposeCore, of a region freed by the taker and allocated in
+                // the field initializer — and it does NOT need the §9.4
+                // borrowing-match binding at all: `var t := move h.C;` with no
+                // read of the field in between reproduces it, so this is the
+                // VACANCY defect proper, not the disposed-state ENCODING that
+                // the borrowing-read cases (s9_4_0010, s15_1_1_0009/0011)
+                // additionally need and that is deliberately NOT attempted here.
+                if (owningChoiceFieldType(fs) && !emittingDisposerBody_) {
+                    llvm::Type* fty = nullptr;
+                    if (llvm::Value* addr = implicitFieldAddr(*id, fty))
+                        if (fty && !fty->isPointerTy())
+                            builder_.CreateStore(
+                                llvm::Constant::getNullValue(fty), addr);
+                }
             }
         } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                        moveSrc)) {
@@ -922,7 +983,18 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                        // miss it and neither arm's `isPointerTy()` test can
                        // fire; without widening the guard no arm is reached for
                        // it at all.
-                       owningInlineArrayFieldType(fs) != nullptr) &&
+                       owningInlineArrayFieldType(fs) != nullptr ||
+                       // fix #5652 (§15.3 / §9.4 / §28.8.1, v0.334): the
+                       // OWNING CHOICE field, the third move-only kind and the
+                       // one this guard had no predicate for at all — an owning
+                       // choice is stored INLINE as a tagged struct, so none of
+                       // the three pointer-typed predicates matches it and no
+                       // arm is reached. This is the form
+                       // `var t := move h.C;` takes, and the one the s9_4_0010
+                       // conformance case trips. The mark itself (a whole-struct
+                       // zero-store) and its full soundness argument are in the
+                       // bare-form arm above, which this mirrors.
+                       owningChoiceFieldType(fs) != nullptr) &&
                 fs->parent && !emittingDisposerBody_) {
                 auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                     ma->target.get());
@@ -966,6 +1038,19 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                                 st, currentThis_, idxIt->second);
                             nullMovedFieldStorage(
                                 addr, st->getElementType(idxIt->second));
+                        } else if (st && owningChoiceFieldType(fs)) {
+                            // fix #5652 (§15.3 / §9.4 / §28.8.1, v0.334): an
+                            // owning choice is a tagged STRUCT member, so the
+                            // `isPointerTy()` test below cannot fire for it.
+                            // Zero the whole struct — the encoding the source
+                            // LOCAL's `markOwningChoiceMovedFromCore` already
+                            // uses, argued in the bare-form arm above.
+                            llvm::Value* addr = builder_.CreateStructGEP(
+                                st, currentThis_, idxIt->second);
+                            builder_.CreateStore(
+                                llvm::Constant::getNullValue(
+                                    st->getElementType(idxIt->second)),
+                                addr);
                         } else if (st && st->getElementType(idxIt->second)
                                       ->isPointerTy()) {
                             llvm::Value* addr = builder_.CreateStructGEP(
@@ -1002,6 +1087,16 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                         // store stays as the fall-through.
                         if (owningInlineArrayFieldType(fs))
                             nullMovedFieldStorage(addr, fty);
+                        else if (fty && owningChoiceFieldType(fs))
+                            // fix #5652 (§15.3 / §9.4 / §28.8.1, v0.334): an
+                            // owning choice field is a tagged struct, so the
+                            // `isPointerTy()` fall-through cannot reach it.
+                            // `fieldAddr` already installed the receiver's
+                            // generic substitution, so `fty` is this
+                            // instantiation's own choice layout — the same
+                            // reason the GEP below is not hand-rolled.
+                            builder_.CreateStore(
+                                llvm::Constant::getNullValue(fty), addr);
                         else if (fty && fty->isPointerTy())
                             builder_.CreateStore(
                                 llvm::ConstantPointerNull::get(ptrTy()), addr);
