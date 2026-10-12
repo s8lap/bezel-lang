@@ -1942,6 +1942,147 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
     }
 }
 
+// §22.6 *`owned` and overload resolution* (v0.334) — the ownership
+// classification of ONE argument expression at a pair position, read off the
+// argument alone. The four clauses are exhaustive and the split is decidable
+// from the argument's spelling, never from the candidate under trial
+// (§22.6: "The clause split is decidable from the argument alone" — K3.13's
+// no-silent-consume rule and §22.3's marker make the marked/unmarked split
+// total).
+//
+// The three outcomes mirror the clauses that DO discriminate:
+//
+//   Owned     — clause 1: an owned production. Applicable to the `owned`
+//               candidate only. Move-rooted (`move x`, `move obj._f`,
+//               `move coll[i]` — §22.3's call-site marker) or any other
+//               §28.3 producers-table owned row: a fresh `new`, an
+//               `owned`-returning call, a reference-typed collection literal.
+//   Borrow    — clause 2: a borrow. Applicable to the PLAIN candidate only.
+//               An unmarked read of a named binding, a storage/property/
+//               indexer read, a plain-returning call.
+//   Both      — clauses 3 and 4, which admit BOTH members and therefore fall
+//               through to the ordinary ambiguity rule: a context-typed
+//               production (`null`, a null-producing `default`) and an
+//               argument carrying no ownership classification at all (an
+//               ordinary value, a `string`, a boxed value, a function value,
+//               a bottom-typed `throw`). §22.6: both fall "to the same
+//               ambiguity rule with the same remedy naming".
+//
+// Deliberately CONSERVATIVE: every shape this predicate cannot confidently
+// classify returns `Both`, which reproduces the pre-fix behaviour (ordinary
+// ambiguity) rather than silently steering a transfer or a borrow. Only the
+// two shapes §22.6 states outright — the marker-rooted argument and the
+// unmarked read of a named binding — discriminate, because those are exactly
+// the two the spec's own example block writes.
+//
+// per §22.6 *`owned` and overload resolution*
+enum class OwnedArgClass {
+    Owned,   // clause 1 — the `owned` candidate
+    Borrow,  // clause 2 — the plain candidate
+    Both,    // clauses 3 and 4 — no discrimination; the ambiguity rule decides
+};
+
+namespace {
+
+// §22.6 clause 1: is this argument move-rooted? §22.3's call-site marker is
+// `move` — A.7 `MoveExpr ::= "move" PrimaryExpr`, parsed to a `UnaryExpr` with
+// `op == "move"` (Parser_Exprs.cpp). The marker is TRANSPARENT through `!`
+// (§28.8.1 / §17.8: "the `!` being transparent to the marker"), so
+// `move x!` classifies owned as well.
+bool isMoveRootedArg(const ast::Expr* e) {
+    while (e) {
+        if (const auto* pe = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            e = pe->operand.get();
+            continue;
+        }
+        const auto* un = dynamic_cast<const ast::UnaryExpr*>(e);
+        if (!un || un->op != "move") return false;
+        return true;
+    }
+    return false;
+}
+
+// §22.6 clause 2: is this argument an unmarked read of a NAMED binding? That
+// is the one shape the spec names for clause 2 which is decidable from the
+// expression alone; storage/property/indexer reads (`MemberAccessExpr`,
+// `IndexExpr`) and plain-returning calls are clause-2 rows too, but a call's
+// owned/plain split is decided by the callee's declared return kind, which
+// `resolveMethodOverload` reaches through the symbol rather than the syntax —
+// `classifyOwnershipArg` handles those.
+//
+// `this` and `base` are IdentifierExprs that name the receiver, not a local
+// binding; §28.3's `this` row classifies the receiver BORROWED, which agrees
+// with clause 2, so they are left in the Borrow arm rather than special-cased.
+bool isUnmarkedNamedRead(const ast::Expr* e) {
+    // Transparent through `!` (A.7 PostfixBangExpr): `x!` is `x`'s own
+    // classification (§28.3's `x!` row).
+    while (const auto* pe = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        e = pe->operand.get();
+    return dynamic_cast<const ast::IdentifierExpr*>(e) != nullptr;
+}
+
+}  // namespace
+
+// §22.6 *`owned` and overload resolution* (v0.334).
+OwnedArgClass classifyOwnershipArg(const ast::Expr* e,
+                                   const sema::SemaContext& ctx) {
+    if (!e) return OwnedArgClass::Both;
+    // Clause 1: `move x` — §22.3's call-site marker, the shape the spec's own
+    // example block writes (`r.Append(move w)`).
+    if (isMoveRootedArg(e)) return OwnedArgClass::Owned;
+    // Clause 1 via the §28.3 producers table: any OTHER owned production. The
+    // two rows reachable from an argument expression are a fresh `new T(...)`
+    // and an `owned`-returning call; `isFreshOwnedClassProducer` is the
+    // codebase's shared accessor for exactly that pair (and requires the
+    // result to be a heap class, §28.3 row 1 / announcement-table row 1). It
+    // does NOT match a plain-returning call, whose result is a BORROW.
+    if (common::isFreshOwnedClassProducer(e, ctx, common::TypeParamResolver{}))
+        return OwnedArgClass::Owned;
+    // Clause 2: a plain-returning call (announcement-table row 4 — the call
+    // borrows, sourced at its receiver). Read off the call's STATIC result
+    // type, which the argument pre-pass has already recorded: a class or
+    // interface result is that borrow. A value / `string` / runtime-managed
+    // result is announcement-table row 7 — no ownership classification at
+    // all — which is clause 4's `Both`, and is left to the default below.
+    if (const auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        const sema::TypeRef* rt = ctx.exprType(*ce);
+        if (rt && sema::isNonNullableReferenceType(rt))
+            return OwnedArgClass::Borrow;
+        return OwnedArgClass::Both;
+    }
+    // Clause 2: an unmarked read of a named binding — the other shape the
+    // spec's example block writes (`r.Append(w)`).
+    if (isUnmarkedNamedRead(e)) return OwnedArgClass::Borrow;
+    // Clause 2: a storage / property / indexer read (§28.3's `obj.f`, `obj.P`
+    // and `coll[i]` rows — all Borrowed). None of these is move-rooted, so
+    // the clause-1 test above already declined them.
+    if (dynamic_cast<const ast::MemberAccessExpr*>(e) ||
+        dynamic_cast<const ast::IndexExpr*>(e) ||
+        dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return OwnedArgClass::Borrow;
+    // Clauses 3 and 4: a `null` literal, a null-producing `default`, a
+    // bottom-typed `throw`, an ordinary value, a `string`, a boxed value, a
+    // function value, a collection literal, an `if`/`??`/`case` join — all
+    // applicable to either member, so the ordinary ambiguity rule decides.
+    return OwnedArgClass::Both;
+}
+
+// §22.6 *`owned` and overload resolution* (v0.334): does a candidate whose
+// differing parameter is `owned` survive APPLICABILITY at this argument? The
+// predicate is one line and reads in both directions at once, which is what
+// keeps a fix here from silently choosing a side: `Owned` admits only the
+// `owned` member, `Borrow` only the plain one, `Both` either — so no edit can
+// make a transfer borrow, or a borrow transfer.
+bool ownedParamAdmits(OwnedArgClass cls, std::string_view paramModifier) {
+    const bool paramOwned = paramModifier == "owned";
+    switch (cls) {
+        case OwnedArgClass::Owned:  return paramOwned;
+        case OwnedArgClass::Borrow: return !paramOwned;
+        case OwnedArgClass::Both:   return true;
+    }
+    return true;
+}
+
 // §22.6 method-overload resolution; see header for contract.
 MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                                             const ast::CallExpr& ce) {
@@ -2141,6 +2282,106 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         }
         cands.swap(fc);
         binds.swap(fb);
+    }
+
+    // §22.6 *`owned` and overload resolution* (v0.334) — pipeline STAGE 4,
+    // ownership-mode APPLICABILITY, applied here between stage 3 (the
+    // `ref`/`out` filter above) and stage 5 (exact-match ranking below).
+    //
+    // §22.6: "At an argument position where two applicable candidates differ
+    // only by ordinary `owned` … the argument expression's ownership
+    // classification completes APPLICABILITY, by four exhaustive clauses", and
+    // "No ranking change … the marker participates in applicability, never in
+    // the better-than relation — at most one member of a pair survives
+    // applicability at any argument carrying a classification, so the
+    // exact-match ranking … operate on the surviving set exactly as written."
+    // So this is a FILTER, not a preference: it removes inapplicable
+    // candidates and lets the untouched pipeline below decide the rest.
+    //
+    // It is consulted ONLY where candidates actually differ by the marker
+    // (§22.6: "The classification is consulted only where candidates differ by
+    // the marker; a single declared member keeps the ordinary compatibility
+    // rules unchanged") — hence the `anyPair` guard, which is also what keeps
+    // every single-`owned` overload (the overwhelmingly common case, and the
+    // whole stdlib surface) off this path.
+    //
+    // Conjunctive across positions (§22.6): "a candidate survives applicability
+    // only where it survives at every differing position, so a pair's `owned`
+    // member is reached only when EVERY marked position receives an owned
+    // production; a call mixing an owned production at one differing position
+    // with a borrow at another leaves no surviving candidate and is a compile
+    // error".
+    {
+        // Does the surviving set contain a PAIR differing only by ordinary
+        // `owned` at some position? Only then does stage 4 engage.
+        bool anyPair = false;
+        for (std::size_t c = 1; c < cands.size() && !anyPair; ++c) {
+            const std::size_t np =
+                std::max(sema::formalParamCount(*cands[0]),
+                         sema::formalParamCount(*cands[c]));
+            for (std::size_t j = 0; j < np && !anyPair; ++j) {
+                const std::string_view pm0 =
+                    sema::formalParamModifier(*cands[0], j);
+                const std::string_view pmc =
+                    sema::formalParamModifier(*cands[c], j);
+                const bool plain0 = pm0.empty() || pm0 == "owned";
+                const bool plainc = pmc.empty() || pmc == "owned";
+                if (plain0 && plainc && pm0 != pmc) anyPair = true;
+            }
+        }
+        if (anyPair) {
+            std::vector<MethodSymbol*> oc;
+            std::vector<BindResult> ob;
+            bool anySurvivor = false;
+            for (std::size_t c = 0; c < cands.size(); ++c) {
+                bool ok = true;
+                const std::size_t np = sema::formalParamCount(*cands[c]);
+                for (std::size_t j = 0; j < np && ok; ++j) {
+                    // Only a DIFFERING position discriminates. At a position
+                    // where every candidate agrees on the modifier, ordinary
+                    // compatibility governs (§22.6).
+                    bool differs = false;
+                    for (std::size_t d = 0; d < cands.size(); ++d) {
+                        const std::string_view pd =
+                            sema::formalParamModifier(*cands[d], j);
+                        const std::string_view pc =
+                            sema::formalParamModifier(*cands[c], j);
+                        const bool plainD =
+                            pd.empty() || pd == "owned";
+                        const bool plainC =
+                            pc.empty() || pc == "owned";
+                        if (plainD && plainC && pd != pc) differs = true;
+                    }
+                    if (!differs) continue;
+                    const int ai = binds[c].paramToArg[j];
+                    // A defaulted position takes no argument, so no
+                    // classification reaches it; the candidate is unjudged
+                    // here and stands.
+                    if (ai < 0) continue;
+                    const ast::Expr* av =
+                        ce.args[static_cast<std::size_t>(ai)].value.get();
+                    if (!ownedParamAdmits(classifyOwnershipArg(av, ctx_),
+                                          sema::formalParamModifier(*cands[c],
+                                                                   j)))
+                        ok = false;
+                }
+                if (ok) {
+                    anySurvivor = true;
+                    oc.push_back(cands[c]);
+                    ob.push_back(std::move(binds[c]));
+                }
+            }
+            if (!anySurvivor) {
+                // §22.6's conjunctive-composition failure: no candidate
+                // survives every differing position. Defer to `arityFallback`
+                // so the existing argument-vs-parameter machinery reports the
+                // conflict; stage 4 decides applicability, it does not invent
+                // a new diagnostic for a shape it did not create.
+                return arityFallback();
+            }
+            cands.swap(oc);
+            binds.swap(ob);
+        }
     }
     if (cands.size() == 1) return cands[0];
 
