@@ -15769,8 +15769,10 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
         // #2310 / §29.8 / §30.1 (#973a residual): also null the FRAME capture
         // slot of an `owned` state-machine PARAMETER this call just consumed —
-        // forms 3 (`M(owned p)`) and 6 (`new Ctor(owned p)`). Self-gating (no-op
-        // outside a state-machine body, for non-parameter sources, for non-owned
+        // forms 3 (`M(move p)`, §A.4's surviving call-site transfer spelling)
+        // and 6 (`new Ctor(move p)`). srcExpr is the UNWRAPPED identifier, which
+        // is what this helper dynamic_casts for. Self-gating (no-op outside a
+        // state-machine body, for non-parameter sources, for non-owned
         // parameters). per §29.8 / §30.1
         nullStateMachineOwnedParamCapture(srcExpr);
     }

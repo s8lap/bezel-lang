@@ -2755,6 +2755,37 @@ struct FrameNullableParamScan {
         return ctx.exprSymbol(*id) == param;
     }
 
+    // Is `e` a CALL-SITE TRANSFER of the tracked parameter — the argument
+    // expression `move p` at a callee `owned` parameter position?
+    //
+    // #973a / §A.4 (proposal 0090, v0.246): the transfer marker at an argument
+    // position is `move x`, part of the argument EXPRESSION. The bare-`owned`
+    // `ArgModifiers` alternative was DELETED from the grammar, so the old
+    // `a.modifier == "owned" && isParamRef(a.value)` test is dead for every
+    // spelled program — which is why the `conditional_owned_argument_admitted`
+    // row fell back to the §28.3 "would be dropped here" reject on a program
+    // Appendix A.4 admits. This is the MoveExpr spelling of the same form.
+    //
+    // The admission is sound because the nulling premise is discharged in
+    // codegen: buildOrderedArgs' transferredOwnedArgSlots now unwraps the
+    // MoveExpr to its operand identifier and records the FRAME capture slot via
+    // nullStateMachineOwnedParamCapture, so the frame's teardown disposal skips
+    // the transferred parameter on the path that adopts it and disposes it on
+    // the path that does not — exactly once either way. // per §29.8 / §30.1
+    bool isParamMoveTransfer(const ast::Expr* e) const {
+        auto* u = dynamic_cast<const ast::UnaryExpr*>(e);
+        if (!u || u->op != "move") return false;
+        return isParamRef(u->operand.get());
+    }
+
+    // An argument at a transfer position: either the surviving `move p`
+    // spelling or the legacy bare-`owned` modifier form (kept so the scan does
+    // not lose an admission if the modifier is ever reintroduced).
+    bool isTransferArg(const ast::CallArgument& a) const {
+        return (a.modifier == "owned" && isParamRef(a.value.get())) ||
+               isParamMoveTransfer(a.value.get());
+    }
+
     // finally-body walker: deny ANY occurrence of the parameter (borrow or
     // discharge). The outer stmt()/expr() allow a bare identifier only in
     // specific safe positions (the marked-adoption RHS, `p.F` borrow read);
@@ -2947,9 +2978,12 @@ struct FrameNullableParamScan {
             // but isn't a discharge — so it doesn't move ownership and the
             // scan has nothing to admit).
             for (auto& a : c->args) {
-                if (a.modifier == "owned" && isParamRef(a.value.get())) {
-                    // form 3 / form 5 — explicit `owned` argument modifier
-                    // (user-method call, owning-collection Add/Insert/Set).
+                if (isTransferArg(a)) {
+                    // form 3 / form 5 — a call-site ownership transfer of the
+                    // parameter: the surviving `move p` spelling (§A.4,
+                    // proposal 0090, v0.246) or the legacy bare-`owned`
+                    // modifier. User-method call, owning-collection
+                    // Add/Insert/Set.
                     continue;
                 }
                 if (!a.modifier.empty()) {
@@ -2970,10 +3004,10 @@ struct FrameNullableParamScan {
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
             expr(c->callee.get());
-            // Same argument-position rule as CallExpr above (#2310: explicit
-            // `owned` arg is admitted).
+            // Same argument-position rule as CallExpr above (#2310 / #973a:
+            // a call-site transfer is admitted).
             for (auto& a : c->args) {
-                if (a.modifier == "owned" && isParamRef(a.value.get())) continue;
+                if (isTransferArg(a)) continue;
                 if (!a.modifier.empty()) { expr(a.value.get()); continue; }
                 expr(a.value.get());
             }
@@ -3007,10 +3041,10 @@ struct FrameNullableParamScan {
             expr(r->lo.get()); expr(r->hi.get()); expr(r->step.get()); return;
         }
         if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
-            // #2310 / §29.8 / §30.1 (form 6): `new Ctor(owned p)` — same
-            // argument-position rule as CallExpr above.
+            // #2310 / #973a / §29.8 / §30.1 (form 6): `new Ctor(move p)` —
+            // same argument-position rule as CallExpr above.
             for (auto& a : n->args) {
-                if (a.modifier == "owned" && isParamRef(a.value.get())) continue;
+                if (isTransferArg(a)) continue;
                 if (!a.modifier.empty()) { expr(a.value.get()); continue; }
                 expr(a.value.get());
             }
