@@ -1193,6 +1193,12 @@ private:
     // can type those expressions.
     void resolveTypesInBody(
         const std::vector<std::unique_ptr<ast::Stmt>>& body, Scope* scope);
+    // §21.10 (v0.334): resolveTypesInBody with the innermost-enclosing-block
+    // scope extent set (see currentBlockEndOffset_). Used at each nested-body
+    // recursion so a local type's recorded extent is its OWN block's.
+    void resolveTypesInNestedBlock(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body, Scope* scope,
+        std::uint32_t blockEndOffset);
     void resolveTypesInStmt(const ast::Stmt& s, Scope* scope);
     void resolveTypesInExpr(const ast::Expr& e, Scope* scope);
 
@@ -1617,6 +1623,40 @@ private:
     // Null outside a method/operator signature; an operator declares no generic
     // parameters, so the OperatorDecl branch nulls it as well.
     const std::vector<ast::GenericParam>* currentMethodGenericParams_ = nullptr;
+
+    // §21.10 (v0.334): true while resolving the members of a LOCAL type
+    // declaration (`record`/`enum` in statement position). §21.10 forbids such
+    // a type from referencing an enclosing generic parameter, and the only
+    // place that fact is knowable is while walking that type's own field and
+    // signature types — resolveNamed's "name is in scope only as a
+    // generic-param marker" branch (the same branch §11.6/#3584's nested-type
+    // rule fires in) is the single point every such reference passes through,
+    // so the flag is what tells it to diagnose instead of recording a
+    // declaration-less Named TypeRef.
+    //
+    // Set/restored around the member walk in resolveTypesInStmt's LocalTypeDecl
+    // arm, on exactly the lifetime of the walk. A local type declares no type
+    // parameters of its own (§21.10: the GenericParams? slot must be empty, and
+    // Parser_Stmts.cpp rejects one), so EVERY generic-param marker reachable
+    // from inside it belongs to an enclosing declaration — there is no own-param
+    // carve-out to make, which is what distinguishes this from §11.6's nested
+    // -type rule (whose `isOwnParam` loop admits the nested type's own).
+    bool inLocalTypeMembers_ = false;
+
+    // §21.10 (v0.334): the source offset one past the end of the INNERMOST
+    // enclosing statement block at the point currently being walked — the
+    // "end of the enclosing block" a local type's name leaves scope at. Zero
+    // means "not tracked here", which TypeSymbol::localScopeEndOffset reads as
+    // "cannot prove the reference is out of scope", so an untracked region
+    // admits rather than falsely rejecting.
+    //
+    // Set/restored around each nested-body recursion (do…end, if/elif/else
+    // branches, loop bodies, try/catch/finally, and each callable's own body),
+    // so the value at a LocalTypeDecl is exactly its innermost enclosing block
+    // and not an outer one. Recorded onto the created TypeSymbol as
+    // localScopeEndOffset, where resolveNamed's module-children fallback
+    // consults it before admitting a reference.
+    std::uint32_t currentBlockEndOffset_ = 0;
 
     // §14.6 (v0.262, #3271): the METHOD declaration whose signature and body
     // are being resolved, so a self-naming generic call inside that body can be

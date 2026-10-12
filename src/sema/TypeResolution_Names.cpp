@@ -1652,7 +1652,10 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         // body (LocalDecl `: Type`, foreach iteration type, …) so
         // ExprTypecheck can pick them up to type identifier uses.
         if (md->bodyKind == ast::MethodBodyKind::Block) {
-            resolveTypesInBody(md->stmts, &methodScope);
+            // §21.10: a method body is a statement block; a local type
+            // declared directly in it leaves scope at the body's end.
+            resolveTypesInNestedBlock(md->stmts, &methodScope,
+                                      md->span.end.offset);
         } else if (md->bodyKind == ast::MethodBodyKind::Expression &&
                    md->exprBody) {
             // Resolve types embedded in an expression body too (e.g.
@@ -1721,7 +1724,8 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         // an operator declaration never admits it (returnType passed as null).
         checkOutNullPostcond(od->params, nullptr, &methodScope, od->span.begin);
         if (od->bodyKind == ast::MethodBodyKind::Block) {
-            resolveTypesInBody(od->stmts, &methodScope);
+            resolveTypesInNestedBlock(od->stmts, &methodScope,
+                                      od->span.end.offset);
         } else if (od->bodyKind == ast::MethodBodyKind::Expression &&
                    od->exprBody) {
             resolveTypesInExpr(*od->exprBody, &methodScope);
@@ -1745,7 +1749,8 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         // §22.4 (v0.183, #1585): a constructor is not a bool-returning method,
         // so any postcondition on its parameters is rejected (null returnType).
         checkOutNullPostcond(cd->params, nullptr, &ctorScope, cd->span.begin);
-        resolveTypesInBody(cd->body, &ctorScope);
+        // §21.10: a constructor body is a statement block too.
+        resolveTypesInNestedBlock(cd->body, &ctorScope, cd->span.end.offset);
         // §22.16 (v0.203, #2062): resolve type nodes embedded in each contract
         // clause's expression in the constructor scope — mirrors the method-
         // decl handling above. Without this a clause's `new T(...)` has no
@@ -1757,7 +1762,7 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         }
     } else if (auto* dd =
                    dynamic_cast<const ast::DestructorDecl*>(&m)) {
-        resolveTypesInBody(dd->body, parent);
+        resolveTypesInNestedBlock(dd->body, parent, dd->span.end.offset);
     } else if (auto* pd =
                    dynamic_cast<const ast::PropertyDecl*>(&m)) {
         if (pd->type) resolveType(*pd->type, parent);
@@ -1789,7 +1794,9 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
                 acc.exprBody)
                 resolveTypesInExpr(*acc.exprBody, &propScope);
             else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
-                resolveTypesInBody(acc.stmts, &propScope);
+                // §21.10: an accessor body is a statement block.
+                resolveTypesInNestedBlock(acc.stmts, &propScope,
+                                          pd->span.end.offset);
         }
     } else if (auto* ed = dynamic_cast<const ast::EventDecl*>(&m)) {
         if (ed->type) resolveType(*ed->type, parent);
@@ -2794,6 +2801,33 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             // Sema slice 3+ will treat generic-param TypeRefs specially.
             ref.kind = TypeRef::Kind::Named;
             ref.declaration = nullptr;
+            // §21.10 "Restrictions (v1)" (v0.334): "A local type may not
+            // reference an enclosing generic parameter (an enclosing method's
+            // or class's `T`) — a compile error naming the rule." A local type
+            // declares no type parameters of its own (the parser rejects the
+            // GenericParams? slot), so a generic-param marker reached from
+            // inside one belongs to an ENCLOSING declaration by construction —
+            // there is no own-param carve-out to admit, which is what
+            // separates this from §11.6's nested-type rule below.
+            //
+            // Left undiagnosed this is the same silent-corruption class #3584
+            // fixed for nested types: the TypeRef above records
+            // `declaration = nullptr` and an unspecialized layout, so every
+            // instantiation shares one struct and the first one's field layout
+            // is what later stores corrupt.
+            if (inLocalTypeMembers_) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t.span.begin,
+                    std::string("local type references the enclosing "
+                                "generic parameter `") +
+                        std::string(first) +
+                        "` — a local type may not reference an enclosing "
+                        "generic parameter (§21.10); the type would be "
+                        "implicitly generic, making its identity, equality "
+                        "synthesis and boxed conformances per-instantiation");
+                ref.kind = TypeRef::Kind::Error;
+                return;
+            }
             // fix #3584 (§11.6 / §14.1, v0.286): a nested type declared
             // inside a generic enclosing class (`class Outer<T> { class Tag {
             // _v: T } }`) silently uses the enclosing class's type parameter
@@ -3967,18 +4001,54 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         }
         // fix #2198: check module children for local types (§21.10)
         if (ctx_.module() && t.name->parts.size() == 1) {
+            // §21.10 "Scope and name discipline" (v0.334): "A local type's
+            // name is in scope from its declaration statement to the end of
+            // the innermost enclosing statement block." The registration is
+            // module-lifetime so the name can be FOUND at all; this is where
+            // its block-lifetime SCOPE is enforced.
+            //
+            // Two facts make this a search rather than a first-match:
+            //   * §21.10 admits "Two different methods may each declare
+            //     `record Row(…)`: the names never meet, and the types are
+            //     distinct" — so several same-named local types coexist in
+            //     module children, and the in-extent one must win over an
+            //     out-of-extent sibling of another method.
+            //   * a reference past the recorded end is OUT OF SCOPE, not
+            //     unresolved, so it gets the scope rule's diagnostic rather
+            //     than "unresolved type name" below — but only when no
+            //     same-named local type is in scope here.
+            //
+            // A zero recorded end means the extent was not tracked for that
+            // declaration; it counts as visible (the conservative direction —
+            // it cannot falsely reject a valid program).
+            TypeSymbol* outOfScopeLocal = nullptr;
             for (Symbol* child : ctx_.module()->children) {
-                if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
-                    if (ts->name == first) {
-                        ref.kind = TypeRef::Kind::Named;
-                        ref.declaration = ts;
-                        for (const auto& ga : t.genericArgs) {
-                            if (!ga) continue;
-                            ref.genericArgs.push_back(resolveType(*ga, scope));
-                        }
-                        return;
-                    }
+                auto* ts = dynamic_cast<TypeSymbol*>(child);
+                if (!ts || ts->name != first) continue;
+                if (ts->isLocalType && ts->localScopeEndOffset &&
+                    t.span.begin.offset > ts->localScopeEndOffset) {
+                    // Remember the first such and keep looking: an in-extent
+                    // sibling of the same name still resolves this reference.
+                    if (!outOfScopeLocal) outOfScopeLocal = ts;
+                    continue;
                 }
+                ref.kind = TypeRef::Kind::Named;
+                ref.declaration = ts;
+                for (const auto& ga : t.genericArgs) {
+                    if (!ga) continue;
+                    ref.genericArgs.push_back(resolveType(*ga, scope));
+                }
+                return;
+            }
+            if (outOfScopeLocal) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t.span.begin,
+                    std::string("local type `") + std::string(first) +
+                        "` is not in scope here — a local type's name is in "
+                        "scope only from its declaration statement to the end "
+                        "of the innermost enclosing statement block (§21.10)");
+                ref.kind = TypeRef::Kind::Error;
+                return;
             }
         }
         {
@@ -4578,6 +4648,26 @@ void Resolver::resolveTypesInBody(
     }
 }
 
+// §21.10 (v0.334): walk `body` with the scope-extent of the statement block
+// that encloses it set to `blockEndOffset` — the "end of the innermost
+// enclosing statement block" a local type declared inside leaves scope at.
+// Restores the caller's extent on the way out, so a nested block does not
+// widen or narrow its parent's. A zero `blockEndOffset` means "extent unknown
+// here" and leaves the tracked value alone (TypeSymbol::localScopeEndOffset
+// then reads as "cannot prove out of scope", which admits).
+void Resolver::resolveTypesInNestedBlock(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body, Scope* scope,
+    std::uint32_t blockEndOffset) {
+    if (!blockEndOffset) {
+        resolveTypesInBody(body, scope);
+        return;
+    }
+    const std::uint32_t saved = currentBlockEndOffset_;
+    currentBlockEndOffset_ = blockEndOffset;
+    resolveTypesInBody(body, scope);
+    currentBlockEndOffset_ = saved;
+}
+
 void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         if (ld->type) resolveType(*ld->type, scope);
@@ -4618,16 +4708,94 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         // `Inner: Point` in a later local type), and (b) ExprTC's later pass
         // can find it and skip creating a duplicate symbol.
         if (!scope) return;
-        // Check if a TypeSymbol for this name already exists in module children.
+        // §21.10 "Scope and name discipline": "The declared name may not
+        // shadow any type name visible at the declaration point … nor collide
+        // with another declaration in the same body's declaration space."
+        //
+        // "Visible at its declaration point" is the whole question, and it is
+        // NOT the same as "present in ctx_.module()->children". Local types
+        // register there for the whole module (see below), so a same-named
+        // entry may belong to a SIBLING method's local type — and §21.10
+        // explicitly admits that case: "Two different methods may each declare
+        // `record Row(…)`: the names never meet, and the types are distinct."
+        // Rejecting it would be a false positive on an admitted program.
+        //
+        // So visibility is decided per candidate:
+        //   * a module-level type is visible from everywhere (§2.7 rule 1), and
+        //   * a local type is visible only within its own recorded scope
+        //     extent (currentBlockEndOffset_, below) — a sibling method's is
+        //     out of extent at this point and so does not collide.
+        //
+        // §21.10 states the collision as an error ("a trap, not a
+        // convenience"), so this diagnoses rather than picking a winner. The
+        // pre-existing behavior REUSED the colliding symbol — the loop below
+        // adopts any same-named TypeSymbol — which silently made the local
+        // declaration a reference to the module-level type: `record Row(A)`
+        // beside a module-level `record Row(B)` produced one `Row` with the
+        // module's fields, and `new Row(...)` in the local body type-checked
+        // against the WRONG parameter list.
+        const std::uint32_t declOffset = localType->decl->span.begin.offset;
+        auto visibleTypeNameAt = [&](std::string_view name) -> bool {
+            if (Symbol* visible = lookupName(name, scope)) {
+                // Only a TYPE name is a collision under this clause; a local
+                // variable or a type parameter sharing the name is §21.1's
+                // *Local names* territory, reported by its own rule.
+                return dynamic_cast<TypeSymbol*>(visible) != nullptr ||
+                       dynamic_cast<TypeAliasSymbol*>(visible) != nullptr;
+            }
+            if (!ctx_.module()) return false;
+            for (Symbol* child : ctx_.module()->children) {
+                auto* ts = dynamic_cast<TypeSymbol*>(child);
+                if (!ts || ts->name != name) continue;
+                // A module-level type is visible here. A local type is only
+                // visible while this declaration point is inside its own
+                // block extent; §21.10's two-methods rule is what that
+                // exclusion buys. A local type with no recorded extent falls
+                // through as visible (the conservative direction).
+                if (ts->isLocalType && ts->localScopeEndOffset &&
+                    declOffset > ts->localScopeEndOffset)
+                    continue;
+                return true;
+            }
+            return false;
+        };
+        bool shadowsVisibleType =
+            visibleTypeNameAt(localType->decl->name);
+        if (shadowsVisibleType) {
+            ctx_.diagnostics().report(
+                Severity::Error, localType->decl->span.begin,
+                std::string("local type `") +
+                    std::string(localType->decl->name) +
+                    "` shadows a type name visible at its declaration point "
+                    "— a local type may not shadow an already-visible type "
+                    "name (§21.10); choose a different name for the local "
+                    "type");
+            // Still collect and register below: the body is walked so later
+            // diagnostics in it are reported rather than cascading, and the
+            // program is rejected by the error above either way.
+        }
+        // Find the TypeSymbol for this name among module children, if one is
+        // already registered AND in scope at this declaration point.
+        //
+        // The scope test is load-bearing for §21.10's "Two different methods
+        // may each declare `record Row(…)` … the types are distinct": adopting
+        // a SIBLING method's `Row` merged the two declarations into one type,
+        // so the second method's `record Row(Other: int)` produced a `Row`
+        // carrying the FIRST method's fields and `new Row(1)` type-checked
+        // against the wrong parameter list (measured: `.Other` was reported as
+        // a missing member). Each declaration is per-declaration identity
+        // (§21.10 "Semantics — an ordinary nominal type"), so an out-of-extent
+        // sibling is skipped and a FRESH symbol is created below.
         TypeSymbol* tsym = nullptr;
         if (ctx_.module()) {
             for (Symbol* child : ctx_.module()->children) {
-                if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
-                    if (ts->name == localType->decl->name) {
-                        tsym = ts;
-                        break;
-                    }
-                }
+                auto* ts = dynamic_cast<TypeSymbol*>(child);
+                if (!ts || ts->name != localType->decl->name) continue;
+                if (ts->isLocalType && ts->localScopeEndOffset &&
+                    declOffset > ts->localScopeEndOffset)
+                    continue;
+                tsym = ts;
+                break;
             }
         }
         // If not found, create it via collectTypeDecl and register.
@@ -4635,18 +4803,49 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
             tsym = collectTypeDecl(*localType->decl, ctx_, kModuleScope, {});
             if (tsym) {
                 tsym->isLocalType = true;
+                // §21.10: record where this name's scope ENDS — the end of the
+                // innermost enclosing statement block (currentBlockEndOffset_).
+                // resolveNamed's module-children fallback consults it, which is
+                // what keeps a block-scoped name from resolving for the rest of
+                // the module (and, before this, from a LATER METHOD).
+                tsym->localScopeEndOffset = currentBlockEndOffset_;
                 if (ctx_.module()) {
                     ctx_.module()->children.push_back(tsym);
                 }
             }
         }
         // Walk members: resolve field types and any nested types' members.
+        //
+        // §21.10 "Restrictions (v1)": "A local type may not reference an
+        // enclosing generic parameter (an enclosing method's or class's `T`)."
+        // inLocalTypeMembers_ turns resolveNamed's generic-param-marker branch
+        // into that diagnostic for every field/signature type below. The flag
+        // covers `members`; the POSITIONAL field types are resolved here too,
+        // which the pre-existing walk did not do at all — `record Cell(Item: T)`
+        // never had its `Item` type resolved, so neither this rule nor any other
+        // could see it (a local record's field type naming a nonexistent type
+        // compiled clean). Positional fields are a record's primary field
+        // surface, so skipping them left the majority of a local record
+        // unchecked.
         Resolver::Scope typeScope;
         typeScope.parent = scope;
+        const bool savedInLocal = inLocalTypeMembers_;
+        inLocalTypeMembers_ = true;
+        for (const auto& pf : localType->decl->positionalFields) {
+            if (pf.type) resolveType(*pf.type, &typeScope);
+            if (pf.defaultValue)
+                resolveTypesInExpr(*pf.defaultValue, &typeScope);
+        }
+        for (const auto& gc : localType->decl->genericConstraints) {
+            for (const auto& item : gc.items) {
+                if (item.typeArg) resolveType(*item.typeArg, &typeScope);
+            }
+        }
         for (const auto& m : localType->decl->members) {
             if (!m) continue;
             resolveMember(*m, &typeScope);
         }
+        inLocalTypeMembers_ = savedInLocal;
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
@@ -4673,17 +4872,21 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         if (ifs->ifBranch.condition)
             resolveTypesInExpr(*ifs->ifBranch.condition, scope);
-        resolveTypesInBody(ifs->ifBranch.body, scope);
+        // §21.10: each branch is its own statement block, so a local type
+        // declared in one leaves scope at that branch's end — the whole `if`
+        // statement's span is the nearest enclosing end each branch has.
+        resolveTypesInNestedBlock(ifs->ifBranch.body, scope,
+                                  ifs->span.end.offset);
         for (const auto& el : ifs->elifBranches) {
             if (el.condition) resolveTypesInExpr(*el.condition, scope);
-            resolveTypesInBody(el.body, scope);
+            resolveTypesInNestedBlock(el.body, scope, ifs->span.end.offset);
         }
-        resolveTypesInBody(ifs->elseBody, scope);
+        resolveTypesInNestedBlock(ifs->elseBody, scope, ifs->span.end.offset);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         if (ws->condition) resolveTypesInExpr(*ws->condition, scope);
-        resolveTypesInBody(ws->body, scope);
+        resolveTypesInNestedBlock(ws->body, scope, ws->span.end.offset);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -4711,15 +4914,17 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
             resolveTypesInExpr(*fs->iterable, scope);
         }
         if (fs->withExpr) resolveTypesInExpr(*fs->withExpr, scope);
-        resolveTypesInBody(fs->body, scope);
+        resolveTypesInNestedBlock(fs->body, scope, fs->span.end.offset);
         return;
     }
     if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        resolveTypesInBody(dob->body, scope);
+        // §21.10: the `do … end` block IS the statement block a local type
+        // declared in it is scoped to.
+        resolveTypesInNestedBlock(dob->body, scope, dob->span.end.offset);
         return;
     }
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        resolveTypesInBody(ts->body, scope);
+        resolveTypesInNestedBlock(ts->body, scope, ts->span.end.offset);
         for (const auto& arm : ts->catches) {
             // Resolve the catch pattern's type(s) and guard, not just the
             // body — else `catch T => …` leaves T with no resolved
@@ -4728,9 +4933,18 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
                 if (ty) resolveType(*ty, scope);
             }
             if (arm.guard) resolveTypesInExpr(*arm.guard, scope);
-            if (arm.body) resolveTypesInStmt(*arm.body, scope);
+            if (arm.body) {
+                // A catch arm body is its own block (§31.2), bounded by the
+                // whole try statement's extent here.
+                const std::uint32_t saved = currentBlockEndOffset_;
+                if (ts->span.end.offset)
+                    currentBlockEndOffset_ = ts->span.end.offset;
+                resolveTypesInStmt(*arm.body, scope);
+                currentBlockEndOffset_ = saved;
+            }
         }
-        resolveTypesInBody(ts->finallyBody, scope);
+        resolveTypesInNestedBlock(ts->finallyBody, scope,
+                                  ts->span.end.offset);
         return;
     }
     if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {

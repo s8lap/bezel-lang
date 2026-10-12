@@ -5780,6 +5780,18 @@ void Resolver::checkDuplicateTopLevelTypes() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->name.empty()) continue;
+        // §21.10 (v0.334): a LOCAL type is not a top-level declaration — it
+        // lives in a method body's statement scope, and the module-level
+        // uniqueness rule does not reach it. §21.10 says so outright: "Two
+        // different methods may each declare `record Row(…)`: the names never
+        // meet, and the types are distinct." Both land in
+        // `ctx_.module()->children` (the registration resolveTypesInStmt does
+        // so a later reference can find them), so without this skip the walk
+        // read two methods' same-named local types as a module-level clash and
+        // rejected a program §21.10 admits. Local types are distinct symbols
+        // precisely because they are per-declaration (§21.10 "Semantics"), so
+        // this skip also stops the walk conflating two of them.
+        if (t->isLocalType) continue;
         auto it = seen.find(t->name);
         if (it == seen.end()) { seen[t->name] = t; continue; }
         SourceLocation loc = t->declLoc;

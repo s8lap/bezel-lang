@@ -180,6 +180,20 @@ struct TypeSymbol : Symbol {
     // Used by checkTopLevelVisibility to skip the §13.2 top-level-only visibility
     // check — local types have method-body scope and are not top-level declarations.
     bool isLocalType = false;
+    // §21.10 "Scope and name discipline" (v0.334): for a LOCAL type, the
+    // source offset one past the end of its scope — "from its declaration
+    // statement to the end of the innermost enclosing statement block". Zero
+    // means "no recorded end", which the out-of-scope check reads as
+    // "cannot prove the reference is out of scope" and so admits.
+    //
+    // A local type is registered in `ctx_.module()->children` so that
+    // resolveNamed's module-children fallback (fix #2198) can find it for
+    // `new Point(1, 2)` and for a later local type's field types. That
+    // registration is module-lifetime, but the NAME's scope is block-lifetime,
+    // so the fallback must consult this extent before admitting a reference:
+    // without it the name stayed visible for the rest of the module — a
+    // `do … end`-declared record was still resolvable from a LATER METHOD.
+    std::uint32_t localScopeEndOffset = 0;
     // §10.3 (#740): for an ENUM, the resolved underlying-type TypeRef from the
     // `: byte|short|int|long|...` annotation. Null means the default `int`.
     // A primitive base type does not become a `baseTypes` entry (those hold
