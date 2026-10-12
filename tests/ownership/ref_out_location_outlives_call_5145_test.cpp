@@ -34,21 +34,13 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::diagnosticMessageContains;
 using bezel::test::failedAtCompileTimeWithRealLocation;
-using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // A heap-owning class so the borrow is a real heap reference (a value type
 // would be copied, and §28.3's rule would not apply to it at all).
@@ -144,6 +136,14 @@ end Program;
 
 // ===========================================================================
 // ACCEPT rows — the rule must NOT fire where the spec says it must not.
+//
+// The three checked rows below assert `BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r))`
+// as a SEPARATE statement before their `r.ran` claim (#3733). The former
+// `if (wasSkipped(r)) return;` guard made each row return having asserted
+// NOTHING whenever the ASan link toolchain was absent — so on a box without
+// clang the whole ASan tier reported a clean PASS having run no sanitizer.
+// Per aot_result_asserts.hpp the guard must stay a separate statement: folding
+// the predicate back into an `if (…) return;` re-creates the absorbing shape.
 // ===========================================================================
 
 // `out _` "names no location and takes no part" (§28.3). Without this row a
@@ -165,7 +165,7 @@ class Program
   end Main;
 end Program;
 )BZL");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -188,7 +188,7 @@ class Program
   end Main;
 end Program;
 )BZL");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("keep=t") != std::string::npos);
@@ -214,7 +214,7 @@ class Program
   end Main;
 end Program;
 )BZL");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("n=3") != std::string::npos);
