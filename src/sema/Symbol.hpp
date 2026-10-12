@@ -1209,6 +1209,10 @@ struct ExternDeclSymbol : Symbol {
     std::vector<Symbol*> params;
     // The originating extern method declaration (for its return type).
     const ast::ExternDecl* externDecl = nullptr;
+    // §32.11: the alias overrides the symbol name; empty when no alias.
+    std::string_view symbolAlias;
+    // §32.11: UINT32_MAX means not variadic; otherwise N in `variadic(N)`.
+    uint32_t variadicN = UINT32_MAX;
 };
 
 // §9.1 / §9.2 / §2.8.3 rule 4 — THE record-storage accessors, symbol-side.

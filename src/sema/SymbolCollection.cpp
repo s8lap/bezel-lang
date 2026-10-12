@@ -713,6 +713,76 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
             dsym->scope = xbScope;
             dsym->params = collectParams(d.params, ctx, xbScope);
             dsym->externDecl = &d;
+            // §32.11: carry the alias and variadic clause from the AST.
+            dsym->symbolAlias = d.symbolAlias;
+            dsym->variadicN = d.variadicN;
+            // §32.11 No silent promotions: variadic-position parameters must
+            // already have a promoted type. The non-promoted set: float, bool,
+            // byte, sbyte, short, ushort, string, char, decimal, and non-scalar
+            // records. Diagnostics cite the parameter and the promoted type.
+            if (d.variadicN != UINT32_MAX) {
+                for (std::size_t i = d.variadicN; i < d.params.size(); ++i) {
+                    const auto& p = d.params[i];
+                    if (!p.type) continue;
+                    const auto* ty = p.type.get();
+                    bool isPromoted = false;
+                    std::string typeName;
+                    std::string promotedReplacement;
+                    if (ty->kind == ast::TypeKind::Named && ty->name &&
+                        ty->name->parts.size() == 1) {
+                        typeName = std::string(ty->name->parts[0]);
+                        // promoted scalar types
+                        if (typeName == "int" || typeName == "uint" ||
+                            typeName == "long" || typeName == "ulong" ||
+                            typeName == "double") {
+                            isPromoted = true;
+                        }
+                        // promoted pointer types
+                        else if (typeName == "IntPtr" || typeName == "UIntPtr" ||
+                                 typeName == "CString" || typeName == "WString") {
+                            isPromoted = true;
+                        }
+                        // Ptr<T> is promoted (single generic arg)
+                        else if (typeName == "Ptr" && !ty->genericArgs.empty()) {
+                            isPromoted = true;
+                        }
+                        // non-promoted: map to the promoted replacement
+                        else if (typeName == "float") {
+                            promotedReplacement = "double";
+                        } else if (typeName == "bool" || typeName == "byte" ||
+                                   typeName == "ushort") {
+                            promotedReplacement = "int or uint";
+                        } else if (typeName == "sbyte" || typeName == "short") {
+                            promotedReplacement = "int or long";
+                        } else if (typeName == "RawBytes") {
+                            // §32.11: RawBytes occupies two C slots (ptr, len) and
+                            // does not fit the one-slot-per-parameter promotion
+                            // accounting — must be passed with an explicit length.
+                            promotedReplacement = "Ptr<byte> or IntPtr plus an explicit length";
+                        } else if (typeName == "string" || typeName == "char" ||
+                                   typeName == "decimal") {
+                            // §32.11: not in the promoted type list
+                            promotedReplacement = "pointer type (Ptr<byte>, IntPtr, CString, etc.)";
+                        }
+                    }
+                    // Function types are also promoted
+                    else if (ty->kind == ast::TypeKind::Function) {
+                        isPromoted = true;
+                    }
+                    if (!isPromoted && !promotedReplacement.empty()) {
+                        ctx.diagnostics().report(
+                            Severity::Error, p.loc,
+                            "parameter `" + std::string(p.name) +
+                                "` has type `" + typeName +
+                                "` in a variadic position — this type is not "
+                                "silently promoted in C variadic calls; " +
+                                typeName + " promotes to " +
+                                promotedReplacement +
+                                " (§32.11 No silent promotions; declare the "
+                                "parameter as " + promotedReplacement + ")");
+                    }
+                }
+            }
             // fix #2482 (follow-up to #2418): ast::ExternDecl now carries
             // its own source location (stamped at the decl's first token);
             // fall back to the enclosing ExternBlock's location only when

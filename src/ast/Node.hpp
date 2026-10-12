@@ -6,6 +6,7 @@
 // and module-declaration shapes (parser slice 1) — imports and top-level
 // declarations are added by their own slices.
 
+#include <cstdint>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -1588,14 +1589,20 @@ struct ExtensionDecl : TopDecl {
 };
 
 // A.3 `ExternDecl ::= Visibility? "method" Identifier "(" ParamList? ")"
-//                      (":" "owned"? Type)? ";"`. Single FFI method
-// declaration inside an extern block.
+//                      (":" "owned"? Type)?
+//                      (":=" "symbol" StringLiteral VariadicClause?)? ";"`.
+// VariadicClause ::= "variadic" "(" IntLiteral ")".
+// Single FFI method declaration inside an extern block.
 struct ExternDecl {
     Visibility visibility = Visibility::None;
     std::string_view name;
     std::vector<Param> params;
     std::unique_ptr<Type> returnType;
     bool returnOwned = false;
+    // §32.11: the optional alias clause overrides the symbol name.
+    std::string_view symbolAlias;  // empty when no alias
+    // §32.11: N in `variadic(N)`; UINT32_MAX means not variadic.
+    uint32_t variadicN = UINT32_MAX;
     // fix #2482: ExternDecl is NOT an ast::Node and carries no span, so its
     // member declLoc fell back to the enclosing extern block's line (#2418).
     // The parser stamps this at the decl's first token (the optional visibility

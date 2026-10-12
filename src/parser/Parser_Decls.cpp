@@ -2,6 +2,7 @@
 #include "parser/Parser_impl.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -837,6 +838,73 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
                 advance();
             }
             decl.returnType = parseType();
+        }
+        // §32.11 alias clause: := symbol "name" variadic(N)?
+        if (consumePunctuator(":=")) {
+            // `symbol` is contextual (App. B.2): emitted as Identifier.
+            bool isSymbol = current_.kind == TokenKind::Identifier &&
+                            current_.text == "symbol";
+            if (!isSymbol) {
+                diagnostics_.report(Severity::Error, current_.location,
+                                   "expected 'symbol' after ':=' in extern declaration");
+            } else {
+                advance();
+                if (current_.kind != TokenKind::StringLiteral) {
+                    diagnostics_.report(Severity::Error, current_.location,
+                                      "expected symbol name string literal");
+                } else {
+                    decl.symbolAlias = current_.text;
+                    advance();
+                }
+                // variadic(N)? — `variadic` is also contextual (App. B.2).
+                bool isVariadic = current_.kind == TokenKind::Identifier &&
+                                  current_.text == "variadic";
+                if (isVariadic) {
+                    advance();
+                    if (!consumePunctuator("(")) {
+                        diagnostics_.report(Severity::Error, current_.location,
+                                          "expected '(' after 'variadic'");
+                    } else {
+                        if (current_.kind == TokenKind::IntLiteral) {
+                            try {
+                                unsigned long long val = std::stoull(
+                                    std::string(current_.text));
+                                // §32.11: N ≤ declared arity; cap at UINT32_MAX
+                                // to prevent silent wraparound on 64-bit platforms.
+                                if (val > UINT32_MAX) {
+                                    diagnostics_.report(
+                                        Severity::Error, current_.location,
+                                        "variadic arity " +
+                                            std::string(current_.text) +
+                                            " exceeds maximum representable "
+                                            "value (" +
+                                            std::to_string(UINT32_MAX) + ")");
+                                } else {
+                                    decl.variadicN = static_cast<uint32_t>(val);
+                                }
+                            } catch (const std::out_of_range&) {
+                                diagnostics_.report(
+                                    Severity::Error, current_.location,
+                                    "variadic arity " +
+                                        std::string(current_.text) +
+                                        " is out of range");
+                            } catch (const std::invalid_argument&) {
+                                diagnostics_.report(
+                                    Severity::Error, current_.location,
+                                    "expected integer literal for variadic arity");
+                            }
+                            advance();
+                        } else {
+                            diagnostics_.report(Severity::Error, current_.location,
+                                              "expected integer literal for variadic arity");
+                        }
+                        if (!consumePunctuator(")")) {
+                            diagnostics_.report(Severity::Error, current_.location,
+                                              "expected ')' to close variadic arity");
+                        }
+                    }
+                }
+            }
         }
         if (!consumePunctuator(";")) {
             diagnostics_.report(Severity::Error, current_.location,

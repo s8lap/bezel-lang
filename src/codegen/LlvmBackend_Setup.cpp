@@ -208,14 +208,19 @@ void Emitter::declareExterns() {
             // (malloc → malloc.1), producing a dangling symbol at link time.
             // The call site in lowerExternCall coerces argument widths so the
             // canonical internal signature is always used at the LLVM level.
-            if (auto* existing = module_->getFunction(std::string(xd->name))) {
+            // §32.11: use symbolAlias if present, else the Bezel method name.
+            std::string symbolName(xd->symbolAlias.empty() ? xd->name : xd->symbolAlias);
+            if (auto* existing = module_->getFunction(symbolName)) {
                 externFns_[xd] = existing;
                 continue;
             }
-            auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+            // §32.11: variadic(N) marks the LLVM function as vararg; the N
+            // fixed parameters are declared explicitly, the rest are variadic.
+            bool isVararg = xd->variadicN != UINT32_MAX;
+            auto* fnTy = llvm::FunctionType::get(retTy, paramTys, isVararg);
             externFns_[xd] = llvm::Function::Create(
                 fnTy, llvm::Function::ExternalLinkage,
-                std::string(xd->name), module_.get());
+                symbolName, module_.get());
         }
     }
 }
