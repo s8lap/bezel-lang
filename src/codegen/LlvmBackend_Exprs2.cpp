@@ -10017,8 +10017,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     for (std::size_t pi = 0; pi < cd->params.size(); ++pi) {
                         const ast::Param& p = cd->params[pi];
                         if (!p.modifier.empty()) continue;
-                        if (!p.type ||
-                            p.type->kind != ast::TypeKind::Function)
+                        // fix #5611 spelling class (§28.14 / §28.9 / §27.6,
+                        // v0.334): this ctor-formal arm is the transplanted
+                        // twin of lowerCall's call-bounded release (its own
+                        // comment says the AST-shape guard applies
+                        // "one-for-one"), so it is a FOURTH gate on the same
+                        // decision. `resolvedFormalIsFunction` admits an ALIAS
+                        // whose target is a function type, re-aligning this
+                        // gate with sema's `fnTyped` as its three named
+                        // consumers do. Without it a lambda literal passed at
+                        // an alias-typed ctor formal skipped the release and
+                        // its 48-byte cell leaked — MEASURED 24000 B / 500
+                        // allocations over 500 iterations, where the inline
+                        // spelling `f: (int) -> string` was already clean.
+                        if (!p.type || !resolvedFormalIsFunction(*p.type, ctx_))
                             continue;
                         const std::size_t ai = pi + 1;
                         if (ai < args.size() && ai - 1 < ctorArgExprs.size() &&

@@ -14931,7 +14931,19 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             for (std::size_t pi = 0; pi < mdSc->params.size(); ++pi) {
                 const ast::Param& p = mdSc->params[pi];
                 if (p.modifier != "scoped") continue;
-                if (!p.type || p.type->kind != ast::TypeKind::Function) continue;
+                // fix #5611 spelling class (§28.14 / §28.9 / §27.6, v0.334):
+                // `resolvedFormalIsFunction` also admits an ALIAS whose target
+                // is a function type, re-aligning this gate with sema's
+                // `fnTyped` exactly as its three named consumers do (see that
+                // helper's comment in LlvmBackend_impl.hpp). This `scoped` arm
+                // is a FOURTH gate on the same decision and the reason a
+                // three-site fix ships a half-closed leak: without it a lambda
+                // literal passed at an alias-typed `scoped` formal skipped the
+                // arm entirely and its 48-byte cell was dropped by nobody.
+                // MEASURED: 24000 B / 500 allocations over 500 iterations
+                // where the inline spelling `scoped f: (int) -> string` was
+                // already clean. Fail-closed direction unchanged.
+                if (!p.type || !resolvedFormalIsFunction(*p.type, ctx_)) continue;
                 // Body-references check: bail at any hit (the conservative
                 // direction — leak, not UAF).
                 std::vector<const ast::IdentifierExpr*> bodyRefs;
