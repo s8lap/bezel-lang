@@ -73,9 +73,8 @@ void expectStdout(const std::string& src, const std::string& expected) {
     // ASan / LSan leg: same program, memory-checked. A `ran == false` here
     // means the sanitizer or the toolchain failed the leg — it is NOT a pass.
     JitResult rc = runAotChecked(src);
-    if (rc.ran) {
-        BEZEL_EXPECT_EQ(rc.stdoutText, expected);
-    }
+    BEZEL_EXPECT_TRUE(rc.ran);
+    BEZEL_EXPECT_EQ(rc.stdoutText, expected);
 }
 
 // l2_7_0005 / stdlib §2.7 (v0.334): "`Random` is **sendable**, on the
