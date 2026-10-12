@@ -280,6 +280,77 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
         mbr == "GetType")
         return {};
     const std::string m(mbr);
+    // fix #5791 (stdlib §2.13, v0.334): `Type` joins the closed-surface
+    // receivers, for the same structural reason `()` does. A `Type`-annotated
+    // receiver (`t: Type` on a parameter, field, or local) resolves through
+    // `resolveNamed`'s `builtinTypeArity` arm to a `Kind::Named` TypeRef whose
+    // `declaration` is NULL (TypeResolution_Names.cpp) — NOT to
+    // `builtinClassSym("Type")`, which only ever stamps the RESULT of
+    // `GetType()`/`typeof`. So `targetType` stays null in `resolveMemberAccess`,
+    // the null-`decl` builtin-class block (`if (!targetType->decl)`) is never
+    // entered, and `knownCompleteUserType` is false — leaving every member name
+    // untyped and unreported. `t.TotallyBogusMember` compiled at exit 0 with
+    // only the #2434 "initializer failed to lower" degradation.
+    //
+    // The predicate is asked here, in the ONE closed-surface gate, so the `.`
+    // and `?.` resolvers ask the same question in the same place (the same
+    // discipline #3391 established for `()`), and so the surface list below is
+    // stated once.
+    //
+    // DISCRIMINATION, CATEGORY-BLIND: the question is "this receiver's
+    // resolved type is the builtin `Type`", not "the source spelled `Type`".
+    // A user `class Type` (§2.3 — every always-available name may be shadowed)
+    // carries a non-null `declaration`, and a bare type parameter spelled
+    // `Type` is already rejected upstream by the #5449/#5466 `isInScopeTypeParam`
+    // gate that runs before this one. So the `Named && !declaration` shape plus
+    // `headName() == "Type"` separates the builtin from both. `aliasQualifiedBuiltin`
+    // is NOT consulted: that flag is set when an import alias qualified a
+    // BUILT-IN, which is exactly this case, so reading it would exclude the
+    // very receivers this arm exists to diagnose.
+    if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+        recvTy->headName() == "Type") {
+        // stdlib §2.13 declares `Type` as a `public sealed class` with a CLOSED
+        // member surface — the names below, and nothing else. §2.13's own
+        // closing paragraph ("What `Type` deliberately does not provide") is why
+        // this is a rejection and not a fallback: there is no by-name member
+        // access, no member enumeration, and no dynamic instantiation, so a
+        // name outside the surface is a compile error rather than a silent null.
+        //
+        // The fifteen names are §2.13's declaration block, transcribed
+        // mechanically (`property|method <Name>` under `public sealed class
+        // Type`): `Name`, `FullName`, the nine kind predicates, `BaseType`,
+        // `IsAssignableFrom`, `EnumNames`, `EnumValues`.
+        //
+        // §8.1's universal members (ToString/Equals/GetHashCode/GetType, above)
+        // and §8.7's `Dispose` are exempt: `Type` is an ordinary class, so they
+        // exist on it and are handled by their own upstream gates — rejecting
+        // them here would shadow the precise #2457 / §28.6 messages they
+        // already draw. `ReferenceEquals` likewise (§8.1), enforced by the
+        // arity check upstream.
+        if (m == "Dispose" || m == "ReferenceEquals") return {};
+        static constexpr std::array<std::string_view, 15> kTypeSurface = {
+            "Name", "FullName",
+            "IsClass", "IsInterface", "IsRecord", "IsEnum", "IsChoice",
+            "IsPrimitive", "IsInlineArray", "IsFunctionType", "IsValueType",
+            "BaseType", "IsAssignableFrom", "EnumNames", "EnumValues",
+        };
+        for (auto n : kTypeSurface)
+            if (m == n) return {};
+        return "no member `" + m +
+               "` on type `Type`: stdlib \xC2\xA7""2.13 declares `Type` as a "
+               "sealed class whose surface is closed \xE2\x80\x94 `Name`, "
+               "`FullName`, the kind predicates `IsClass`/`IsInterface`/"
+               "`IsRecord`/`IsEnum`/`IsChoice`/`IsPrimitive`/`IsInlineArray`/"
+               "`IsFunctionType`/`IsValueType`, the lattice queries `BaseType` "
+               "and `IsAssignableFrom`, and the enum-metadata views "
+               "`EnumNames`/`EnumValues` \xE2\x80\x94 and nothing else. `Type` "
+               "is type identity plus lattice metadata, not member reflection "
+               "(rationale \xC2\xA7""5.18): there is no by-name member access, "
+               "no field/property/method enumeration, and no attribute reading "
+               "or dynamic instantiation, so `" + m +
+               "` is not a member of it. Use a compile-time generic or an "
+               "explicit registration instead of reflective discovery.";
+    }
     if (recvTy->kind == TypeRef::Kind::Unit) {
         return "no member `" + m +
                "` on the unit type `()`: `()` has exactly one value "
