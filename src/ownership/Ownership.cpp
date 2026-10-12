@@ -5764,6 +5764,28 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             }
         }
     }
+    // fix (§29.11, v0.334): a deferred-activation call (a lazy query —
+    // `Where`, `Select`, etc.) produces an owned frame that must be consumed
+    // by enumeration. A `var q := xs.Where(...)` binding that is never
+    // consumed carries an undischarged owned obligation and must draw the
+    // K3.14 must-use warning at its auto-drop. Without this, producerState
+    // fell through to Borrowed for every deferred-activation call, so the
+    // auto-drop sweep never had an Owned binding to flag and the warning
+    // never fired. The frame was also invisible to the disposal path — but
+    // the disposal of an unconsumed deferred activation is a no-op (the slot
+    // holds a sentinel, not a real object), so there is no leak risk from
+    // marking it Owned. The consumption site (GetEnumerator on the local)
+    // already updates everDischarged_ via the ordinary consume path, so a
+    // consumed query is correctly silent. The narrowness guard
+    // `!calleeMethodDecl` excludes instance-method calls that return a
+    // deferred-activation type (e.g. `h.Items()`) — those are ordinary
+    // method calls with a receiver-borrow source and are not sourceless
+    // deferred activations. // per §29.11
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (isDeferredActivationCallResult(*ce) &&
+            !common::calleeMethodDecl(*ce, ctx_))
+            return OwnershipState::Owned;
+    }
     // #724 F1 / §28.8.1 / §17.x: `move x` TRANSFERS ownership of x to the binding,
     // so `var s := move x` makes `s` an OWNED local (subject to the standard §28.3
     // discharge rules), exactly as `var s := x` would have made `x`'s obligation
