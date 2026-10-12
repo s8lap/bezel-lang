@@ -228,6 +228,20 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
 // vtable instead, so this row is an end-to-end oracle on the SECOND argument,
 // not merely on the call arity. It also fails without the fix, because that
 // same program does not compile at all (IR verification).
+//
+// SCOPE OF WHAT THIS ROW PINS — narrower than the paragraph above suggests.
+// MEASURED by sabotaging each arm's vtable in isolation: this row reaches the
+// `it->channel` **non-unwindOnly** arm, NOT the unwindOnly arm (~8164) that
+// #5852's one-arg call lived in. Corrupting the non-unwindOnly arm makes this
+// row FAIL; corrupting the unwindOnly arm leaves all 11 rows GREEN. The row is
+// therefore an oracle that *a* channel dispose faults a parked receiver with a
+// real ChannelClosedException — it is not a vtable oracle for the unwindOnly
+// arm. The unwindOnly arm's dispose is unwind-gated, and that same gating
+// suppresses it under a locally-caught throw, so no shape reaches it with a
+// receiver parked; covering it is separate work, not a fix-forward on #5852.
+// (The three-arm arity fix stands on its own: a 1-argument call to a
+// 2-parameter runtime function is wrong regardless of which arm reaches it,
+// and `declareC` reuse makes it all-or-nothing across all of them.)
 // =====================================================================
 BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
            channel_owned_param_autodrop_faults_pending_receiver_spec_30_15) {
