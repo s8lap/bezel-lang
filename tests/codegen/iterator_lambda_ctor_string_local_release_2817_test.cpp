@@ -126,10 +126,48 @@
 // 5112 B / 222); and a generic specialization does not re-establish the CLOSURE
 // release eligibility, so a `var f := <lambda>` local inside one leaks its
 // 40-byte closure cell (400 B / 10, down from 771 B / 30).
+//
+// #3733 — THE TOOLCHAIN SKIP IS NOW LOUD, NOT ABSORBED. Every `runAotChecked`
+// row here used to read
+//
+//     if (wasSkipped(r)) return;
+//
+// where `wasSkipped` matched the literal "SKIP" and nothing else. On a box whose
+// ASan/LSan link toolchain is absent, that branch RETURNS BEFORE ANY ASSERTION
+// runs, so the row reports a clean PASS having executed no sanitizer at all —
+// the #3733 silent-skip class, and the worst failure mode this harness has,
+// because it fails silently and only on the machine that cannot check. This file
+// is the single largest holder of that shape: 25 absorbing sites, more than any
+// other file in the tree, and counted by
+// scripts/check_toolchain_skip_surface.py.
+//
+// Each guard is replaced by the loud, positive form shared across the burn-down
+// (tests/support/aot_result_asserts.hpp::checkedToolchainSkipped, the idiom
+// fixes #5105 / #5145 / #5410 / #2080 landed first):
+//
+//     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+//
+// The row now still passes where the toolchain is genuinely absent — a
+// diagnostic naming "SKIP" is the ONLY thing this predicate reports — but it
+// FAILS anywhere a real sanitizer finding was being discarded as though the box
+// merely lacked clang. That is the strict strengthening: no expectation below
+// any of these 25 rows was relaxed, and the file-local `wasSkipped` predicate is
+// deleted rather than left behind as an unused SKIP reader. The predicate must
+// stay a SEPARATE statement from any `if` over `r`; inlining it back into a
+// guard re-creates exactly the absorbing shape this line replaces.
+//
+// MEASURED on the tree this landed on: all 25 rows were already genuinely
+// passing, not passing-only-because-of-the-guard — `CHECKED TOOLCHAIN: 0
+// skip(s)` is printed unconditionally by tests/test_main.cpp and increments at
+// the single chokepoint that can emit the SKIP diagnostic
+// (tests/support/aot_support.hpp runAotCheckedImpl), so a 0 there proves no
+// guard fired and every assertion below it really ran. 44 passed / 0 failed
+// before and after the change.
 
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -137,14 +175,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 std::string sanitizerText(const JitResult& r) {
     std::string all;
@@ -832,7 +862,7 @@ const char* kCtorThrowEdges =
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            async_iterator_body_locals_are_released_spec_30_7) {
     JitResult r = runAotChecked(kAsyncIteratorLocals);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -849,7 +879,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            sync_iterator_body_locals_are_released_spec_29_2) {
     JitResult r = runAotChecked(kSyncIteratorLocals);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1845 B / 78 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -864,7 +894,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            lambda_body_locals_are_released_spec_27_3) {
     JitResult r = runAotChecked(kLambdaLocals);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -879,7 +909,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            async_lambda_body_locals_are_released_spec_30_6) {
     JitResult r = runAotChecked(kAsyncLambdaLocals);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -894,7 +924,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            compiled_constructor_body_locals_are_released_spec_22_8) {
     JitResult r = runAotChecked(kCtorLocals);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 111);
 }
@@ -914,7 +944,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            lambda_borrow_local_releases_exactly_once_spec_28_3) {
     JitResult r = runAotChecked(kLambdaBorrowOnce);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
@@ -929,7 +959,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            async_lambda_borrow_local_releases_exactly_once_spec_28_3) {
     JitResult r = runAotChecked(kAsyncLambdaBorrowOnce);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
@@ -937,7 +967,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            sync_iterator_borrow_local_releases_exactly_once_spec_28_3) {
     JitResult r = runAotChecked(kSyncIteratorBorrowOnce);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
@@ -952,7 +982,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            async_iterator_borrow_local_releases_exactly_once_spec_28_3) {
     JitResult r = runAotChecked(kAsyncIteratorBorrowOnce);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
@@ -960,7 +990,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            constructor_borrow_local_releases_exactly_once_spec_28_3) {
     JitResult r = runAotChecked(kCtorBorrowOnce);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
@@ -982,7 +1012,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            lambda_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kLambdaAssignedParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectLeakButNoMemoryError(r);         // 390 B / 20
 }
 
@@ -996,7 +1026,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            async_lambda_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kAsyncLambdaAssignedParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectLeakButNoMemoryError(r);         // 390 B / 20
 }
 
@@ -1010,7 +1040,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            sync_iterator_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kSyncIteratorAssignedParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectLeakButNoMemoryError(r);         // 427 B / 22
 }
 
@@ -1024,7 +1054,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            async_iterator_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kAsyncIteratorAssignedParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectLeakButNoMemoryError(r);         // 427 B / 22
 }
 
@@ -1038,7 +1068,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            constructor_assigned_string_param_does_not_free_caller_spec_28_1) {
     JitResult r = runAotChecked(kCtorAssignedParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectLeakButNoMemoryError(r);         // 390 B / 20
 }
 
@@ -1055,7 +1085,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            enclosing_body_keeps_its_string_state_across_a_lambda_spec_27_3) {
     JitResult r = runAotChecked(kLambdaSaveRestore);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 371 B / 20 pre-fix; 934 B / 40 with
     BEZEL_EXPECT_EQ(r.exitCode, 123);      // the restore dropped
 }
@@ -1063,7 +1093,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            enclosing_body_keeps_its_string_state_across_async_lambda_spec_30_6) {
     JitResult r = runAotChecked(kAsyncLambdaSaveRestore);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 371 B / 20 pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 123);
 }
@@ -1074,7 +1104,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            abandoned_sync_iterator_releases_its_locals_once_spec_29_7) {
     JitResult r = runAotChecked(kSyncIteratorAbandoned);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 5580 B / 240 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 240);
 }
@@ -1092,7 +1122,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            abandoned_async_iterator_releases_its_locals_once_spec_30_7) {
     JitResult r = runAotChecked(kAsyncIteratorAbandoned);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 5580 B / 240 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 240);
 }
@@ -1103,7 +1133,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            inlined_generic_ctor_borrow_local_is_not_freed_early_spec_28_1) {
     JitResult r = runAotChecked(kInlinedGenericCtorBorrowThenAssign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // heap-use-after-free pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 100);
 }
@@ -1118,7 +1148,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            compiled_ctor_chaining_a_generic_base_is_balanced_spec_22_9) {
     JitResult r = runAotChecked(kCompiledCtorInlinesGenericBase);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1324 B / 60 pre-fix; UAF with the
     BEZEL_EXPECT_EQ(r.exitCode, 141);      // ctor pin and no inline analysis
 }
@@ -1136,7 +1166,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            lambda_returning_its_own_string_local_transfers_once_spec_27_3) {
     JitResult r = runAotChecked(kLambdaReturnsItsLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -1151,7 +1181,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            linq_block_bodied_lambda_releases_its_locals_spec_27_3) {
     JitResult r = runAotChecked(kLinqBlockLambda);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 4700 B / 200 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 250);
 }
@@ -1162,7 +1192,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
     // change; it goes RED (double free / LSan) if the candidate-set guard in
     // returnedStringLocalOwnsPlusOne is removed.
     JitResult r = runAotChecked(kLambdaReturnsCapturedLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 108);
 }
@@ -1177,7 +1207,7 @@ BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
 BEZEL_TEST(codegen_iterator_lambda_ctor_string_local_release_2817,
            constructor_throw_edges_release_exactly_once_spec_22_9) {
     JitResult r = runAotChecked(kCtorThrowEdges);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 84);
 }
