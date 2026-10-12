@@ -5670,16 +5670,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // ordinary arg-vs-param §5.1 check that runs later in
                 // typeCall/checkCallArity handles non-convertible cases
                 // (e.g. `Merge<int>(5, true)`).
-                if (!md->genericParams.empty() && !hadExplicitTypeArgs) {
+                if (!ms->genericParams.empty() && !hadExplicitTypeArgs) {
                     // §14.1 (#785): build the argument-inferred substitution map
                     // by STRUCTURALLY unifying each value parameter's declared
                     // type against the call argument's type — so a generic-typed
                     // parameter `p: Pair<A, B>` binds A and B (not only a bare
                     // `p: T`). Without this the return type `A` was left as the
                     // unresolvable bare param (`q := First(p)` typed `?`).
+                    // Uses ms->genericParams (symbol-side) because md->genericParams
+                    // (AST-side) is empty for interface methods; ms is always
+                    // populated for dispatched generic method calls.
                     std::unordered_set<std::string_view> paramNames;
-                    for (const auto& gp : md->genericParams)
-                        paramNames.insert(gp.name);
+                    for (const auto& gp : ms->genericParams)
+                        paramNames.insert(gp->name);
                     std::unordered_map<std::string_view, TypeRef*> argSubst;
                     // §14.1 / #896: collect type-param names whose inference
                     // produces a conflict (two args would bind the same T to
@@ -5793,6 +5796,75 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         return;  // skip constraint check + codegen for this call
                     }
+                    // §14.2 (v0.327, #5685): inferred type arguments at a dispatched
+                    // generic method call also reject inline array and move-only types
+                    // — the inference produces the same malformed type argument that
+                    // the explicit-args check rejects; the copy-for-dispatch problem
+                    // (§14.2) exists regardless of how the type argument was supplied.
+                    // Mirrors the explicit-args check above (lines ~4360-4425).
+                    {
+                        bool isDispatchedInf = false;
+                        bool isStaticInf = false;
+                        for (std::string_view mod : ms->modifiers)
+                            if (mod == "static") { isStaticInf = true; break; }
+                        if (!isStaticInf && ms->parent &&
+                            ms->parent->kind == ast::TypeDeclKind::Interface)
+                            isDispatchedInf = true;
+                        else {
+                            for (std::string_view mod : ms->modifiers)
+                                if (mod == "virtual" || mod == "abstract" ||
+                                    mod == "override") {
+                                    isDispatchedInf = true;
+                                    break;
+                                }
+                            if (!isDispatchedInf && ms->parent) {
+                                for (TypeSymbol* base : ms->parent->baseTypes) {
+                                    if (!base ||
+                                        base->kind != ast::TypeDeclKind::Interface)
+                                        continue;
+                                    for (Symbol* m : base->members) {
+                                        if (m->name == ms->name) {
+                                            isDispatchedInf = true;
+                                            break;
+                                        }
+                                    }
+                                    if (isDispatchedInf) break;
+                                }
+                            }
+                        }
+                        if (isDispatchedInf) {
+                            for (const auto& [tpName, tpType] : argSubst) {
+                                if (!tpType) continue;
+                                TypeRef* resolved = tpType;
+                                bool isInlineArray =
+                                    (resolved->kind == TypeRef::Kind::InlineArray);
+                                const char* moveOnlyKind = nullptr;
+                                bool isMoveOnly = common::isMoveOnlyValueType(
+                                    resolved, ctx_, moveOnlyKind);
+                                if (isInlineArray || isMoveOnly) {
+                                    std::string kindStr;
+                                    if (isInlineArray && !isMoveOnly)
+                                        kindStr = "an inline array";
+                                    else
+                                        kindStr =
+                                            moveOnlyKind ? std::string(moveOnlyKind)
+                                                         : std::string("move-only");
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        kindStr +
+                                        " may not be used as a type argument at a "
+                                        "dispatched generic method call (\xc2\xa7""14.2, "
+                                        "v0.327; the vtable slot for a move-only or "
+                                        "inline-array type argument would carry a "
+                                        "wrong layout for the copy-for-dispatch that "
+                                        "move-only forbids; this applies to inferred "
+                                        "type arguments as well as explicit ones "
+                                        "(#5685))");
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     // #729: enforce the method's where-constraints on the
                     // argument-inferred type args (only when no explicit type
                     // args were given — else the explicit check already ran).
@@ -5836,9 +5908,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // already own, unchanged, elsewhere.
                     if (!hadExplicitTypeArgs && !paramNames.empty()) {
                         std::unordered_set<std::string_view> stillUnbound;
-                        for (const auto& gp : md->genericParams) {
-                            if (argSubst.count(gp.name)) continue;
-                            std::unordered_set<std::string_view> single{gp.name};
+                        for (const auto& gp : ms->genericParams) {
+                            if (argSubst.count(gp->name)) continue;
+                            std::unordered_set<std::string_view> single{gp->name};
                             // per §22.3/§14.5 #2266: `containsMethodTypeParam`
                             // does NOT walk function-type param/return slots
                             // (`refOutParamTypeMentionsTypeParam` is the
@@ -5856,7 +5928,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     break;
                                 }
                             }
-                            if (mentionedInArg) stillUnbound.insert(gp.name);
+                            if (mentionedInArg) stillUnbound.insert(gp->name);
                         }
                         if (!stillUnbound.empty()) {
                             // fix #4183: generalized wording — this check
@@ -6185,6 +6257,72 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (inferConflicts.empty() && !argSubst.empty()) {
                         checkMethodGenericConstraints(argSubst);
                         checkAsyncInstantiationBorrowBearing(argSubst);
+                    }
+                    // §14.2 (v0.327, #5685): inferred type arguments at a dispatched
+                    // void-returning generic method call also reject inline array and
+                    // move-only types — mirrors the non-void arm's check above.
+                    {
+                        bool isDispatchedInf = false;
+                        bool isStaticInf = false;
+                        for (std::string_view mod : ms->modifiers)
+                            if (mod == "static") { isStaticInf = true; break; }
+                        if (!isStaticInf && ms->parent &&
+                            ms->parent->kind == ast::TypeDeclKind::Interface)
+                            isDispatchedInf = true;
+                        else {
+                            for (std::string_view mod : ms->modifiers)
+                                if (mod == "virtual" || mod == "abstract" ||
+                                    mod == "override") {
+                                    isDispatchedInf = true;
+                                    break;
+                                }
+                            if (!isDispatchedInf && ms->parent) {
+                                for (TypeSymbol* base : ms->parent->baseTypes) {
+                                    if (!base ||
+                                        base->kind != ast::TypeDeclKind::Interface)
+                                        continue;
+                                    for (Symbol* m : base->members) {
+                                        if (m->name == ms->name) {
+                                            isDispatchedInf = true;
+                                            break;
+                                        }
+                                    }
+                                    if (isDispatchedInf) break;
+                                }
+                            }
+                        }
+                        if (isDispatchedInf) {
+                            for (const auto& [tpName, tpType] : argSubst) {
+                                if (!tpType) continue;
+                                TypeRef* resolved = tpType;
+                                bool isInlineArray =
+                                    (resolved->kind == TypeRef::Kind::InlineArray);
+                                const char* moveOnlyKind = nullptr;
+                                bool isMoveOnly = common::isMoveOnlyValueType(
+                                    resolved, ctx_, moveOnlyKind);
+                                if (isInlineArray || isMoveOnly) {
+                                    std::string kindStr;
+                                    if (isInlineArray && !isMoveOnly)
+                                        kindStr = "an inline array";
+                                    else
+                                        kindStr =
+                                            moveOnlyKind ? std::string(moveOnlyKind)
+                                                         : std::string("move-only");
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        kindStr +
+                                        " may not be used as a type argument at a "
+                                        "dispatched generic method call (\xc2\xa7""14.2, "
+                                        "v0.327; the vtable slot for a move-only or "
+                                        "inline-array type argument would carry a "
+                                        "wrong layout for the copy-for-dispatch that "
+                                        "move-only forbids; this applies to inferred "
+                                        "type arguments as well as explicit ones "
+                                        "(#5685))");
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
             }
