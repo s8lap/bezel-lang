@@ -16847,53 +16847,67 @@ void MethodOwnership::checkForStmtStructuralMutation(const ast::ForStmt& fs) {
                   const bezel::ast::Stmt& containingStmt) {
             for (const auto& s : body) {
                 if (!s) continue;
-                if (auto* es = dynamic_cast<const bezel::ast::ExpressionStmt*>(s.get())) {
-                    if (auto* call = dynamic_cast<const bezel::ast::CallExpr*>(es->expr.get())) {
-                        if (call->callee) {
-                            if (auto* ma = dynamic_cast<const bezel::ast::MemberAccessExpr*>(call->callee.get())) {
-                                std::string_view member = ma->member;
-                                if (isStructuralMutationMember(member) &&
-                                    ma->target && sameBinding(*ma->target, iterName)) {
-                                    if (!isCallExempt(containingStmt, *s)) {
-                                        std::string memberStr(member);
-                                        self.report(
-                                            bezel::Severity::Warning, ma->span.begin,
-                                            "`" + memberStr + "` on `" + iterName +
-                                            "` modifies the collection this `for` is "
-                                            "iterating; the enumerator is invalidated and "
-                                            "the loop's next advance raises "
-                                            "`InvalidOperationException` (§29.12). "
-                                            "Collect the matches and remove them after the "
-                                            "loop, or consume the collection with "
-                                            "`PopAt`/`Pop` in a loop that does not "
-                                            "iterate it.");
-                                    }
+                walkStmt(*s, containingStmt);
+            }
+        }
+        // A lone statement the AST owns directly — a CatchArm's body is a
+        // `unique_ptr<Stmt>`, not a vector. This overload walks it by
+        // reference so the lint never takes ownership of an AST node it
+        // does not own: building a vector of aliasing `unique_ptr`s here
+        // deleted the arm's body when that vector went out of scope, and
+        // the CFG (built over the same live AST) then read freed memory
+        // while discharging the catch block (#2082).
+        void walk(const bezel::ast::Stmt& s,
+                  const bezel::ast::Stmt& containingStmt) {
+            walkStmt(s, containingStmt);
+        }
+
+        void walkStmt(const bezel::ast::Stmt& s,
+                      const bezel::ast::Stmt& containingStmt) {
+            if (auto* es = dynamic_cast<const bezel::ast::ExpressionStmt*>(&s)) {
+                if (auto* call = dynamic_cast<const bezel::ast::CallExpr*>(es->expr.get())) {
+                    if (call->callee) {
+                        if (auto* ma = dynamic_cast<const bezel::ast::MemberAccessExpr*>(call->callee.get())) {
+                            std::string_view member = ma->member;
+                            if (isStructuralMutationMember(member) &&
+                                ma->target && sameBinding(*ma->target, iterName)) {
+                                if (!isCallExempt(containingStmt, s)) {
+                                    std::string memberStr(member);
+                                    self.report(
+                                        bezel::Severity::Warning, ma->span.begin,
+                                        "`" + memberStr + "` on `" + iterName +
+                                        "` modifies the collection this `for` is "
+                                        "iterating; the enumerator is invalidated and "
+                                        "the loop's next advance raises "
+                                        "`InvalidOperationException` (§29.12). "
+                                        "Collect the matches and remove them after the "
+                                        "loop, or consume the collection with "
+                                        "`PopAt`/`Pop` in a loop that does not "
+                                        "iterate it.");
                                 }
                             }
                         }
                     }
                 }
-                if (auto* ifs = dynamic_cast<const bezel::ast::IfStmt*>(s.get())) {
-                    walk(ifs->ifBranch.body, *s);
-                    if (ifs->hasElse) walk(ifs->elseBody, *s);
-                }
-                if (auto* ws = dynamic_cast<const bezel::ast::WhileStmt*>(s.get()))
-                    walk(ws->body, *s);
-                if (auto* fs2 = dynamic_cast<const bezel::ast::ForStmt*>(s.get()))
-                    walk(fs2->body, *s);
-                if (auto* dob = dynamic_cast<const bezel::ast::DoEndBlock*>(s.get()))
-                    walk(dob->body, *s);
-                if (auto* ts = dynamic_cast<const bezel::ast::TryStmt*>(s.get())) {
-                    walk(ts->body, *s);
-                    for (const auto& arm : ts->catches) {
-                        if (arm.body) {
-                            std::vector<std::unique_ptr<bezel::ast::Stmt>> bodyVec;
-                            bodyVec.push_back(std::unique_ptr<bezel::ast::Stmt>(arm.body.get()));
-                            walk(bodyVec, *s);
-                        }
+            }
+            if (auto* ifs = dynamic_cast<const bezel::ast::IfStmt*>(&s)) {
+                walk(ifs->ifBranch.body, s);
+                if (ifs->hasElse) walk(ifs->elseBody, s);
+            }
+            if (auto* ws = dynamic_cast<const bezel::ast::WhileStmt*>(&s))
+                walk(ws->body, s);
+            if (auto* fs2 = dynamic_cast<const bezel::ast::ForStmt*>(&s))
+                walk(fs2->body, s);
+            if (auto* dob = dynamic_cast<const bezel::ast::DoEndBlock*>(&s))
+                walk(dob->body, s);
+            if (auto* ts = dynamic_cast<const bezel::ast::TryStmt*>(&s)) {
+                walk(ts->body, s);
+                for (const auto& arm : ts->catches) {
+                    if (arm.body) {
+                        walk(*arm.body, s);
                     }
-                    if (ts->hasFinally) walk(ts->finallyBody, *s);
                 }
+                if (ts->hasFinally) walk(ts->finallyBody, s);
             }
         }
     };
