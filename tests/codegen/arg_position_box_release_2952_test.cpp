@@ -62,13 +62,6 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // The cardinal repro, loop-amplified 20× so LSan flips r.ran false without the
 // fix. The value 120 is what 20 × Area(RBox(2,3))=6 sums to; the program's own
 // observable value (independent of the leak).
@@ -239,7 +232,6 @@ BEZEL_TEST(codegen_arg_position_box_release_2952,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kInterfaceParamRecordArg);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);   // pre-fix: 24 B × 20 = 480 B / 20 objects
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -251,7 +243,6 @@ BEZEL_TEST(codegen_arg_position_box_release_2952,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kObjectParamRecordArg);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -263,7 +254,6 @@ BEZEL_TEST(codegen_arg_position_box_release_2952,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kPrimitiveArg);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -285,7 +275,6 @@ BEZEL_TEST(codegen_arg_position_box_release_2952,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotCheckedLenient(kParamPassedToOtherCall);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -300,7 +289,6 @@ BEZEL_TEST(codegen_arg_position_box_release_2952,
 BEZEL_TEST(codegen_arg_position_box_release_2952,
            param_stored_in_field_is_not_released_spec_28_3) {
     JitResult r = runAotCheckedLenient(kParamStoredInField);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);   // no UAF on _saved.ToString()
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -322,7 +310,6 @@ BEZEL_TEST(codegen_arg_position_box_release_2952,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kClassThroughObjectControl);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
