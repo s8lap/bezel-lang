@@ -35,13 +35,16 @@ int run(const std::string& body) {
     return r.ran ? r.exitCode : -999;
 }
 
-// True if `src` fails to compile (a clean reject — used for the controls).
+// True if `src` fails to compile with a genuine error diagnostic.
+// A bare `!r.ran` would also pass for a crash (SIGSEGV etc.), which is not
+// the same as a clean compile-time rejection — the diagnostic produced by a
+// crash carries a real location and would satisfy a bare check alone.
 bool rejected(const std::string& body) {
     std::string src =
         "module M; class C public static method Main(): int " + body +
         " end Main; end C;";
     auto r = runAot(src);
-    return !r.ran;
+    return !r.ran && bezel::test::failedAtCompileTimeWithRealLocation(r);
 }
 
 }  // namespace
