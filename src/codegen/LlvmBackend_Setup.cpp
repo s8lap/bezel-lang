@@ -5527,7 +5527,13 @@ void Emitter::declareVtables() {
             for (sema::Symbol* m : iface->members) {
                 auto* es = dynamic_cast<sema::EventSymbol*>(m);
                 if (!es) continue;
-                if (!eventIsAsync(es)) ifaceEvents.push_back(es);
+                // fix #4202 (spec §15.4.1, v0.334): static interface members
+                // may be methods or operators but not events or properties
+                // (§11.8); static events are rejected by the parser, so only
+                // async filtering is needed here. The empty-interface skip
+                // below handles ICollectionLiteralTarget / IOwningCollectionLiteralTarget.
+                if (!eventIsAsync(es))
+                    ifaceEvents.push_back(es);
             }
             // #481 / §13 / §23: collect iface's properties in declaration order
             // (after the events, matching ifacePropertyGetIndex_'s numbering).
@@ -5537,7 +5543,11 @@ void Emitter::declareVtables() {
                 auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
                 if (ps) ifaceProps.push_back(ps);
             }
-            // Skip a wholly empty interface (no methods, events, or properties).
+            // Skip static interfaces — interfaces that declare only static members
+            // (e.g. ICollectionLiteralTarget<TSelf,T>, IOwningCollectionLiteralTarget
+            // <TSelf,T>, spec §15.4.1, v0.334). Such interfaces contribute no itable
+            // slots; including them in class-layout corrupts GEP offsets (#4202).
+            // ifaceMethods/Events/Props contain only non-static members at this point.
             if (ifaceMethods.empty() && ifaceEvents.empty() &&
                 ifaceProps.empty())
                 continue;

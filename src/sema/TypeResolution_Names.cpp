@@ -384,26 +384,15 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // already a member of `kHeapPointerReferenceBuiltins`).
     if (n == "DictionaryEntry" || n == "DrainedEntry" ||
         n == "IGrouping") return 2;
-    // stdlib §2.19 / spec §15.4.1 (issue #4178 investigation; NOT registered
-    // here — see issue #4202). `ICollectionLiteralTarget<TSelf, T>` /
-    // `IOwningCollectionLiteralTarget<TSelf, T>` were measured as a sibling
-    // "unresolved type name" gap while fixing #4178's IOrderedEnumerable, and
-    // a `builtinTypeArity` entry identical in shape to the one above was
-    // written and tested — but naming them exposed a REAL, reachable
-    // IR-verifier crash ("Invalid indices for GEP pointer type!"), not just
-    // the expected "structural, not nominal, dispatch" gap #4202 already
-    // tracks: any class with FIELDS that declares
-    // `: ICollectionLiteralTarget<Self, T>` in its base list (the spec's own
-    // §15.4.1 `RingBuffer<T>` worked example, once it has real fields and a
-    // real `Push`/indexer body — the spec's own elided-body example did not
-    // stress this) corrupts class-layout GEP codegen. A minimal
-    // no-fields repro did not reveal it, which is why it was not caught
-    // before the first attempt at this line. Reverted rather than shipped;
-    // see issue #4202 for the measured repro and the GEP crash detail. Do
-    // NOT re-add this line without first fixing whatever in class-layout
-    // codegen treats a builtin interface base as a real, offset-consuming
-    // base — the earlier structural-vs-nominal dispatch gap is the SMALLER
-    // of the two problems here.
+    // fix #4202 / spec §15.4.1 (v0.334): the collection-literal target protocol
+    // interfaces. Arity 2; the synthesized declaration is attached by
+    // ctx_.builtinInterfaceSym below. A class conforming to one of these
+    // opts into sequence-literal construction (§15.4.1). These are static
+    // interfaces (declare only static members) and contribute no itable slots.
+    // declareVtables Pass D skips any interface with no non-static members,
+    // so these do not affect class layout / itables.
+    if (n == "ICollectionLiteralTarget" ||
+        n == "IOwningCollectionLiteralTarget") return 2;
     // §30.14 / §30.15 (#600): Channel<T> and ChannelSender<T> (arity 1).
     // Domain is a static class (arity 0); ChannelClosedException is a nullary
     // exception type (§30.15); DomainFaultedException is a nullary exception.
