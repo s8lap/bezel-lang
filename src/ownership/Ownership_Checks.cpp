@@ -6264,7 +6264,13 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     if (!isBorrowBearingRecordOrSpan(rt)) return;
     // A builtin span view (no user Record decl) vs a user borrow-bearing
     // record — selects the diagnostic wording and the projection-branch gate.
-    const bool typeIsSpan = !isBorrowBearingRecord(rt);
+    // fix #5738 (spec §9.7 / §4.14 / §4.15): use the exact builtin-span
+    // discriminator `isBuiltinSpanTypeRef`, not the inverse of
+    // `isBorrowBearingRecord` — the latter returns false for BOTH builtin
+    // spans AND user records that happen to be named like spans (e.g.
+    // user-defined `ArraySpan`), so `typeIsSpan = !false = true` incorrectly
+    // classified every user record named like a span as a builtin span.
+    const bool typeIsSpan = isBuiltinSpanTypeRef(rt);
 
     // Shared: if `root` names a tracked scope-bound OWNED local (a `using var`
     // or a plain `var` owned local — both Owned in `states_`), report the
