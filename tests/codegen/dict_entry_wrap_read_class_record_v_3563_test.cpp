@@ -70,13 +70,6 @@ bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
 }
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // The class V every class-V row shares: one owned field, one method that
 // READS that field (so a wrong receiver is observable, not merely a wrong
 // pointer). A method call on a class value is the sharpest probe of (B): with
@@ -120,7 +113,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=42"));
@@ -157,7 +149,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=3"));
@@ -195,7 +186,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=3"));
@@ -231,7 +221,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=3"));
@@ -267,7 +256,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=42"));
@@ -310,7 +298,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=124750"));
@@ -357,7 +344,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=2800"));
@@ -409,7 +395,6 @@ BEZEL_TEST(dict_entry_wrap_read_class_record_v_3563,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=12600"));

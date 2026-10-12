@@ -184,7 +184,6 @@ BEZEL_TEST(dict_entry_wrap_choice_v_3767,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "x=1"));
