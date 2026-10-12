@@ -13114,15 +13114,70 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             return cs;
                         };
 
+                        // fix #5858 / §30.15 (v0.334): "Receive() is asynchronous
+                        // — `OwningTask<T>` for class-typed T (Pattern B: awaiting
+                        // transfers ownership of the item to the receiver),
+                        // `Task<T>` otherwise." ONE predicate for that split,
+                        // shared with the `ReceiveAll` arm below so the two
+                        // cannot drift (stdlib §6.9 states the drain form
+                        // "yields each item with `Receive`'s transfer
+                        // semantics" — the same sentence, so the same test).
+                        //
+                        // The previous test read `declaration->kind ==
+                        // TypeDeclKind::Class` ALONE. That answers the question
+                        // only for a USER-declared element type: `TypeResolution`
+                        // attaches a `builtinClassSym` to a Named TypeRef for a
+                        // handful of names only (`Range`, `Ptr` —
+                        // TypeResolution_Names.cpp:3746/:3778), so a BUILT-IN
+                        // class element arrived with `declaration == nullptr`
+                        // and was classified a VALUE type. MEASURED consequence
+                        // (#5858, four banked `fail` rows across four unrelated
+                        // sections): `Channel<Random>` / `<StringBuilder>` /
+                        // `<Stopwatch>` / `<OwningBuffer<double>>` all typed
+                        // `Receive()` as `Task<T>` — Pattern A, a BORROW — so the
+                        // §30.5 may-not-flow list rejected the canonical
+                        // `using var x := await ch.Receive();` that §30.15
+                        // itself writes as its example, and the §28.10 vacuity
+                        // lint called the same binding vacuous. A control
+                        // `sealed class Item` element compiled clean on the same
+                        // tree, and a double `await` of the built-in form
+                        // compiled clean where the user-class form was rejected
+                        // for dropping owned values — the borrow/owned split,
+                        // read off the program's own behaviour.
+                        //
+                        // The BUILT-IN arm: a declaration-less Named TypeRef is
+                        // one of exactly two things (#2757) — a reserved built-in
+                        // name or a type PARAMETER — so keying on the reserved
+                        // built-in table excludes type parameters by
+                        // construction and a newly-added built-in class joins
+                        // automatically. `isHeapPointerReferenceBuiltin` is the
+                        // derived heap-class set (every reserved name whose
+                        // runtime value is a pointer-sized heap object); the
+                        // `isBuiltinInterfaceHead` subtraction is the same
+                        // derived-minus-interfaces shape
+                        // `isVtableLessBuiltinClassName` documents, and it is
+                        // required here: a built-in INTERFACE head's runtime
+                        // value may be a USER class (§28.9), so it is not the
+                        // "class-typed T" §30.15 splits on. The value shapes
+                        // (`DateTime`, `Guid`, the spans, `IntPtr`, …) are
+                        // `kNonHeapReservedBuiltins`, so they are absent from
+                        // the heap table by construction and stay `Task<T>`.
+                        auto elemIsClassTy = [&](const TypeRef* t) -> bool {
+                            if (!t || t->kind != TypeRef::Kind::Named)
+                                return false;
+                            if (t->declaration)
+                                return t->declaration->kind ==
+                                       ast::TypeDeclKind::Class;
+                            const std::string_view head = t->headName();
+                            return common::isHeapPointerReferenceBuiltin(head) &&
+                                   !common::isBuiltinInterfaceHead(head);
+                        };
+
                         if (m == "Receive") {
                             // §30.15: Receive() returns:
                             //   OwningTask<T> when T is a class type (owned transfer),
                             //   Task<T>      when T is a value type or string.
-                            bool elemIsClass = (elemTy->kind == TypeRef::Kind::Named &&
-                                               elemTy->declaration &&
-                                               elemTy->declaration->kind ==
-                                                   ast::TypeDeclKind::Class);
-                            if (elemIsClass)
+                            if (elemIsClassTy(elemTy))
                                 ctx_.setExprType(&ce, makeOwnedTask(elemTy));
                             else
                                 ctx_.setExprType(&ce, makeTask(elemTy));
@@ -13150,10 +13205,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // §28.3 v0.258 (calls mint); single-consumer discipline
                             // is a channel invariant (runtime-enforced), not a
                             // frame-identity fact.
-                            bool elemIsClass = (elemTy->kind == TypeRef::Kind::Named &&
-                                               elemTy->declaration &&
-                                               elemTy->declaration->kind ==
-                                                   ast::TypeDeclKind::Class);
+                            bool elemIsClass = elemIsClassTy(elemTy);
                             auto* aeTy = ctx_.makeTypeRef();
                             aeTy->kind = TypeRef::Kind::Named;
                             aeTy->nullable = false;

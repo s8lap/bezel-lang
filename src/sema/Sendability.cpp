@@ -423,6 +423,29 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             if (bname == "StringBuilder")
                 return true;
 
+            // fix #5858 / §30.14 (v0.334): stdlib §8.1 states `Stopwatch` is
+            // **sendable**, on the same copy-state ground as the two arms above:
+            // "its state is a running flag and elapsed-time counters, read and
+            // written by value, and no member retains a borrow or exposes an
+            // address. A moved running stopwatch keeps measuring."
+            //
+            // §30.14 makes the stdlib section's Sendability paragraph "the single
+            // normative carrier of each such type's classification" — the spec
+            // states the forms, the stdlib states the memberships — and stdlib §1
+            // closes the other direction: "A compiler-known class type whose
+            // section states no sendability ... is not sendable. Such a type
+            // becomes sendable only by a statement in its own section." §8.1 has
+            // that statement, so `Channel<Stopwatch>` is admitted (§30.15) and
+            // `Channel<Stopwatch>.Receive()` returns `OwningTask<Stopwatch>`.
+            //
+            // This is the sibling the a7db94ef sendability sweep missed: that
+            // commit added Random / StringBuilder / Type / OwningBuffer, and
+            // `git log -S'Stopwatch' -- src/sema/Sendability.cpp` is empty, so
+            // Stopwatch has never had an entry here and fell through to this
+            // function's "conservatively not sendable" default. per §30.14
+            if (bname == "Stopwatch")
+                return true;
+
             // stdlib §2.13: Type is sendable — shared reference across domains
             // (§30.14: interned immutable; crosses as a shared reference, like string).
             if (bname == "Type")
