@@ -13338,6 +13338,23 @@ llvm::Value* Emitter::emitStringGuardedIsA(llvm::Value* scrut,
     return phi;
 }
 
+// §35.5 (*Case patterns*): a payload-free choice case is matched by a
+// constant-style pattern naming it "through the scrutinee-type
+// prefix-omission rule" — so the bare `Red` arrives as an `IdentifierExpr`
+// and the qualified `Color.Red` as a `MemberAccessExpr`. Same two shapes
+// `Emitter::enumConstantOfPatternExpr` reads (LlvmBackend_Setup.cpp) and the
+// same two the §35.6 coverage walk reads (src/sema/ExprTypecheck.cpp
+// `caseArmsExhaustive`, `coverPayloadFreeCase` callers); empty for a member
+// that is not a name at all (a literal, `null`).
+static std::string_view choiceCaseNameOfPatternExpr(const ast::Expr* e) {
+    if (!e) return {};
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return ma->member;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+        return id->name;
+    return {};
+}
+
 llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut,
                             const sema::TypeSymbol* enumTy,
                             bool isStr,
@@ -13546,9 +13563,102 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 }
             }
         }
-        // Other pattern kinds on a choice scrutinee are not supported
-        // (fall through to the deferred-return-null path below; the
-        // caller degrades the arm to no-match, never a miscompile).
+        // §35.5 (*Case patterns*, last bullet) / §19.3 (*Alternatives*): a
+        // `|` alternative list over a CHOICE scrutinee is a list of
+        // payload-free case names, and the arm matches when the scrutinee's
+        // tag is any listed case's tag — the SAME test the bare
+        // NamedPattern arm above emits, OR-ed together (§19.3: "matches any
+        // of these"). §35.5 admits ONLY payload-free cases as members
+        // ("payload-carrying case patterns are not, even in the all-discard
+        // form — they are destructurings, not constants"), so there is no
+        // payload to compare: the discriminator IS the whole match.
+        //
+        // This is deliberately NOT §35.7's emitChoiceEquality, which compares
+        // the active case's payload fields. That has no spec basis here: the
+        // members are payload-free by §35.5's admission rule, and a freshly
+        // constructed case's payload slots hold `undef`, so a payload
+        // compare against one would report two equal values as unequal —
+        // the exact defect emitChoiceEquality's own header documents.
+        //
+        // The node such an arm arrives as is a ConstantPattern, not an
+        // AltPattern: Parser::parsePattern (src/parser/Parser_Exprs.cpp,
+        // §19.3 v0.183 #1584) collapses a `|` list whose members are all
+        // constant-shaped into one ConstantPattern and reserves AltPattern
+        // for a heterogeneous list carrying a range or relational member.
+        // §35.5's payload-free case names are exactly the constant-shaped
+        // case, so this is the arm that carries the rule.
+        //
+        // Before this arm the ConstantPattern fell through to the generic
+        // handler below, which lowers each member with `lowerExpr` into a
+        // WHOLE choice struct and hands it to emitEquals → `icmp eq` over
+        // two AGGREGATES, which LLVM's IR verifier rejects ("Invalid
+        // operand types for ICmp instruction"). That handler's `incompatible`
+        // guard discriminates only pointer / i1 / float, so struct-vs-struct
+        // reads as compatible and the whole-struct ICmp is emitted; the
+        // aggregate comparison has no case in it.
+        if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(pat)) {
+            llvm::Value* any = builder_.getInt1(false);
+            bool reported = false;
+            for (const auto& c : cp->constants) {
+                if (!c) continue;
+                std::size_t tag = 0;
+                const sema::ChoiceCaseSymbol* cc = nullptr;
+                std::string_view nm = choiceCaseNameOfPatternExpr(c.get());
+                if (!nm.empty())
+                    cc = choiceCaseByName(choiceTy, nm, &tag);
+                // §35.5: only a PAYLOAD-FREE case is admissible here. A
+                // payload-carrying case is a destructuring, not a constant
+                // (§35.5's same bullet), and sema rejects it in a `|` list
+                // outright (§19.3 "a pattern alternative member must be a
+                // constant"); it contributes `false` here as a defensive
+                // never-match so a codegen run that outlived the sema error
+                // still emits well-formed IR.
+                if (cc && cc->caseDecl && cc->caseDecl->payload.empty()) {
+                    llvm::Value* tagVal =
+                        builder_.CreateExtractValue(scrut, {0}, "choice.tag");
+                    any = builder_.CreateOr(
+                        any,
+                        builder_.CreateICmpEQ(
+                            tagVal, llvm::ConstantInt::get(i32(), tag),
+                            "choice.tag.eq"),
+                        "choice.alt.eq");
+                    continue;
+                }
+                // §19.6: a `null` alternative over a scrutinee that cannot
+                // hold null (a non-nullable choice) is "admitted and never
+                // selected" — contribute `false` and do NOT report, the same
+                // verdict the generic ConstantPattern handler's
+                // `nullOverNonNullable` sibling gives (L14649).
+                if (dynamic_cast<const ast::NullLiteralExpr*>(c.get()))
+                    continue;
+                // §19 / §35.5: anything else — a literal, a const of an
+                // unrelated type, a name that is neither a case nor a value
+                // — is not comparable to a choice. Report ONCE per arm (same
+                // fire-at-most-once discipline #2227 uses, so an ill-formed
+                // arm stays readable) and never-match, mirroring that
+                // handler's `incompatible` branch. This is strictly better
+                // than the pre-fix outcome, which was an IR-verifier abort.
+                if (!reported) {
+                    reported = true;
+                    ctx_.diagnostics().report(
+                        Severity::Error, c->span.begin,
+                        "case pattern constant type is not compatible with "
+                        "the scrutinee type (\xC2\xA7""19) — a `case` "
+                        "constant must be comparable to the scrutinee");
+                }
+            }
+            return any;
+        }
+        // Other pattern kinds on a choice scrutinee are not supported here.
+        // They fall through to the generic handlers below, which degrade an
+        // unhandled shape to `return nullptr` (the caller lowers the arm to
+        // no-match). The one shape a generic handler WOULD recognise and
+        // lower against the choice struct — a range or relational member of a
+        // heterogeneous list — is unreachable here: sema rejects both over a
+        // choice with `"Color" has no intrinsic ordering (§19.3) — a
+        // relational or range pattern is not admitted over this type`, and
+        // the parser only builds an AltPattern (rather than collapsing to the
+        // ConstantPattern above) when such a member is present.
     }
 
     // §19.3 (v0.183, #1584): a heterogeneous alternative list (AltPattern) —
@@ -13869,6 +13979,12 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // §19: ConstantPattern on a nullable value — hasValue AND value == c.
         if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(pat)) {
             llvm::Value* any = builder_.getInt1(false);
+            // §19: fire-at-most-once for the §19 incompatibility diagnostic
+            // the CHOICE branch below reports, so an ill-formed arm stays
+            // readable when several members are bad. Scoped to that branch —
+            // the primitive/enum/string members above have their own
+            // diagnostics and must not be gated on it.
+            bool reportedIncompat = false;
             for (const auto& c : cp->constants) {
                 if (!c) continue;
                 // §19.5 (#1471): a `null` member folded into a `|`-alternative
@@ -13896,6 +14012,65 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     llvm::Value* match = builder_.CreateAnd(
                         hasVal, decCmp(innerVal, dop, "="), "nv.val.match");
                     any = builder_.CreateOr(any, match);
+                    continue;
+                }
+                // §35.5 (*Case patterns*, last bullet) / §19.3: a `|` list
+                // over a NULLABLE choice (`Color?`, §35.9) is the same
+                // payload-free case-name list the non-nullable choice branch
+                // in patternMatches lowers, ANDed with hasValue — the
+                // #4399 sibling for a single bare case name, extended to the
+                // list form. The test is the tag of the UNWRAPPED choice
+                // struct (`innerVal`), same as the non-nullable arm's test of
+                // `scrut`. Without this the member fell through to the
+                // generic value comparison below, which lowers it with
+                // `lowerExpr` into a WHOLE choice struct and feeds it to
+                // emitEquals → `icmp eq` over two aggregates, which LLVM's
+                // IR verifier rejects. `null` is handled above (it matches
+                // when hasValue == 0) and a decimal scrutinee above.
+                if (innerVal->getType()->isStructTy() &&
+                    scrutTy->kind == sema::TypeRef::Kind::Named &&
+                    scrutTy->declaration &&
+                    scrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
+                    const sema::TypeSymbol* choiceTy = scrutTy->declaration;
+                    std::size_t tag = 0;
+                    const sema::ChoiceCaseSymbol* cc = nullptr;
+                    std::string_view nm =
+                        choiceCaseNameOfPatternExpr(c.get());
+                    if (!nm.empty())
+                        cc = choiceCaseByName(choiceTy, nm, &tag);
+                    // §35.5: payload-free only; a payload-carrying case is a
+                    // destructuring, not a constant (§35.5 / §19.3), and
+                    // contributes `false` — sema rejects that shape outright.
+                    if (cc && cc->caseDecl && cc->caseDecl->payload.empty()) {
+                        llvm::Value* tagVal = builder_.CreateExtractValue(
+                            innerVal, {0}, "choice.tag");
+                        llvm::Value* matched = builder_.CreateICmpEQ(
+                            tagVal, llvm::ConstantInt::get(i32(), tag),
+                            "choice.tag.eq");
+                        any = builder_.CreateOr(
+                            any, builder_.CreateAnd(hasVal, matched,
+                                                    "nv.choice.match"),
+                            "nv.choice.alt");
+                        continue;
+                    }
+                    // Anything else over a choice is a §19 type error, on
+                    // BOTH the nullable and non-nullable path: report it
+                    // rather than letting the member silently never-match.
+                    // Gated on the first BAD member, not on
+                    // `cp->constants.front()` — in `Red | 5` the FIRST member
+                    // is the good one and takes the `continue` above, so a
+                    // front-gated report never fires at all. `null` never
+                    // reaches here: the NullLiteralExpr branch above returns
+                    // before this point.
+                    if (!reportedIncompat) {
+                        reportedIncompat = true;
+                        ctx_.diagnostics().report(
+                            Severity::Error, c->span.begin,
+                            "case pattern constant type is not compatible "
+                            "with the scrutinee type (\xC2\xA7""19) — a "
+                            "`case` constant must be comparable to the "
+                            "scrutinee");
+                    }
                     continue;
                 }
                 llvm::Value* cv = litAtWidth(*c, innerVal->getType());  // #836
