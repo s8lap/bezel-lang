@@ -6,6 +6,6 @@
 // §28.3 / #892 (WHILE DRAIN REJECT): item dropped without disposal in the
 // while body → REJECT (obligation incurred by the condition, not discharged).
 
-module M; class Cell public static _n: int := 0; public constructor() Cell._n := Cell._n + 1; end constructor; destructor Cell._n := Cell._n - 1; end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push(move (new Cell())); while s.TryPop(out owned var item) do // item dropped without disposal end; end; return Cell._n; end Main; end C;
+module M; class Cell public static _n: int := 0; public constructor() Cell._n := Cell._n + 1; end constructor; destructor Cell._n := Cell._n - 1; end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push(move (new Cell())); while s.TryPop(out var item) do // item dropped without disposal end; end; return Cell._n; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: expected 'end' to close 'while' statement

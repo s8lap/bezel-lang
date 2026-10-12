@@ -111,7 +111,7 @@ BEZEL_TEST(try_convention_1336, owning_array_trypopfirst_true_bang) {
         "  public constructor(v: int) Val := v; end constructor; end Box; "
         "class C public static method Main(): int "
         "  do using var a := new OwningArray<Box>(); a.Add(move (new Box(10))); "
-        "    if a.TryPopFirst(out owned var item) then "
+        "    if a.TryPopFirst(out var item) then "
         "      var r := item!.Val; item!.Dispose(); return r; end; return 0; end; return 0; "
         "end Main; end C;"), 10);
 }
@@ -123,7 +123,7 @@ BEZEL_TEST(try_convention_1336, owning_array_trypopfirst_false_is_null) {
         "module M; class Box public Val: int := 0; end Box; "
         "class C public static method Main(): int "
         "  do using var a := new OwningArray<Box>(); "
-        "    var ok := a.TryPopFirst(out owned var item); "
+        "    var ok := a.TryPopFirst(out var item); "
         "    item?.Dispose(); "
         "    if item = null then return 7; end; return 3; end; return 0; "
         "end Main; end C;"), 7);
@@ -140,7 +140,7 @@ BEZEL_TEST(try_convention_1336, owning_dict_trypopvalue_true_disposed_once) {
         "class C public static method Main(): int "
         "  do using var d := new OwningDictionary<string, R>(); "
         "    d.Add(\"a\", move (new R())); "                          // _n = 1
-        "    if d.TryPopValue(\"a\", out owned var v) then v?.Dispose(); end; "  // → _n = 0
+        "    if d.TryPopValue(\"a\", out var v) then v?.Dispose(); end; "  // → _n = 0
         "  end; return R._n; "        // 0 iff popped value disposed exactly once
         "end Main; end C;"), 0);
 }

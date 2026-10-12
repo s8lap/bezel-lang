@@ -149,7 +149,7 @@ BEZEL_TEST(out_owned_param_propagate_1304, out_owned_var_form_reads_back) {
         "    return true; "
         "  end Take; "
         "  public static method Main(): int "
-        "    var ok := C.Take(out owned var res); "
+        "    var ok := C.Take(out var res); "
         "    if res = null then return -1; end; "
         "    return res!.V; "  // 7
         "  end Main; end C;"), 7);

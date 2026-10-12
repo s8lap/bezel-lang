@@ -297,8 +297,9 @@ bool mentions3220(const std::string& hay, const char* needle) {
 //          (the rejection gate in `checkRefOutOperandCategory` runs only when
 //          `formalMod == "out owned"`, and for an imported callee the AST
 //          `calleeMd2` is null so `formalMod` stayed empty).
-// Post-fix: rejected with the §22.3/§22.4 "must be an inline `out using var
-//          x` or `out owned var x`" diagnostic.
+// Post-fix: rejected with the §22.3/§22.4 "must be an inline `out var x`
+//          or `out using var x`" diagnostic — reworded at fix #3842, which
+//          retired the `out owned var x` spelling per §A.4 / v0.289 L2.
 // ===========================================================================
 BEZEL_TEST(xmod_three_formal_3220,
            item1_imported_out_owned_formalMod_rejects_non_inline_22_4) {
@@ -316,7 +317,10 @@ BEZEL_TEST(xmod_three_formal_3220,
     BEZEL_EXPECT_TRUE(r.dependencyCompiled);
     BEZEL_EXPECT_FALSE(r.appCompiled);
     BEZEL_EXPECT_TRUE(mentions3220(r.error, "must be an inline"));
-    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4)"));
+    // The citation gained ", v0.289 L2" at fix #3842, which reworded the
+    // remedy to name the two admitted inline forms (`out var x` / `out using
+    // var x`) after `out owned var x` was retired per §A.4.
+    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4, v0.289 L2)"));
 }
 
 // T1b — the local twin of T1. Rejects before the fix and must keep rejecting.
@@ -334,7 +338,10 @@ BEZEL_TEST(xmod_three_formal_3220,
         "end C;");
     BEZEL_EXPECT_FALSE(r.compiled);
     BEZEL_EXPECT_TRUE(mentions3220(r.error, "must be an inline"));
-    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4)"));
+    // The citation gained ", v0.289 L2" at fix #3842, which reworded the
+    // remedy to name the two admitted inline forms (`out var x` / `out using
+    // var x`) after `out owned var x` was retired per §A.4.
+    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4, v0.289 L2)"));
 }
 
 // T1c — over-widening control: the accessor's local arm must be UNCHANGED.

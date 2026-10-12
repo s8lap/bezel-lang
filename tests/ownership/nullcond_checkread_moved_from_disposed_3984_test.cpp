@@ -166,7 +166,7 @@ BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,
         "class C public static method Main(): int "
         "  do using var a := new OwningArray<Box>(); "
         "    a.Add(move (new Box(10))); a.Add(move (new Box(20))); "
-        "    var ok := a.TryPopFirst(out owned var item); "
+        "    var ok := a.TryPopFirst(out var item); "
         "    var v := 0; if item <> null then v := item.Val; end; "
         "    item?.Dispose(); "
         "    if ok then return v; end; return 0; end; return 0; "

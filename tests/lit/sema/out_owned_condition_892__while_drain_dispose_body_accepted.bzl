@@ -29,6 +29,6 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class Cell public static _n: int := 0; public constructor() Cell._n := Cell._n + 1; end constructor; destructor Cell._n := Cell._n - 1; end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push((new Cell())); s.Push((new Cell())); while s.TryPop(out owned var item) do item?.Dispose(); end; end; return Cell._n; end Main; end C;
+module M; class Cell public static _n: int := 0; public constructor() Cell._n := Cell._n + 1; end constructor; destructor Cell._n := Cell._n - 1; end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push((new Cell())); s.Push((new Cell())); while s.TryPop(out var item) do item?.Dispose(); end; end; return Cell._n; end Main; end C;
 
 // CHECK-NOT: disposed again here

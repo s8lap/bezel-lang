@@ -9114,7 +9114,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // argument modifier does not make an argument non-positional. This
         // predicate is the branch's only admission gate and it originally
         // rejected ANY non-empty `a.modifier`, i.e. every `ref` / `out` /
-        // `out var` / `out owned var` / `out using var` argument. The branch's
+        // `out var` / `out using var` argument (`out owned var` was a fourth
+        // at the time; it is RETIRED per §A.4, v0.289 L2, fix #3842). The
+        // branch's
         // only other exit is the `return obj` below, which emits NOTHING — so
         // `new ImportedT("x", out var n)` allocated the instance, ran
         // `bz$T$init` (vtable + field initializers) and then SILENTLY SKIPPED

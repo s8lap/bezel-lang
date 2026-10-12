@@ -123,7 +123,7 @@ BEZEL_TEST(out_owned_var_ctor_2681,
         "end Widget; "
         "class C "
         "  public static method Main(): int "
-        "    new Widget(out owned var x); "
+        "    new Widget(out var x); "
         "    var v := x.Id; "
         "    return v + Res.alive; "
         "  end Main; "

@@ -143,7 +143,7 @@ BEZEL_TEST(chain_call_imported_out_owned_recipient_4975,
 // (§28.11).
 BEZEL_TEST(chain_call_imported_out_owned_recipient_4975,
            out_owned_var_recipient_of_imported_base_ctor_disposed_x50) {
-    auto [code, out] = runApp4975("out owned var recipient", "o");
+    auto [code, out] = runApp4975("out var recipient", "o");
     BEZEL_EXPECT_EQ(code, 0);
     BEZEL_EXPECT_EQ(out, std::string("0\n"));
 }

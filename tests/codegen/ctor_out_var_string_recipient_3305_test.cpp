@@ -393,7 +393,7 @@ BEZEL_TEST(ctor_out_var_string_recipient_3305,
         "class C "
         "  public static method Main(): int "
         "    Res.alive := 0; "
-        "    var w := new Widget(out owned var n); "
+        "    var w := new Widget(out var n); "
         "    _ := w; "
         "    var idOk := (n.Id = 9); "
         "    if idOk then return 0; end; "

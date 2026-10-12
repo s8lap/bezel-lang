@@ -14345,7 +14345,26 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                     slotTy = lowerTypeRef(fty);
                 v = entryAlloca(slotTy);
             }
-        } else if (a.modifier == "out owned var" && a.value) {
+        } else if ((a.modifier == "out owned var" ||
+                    // fix #3842 (§A.4 / §22.4, v0.289 L2): `out owned var` is
+                    // RETIRED and `out var x` is its replacement, adopting the
+                    // resolved parameter's classification (§22.4). Gated on
+                    // the CHAIN TARGET's formal — read a few lines above at the
+                    // bound position `pi` — so an ordinary `out var` against a
+                    // BORROWING `out` formal still adopts a borrow and registers
+                    // nothing, exactly as `ensureCtorOutVarSlots`' landed
+                    // `out owned`-formal-gated arm (LlvmBackend_Calls2.cpp,
+                    // #3842-adjacent) does for `new T(out var x)`.
+                    //
+                    // MEASURED on the #4975 imported-base shape
+                    // (`base(out var recipient)` × 50): without this the
+                    // ownership pass still marked the recipient Owned (the
+                    // §28.3 must-use warning fired) but codegen registered no
+                    // reclamation and no scope-end disposal — the destructor
+                    // ran, the block was never freed, and `Counted.Live()`
+                    // settled at 50 instead of 0.
+                    (a.modifier == "out var" && formalMod == "out owned")) &&
+                   a.value) {
             // fix #4975 (§22.4/§28.3/§28.11, v0.307): `this(out owned var x,
             // ...)` / `base(out owned var x, ...)` — a chain-call recipient
             // declared fresh via `out owned var`. Exactly the #4994 `out var`

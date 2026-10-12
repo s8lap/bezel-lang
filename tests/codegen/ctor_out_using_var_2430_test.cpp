@@ -229,7 +229,7 @@ BEZEL_TEST(ctor_out_using_var_2430,
         "class C "
         "  private static method Run(): int "
         "    Res.alive := 0; "
-        "    var w := new Widget(out owned var a, out using var b); "
+        "    var w := new Widget(out var a, out using var b); "
         "    var ok := (a.Id = 1) and (b.Id = 2); "
         "    a.Dispose(); "
         "    w.Dispose(); "

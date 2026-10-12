@@ -16,7 +16,7 @@
 //
 // RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; class Cell public _id: int := 0; public constructor(id: int) _id := id; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); using var s2 := new OwningStack<Cell>(); s.Push(move (new Cell(1))); var ok := s.TryPop(out owned var item); s2.Push(move item); end; return 0; end Main; end C;
+module M; class Cell public _id: int := 0; public constructor(id: int) _id := id; end constructor; destructor end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); using var s2 := new OwningStack<Cell>(); s.Push(move (new Cell(1))); var ok := s.TryPop(out var item); s2.Push(move item); end; return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: the argument to `OwningStack<T>.Push` is nullable but the target type is non-nullable
 // CHECK-SAME: (§7)

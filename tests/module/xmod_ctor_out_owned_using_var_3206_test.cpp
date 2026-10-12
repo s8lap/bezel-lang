@@ -274,7 +274,7 @@ std::string nopeBody3206(const char* form) {
 // ===========================================================================
 BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
            t1_imported_ctor_out_owned_recipient_typed_and_dropped_22_4) {
-    int rc = runImported3206(workBody3206("out owned var"), "t1");
+    int rc = runImported3206(workBody3206("out var"), "t1");
     if (rc == -2) return;
     BEZEL_EXPECT_EQ(rc, 211);
 }
@@ -285,7 +285,7 @@ BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
 BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
            t1b_same_module_ctor_out_owned_recipient_22_4) {
     int rc = runSingleModule3206(
-        sameModuleProgram3206(workBody3206("out owned var"), "T1b"), "t1b");
+        sameModuleProgram3206(workBody3206("out var"), "T1b"), "t1b");
     BEZEL_EXPECT_EQ(rc, 211);
 }
 
@@ -316,7 +316,7 @@ BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
 // ===========================================================================
 BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
            t3_imported_ctor_out_owned_no_leak_no_double_free_28_3) {
-    int rc = runImported3206(workBody3206("out owned var"), "t3",
+    int rc = runImported3206(workBody3206("out var"), "t3",
                              /*capturedStderr=*/nullptr, /*asan=*/true);
     if (rc == -2) return;
     BEZEL_EXPECT_EQ(rc, 211);
@@ -341,7 +341,7 @@ BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
 BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
            t4_imported_ctor_out_owned_recipient_has_a_real_type_11_3) {
     std::string err;
-    int rc = runImported3206(nopeBody3206("out owned var"), "t4", &err);
+    int rc = runImported3206(nopeBody3206("out var"), "t4", &err);
     if (rc == -2) return;
     BEZEL_EXPECT_EQ(rc, -1);  // must NOT build
     BEZEL_EXPECT_TRUE(mentions3206(err, "no member `Nope` on type `Res`"));
@@ -351,7 +351,7 @@ BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
            t4b_same_module_ctor_out_owned_recipient_type_11_3) {
     std::string err;
     int rc = runSingleModule3206(
-        sameModuleProgram3206(nopeBody3206("out owned var"), "T4b"), "t4b",
+        sameModuleProgram3206(nopeBody3206("out var"), "T4b"), "t4b",
         &err);
     BEZEL_EXPECT_EQ(rc, -1);
     BEZEL_EXPECT_TRUE(mentions3206(err, "no member `Nope` on type `Res`"));
@@ -409,7 +409,7 @@ BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
         "end Two; "
         "class C "
         "  static method Work(): int "
-        "    using var t := new Two(7, out owned var made); "
+        "    using var t := new Two(7, out var made); "
         "    return made.v + 20; "
         "  end Work; "
         "  public static method Main(): int "
@@ -460,7 +460,7 @@ BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
         "module CtorOutIdxApp3206; import CtorOutIdxLib3206; "
         "class C "
         "  static method Work(): int "
-        "    using var t := new Two(7, out owned var made); "
+        "    using var t := new Two(7, out var made); "
         "    return made.v + 20; "
         "  end Work; "
         "  public static method Main(): int "

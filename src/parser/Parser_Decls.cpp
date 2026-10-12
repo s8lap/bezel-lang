@@ -3050,11 +3050,13 @@ std::vector<ast::Param> Parser::parseParamList() {
 std::vector<ast::CallArgument> Parser::parseArgList(bool isIndexPosition) {
     // A.4 ArgList ::= Argument ("," Argument)*
     // Argument    ::= ArgModifiers? (Identifier ":=")? ArgExpression
-    // ArgModifiers ∈ { ref | out var? | out using var | out owned var | owned
-    //                   | scoped }
-    // per §A.4 / v0.160: the former bare `out owned` form now requires "var"
-    // (an inline owned-local declaration). §22.3/§28.14 (v0.180, #1439): the
-    // `scoped` call-site marker parallels bare `owned` — it marks a class/
+    // ArgModifiers ∈ { ref | out var? | out using var | scoped }
+    // A.4 carries NO `owned` alternative (proposal 0090, v0.246): the call-site
+    // transfer marker is the `move` keyword inside the argument EXPRESSION
+    // (§22.3, §28.8.1), not a modifier. `out owned var` was the last use-site
+    // `owned` standing and is retired at v0.289 L2 (fix #3842).
+    // §22.3/§28.14 (v0.180, #1439): the
+    // `scoped` call-site marker parallels `move` — it marks a class/
     // interface-typed borrow argument to a `scoped` parameter (`M(scoped x)`).
     // Positional-only like the other modified forms; fresh-producer /
     // declared-before/freeze admission is checked semantically in ownership
@@ -3066,17 +3068,34 @@ std::vector<ast::CallArgument> Parser::parseArgList(bool isIndexPosition) {
         if (consumeKeyword("ref")) {
             a.modifier = "ref";
         } else if (consumeKeyword("out")) {
-            if (consumeKeyword("owned")) {
-                // per §A.4 / v0.160: `out owned` MUST be followed by `var`
-                // (declares an inline owned local); bare `out owned x` is
-                // no longer derivable from the grammar.
-                if (!consumeKeyword("var")) {
-                    diagnostics_.report(
-                        Severity::Error, current_.location,
-                        "expected 'var' after 'out owned' (§22.4, v0.160: "
-                        "use 'out owned var x' to declare an inline owned local)");
-                }
-                a.modifier = "out owned var";
+            if (current_.kind == TokenKind::Keyword &&
+                current_.text == "owned") {
+                // RETIRED (fix #3842; §A.4 + §22.4, v0.289 L2). `out owned var x`
+                // is not in the A.4 ArgModifiers production — the last use-site
+                // `owned` v0.246 left standing, and v0.289 L2 deleted it:
+                // "out var x" now declares a fresh local that ADOPTS the
+                // classification the resolved parameter announces (§22.4's
+                // adoption clause, §28.3), so the call-site marker is redundant
+                // here rather than informative. Consume the tokens and report at
+                // the `owned`, naming the sanctioned replacement.
+                //
+                // The modifier is still SET to "out var" (the successor
+                // spelling) so the rest of the pipeline type-checks the shape
+                // and any SECOND diagnostic a caller trips is the real one
+                // rather than a cascade from an empty modifier. The error above
+                // is what rejects the program.
+                const SourceLocation loc = current_.location;
+                advance();  // `owned`
+                consumeKeyword("var");  // the retired `var`, if written
+                diagnostics_.report(
+                    Severity::Error, loc,
+                    "'out owned var' is not a call-site spelling (§A.4, "
+                    "v0.334: ArgModifiers has no `owned` alternative; "
+                    "proposal 0090, v0.246). Write `out var x` — at an "
+                    "`out owned` parameter the inline recipient ADOPTS the "
+                    "callee's owned classification (§22.4, v0.289 L2), or "
+                    "`out using var x` for the scope-bound owned form");
+                a.modifier = "out var";
             } else if (consumeKeyword("using")) {
                 if (!consumeKeyword("var")) {
                     diagnostics_.report(
@@ -3153,8 +3172,8 @@ std::vector<ast::CallArgument> Parser::parseArgList(bool isIndexPosition) {
         // disambiguation — "no Expression contains the bare token (A.1)".
         // §17.13 sanctions it only under the `out` modifier: "the discard
         // composes with `out` only: **`ref _` is a compile error**"; the
-        // inline-declaration modifiers (`out var` / `out owned var` /
-        // `out using var`) declare a local, and `_` is never declarable.
+        // inline-declaration modifiers (`out var` / `out using var`) declare a
+        // local, and `_` is never declarable.
         if (atDiscard()) {
             const SourceLocation discardLoc = current_.location;
             if (a.modifier == "ref") {
@@ -3165,7 +3184,6 @@ std::vector<ast::CallArgument> Parser::parseArgList(bool isIndexPosition) {
                     "location, or use `out _` if the parameter is pure output "
                     "(§17.13, §22.3)");
             } else if (a.modifier == "out var" ||
-                       a.modifier == "out owned var" ||
                        a.modifier == "out using var") {
                 diagnostics_.report(
                     Severity::Error, discardLoc,

@@ -2060,7 +2060,11 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // ENFORCES the mandatory keyword even for a single candidate (defects 3/4).
     auto isOutMod = [](std::string_view m) {
         return m == "out" || m == "out var" || m == "out using var" ||
-               m == "out owned var";  // per §22.4 / v0.160: bare "out owned" is gone
+               // `out owned var` is RETIRED (§A.4, v0.289 L2, fix #3842) and
+               // no longer produced by the parser; the arm is kept so a
+               // hand-built AST / stale interface cannot silently fall out of
+               // the out-modifier class.
+               m == "out owned var";
     };
     auto refOutMatch = [&](std::string_view argMod,
                            std::string_view paramMod) -> bool {
@@ -2112,9 +2116,10 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 if (paramRefOut && am.empty())
                     detail = "parameter `" + pname + "` is `" + pm +
                              "` — pass the argument with `" +
-                             // per §22.4 / v0.160: `out owned` param → use
-                             // `out owned var x` (inline declaration) at call site
-                             (pm == "out owned" ? std::string("out owned var")
+                             // per §A.4 / §22.4 (v0.289 L2, fix #3842): an
+                             // `out owned` param → use `out var x`, whose inline
+                             // recipient ADOPTS the callee's owned classification.
+                             (pm == "out owned" ? std::string("out var")
                                                 : pm) +
                              "` at the call site";
                 else if (!paramRefOut && !am.empty())
@@ -8940,9 +8945,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         "every extraction Try's out parameter "
                                         "is `T?` and the false path assigns "
                                         "`null` (stdlib §1 / §22.3, v0.171 "
-                                        "#1336). Declare the recipient nullable "
-                                        "(`T?`) or use an inline `out var` / "
-                                        "`out owned var` / `out using var` form.");
+                                        "#1336; `out owned var` retired at "
+                                        "§A.4, v0.289 L2). Declare the recipient "
+                                        "nullable (`T?`) or use an inline "
+                                        "`out var` / `out using var` form.");
                                 }
                             }
                         }
@@ -13016,9 +13022,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (rcn == "Weak") {
                         if (m == "TryUpgrade") {
                             // TryUpgrade(out owned s: Shared<T>?): bool.
-                            // spec §22.4 / #653: the parameter is "out owned" —
-                            // the only accepted call-site forms are
-                            // "out using var x" and "out owned var x".
+                            // spec §22.4 / #653 + fix #3842 (§A.4, v0.289 L2):
+                            // the parameter is "out owned" — the only accepted
+                            // inline call-site forms are "out var x" (adopting,
+                            // v0.289 L2) and "out using var x". `out owned var x`
+                            // is RETIRED and now rejected at the parser.
                             // Plain "out x" (pre-declared variable) is ill-formed
                             // because it doesn't communicate an owned-discharge
                             // obligation to the compiler. Emit a clear diagnostic.
@@ -13026,21 +13034,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 const auto& arg0 = ce.args[0];
                                 bool isOutUsingVar =
                                     arg0.modifier == "out using var";
-                                bool isOutOwnedVar =
-                                    arg0.modifier == "out owned var";
+                                bool isOutVar = arg0.modifier == "out var";
                                 bool isDiscard = arg0.isDiscard;
                                 if (!arg0.modifier.empty() &&
-                                    !isOutUsingVar && !isOutOwnedVar &&
+                                    !isOutUsingVar && !isOutVar &&
                                     !isDiscard) {
                                     ctx_.diagnostics().report(
                                         Severity::Error, ce.span.begin,
                                         "TryUpgrade parameter is 'out owned': "
                                         "accepted call-site forms are "
-                                        "'out using var x' or 'out owned var x' "
-                                        "(spec §22.4). "
+                                        "'out var x' or 'out using var x' "
+                                        "(spec §22.4, v0.289 L2). "
                                         "Plain 'out x' is not valid for an "
                                         "'out owned' parameter — use "
-                                        "'out using var x' instead.");
+                                        "'out var x' instead.");
                                 }
                             }
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
@@ -15988,7 +15995,9 @@ void ExprTC::checkChainRefOutModifiers(const ast::ConstructorDecl& cd) {
         if (paramRefOut && am.empty()) {
             detail = "parameter `" + pname + "` is `" + pm +
                      "` — pass the argument with `" +
-                     (pm == "out owned" ? std::string("out owned var") : pm) +
+                     // per §A.4 / §22.4 (v0.289 L2, fix #3842): `out var x`
+                     // adopts the `out owned` parameter's classification.
+                     (pm == "out owned" ? std::string("out var") : pm) +
                      "` at the call site";
             if (a && !a->name.empty())
                 detail += ", positionally (a `ref`/`out` argument has no "
@@ -18800,7 +18809,9 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                           std::string_view paramMod) -> bool {
         auto isOut = [](std::string_view m) {
             return m == "out" || m == "out var" || m == "out using var" ||
-                   m == "out owned var";  // per §22.4 / v0.160
+                   // `out owned var` is RETIRED (§A.4, v0.289 L2, fix #3842);
+                   // retained as a defensive arm, see isOutMod above.
+                   m == "out owned var";
         };
         bool argRef = argMod == "ref", argOut = isOut(argMod);
         bool paramRef = paramMod == "ref";
@@ -18825,7 +18836,9 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     ? "parameter `" + pname + "` is `" + pm +
                           "` — pass the argument with `" +
                           // per §22.4 / v0.160: `out owned` param → use `out owned var x`
-                          (pm == "out owned" ? std::string("out owned var") : pm) +
+                          // per §A.4 / §22.4 (v0.289 L2, fix #3842): `out var x`
+                     // adopts the `out owned` parameter's classification.
+                     (pm == "out owned" ? std::string("out var") : pm) +
                           "` at the call site"
                 : (!prefOut && !am.empty()
                        ? "parameter `" + pname +

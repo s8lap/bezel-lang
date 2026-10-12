@@ -2105,12 +2105,38 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
 // one).
 bool Emitter::isOutOwnedArgPosition(const ast::CallExpr& call, std::size_t pos) {
     // A USER method whose formal at `pos` is declared `out owned`.
+    //
+    // BOTH SOURCES, imported-first with the AST winning — fix #3842. This read
+    // only `ms->decl` (the `ast::MethodDecl`), which is NULL for an IMPORTED
+    // callee, so an imported `Make(out owned r)` answered "not an out-owned
+    // position" and the `out var x` disposal arm below registered nothing:
+    // the ownership pass still marked the recipient Owned (the §28.3 must-use
+    // warning fired, so the program looked diagnosed) but nothing reclaimed
+    // the block — MEASURED on tests/module/
+    // xmod_method_owned_param_3176_test.cpp's `t10` (an imported `Fact.Make`
+    // against `out var made`), where the undischarged recipient leaked.
+    //
+    // This is the SAME both-sources defect class #3176 fixed in the OWNERSHIP
+    // pass's `collectCondOutOwnedRecipients` ("they both read `ms->decl`, both
+    // answered 'no', and the two wrongs cancelled into a silent leak") and
+    // #3188 fixed in sema's `formalOutParamType2`. The codegen mirror had been
+    // left on the AST-only reading, so fixing ownership + sema without it left
+    // the leak reachable — precisely the half-landed shape this issue class
+    // warns about. `ParameterSymbol::modifier` carries the modifier across the
+    // module boundary (it is what an imported signature is built from).
     if (auto* calleeSym = ctx_.exprSymbol(*call.callee)) {
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym)) {
-            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-                if (pos < md->params.size())
-                    return md->params[pos].modifier == "out owned";
+            std::string_view mod;
+            if (pos < ms->params.size()) {
+                if (auto* ps =
+                        dynamic_cast<const sema::ParameterSymbol*>(
+                            ms->params[pos]))
+                    mod = ps->modifier;
             }
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+                if (pos < md->params.size()) mod = md->params[pos].modifier;
+            }
+            if (!mod.empty()) return mod == "out owned";
         }
     }
     // A builtin owned-OUT collection Try* method — no AST declaration, so

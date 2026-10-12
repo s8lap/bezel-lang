@@ -606,7 +606,7 @@ BEZEL_TEST(xmod_method_owned_param_3176,
            t10_imported_out_owned_recipient_typed_and_dropped_22_4) {
     int rc = runImported3176(
         "  static method Work(): int "
-        "    var ok := Fact.Make(out owned var made); "
+        "    var ok := Fact.Make(out var made); "
         "    if not ok then "
         "      return 0; "
         "    end if; "
@@ -629,7 +629,7 @@ BEZEL_TEST(xmod_method_owned_param_3176,
     int rc = runSingleModule3176(
         sameModuleProgram3176(
             "  static method Work(): int "
-            "    var ok := Fact.Make(out owned var made); "
+            "    var ok := Fact.Make(out var made); "
             "    if not ok then "
             "      return 0; "
             "    end if; "
@@ -660,7 +660,7 @@ BEZEL_TEST(xmod_method_owned_param_3176,
     std::string err;
     int rc = runImported3176(
         "  public static method Main(): int "
-        "    var ok := Fact.Make(out owned var made); "
+        "    var ok := Fact.Make(out var made); "
         "    if not ok then "
         "      return 0; "
         "    end if; "
@@ -681,7 +681,7 @@ BEZEL_TEST(xmod_method_owned_param_3176,
     int rc = runSingleModule3176(
         sameModuleProgram3176(
             "  public static method Main(): int "
-            "    var ok := Fact.Make(out owned var made); "
+            "    var ok := Fact.Make(out var made); "
             "    if not ok then "
             "      return 0; "
             "    end if; "

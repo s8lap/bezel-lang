@@ -114,24 +114,34 @@ BEZEL_TEST(out_owned_value_erasure_1860,
 }
 
 // ===========================================================================
-// (2) VALUE substitution `out owned var` — the marker is erased, so the recipient
-// carries NO disposal obligation and draws NO §28.3 auto-drop warning.
-// WITHOUT the fix: the spurious "owned value in `n` …" warning fires.
+// (2) VALUE substitution `out var` — the marker is ERASED at the value
+// substitution, so the recipient carries NO disposal obligation and draws NO
+// §28.3 auto-drop warning. `out owned var` is RETIRED (§A.4, v0.289 L2,
+// fix #3842) and `out var x` is the sanctioned replacement; this row is the
+// erasure gate's coverage of that replacement.
+// WITHOUT the fix: the spurious "owned value in `n` …" warning fires — MEASURED
+// at BASE, where `out var` warned and `out owned var` did not. ROOT CAUSE: the
+// `out var` inline recipient took the bare `T` as its `declType` (the CallExpr
+// handler substituted the formal only for an INTERFACE parent, §11.8/#807,
+// while `out using var` substitutes for ANY generic parent), so §28.1's
+// `isValueSubstitutionErased` gate — which deliberately does NOT erase a
+// null-declaration Named, being the leak-safe direction — declined to erase.
 // ===========================================================================
 BEZEL_TEST(out_owned_value_erasure_1860,
-           value_out_owned_var_no_auto_drop_spec_28_1) {
-    OwnershipResult r = parseAndCheckOwnership(valueMain("out owned var"));
+           value_out_var_no_auto_drop_spec_28_1) {
+    OwnershipResult r = parseAndCheckOwnership(valueMain("out var"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_FALSE(hasAutoDropWarning(r, "n"));
 }
 
 // ===========================================================================
-// (3) VALUE substitution `out owned var` — same erased-value runtime path; the
-// value round-trips and the program runs clean under ASan/LSan.
+// (3) VALUE substitution `out var` — same erased-value runtime path; the value
+// round-trips and the program runs clean under ASan/LSan. `n.ToString()` is a
+// box on a value type (§8.6), which is the codegen-segfault half #1860 found.
 // ===========================================================================
 BEZEL_TEST(out_owned_value_erasure_1860,
-           value_out_owned_var_runs_clean_spec_28_10) {
-    JitResult r = runAotChecked(valueMain("out owned var"));
+           value_out_var_runs_clean_spec_28_10) {
+    JitResult r = runAotChecked(valueMain("out var"));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -170,7 +180,7 @@ BEZEL_TEST(out_owned_value_erasure_1860,
 }
 
 // ===========================================================================
-// NEG (5) — a CLASS-substituted `out owned var` recipient left undischarged STILL
+// NEG (5) — a CLASS-substituted `out var` recipient left undischarged STILL
 // carries a disposal obligation: the §28.3 affine auto-drop warning fires (and
 // the runtime disposes it exactly once). Guards that the erasure gate does not
 // silently drop a class resource's obligation at a class substitution.
@@ -187,7 +197,7 @@ BEZEL_TEST(out_owned_value_erasure_1860,
         "class P "
         "  public static method Main(): int "
         "    using var f := new Factory<Conn>(); "
-        "    if f.TryMake(new Conn(3), out owned var n) then "
+        "    if f.TryMake(new Conn(3), out var n) then "
         "      Console.WriteLine(\"got\"); "
         "    end; "
         "    return 0; "

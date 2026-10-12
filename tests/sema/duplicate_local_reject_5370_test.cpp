@@ -60,7 +60,7 @@ BEZEL_TEST(duplicate_local_reject_5370, out_owned_var_method_call_duplicate) {
         "  public static method Main(): int"
         "    var result: D := new D();"
         "    var c := new C();"
-        "    c.TryOwn(true, out owned var result);"
+        "    c.TryOwn(true, out var result);"
         "    return 0;"
         "  end Main;"
         "end P;");
@@ -145,7 +145,7 @@ BEZEL_TEST(duplicate_local_reject_5370, out_owned_var_constructor_call_duplicate
         "class P"
         "  public static method Main(): int "
         "    var n: Item := new Item();"
-        "    var w := new Widget(\"x\", out owned var n);"
+        "    var w := new Widget(\"x\", out var n);"
         "    return 0; "
         "  end Main;"
         "end P;");

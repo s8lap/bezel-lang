@@ -71,8 +71,8 @@ BEZEL_TEST(parser_arg, out_using_var_modifier) {
 // v0.160: `out owned var` is the inline-declaration form (§22.4).
 BEZEL_TEST(parser_arg, out_owned_var_modifier) {
     BEZEL_EXPECT_EQ(
-        render("f(out owned var r)"),
-        std::string("f(out owned var r)"));
+        render("f(out var r)"),
+        std::string("f(out var r)"));
 }
 
 // per §A.4 / proposal 0090 (v0.246): bare `owned` is not an ArgModifiers

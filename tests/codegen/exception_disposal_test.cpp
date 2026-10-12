@@ -1417,7 +1417,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_recipient_unwind_disposed) {
         std::string("module M; ") + kCellCtorDtor +
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); s.Push(new Cell()); "
-        "    try do var ok := s.TryPop(out owned var item); "
+        "    try do var ok := s.TryPop(out var item); "
         "           throw new Exception(\"x\"); item?.Dispose(); end; "
         "    catch Exception => return Cell._n; end; "  // 0
         "    return -1; end; "
@@ -1432,7 +1432,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_dispose_then_throw_no_double_free) 
         std::string("module M; ") + kCellCtorDtor + "class E: Exception end E; "
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); s.Push(new Cell()); "
-        "    try do var ok := s.TryPop(out owned var item); "
+        "    try do var ok := s.TryPop(out var item); "
         "           item?.Dispose(); throw new E(); end; "
         "    catch E => return Cell._n; end; "  // 0 — disposed once
         "    return -1; end; "
@@ -1446,7 +1446,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_normal_exit_disposed_once) {
         std::string("module M; ") + kCellCtorDtor +
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); s.Push(new Cell()); "
-        "    do var ok := s.TryPop(out owned var item); "
+        "    do var ok := s.TryPop(out var item); "
         "       item?.Dispose(); end; "
         "    return Cell._n; end; "  // 0
         "end Main; end C;", 0);
@@ -1945,7 +1945,7 @@ const char* kArr1602InlineOutOwnedVarDischargeAfterIfNormalPath =
     "class C public static method Main(): int "
     "  using var s := new OwningStack<R>(); "
     "  s.Push(move (new R())); "
-    "  if s.TryPop(out owned var top) then end; "
+    "  if s.TryPop(out var top) then end; "
     "  top?.Dispose(); "
     "  return R.count; "
     "  end Main; "
@@ -1971,7 +1971,7 @@ const char* kArr1602InlineOutOwnedVarThrowBeforeLaterDischarge =
     "  public static method Run(shouldThrow: bool): int "
     "    using var s := new OwningStack<R>(); "
     "    s.Push(move (new R())); "
-    "    if s.TryPop(out owned var top) then end; "
+    "    if s.TryPop(out var top) then end; "
     "    if shouldThrow then throw new AppError(); else top?.Dispose(); end; "
     "    return R.count; "
     "  end Run; "

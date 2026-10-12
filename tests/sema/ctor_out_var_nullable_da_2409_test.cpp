@@ -449,7 +449,7 @@ BEZEL_TEST(ctor_out_var_da_2409,
         "end Pool; "
         "class C "
         "  public static method Main(): int "
-        "    using var p := new Pool(out owned var c); "
+        "    using var p := new Pool(out var c); "
         "    _ := p; "
         "    return c.Use(); "
         "  end Main; end C;",

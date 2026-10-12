@@ -7,4 +7,4 @@
 
 module M; class C public static method Main(): int do const s: Stack<int> := [1]; var x: int := 0; var ok := s.TryPop(out x); end; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `out` recipient of `TryPop` must be nullable: every extraction Try's out parameter is `T?` and the false path assigns `null` (stdlib §1 / §22.3, v0.171 #1336). Declare the recipient nullable (`T?`) or use an inline `out var` / `out owned var` / `out using var` form.
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: the `out` recipient of `TryPop` must be nullable: every extraction Try's out parameter is `T?` and the false path assigns `null` (stdlib §1 / §22.3, v0.171 #1336; `out owned var` retired at §A.4, v0.289 L2). Declare the recipient nullable (`T?`) or use an inline `out var` / `out using var` form.

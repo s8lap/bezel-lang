@@ -67,7 +67,7 @@ class Widget
 end Widget;
 class C
   public static method Main(): int
-    _ := new Widget(out owned var x);
+    _ := new Widget(out var x);
     var v := x.Id;
     return v;
   end Main;
@@ -109,7 +109,7 @@ class Widget
 end Widget;
 class C
   public static method Main(): int
-    new Widget(out owned var x);
+    new Widget(out var x);
     var v := x.Id;
     return v;
   end Main;

@@ -350,7 +350,7 @@ BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655,
         "end Widget; "
         "class C "
         "  public static method Main(): int "
-        "    new Widget(out owned var x); "
+        "    new Widget(out var x); "
         "    var v := x.Id; "
         "    return v + Res.alive; "
         "  end Main; "

@@ -285,7 +285,7 @@ BEZEL_TEST(owned_marker, out_owned_var_unaffected) {
         "module M; class T end T; "
         "class Src public method Get(out owned r: T) r := new T(); end Get; end Src; "
         "class C public method M(s: Src) "
-        "  s.Get(out owned var top); "
+        "  s.Get(out var top); "
         "  using var h := move top; "
         "end M; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

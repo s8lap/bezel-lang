@@ -100,7 +100,7 @@ const char* kOutOwnedVarBindingTransfers =
     "    return true; "
     "  end TryMake; "
     "  public static method Main(): int "
-    "    var ok := TryMake(out owned var x); "
+    "    var ok := TryMake(out var x); "
     "    if x <> null then Console.WriteLine(\"got=\" + x.Id.ToString()); end; "
     "    Console.WriteLine(\"ok=\" + ok.ToString()); "
     "    return 0; "

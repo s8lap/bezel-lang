@@ -9635,18 +9635,38 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // condition used to compute.
                     if (TypeRef* formalTy2 = formalOutParamType2(pos2)) {
                         lsym->declType = formalTy2;
-                        // §11.8 (v0.176, #807): a STATIC interface member
-                        // called through a constrained type parameter
-                        // (`T.TryParse(s, out var v)`) declares its out param
-                        // in terms of the INTERFACE's recurrence parameter
-                        // (`value: T?` on IParsable<T>). Substitute it against
-                        // the receiver (whose exprType resolveMemberAccess set
-                        // to the constraint instantiation `I<T>`) so `v` is
-                        // typed by the CALL SITE's type parameter, not the
-                        // interface's unrelated `T` spelling.
+                        // §28.1 (v0.196, #1860) clause 3 — fix #3842: an
+                        // `out var` recipient of a GENERIC CLASS callee
+                        // (`Factory<int>.TryMake(5, out var n)` against
+                        // `TryMake(owned v: T, out owned result: T)`) took the
+                        // bare `T` as its `declType`, because the block below
+                        // substituted the formal only for an INTERFACE parent
+                        // (§11.8 / #807). `out using var` has always
+                        // substituted for ANY parent with generic params (see
+                        // its handler further down), which is why the two
+                        // spellings of the SAME §22.4 inline declaration
+                        // disagreed on the recipient's type.
+                        //
+                        // The consequence was not cosmetic. §28.1's
+                        // substitution-erasure is read off the recipient's
+                        // SUBSTITUTED type kind (`isValueSubstitutionErased`),
+                        // and the bare `T` — a `Named` with no declaration —
+                        // is deliberately NOT erased (leak-safe). So at
+                        // `Factory<int>` the recipient kept an Owned
+                        // classification for a value carrying no obligation:
+                        // MEASURED at BASE, `out var` at a value substitution
+                        // emitted a spurious §28.3 must-use warning where
+                        // `out owned var` did not, and the codegen half read
+                        // the unresolved type too. Since v0.289 L2 retires
+                        // `out owned var` and makes `out var` the migration
+                        // target, leaving this would have landed the gap on
+                        // every user of the retirement. Widen the condition
+                        // from "interface parent" to "parent with generic
+                        // params"; an interface parent still takes it (its
+                        // `genericParams` is non-empty whenever #807's case
+                        // applies), so #807 is strictly preserved.
                         if (lsym->declType && calleeParent2 &&
-                            calleeParent2->kind ==
-                                ast::TypeDeclKind::Interface) {
+                            !calleeParent2->genericParams.empty()) {
                             if (auto* maCal =
                                     dynamic_cast<const ast::MemberAccessExpr*>(
                                         ce->callee.get())) {

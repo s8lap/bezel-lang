@@ -37,7 +37,12 @@ BEZEL_TEST(out_owned_ref_out_diagnostic_2320,
     BEZEL_EXPECT_TRUE(messageContains(r, "§22.3"));
     BEZEL_EXPECT_TRUE(messageContains(r, "§22.4"));
     BEZEL_EXPECT_TRUE(messageContains(r, "out using var"));
-    BEZEL_EXPECT_TRUE(messageContains(r, "out owned var"));
+    // fix #3842 (§A.4 / §22.4, v0.289 L2): the diagnostic now names the two
+    // ADMITTED inline forms. `out owned var x` was the third name it used to
+    // advertise and is retired — the parser rejects it now — so asserting it
+    // here would pin text the user can no longer act on. The §22.3 / §22.4
+    // citations and the "out using var" remedy above are unchanged.
+    BEZEL_EXPECT_TRUE(messageContains(r, "out var x"));
     BEZEL_EXPECT_FALSE(messageContains(r, "#1386"));
 }
 
@@ -119,7 +124,7 @@ BEZEL_TEST(out_owned_ref_out_diagnostic_2320,
         "    c := new Cell(5); "
         "  end Make; "
         "  public static method Main(): int "
-        "    C.Make(out owned var cell); "
+        "    C.Make(out var cell); "
         "    return cell.N; "
         "  end Main; "
         "end C;"));

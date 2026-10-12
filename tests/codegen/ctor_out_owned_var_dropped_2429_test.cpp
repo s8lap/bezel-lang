@@ -123,7 +123,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         // through this wrapper call means Main's own read happens strictly
         // after Build's frame (and its auto-drop) has fully unwound.
         "  public static method Build(): int "
-        "    var w := new Widget(\"x\", out owned var n); "
+        "    var w := new Widget(\"x\", out var n); "
         "    w.Dispose(); "
         "    return 0; "
         // `n` is never touched again — dropped on the floor.
@@ -164,7 +164,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "class C "
         "  public static method Main(): int "
         "    Res.alive := 0; "
-        "    var w := new Widget(\"x\", out owned var n); "
+        "    var w := new Widget(\"x\", out var n); "
         "    n.Dispose(); "
         "    w.Dispose(); "
         "    return Res.alive; "
@@ -200,7 +200,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "class C "
         "  public static method Main(): int "
         "    Res.alive := 0; "
-        "    var w := new Widget(\"x\", out owned var n); "
+        "    var w := new Widget(\"x\", out var n); "
         "    w.Dispose(); "
         "    var h := new Holder(move n); "
         "    h.Dispose(); "
@@ -234,7 +234,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "  end Consume; "
         "  public static method Main(): int "
         "    Res.alive := 0; "
-        "    var w := new Widget(\"x\", out owned var n); "
+        "    var w := new Widget(\"x\", out var n); "
         "    w.Dispose(); "
         "    _ := C.Consume(move n); "
         "    return Res.alive; "
@@ -271,7 +271,7 @@ BEZEL_TEST(
         // epilogue, so Res.alive is read from Main, strictly after Build's
         // frame (and its auto-drop) has fully unwound.
         "  public static method Build(): int "
-        "    var w := new Widget(out owned var x, out owned var y); "
+        "    var w := new Widget(out var x, out var y); "
         "    w.Dispose(); "
         "    x.Dispose(); "
         "    return 0; "

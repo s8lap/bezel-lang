@@ -50,7 +50,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_out_owned_null_cond_dispose) {
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell())); "
-        "    var ok := s.TryPop(out owned var item); "
+        "    var ok := s.TryPop(out var item); "
         "    item?.Dispose(); "
         "  end; return Cell._n; end Main; end C;"), 0);
 }
@@ -63,7 +63,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_out_owned_narrowed_dispose) {
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell())); "
-        "    var ok := s.TryPop(out owned var item); "
+        "    var ok := s.TryPop(out var item); "
         "    if item <> null then item.Dispose(); end; "
         "  end; return Cell._n; end Main; end C;"), 0);
 }
@@ -80,7 +80,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_two_elements_each_disposed_once) {
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); "
         "    s.Push(move (new Cell(1))); s.Push(move (new Cell(2))); "
-        "    var ok := s.TryPop(out owned var item); "  // pops id=2 (top)
+        "    var ok := s.TryPop(out var item); "  // pops id=2 (top)
         "    item?.Dispose(); "                          // disposes 2 -> log=2
         "  end; return Cell._log; end Main; end C;"), 21);
 }
@@ -103,7 +103,7 @@ BEZEL_TEST(out_owned_writeback_889, trypop_empty_null_cond_noop) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); "
-        "    var ok := s.TryPop(out owned var item); "
+        "    var ok := s.TryPop(out var item); "
         "    item?.Dispose(); "
         "    if ok then return 99; end; "
         "  end; return Cell._n; end Main; end C;"), 0);
@@ -125,7 +125,7 @@ BEZEL_TEST(out_owned_writeback_889, trydequeue_out_owned_disposed_once) {
         "class C public static method Main(): int "
         "  do using var q := new OwningQueue<Cell>(); "
         "    q.Enqueue(move (new Cell())); "
-        "    var ok := q.TryDequeue(out owned var item); "
+        "    var ok := q.TryDequeue(out var item); "
         "    item?.Dispose(); "
         "  end; return Cell._n; end Main; end C;"), 0);
 }

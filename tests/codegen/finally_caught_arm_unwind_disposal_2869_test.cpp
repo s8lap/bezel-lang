@@ -475,7 +475,7 @@ BEZEL_TEST(finally_caught_arm_unwind_2869,
         "    var i := 0; "
         "    while i < 20 do "
         "      try "
-        "        var r := C.Make(out owned var q); "
+        "        var r := C.Make(out var q); "
         "        r := r + T.Boom(); "
         "        q.Dispose(); "
         "      catch var e: InvalidOperationException => "

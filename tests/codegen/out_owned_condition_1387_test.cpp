@@ -129,7 +129,7 @@ BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_discard_discharge) {
         "class C public static method Main(): int "
         "  using var s := new OwningStack<Cell>(); "
         "  s.Push(move (new Cell())); "
-        "  if s.TryPop(out owned var top) then "
+        "  if s.TryPop(out var top) then "
         "    top?.Dispose(); "  // v0.171 (#1336): out owned is T?, discharge via `?.`
         "  end; "
         "  return Cell._n; "
@@ -147,7 +147,7 @@ BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_discard_false_path) {
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  using var s := new OwningStack<Cell>(); "
-        "  if s.TryPop(out owned var top) then "
+        "  if s.TryPop(out var top) then "
         "    return 99; "
         "  end; "
         "  return Cell._n; "
@@ -168,7 +168,7 @@ BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_auto_drop) {
         "  var snap: int := -1; "
         "  using var s := new OwningStack<Cell>(); "
         "  s.Push(move (new Cell())); "
-        "  if s.TryPop(out owned var top) then "
+        "  if s.TryPop(out var top) then "
         "    top?.Dispose(); "  // v0.171 (#1336): out owned is T?, discharge via `?.`
         "  end; "
         "  snap := Cell._n; "
@@ -186,7 +186,7 @@ BEZEL_TEST(out_owned_condition_1387, if_cond_out_owned_var_auto_drop_false_path)
     BEZEL_EXPECT_EQ(run(std::string(kCellHdr) +
         "class C public static method Main(): int "
         "  using var s := new OwningStack<Cell>(); "
-        "  if s.TryPop(out owned var top) then "
+        "  if s.TryPop(out var top) then "
         "    return 99; "
         "  end; "
         "  return Cell._n; "
