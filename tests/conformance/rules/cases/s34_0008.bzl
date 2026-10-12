@@ -5,6 +5,7 @@
 //! rule: Three comment forms (§1.5): `// ...` line comment, `/* ... */` block
 //!   comment, `/// ...` documentation comment.
 //! expect: accept
+//! cites: 34
 module Conf;
 
 /// <summary/>

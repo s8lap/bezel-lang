@@ -5,6 +5,7 @@
 //! rule: Value types may also be wrapped in ? to produce an optional.
 //! expect: run
 //! stdout: has value 42
+//! cites: 3.3
 module OptionalVal;
 
 public class OptionalVal

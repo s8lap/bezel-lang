@@ -4,6 +4,7 @@
 //! title: additional recognized documentation tags are accepted
 //! rule: Recognized tags include <remarks>, <example>, <see>, and <seealso>.
 //! expect: accept
+//! cites: 34
 module Conf;
 
 /// <summary>

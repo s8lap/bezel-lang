@@ -5,6 +5,7 @@
 //! rule: A reference type is non-nullable by default.
 //! expect: run
 //! stdout: not null
+//! cites: 3.3, 7.1
 module Contained;
 
 public class Container

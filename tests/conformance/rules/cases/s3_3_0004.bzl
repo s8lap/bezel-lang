@@ -6,6 +6,7 @@
 //!   produces its nullable form.
 //! expect: run
 //! stdout: hello
+//! cites: 3.3, 7.4
 module NullableFlow;
 
 public class NullableFlow

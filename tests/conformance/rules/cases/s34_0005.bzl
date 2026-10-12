@@ -5,6 +5,7 @@
 //! rule: Recognized tags include <typeparam>, <typeparamref>, and <paramref> —
 //!   generic declarations are documented like any other.
 //! expect: accept
+//! cites: 34
 module Conf;
 
 /// <summary>

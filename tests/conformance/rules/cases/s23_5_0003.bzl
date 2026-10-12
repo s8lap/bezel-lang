@@ -5,7 +5,7 @@
 //! rule: `ref` and `out` parameters are not allowed in indexer parameter lists.
 //! cites: 23.5, 22.3
 //! expect: reject
-//! diagnostic: ref
+//! diagnostic: indexer parameter may not be declared with
 module Conf;
 
 public class Holder

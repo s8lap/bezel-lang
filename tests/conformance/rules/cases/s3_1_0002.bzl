@@ -6,6 +6,7 @@
 //!   instance, a boxed record, a boxed enum, or a boxed primitive.
 //! expect: run
 //! stdout: 42
+//! cites: 3.1
 module Test;
 
 import System;

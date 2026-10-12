@@ -5,6 +5,7 @@
 //! rule: The unit type `()` — exactly one value, also written `()`.
 //! expect: run
 //! stdout: ()
+//! cites: 3.1
 module UnitTest;
 
 public class UnitTest

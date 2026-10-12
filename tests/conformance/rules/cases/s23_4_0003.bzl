@@ -6,7 +6,7 @@
 //!   indexer has no name to reference, so a supplied identifier is a mismatch.
 //! cites: 23.4, 1.6
 //! expect: reject
-//! diagnostic: end
+//! diagnostic: no name to label
 module Conf;
 
 public class Names

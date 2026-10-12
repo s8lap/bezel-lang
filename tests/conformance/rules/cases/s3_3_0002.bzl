@@ -6,6 +6,7 @@
 //!   produces its nullable form.
 //! expect: run
 //! stdout: null value
+//! cites: 3.3, 7.1
 module NullableRef;
 
 public class NullableRef
