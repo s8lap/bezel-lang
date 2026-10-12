@@ -577,9 +577,16 @@ bool PureBodyWalker::isEnumeratorConstructingSource(
         // Concrete element type — use direct indexed loop, admitted.
         return false;
     }
-    // IEnumerable<T> and IEnumerator<T>: always construct an enumerator,
-    // rejected even with a concrete element type.
-    if (head == "IEnumerable" || head == "IEnumerator")
+    // Any iterable INTERFACE head: always constructs an enumerator, rejected
+    // even with a concrete element type. §22.15 rule 5 rejects "a source whose
+    // static type is an interface (IEnumerable<T> included)".
+    //
+    // Read the shared classifier rather than a private name list: the raw
+    // `head == "IEnumerable" || head == "IEnumerator"` spelling missed the
+    // async and owning members of the same 8-member family
+    // (IAsyncEnumerable, IAsyncEnumerator, IOwningEnumerable, …), which fell
+    // through to the final `return false` and were therefore ADMITTED. // per §22.15
+    if (common::isIterableInterfaceHead(head))
         return true;
     // OwningBuffer<T> (stdlib §4.14): BOTH presentations are admitted, and
     // for different reasons the clause states separately.
