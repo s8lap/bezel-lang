@@ -53,6 +53,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -60,17 +61,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked (ASan/LSan) run is SKIPPED, not failed, when the toolchain link
-// is unavailable in this environment — same convention as
-// arm_meet_ownership_1661_test.cpp / captured_owned_primary_param_shared_
-// predicate_3634_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 bool hasBareDiscardOwnedError(const JitResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
@@ -145,7 +135,7 @@ BEZEL_TEST(trivial_dispose_recursive_clause_callsite_3647,
         "    return 0; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // WITHOUT the codegen cascade actually running: each iteration's `Inner`
     // (freshly allocated in K's constructor) would leak — LSan direct leak,
     // r.ran false. WITH a double-free in the cascade: heap-use-after-free /
