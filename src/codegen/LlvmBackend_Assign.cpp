@@ -15448,29 +15448,28 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 if (v != carrier && isBareTypeParamRef(formalTy))
                     bareTParamNarrowUnwraps_.push_back({idx, v, carrier});
             }
-            // fix #5105 (§8.6 / §28.2, v0.315): a record with string fields
-            // that is boxed loses its scope-end string-release disposal — the
-            // box holds a COPY of the record bytes, so the original record's
-            // string fields are never released. Emit the string field releases
-            // BEFORE boxing (using a temp stack slot to hold the record address)
-            // so the strings are freed while the record struct is still live.
-            // Only for records (not primitives — they have no string fields).
-            // Gated on `formalTy` being Object/interface
-            // (the only case that triggers boxForTarget).
-            if (formalTy && isObjectOrInterfaceTarget(formalTy) && v &&
-                a.value) {
-                const sema::TypeRef* argTy = ctx_.exprType(*a.value);
-                if (argTy && argTy->kind == sema::TypeRef::Kind::Named &&
-                    argTy->declaration &&
-                    argTy->declaration->kind == ast::TypeDeclKind::Record &&
-                    recordHasStringFields(argTy)) {
-                    // `v` is the loaded record struct value. Allocate a temp
-                    // slot, store the value, and use its address for the release.
-                    llvm::AllocaInst* tmpSlot = entryAlloca(v->getType());
-                    builder_.CreateStore(v, tmpSlot);
-                    emitRecordStringFieldReleases(tmpSlot, argTy);
-                }
-            }
+            // fix #5853 (§8.6 "Boxing of borrow-bearing records", §28.3,
+            // v0.334) — REMOVES the #5105 box-site string-field release
+            // (4b508ebf). A §8.6 box holds the record's fields as BORROWED
+            // references and extends no lifetime ("holds the same borrowed
+            // references as the source record; it does not extend their
+            // lifetimes"), so the record LOCAL remains the fields' sole owner
+            // and must drop them exactly once at its OWN scope end. Releasing
+            // them HERE attributed an owner-side release to a borrow: the box
+            // minted a few lines below (`boxForTarget`) copies the record bytes
+            // — including the now-dangling field pointers — so every later read
+            // of the boxed copy, and the record's own scope-end disposal, hit
+            // freed memory. String LITERALS masked it (they carry the immortal
+            // sentinel refcount), so the defect was invisible on any record
+            // whose fields were built at runtime.
+            //
+            // The missing release is restored on the local's own side, by the
+            // sibling edit in `walkCallArgs` (LlvmBackend_Setup.cpp), which
+            // admits the call-bounded borrow this removal makes sound: the box
+            // is released post-call (isCalleeParamNonEscaping, #2952) ⟺ the
+            // record does not outlive the call ⟺ releasing the record's fields
+            // at the record's own scope end cannot dangle them.
+            //
             // §8.6: a value-typed argument bound to an Object/interface
             // parameter is boxed, so a later `is`/`as` or virtual dispatch on
             // that parameter (which lowers to a descriptor walk through the

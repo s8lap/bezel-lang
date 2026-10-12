@@ -27734,6 +27734,24 @@ struct StringEscapeWalker {
     // record-call-result eligibility pass sets it; the
     // string/dict/grouping/borrowing-Array walks leave it false.
     bool recordFieldReleaseMode = false;
+    // fix #5853 (§8.6 "Boxing of borrow-bearing records", §28.3, v0.334):
+    // OPT-IN gate for the BOXED-ARGUMENT call-bounded-borrow relaxation in
+    // walkCallArgs. Set ONLY by collectRecordCallResultReleaseEligible's
+    // candidates loop — the record-call-result walk — and only there alongside
+    // `paramNonEscaping`. `paramNonEscaping` is the ONE predicate that decides
+    // whether the §8.6 box minted for an argument is released at the call
+    // return (isCalleeParamNonEscaping, #2952, consumed by the
+    // `pendingArgBoxReleases_` flush in buildOrderedArgs). Supplying it here is
+    // what makes this walk's verdict and the box's post-call release the SAME
+    // fact rather than two independent guesses — see the relaxation's own
+    // comment for the one-predicate/two-sides argument.
+    //
+    // nullptr for every other caller (string, dict-materializer, grouping,
+    // borrowing-Array, the value-like-choice walks), which leaves those walks
+    // bit-for-bit unchanged: they never read this member, so the relaxation
+    // below is unreachable for them.
+    const std::function<bool(const ast::Member*, size_t)>* paramNonEscaping =
+        nullptr;
     // fix #2450 / §35.5 / §28.9 / §35.4: OPT-IN gate for the case-scrutinee
     // relaxation below. §35.5's "borrowing match" makes every payload binding
     // a BORROW of the scrutinee's source — for a value-like choice, a
@@ -28499,6 +28517,65 @@ struct StringEscapeWalker {
                 auto* ps =
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
+            }
+            // fix #5853 (§8.6 "Boxing of borrow-bearing records", §28.3,
+            // v0.334) — the BOXED twin of the #1430 relaxation above, for the
+            // record-call-result walk (`recordFieldReleaseMode`, the only mode
+            // that sets `paramNonEscaping`).
+            //
+            // WHAT THIS ADMITS. A record local with string fields passed to an
+            // `Object`/interface formal is BOXED: `boxForTarget` copies the
+            // record BYTES into a fresh §8.6 box. Per §8.6 that box "holds the
+            // same borrowed references as the source record; it does not extend
+            // their lifetimes" — it retains nothing and `bz_box_release` treats
+            // the boxed value as a leaf, so the RECORD LOCAL is still the sole
+            // owner of its string fields and must drop them at its OWN scope
+            // end. The walk used to call every call argument a conservative
+            // ESCAPE, which suppressed exactly that scope-end release: the
+            // local never entered `recordCallResultReleaseEligible_` and its
+            // strings leaked. (#5105 patched the symptom from the other side —
+            // a release at the box SITE, which freed the fields while the box
+            // still pointed at them; that is a use-after-free, and #5853
+            // removed it in `buildOrderedArgs`.)
+            //
+            // WHY IT IS A BORROW, NOT AN ESCAPE. The box outlives nothing: it
+            // is a §28.3 unbound owned temporary whose lifetime ends at the
+            // call return. It is released there ONLY when the callee's
+            // parameter is provably non-escaping (`isCalleeParamNonEscaping`,
+            // #2952 — `paramNonEscaping`, the very predicate whose answer arms
+            // that post-call `bz_box_release`). If the callee DID retain the
+            // parameter, the box would outlive the call and a scope-end release
+            // of the record's fields could dangle whatever the retained box
+            // aliased — but that is exactly the case where the release is NOT
+            // armed at the box site either. So the two sites are decided by ONE
+            // fact: box released post-call ⟺ record does not outlive the call
+            // ⟺ the record local's own scope-end release is sound. Gating on
+            // the same predicate is what makes the pair symmetric by
+            // construction rather than by two analyses agreeing.
+            //
+            // This mirrors #1430's exhaustiveness argument one level down: any
+            // channel that could extend the argument past the call either makes
+            // `isCalleeParamNonEscaping` false (the store/return/capture is in
+            // the callee body, which ParamEscapeWalker walks) or is a
+            // call-internal lifetime. The walker conservatively ESCAPES
+            // everything else, so this admission cannot manufacture a release
+            // for a record whose box actually escapes.
+            //
+            // A callee with no body here (imported — `ms->decl == nullptr`) is
+            // rejected by `paramNonEscaping` itself (ParamEscapeWalker has no
+            // body to walk, so it never answers "non-escaping"), which is the
+            // safe direction: leak, not UAF.
+            if (recordFieldReleaseMode && paramNonEscaping && ms &&
+                a.modifier.empty() && a.name.empty() && a.value &&
+                i < ms->params.size() && isTargetIdent(a.value.get())) {
+                auto* ps =
+                    dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+                if (ps && ps->modifier.empty() && ms->decl) {
+                    if (auto* callee =
+                            dynamic_cast<const ast::Member*>(ms->decl)) {
+                        if ((*paramNonEscaping)(callee, i)) safeArg = true;
+                    }
+                }
             }
             // fix #5441 (§28.3 "Plain parameters are borrows" / §28.9, v0.330):
             // the #1430 relaxation's CLOSURE-CALLEE twin. The block above is
@@ -34914,11 +34991,29 @@ void Emitter::collectRecordCallResultReleaseEligible(
         }
     }
 
+    // fix #5853 (§8.6, v0.334): the ONE predicate both sides of the boxed
+    // record's ownership story consult — `isCalleeParamNonEscaping` (#2952)
+    // decides the post-call `bz_box_release` in buildOrderedArgs, and (through
+    // the walker's `paramNonEscaping` hook, set below) whether this pass treats
+    // a boxed argument as a call-bounded BORROW rather than a conservative
+    // escape. Held by value so it outlives every walker in the loop below; the
+    // walker stores a pointer to it.
+    const std::function<bool(const ast::Member*, size_t)> paramNonEscaping =
+        [this](const ast::Member* callee, size_t idx) {
+            return isCalleeParamNonEscaping(callee, idx);
+        };
+
     for (const ast::Node* ld : candidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // recordFieldReleaseMode = true (the gate above); the other modes
         // stay false so the string-release / borrowing-Array / value-like-
         // choice relaxation never affects this pass.
+        //
+        // fix #5853: `paramNonEscaping` is handed to THIS walk only. Without
+        // it the walker's boxed-argument relaxation is unreachable, so the
+        // #5105-era behaviour (every call argument a conservative escape) is
+        // exactly preserved for every other mode and call site.
+        w.paramNonEscaping = &paramNonEscaping;
         w.recordFieldReleaseMode = true;
         // fix #4266: arm the declare-then-assign exclusion ONLY for a
         // candidate admitted via that path — a map-lookup miss for the
