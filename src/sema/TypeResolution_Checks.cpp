@@ -3865,6 +3865,9 @@ void Resolver::checkIndexerEndLabel() {
         for (Symbol* m : t->members) {
             auto* ps = dynamic_cast<PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
+        // SEAM-DEBT: #5868 `blockEndLabel` is carried ONLY by the AST decl —
+        // PropertySymbol has isIndexer/indexerParams but no blockEndLabel. So
+        // ps->decl is null for an IMPORTED symbol and the check skips silently.
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd || pd->blockEndLabel.empty()) continue;
             ctx_.diagnostics().report(
@@ -3885,6 +3888,9 @@ void Resolver::checkIndexerRefOutParams() {
         for (Symbol* m : t->members) {
             auto* ps = dynamic_cast<PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
+        // SEAM-DEBT: #5868 the indexer parameter `ref`/`out` modifier is carried
+        // ONLY by the AST decl — ParamSymbol has no modifier field. Same silent
+        // skip for imported symbols; the local-only limit is not in the spec.
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
             if (!pd) continue;
             for (const auto& p : pd->indexerParams) {
