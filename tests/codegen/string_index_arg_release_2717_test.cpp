@@ -112,14 +112,23 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733: the per-row `if (wasSkipped(r)) return;` guard that used to precede
+// every `runAotChecked` row in this file is GONE, deliberately. A checked run is
+// SKIPPED (not failed) when the ASan link toolchain is absent: `runAotChecked`
+// returns ran=false with a "SKIP" diagnostic. Returning early on that literal
+// reported the row as a PASS having run no sanitizer at all — a silent skip
+// dressed as a clean result (issue #3733). Measured on this file with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): 22 rows "passed"
+// with 22 skips and zero sanitizer runs.
+//
+// Every row below is an ACCEPT row: the program must COMPILE and RUN. So the
+// runtime half already carries the whole verdict — `BEZEL_EXPECT_TRUE(r.ran)`
+// (directly, or through `expectLeakButNoMemoryError`) sets `currentTestFailed()`
+// when the run did not happen, and the row goes RED loudly instead of green.
+// The guard was therefore dead weight that inverted the failure direction, and
+// the right repair is to delete it, not to re-point it: `failedAtCompileTime-
+// WithRealLocation(r)` asserts the opposite of what an accept row wants (that
+// the driver REJECTED the program before running it).
 
 // The concatenated diagnostic text of a checked run. runAotChecked funnels the
 // program's whole sanitizer report into one Error diagnostic (aot_support.hpp
@@ -726,7 +735,6 @@ const char* kNamedLocalIndexObjectElementSink =
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            named_local_index_arg_to_inlined_setter_spec_23_4) {
     JitResult r = runAotChecked(kNamedLocalIndexInlinedSetter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 731 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -750,7 +758,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            producer_temp_index_arg_to_inlined_setter_spec_28_9) {
     JitResult r = runAotChecked(kProducerTempIndexInlinedSetter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 210);
 }
@@ -768,7 +775,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            named_local_index_arg_to_inlined_getter_spec_23_4) {
     JitResult r = runAotChecked(kNamedLocalIndexInlinedGetter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -776,7 +782,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            producer_temp_index_arg_to_inlined_getter_spec_23_4) {
     JitResult r = runAotChecked(kProducerTempIndexInlinedGetter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -787,7 +792,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            named_local_index_arg_to_compound_assign_spec_6_6) {
     JitResult r = runAotChecked(kNamedLocalIndexCompound);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 91);
 }
@@ -795,7 +799,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            producer_temp_index_arg_to_compound_assign_spec_6_6) {
     JitResult r = runAotChecked(kProducerTempIndexCompound);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 91);
 }
@@ -806,7 +809,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            producer_temp_index_arg_to_increment_spec_23_4) {
     JitResult r = runAotChecked(kProducerTempIndexIncrement);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 91);
 }
@@ -817,7 +819,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            index_args_through_virtual_indexer_vtable_spec_23_4) {
     JitResult r = runAotChecked(kVirtualIndexerVtableDispatch);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -828,7 +829,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            index_args_to_block_form_getter_spec_23_4) {
     JitResult r = runAotChecked(kBlockFormGetterIndex);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenSum20);   // both index shapes read back
 }
@@ -839,7 +839,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            multi_arg_indexer_mixed_index_shapes_spec_23_4) {
     JitResult r = runAotChecked(kMultiArgIndexerMixedShapes);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenSum20);   // BOTH indices read back
 }
@@ -850,7 +849,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            caller_owned_local_index_is_not_freed_at_the_call_site_spec_28_9) {
     JitResult r = runAotChecked(kCallerOwnedLocalNotFreedGuard);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);   // over-release ⇒ heap-use-after-free
     BEZEL_EXPECT_EQ(r.exitCode, 247);
 }
@@ -868,7 +866,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            setter_storing_named_local_index_into_field_stays_balanced_spec_23_3) {
     JitResult r = runAotChecked(kSetterStoresNamedLocalIndexIntoField);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);   // double-free / UAF / leak all fail here
     // s.Length + t.Last.Length, both non-cancelling: the field read is a live
     // oracle for the value the setter stored.
@@ -878,7 +875,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            setter_storing_temp_index_into_field_stays_balanced_spec_23_3) {
     JitResult r = runAotChecked(kSetterStoresProducerTempIndexIntoField);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -896,7 +892,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            ref_arg_into_indexer_slot_index_is_released_exactly_once_spec_22_3) {
     JitResult r = runAotChecked(kRefArgIntoIndexerSlotWithProducerIndex);
-    if (wasSkipped(r)) return;
     // #2746 fix: the bracket owns the lifetime across copy-in + write-back,
     // so the release fires once, here, instead of at EITHER accessor (which
     // would double-free). Pre-fix this asserted LEAK; the assertion inverts
@@ -928,7 +923,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            out_arg_into_indexer_slot_index_is_released_exactly_once_spec_22_3) {
     JitResult r = runAotChecked(kOutArgIntoIndexerSlotWithProducerIndex);
-    if (wasSkipped(r)) return;
     // Same as the `ref` case above. Pre-fix this asserted LEAK; #2746 closes
     // it. `out` was ACCIDENTALLY clean before #2717 (no copy-in getter runs,
     // so exactly one release fired and the helper happened to be correct);
@@ -960,7 +954,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            record_receiver_index_is_deliberately_not_released_spec_9_7) {
     JitResult r = runAotChecked(kRecordReceiverResidual);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
@@ -976,7 +969,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            interface_receiver_index_is_deliberately_not_released_spec_11) {
     JitResult r = runAotChecked(kInterfaceReceiverResidual);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
@@ -992,7 +984,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
     // The load-bearing gate: without it this is `heap-use-after-free` in main,
     // which expectLeakButNoMemoryError rejects explicitly.
     JitResult r = runAotChecked(kStringElementGetterResidual);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
@@ -1015,7 +1006,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
     // leaks; a doubled one double-frees; releasing before the field's retain is
     // a UAF on `t.Last.Length`.
     JitResult r = runAotChecked(kStringElementSetterIndexIsReleased);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);   // leaked under a blanket element-type gate
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -1040,7 +1030,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
     // `Object.ToString()` ever grows a copy step, this stops observing the free
     // and needs a different sink.
     JitResult r = runAotChecked(kObjectElementResidual);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
@@ -1117,7 +1106,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            named_local_index_with_string_element_is_not_armed_spec_4_6) {
     JitResult r = runAotChecked(kNamedLocalIndexPointerElementNullableSink);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
@@ -1131,7 +1119,6 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 BEZEL_TEST(codegen_string_index_arg_release_2717,
            named_local_index_with_object_element_is_not_armed_spec_4_6) {
     JitResult r = runAotChecked(kNamedLocalIndexObjectElementSink);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 

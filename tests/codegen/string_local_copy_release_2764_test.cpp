@@ -94,14 +94,23 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733: the per-row `if (wasSkipped(r)) return;` guard that used to precede
+// every `runAotChecked` row in this file is GONE, deliberately. A checked run is
+// SKIPPED (not failed) when the ASan link toolchain is absent: `runAotChecked`
+// returns ran=false with a "SKIP" diagnostic. Returning early on that literal
+// reported the row as a PASS having run no sanitizer at all — a silent skip
+// dressed as a clean result (issue #3733). Measured on this file with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): 16 rows "passed"
+// with 16 skips and zero sanitizer runs.
+//
+// Every row below is an ACCEPT row: the program must COMPILE and RUN. So the
+// runtime half already carries the whole verdict — `BEZEL_EXPECT_TRUE(r.ran)`
+// (directly, or through `expectLeakButNoMemoryError`) sets `currentTestFailed()`
+// when the run did not happen, and the row goes RED loudly instead of green.
+// The guard was therefore dead weight that inverted the failure direction, and
+// the right repair is to delete it, not to re-point it: `failedAtCompileTime-
+// WithRealLocation(r)` asserts the opposite of what an accept row wants (that
+// the driver REJECTED the program before running it).
 
 // The concatenated diagnostic text of a checked run. runAotChecked funnels the
 // program's whole sanitizer report into one Error diagnostic, so a test can tell
@@ -495,7 +504,6 @@ const char* kUsingVarCopyTarget =
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            copy_into_second_local_is_released_spec_28_9) {
     JitResult r = runAotChecked(kCopyIntoSecondLocal);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 751 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -516,7 +524,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            copy_of_a_copy_releases_every_link_spec_28_3) {
     JitResult r = runAotChecked(kCopyOfACopy);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 371 B / 20 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 3 * kLenSum10);
 }
@@ -534,7 +541,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            copy_in_inner_scope_source_survives_spec_28_3) {
     JitResult r = runAotChecked(kCopyInInnerScopeSourceReadAfter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 751 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenSum20);
 }
@@ -557,7 +563,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
     // callee's copy must mint its own. Clean on both sides of the fix — a guard
     // against widening the relaxation to a location that is never retained.
     JitResult r = runAotChecked(kCopyOfStringParameter);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3 * kLenSum10);
 }
@@ -567,7 +572,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
     // The rc sentinel: retain and release are no-ops, so no special case was
     // needed. Clean on both sides of the fix.
     JitResult r = runAotChecked(kCopyOfLiteral);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 200);
 }
@@ -578,7 +582,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            source_reassigned_after_copy_releases_both_values_spec_4_6) {
     JitResult r = runAotChecked(kSourceReassignedAfterCopy);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 371 B / 20 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenSum10);
 }
@@ -598,7 +601,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            alias_captured_by_lambda_source_still_released_spec_28_9) {
     JitResult r = runAotChecked(kAliasCapturedByLambda);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 333 B / 18 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenSum10);
 }
@@ -616,7 +618,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            alias_returned_from_callee_source_released_spec_28_3) {
     JitResult r = runAotChecked(kAliasReturnedFromCallee);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 751 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -636,7 +637,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            alias_passed_as_call_argument_spec_28_3) {
     JitResult r = runAotChecked(kAliasPassedToCall);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 371 B / 20 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenSum10);
 }
@@ -647,7 +647,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            copy_inside_case_arm_bodies_spec_19_2) {
     JitResult r = runAotChecked(kCopyInsideCaseArms);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 751 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -658,7 +657,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            concat_of_source_and_alias_spec_4_6) {
     JitResult r = runAotChecked(kConcatOfSourceAndAlias);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 371 B / 20 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 2 * kLenSum10);
 }
@@ -669,7 +667,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            alias_chain_with_escaping_middle_link_spec_28_3) {
     JitResult r = runAotChecked(kAliasChainWithEscapingMiddle);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 333 B / 18 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, 3 * kLenSum10);
 }
@@ -691,7 +688,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            alias_stored_into_class_field_still_leaks_spec_28_9) {
     JitResult r = runAotChecked(kAliasStoredIntoClassField);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
@@ -710,7 +706,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            const_copy_target_is_relaxed_like_var_spec_21_1) {
     JitResult r = runAotChecked(kConstCopyTarget);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // leaked 20 producers pre-#3416
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -729,7 +724,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            nullable_copy_target_is_released_spec_28_9) {
     JitResult r = runAotChecked(kNullableCopyTarget);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -744,7 +738,6 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 BEZEL_TEST(codegen_string_local_copy_release_2764,
            using_var_copy_target_is_deliberately_excluded_spec_28_10) {
     JitResult r = runAotChecked(kUsingVarCopyTarget);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
