@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "sema/Sendability.hpp"  // #5305: isAggregateChannelElement — §30.14 aggregate channel element
+#include "common/OwnershipFacts.hpp"  // §30.11: isFreshOwnedClassProducer — the false-path operand gate
 
 namespace bezel::codegen {
 // ===========================================================================
@@ -7095,11 +7096,69 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
         // a non-class value (§30.11's intrinsic restriction), so there is
         // nothing to release and that arm is deliberately left untouched.
         //
-        // `SetResult` is NOT handled here: §30.11 states no disposal for its
-        // already-terminal case (it throws InvalidOperationException instead)
-        // and does not settle whether the operand is released on that edge, so
-        // that is left as an open spec question rather than ruled on in code.
-        if (mname == "TrySetResult" && rcn == "OwningTaskCompletionSource") {
+        // `SetResult` shares the SAME obligation, on its throwing edge (ruling of
+        // record): "ownership was transferred at the call, and the
+        // implementation is responsible for releasing it on every path" is a
+        // general duty of the `owned` parameter, not a remark scoped to the
+        // `TrySetResult`-returns-`false` branch. A terminal source makes
+        // `SetResult` throw InvalidOperationException, but the operand was still
+        // handed over at the call, so it is released there too. Measured before
+        // this arm: the counter read 2 inside the source's scope (the task's own
+        // result plus the thrown operand, which nothing reclaimed) and LSan
+        // reported the 16-byte instance. The disposal is emitted BEFORE the
+        // `emitGuardThrow` below, so the operand is released on the edge that
+        // throws.
+        //
+        // Both members additionally require `operandOwnedHere` — see the
+        // SOUNDNESS GATE below, which is what keeps the disposal off an operand
+        // some other owner (the caller's named local) will dispose.
+        // SOUNDNESS GATE (measured). Disposing the rejected operand here is
+        // correct ONLY for an operand this call expression owns outright. If
+        // the caller passed a NAMED local (`var held := new Probe();
+        // tcs.TrySetResult(held);`), that local still carries its own
+        // scope-end disposal, and disposing here double-frees: MEASURED
+        // heap-use-after-free under `--sanitize=address` on
+        // `OwningTaskCompletionSource<Probe>.TrySetResult(held)` after a
+        // rejected hand-over, where the SAME program on base (this arm absent)
+        // exits 0. Nothing in codegen moves the value out of the caller's
+        // local — there is no move-out machinery (`grep movedFrom|moveOut|
+        // isMoved` over src/codegen: no hits) — so the local's disposal is
+        // still registered and still fires. Disposing both is a use-after-free,
+        // which is strictly worse than the leak this arm fixes.
+        //
+        // So mirror the guard the `operator` overload already uses for exactly
+        // this hazard (LlvmBackend_Exprs.cpp `isOwnedTempOperand` +
+        // `paramConsumes`, fix #3189): admit ONLY an operand the expression
+        // itself owns — a bare `new ClassType(...)`, a chained owned-returning
+        // operator, or an `owned`-returning call result. A borrowed read of a
+        // local, field or index has some other owner that will dispose it, so
+        // this arm must leave it alone and that owner does the work.
+        //
+        // This also settles the `Object`-typed question the operator guard's
+        // first line already answers: `Object` is a class (§8.1), so an
+        // `Object`-typed local holding a user instance is NOT an
+        // `isOwnedTempOperand` (it is an identifier, not a `new`), and is left
+        // to its own owner. A bare `new Object()` handed straight to the call
+        // IS admitted, and reclaims the 8-byte instance §8.1 defines. The
+        // §8.6-box hazard `LlvmBackend_Disposal.cpp`'s `objectReclaim` arm
+        // guards against cannot arise here: a box only exists inside an
+        // `Object`-TYPED slot, and such a slot's value is reached by an
+        // identifier or field read — never by the `new`/owned-call forms
+        // admitted below.
+        // `isFreshOwnedClassProducer` is the SHARED, documented classifier for exactly
+        // this question ("a literal `new T(...)` or a call to a method declared
+        // to return `owned T`, whose STATIC result type is a heap CLASS. A
+        // variable / field / `this` / property receiver is neither" —
+        // common/OwnershipFacts.hpp). Reusing it keeps this arm on the same
+        // definition the rest of codegen uses, instead of a fourth hand-rolled
+        // copy. `resolveParam` is the documented shared resolver hook; passing
+        // a null resolver reproduces the weakest-copy behaviour (a `new T()` in
+        // a monomorphized body is conservatively NOT a fresh producer —
+        // leak-but-sound), which is the safe direction here.
+        const bool operandOwnedHere = common::isFreshOwnedClassProducer(
+            call.args[0].value.get(), ctx_, nullptr);
+        if ((mname == "TrySetResult" || mname == "SetResult") &&
+            rcn == "OwningTaskCompletionSource" && operandOwnedHere) {
             // Guarded on `!ok` AND a non-null handed-over pointer:
             // emitDynamicDispose reads word 0 as the vtable, so a null would
             // fault. The slot is nulled after, so the disposal is reachable at
