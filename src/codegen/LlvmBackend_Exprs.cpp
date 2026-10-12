@@ -6871,8 +6871,48 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     genericSubstSemaTy_ = std::move(ancSema);
                     substInstalled = true;
                 }
+            } else if (recvTy2 && ps2 &&
+                       recvTy2->kind == sema::TypeRef::Kind::Named &&
+                       recvTy2->declaration == ps2->parent &&
+                       !recvTy2->genericArgs.empty()) {
+                // fix #5315/5339-sibling (§14.1 / §23.3, v0.334): a DIRECT
+                // generic receiver (`h.bv` where `h: Holder<string>`, `bv`
+                // declared on `Holder<T>`) — the case the ancestor branch above
+                // SKIPS, because it is gated on `declaration != ps2->parent`.
+                // Without the receiver's substitution the standalone getter
+                // lowers against the erased T->i32 template: it names its own
+                // return type `lowerType(T)` == i32 and reads a T=string field's
+                // first 4 bytes. Measured on 0e6a4c6 — for
+                // `class Holder<T> { public _v: T;
+                //     public property bv: T get => do return _v; end; end; }`
+                // with `var hs := new Holder<string>("z"); Console.WriteLine(hs.bv);`
+                // the program printed `0`, not `z`; declared `var s: string := hs.bv;`
+                // printed `0` as well, and the BARE-this twin
+                // (`return bv;` inside `Holder<T>`'s own `Show(): T`) did not
+                // merely miscompile — it emitted `ret i32 %1` against a
+                // `ptr` return type and the backend aborted with "Function
+                // return type does not match operand type of return inst!
+                // ... IR verification failed". The non-generic control
+                // (`Plain` with an `int` field) printed 5, and the sibling
+                // FORMS of the same property were sound: the auto-property
+                // (`public property bv: T;`) and the expression-bodied getter
+                // (`get => _v`) both printed `z`. Same helper, same gate as
+                // the block-bodied INDEXER twin caff8947 installed one function
+                // away in this file's sibling (LlvmBackend_Assign.cpp:2519) —
+                // the property read face was missed for exactly the same reason.
+                auto directSaved =
+                    setupReceiverGenericSubst(ma->target.get(), ps2->parent);
+                savedSubst = std::move(directSaved.subst);
+                savedSema = std::move(directSaved.semaTy);
+                substInstalled = true;
             }
-            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
+            // fix #5315/5339-sibling (§14.1 / §23.3, v0.334): pass `ps2` so the
+            // memo is keyed on the OWNER's instantiation
+            // (`propertyThunkSubstKey`), not on `pd` alone. Two instantiations
+            // of one generic declaration otherwise share a single cached getter
+            // and the second reads the first one's answer. `ps2` is null for a
+            // non-generic owner, where the empty key is already correct.
+            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc, ps2);
             if (substInstalled) {
                 genericSubst_ = std::move(savedSubst);
                 genericSubstSemaTy_ = std::move(savedSema);
@@ -7480,7 +7520,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e));
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc);
+            // fix #5315/5339-sibling (§14.1 / §23.3, v0.334): pass `ps` so the
+            // memo is keyed on the OWNER's instantiation
+            // (`propertyThunkSubstKey`), not on `pd` alone — the bare-this twin
+            // of the qualified read fixed above. The enclosing method body is
+            // itself specialized per instantiation, so the live substitution is
+            // already installed here and only the KEY was missing: without it
+            // `return bv;` inside `Holder<T>`'s own `Show(): T` called the
+            // ERASED `bz$prop$bv$get` (return type `lowerType(T)` == i32)
+            // while the enclosing `Show()` returned `ptr`, emitting
+            // `ret i32 %1` into a `ptr`-returning function. The backend caught
+            // it — "Function return type does not match operand type of return
+            // inst! ... IR verification failed" — but a build-time abort is a
+            // worse user-visible outcome than a wrong value, and the same
+            // omission is one field-layout drift away from a silent miscompile
+            // whenever the two return types happen to agree.
+            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps);
             llvm::Value* res =
                 builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
             // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
