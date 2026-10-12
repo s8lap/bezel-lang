@@ -22131,8 +22131,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // §9.4 (#624): DictionaryEntry<K,V>.Key and .Value are positional
             // read-only fields — any assignment through the entry loop variable
             // (e.Key := …, e.Value := …, e.Value += …, etc.) must be rejected.
-            // The synthetic DictionaryEntry TypeRef has importedName="DictionaryEntry"
-            // and no user TypeSymbol (declaration == nullptr); detect by that tag.
+            // DictionaryEntry has no user TypeSymbol (declaration == nullptr)
+            // under EITHER carrier of the name, so `!tt->declaration` is kept
+            // and the head is read with `headName()` — the ONE spelling that
+            // covers both: the synthetic `importedName="DictionaryEntry"` tag
+            // (set when the element type is derived from a `Dictionary<K,V>`
+            // source) AND the WRITTEN annotation's astNode head
+            // (`var e: IEnumerable<DictionaryEntry<string, V>> := d;`,
+            // §29.2's wrap face), which carries an astNode and an EMPTY
+            // importedName.
+            //
+            // fix #3563 follow-up (sibling site to the widening at
+            // ExprTypecheck_Calls.cpp:24485, §9.4 / stdlib §4.8, v0.334): that
+            // commit widened the `.Key`/`.Value` TYPING guard to `headName()`
+            // but did NOT widen this sibling REJECTION, which still tested
+            // `importedName` alone. The two had therefore drifted in the
+            // opposite direction from the #548 pair 38b32b9c repaired: the
+            // written-spelling receiver became TYPED (so it reached this
+            // guard at all) while this guard no longer RECOGNISED it, so the
+            // §9.4 rejection stopped firing for exactly the spelling #3563
+            // had just made reachable.
+            // MEASURED (pre-fix, this tree): `entry.Value := new V(7)` on the
+            // written spelling compiled at exit 0, emitting only the #4045
+            // internal warning "assignment target lvalue address failed to
+            // resolve (store dropped — target retains its previous value)" —
+            // a SILENT ACCEPT whose store is additionally dropped, while the
+            // synthetic spelling still rejected with the §9.4 diagnostic
+            // below. `headName()` is the strict superset: it returns
+            // `importedName` verbatim when there is no astNode, so every shape
+            // the old test admitted is admitted identically.
             if (as->target) {
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         as->target.get())) {
@@ -22141,7 +22168,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             if (auto* tt = ctx_.exprType(*ma->target)) {
                                 if (tt->kind == TypeRef::Kind::Named &&
                                         !tt->declaration &&
-                                        tt->importedName == "DictionaryEntry") {
+                                        tt->headName() == "DictionaryEntry") {
                                     ctx_.diagnostics().report(
                                         Severity::Error, as->span.begin,
                                         std::string("cannot assign to `") +

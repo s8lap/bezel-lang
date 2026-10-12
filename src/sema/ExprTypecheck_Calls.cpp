@@ -27176,8 +27176,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // §8.1/§8.3/§8.5/§8.7): the builtin entry sentinels
         // `DictionaryEntry<K, V>` (a RECORD) and `DrainedEntry<K, V>` (a
         // CLASS implementing `IDisposable`) — declaration == nullptr;
-        // detected the same importedName tag the `.Key`/`.Value` handler
-        // ~250 lines up already uses — have a closed documented surface:
+        // detected by the same `headName()` the `.Key`/`.Value` handler
+        // ~250 lines up uses, so BOTH carriers of the name are covered (see
+        // the #3563 note on that handler: the synthetic
+        // `importedName="DictionaryEntry"` tag AND the WRITTEN annotation's
+        // astNode head) — have a closed documented surface:
         // `Key`/`Value` (typed above), the universal Object members every
         // record/class carries (§8.1/§8.3/§8.5), and — DrainedEntry only —
         // `Dispose()` (it is a class implementing IDisposable per stdlib
@@ -27192,11 +27195,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // (confirmed live: `entry.TotallyBogusMember` on the `for var entry
         // in dict do` element type compiled at exit 0 with no diagnostic
         // before this fix).
+        //
+        // fix #3563 follow-up (sibling site, §9.4 / stdlib §4.8, v0.334): this
+        // block tested `tt->importedName` alone — the SAME synthetic-only tag
+        // 38b32b9c replaced with `headName()` on the `.Key`/`.Value` typing
+        // handler above. The comment's own live repro was measured on the
+        // SYNTHETIC spelling only, so the WRITTEN-annotation spelling
+        // (`var e: IEnumerable<DictionaryEntry<string, V>> := d;` then
+        // `for var entry in e do`) was never covered and sailed through this
+        // closed-surface rejection too.
+        // MEASURED (pre-fix, this tree): `entry.TotallyBogusMember` on the
+        // written spelling compiled at exit 0, emitting only the #1386
+        // internal warning "lowerExpr returned null for interpolated-string
+        // expression part (degraded to a placeholder rendering)" — a SILENT
+        // ACCEPT of a member outside the documented surface, degraded at
+        // runtime to a placeholder, while the synthetic spelling rejected
+        // with the "documented surface: Key, Value (stdlib §4.8)" diagnostic
+        // below. Widening here ADDS rejections and removes none: the block
+        // runs only when the member access is UNTYPED (`!ctx_.exprType(ma)`),
+        // and `headName()` returns `importedName` verbatim when there is no
+        // astNode, so every shape the old test admitted is admitted
+        // identically. `DrainedEntry` is widened on the same reasoning — it
+        // has the identical carrier split (stdlib §4.9 declares it
+        // `public class DrainedEntry<K, V>`, and the written
+        // `IEnumerable<DrainedEntry<...>>` / `IDrainedEnumerable` spelling
+        // carries the astNode rather than the synthetic tag).
         if (ma.target && !ctx_.exprType(ma)) {
             if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
                 if (tt->kind == TypeRef::Kind::Named && !tt->declaration) {
-                    bool isDictEntry = tt->importedName == "DictionaryEntry";
-                    bool isDrainedEntry = tt->importedName == "DrainedEntry";
+                    bool isDictEntry = tt->headName() == "DictionaryEntry";
+                    bool isDrainedEntry = tt->headName() == "DrainedEntry";
                     if (isDictEntry || isDrainedEntry) {
                         const auto& mbr = ma.member;
                         bool isGetTypeOrRefEq =
