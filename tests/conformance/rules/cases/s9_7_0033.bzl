@@ -7,7 +7,9 @@
 //!   or a span. A span may not be stored in an instance field (§9.7); an inline
 //!   array of a borrow-carrying element type may — it is not a span.
 //! cites: 8.6, 9.7, 15.1
-//! expect: accept
+//! expect: run
+//! stdout: 5
+//! issue: 5662
 module M;
 
 interface IHolder
@@ -22,9 +24,9 @@ class Holder
   public Items: [1]IHolder := [new RecHolder("hello")];
 end Holder;
 
-class C
-  public static method Main(): int
+public class C
+  public static method Main()
     var h: Holder := new Holder();
-    return h.Items[0].GetV().Length;
+    Console.WriteLine(h.Items[0].GetV().Length);
   end Main;
 end C;

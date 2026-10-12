@@ -1,7 +1,7 @@
 //! case: s9_7_0032
 //! doc: spec
 //! section: 9.7
-//! title: a borrow-bearing choice with a non-null reference-typed payload may not be stored in an instance field (choice)
+//! title: a borrow-bearing choice with a non-null reference-typed payload may not be an instance field
 //! rule: A borrow-bearing choice may not be stored in an instance field of a class,
 //!   except when every reference-typed payload is null (the null-source form). The
 //!   quantifier is over reference-typed payloads, not borrow-carrying payloads alone:

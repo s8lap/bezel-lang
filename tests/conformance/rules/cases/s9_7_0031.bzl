@@ -1,7 +1,7 @@
 //! case: s9_7_0031
 //! doc: spec
 //! section: 9.7
-//! title: a borrow-bearing record with a non-null reference-typed field may not be stored in an instance field (record)
+//! title: a borrow-bearing record with a non-null reference-typed field may not be an instance field (record)
 //! rule: A borrow-bearing record may not be stored in an instance field of a class,
 //!   except when every reference-typed field is null (the null-source form). The
 //!   quantifier is over reference-typed fields, not borrow-carrying fields alone:
