@@ -35,12 +35,6 @@ namespace {
 // when the env can't supply the C toolchain — it does in this repo, but the
 // guard keeps the tests self-documenting and matches the pattern in
 // closure_arg_plain_method_release_1921_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string_view::npos) return true;
-    return false;
-}
 
 // A simple well-formed program with a known return value. No heap allocation,
 // no owned class instances, no closures — LSan has nothing to flag in either
@@ -66,7 +60,6 @@ constexpr const char* kCleanProgram =
 // =====================================================================
 BEZEL_TEST(aot_checked_lenient_2214, clean_program_returns_expected_exit_code) {
     JitResult r = runAotCheckedLenient(kCleanProgram);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -83,7 +76,6 @@ BEZEL_TEST(aot_checked_lenient_2214, clean_program_returns_expected_exit_code) {
 // =====================================================================
 BEZEL_TEST(aot_checked_lenient_2214, clean_program_strict_unchanged) {
     JitResult r = runAotChecked(kCleanProgram);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -99,7 +91,6 @@ BEZEL_TEST(aot_checked_lenient_2214, clean_program_strict_unchanged) {
 // =====================================================================
 BEZEL_TEST(aot_checked_lenient_2214, clean_program_lenient_preserves_stdout_channel) {
     JitResult r = runAotCheckedLenient(kCleanProgram);
-    if (wasSkipped(r)) return;
     // A well-formed program that doesn't print anything has an empty
     // stdoutText — but the channel must be PRESENT (not exception-thrown
     // on access). Comparing against a freshly-constructed JitResult's empty
