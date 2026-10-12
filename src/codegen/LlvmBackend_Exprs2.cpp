@@ -9140,11 +9140,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // Deliberately NARROW: only `isByRefMod` modifiers are admitted here.
         // A NAMED argument and an `out _` DISCARD stay excluded — this loop is
         // positional and records no `discardOwnedOutSlots_` entry, so neither
-        // is handled — as do the by-value ownership modifiers `owned` /
-        // `scoped`, whose transfer bookkeeping (`nullTransferredOwned`) lives
-        // in `buildOrderedArgs`, which this path does not use. Those shapes
-        // keep today's behaviour exactly; each is the same silent-no-ctor-call
-        // defect and is FILED separately rather than widened into here.
+        // is handled — as does `scoped`; its transfer bookkeeping
+        // (`nullTransferredOwned`) lives in `buildOrderedArgs`, which this path
+        // does not use, and `nullTransferredOwnedLocalSlot` (line 9553) does not
+        // admit it. That shape keeps today's behaviour exactly; the defect is
+        // FILED separately rather than widened into here. `owned` IS handled:
+        // the imported-ctor-specific `nullTransferredOwnedLocalSlot` call
+        // (line 9553) admits `a.modifier == "owned"` (and the symmetric
+        // `importedFormalMod(ai) == "owned"`), mirroring buildOrderedArgs'
+        // in-module nulling and closing the same double-free gap — that caller's
+        // unwindOnly disposal must not fire against a value this ctor's
+        // owned-parameter teardown already disposed.
         // fix #2658 (§17.13 "The discard `_`" / §22.6 / §22.3, v0.236): the
         // `out _` DISCARD is admitted too, against a plain borrowing `out`
         // formal. fix #3081 (§22.6, v0.244) widened the admission to `out owned`

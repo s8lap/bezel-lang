@@ -23932,20 +23932,17 @@ struct UnwindIneligibleWalker {
                 // walker may leave a symbol unwind-ELIGIBLE only when the codegen
                 // NULLS its slot at the transfer, so the null-guarded unwindOnly
                 // disposal skips the transferred value on the post-transfer edge.
-                // For a USER METHOD, buildOrderedArgs nulls only a BARE-identifier
-                // source (LlvmBackend_Assign.cpp: `dynamic_cast<IdentifierExpr>`
-                // on a.value); a `move x` source is a MoveExpr and is NOT nulled —
-                // the NOTE at that site records the deliberate choice. So for
-                // `M(move x)` the invariant does NOT hold here: leaving the source
-                // eligible made the caller's unwindOnly disposal run against a
-                // value the callee already owns and disposes — ASan heap-
-                // use-after-free in the caller (measured; the callee's
-                // DisposeCore freed it first). A BUILTIN COLLECTION transfer is
-                // unaffected and stays untainted: nullTransferredOwnedLocalSlot
-                // DOES unwrap MoveExpr and runs after the call succeeds, so its
-                // null ⟹ eligible holds (cells d and the OwningArray/Stack/Queue
-                // rows stay green). Restoring taint is the walker's stated bias —
-                // "at worst a leak, NEVER a double-free". // per §28.3
+                // After the fix (LlvmBackend_Assign.cpp:14676), buildOrderedArgs
+                // handles `move x` by unwrapping the MoveExpr to its operand
+                // identifier and recording that identifier in transferredOwnedArgSlots,
+                // so nullTransferredOwnedLocalSlot nulls the slot — the invariant
+                // holds for both a bare-id and a `move x` source, and `M(move x)`
+                // does NOT double-free. A BUILTIN COLLECTION transfer is unaffected
+                // and stays untainted: nullTransferredOwnedLocalSlot DOES unwrap
+                // MoveExpr and runs after the call succeeds, so its null ⟹ eligible
+                // holds (cells d and the OwningArray/Stack/Queue rows stay green).
+                // Restoring taint is the walker's stated bias — "at worst a leak,
+                // NEVER a double-free". // per §28.3
                 const ast::IdentifierExpr* localId =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
                 if (localId) {
