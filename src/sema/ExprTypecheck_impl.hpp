@@ -1376,6 +1376,25 @@ private:
                             const ast::Expr* scrutinee, TypeRef* scrutTy,
                             const SourceLocation& warnLoc, bool quiet);
 
+    // §19.3 "Named destructuring" (v0.334, #2197): resolve a NAMED slot list
+    // (`Rect(Width = 3, Height = var h)`) to declaration order so every
+    // downstream consumer — sema's own binding walk AND codegen, which both
+    // index `subPatterns[i]` POSITIONALLY against `fields[i]` (record) /
+    // `payload[i]` (choice) — reads an ordinary positional pattern. The named
+    // form is a pure SURFACE over the positional machinery, so normalizing
+    // here is what lets the feature need no codegen change at all.
+    //
+    // `memberNames` is the head's member list IN DECLARATION ORDER (a record's
+    // positional fields, or a choice case's payload fields). A pattern with no
+    // named slot is left untouched (the whole positional surface). Reports and
+    // returns false on an unknown / duplicate name, a mixed positional+named
+    // slot list, or a `move` marker outside an owning choice match — each
+    // naming its rule per §19.3. `headName` is the pattern head, for messages.
+    bool normalizeNamedDestructureSlots(
+        ast::DestructuringPattern& dp,
+        const std::vector<std::string_view>& memberNames,
+        std::string_view headName, const SourceLocation& loc);
+
     // §19.6 (v0.196, #1816): compose a leaf class's ROOT INSTANTIATION — the
     // instantiation of the root declaration `root` that `leaf` derives from,
     // obtained by composing the base-clause substitutions along `leaf`'s

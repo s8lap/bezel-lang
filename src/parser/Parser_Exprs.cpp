@@ -1642,6 +1642,34 @@ std::unique_ptr<ast::Pattern> Parser::parsePrimaryPattern(
 
 ast::PositionalPattern Parser::parsePositionalPattern() {
     ast::PositionalPattern pp;
+    // A.7 NamedSlot: `("move")? Identifier "=" AltPattern` (§19.3 "Named
+    // destructuring", v0.334). The optional `move` is checked FIRST and
+    // OUTSIDE any Identifier guard: `move` is an unconditionally reserved
+    // keyword (§B.1 kReserved), so it lexes as TokenKind::Keyword and can
+    // never be the TokenKind::Identifier an Identifier guard requires. The
+    // marked reading commits at the three tokens `move Identifier "="`
+    // (§19.3 "One parse note"); a bare `move` with no `Identifier =` after
+    // it is not a named slot and falls through to the positional path.
+    if (isKeyword("move") && peekAt(1).kind == TokenKind::Identifier &&
+        peekAt(2).kind == TokenKind::Punctuator && peekAt(2).text == "=") {
+        pp.hasMoveMarker = true;
+        advance();  // `move`
+    }
+    // A named slot is an Identifier followed by `=`. `=` cannot occur in a
+    // positional slot: a positional slot is a Pattern, and a pattern-embedded
+    // expression is a `Shift` production (§A.7 PatternBound) which sits BELOW
+    // equality, so no pattern-embedded expression can absorb this `=`
+    // (§19.3 "The `=` is the interrogation reading of §8.4"). `=` is also not
+    // a pattern relational operator (A.7 admits only `<` `>` `<=` `>=`), and
+    // a bare constant already means equals.
+    if (current_.kind == TokenKind::Identifier &&
+        peekAt(1).kind == TokenKind::Punctuator && peekAt(1).text == "=") {
+        pp.slotName = current_.text;
+        advance();  // the Identifier naming the member
+        advance();  // `=`
+        pp.pattern = parsePattern(/*inPositional=*/false);
+        return pp;
+    }
     // A.7 PositionalPattern: a Pattern OR a naked binding Identifier (valid
     // only inside destructuring position). Naked binding is detected as a
     // single Identifier followed immediately by `,` or `)`. Any other shape

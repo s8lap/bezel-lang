@@ -12745,7 +12745,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto* bp =
                 dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
             auto* dp =
-                dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get());
+                // §19.3 named destructuring (v0.334, #2197) normalizes a named
+                // slot list IN PLACE (reordering the slots), so the pattern
+                // must be reached mutably. `arm` is a const loop variable over
+                // `ce->arms`, but `arm.pattern` is a `unique_ptr<Pattern>`
+                // member — the constness belongs to the arm, not to the
+                // pattern it owns, so the pointee is safely mutable.
+                dynamic_cast<ast::DestructuringPattern*>(
+                    const_cast<ast::Pattern*>(arm.pattern.get()));
             if (bp && currentScope_) {
                 Scope armScope;
                 armScope.parent = currentScope_;
@@ -13043,6 +13050,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     auto* cc = const_cast<ChoiceCaseSymbol*>(
                         findChoiceCaseOnScrutinee(scrutTy, lastName));
                     if (cc && cc->caseDecl) {
+                        // §19.3 "Named destructuring" (v0.334, #2197): a
+                        // choice case's named slots resolve to payload field
+                        // names in payload DECLARATION order — the order the
+                        // arity check and binding walk below (and codegen)
+                        // already read positionally. A no-op for positional.
+                        if (!cc->caseDecl->payload.empty()) {
+                            std::vector<std::string_view> payloadNames;
+                            payloadNames.reserve(cc->caseDecl->payload.size());
+                            for (const auto& p : cc->caseDecl->payload)
+                                payloadNames.push_back(p.name);
+                            normalizeNamedDestructureSlots(
+                                *dp, payloadNames, lastName, dp->span.begin);
+                        }
                         if (dp->subPatterns.size() !=
                             cc->caseDecl->payload.size()) {
                             ctx_.diagnostics().report(
@@ -13244,6 +13264,37 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         }
                     }
                     if (isClassHead) {
+                        // §19.3 "Named destructuring" (v0.334, #2197) admits the
+                        // NAMED form over a class-typed head ("A class-typed
+                        // pattern head is admitted in the named form"), so the
+                        // "no positional surface" rule below is the POSITIONAL
+                        // form's alone and must not be reported for a named
+                        // slot list. The named form reads a public readable
+                        // PROPERTY — a getter invocation on the scrutinee —
+                        // and this compiler's destructuring lowering keys on
+                        // positional record fields (codegen resolves a head
+                        // only when it is a TypeDeclKind::Record), so the
+                        // named class form is reported as unsupported rather
+                        // than mislabelled. The positional spelling keeps the
+                        // exact §19.3 diagnostic and its pinned lit/gtest
+                        // needles (s19_3_0014, sema_1587_lambda_destructure).
+                        bool namedSlots = false;
+                        for (const auto& sp : dp->subPatterns)
+                            if (!sp.slotName.empty()) { namedSlots = true; break; }
+                        if (namedSlots) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, dp->span.begin,
+                                "named destructuring pattern `" +
+                                std::string(lastName) +
+                                "(...)` over a class type is not yet "
+                                "supported by this compiler: §19.3 admits the "
+                                "named form over a class head, reading a public "
+                                "readable property, but the destructuring "
+                                "lowering resolves positional record fields "
+                                "only; use a type-test pattern (`" +
+                                std::string(lastName) + "` or `var x: " +
+                                std::string(lastName) + "`) instead");
+                        } else {
                         ctx_.diagnostics().report(
                             Severity::Error, dp->span.begin,
                             "positional destructuring pattern `" +
@@ -13256,6 +13307,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             "` or `var x: " +
                             std::string(lastName) +
                             "`) instead");
+                        }
                     }
                 }
                 // fix #4381 (§19.3, v0.298): after the class-head check, detect
@@ -13366,6 +13418,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             if (!isStatic) fields.push_back(fs);
                         }
                     }
+                }
+                // §19.3 "Named destructuring" (v0.334, #2197): resolve a named
+                // slot list to declaration order before the arity and binding
+                // logic below, which — like codegen — reads slots positionally.
+                // The statement-position twin is in ExprTypecheck.cpp. A no-op
+                // for every positional pattern.
+                if (!fields.empty()) {
+                    std::vector<std::string_view> memberNames;
+                    memberNames.reserve(fields.size());
+                    for (const auto* f : fields) memberNames.push_back(f->name);
+                    normalizeNamedDestructureSlots(*dp, memberNames, lastName,
+                                                   dp->span.begin);
                 }
                 // §19.3 (v0.226, #2178): a generic-record DESTRUCTURING pattern
                 // (the form `Pair(a, b)` against a record `record Pair<A,B>(…)`)

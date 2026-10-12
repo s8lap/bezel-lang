@@ -2458,6 +2458,118 @@ static bool armsContainRelOpPattern(const std::vector<ast::CaseArm>& arms) {
     return false;
 }
 
+// §19.3 "Named destructuring" (v0.334, #2197). Resolve `T(N = p, …)` to
+// declaration order so the positional machinery downstream (sema's binding
+// walk and codegen's `subPatterns[i]` / `fields[i]` indexing) needs no change
+// of its own.
+bool ExprTC::normalizeNamedDestructureSlots(
+    ast::DestructuringPattern& dp,
+    const std::vector<std::string_view>& memberNames,
+    std::string_view headName, const SourceLocation& loc) {
+    // Fast path: no named slot means the whole pre-#2197 positional surface.
+    // Returning without touching `dp` is what keeps every existing positional
+    // row bit-identical — the differential control for this feature.
+    bool anyNamed = false, anyPositional = false;
+    for (const auto& sp : dp.subPatterns) {
+        if (!sp.slotName.empty()) anyNamed = true;
+        else anyPositional = true;
+    }
+    if (!anyNamed) return true;
+
+    const std::string head(headName);
+    // §19.3: "A slot list is either positional or named, never mixed in one
+    // pattern (v1); mixing (`Rect(3, Height = var h)`) is a compile error
+    // naming the rule."
+    if (anyPositional) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "destructuring pattern `" + head +
+            "(...)` mixes positional and named slots; a slot list is either "
+            "positional or named, never mixed in one pattern (§19.3)");
+        return false;
+    }
+    // §19.3 "Named-slot bindings and ownership": the `move` marker is admitted
+    // ONLY on a choice case head — "on a record or class pattern head — by
+    // derivation, not fiat … so marked slots are choice-case-only". The
+    // marker additionally requires an OWNING match (§35.5) on an `owned` /
+    // move-only payload field with a top-level binding RHS; this compiler's
+    // owning-match machinery has no named-slot admission path yet, so the
+    // marker is rejected rather than silently ignored. Reporting it here is
+    // what makes `hasMoveMarker` a field with a real reader.
+    for (const auto& sp : dp.subPatterns) {
+        if (!sp.hasMoveMarker) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`move` marker on named slot `" + std::string(sp.slotName) +
+            " =` in pattern `" + head + "(...)` is admitted only on a choice "
+            "case head, in an owning match (§35.5), on an `owned`-marked or "
+            "move-only payload field, with a top-level binding right-hand "
+            "side; a record or class head admits no obligation-bearing slot "
+            "(§19.3)");
+        return false;
+    }
+    // Resolve each name to its declaration index. §19.3: an unknown name or a
+    // duplicate name in one slot list "is a compile error at the pattern, each
+    // naming its rule".
+    std::vector<std::size_t> targetIndex(dp.subPatterns.size(), 0);
+    for (std::size_t i = 0; i < dp.subPatterns.size(); ++i) {
+        const std::string_view nm = dp.subPatterns[i].slotName;
+        auto it = std::find(memberNames.begin(), memberNames.end(), nm);
+        if (it == memberNames.end()) {
+            std::string avail;
+            for (std::size_t k = 0; k < memberNames.size(); ++k) {
+                if (k) avail += ", ";
+                avail += "`" + std::string(memberNames[k]) + "`";
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "named slot `" + std::string(nm) + "` in pattern `" + head +
+                "(...)` names no member of `" + head + "`; an unknown name is "
+                "a compile error at the pattern (§19.3)" +
+                (avail.empty() ? std::string("; the type has no member to "
+                                             "name")
+                               : "; its named slots are " + avail));
+            return false;
+        }
+        const std::size_t idx =
+            static_cast<std::size_t>(it - memberNames.begin());
+        for (std::size_t j = 0; j < i; ++j) {
+            if (targetIndex[j] != idx) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "named slot `" + std::string(nm) + "` is bound twice in "
+                "pattern `" + head + "(...)`; a duplicate name in one slot "
+                "list is a compile error (§19.3)");
+            return false;
+        }
+        targetIndex[i] = idx;
+    }
+    // Reorder the slots into DECLARATION order and clear the named marker, so
+    // the pattern that reaches sema's binding walk and codegen is exactly the
+    // positional pattern the same source would have written. Moving the
+    // (move-only) slots keeps each slot's own anchors — `nakedAnchor` /
+    // `pattern` pointers, which sema and codegen key their LocalSymbol /
+    // `locals_` slot on (#1271) — attached to their own binding, so the
+    // reorder does not disturb the anchor identity. The duplicate check above
+    // makes `targetIndex` injective, so every slot lands on exactly one
+    // distinct member and none is dropped; a named list may still cover FEWER
+    // members than the type has (§19.3 states the arity rule for the POSITIONAL
+    // form only — #5864), which leaves the downstream positional arity check to
+    // report.
+    std::vector<ast::PositionalPattern> reordered;
+    reordered.reserve(dp.subPatterns.size());
+    for (std::size_t idx = 0; idx < memberNames.size(); ++idx)
+        for (std::size_t i = 0; i < targetIndex.size(); ++i)
+            if (targetIndex[i] == idx)
+                reordered.push_back(std::move(dp.subPatterns[i]));
+    for (auto& sp : reordered) {
+        sp.slotName = std::string_view{};
+        sp.hasMoveMarker = false;
+    }
+    dp.subPatterns = std::move(reordered);
+    return true;
+}
+
 bool ExprTC::caseArmsExhaustive(
     const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee,
     TypeRef* scrutTy, const SourceLocation& warnLoc, bool quiet) {
@@ -24052,7 +24164,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             auto* bp =
                 dynamic_cast<const ast::BindingPattern*>(arm.pattern.get());
             auto* dp =
-                dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get());
+                // §19.3 named destructuring (v0.334, #2197) normalizes a named
+                // slot list IN PLACE (reordering the slots), so the pattern
+                // must be reached mutably. `arm` is a const loop variable over
+                // `cs->arms`, but `arm.pattern` is a `unique_ptr<Pattern>`
+                // member — the constness belongs to the arm, not to the
+                // pattern it owns, so the pointee is safely mutable.
+                dynamic_cast<ast::DestructuringPattern*>(
+                    const_cast<ast::Pattern*>(arm.pattern.get()));
             if (bp && currentScope_) {
                 Scope armScope;
                 armScope.parent = currentScope_;
@@ -24354,6 +24473,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     auto* cc = const_cast<ChoiceCaseSymbol*>(
                         findChoiceCaseOnScrutinee(scrutTy, lastName));
                     if (cc && cc->caseDecl) {
+                        // §19.3 "Named destructuring" (v0.334, #2197): a
+                        // choice case's named slots resolve to its payload
+                        // field names, in payload DECLARATION order — the same
+                        // order the arity check and binding walk below (and
+                        // codegen's `subPatterns[i]` / `payload[i]` indexing)
+                        // already read positionally. A no-op for positional.
+                        if (!cc->caseDecl->payload.empty()) {
+                            std::vector<std::string_view> payloadNames;
+                            payloadNames.reserve(cc->caseDecl->payload.size());
+                            for (const auto& p : cc->caseDecl->payload)
+                                payloadNames.push_back(p.name);
+                            normalizeNamedDestructureSlots(
+                                *dp, payloadNames, lastName, dp->span.begin);
+                        }
                         // §35.5 "Case patterns": "a positional destructuring
                         // pattern `CaseName(slot, …)` with the case's exact
                         // payload arity." Reject an arity mismatch (mirrors
@@ -24553,6 +24686,38 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                     if (isClassHead) {
+                        // §19.3 "Named destructuring" (v0.334, #2197) admits the
+                        // NAMED form over a class-typed head ("A class-typed
+                        // pattern head is admitted in the named form"), so the
+                        // "no positional surface" rule below is the POSITIONAL
+                        // form's alone and must not be reported for a named
+                        // slot list. The named form reads a public readable
+                        // PROPERTY — a getter invocation on the scrutinee —
+                        // and this compiler's destructuring lowering keys on
+                        // positional record fields (codegen resolves a head
+                        // only when it is a TypeDeclKind::Record), so the
+                        // named class form is reported as unsupported rather
+                        // than mislabelled. The positional spelling keeps the
+                        // exact §19.3 diagnostic and its pinned lit/gtest
+                        // needles (s19_3_0014, sema_1587_lambda_destructure).
+                        // Statement-position twin of the CaseExpr check.
+                        bool namedSlots = false;
+                        for (const auto& sp : dp->subPatterns)
+                            if (!sp.slotName.empty()) { namedSlots = true; break; }
+                        if (namedSlots) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, dp->span.begin,
+                                "named destructuring pattern `" +
+                                std::string(lastName) +
+                                "(...)` over a class type is not yet "
+                                "supported by this compiler: §19.3 admits the "
+                                "named form over a class head, reading a public "
+                                "readable property, but the destructuring "
+                                "lowering resolves positional record fields "
+                                "only; use a type-test pattern (`" +
+                                std::string(lastName) + "` or `var x: " +
+                                std::string(lastName) + "`) instead");
+                        } else {
                         ctx_.diagnostics().report(
                             Severity::Error, dp->span.begin,
                             "positional destructuring pattern `" +
@@ -24565,6 +24730,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "` or `var x: " +
                             std::string(lastName) +
                             "`) instead");
+                        }
                     }
                 }
                 // fix #4381 (§19.3, v0.298): after the class-head check, detect
@@ -24677,6 +24843,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             fields.push_back(fs);
                         }
                     }
+                }
+                // §19.3 "Named destructuring" (v0.334, #2197): resolve a
+                // named slot list to declaration order BEFORE the arity and
+                // binding logic below, which — like codegen — reads the slots
+                // positionally. A no-op for every positional pattern.
+                if (!fields.empty()) {
+                    std::vector<std::string_view> memberNames;
+                    memberNames.reserve(fields.size());
+                    for (const auto* f : fields) memberNames.push_back(f->name);
+                    normalizeNamedDestructureSlots(*dp, memberNames, lastName,
+                                                   dp->span.begin);
                 }
                 // §19.3 (v0.226, #2178): a generic-record DESTRUCTURING pattern
                 // against an ERASED scrutinee — the scrutinee's static type does

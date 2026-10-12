@@ -1463,6 +1463,24 @@ struct PositionalPattern {
     // the anchor is a genuine dynamic_cast-safe Node. Null for a non-naked
     // PositionalPattern (which anchors on its own `pattern` BindingPattern).
     std::unique_ptr<BindingPattern> nakedAnchor;
+    // §19.3 / §A.7 `NamedSlot ::= ("move")? Identifier "=" AltPattern`.
+    // Non-empty `slotName` marks the slot as NAMED (`Width = var w`): the
+    // Identifier names a member of the pattern's type and the sub-pattern
+    // interrogates that member rather than a position. Sema resolves the name
+    // to a field/payload INDEX and — because both sema and codegen index
+    // `subPatterns` positionally — REORDERS `subPatterns` into declaration
+    // order, clearing this, so every downstream consumer reads a plain
+    // positional pattern (§19.3 "Named destructuring"). Empty for a positional
+    // slot, which is the whole parseable surface before #2197.
+    std::string_view slotName;
+    // §19.3 "Named-slot bindings and ownership": `move N = var x` marks the
+    // slot's SOURCE as transferring. Admitted only when the match is owning
+    // (§35.5), `N` names an `owned`/move-only payload field, and the RHS is a
+    // top-level binding — and therefore only on a CHOICE case head (a record
+    // or class head admits no obligation-bearing slot). `move` is a reserved
+    // keyword (§B.1) and lexes as TokenKind::Keyword, so the parser must test
+    // it with isKeyword(), never under an Identifier guard.
+    bool hasMoveMarker = false;
 };
 
 struct DestructuringPattern : Pattern {             // `QualifiedName ( ... )`
