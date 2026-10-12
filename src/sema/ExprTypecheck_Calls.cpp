@@ -13431,6 +13431,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         } else if (m == "NewSender") {
                             // NewSender() → owned ChannelSender<T>.
                             ctx_.setExprType(&ce, makeChannelSender(elemTy));
+                        } else if (m == "Close") {
+                            // §30.15 (v0.334) / stdlib §6.9 (#1807):
+                            // `Close()` — the receiver-initiated graceful close.
+                            // "The receiving end may close first-class: Close()
+                            // puts the channel in the same closed state."
+                            // Declared `public method Close();` — no return
+                            // type, so UNIT: no expr type is set, matching the
+                            // `Send` arm below and the `Dispose` fallthrough
+                            // (both leave the type unset for a void call).
+                            //
+                            // NOT a disposal: Close() marks the channel closed
+                            // but does NOT dispose undelivered items — those
+                            // stay the channel's, released exactly once when
+                            // the channel itself is disposed (§30.15's
+                            // "Disposing the Channel<T> itself ... disposes
+                            // every undelivered class-typed item in reverse
+                            // insertion order"). §28.2's borrow-receiver rule
+                            // governs `Dispose()`, not `Close()`; a
+                            // `Close()` through a borrow of a channel is the
+                            // documented shape (the channel stays alive and
+                            // receivable, so the borrow outlives the call).
                         } else if (m == "Count" || m == "IsClosed") {
                             // Count → int; IsClosed → bool.
                             if (m == "Count")

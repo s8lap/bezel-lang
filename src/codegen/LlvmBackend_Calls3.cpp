@@ -5551,6 +5551,29 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 return builder_.CreateICmpNE(r, builder_.getInt32(0));
             }
 
+            // Close() — §30.15 (v0.334) / stdlib §6.9 (#1807): receiver-
+            // initiated graceful close. Puts the channel in the same closed
+            // state as disposing the last sender: buffered items stay
+            // receivable, subsequent Send faults with
+            // ChannelClosedException, and a pending SendAsync's item is
+            // disposed and its task faulted (all inside
+            // bz_channel_close). Idempotent.
+            //
+            // NOT the Dispose arm below: no slot-nulling and no core_refs
+            // release. Nulling the receiver slot here would make the
+            // `using var` scope-exit skip `bz_channel_dispose`, and the
+            // undelivered buffered items would never be released — the exact
+            // leak §28.2's exactly-once rule exists to prevent. The channel
+            // stays alive and receivable after Close(); disposing it is a
+            // separate, later act.
+            if (mname == "Close" && call.args.empty()) {
+                auto* fn = declareC("bz_channel_close",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {ch, getCCEVtable()});
+                return nullptr;  // void
+            }
+
             // Dispose() — explicit dispose of the channel (frees backing struct).
             // Null the receiver slot after the call so any subsequent
             // using-var scope-exit reload sees null and skips (§28.2).

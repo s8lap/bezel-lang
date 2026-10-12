@@ -3183,6 +3183,57 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
     }
 }
 
+// bz_channel_close: §30.15 (v0.334) / stdlib §6.9 (#1807) — the RECEIVER-
+// initiated graceful close, `Channel<T>.Close()`.
+//
+// "The receiving end may close first-class: Close() puts the channel in the
+// same closed state" (spec §30.15, v0.334) as disposing the last sender:
+// buffered items remain receivable, subsequent `Send`/`SendAsync` raise
+// ChannelClosedException (disposing the offered item), and a `SendAsync`
+// pending at that instant has its item disposed by the channel and its task
+// faulted — all three of which `channel_close_and_drain_pending` above
+// already does. This is the ENTIRE close state transition, shared verbatim
+// with the last-sender path, so the two cannot drift.
+//
+// WHAT MAKES Close() NOT DISPOSE (stdlib §6.9, the destructor comment and the
+// "Closing" paragraph; spec §30.15, v0.334):
+//
+//   "Disposing the Channel<T> itself closes it immediately and disposes every
+//    undelivered class-typed item in reverse insertion order"
+//
+// Close() closes WITHOUT that drain, and this function is deliberately the
+// dispose path MINUS two things:
+//
+//   (1) `ch->items` is left intact — the buffered undelivered items stay the
+//       channel's to release, EXACTLY ONCE, when the channel itself is later
+//       disposed (`bz_channel_dispose` drains them in reverse insertion order,
+//       §28.11's owned column). A Close() that drained here would DOUBLE-FREE
+//       every buffered class-typed item at the channel's own disposal.
+//   (2) `channel_core_release(ch)` is NOT called. The core_ref the Channel
+//       OBJECT holds is dropped by `bz_channel_dispose`, not here; releasing it
+//       here would free the core out from under a channel that is still open
+//       for `Receive`/`TryReceive` — the #634 UAF, reintroduced.
+//
+// Idempotent (§30.15: "Close() is idempotent: on an already-closed channel it
+// is a no-op"): `closed` is set ONLY under the lock by
+// `channel_close_and_drain_pending`, which drains pending receivers / pending
+// senders / the ReceiveAll waiter in the SAME critical section that sets it —
+// so `closed == true` already implies there is nothing left to drain, and the
+// early return below is a genuine no-op rather than a skipped obligation.
+// A later sender disposal stays a no-op with respect to the closed state:
+// `bz_channel_sender_release` only reaches this state machine when
+// `sender_count` hits 0, and re-entering it would find the deques already
+// swapped out.
+extern "C"
+void bz_channel_close(void* chp, void* cce_vtable) {
+    if (!chp) return;  // disposed + slot-nulled = already closed (§30.15)
+    auto* ch = (bz_channel_t*)chp;
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        if (ch->closed) return;  // idempotent no-op (see above)
+    }
+    channel_close_and_drain_pending(ch, cce_vtable);
+}
+
 // bz_channel_sender_release: release one sender handle. If this was the last
 // sender, close the channel. cce_vtable is the ChannelClosedException vtable.
 // per fix #634: also drops the sender's core_refs reference so the channel
