@@ -14437,19 +14437,43 @@ private:
     // result), and an `await for` that loads the vtable from the returned
     // bz_task* pointer crashes (SIGSEGV).
     bool returnsAsyncIteratorType(sema::MethodSymbol* ms) const {
-        if (!ms->decl) return false;
-        const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-        if (!md || !md->returnType) return false;
-        const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        // fix #3152 / #4988 (§30.7 / §2.5 / §29.3, v0.334): the DECLARED
+        // RETURN TYPE, read BOTH sources. This used to open-code the AST half
+        // alone — `ms->decl` → `dynamic_cast<const ast::MethodDecl*>` →
+        // `md->returnType` → `ctx_.resolvedType` — behind an
+        // `if (!ms->decl) return false;` guard. `ModuleLoader` assigns
+        // `MemberSymbol::decl` only where it re-parsed body text for a
+        // GENERIC type (umbrella #3152), so for every other imported method
+        // that guard's `false` is a SILENT WRONG ANSWER wearing the
+        // substantive claim "this method does not return an async iterator" —
+        // audit docs/proposals/imported-symbol-audit-2026-08-13.md §4: "An
+        // accessor must consult both sources, not switch on which one exists."
+        // The named sister accessor `sema::methodReturnResolvedType` (the
+        // #4988 consolidation of this same pattern at five other sites)
+        // consults the AST first and `SemaContext::importedReturnType` second
+        // — the order every `formalParam*` accessor uses — so one read
+        // answers for a local and an imported method alike.
+        const sema::TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_);
         if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
-        // Path A: no declaration — name is in astNode->name->parts.
+        // Path A: no declaration — the name rides one of the two carriages
+        // available without one. Locally it is the syntactic node's head
+        // (unchanged). For a Named ref the loader reconstructed from module
+        // metadata it is `importedName`, because §2.5 / §29.3 (v0.240) leave
+        // `astNode` null (a dependency's type has no `ast::Type` node in the
+        // importing compilation) and `declaration` null for a builtin the
+        // dependency does not export — and `IAsyncEnumerable<T>` /
+        // `IAsyncEnumerator<T>` are exactly that shape (§30.7: the compiler's
+        // own async-iterator interfaces, never exported user types, and not on
+        // `SemaContext::isSynthesizedBuiltinInterfaceName`'s closed list, so
+        // `builtinInterfaceSym` does not give them an identity either).
+        // That second carriage is what lets this arm answer at all once the
+        // TypeRef arrives from the accessor's imported half.
         if (!rt->declaration) {
+            std::string_view head = rt->importedName;
             if (rt->astNode && rt->astNode->name &&
-                !rt->astNode->name->parts.empty()) {
-                auto& n = rt->astNode->name->parts[0];
-                return n == "IAsyncEnumerable" || n == "IAsyncEnumerator";
-            }
-            return false;
+                !rt->astNode->name->parts.empty())
+                head = rt->astNode->name->parts[0];
+            return head == "IAsyncEnumerable" || head == "IAsyncEnumerator";
         }
         // Path B: builtinClassSym (non-null declaration with no user decl).
         if (!rt->declaration->decl) {
