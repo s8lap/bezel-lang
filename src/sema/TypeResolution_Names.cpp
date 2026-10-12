@@ -1115,6 +1115,14 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
             default: return false;
         }
     };
+    // §21.10 member-signature rule: the base/interface list and the generic
+    // constraints are member-signature positions of this declaration — "base/
+    // interface positions" and "generic-constraint" in the rule's own list —
+    // so a local type's name may not appear in either. Set for the header walk
+    // below; the member walk that follows goes through resolveMember, which
+    // sets the same flag for its own reasons.
+    const bool savedInSigHeader = inMemberSignature_;
+    inMemberSignature_ = true;
     for (const auto& bt : td.baseTypes) {
         if (!bt) { ++colonIndex; continue; }
         TypeRef* ref = resolveType(*bt, &typeScope);
@@ -1295,6 +1303,12 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
             if (item.typeArg) resolveType(*item.typeArg, &typeScope);
         }
     }
+    // End of the declaration HEADER: the base/interface list and the generic
+    // constraints above were the header's member-signature positions. Restore
+    // here rather than at the end of resolveTypeDecl so the flag cannot leak
+    // past this declaration into an unrelated later one; resolveMember re-sets
+    // it for each member's own signature.
+    inMemberSignature_ = savedInSigHeader;
     // Positional fields (records).
     for (const auto& pf : td.positionalFields) {
         if (pf.type) resolveType(*pf.type, &typeScope);
@@ -1403,6 +1417,28 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
         }
     }
     // Members.
+    //
+    // §21.10 member-signature rule: pre-collect the local-type names declared
+    // in this declaration's member bodies BEFORE any member signature is
+    // walked. A member's own signature is resolved before its body, and a
+    // member declared earlier in the body is resolved before a later
+    // method's body at all — so for the enclosing method's own return/
+    // parameter types and for any earlier-declared member, the local type's
+    // TypeSymbol does not exist yet and the name would otherwise fall through
+    // to the generic "unresolved type name" instead of this rule's diagnostic.
+    localTypeNamesInDecl_.clear();
+    for (const auto& m : td.members) {
+        if (!m) continue;
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.get()))
+            collectLocalTypeNamesIn(md->stmts);
+        else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.get()))
+            collectLocalTypeNamesIn(cd->body);
+        else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(m.get()))
+            collectLocalTypeNamesIn(dd->body);
+        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m.get()))
+            for (const auto& acc : pd->accessors)
+                collectLocalTypeNamesIn(acc.stmts);
+    }
     for (const auto& m : td.members) {
         if (m) resolveMember(*m, &typeScope);
     }
@@ -1420,6 +1456,18 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
     // currentAnnotatedLocals_'s own declaration comment for the full
     // rationale of the table itself.
     currentAnnotatedLocals_.clear();
+    // §21.10 member-signature rule: this whole member's DECLARED types — the
+    // field/property/const/event type, the parameter and return types, the
+    // generic constraints, the indexer parameters — are member-signature
+    // positions, where a local type's name may not appear. The member's BODY
+    // is not, and every body reaches resolveTypesInBody / resolveTypesInExpr,
+    // which clear the flag again (see inMemberSignature_'s declaration).
+    const bool savedInSig = inMemberSignature_;
+    inMemberSignature_ = true;
+    struct SigGuard {
+        Resolver* r; bool saved;
+        ~SigGuard() { r->inMemberSignature_ = saved; }
+    } sigGuard{this, savedInSig};
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         if (fd->type) resolveType(*fd->type, parent);
         // per §28.14 (v0.175): a `scoped` FIELD must be function-typed.
@@ -3999,6 +4047,81 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 return;
             }
         }
+        // §21.10 member-signature rule, v0.334: "The name may **not** appear
+        // in any **member signature of an enclosing or sibling declaration** —
+        // parameter, return, field/property/indexer, generic-constraint, or
+        // base/interface positions of the enclosing method itself, or of any
+        // member of any type declared outside the local type — which is a
+        // compile error naming that rule ...; at those positions the name is
+        // not in scope, but the rule is stated so the diagnostic is the named
+        // one."
+        //
+        // The check runs BEFORE the module-children fallback below and before
+        // the generic unresolved/scope diagnostics, because at a member
+        // signature the name is out of scope in EVERY case — whether it was
+        // already registered (the sibling-member shape, where the fallback's
+        // extent test would otherwise report the §21.10 SCOPE rule) or not yet
+        // (the enclosing method's own return/parameter shape, which falls all
+        // the way through to "unresolved type name"). One position, one rule,
+        // one message; the pre-existing diagnostics keep their own shapes at
+        // every position this one does not own.
+        if (inMemberSignature_ && t.name->parts.size() == 1 &&
+            !inLocalTypeMembers_) {
+            // The rule's sole exemption, and the reason the check is skipped
+            // wholesale inside local-type members: §21.10 says "The
+            // prohibition does **not** reach the local type's **own** members"
+            // — `public method Twin(): Pair` inside `record Pair` is admitted.
+            //
+            // Skipping by `inLocalTypeMembers_` rather than by comparing the
+            // resolved symbol is what the field-type sentence below requires.
+            // §21.10 also says "a local type's field types may name only
+            // types already in scope by that rule's list — module-visible
+            // types, the enclosing class's nested types, and *earlier* local
+            // types", so a local type's member naming an EARLIER local type
+            // IS admitted, and the prohibition does not reach it: the rule's
+            // own stated rationale is "at those positions the name is not in
+            // scope", and an earlier local type is in scope there. A forward
+            // reference from a local type's member to a LATER local type is a
+            // different rule (§21.10's "no forward references"), which is not
+            // this one and keeps its own diagnostic.
+            //
+            // Two sources for "this name is a local type":
+            //   * the registered TypeSymbol, which exists once some body has
+            //     been walked (the sibling-member shape), and
+            //   * the pre-collected name set for the enclosing declaration,
+            //     which covers the shapes resolved BEFORE that body — the
+            //     enclosing method's own signature, and a member declared
+            //     earlier than the method that declares the local type.
+            // Either alone leaves a real member-signature position reported
+            // under some other rule's diagnostic.
+            bool isLocalName = false;
+            if (ctx_.module()) {
+                for (Symbol* child : ctx_.module()->children) {
+                    auto* ts = dynamic_cast<TypeSymbol*>(child);
+                    if (ts && ts->isLocalType && ts->name == first) {
+                        isLocalName = true;
+                        break;
+                    }
+                }
+            }
+            if (!isLocalName) {
+                for (const std::string& n : localTypeNamesInDecl_)
+                    if (n == first) { isLocalName = true; break; }
+            }
+            if (isLocalName) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t.span.begin,
+                    std::string("local type `") + std::string(first) +
+                        "` may not appear in a member signature — a "
+                        "method-local type's name is in scope only in body "
+                        "positions of the declaring block, never in the "
+                        "parameter, return, field, property, indexer, "
+                        "generic-constraint or base/interface signature of an "
+                        "enclosing or sibling declaration (§21.10)");
+                ref.kind = TypeRef::Kind::Error;
+                return;
+            }
+        }
         // fix #2198: check module children for local types (§21.10)
         if (ctx_.module() && t.name->parts.size() == 1) {
             // §21.10 "Scope and name discipline" (v0.334): "A local type's
@@ -4641,11 +4764,30 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     }
 }
 
+void Resolver::collectLocalTypeNamesIn(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body) {
+        if (!s) continue;
+        if (auto* ltd = dynamic_cast<const ast::LocalTypeDecl*>(s.get())) {
+            if (ltd->decl && !ltd->decl->name.empty())
+                localTypeNamesInDecl_.emplace_back(ltd->decl->name);
+        }
+    }
+}
+
 void Resolver::resolveTypesInBody(
     const std::vector<std::unique_ptr<ast::Stmt>>& body, Scope* scope) {
+    // §21.10 member-signature rule: statements are BODY positions — a local
+    // variable ascription, `new`, a cast, a type pattern — where the local
+    // type's name IS in scope (§21.10's "body positions" list). Clearing the
+    // signature flag here, once, is what keeps a local type's ordinary in-body
+    // use admissible; see inMemberSignature_'s declaration comment.
+    const bool savedInSig = inMemberSignature_;
+    inMemberSignature_ = false;
     for (const auto& s : body) {
         if (s) resolveTypesInStmt(*s, scope);
     }
+    inMemberSignature_ = savedInSig;
 }
 
 // §21.10 (v0.334): walk `body` with the scope-extent of the statement block
@@ -5352,6 +5494,17 @@ void Resolver::recordGenericMemberSelfEdge(const ast::NullCondMemberExpr& ncm,
 }
 
 void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
+    // §21.10 member-signature rule: an EXPRESSION is a body position, reached
+    // from a member body, a contract clause, a parameter default or an
+    // initializer — none of which the rule's parameter/return/field/
+    // generic-constraint/base list names. Clear the signature flag on the same
+    // lifetime resolveTypesInBody clears it, so a `new Row(...)` or a
+    // `lambda(r: Row) => …` inside a body is never read as a signature.
+    //
+    // This function recurses into itself, so a nested call re-saves the
+    // already-clear value and restores it — redundant but exact.
+    const bool savedInSig = inMemberSignature_;
+    inMemberSignature_ = false;
     // fix #4554 (§16.4, v0.307): when a `RangeExpr` carries a `step` and all
     // three of `lo`, `hi`, `step` are compile-time-constant integer expressions,
     // the iteration's direction can be proven at compile time. A range whose
@@ -5645,6 +5798,7 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         return;
     }
     // Literals + ThisBaseTypeOf — no nested Types/Exprs.
+    inMemberSignature_ = savedInSig;
 }
 
 // fix #4038/#4048/#4050/#4051 (§27.8, v0.294): see the declaration comment

@@ -1643,6 +1643,48 @@ private:
     // -type rule (whose `isOwnParam` loop admits the nested type's own).
     bool inLocalTypeMembers_ = false;
 
+    // §21.10 "Scope and name discipline" (v0.334), the member-signature rule:
+    // "The name may **not** appear in any **member signature of an enclosing
+    // or sibling declaration** — parameter, return, field/property/indexer,
+    // generic-constraint, or base/interface positions of the enclosing method
+    // itself, or of any member of any type declared outside the local type."
+    //
+    // Set at the entry of resolveMember and of resolveTypeDecl's header
+    // positions (base/interface list, generic constraints) — the declarations
+    // whose types are a SIGNATURE — and cleared on entry to the two body
+    // walkers, resolveTypesInBody and resolveTypesInExpr, which every member
+    // body, contract clause, parameter default and initializer reaches.
+    //
+    // Clearing centrally in the two body walkers rather than at each of ~15
+    // signature sites is what makes the flag exact: a member body is reached
+    // only through those two, so "flag set" is precisely "this type reference
+    // is being resolved in a member SIGNATURE", and a body position can never
+    // be misread as one. resolveNamed consults it to pick the rule's own
+    // diagnostic over the generic scope/unresolved ones.
+    bool inMemberSignature_ = false;
+
+    // §21.10 member-signature rule: the names of the local types declared in
+    // the bodies of the type declaration whose members are about to be
+    // resolved, collected BEFORE any member signature is walked.
+    //
+    // A local type reaches ctx_.module()->children only when its body is
+    // walked, and a body is walked AFTER its own method's signature — so for
+    // "the enclosing method itself" (its own return/parameter types) and for
+    // any member declared BEFORE the method that declares the local type, the
+    // symbol does not exist yet at signature-resolution time and the name
+    // falls through to the generic "unresolved type name". Pre-collecting the
+    // names is what lets the rule's diagnostic fire at those positions too.
+    //
+    // Names only: this set is consulted by the member-signature check alone
+    // and never by ordinary name resolution, so it cannot widen what any other
+    // lookup admits.
+    std::vector<std::string> localTypeNamesInDecl_;
+
+    // Record the local-type names declared directly in `body` (a member body's
+    // top-level statement list — the position §21.10's own example uses).
+    void collectLocalTypeNamesIn(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // §21.10 (v0.334): the source offset one past the end of the INNERMOST
     // enclosing statement block at the point currently being walked — the
     // "end of the enclosing block" a local type's name leaves scope at. Zero
