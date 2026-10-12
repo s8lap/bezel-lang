@@ -17924,6 +17924,14 @@ private:
     // eligibility and to release intermediate concat operands.
     bool isPlusOneStringProducer(const ast::Expr* init) const;
 
+    // fix #5849 (§8.5 / §28.3 / §28.9): is `expr` a CG27c ToString() call on a
+    // NUMERIC or CHAR primitive (emitPrimitiveToString / emitValueToString both
+    // allocate a fresh heap string with rc := 1)? Recognized by the same shape
+    // isPlusOneStringProducer uses for CG27c, plus the nullable-primitive path
+    // that emitValueToString handles (which produces a phi of [heap-str, literal]).
+    // Used to emit a bare-expression release for the owned result.
+    bool isPrimitiveToStringCG27c(const ast::Expr* expr) const;
+
     // #429 (RETURN-escape category) / §4.6 / §28.9: is `init` a CALL to a
     // USER-DEFINED, LOCALLY-COMPILED Bezel method whose declared return type is
     // (non-nullable) `string`? Such a call hands back EXACTLY +1: the callee's

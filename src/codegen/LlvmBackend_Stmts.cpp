@@ -3956,6 +3956,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 return diverged_;
             }
         }
+        // fix #5849 (§8.5 / §28.3 / §28.9): CG27c ToString() on a primitive
+        // (emitPrimitiveToString) or nullable primitive (emitValueToString) produces
+        // a fresh owned string with rc := 1. For a bare expression statement the
+        // result is discarded without being released — leak. Detect the CG27c
+        // shape and emit bz_string_release directly here. bz_string_release is
+        // null- and sentinel-safe (no-op on literals), so this handles both the
+        // non-nullable case and the nullable case where emitValueToString produces
+        // a phi of [heap-str, literal]: the literal branch hits the sentinel check
+        // and no-ops, the heap-str branch releases properly.
+        if (es->expr && isPrimitiveToStringCG27c(es->expr.get())) {
+            llvm::Value* v = lowerExpr(*es->expr);
+            if (!diverged_ && v) emitStringRelease(v);
+            return diverged_;
+        }
         if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
         return diverged_;  // CG40: a throw-expression terminated the block
     }

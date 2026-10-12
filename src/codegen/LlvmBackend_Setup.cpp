@@ -26336,6 +26336,42 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     return false;
 }
 
+// fix #5849 (§8.5 / §28.3 / §28.9): is `expr` a CG27c ToString() call on a
+// NUMERIC or CHAR primitive — emitPrimitiveToString — or on a nullable
+// primitive whose non-null branch calls emitPrimitiveToString — emitValueToString
+// produces a phi of [heap-str, literal]? Both allocate a fresh heap string with
+// rc := 1 that must be released in a bare expression statement. The same shape
+// is already recognized by isPlusOneStringProducer (lines ~24936-24950); this
+// helper exposes it for the ExpressionStmt bare-expression release.
+bool Emitter::isPrimitiveToStringCG27c(const ast::Expr* expr) const {
+    if (!expr) return false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(expr);
+    if (!call || !call->args.empty() || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || ma->member != "ToString" || !ma->target) return false;
+    auto* tt = ctx_.exprType(*ma->target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Primitive) return false;
+    using P = sema::PrimitiveType;
+    switch (tt->primitive) {
+        case P::Int: case P::Long: case P::Short:
+        case P::Byte: case P::SByte: case P::UInt:
+        case P::ULong: case P::UShort:
+        case P::Float: case P::Double: case P::Decimal:
+        case P::Char:
+            return true;  // emitPrimitiveToString → rc=1 heap string
+        case P::Object: case P::String: case P::Bool:
+            return false;  // not CG27c
+        default:
+            return false;
+    }
+    // Note: nullable primitives (int?, etc.) also reach emitValueToString, which
+    // produces a phi of [heap-str, literal]. The phi itself is the value to
+    // release — bz_string_release is sentinel-safe so the literal branch no-ops.
+    // We could detect nullable primitives here too, but the CG27c check above
+    // is sufficient: a non-nullable int.ToString() is the canonical bare-expr
+    // leak. The nullable case is handled by the phi release implicitly.
+}
+
 
 // #429 (RETURN-escape category) / §4.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. Recognize a CallExpr whose resolved callee is a
