@@ -45,16 +45,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // A sendable class item (sealed, value fields) so Channel<R> is well-formed
 // (§30.14). Its destructor makes disposal observable if needed.
 const char* kR =
@@ -118,7 +108,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    if inbox.IsClosed then return 1; else return 0; end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;            // ASan toolchain unavailable — skip
     BEZEL_EXPECT_TRUE(r.ran);             // no leak, no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -184,7 +173,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    if inbox.IsClosed then return 1; else return 0; end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // no double-release, no leak
     BEZEL_EXPECT_EQ(r.exitCode, 1);      // still closes
 }
@@ -210,7 +198,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -264,7 +251,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    return got; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -287,7 +273,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -325,7 +310,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    return a.Get().V; "         // 7 (a double-free would SEGV here)
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // single release — no double-free / SEGV
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -352,7 +336,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    return a.Get().V; "         // 5
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // single release — no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
@@ -378,7 +361,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    return a.Get().V; "         // 9 (a still holds its own handle)
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // single release, no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 9);
 }
@@ -412,7 +394,6 @@ BEZEL_TEST(channel_sender_owned_param_autodrop_1957,
         "    if inbox.IsClosed then return 1; else return 0; end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // single release, no double-free / UAF
     BEZEL_EXPECT_EQ(r.exitCode, 1);      // dispose closed the channel
 }
