@@ -12,6 +12,23 @@
 
 namespace bezel {
 
+// §18.3 (v0.334): a char literal is `'` CharContent `'`, and `CharContent`
+// is one Unicode scalar value or one escape sequence — so a COMPLETE char
+// literal is exactly an opening quote, one CharContent, and a closing
+// quote. Returns the offset one past that closing quote, or `npos` when
+// the text at `open` does not begin a complete char literal.
+//
+// §18.5's hole-delimitation rule (v0.334) requires the lexer to "skip
+// nested string/char literals (recognized by their own opening quote and
+// parsed as complete literals; they do not terminate the outer string)".
+// "Parsed as complete literals" is what makes this the right test: a lone
+// apostrophe that never closes before the hole's `}` is not a nested
+// literal opener, it is content (a format spec's literal separator, as in
+// the `HH'` of `{d:HH'}`). Shared with the parser, which re-scans the same
+// hole text when splitting the token into fragments (see
+// `Parser::splitInterpolation`).
+std::size_t charLiteralEnd(std::string_view src, std::size_t open);
+
 class Lexer {
 public:
     Lexer(std::string_view source, DiagnosticEngine& diagnostics);

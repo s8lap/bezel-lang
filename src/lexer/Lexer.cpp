@@ -136,6 +136,51 @@ bool isReservedKeyword(std::string_view text) {
 
 } // namespace
 
+// See Lexer.hpp for the contract. The two `CharContent` shapes of §18.3
+// (v0.334) — one escape sequence, else one Unicode scalar value — are
+// measured off `src` without touching a diagnostic engine, because this runs
+// as a *speculative* lookahead: a `'` that does not close into a complete
+// literal must leave the caller's position untouched and be treated as
+// ordinary content.
+std::size_t charLiteralEnd(std::string_view src, std::size_t open) {
+    if (open >= src.size() || src[open] != '\'') return std::string_view::npos;
+    std::size_t p = open + 1;
+    if (p >= src.size()) return std::string_view::npos;
+    if (src[p] == '\\') {
+        // One escape sequence. §18.5/§18.7 keep a char literal inside a
+        // `$@"…"` hole an ordinary char literal — `@` suppresses *string*
+        // escapes, not CharContent escapes — so this arm serves both scans.
+        ++p;
+        if (p >= src.size()) return std::string_view::npos;
+        const char k = src[p++];
+        if (k == 'x' || k == 'X') {
+            std::size_t digits = 0;
+            while (digits < 2 && p < src.size() && isHexDigit(src[p])) {
+                ++p;
+                ++digits;
+            }
+            if (digits == 0) return std::string_view::npos;
+        } else if (k == 'u' || k == 'U') {
+            const std::size_t want = (k == 'u') ? 4 : 8;
+            for (std::size_t n = 0; n < want; ++n) {
+                if (p >= src.size() || !isHexDigit(src[p]))
+                    return std::string_view::npos;
+                ++p;
+            }
+        } else if (!(k == 'n' || k == 'r' || k == 't' || k == '\\' ||
+                     k == '\'' || k == '"' || k == '0' || k == 'a' ||
+                     k == 'b' || k == 'f' || k == 'v')) {
+            return std::string_view::npos; // §18.8's table is closed
+        }
+    } else {
+        std::size_t probe = p; // one Unicode scalar value
+        consumeOneScalar(src, probe);
+        p = probe;
+    }
+    if (p < src.size() && src[p] == '\'') return p + 1;
+    return std::string_view::npos;
+}
+
 Lexer::Lexer(std::string_view source, DiagnosticEngine& diagnostics)
     : source_(source), diagnostics_(diagnostics) {}
 
@@ -609,6 +654,13 @@ Token Lexer::scanInterpolatedString() {
             // Interpolation part — consume balanced braces.
             ++position_; // past `{`
             int depth = 1;
+            // per §18.5 (v0.334): the format spec runs from the FIRST
+            // top-level `:` to the hole's closing `}`, so only the text
+            // before that `:` is hole-expression source. Below it a
+            // complete char literal is one opaque unit (its own `}` is
+            // content, not the hole's closer); above it an apostrophe is an
+            // ordinary format character and the hole's `}` always closes.
+            bool inFormatSpec = false;
             while (position_ < source_.size() && depth > 0) {
                 const char ic = source_[position_];
                 if (ic == '"') {
@@ -625,6 +677,18 @@ Token Lexer::scanInterpolatedString() {
                     if (position_ < source_.size()) ++position_; // closing "
                     continue;
                 }
+                // per §18.5 (v0.334): skip a nested char literal as a unit.
+                // `charLiteralEnd` reports a COMPLETE literal, so an
+                // apostrophe that never closes (`HH'` in `{d:HH'}`) is left
+                // as content rather than swallowing the hole's `}`.
+                if (!inFormatSpec && depth == 1 && ic == '\'') {
+                    const std::size_t litEnd = charLiteralEnd(source_, position_);
+                    if (litEnd != std::string_view::npos) {
+                        position_ = litEnd;
+                        continue;
+                    }
+                }
+                if (ic == ':' && depth == 1) inFormatSpec = true;
                 if (ic == '{') ++depth;
                 else if (ic == '}') --depth;
                 ++position_;
@@ -683,9 +747,16 @@ Token Lexer::scanInterpolatedVerbatimString() {
             }
             ++position_;
             int depth = 1;
+            // per §18.5 (v0.334) — the same rule as scanInterpolatedString:
+            // only text before the first top-level `:` is hole-expression
+            // source, and a complete char literal there is one opaque unit.
+            bool inFormatSpec = false;
             while (position_ < source_.size() && depth > 0) {
                 const char ic = source_[position_];
                 if (ic == '"') {
+                    // Nested string inside the interpolation — skip it as a
+                    // unit so its braces/quotes don't confuse the depth
+                    // counter.
                     ++position_;
                     while (position_ < source_.size() &&
                            source_[position_] != '"') {
@@ -694,6 +765,18 @@ Token Lexer::scanInterpolatedVerbatimString() {
                     if (position_ < source_.size()) ++position_;
                     continue;
                 }
+                // per §18.5 (v0.334): skip a nested char literal as a unit.
+                // A char literal keeps §18.3's CharContent grammar inside a
+                // `$@"…"` hole — `@` suppresses *string* escapes, not
+                // CharContent ones — so `charLiteralEnd` serves both.
+                if (!inFormatSpec && depth == 1 && ic == '\'') {
+                    const std::size_t litEnd = charLiteralEnd(source_, position_);
+                    if (litEnd != std::string_view::npos) {
+                        position_ = litEnd;
+                        continue;
+                    }
+                }
+                if (ic == ':' && depth == 1) inFormatSpec = true;
                 if (ic == '{') ++depth;
                 else if (ic == '}') --depth;
                 ++position_;

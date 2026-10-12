@@ -1,6 +1,8 @@
 #include "parser/Parser.hpp"
 #include "parser/Parser_impl.hpp"
 
+#include "lexer/Lexer.hpp" // charLiteralEnd — §18.5's nested-literal skip
+
 #include <algorithm>
 #include <string>
 #include <string_view>
@@ -198,6 +200,13 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
             // Find matching `}` tracking brace depth (and nested strings).
             size_t exprStart = i;
             int depth = 1;
+            // per §18.5 (v0.334): the format spec runs from the FIRST
+            // top-level `:` to the hole's closing `}`, so only the text
+            // before that `:` is hole-expression source. This scan must
+            // agree with `Lexer::scanInterpolatedString`, which cut the
+            // token the same way — a disagreement here would show up as a
+            // hole whose text the lexer and the parser disagree about.
+            bool inFormatSpec = false;
             while (i < end && depth > 0) {
                 char ic = raw[i];
                 if (ic == '"') {
@@ -208,7 +217,19 @@ void Parser::splitInterpolation(ast::InterpolatedStringExpr& e) {
                         ++i;
                     }
                     if (i < end) ++i; // closing `"`
-                } else if (ic == '{') { ++depth; ++i; }
+                } else if (!inFormatSpec && depth == 1 && ic == '\'') {
+                    // per §18.5 (v0.334): a nested char literal is one opaque
+                    // unit; its `}` must not be taken for the hole's closer.
+                    // `charLiteralEnd` reports a COMPLETE literal, so an
+                    // apostrophe that never closes (`HH'` in `{d:HH'}`) stays
+                    // content and the hole's `}` closes it as before.
+                    const size_t litEnd = charLiteralEnd(raw, i);
+                    if (litEnd != std::string_view::npos && litEnd <= end)
+                        i = litEnd;
+                    else
+                        ++i;
+                } else if (ic == ':' && depth == 1) { inFormatSpec = true; ++i; }
+                else if (ic == '{') { ++depth; ++i; }
                 else if (ic == '}') { --depth; if (depth > 0) ++i; else break; }
                 else ++i;
             }

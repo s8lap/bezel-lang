@@ -97,6 +97,102 @@ BEZEL_TEST(parser_interp, nested_quote_inside_part) {
         std::string("$\"got {Lookup(\"x\")} back\""));
 }
 
+// §18.5 (v0.334), issue #2250. The hole-delimitation rule: the lexer "skips
+// nested string/char literals (recognized by their own opening quote and
+// parsed as complete literals; they do not terminate the outer string)".
+// The char literal below holds a LITERAL `}` — the character itself, not the
+// escape `\x7D` — so without the fix that `}` closes the hole early, the rest
+// of the literal becomes stray text, and the string never terminates. This is
+// the discriminating row: it fails on the pre-fix lexer AND on the
+// intermediate fix whose lookahead stopped at `}` (which cannot, by
+// construction, ever see the very `}` it needs to protect).
+BEZEL_TEST(parser_interp, nested_char_literal_with_closing_brace) {
+    auto r = parseAll(
+        R"(module M; class C public method M() _ := $"{'}'}"; end M; end C;)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// The same shape, but asserted on the split RESULT rather than on the
+// absence of diagnostics: the char literal must survive into the hole's
+// expression text intact, so the row cannot be satisfied by merely
+// swallowing the offending characters.
+BEZEL_TEST(parser_interp, nested_char_literal_survives_split) {
+    BEZEL_EXPECT_EQ(render("$\"{'}'}\""), std::string("$\"{'}'}\""));
+}
+
+// §18.5 (v0.334), issue #2250: the issue's own repro, verbatim. `HH'` is a
+// brace-free format spec that happens to END in an apostrophe. The format
+// spec runs from the first top-level `:` to the hole's closing `}`, so the
+// `'` is ordinary format content and the `}` closes the hole — exactly as
+// before the fix. Note the NO space before the `'`, which is the form the
+// issue reports; a lookahead that scans for a closing `'` PAST the hole's
+// `}` swallows this string whole (the original #2250 defect, reverted in
+// 9ee923ab).
+BEZEL_TEST(parser_interp, format_spec_trailing_apostrophe) {
+    auto r = parseAll(
+        R"(module M; class C public method M() _ := $"{d:HH'}"; end M; end C;)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §18.5 (v0.334), issue #2250 — the spaced spelling of the same format spec.
+// Pins the other direction of the "is this a complete char literal?" test:
+// here the `'` is followed by a space, so `'` … `}` is not `'` CharContent
+// `'`, and the apostrophe stays format content.
+BEZEL_TEST(parser_interp, format_spec_trailing_apostrophe_spaced) {
+    auto r = parseAll(
+        R"(module M; class C public method M() _ := $"{d:HH' }"; end M; end C;)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §18.5 (v0.334), issue #2250 — DIFFERENTIAL CONTROL. A format spec
+// carrying a MATCHED pair of apostrophes (`HH'mm'`) is still brace-free
+// content running to the hole's `}`. A "skip to the next `'`" heuristic
+// applied at the hole's top nesting level regardless of the format-spec
+// boundary would cut this hole short and swallow the rest of the string.
+BEZEL_TEST(parser_interp, format_spec_matched_apostrophe_pair) {
+    auto r = parseAll(
+        R"(module M; class C public method M() _ := $"{d:HH'mm'}"; end M; end C;)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §18.5 (v0.334), issue #2250 — DIFFERENTIAL CONTROL. A hole with no
+// apostrophe anywhere must be untouched by the nested-literal skip, braces
+// and all: the round-trip assertion pins that the expression is still split
+// and re-rendered unchanged.
+BEZEL_TEST(parser_interp, hole_without_apostrophe) {
+    BEZEL_EXPECT_EQ(render("$\"{x + 1}\""), std::string("$\"{x + 1}\""));
+}
+
+// §18.5 (v0.334) / §18.7, issue #2250 — the verbatim spelling of the primary
+// row. `@` suppresses *string* escapes, not §18.3's CharContent grammar, so
+// a char literal in a `$@"…"` hole obeys the same complete-literal rule.
+BEZEL_TEST(parser_interp, verbatim_nested_char_literal_with_closing_brace) {
+    auto r = parseAll(
+        R"(module M; class C public method M() _ := $@"{'}'}"; end M; end C;)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §18.5 (v0.334) / §18.7, issue #2250 — the verbatim differential control:
+// the format spec's trailing apostrophe still ends at the hole's `}`.
+BEZEL_TEST(parser_interp, verbatim_format_spec_trailing_apostrophe) {
+    auto r = parseAll(
+        R"(module M; class C public method M() _ := $@"{d:HH'}"; end M; end C;)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §18.5 (v0.334), issue #2250 — escape control. A char literal whose `}` is
+// written as the escape `\x7D` never had a literal `}` for the hole scan to
+// mis-delimit, so this row passes with and without the fix. It is here to
+// pin that the escape arm of the complete-literal test does not mis-fire —
+// in particular that `\x7D`'s hex digits are consumed as the CharContent
+// rather than scanned for a stray `'` — NOT to demonstrate the bug.
+BEZEL_TEST(parser_interp, nested_char_literal_escaped_brace) {
+    const std::string src =
+        "module M; class C public method M() _ := $\"{'\\x7D'}\"; end M; end C;";
+    auto r = parseAll(src);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 BEZEL_TEST(parser_interp, verbatim_interp_multiline) {
     BEZEL_EXPECT_EQ(
         render("$@\"line1\nline2 {x}\""),
