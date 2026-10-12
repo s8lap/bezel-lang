@@ -7079,6 +7079,53 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
             "tcs.trysetres");
         llvm::Value* ok1 = builder_.CreateICmpNE(
             ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetres.b");
+        // §30.11 (stdlib §6.6): `OwningTaskCompletionSource<T>.TrySetResult(
+        // owned result: T)` — "If `TrySetResult` returns `false` because the
+        // task is already in a terminal state, the implementation disposes
+        // `result` before returning. The caller has no further obligation —
+        // ownership was transferred at the call, and the implementation is
+        // responsible for releasing it on every path." Pre-fix the value was
+        // lowered into the slot, handed to bz_tcs_try_set_result, and DROPPED
+        // on the false path: bz_tcs_try_set_result returns 0 without copying
+        // (its compare_exchange on tcs->completed fails first), so nothing
+        // downstream reclaimed it and every rejected hand-over leaked one
+        // instance for the life of the process.
+        //
+        // Only the OWNING twin takes `owned`; on `TaskCompletionSource<T>` T is
+        // a non-class value (§30.11's intrinsic restriction), so there is
+        // nothing to release and that arm is deliberately left untouched.
+        //
+        // `SetResult` is NOT handled here: §30.11 states no disposal for its
+        // already-terminal case (it throws InvalidOperationException instead)
+        // and does not settle whether the operand is released on that edge, so
+        // that is left as an open spec question rather than ruled on in code.
+        if (mname == "TrySetResult" && rcn == "OwningTaskCompletionSource") {
+            // Guarded on `!ok` AND a non-null handed-over pointer:
+            // emitDynamicDispose reads word 0 as the vtable, so a null would
+            // fault. The slot is nulled after, so the disposal is reachable at
+            // most once even if the caller's expression is re-entered.
+            llvm::Value* handed = builder_.CreateLoad(valTy, slot, "tcs.hand");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                handed, llvm::ConstantPointerNull::get(ptrTy()),
+                "tcs.hand.null");
+            llvm::Value* doDispose = builder_.CreateAnd(
+                builder_.CreateNot(ok1, "tcs.hand.rejected"),
+                builder_.CreateNot(isNull, "tcs.hand.live"), "tcs.hand.go");
+            llvm::BasicBlock* rejBB = llvm::BasicBlock::Create(
+                llvm_, "tcs.hand.rejected.bb", currentFn_);
+            llvm::BasicBlock* contBB = llvm::BasicBlock::Create(
+                llvm_, "tcs.hand.cont", currentFn_);
+            builder_.CreateCondBr(doDispose, rejBB, contBB);
+            builder_.SetInsertPoint(rejBB);
+            // The OBJECT POINTER, not the slot: emitDisposeAndReclaim reads
+            // word 0 of its argument as the vtable (that is a Bezel object's
+            // layout) and hands the same pointer to the runtime helpers.
+            emitDisposeAndReclaim(handed);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), slot);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        }
         if (mname == "SetResult") {
             // SetResult: throw InvalidOperationException if already completed.
             llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setres.fail");
