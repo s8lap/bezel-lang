@@ -8,7 +8,8 @@ This matrix asks whether a generic body, checked once and never re-checked, stay
 
 | Run | Spec | Base cells open | Route cells open | Outcome |
 |---|---|---|---|---|
-| 1 | v0.333 | 61 of 140 | 13 of 13 | 29 root causes, each filed as an issue (listed in the run file's `groups`) |
+| 1 | v0.333 | 61 of 140 | 13 of 13 | 29 root causes, each filed as an issue (listed in the run file's `groups`); all decided in v0.334 (proposals 0159–0169) |
+| 2 | v0.334 | 18 of 140 | 5 of 20 | 8 issues: `is` narrowing (#5835), generic function-value routes (#5836), second-kind ambiguity (#5837), `where T: U` assignability (#5838), assembly-time cycle edges (#5839), and existing #5792, #5798, #5800 |
 
 ## Files
 
