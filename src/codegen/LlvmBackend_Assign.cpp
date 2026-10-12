@@ -12771,36 +12771,76 @@ bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy,
     //     MEASURED (200x, LSan): `Dictionary<int, Color>` gives
     //     `keys=600 total=800`, clean.
     //
-    // ⚠ A RECORD, CLASS or INTERFACE value stays DECLINED, and the reason is no
-    // longer this issue. #3568's disposal half is solved for them too — ARM 1
-    // and ARM 2 of `dictSnapshotValueDisposers` cover the owned class pointer
-    // and the record box, and an `OwningDictionary<int, Item>` measured LSan
-    // clean at 200x on this build. What is NOT solved is issue 3563: on the
-    // WRAPPED entry face `x.Value.<member>` fails to lower (the #2961 internal,
-    // store dropped), so a valid program that reads a field of a record- or
-    // class-typed value silently computes 0 — measured `n=400 total=0` where
-    // the in-place control gives the right answer. Admitting these shapes would
-    // convert a deterministic SIGSEGV into a QUIET WRONG ANSWER, which is the
-    // trade this arm was narrowed to avoid in the first place. They come in
-    // with 3563, not before it; the gate is one `TypeDeclKind` away.
-    //   A CHOICE value was ALSO declined for a third, independent reason: it
-    // lowers to a bare struct that is neither `valRec` nor `valNullableVal`,
-    // so the decode's scalar arm would try to `trunc` an i64 into a struct
-    // type — measured as the exact `Trunc only produces integer` IR-verifier
-    // crash issue #3758 reports for `for var e in d` over
-    // `Dictionary<int, Choice>`. fix #3758 closes THAT reason (decodeDictValueAt
-    // now derives struct-vs-scalar from `valLlvm` itself, so it struct-loads
-    // a choice correctly), but a choice V stays declined HERE regardless: its
-    // disposal obligation through `dictSnapshotValueDisposers` and its
-    // `x.Value.<member>` lowering on the wrapped entry face are both
-    // unaudited for a choice payload (issue 3563 measured only record/class),
-    // so admitting it here would risk the exact quiet-wrong-answer trade the
-    // record/class exclusion above was written to avoid. Filed as followup
-    // #3767 rather than lifted speculatively.
+    // ⚠ An INTERFACE value stays DECLINED. Its read-side half is the one below's,
+    // but its disposal half is not: `dictSnapshotValueDisposers`' ARM 1 reaches
+    // an interface through `elementPolicyFor(valTy, owning)`, and that path has
+    // no measured interface-V row on this build (the #3563 rows below measure
+    // record + class only). It stays declined until both halves are measured —
+    // same discipline, same "one `TypeDeclKind` at a time" the record/class
+    // exclusion was written with.
+    //   A CHOICE value is ADMITTED, unchanged by this commit, and its history is
+    //   worth keeping: it was declined for a third, independent reason (a bare
+    //   LLVM struct that is neither `valRec` nor `valNullableVal`, so the
+    //   decode's scalar arm `trunc`ed an i64 into a struct — the exact
+    //   `Trunc only produces integer` IR-verifier crash #3758 reports for
+    //   `for var e in d` over `Dictionary<int, Choice>`); #3758 closed that
+    //   reason by deriving struct-vs-scalar from `valLlvm` itself, and #3767
+    //   landed the choice V the flag says "one `TypeDeclKind` away".
+    //
+    // fix #3563 (§29.2 / §4.8 / stdlib §4.8, v0.334): a RECORD and a CLASS value
+    // are ADMITTED. The ⚠ note that stood here read "what is NOT solved is issue
+    // 3563: on the WRAPPED entry face `x.Value.<member>` fails to lower (the
+    // #2961 internal, store dropped), so a valid program that reads a field of a
+    // record- or class-typed value silently computes 0 — measured `n=400
+    // total=0` where the in-place control gives the right answer … They come in
+    // with 3563, not before it; the gate is one `TypeDeclKind` away." That is
+    // this commit: the sibling fix in `ExprTypecheck_Calls.cpp` gives sema the
+    // SAME `headName()` spelling codegen's #2794 already used for `.Key`/`.Value`,
+    // so a written `DictionaryEntry<K,V>` annotation is now typed as well as the
+    // synthetic one, `x.Value.<member>` has a type to lower against, and the
+    // #2961 store-drop no longer fires on this face. Measured on this build with
+    // the sibling fix in place:
+    //   * `Dictionary<string, V>` (class), wrapped + for-in + `entry.Value` read
+    //     through a method call — `total=42` (was SIGSEGV, rc 139);
+    //   * `Dictionary<string, Pt>` (record), `entry.Value.x` direct — `total=3`
+    //     (was `total=0`);
+    //   * both TYPED and UNTYPED `:=` locals, both the local-decl and return
+    //     coercion faces, and `it.Current.Value.x` through an explicit
+    //     `.GetEnumerator()` — all correct, zero #2961 warnings.
+    // DISPOSAL, measured so the widening is not taken on the comment's word:
+    // `dictSnapshotValueDisposers` is reached only on the `srcOwnedByCallee`
+    // return face, and its ARM 1 (`elementPolicyFor`, DEFERRED) + ARM 2
+    // (`dictValueBoxFreer`, IMMEDIATE) already cover both shapes. LSan-clean at
+    // 300x–500x under generated-code ASan: class V on the local-decl face, class
+    // V passed in as a PARAMETER and returned, class V in an OwningDictionary
+    // returned, and a record V carrying an OWNED `string` field (typed and
+    // untyped reads). The borrowing-source wrap passes a NULL value disposer to
+    // `bz_dict_free` — confirmed in the emitted IR (`xor %esi,%esi` ahead of the
+    // `call bz_dict_free` in `Factory$Make`) — so it frees the TABLE only and
+    // never a borrowed class instance; that is the §28.11 "the borrowing family
+    // does not own its values" contract this arm relies on.
+    //   Not widened: `SortedDictionary` (above, its snapshot mint has no disposer
+    //   parameter), a nullable Class/Record V (the nullable-value tag struct has
+    //   its own #3802 box story, unaudited here), and Interface (above) — all
+    //   keep the pre-fix answer, so this is a strict widening of the admitted
+    //   set with nothing removed from it.
     if (valTy->kind == K::Primitive) return true;
     const ast::TypeDeclKind* vk = namedDeclKind(valTy);
-    return vk && (*vk == ast::TypeDeclKind::Enum ||
-                  *vk == ast::TypeDeclKind::Choice);
+    // fix #3563 (§9.4 / stdlib §4.8, v0.334): RECORD and CLASS V join ENUM and
+    // CHOICE. The two NEW kinds carry their own `!nullable` guard, and ONLY
+    // they do — ENUM and CHOICE keep the exact pre-fix, nullable-agnostic answer
+    // the arms above were measured with (`Color?` is heap-boxed on `.Add`, and
+    // `dictValueBoxFreer`'s `isStructTy()` test already catches that box, which
+    // is why the Enum arm is deliberately nullable-permissive). The new kinds
+    // stay declined for a nullable `V?` because the nullable-value TAG struct
+    // has its own box/disposal story (#3802) that this commit did not measure;
+    // declining them is the pre-fix answer for those shapes, not a narrowing.
+    if (!vk) return false;
+    if (*vk == ast::TypeDeclKind::Enum ||
+        *vk == ast::TypeDeclKind::Choice) return true;
+    return !valTy->nullable &&
+           (*vk == ast::TypeDeclKind::Class ||
+            *vk == ast::TypeDeclKind::Record);
 }
 
 llvm::Value* Emitter::wrapDictionaryAsIEnumerable(

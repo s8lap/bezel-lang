@@ -62,19 +62,16 @@
 
 ctor_this_observation_residual_1748.closure_invoked_during_construction_unchecked_is_ub_not_nre  # §22.7: an unchecked build observes the `this` watermark null, and any use requiring non-null is UNDEFINED — the row's whole point is that unchecked does NOT reach the checked build's NullReferenceException, and it asserts only `!= 1`. Matches the `bz$M.W$ctor` SEGV-at-0x8 in the failed e89577e4 cycle. tests/codegen/ctor_this_observation_residual_1748_test.cpp:269
 
-# ── ADDED 2026-09-21, AND IT DOES NOT MEET THE BAR ABOVE — see #4558 ────────
-# This row is exempted to unblock a cycle, and the reasoning is recorded here
-# rather than hidden. The bar this file sets is "a program whose behaviour the
-# SPEC leaves undefined". That is NOT this row: the program is well-formed
-# Bezel (iterate a `Dictionary<int, Pt>` through
-# `IEnumerable<DictionaryEntry<int, Pt>>`), and the spec defines what it should
-# do. What actually happens is that `dictEntryWrapShapeSupported` SILENTLY
-# declines record V on the wrap face, passes the raw dict through, and the
-# generated code dispatches a vtable slot on garbage — a compiler gap (#3563,
-# OPEN), not a spec allowance. By this file's own §31.1 precedent the right
-# answer is to restructure the row, not to exempt it: a declined construct
-# should be REJECTED at compile time, and then the row asserts a diagnostic
-# instead of a SIGSEGV. #4558 tracks that. Until then the row does carry real
-# value — it pins that the decline fails LOUDLY rather than returning a quiet
-# wrong answer, which is the trade its own comment says it guards.
-dict_entry_wrap_choice_v_3767.record_v_still_declined_on_wrap_face_3563_object_parity  # #3563 (OPEN): record V on the DictionaryEntry wrap face is silently declined and mis-lowered to a vtable dispatch on garbage; the row runs it deliberately and asserts it crashes without printing, so the ASan report is the expected outcome. Exempted under protest — see the note above and #4558. tests/codegen/dict_entry_wrap_choice_v_3767_test.cpp:150
+# ── REMOVED 2026-10-12 by fix #3563 ─────────────────────────────────────────
+# The `dict_entry_wrap_choice_v_3767.record_v_still_declined_on_wrap_face_3563_
+# object_parity` entry (and the "ADDED 2026-09-21, AND IT DOES NOT MEET THE
+# BAR" note above it) is GONE: #3563 closed the compiler gap that note names.
+# `dictEntryWrapShapeSupported` now admits a record / class V, and sema types
+# `.Key`/`.Value` for the WRITTEN `DictionaryEntry<K,V>` spelling, so that
+# program's vtable dispatch on garbage is gone with it — the row no longer
+# produces an ASan corruption report, so there is nothing left to exempt. The
+# row was renamed to
+# `record_v_wrapped_on_wrap_face_now_runs_3563_fixed` and now asserts the
+# correct behaviour (exit 0, "x=1") under `runAotChecked`; see
+# `tests/codegen/dict_entry_wrap_choice_v_3767_test.cpp` and
+# `tests/codegen/dict_entry_wrap_read_class_record_v_3563_test.cpp`.

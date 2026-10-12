@@ -24447,14 +24447,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // #548 / stdlib §4.8 v0.135: `DictionaryEntry<K,V>.Key` is K and
         // `.Value` is V.  DictionaryEntry has no user TypeSymbol (it is a
         // builtin synthetic type), so the ordinary member-lookup path never
-        // types these.  Detect by the importedName="DictionaryEntry" tag
-        // (set by the for-loop sema above when element type is derived from
-        // a Dictionary<K,V> source).
+        // types these.  Detect by headName() == "DictionaryEntry" — the ONE
+        // spelling that reads BOTH carriers of the name: the synthetic
+        // `importedName="DictionaryEntry"` tag (set by the for-loop sema above
+        // when the element type is derived from a `Dictionary<K,V>` source) AND
+        // the WRITTEN annotation's astNode head.
+        //
+        // fix #3563 (§9.4 / stdlib §4.8, v0.334): the old test was
+        // `importedName == "DictionaryEntry"` alone — SYNTHETIC-ONLY, and the
+        // sema twin of codegen fix #2794, which had already made the codegen
+        // half of this exact pair read `headName()` precisely because a written
+        // `DictionaryEntry<K,V>` annotation carries an astNode and an EMPTY
+        // importedName. The two halves had therefore drifted: codegen's #548
+        // DictionaryEntry arm (LlvmBackend_Exprs.cpp) lowers `.Key`/`.Value` for
+        // both carriers, while sema TYPED them for only one. A receiver whose
+        // `DictionaryEntry<string, V>` arrives through the written annotation —
+        // `var e: IEnumerable<DictionaryEntry<string, V>> := d;` followed by
+        // `for var entry in e do … end` (§29.2's wrap face) — got NO recorded
+        // type for `entry.Value`, so any expression that needs that node's own
+        // type to go further (`entry.Value.<member>` directly, or
+        // `var v := entry.Value;` followed by `v.<member>`, since an
+        // unannotated `:=` infers from this same node) found `exprType` null.
+        // Codegen's CG8 field read then missed, `fieldAddr` returned null, and
+        // the #2961 arm dropped the store — a SILENT ZERO for a record-typed V
+        // and a null receiver for a class-typed one (whose method call is an
+        // indirect call through a null vtable: SIGSEGV).
+        // MEASURED (pre-fix, this tree): `total := total + entry.Value.x;` over
+        // a wrapped `Dictionary<string, Pt>` printed `total=0` where the
+        // in-place `for var entry in dict` control printed `total=3`.
+        // `headName()` is the strict superset — it returns `importedName`
+        // verbatim when there is no astNode, so every shape the old test
+        // admitted is admitted identically.
         if (ma.target && (ma.member == "Key" || ma.member == "Value")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
                 bool isDictEntry =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->importedName == "DictionaryEntry" &&
+                    tt->headName() == "DictionaryEntry" &&
                     tt->genericArgs.size() >= 2;
                 if (isDictEntry) {
                     std::size_t gi = ma.member == "Key" ? 0 : 1;
@@ -24462,12 +24490,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, tt->genericArgs[gi]);
                     return;
                 }
-                // #628 / stdlib §4.9 v0.135: `DrainedEntry<K,V>.Key` is K
-                // and `.Value` is V. Mirrors DictionaryEntry handling above.
-                // DrainedEntry has no user TypeSymbol; detect by importedName tag.
+                // #628 / stdlib §4.9 v0.135: `DrainedEntry<K,V>.Key` is K and
+                // `.Value` is V. Mirrors DictionaryEntry handling above.
+                // DrainedEntry has no user TypeSymbol; detected the same way
+                // (see the #3563 note above for why headName(), not
+                // importedName, on both entries).
                 bool isDrainedEntry =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->importedName == "DrainedEntry" &&
+                    tt->headName() == "DrainedEntry" &&
                     tt->genericArgs.size() >= 2;
                 if (isDrainedEntry) {
                     std::size_t gi = ma.member == "Key" ? 0 : 1;

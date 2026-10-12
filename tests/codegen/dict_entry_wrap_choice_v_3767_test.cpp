@@ -26,11 +26,17 @@
 //      face read goes through the entry struct's field 1, then a typed local
 //      (`var v: Shape := entry.Value`) feeds the case scrutinee — measured to
 //      recover the exact payload bytes written at `.Add`. The untyped
-//      `entry.Value` (no `: Shape` annotation) still degrades to a zero-
-//      initialized slot — the open wrapped-face field-access gap for ANY
-//      non-primitive V, #3563 — and this lane's brief deliberately scopes the
+//      `entry.Value` (no `: Shape` annotation) still degraded to a zero-
+//      initialized slot here — the open wrapped-face field-access gap for ANY
+//      non-primitive V, #3563 — and this lane's brief deliberately scoped the
 //      fix to the TYPED path (#3563 is a separate, broader fix; this commit
 //      does NOT widen that gate).
+//      ⚠ SUPERSEDED BY fix #3563 (v0.334), which lands the gap this paragraph
+//      scoped out: sema now types `.Key`/`.Value` for the WRITTEN
+//      `DictionaryEntry<K,V>` spelling as well as the synthetic one, so the
+//      UNTYPED read works and the gate admits a record / class V. See
+//      `dict_entry_wrap_read_class_record_v_3563_test.cpp` for that fix's
+//      rows and Row 2 below for the flip it forced here.
 //
 // GATE MECHANICS. The local-decl mirror at `LlvmBackend_Setup.cpp:14494`
 // previously called `dictEntryWrapShapeSupported(declTR)` with the SECOND
@@ -52,14 +58,20 @@
 // row (1) — they all read choice payloads via destructuring patterns on
 // typed locals, never via the wrap-face field access of an untyped `entry.
 // Value`.
+// ⚠ SUPERSEDED BY fix #3563 (v0.334). The record / class V exclusion this
+// paragraph records is now lifted: sema types `.Key`/`.Value` for the written
+// `DictionaryEntry<K,V>` spelling (the sema twin of codegen's #2794
+// `headName()` widening), so the read side is sound and the gate admits both
+// kinds. Row 2 below is the row that flip renamed and rewrote.
 //
 // REGRESSION ROOM. Row 1 is the issue's own repro shape — the
 // `Dictionary<int, Color>.Add/get` via the wrapped GetEnumerator face
 // (`IEnumerable<DictionaryEntry<K,V>> := d;` plus `.GetEnumerator()` plus
-// `Current.Key` to confirm the wrap minted). Row 2 is a record-V control
-// that the widening does NOT touch (record V stays DECLINED, matching the
-// pre-fix behaviour — the brief's "control" is the for-in path that DOES
-// accept record V via `decodeDictValueAt`). Row 3 is a primitive-V control
+// `Current.Key` to confirm the wrap minted). Row 2 was originally a record-V
+// control asserting record V stayed DECLINED on this face; fix #3563 lifted
+// that exclusion, so Row 2 is now a POSITIVE record-V row (the wrap minted and
+// the entry rebuilt) — see its own header for the flip. Row 3 is a primitive-V
+// control
 // for object-parity (the original gate's narrow answer must keep working
 // after the widening). Row 4 is the choice V with payload case, through the
 // assignment-coercion face, with a typed local + destructuring pattern —
@@ -75,7 +87,6 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -132,22 +143,33 @@ BEZEL_TEST(dict_entry_wrap_choice_v_3767,
 }
 
 // ---------------------------------------------------------------------------
-// Row 2 — record V control (stdlib §4.8 / §28.3, v0.287). The wrap-face field
-// access gap (#3563) is open for record V too — `x.Value.<member>` returns a
-// silently-zero field on the wrapped entry face, exactly the trade the gate's
-// record/class exclusion was written to avoid. The brief's intent is that
-// record V stays DECLINED on the assignment-coercion face, just as it was
-// pre-#3767 — and the for-in path (which DOES work for record V, via
-// `lowerDictEntryFor`'s struct-load) keeps working. This row asserts that
-// record V on the wrap face still fails LOUDLY (the IR verifier / runtime
-// trap), not silently. Pre-fix: SIGSEGV (gate declined, raw dict passed
-// through, vtable dispatch on garbage). Post-fix: IDENTICAL behaviour (gate
-// still declines record V). Object-parity guard against an over-eager
-// widening.
+// Row 2 — record V on the wrap face (stdlib §4.8 / §29.2 / §28.3, v0.334).
+//
+// ⚠ BEHAVIOUR FLIP — fix #3563 renamed and REWROTE this row. It was
+// `record_v_still_declined_on_wrap_face_3563_object_parity` and it asserted
+// the OPPOSITE of what it now asserts: that a record V bound to
+// `IEnumerable<DictionaryEntry<int, Pt>>` fails LOUDLY (rc-139 SIGSEGV,
+// nothing on stdout). That was correct for its commit and is now false —
+// #3563 lands the fix it was written to guard against, so record V is no
+// longer DECLINED on the wrap face and the program runs correctly. A row that
+// pins the ABSENCE of a fix has to be rewritten when the fix lands; keeping
+// the old assertion would have meant shipping #3563 with a deliberately red
+// test. Renamed so the flip is greppable from the issue number, and rewritten
+// to assert the wrapped entry's key DECODES (exit 0, "x=1"), which is what
+// "the wrap was minted and the entry rebuilt" means.
+//
+// Pre-#3563 this row's program SIGSEGV'd at `it.MoveNext()`: the gate declined
+// a record V, the coercion stored the raw `bz_dict_t*` in the `IEnumerable`
+// slot, and `GetEnumerator()` vtable-dispatched on a layout that object does
+// not have. The full #3563 story (the gate's other half — sema typing
+// `.Key`/`.Value` for the WRITTEN `DictionaryEntry` spelling) and the
+// regression rows are in `dict_entry_wrap_read_class_record_v_3563_test.cpp`.
+// The object-parity intent survives in Row 3 (primitive V) and in that file's
+// Row 5 (the in-place for-in control).
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_entry_wrap_choice_v_3767,
-           record_v_still_declined_on_wrap_face_3563_object_parity) {
+           record_v_wrapped_on_wrap_face_now_runs_3563_fixed) {
     const std::string src =
         "module M; "
         "record Pt(x: int, y: int); "
@@ -161,16 +183,11 @@ BEZEL_TEST(dict_entry_wrap_choice_v_3767,
         "  end; "
         "  return 0; "
         "end Main; end C;";
-    // runAot (NOT runAotChecked) — the program is EXPECTED to crash, since
-    // record V is DECLINED on the wrap face (issue #3563). What matters is
-    // that it FAILS LOUDLY (the rc-139 SIGSEGV the brief warns about), not
-    // silently (which would be a quiet wrong answer — the trade this row
-    // guards against). Pre-fix and post-fix this row's outcome must match:
-    // the program crashes (rc != 0) without printing `x=1`.
-    JitResult r = runAot(src);
+    JitResult r = runAotChecked(src);
     if (wasSkipped(r)) return;
-    BEZEL_EXPECT_TRUE(!r.stdoutText.empty() == false);
-    BEZEL_EXPECT_TRUE(!has(r.stdoutText, "x=1"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "x=1"));
 }
 
 // ---------------------------------------------------------------------------
@@ -213,10 +230,11 @@ BEZEL_TEST(dict_entry_wrap_choice_v_3767,
 // The wrap-face read uses a TYPED local (`var v: Shape := entry.Value`) to
 // feed the case scrutinee — measured to recover the exact payload bytes
 // written at `.Add` (Circle(r=3) + Square(s=4) = 3 + 4 = 7). The untyped
-// `entry.Value` path remains broken for ANY non-primitive V (issue #3563,
-// out of scope for this lane's narrow fix). FAILS-WITHOUT (assignment-
-// coercion gate declines, raw dict passes through, vtable dispatch on
-// garbage / crash) / PASSES-WITH (exit=0, total=7).
+// `entry.Value` path was broken for ANY non-primitive V (issue #3563, out of
+// scope for this lane's narrow fix) and is FIXED by #3563 — see
+// `dict_entry_wrap_read_class_record_v_3563_test.cpp`.
+// FAILS-WITHOUT (assignment-coercion gate declines, raw dict passes through,
+// vtable dispatch on garbage / crash) / PASSES-WITH (exit=0, total=7).
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_entry_wrap_choice_v_3767,
