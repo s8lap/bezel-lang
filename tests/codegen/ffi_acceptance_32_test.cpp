@@ -80,8 +80,8 @@ BEZEL_TEST(ffi_acceptance_32, stdcall_convention_accepted_32_4) {
 // §32.5 — FFI-compatible types
 // ===========================================================================
 
-// §32.5: UIntPtr is an FFI-compatible scalar type.
-BEZEL_TEST(ffi_acceptance_32, uintptr_resolves_as_extern_param_32_5) {
+// §32.5: UIntPtr is an FFI-compatible scalar type (declaration admitted).
+BEZEL_TEST(ffi_acceptance_32, uintptr_declaration_compiles_32_5) {
     // Declare a function with UIntPtr parameters and return. The declaration compiles.
     auto r = runAot(
         "module M; "
@@ -106,12 +106,11 @@ BEZEL_TEST(ffi_acceptance_32, float_double_params_32_5) {
 }
 
 // §32.5: bool is an FFI-compatible scalar type (spec: 1-byte, 0/1 representation).
-// NOTE: Testing Bezel-bool-to-C-bool marshalling end-to-end requires a custom C
-// shim — no standard C function takes a single bool parameter and produces
-// observable output. This test verifies bool production from FFI data (atoi
-// returns int; int comparison produces Bezel bool) and bool-to-int coercion
-// across the FFI boundary (printf %d receives int 1 for true).
-BEZEL_TEST(ffi_acceptance_32, bool_marshalling_32_5) {
+// GAP: bool-to-bool marshalling end-to-end requires a custom C shim — no standard
+// C function takes a single bool parameter and produces observable output. This row
+// verifies bool production from FFI data (atoi returns int; int comparison produces
+// Bezel bool) and bool-to-int coercion across the FFI boundary via a variadic slot.
+BEZEL_TEST(ffi_acceptance_32, bool_to_int_variadic_coercion_32_5) {
     // atoi("1") returns int 1. The comparison "1 <> 0" produces Bezel bool true.
     // Passing that bool to printf with %d shows it coerces to int 1 at the FFI
     // boundary (the variadic int slot receives the bool's int representation).
@@ -132,9 +131,9 @@ BEZEL_TEST(ffi_acceptance_32, bool_marshalling_32_5) {
 // ===========================================================================
 
 // §32.8 / §32.5: A plain (un-env-paired) function-typed parameter is admitted.
-// We verify the declaration compiles and links; a static method reference is
-// the admissible callback form per §32.8.
-BEZEL_TEST(ffi_acceptance_32, plain_callback_function_type_declared_32_8) {
+// We verify the declaration compiles; a static method reference is the admissible
+// callback form per §32.8.
+BEZEL_TEST(ffi_acceptance_32, plain_callback_function_type_declaration_compiles_32_8) {
     // Declare bsearch_s with a comparator function type. The declaration compiles.
     // The actual callback invocation is tested in other scenarios.
     // Note: "base" is a reserved keyword, so we use "buf" instead.
@@ -153,8 +152,8 @@ BEZEL_TEST(ffi_acceptance_32, plain_callback_function_type_declared_32_8) {
 // §32.5 — Function type as return type
 // ===========================================================================
 
-// §32.5: An FFI function type as a return type. The declaration compiles.
-BEZEL_TEST(ffi_acceptance_32, function_type_return_type_32_5) {
+// §32.5: An FFI function type as a return type (declaration admitted).
+BEZEL_TEST(ffi_acceptance_32, function_type_return_declaration_compiles_32_5) {
     auto r = runAot(
         "module M; "
         "extern \"c\" public method dlsym(handle: IntPtr, name: CString): IntPtr; end; "
