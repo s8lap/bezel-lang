@@ -67,17 +67,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required
-// to build this repo, so a skip is not expected — guard anyway (mirrors
-// #1982 / #1934 / #1988 / #2065).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // Build a "render N times, count byte-correct results" program for a stdlib
 // string-transforming method. `decl` binds the receiver; `render` is the
 // method call; `expected` is the exact result (rendered via .Length, which
@@ -130,7 +119,6 @@ const char* kOriginalRepro =
 BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
            original_p_coalesce_toupper_lsan_clean) {
     JitResult r = runAotChecked(kOriginalRepro);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // LSan-clean: ToUpper() result freed once
     BEZEL_EXPECT_EQ(r.exitCode, 8);    // 4 × "HI".Length = 4 × 2 = 8
 }
@@ -143,7 +131,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"hi\"; ",
         "src.ToUpper()", 2));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -156,7 +143,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"HI\"; ",
         "src.ToLower()", 2));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -169,7 +155,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"  hi  \"; ",
         "src.Trim()", 2));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -190,7 +175,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"  hi  \"; ",
         "src.TrimStart()", 4));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -203,7 +187,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"  hi  \"; ",
         "src.TrimEnd()", 4));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -216,7 +199,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"abcdef\"; ",
         "src.Substring(2, 3)", 3));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -230,7 +212,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"abcdef\"; ",
         "src.Substring(3)", 3));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -243,7 +224,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"abba\"; ",
         "src.Replace('a', 'X')", 4));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -256,7 +236,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"abc\"; ",
         "src.Replace(\"b\", \"YY\")", 4));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -269,7 +248,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"hi\"; ",
         "src.PadLeft(5)", 5));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -282,7 +260,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"hi\"; ",
         "src.PadRight(5)", 5));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -295,7 +272,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"ab\"; ",
         "src.Insert(1, \"XX\")", 4));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -308,7 +284,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"abcde\"; ",
         "src.Remove(1, 2)", 3));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -321,7 +296,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
     JitResult r = runAotChecked(loopCount(
         "var src := \"abcde\"; ",
         "src.Remove(2)", 2));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -349,7 +323,6 @@ BEZEL_TEST(stdlib_string_transform_methods_leak_2199,
         "    return t; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // borrows survive release unchanged
     BEZEL_EXPECT_EQ(r.exitCode, 8);    // 4 × (Length + StartsWith) = 8
 }
