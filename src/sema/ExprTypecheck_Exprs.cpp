@@ -9748,6 +9748,48 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                         // read) — but the table had no OwningSet
                                         // arm at all, so the inline `out var`
                                         // recipient was left UNTYPED.
+                                        // fix-forward #3842 (§22.4 / §28.11,
+                                        // stdlib §1 shape (a), v0.334): the
+                                        // OWNING-collection extraction Try's
+                                        // whose out param is written at a
+                                        // position the Stack/Queue arms above
+                                        // do not match were absent from this
+                                        // table, although the `out owned var`
+                                        // and `out using var` tables three
+                                        // hundred lines below have carried
+                                        // their arms since #831/#1354. §28.11
+                                        // derives the recipient's type from
+                                        // the receiver's element argument, so
+                                        // with no arm here the inline `out var`
+                                        // recipient was left UNTYPED.
+                                        //
+                                        // MEASURED at the pick 8dd17f3b (the
+                                        // retirement migrated this spelling
+                                        // suite-wide, so the gap landed on
+                                        // `out var` users):
+                                        // `OwningArray<Box>.TryPopFirst(out var
+                                        // item)` compiled, ran and returned 0
+                                        // instead of 10, with
+                                        //   "assignment RHS expression failed
+                                        //    to lower to a value for this
+                                        //    assignment's target (store
+                                        //    dropped …) — #2961"
+                                        // because `item.Val` had no type to
+                                        // lower through. Same for
+                                        // OwningLinkedList.TryPopFirst and
+                                        // OwningDictionary.TryPopValue;
+                                        // OwningStack.TryPop was already
+                                        // covered by the posElem arm and
+                                        // answered 5. The 9666 substitution
+                                        // block is NOT involved: a BUILTIN
+                                        // Try* callee resolves to no
+                                        // MethodSymbol at all, so
+                                        // `formalOutParamType2` returns null,
+                                        // `calleeParent2` is null and that block
+                                        // never runs (MEASURED: reverting
+                                        // ExprTypecheck_Exprs.cpp wholesale to
+                                        // the parent leaves the repro failing
+                                        // identically).
                                         bool posElem =
                                             ((cn == "Stack" || cn == "Queue" ||
                                               cn == "OwningStack" ||
@@ -9758,18 +9800,40 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                             (cn == "Channel" &&
                                              mn == "TryReceive") ||
                                             (cn == "OwningSet" &&
-                                             mn == "TryPop");
+                                             mn == "TryPop") ||
+                                            // §4.5 / §4.7 (#831/#1354):
+                                            // OwningArray / OwningLinkedList
+                                            // write the element type T to
+                                            // `out owned item: T?` at position 0.
+                                            ((cn == "OwningArray" ||
+                                              cn == "OwningLinkedList") &&
+                                             (mn == "TryPopFirst" ||
+                                              mn == "TryPopLast") &&
+                                             pos2 == 0);
                                         bool valElem =
                                             (cn == "Dictionary" ||
                                              cn == "SortedDictionary" ||
                                              cn == "OwningDictionary") &&
                                             mn == "TryGetValue";
+                                        // §4.17 / §28.11 (#860,
+                                        // #1387): OwningDictionary's keyed
+                                        // extraction writes the VALUE type V =
+                                        // genericArgs[1] at position 1
+                                        // (`TryPopValue(key, out owned value:
+                                        // V?)`) — the same slot `TryGetValue`
+                                        // reads, but at a different position.
+                                        bool popValElem =
+                                            cn == "OwningDictionary" &&
+                                            mn == "TryPopValue" && pos2 == 1;
                                         bool ownSetElem =
                                             cn == "OwningSet" &&
                                             mn == "TryPop" && pos2 == 1;
                                         if (posElem && !rt->genericArgs.empty())
                                             elemT = rt->genericArgs[0];
                                         else if (valElem &&
+                                                 rt->genericArgs.size() >= 2)
+                                            elemT = rt->genericArgs[1];
+                                        else if (popValElem &&
                                                  rt->genericArgs.size() >= 2)
                                             elemT = rt->genericArgs[1];
                                         else if (ownSetElem &&

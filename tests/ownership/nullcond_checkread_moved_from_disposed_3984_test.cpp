@@ -193,3 +193,95 @@ BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
+
+// ============================================================================
+// fix-forward #3842 (§22.4 "Inline `out` declarations" / §28.11, stdlib §1
+// shape (a), v0.334): the `out var` BUILTIN extraction table in
+// sema/ExprTypecheck_Exprs.cpp carried no arm for the owning-collection
+// Try's whose out param the Stack/Queue arms did not match, although the
+// `out owned var` and `out using var` tables beside it have carried those
+// arms since #831/#1354. §28.11 derives the inline recipient's type from the
+// RECEIVER's element argument, so with no arm the recipient is left UNTYPED
+// and every read through it fails to lower.
+//
+// #3842 (8dd17f3b) RETIRED the `out owned var` call-site spelling
+// (§A.4, v0.289 L2) and migrated this file's own accept-side control from
+// `out owned var item` to `out var item` — which is what made the gap
+// reachable. MEASURED at 8dd17f3b, `OwningArray<Box>.TryPopFirst(out var
+// item)` compiled rc=0, RAN, and returned 0 instead of 10, with
+//   "assignment RHS expression failed to lower to a value for this
+//    assignment's target (store dropped …) — #2961"
+// because `item.Val` had no type to lower through. Same for
+// OwningLinkedList.TryPopFirst and OwningDictionary.TryPopValue;
+// OwningStack.TryPop was already covered by the Stack/Queue arm and
+// answered 5.
+//
+// NOT the substitution condition: the `substituteMemberType` block at the
+// top of the same handler is unreachable here — a BUILTIN Try* callee
+// resolves to no MethodSymbol, so `formalOutParamType2` returns null and
+// `calleeParent2` is null. MEASURED: reverting ExprTypecheck_Exprs.cpp
+// wholesale to the parent leaves this repro failing identically.
+//
+// These rows pin the VALUE that comes back out of the discharge idiom, so a
+// fix that merely silenced the #2961 warning (typed the recipient `int`, say)
+// still fails them.
+// ============================================================================
+BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,
+           owningarray_trypopfirst_out_var_recipient_typed_spec_28_11) {
+    auto r = runAot(
+        "module M; "
+        "class Box public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; end Box; "
+        "class C public static method Main(): int "
+        "  do using var a := new OwningArray<Box>(); "
+        "    a.Add(move (new Box(10))); a.Add(move (new Box(20))); "
+        "    var ok := a.TryPopFirst(out var item); "
+        "    var v := 0; if item <> null then v := item.Val; end; "
+        "    item?.Dispose(); "
+        "    if ok then return v; end; return 0; end; return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 10);
+}
+
+// The OwningLinkedList twin of the row above (stdlib §4.7) — same table, same
+// missing arm. A fix that added only the `OwningArray` arm leaves this red.
+BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,
+           owninglinkedlist_trypopfirst_out_var_recipient_typed_spec_28_11) {
+    auto r = runAot(
+        "module M; "
+        "class Box public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; end Box; "
+        "class C public static method Main(): int "
+        "  do using var a := new OwningLinkedList<Box>(); "
+        "    a.Add(move (new Box(10))); a.Add(move (new Box(20))); "
+        "    var ok := a.TryPopFirst(out var item); "
+        "    var v := 0; if item <> null then v := item.Val; end; "
+        "    item?.Dispose(); "
+        "    if ok then return v; end; return 0; end; return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 10);
+}
+
+// OwningDictionary.TryPopValue (stdlib §4.17, #860): a KEYED extraction, so its out
+// param is at position 1 and its type is the VALUE argument genericArgs[1] —
+// a different slot AND a different position from the TryGetValue arm the table
+// already had. Exit 7, not 10, so this cannot pass by reusing the element arm.
+BEZEL_TEST(nullcond_checkread_moved_from_disposed_3984,
+           owningdictionary_trypopvalue_out_var_recipient_typed_spec_28_11) {
+    auto r = runAot(
+        "module M; "
+        "class Box public Val: int := 0; "
+        "  public constructor(v: int) Val := v; end constructor; end Box; "
+        "class C public static method Main(): int "
+        "  do using var d := new OwningDictionary<string, Box>(); "
+        "    d.Add(\"k\", move (new Box(7))); "
+        "    var ok := d.TryPopValue(\"k\", out var item); "
+        "    var v := 0; if item <> null then v := item.Val; end; "
+        "    item?.Dispose(); "
+        "    if ok then return v; end; return 0; end; return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
