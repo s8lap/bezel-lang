@@ -7016,7 +7016,37 @@ void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
     // identifier is the only shape §15.3 bullet 1 moves; `b.f`, `b[i]` and
     // `b.M()` are borrows of `b` (the same reading `MoveOnlyArrayTransfer
     // Walker` gives those positions for the other move-only kind).
-    auto* sid = dynamic_cast<const ast::IdentifierExpr*>(srcExpr);
+    //
+    // The `move` SPELLING of that same transfer — `var t := move b;` — is the
+    // one §15.3 bullet 1's scope note makes UNMARKED in the plain binding form
+    // ("copies are forbidden, so the plain binding can only move - and therefore
+    // stays unmarked, as this rule has always defined"). It is still the SAME
+    // transfer, and it arrives here as an `ast::UnaryExpr` with `op == "move"`
+    // wrapping the identifier (Parser_Exprs.cpp, A.7 `MoveExpr ::= "move"
+    // PrimaryExpr`), so the bare cast below declined it and the source kept
+    // its scope-end owning-choice disposal while the taker took one too.
+    // // per §15.3 / §A.4
+    //
+    // MEASURED at r23-c28 (fece431f) on
+    //   var src := Slot.Full(new Conn()); var t := move src;
+    // heap-use-after-free, READ of size 8 in `main` (ASan), region allocated by
+    // `new Conn()` in the initializer and freed by the taker's scope-end pass;
+    // without ASan the same binary exits SIGSEGV. The UNMARKED spelling
+    // `var t := src;` of the identical transfer is clean, which is the
+    // differential control: the marker alone decided the double free.
+    //
+    // Unwrapping is the sanctioned shape, not a new one:
+    // `nullTransferredOwnedLocalSlot` (LlvmBackend_Assign.cpp) does exactly
+    // this for the call-ARGUMENT position, which is why `C.Sink(move b!)` never
+    // double-freed while this declaration form did.
+    const ast::IdentifierExpr* sid =
+        dynamic_cast<const ast::IdentifierExpr*>(srcExpr);
+    if (!sid) {
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(srcExpr))
+            if (u->op == "move")
+                sid = dynamic_cast<const ast::IdentifierExpr*>(
+                    u->operand.get());
+    }
     if (!sid) return;
     auto* sloc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*sid));
     if (!sloc) return;
