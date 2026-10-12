@@ -577,6 +577,26 @@ bool PureBodyWalker::isEnumeratorConstructingSource(
         // Concrete element type — use direct indexed loop, admitted.
         return false;
     }
+    // §22.15 rule 5: "A source whose static type is an interface
+    // (IEnumerable<T> included) or a generic type parameter — even one
+    // instantiated at a concrete sequence type — remains rejected."
+    //
+    // A bare type parameter (e.g. `T` in `method Foo<T>(source: T)`) has
+    // kind==Named and declaration==null.  Its headName() is the parameter's
+    // own name ("T"), which matches no arm below, so it falls through to
+    // `return false` and the for is incorrectly admitted — later dying in
+    // codegen with "not yet implemented: codegen for this for statement".
+    //
+    // Reuse the same Named+null-declaration sentinel the Array<T> arm uses
+    // for a type-parameter element type.  Unlike Array<T> (which reaches
+    // this point with a non-null head that matched no arm), a bare type
+    // parameter IS the head — so we must additionally check that it has
+    // NO generic args, to avoid incorrectly rejecting an instantiated
+    // builtin type (OwningBuffer<Dog>, etc.) whose declaration is also null.
+    // // per §22.15
+    if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+        rt->genericArgs.empty())
+        return true;
     // Any iterable INTERFACE head: always constructs an enumerator, rejected
     // even with a concrete element type. §22.15 rule 5 rejects "a source whose
     // static type is an interface (IEnumerable<T> included)".
