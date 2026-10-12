@@ -1390,10 +1390,31 @@ private:
     // returns false on an unknown / duplicate name, a mixed positional+named
     // slot list, or a `move` marker outside an owning choice match — each
     // naming its rule per §19.3. `headName` is the pattern head, for messages.
+    //
+    // fix #4763 follow-up (v0.334): `ccPayload` is the head case's payload
+    // DECLARATION when the head names a CHOICE CASE, and null for every other
+    // head (a record's positional fields, a class). It is what makes §19.3's
+    // marker admission decidable here at all: "(ii) `N` names an `owned`-marked
+    // payload field or a payload field of move-only value type **of the matched
+    // case**", and "(iii) the slot's pattern is a top-level binding" — both
+    // need the payload the name resolved to. A null `ccPayload` IS the head
+    // condition failing, which the spec states "by derivation, not fiat":
+    // "records carry no `owned` fields (§28.5), and a class getter may not
+    // mint an owned value (§28.6), so marked slots are choice-case-only".
+    //
+    // Condition **(i)** — the match is an OWNING match (§35.5) — is NOT checked
+    // here: it is a property of the SCRUTINEE, and `owningMatchScrutineeForm`
+    // (ownership) is the one authority for that, so the borrowing-match
+    // rejection rides there. The two error directions are asymmetric (marking a
+    // slot the arm did not adopt LEAKS it), so ownership and codegen must agree
+    // about which slots a MARKED named slot transfers — they consult
+    // `PositionalPattern::hasMoveMarker`, which this function now PRESERVES for
+    // an admitted marker (it used to clear it with `slotName`).
     bool normalizeNamedDestructureSlots(
         ast::DestructuringPattern& dp,
         const std::vector<std::string_view>& memberNames,
-        std::string_view headName, const SourceLocation& loc);
+        std::string_view headName, const SourceLocation& loc,
+        const std::vector<ast::Param>* ccPayload = nullptr);
 
     // §19.6 (v0.196, #1816): compose a leaf class's ROOT INSTANTIATION — the
     // instantiation of the root declaration `root` that `leaf` derives from,

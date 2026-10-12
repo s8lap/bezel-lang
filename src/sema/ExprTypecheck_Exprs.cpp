@@ -13060,8 +13060,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             payloadNames.reserve(cc->caseDecl->payload.size());
                             for (const auto& p : cc->caseDecl->payload)
                                 payloadNames.push_back(p.name);
-                            normalizeNamedDestructureSlots(
-                                *dp, payloadNames, lastName, dp->span.begin);
+                            // fix #4763 follow-up (v0.334): the head names a
+                            // CHOICE CASE, so pass its payload declaration —
+                            // §19.3's marker conditions (ii) and (iii) are
+                            // stated over "an `owned`-marked payload field or a
+                            // payload field of move-only value type **of the
+                            // matched case**", and the case's payload list is
+                            // what a slot's resolved name indexes into. A null
+                            // here is the head-condition rejection (records and
+                            // classes carry no obligation-bearing slot).
+                            normalizeNamedDestructureSlots(*dp, payloadNames,
+                                                           lastName, dp->span.begin,
+                                                           &cc->caseDecl->payload);
                         }
                         if (dp->subPatterns.size() !=
                             cc->caseDecl->payload.size()) {

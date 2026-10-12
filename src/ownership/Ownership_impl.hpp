@@ -3628,6 +3628,10 @@ private:
     // only; see the definition. // per §19.3, §35.5, v0.334
     static void collectNamedSlotAnchors(const ast::Pattern* p,
                                         std::vector<const ast::Node*>& out);
+    // §19.3 condition (i) (v0.334): does `arm` carry a MARKED named slot — the
+    // shape the "admitted only in an owning match" refusal is reported against.
+    // See the definition. // per §19.3, §35.5, v0.334
+    static bool armHasMarkedNamedSlot(const ast::CaseArm& arm);
     // fix #4664: the check point — one `move` the pre-pass walk reached.
     // Reports iff its operand is a bare identifier resolving to a
     // `borrowOnlyArmBindings_` entry. // per §35.5, §28.3 K3.1, v0.307

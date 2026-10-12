@@ -7269,14 +7269,49 @@ bool Emitter::markOwningMatchTransferredSlots(llvm::Value* choiceAddr,
         // fields, unmarked named slots, discarded siblings" — and NOT part of
         // the slots this mark discharges.
         //
+        // A MARKED named slot DOES transfer ("On arm selection each marked
+        // payload transfers into its binding exactly as the corresponding
+        // positional slot would", §19.3; §15.3 the same for a move-only
+        // payload), so it is marked like the positional slot beside it.
+        //
         // This MUST agree with `collectOwningMatchTransferBindings`, which
-        // skips the same slots. The two error directions of this function are
-        // not symmetric (see the caller's note): marking a slot the arm did
-        // not adopt LEAKS it, and here ownership has already been told the
-        // binding is a borrow that owns nothing, so nothing else reclaims it.
-        // Skipping leaves the payload for the completion reclaim, which is
-        // what §19.3/§35.5 state.
-        if (sp.namedSlot) continue;
+        // skips exactly the unmarked ones. The two error directions of this
+        // function are not symmetric (see the caller's note): marking a slot
+        // the arm did not adopt LEAKS it, and here ownership has already been
+        // told the binding is a borrow that owns nothing, so nothing else
+        // reclaims it. Skipping leaves the payload for the completion reclaim,
+        // which is what §19.3/§35.5 state.
+        //
+        // The marked case is therefore re-derived from the SAME payload
+        // predicate ownership uses, rather than taken on the marker's word:
+        // §28.1 erases an `owned` marker on a value / runtime-managed
+        // instantiation, and a slot that is marked but does not transfer must
+        // NOT be marked here (leak), while ownership refuses to put its binding
+        // in the transfer set — so the two agree by construction. Reaching here
+        // also means §19.3 condition (i) held: this function is reached only
+        // from an owning-match scrutinee slot (`scrutChoiceSlot`), the same
+        // alloca `unboundOwningChoiceTemp` / `markedOwningChoiceScrutineeSlot`
+        // gate produced.
+        if (sp.namedSlot) {
+            if (!sp.hasMoveMarker) continue;
+            const sema::TypeRef* mftInst = common::substitutedChoicePayloadType(
+                cc->caseDecl->payload[j], choiceTy, choiceRef, ctx_);
+            const ast::Param& mpf = cc->caseDecl->payload[j];
+            bool mtransfers = false;
+            if (mpf.modifier == "owned")
+                mtransfers = common::ownedMarkerActiveOnInstantiatedType(
+                    mftInst ? mftInst
+                            : (mpf.type ? ctx_.resolvedType(*mpf.type) : nullptr),
+                    ctx_);
+            else {
+                const char* mkind = nullptr;
+                mtransfers = common::isMoveOnlyValueType(
+                    mftInst ? mftInst
+                            : (mpf.type ? ctx_.resolvedType(*mpf.type) : nullptr),
+                    ctx_, mkind);
+            }
+            if (!mtransfers) continue;
+        }
         // §35.5: a slot that binds nothing — `_`, a constant, a range — is
         // "the un-transferred remainder"; leave it for the completion reclaim.
         // THIS IS THE FIX: before #4617 the loop did not exist and every slot

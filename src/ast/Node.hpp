@@ -1474,12 +1474,21 @@ struct PositionalPattern {
     // slot, which is the whole parseable surface before #2197.
     std::string_view slotName;
     // §19.3 "Named-slot bindings and ownership": `move N = var x` marks the
-    // slot's SOURCE as transferring. Admitted only when the match is owning
+    // slot's SOURCE as transferring. Admitted when the match is owning
     // (§35.5), `N` names an `owned`/move-only payload field, and the RHS is a
     // top-level binding — and therefore only on a CHOICE case head (a record
     // or class head admits no obligation-bearing slot). `move` is a reserved
     // keyword (§B.1) and lexes as TokenKind::Keyword, so the parser must test
     // it with isKeyword(), never under an Identifier guard.
+    //
+    // fix #4763 follow-up (v0.334): an ADMITTED marker SURVIVES sema, beside
+    // `namedSlot` and where `slotName` does not. §19.3's ownership rule is
+    // keyed on the slot's SPELLING and the marker's operand is the payload
+    // field, so ownership and codegen must be able to tell a MARKED named slot
+    // — which DOES transfer, "exactly as the corresponding positional slot
+    // would" — from an unmarked one, which never does. Only meaningful together
+    // with `namedSlot` (a positional slot never carries it: the parser sets it
+    // on the `move Identifier "="` branch alone).
     bool hasMoveMarker = false;
     // §19.3 "Named-slot bindings and ownership" (v0.334): TRUE when this slot
     // was WRITTEN in the named form (`N = p`). Unlike `slotName` — which
@@ -1492,11 +1501,10 @@ struct PositionalPattern {
     // spelling therefore does not merely lose information, it inverts the
     // ownership class of the binding (#4763).
     //
-    // A slot reaching ownership or codegen with this set is necessarily
-    // UNMARKED: sema's `normalizeNamedDestructureSlots` rejects every marked
-    // named slot outright (this compiler has no owning-match named-slot
-    // admission path), so the marker never survives sema. Whoever implements
-    // that admission must revisit this field at the same time.
+    // A slot reaching ownership or codegen with this set is either UNMARKED or
+    // MARKED; `hasMoveMarker` beside it says which, and the two passes that
+    // must agree (`collectOwningMatchTransferBindings`,
+    // `markOwningMatchTransferredSlots`) key their skip on exactly that pair.
     bool namedSlot = false;
 };
 

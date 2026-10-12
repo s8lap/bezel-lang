@@ -2465,7 +2465,8 @@ static bool armsContainRelOpPattern(const std::vector<ast::CaseArm>& arms) {
 bool ExprTC::normalizeNamedDestructureSlots(
     ast::DestructuringPattern& dp,
     const std::vector<std::string_view>& memberNames,
-    std::string_view headName, const SourceLocation& loc) {
+    std::string_view headName, const SourceLocation& loc,
+    const std::vector<ast::Param>* ccPayload) {
     // Fast path: no named slot means the whole pre-#2197 positional surface.
     // Returning without touching `dp` is what keeps every existing positional
     // row bit-identical — the differential control for this feature.
@@ -2477,36 +2478,27 @@ bool ExprTC::normalizeNamedDestructureSlots(
     if (!anyNamed) return true;
 
     const std::string head(headName);
+    // fix #4763 follow-up (v0.334): a REJECTED pattern must not carry a live
+    // `hasMoveMarker` into a later pass. Since the marker now SURVIVES
+    // normalization for an ADMITTED slot, "survives" has to mean exactly that:
+    // ownership's condition-(i) refusal keys on the same field, and without this
+    // a record-head program (`Rect(move Height = var h)`, rejected here for the
+    // head condition) ALSO drew ownership's "borrowing match" message — two
+    // diagnostics for one error, the second naming a condition that was never
+    // the failing one. Every `return false` below goes through this lambda.
+    const auto reject = [&](const std::string& msg) {
+        for (auto& sp : dp.subPatterns) sp.hasMoveMarker = false;
+        ctx_.diagnostics().report(Severity::Error, loc, msg);
+        return false;
+    };
     // §19.3: "A slot list is either positional or named, never mixed in one
     // pattern (v1); mixing (`Rect(3, Height = var h)`) is a compile error
     // naming the rule."
     if (anyPositional) {
-        ctx_.diagnostics().report(
-            Severity::Error, loc,
-            "destructuring pattern `" + head +
-            "(...)` mixes positional and named slots; a slot list is either "
-            "positional or named, never mixed in one pattern (§19.3)");
-        return false;
-    }
-    // §19.3 "Named-slot bindings and ownership": the `move` marker is admitted
-    // ONLY on a choice case head — "on a record or class pattern head — by
-    // derivation, not fiat … so marked slots are choice-case-only". The
-    // marker additionally requires an OWNING match (§35.5) on an `owned` /
-    // move-only payload field with a top-level binding RHS; this compiler's
-    // owning-match machinery has no named-slot admission path yet, so the
-    // marker is rejected rather than silently ignored. Reporting it here is
-    // what makes `hasMoveMarker` a field with a real reader.
-    for (const auto& sp : dp.subPatterns) {
-        if (!sp.hasMoveMarker) continue;
-        ctx_.diagnostics().report(
-            Severity::Error, loc,
-            "`move` marker on named slot `" + std::string(sp.slotName) +
-            " =` in pattern `" + head + "(...)` is admitted only on a choice "
-            "case head, in an owning match (§35.5), on an `owned`-marked or "
-            "move-only payload field, with a top-level binding right-hand "
-            "side; a record or class head admits no obligation-bearing slot "
-            "(§19.3)");
-        return false;
+        return reject("destructuring pattern `" + head +
+                      "(...)` mixes positional and named slots; a slot list is "
+                      "either positional or named, never mixed in one pattern "
+                      "(§19.3)");
     }
     // Resolve each name to its declaration index. §19.3: an unknown name or a
     // duplicate name in one slot list "is a compile error at the pattern, each
@@ -2521,28 +2513,152 @@ bool ExprTC::normalizeNamedDestructureSlots(
                 if (k) avail += ", ";
                 avail += "`" + std::string(memberNames[k]) + "`";
             }
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                "named slot `" + std::string(nm) + "` in pattern `" + head +
-                "(...)` names no member of `" + head + "`; an unknown name is "
-                "a compile error at the pattern (§19.3)" +
-                (avail.empty() ? std::string("; the type has no member to "
-                                             "name")
-                               : "; its named slots are " + avail));
-            return false;
+            return reject("named slot `" + std::string(nm) + "` in pattern `" +
+                          head + "(...)` names no member of `" + head +
+                          "`; an unknown name is a compile error at the pattern "
+                          "(§19.3)" +
+                          (avail.empty() ? std::string("; the type has no "
+                                                       "member to name")
+                                         : "; its named slots are " + avail));
         }
         const std::size_t idx =
             static_cast<std::size_t>(it - memberNames.begin());
         for (std::size_t j = 0; j < i; ++j) {
             if (targetIndex[j] != idx) continue;
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                "named slot `" + std::string(nm) + "` is bound twice in "
-                "pattern `" + head + "(...)`; a duplicate name in one slot "
-                "list is a compile error (§19.3)");
-            return false;
+            return reject("named slot `" + std::string(nm) + "` is bound twice "
+                          "in pattern `" + head + "(...)`; a duplicate name in "
+                          "one slot list is a compile error (§19.3)");
         }
         targetIndex[i] = idx;
+    }
+    // §19.3 "Named-slot bindings and ownership" (v0.334) — the transfer
+    // marker on a named slot's SOURCE, `move N = var x`:
+    //
+    //   "A named slot may instead carry the transfer marker on its **source**:
+    //    `move N = var x`. The marked slot is admitted exactly when **(i)** the
+    //    match is an **owning match** (§35.5 — either trigger), **(ii)** `N`
+    //    names an **`owned`-marked payload field or a payload field of move-only
+    //    value type** of the matched case …, and **(iii)** the slot's pattern is
+    //    a top-level binding (`var x`; v1)."
+    //
+    // The head condition and (iii) are decidable HERE; (i) is a property of the
+    // SCRUTINEE and rides `owningMatchScrutineeForm` (ownership), which is the
+    // one authority for "owning match". This check runs AFTER name resolution
+    // because (ii) needs the payload FIELD the name resolved to — the
+    // pre-#4763-follow-up check ran first and rejected the marker on the bare
+    // spelling, which is why `move response = var r` over an `owned response`
+    // payload was refused for want of a condition it actually satisfied.
+    //
+    // It runs here rather than in ownership because (ii) and (iii) are the two
+    // conditions the SPEC words as slot-level admission, and refusing them here
+    // keeps the marker from ever reaching a pass that would classify the binding
+    // as a transfer — the leak direction (see the codegen twin).
+    for (std::size_t i = 0; i < dp.subPatterns.size(); ++i) {
+        const ast::PositionalPattern& sp = dp.subPatterns[i];
+        if (!sp.hasMoveMarker) continue;
+        const std::string slot(dp.subPatterns[i].slotName);
+        const std::string pat = head + "(...)";
+        // The head condition, "by derivation, not fiat": "no obligation-bearing
+        // slot can exist there (records carry no `owned` fields, §28.5, and a
+        // class getter may not mint an owned value, §28.6), so marked slots are
+        // choice-case-only."
+        if (!ccPayload) {
+            return reject(
+                "`move` marker on named slot `" + slot + " =` in pattern `" +
+                pat + "` is admitted only on a choice case head: a record or "
+                "class pattern head admits no obligation-bearing slot — "
+                "records carry no `owned` fields (§28.5) and a class getter may "
+                "not mint an owned value (§28.6) — so there is nothing there "
+                "to transfer; write the positional destructure over the case, "
+                "or a marked named slot on it (§19.3, §35.5)");
+        }
+        // (iii) "the slot's pattern is a top-level binding (`var x`; v1)." The
+        // naked-binding shorthand is POSITIONAL-only (§19.3: "The positional
+        // naked-binding shorthand (above) is scoped to positional slots"), so
+        // the binding is always a `var x` BindingPattern here.
+        if (!dynamic_cast<const ast::BindingPattern*>(sp.pattern.get())) {
+            const bool discard =
+                dynamic_cast<const ast::DiscardPattern*>(sp.pattern.get()) !=
+                nullptr;
+            return reject(
+                "`move` marker on named slot `" + slot + " =` in pattern `" +
+                pat + "` needs a top-level binding on its right-hand side — " +
+                (discard
+                     ? std::string("a discarded payload is already disposed at "
+                                   "construct completion, so drop the marker, "
+                                   "or bind with `var " + slot +
+                                   "` to transfer (§17.13)")
+                     : std::string("a nested pattern binds a borrow at every "
+                                   "level, which an owned payload must not "
+                                   "have — bind it with `var " + slot +
+                                   "`")) +
+                " (§19.3)");
+        }
+        // (ii) "`N` names an `owned`-marked payload field or a payload field of
+        // move-only value type of the matched case".
+        //
+        // §19.3's own words for the `owned` half of (ii) are "`owned`-MARKED
+        // payload field", so the test is §28.1's own oracle
+        // (`ownedMarkerActiveOnInstantiatedType`) and not a bare
+        // `modifier == "owned"`: that oracle is what tells an `owned` marker
+        // that MEANS something from one §28.1 "ERASES" on a value or
+        // runtime-managed type, and §19.3 names the erased case as its own
+        // compile error — "on a **copyable value, `string`, or runtime-managed
+        // payload** (no obligation to transfer …)". A `move` marker on
+        // `Fetched(owned note: string)` is therefore refused here, where a
+        // marker-only test would have admitted it (MEASURED: it compiled).
+        //
+        // Read at the payload's DECLARED type, before generic substitution.
+        // A still-generic bare parameter counts as owning by that oracle, which
+        // is §19.3's literal (ii) satisfied — and it is the SOUND side to be
+        // uncertain on: ownership re-derives the same predicate at the
+        // instantiation and codegen skips the mark when the two disagree, so a
+        // marker admitted here over an erased instantiation binds a copy and
+        // its payload is left to §35.5's construct-completion reclaim. The
+        // error directions are not symmetric — marking a slot the arm did not
+        // adopt LEAKS it — so the narrow reading is the safe one.
+        const std::size_t idx = targetIndex[i];
+        const ast::Param* pf =
+            idx < ccPayload->size() ? &(*ccPayload)[idx] : nullptr;
+        const sema::TypeRef* ft =
+            (pf && pf->type) ? ctx_.resolvedType(*pf->type) : nullptr;
+        bool transfers =
+            pf && pf->modifier == "owned" &&
+            common::ownedMarkerActiveOnInstantiatedType(ft, ctx_);
+        if (!transfers && ft) {
+            const char* moKind = nullptr;
+            transfers = common::isMoveOnlyValueType(ft, ctx_, moKind);
+        }
+        if (!transfers) {
+            // §19.3 names the two refusals separately, and so does the
+            // message: a plain class/interface payload field of an owning case
+            // (the case's owning classification comes from a SIBLING field,
+            // §35.4) against a copyable value / `string` / runtime-managed one.
+            const bool classPayload =
+                ft && ft->kind == sema::TypeRef::Kind::Named &&
+                ft->declaration &&
+                (ft->declaration->kind == ast::TypeDeclKind::Class ||
+                 ft->declaration->kind == ast::TypeDeclKind::Interface) &&
+                !ft->declaration->isValueBuiltin;
+            return reject(
+                "`move` marker on named slot `" + slot + " =` in pattern `" +
+                pat + "` names payload field `" + slot + "`, which carries no "
+                "obligation to transfer: " +
+                (classPayload
+                     ? std::string("it is a plain (unmarked) class- or "
+                                   "interface-typed payload field of this "
+                                   "case, so the slot is a borrow — the case's "
+                                   "owning classification comes from a sibling "
+                                   "field (§35.4) and an unmarked field routes "
+                                   "nothing to transfer; mark the field "
+                                   "`owned` at the declaration (§28.1, §35.1) "
+                                   "if the case is meant to own it")
+                     : std::string("it is a copyable value, `string` or "
+                                   "runtime-managed payload, which has no "
+                                   "disposal obligation to move")) +
+                "; the marker is admitted only on an `owned`-marked payload "
+                "field or one of move-only value type (§15.3, §19.3)");
+        }
     }
     // Reorder the slots into DECLARATION order and clear the named marker, so
     // the pattern that reaches sema's binding walk and codegen is exactly the
@@ -2564,7 +2680,18 @@ bool ExprTC::normalizeNamedDestructureSlots(
                 reordered.push_back(std::move(dp.subPatterns[i]));
     for (auto& sp : reordered) {
         sp.slotName = std::string_view{};
-        sp.hasMoveMarker = false;
+        // fix #4763 follow-up (v0.334): `hasMoveMarker` SURVIVES for an ADMITTED
+        // marker, where `slotName` does not. Clearing both was right while the
+        // marker was rejected outright, but §19.3's ownership rule is keyed on
+        // the slot's SPELLING and the marker's operand is the payload field, so
+        // ownership (`collectOwningMatchTransferBindings`) and codegen
+        // (`markOwningMatchTransferredSlots`) must be able to tell a MARKED
+        // named slot — which DOES transfer — from an unmarked one, which never
+        // does. Both read it beside `namedSlot`, which survives too.
+        //
+        // Only an admitted marker reaches here: the admission loop above
+        // returns false on every rejected one, leaving the slot list UNREORDERED
+        // and its `slotName`s intact, which is the pre-existing error path.
     }
     dp.subPatterns = std::move(reordered);
     return true;
@@ -24500,8 +24627,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             payloadNames.reserve(cc->caseDecl->payload.size());
                             for (const auto& p : cc->caseDecl->payload)
                                 payloadNames.push_back(p.name);
-                            normalizeNamedDestructureSlots(
-                                *dp, payloadNames, lastName, dp->span.begin);
+                            // fix #4763 follow-up (v0.334): the head names a
+                            // CHOICE CASE, so pass its payload declaration —
+                            // §19.3's marker conditions (ii) and (iii) are
+                            // stated over "an `owned`-marked payload field or a
+                            // payload field of move-only value type **of the
+                            // matched case**", and the case's payload list is
+                            // what a slot's resolved name indexes into. A null
+                            // here is the head-condition rejection (records and
+                            // classes carry no obligation-bearing slot).
+                            normalizeNamedDestructureSlots(*dp, payloadNames,
+                                                           lastName, dp->span.begin,
+                                                           &cc->caseDecl->payload);
                         }
                         // §35.5 "Case patterns": "a positional destructuring
                         // pattern `CaseName(slot, …)` with the case's exact
