@@ -148,9 +148,9 @@ private:
     bool recordConstructionIsPure(const ast::NewExpr& ne);
 
     // §22.15 rule 5: a `for` loop source must not construct an enumerator.
-    // Range<T> of primitive steppable type, inline arrays, spans,
-    // value-typed OwningBuffer<T>, and a CONCRETE Array<T>/OwningArray<T>
-    // source are admitted; an IEnumerable<T> source, a `string` source,
+    // Range<T> of primitive steppable type, inline arrays, spans, both
+    // OwningBuffer<T> presentations, a CONCRETE Array<T>/OwningArray<T>
+    // source, and a `string` source are admitted; an IEnumerable<T> source
     // and an Array<T> whose element is a type parameter are rejected.
     bool forSourceAdmitsEnumerator(const ast::Expr& iterable) const;
 
@@ -556,8 +556,9 @@ bool PureBodyWalker::isEnumeratorConstructingSource(
     const TypeRef* rt) const {
     // §22.15 rule 5: an IEnumerable<T> source constructs an enumerator class
     // instance. Range<T> of primitive steppable type, inline arrays, spans,
-    // and value-typed OwningBuffer<T> use direct counted/indexed loops. A
-    // CONCRETE Array<T>/OwningArray<T> source uses the direct indexed loop,
+    // and both OwningBuffer<T> presentations use direct counted/indexed
+    // loops. A CONCRETE Array<T>/OwningArray<T> source, a class-typed
+    // OwningBuffer<T>, and a `string` source use the direct indexed loop,
     // which is the NORMATIVE semantics inside a pure body; an Array<T> whose
     // element is a type parameter is not concrete at this check site and is
     // rejected.
@@ -580,8 +581,39 @@ bool PureBodyWalker::isEnumeratorConstructingSource(
     // rejected even with a concrete element type.
     if (head == "IEnumerable" || head == "IEnumerator")
         return true;
-    if (head == "string" ||
-        head == "List" || head == "OwningList" ||
+    // OwningBuffer<T> (stdlib §4.14): BOTH presentations are admitted, and
+    // for different reasons the clause states separately.
+    //
+    // Value-typed T is one of §29.2's "Direct-indexed sources" — its
+    // desugaring is already the direct indexed loop, and §22.15 rule 5
+    // lists it among the sources admitted on that ground.
+    //
+    // Class-typed T is the enumerator-constructing presentation (stdlib
+    // §4.14 declares `class OwningBuffer<T>: IEnumerable<T?>` for class-typed
+    // T, and its table note 5 says "the type implements IEnumerable<T?> and
+    // the standard enumerator path applies, with the elision rule below").
+    // It is admitted because §22.15 rule 5 NAMES it in the elision clause:
+    // "over a source whose static type at this body's own check site is
+    // concretely Array<T>, OwningArray<T>, class-typed OwningBuffer<T>, or
+    // string, §29.2's admitted protocol elision is likewise the normative
+    // semantics inside a pure body". The clause's stated reason is that
+    // `OwningBuffer<T>.Length` is `pure`-declared as an
+    // immutable-once-allocated extent read (stdlib §4.14), so the bounds
+    // read is rule-1 material.
+    //
+    // The two presentations are ONE generic class (stdlib §4.14: "The two
+    // presentations are different specializations of the same generic class.
+    // The compiler resolves T's category at instantiation"), so `head` does
+    // not — and must not — discriminate between them here: both are admitted,
+    // and stating the arm makes that a decision of this clause rather than the
+    // fall-through below.
+    if (head == "OwningBuffer") return false;
+    // The remaining collection families. `string` is NOT here: it is one of
+    // the four types the elision clause names concretely, so it is admitted
+    // by falling through (the compiler lowers a `string` source to a direct
+    // indexed loop — `lowerStringFor` reads `Length` and per-code-point reads
+    // and constructs no enumerator, §29.2).
+    if (head == "List" || head == "OwningList" ||
         head == "OwningDictionary" || head == "OwningSet" ||
         head == "Dictionary" || head == "Set" || head == "Stack" ||
         head == "Queue" || head == "LinkedList" || head == "OwningStack" ||
@@ -953,7 +985,7 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
             reportPureViolation(
                 fs->span.begin, "`for` loop source",
                 "the source constructs an enumerator (an "
-                "IEnumerable<T>-typed source, a `string` source, or an "
+                "IEnumerable<T>-typed source, or an "
                 "`Array<T>` whose element is a type parameter); declare "
                 "the source at a concrete sequence type, or use an index "
                 "loop `for var i in 0..<xs.Count`");

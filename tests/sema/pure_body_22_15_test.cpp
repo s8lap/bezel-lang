@@ -235,6 +235,114 @@ BEZEL_TEST(pure_body_22_15, pure_type_param_element_array_for_rejected_spec_22_1
     BEZEL_EXPECT_TRUE(hasMsg(r, "`for` loop source"));
 }
 
+// §22.15 rule 5, the elision clause's THIRD concrete type: a `string`
+// source. Verbatim: "over a source whose static type at this body's own
+// check site is concretely `Array<T>`, `OwningArray<T>`, class-typed
+// `OwningBuffer<T>`, or `string`, §29.2's admitted protocol elision is
+// likewise the normative semantics inside a pure body: the compiler emits
+// the direct indexed loop — a bounds read and per-element reads, rule-1
+// material — and constructs no enumerator."
+//
+// The clause's stated reason is that "`string.Length` and the `string`
+// indexer (stdlib §9.6) ... are `pure`-declared, so for those reads either
+// lowering satisfies the fragment".
+//
+// FAILS-WITHOUT / PASSES-WITH: before the fix `isEnumeratorConstructingSource`
+// listed `string` among the enumerator-constructing sources, so this program
+// was rejected with the "`for` loop source" diagnostic.
+BEZEL_TEST(pure_body_22_15, pure_string_source_for_accepted_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public pure method M(s: string): int "
+        "    var t: int := 0; "
+        "    for var ch in s do t := t + int(ch); end; "
+        "    return t; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasMsg(r, "`for` loop source"));
+    // The loop variable is a VALUE COPY typed `char` (§22.15 rule 5's
+    // "a value copy for value elements and `string`"; §29.2's table gives
+    // `ReadOnlyStringSpan` the same `char` shape). Reading it at its own type
+    // is what makes this row load-bearing on the iteration-variable typing
+    // path rather than on the admission alone: an admit-with-no-typed-element
+    // would still fail `int(ch)` at the operator.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §22.15 rule 5, the elision clause's FOURTH concrete type: class-typed
+// `OwningBuffer<T>`. Same clause, verbatim (as above): "class-typed
+// `OwningBuffer<T>`", with the reason "`OwningBuffer<T>.Length` (stdlib
+// §4.14) is `pure`-declared as an immutable-once-allocated extent read".
+//
+// stdlib §4.14 declares the class-typed presentation as
+// `class OwningBuffer<T>: IEnumerable<T?>` — it IS an enumerator-constructing
+// type, admitted only via the elision. §29.2's table note 5 says so
+// directly: "For class-typed `OwningBuffer<T>`, the type implements
+// `IEnumerable<T?>` and the standard enumerator path applies, with the
+// elision rule below."
+//
+// This row also pins that the fix does not accidentally admit the wrong
+// element category: the VALUE-typed presentation is admitted on the
+// DIFFERENT ground §22.15 states for it ("over ... value-typed
+// `OwningBuffer<T>` the desugaring is ALREADY the direct indexed loop"), and
+// both are checked here because the two presentations are one generic class.
+BEZEL_TEST(pure_body_22_15, pure_class_typed_owning_buffer_for_accepted_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Dog "
+        "  public constructor() end constructor; "
+        "end Dog; "
+        "class C "
+        "  public pure method M(b: OwningBuffer<Dog>): int "
+        "    var n: int := 0; "
+        "    for var d in b do n := n + 1; end; "
+        "    return n; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasMsg(r, "`for` loop source"));
+}
+
+// The value-typed OwningBuffer<T> presentation, the clause's other
+// OwningBuffer arm ("over ... value-typed `OwningBuffer<T>` the desugaring
+// is already the direct indexed loop"). Paired with the row above so a
+// future edit cannot admit one presentation and reject the other without a
+// row going red.
+BEZEL_TEST(pure_body_22_15, pure_value_typed_owning_buffer_for_accepted_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public pure method M(b: OwningBuffer<int>): int "
+        "    var n: int := 0; "
+        "    for var v in b do n := n + 1; end; "
+        "    return n; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasMsg(r, "`for` loop source"));
+}
+
+// The elision must NOT widen the diagnostic's own stated reasons: the two
+// rejections the clause keeps (`IEnumerable<T>`-typed, and `Array<T>` whose
+// ELEMENT is a type parameter) must still fire after the fix, and the
+// message must no longer name `string` as one of them. Pins the text so a
+// later re-widening of either the arm list or the message is caught.
+BEZEL_TEST(pure_body_22_15, pure_for_source_diagnostic_text_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public pure method M(xs: IEnumerable<int>): int "
+        "    var sum: int := 0; "
+        "    for var x in xs do sum := sum + 1; end; "
+        "    return sum; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`for` loop source"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "IEnumerable<T>-typed source"));
+    // `string` is admitted by the clause, so the diagnostic must not list it
+    // as a reason for rejection.
+    BEZEL_EXPECT_FALSE(hasMsg(r, "a `string` source"));
+}
+
 // =========================================================================
 // §22.15 contrapositive: class construction outside throw; the throw
 // carve-out.
