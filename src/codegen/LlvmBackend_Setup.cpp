@@ -30796,7 +30796,19 @@ bool Emitter::isCallBoundedClosureArgPosition(const ast::CallExpr& call,
     if (!p.modifier.empty()) return false;
     // Spelled as a function type IN SOURCE (#1921 / #2248: a bare `T` is
     // `Kind::Named` at every instantiation, so it can never arm this).
-    if (!p.type || p.type->kind != ast::TypeKind::Function) return false;
+    // fix #5611 (§28.14 / §28.9, v0.334): `resolvedFormalIsFunction` also
+    // admits an ALIAS whose target is a function type — the same re-alignment
+    // with sema's `fnTyped` the two `formalIsFunction` sites in
+    // LlvmBackend_Calls2.cpp make (see that helper's comment). Without it a
+    // CAPTURING literal at an alias-typed formal released its CLOSURE cell (the
+    // call-bounded arm, once fixed) but not the CAPTURE CELL this pre-scan
+    // gates: MEASURED 4 bytes × 200 iterations left behind where the inline
+    // spelling `f: (int) -> string` was already clean. This is the THIRD
+    // spelling-level gate on the same decision and the reason a two-site fix
+    // would have shipped a half-closed leak. The #1921/#2248 exclusion is
+    // untouched — a bare `T` still resolves to `Kind::Named` at every
+    // instantiation and still cannot arm this.
+    if (!p.type || !resolvedFormalIsFunction(*p.type, ctx_)) return false;
     return true;
 }
 
@@ -32173,9 +32185,10 @@ namespace {
 // (scope end, not call end).
 //
 // Every clause fails closed (→ ESCAPE → leak): an unresolved or imported
-// callee, a non-generic callee, an argument or formal modifier, an async
-// callee, an unmappable named/positional argument, a formal that is not
-// exactly a method-own `U`, or a callee body with any non-invocation use.
+// callee, an argument or formal modifier, an async callee, an unmappable
+// named/positional argument, a formal that is neither a function-typed
+// declaration (arm (b), #5611) nor exactly a method-own `U` (arm (a), #5129),
+// or a callee body with any non-invocation use.
 inline bool closureArgBindsMethodOwnTypeParamBorrow(
         const sema::SemaContext& ctx, const ast::CallExpr& call,
         std::size_t ai) {
@@ -32188,7 +32201,7 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     // needs the AST. An imported callee is refused just above, so it
     // fails closed (ESCAPE → leak, never an early release).
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-    if (!md || md->genericParams.empty()) return false;
+    if (!md) return false;
     for (auto mod : md->modifiers)
         if (mod == "async") return false;
     // Map the argument to its formal (positional or named).
@@ -32205,6 +32218,39 @@ inline bool closureArgBindsMethodOwnTypeParamBorrow(
     if (pidx >= md->params.size()) return false;
     const ast::Param& p = md->params[pidx];
     if (!p.modifier.empty() || !p.type) return false;
+    // fix #5611 (§28.14 / §27.5 / §28.9, v0.334): arm (b) — a formal whose
+    // DECLARED type RESOLVES to a function type. This is the shape #5129's
+    // arm (a) below was the only admission for, and it is the shape the
+    // ISSUE'S OWN REPRO uses: `method Take(f: Show)` (or the inline
+    // `f: (int) -> string`) with `var f: Show := lambda …; p.Take(f);`. The
+    // callee body is empty, so it never invokes, stores, or forwards `f`;
+    // before this arm the walker classified the ARGUMENT as an escape, which
+    // withheld the local's scope-end `bz_closure_release` — and since an
+    // IdentifierExpr argument is not a `+1 producer`, lowerCallDispatch's
+    // call-bounded arm never released it either. The 48-byte cell then had NO
+    // releaser at all (MEASURED: 0 `bz_closure_release` sites in `main`
+    // against 2 on the same program without the pass).
+    //
+    // SOUNDNESS. `!p.modifier` is the load-bearing clause and it is not a
+    // codegen heuristic: §28.14 makes a function-typed parameter declared
+    // WITHOUT `scoped` call-bounded, and SEMA enforces that independent of
+    // codegen — `MethodOwnership`'s `fnTyped` enrolment test (Ownership.cpp:
+    // 473-480 / 1730-1737) resolves the declared type, so it covers BOTH the
+    // inline spelling and an alias (`type Show := (int) -> string`), and
+    // `callBoundedScan` then REJECTS any store of it. MEASURED: storing `f`
+    // into a field of `new Sub(f)` is a hard rejection under both spellings.
+    // `calleeBodyUsesFormalOnlyByInvocation` below is a second, independent
+    // fail-closed guard that does not consult sema at all.
+    if (resolvedFormalIsFunction(*p.type, ctx)) {
+        const sema::TypeRef* at0 = ctx.exprType(*a.value);
+        if (at0 && at0->kind == sema::TypeRef::Kind::Function &&
+            !at0->nullable && calleeBodyUsesFormalOnlyByInvocation(*md, p.name))
+            return true;
+        return false;
+    }
+    // arm (a) — narrow #5129: a bare METHOD-OWN generic `U` instantiated at
+    // this call site to a non-nullable function type.
+    if (md->genericParams.empty()) return false;
     if (p.type->kind != ast::TypeKind::Named || !p.type->name ||
         p.type->name->parts.size() != 1 || p.type->nullable)
         return false;

@@ -762,6 +762,41 @@ inline bool isLambdaExprBodyVoidBuiltin(const ast::LambdaExpr& lam) {
 bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
                                           std::string_view name);
 
+// fix #5611 (§28.14 / §28.9 / §8.6, v0.334): true when a PLAIN (no-modifier)
+// parameter's DECLARED type is a function type, however it is SPELLED.
+//
+// WHY IT IS ALIAS-TRANSPARENT, AND WHY THAT IS A RE-ALIGNMENT RATHER THAN A
+// WIDENING. The §28.14 call-bounded obligations are enforced by SEMA, in
+// `MethodOwnership`'s `fnTyped` test (Ownership.cpp:473-480 for a block body,
+// :1730-1737 for an expression body, Ownership_Checks.cpp:23627-23637 for a
+// lambda's own formals), which reads
+//
+//     (rt && rt->kind == sema::TypeRef::Kind::Function) ||
+//     (ps->declType && ps->declType->kind == ast::TypeKind::Function)
+//
+// where `rt = ctx.resolvedType(*ps->declType)`. `resolvedType` is
+// alias-transparent, so sema ALREADY classifies `method Take(f: Show)` with
+// `type Show := (int) -> string` as call-bounded and already rejects storing
+// it (`reportCallBounded` — MEASURED: `new Sub(f)` into a `Cb: Show` field is
+// a hard rejection under BOTH spellings). Codegen's two `formalIsFunction`
+// tests read only the AST spelling, so an alias reached `Named`, the
+// call-bounded release arm skipped the parameter, and the +1 closure producer
+// passed to it leaked — 48 bytes per call site (issue #5611's repro).
+//
+// The three consumers are the only sites that decide whether to release:
+// lowerCallDispatch's sync-iterator `#1864` arm, its call-bounded
+// `#1073`/`#5116` arm, and `isCallBoundedClosureArgPosition` (the capture-cell
+// pre-scan). Because the arm's soundness argument rests on the callee being
+// call-bounded, and sema decides call-boundedness with the RESOLVED type,
+// matching codegen to sema changes no program's verdicts — it only stops
+// codegen from leaking in a case sema had already proven safe.
+//
+// The bare `ast::TypeKind::Function` disjunct is kept because an inferred
+// (unannotated) formal has no resolved ref at all. Declared in Calls2.cpp next
+// to calleeBodyUsesFormalOnlyByInvocation.
+bool resolvedFormalIsFunction(const ast::Type& t,
+                              const sema::SemaContext& ctx);
+
 // Per-module emitter. Holds the LLVM context/module/builder and lowers the
 // checked AST. Grows one expression/statement kind per codegen slice.
 class Emitter {

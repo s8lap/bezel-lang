@@ -14507,7 +14507,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (pi >= mdIt->params.size()) continue;
                 const ast::Param& p = mdIt->params[pi];
                 if (!p.modifier.empty() || !p.type) continue;
-                bool formalIsFunction = p.type->kind == ast::TypeKind::Function;
+                // fix #5611 (§28.14 / §28.9, v0.334): `resolvedFormalIsFunction`
+                // is alias-transparent; the bare `p.type->kind == Function`
+                // spelling test that used to stand here saw an ALIAS TO a
+                // function type (`type Show := (int) -> string`) as Named and
+                // missed the release entirely. Both `formalIsFunction` sites in
+                // this file are the SAME decision (the #1864 sync-iterator arm
+                // and the #1073/#5116 call-bounded arm) and both are fixed;
+                // fixing one and not the other is the #5672 sibling trap. See
+                // the helper's own comment (LlvmBackend_impl.hpp) for why this
+                // RE-ALIGNS codegen with sema rather than widening it.
+                bool formalIsFunction = resolvedFormalIsFunction(*p.type, ctx_);
                 if (!formalIsFunction && p.type->kind == ast::TypeKind::Named &&
                     p.type->name && p.type->name->parts.size() == 1) {
                     std::string_view formalHead = p.type->name->parts.front();
@@ -14773,7 +14783,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // direction) whenever the Named head is not one of the
                 // callee's OWN `genericParams`, even if it verbatim matches an
                 // enclosing type's generic parameter of the same name.
-                bool formalIsFunction = p.type->kind == ast::TypeKind::Function;
+                // fix #5611 (§28.14 / §28.9, v0.334): `resolvedFormalIsFunction`
+                // is alias-transparent; the bare `p.type->kind == Function`
+                // spelling test that used to stand here saw an ALIAS TO a
+                // function type (`type Show := (int) -> string`) as Named and
+                // missed the release entirely. Both `formalIsFunction` sites in
+                // this file are the SAME decision (the #1864 sync-iterator arm
+                // and the #1073/#5116 call-bounded arm) and both are fixed;
+                // fixing one and not the other is the #5672 sibling trap. See
+                // the helper's own comment (LlvmBackend_impl.hpp) for why this
+                // RE-ALIGNS codegen with sema rather than widening it.
+                bool formalIsFunction = resolvedFormalIsFunction(*p.type, ctx_);
                 if (!formalIsFunction && p.type->kind == ast::TypeKind::Named &&
                     p.type->name && p.type->name->parts.size() == 1) {
                     std::string_view formalHead = p.type->name->parts.front();
@@ -16200,6 +16220,17 @@ struct FormalInvocationOnlyWalk {
     }
 };
 }  // namespace
+
+// fix #5611 (§28.14 / §28.9 / §8.6, v0.334) — see the declaration's comment in
+// LlvmBackend_impl.hpp for the full argument. The one-line shape: the AST
+// spelling test first, then the alias-transparent resolved test that SEMA's own
+// `fnTyped` uses, so codegen and sema agree on which parameters are call-bounded.
+bool resolvedFormalIsFunction(const ast::Type& t,
+                              const sema::SemaContext& ctx) {
+    if (t.kind == ast::TypeKind::Function) return true;
+    const sema::TypeRef* rt = ctx.resolvedType(t);
+    return rt && rt->kind == sema::TypeRef::Kind::Function;
+}
 
 bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
                                           std::string_view name) {
