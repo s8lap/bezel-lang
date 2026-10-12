@@ -14965,7 +14965,9 @@ void ExprTC::checkCallArity(
             explicitSubst);
         return;
     }
-    if (!md || !ms->parent) return;
+    if (!md || !ms->parent) {
+        return;
+    }
     // §22.3 (#1756): pass the call's receiver as classTarget (and ms->parent as
     // classParent) so checkArgsAgainstParams's ref/out exact-type check can run
     // substituteMemberType on the parameter referent type. Without this, a
@@ -15024,6 +15026,22 @@ void ExprTC::checkCallArity(
                                    recvTarget, ms->parent, md, /*extBinding=*/nullptr,
                                    explicitSubst);
         else if (md->genericParams.empty()) {
+            // fix #5684 (§5.1 / §14.1, v0.313): overload resolution validated
+            // the call by applicability (arity, named args), but checkAssignable
+            // was never called — for a non-generic single-overload call that
+            // binds successfully, this block returned without type-checking the
+            // arguments against the parameter types. An InlineArray argument at
+            // a primitive parameter (e.g. `d.Put(arr)` where `arr: [2]Item` and
+            // `Put(x: int)`) compiled clean through sema and reached codegen
+            // as malformed IR ("Call parameter type does not match function
+            // signature!" + LLVM verifier failure). The #5208 block below checks
+            // method reference arguments; call checkArgsAgainstParams first to
+            // check ALL arguments.
+            checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
+                                  std::string("call to `") +
+                                      std::string(ms->name) + "`",
+                                  recvTarget, ms->parent, md,
+                                  /*extBinding=*/nullptr, explicitSubst);
             // fix #5208 (§27.6, v0.313): overload resolution validated the
             // call by applicability, never through checkAssignable, so a
             // method reference bound to a function-typed parameter of the
@@ -18107,7 +18125,8 @@ void ExprTC::checkArgsAgainstParams(
             checkCollectionLiteralElementAssignability(
                 *cl, paramTy, &calleeFreeParamNames);
         }
-        checkAssignable(ctx_.exprType(*a.value),
+        TypeRef* argTy_ = ctx_.exprType(*a.value);
+        checkAssignable(argTy_,
                         paramTy,
                         a.value->span.begin,
                         std::string("argument `") + std::string(p.name) +

@@ -5381,6 +5381,79 @@ void ExprTC::checkAssignable(
         // Function-typed target, OR Object? → non-nullable reference:
         // fall through to the downstream blocks.
     }
+    // fix #5684 (§5.1 / §8.6, v0.313): an inline array SOURCE has no implicit
+    // conversion to a VALUE-typed target (primitive, record, enum, choice, inline
+    // array). §8.6: "an inline array of any form" lists exactly four convertible
+    // targets — Object (boxing), a record, an enum, and another inline array —
+    // and §5.1's primitive-widening table has no row for InlineArray. The `Object`
+    // source arm above rejects Object→value-type (including InlineArray target);
+    // this is the symmetric InlineArray source rejection. Without it,
+    // `d.Put(arr)` where `arr: [2]Item` and `Put(x: int)` compiled clean through
+    // sema and reached codegen as malformed IR ("Call parameter type does not
+    // match function signature!" + LLVM verifier failure).
+    if (from->kind == TypeRef::Kind::InlineArray) {
+        // Identity conversion: InlineArray → same InlineArray (same size, element
+        // type, and ownership) is always allowed. Check this BEFORE the value-type
+        // rejection below so `[3]int := default([3]int)` is admitted.
+        if (to->kind == TypeRef::Kind::InlineArray &&
+            from->arraySizeValue == to->arraySizeValue &&
+            from->arrayOwned == to->arrayOwned &&
+            from->nullable == to->nullable) {
+            // Check element type equality
+            const TypeRef* fromEl = from->arrayElement;
+            const TypeRef* toEl = to->arrayElement;
+            bool sameElement = false;
+            if (!fromEl && !toEl) {
+                sameElement = true;
+            } else if (fromEl && toEl) {
+                if (fromEl->kind == toEl->kind) {
+                    if (fromEl->kind == TypeRef::Kind::Primitive)
+                        sameElement = fromEl->primitive == toEl->primitive;
+                    else if (fromEl->kind == TypeRef::Kind::Named &&
+                             fromEl->declaration && toEl->declaration)
+                        sameElement = fromEl->declaration == toEl->declaration;
+                }
+            }
+            if (sameElement) return;  // identity: allow
+        }
+        bool toIsValuePrimitive =
+            to->kind == TypeRef::Kind::Primitive &&
+            to->primitive != PrimitiveType::Object &&
+            to->primitive != PrimitiveType::String;
+        bool toIsValueBuiltinNamed =
+            to->kind == TypeRef::Kind::Named &&
+            isValueBuiltinByName(to->headName());
+        bool toIsValueRecordEnumOrChoice =
+            to->kind == TypeRef::Kind::Named && to->declaration &&
+            (to->declaration->kind == ast::TypeDeclKind::Record ||
+             to->declaration->kind == ast::TypeDeclKind::Enum ||
+             to->declaration->kind == ast::TypeDeclKind::Choice);
+        if (toIsValuePrimitive || toIsValueBuiltinNamed ||
+            toIsValueRecordEnumOrChoice) {
+            if (from->nullable && to->nullable) {
+                return;  // `null → T?` — legitimate §5.1 nullable path.
+            }
+            if (from->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("the ") + what +
+                    " is nullable but the target type is non-nullable (§7)");
+                return;
+            }
+            std::string fromName = spellMoveOnlySource(from);
+            std::string toName =
+                to->kind == TypeRef::Kind::Primitive
+                    ? std::string("a primitive value type")
+                    : std::string("a value type");
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what +
+                " has type `" + fromName +
+                "`, which has no implicit conversion to " + toName +
+                " (§5.1, §8.6)");
+            return;
+        }
+    }
     auto reportNullable = [&] {
         ctx_.diagnostics().report(
             Severity::Error, loc,
