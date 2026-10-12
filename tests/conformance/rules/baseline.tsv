@@ -1774,10 +1774,10 @@ s32_8_0005	fail	#4561
 s32_8_0006	fail	#4561
 s32_8_0007	pass	
 s32_9_0001	fail	divergence
-s32_11_0001	fail	#4561
-s32_11_0002	fail	#4561
-s32_11_0003	fail	#4561
-s32_11_0004	fail	#4561
+s32_11_0001	pass	
+s32_11_0002	pass	
+s32_11_0003	pass	
+s32_11_0004	pass	
 s32_11_0005	pass	
 s32_12_0001	fail	divergence
 s32_12_0002	pass	
@@ -2113,6 +2113,8 @@ l4_14_0011	pass
 l4_14_0012	pass	
 l4_14_0013	pass	
 l4_14_0015	pass	
+l4_14_0016	pass	
+l4_14_0017	pass	
 l4_15_0001	pass	
 l4_15_0002	pass	
 l4_15_0003	pass	
@@ -2309,5 +2311,3 @@ l10_5_0002	fail	divergence
 l10_5_0003	pass	
 l10_6_0001	fail	divergence
 l10_6_0002	pass	
-l4_14_0016	pass	
-l4_14_0017	pass	
