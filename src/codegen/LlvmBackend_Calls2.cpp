@@ -7906,7 +7906,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             ++llvmIdx;
             ++idx;
         }
-        if (args.size() != it->second->arg_size()) {
+        // §32.11 (v0.333): a `variadic(N)` extern declares only the first N
+        // parameters as FIXED slots of the emitted C signature — "the remaining
+        // declared parameters pass in the symbol's variadic slots". So for a
+        // variadic callee the call legitimately carries MORE arguments than the
+        // LLVM function type's fixed parameter count, and the old `!=` check
+        // rejected exactly that shape (returning nullptr, which the #2434
+        // backstop turns into a silent zero — measured, #5687). A non-variadic
+        // callee still requires an exact match.
+        llvm::FunctionType* calleeTy = it->second->getFunctionType();
+        const bool calleeVararg = calleeTy->isVarArg();
+        const std::size_t fixedParams = calleeTy->getNumParams();
+        const bool arityOk = calleeVararg ? (args.size() >= fixedParams)
+                                          : (args.size() == fixedParams);
+        if (!arityOk) {
             emitAccessorRefArgWriteBacks(externRefArgs, /*emit=*/false);
             return nullptr;
         }

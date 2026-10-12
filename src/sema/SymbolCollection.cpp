@@ -721,6 +721,21 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
             // byte, sbyte, short, ushort, string, char, decimal, and non-scalar
             // records. Diagnostics cite the parameter and the promoted type.
             if (d.variadicN != UINT32_MAX) {
+                // §32.11: "`N` ≤ the declared arity." A `variadic(N)` naming
+                // more fixed parameters than the declaration has is not a
+                // spelling of anything; it used to fall out of the loop below
+                // vacuously and reach codegen as "every parameter is
+                // variadic", i.e. a silent acceptance of a value the source
+                // never spelled.
+                if (d.variadicN > d.params.size()) {
+                    ctx.diagnostics().report(
+                        Severity::Error, d.loc,
+                        "variadic(" + std::to_string(d.variadicN) +
+                            ") names more fixed parameters than the "
+                            "declaration has (" +
+                            std::to_string(d.params.size()) +
+                            "); §32.11 requires N ≤ the declared arity");
+                }
                 for (std::size_t i = d.variadicN; i < d.params.size(); ++i) {
                     const auto& p = d.params[i];
                     if (!p.type) continue;

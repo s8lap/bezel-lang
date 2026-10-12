@@ -853,7 +853,19 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
                     diagnostics_.report(Severity::Error, current_.location,
                                       "expected symbol name string literal");
                 } else {
-                    decl.symbolAlias = current_.text;
+                    // §32.11: the clause names a LINKER symbol, so the lexeme's
+                    // surrounding quotes are syntax, not part of the name. The
+                    // lexer's StringLiteral text retains them (§18.4), and an
+                    // alias carrying them emits an LLVM symbol literally spelled
+                    // `"open"` — which no shared object defines, so every aliased
+                    // extern fails at link with `undefined reference to `"open"'`.
+                    // Same strip the SerializedName rule above applies.
+                    std::string_view txt = current_.text;
+                    if (txt.size() >= 2 && txt.front() == '"' && txt.back() == '"') {
+                        decl.symbolAlias = txt.substr(1, txt.size() - 2);
+                    } else {
+                        decl.symbolAlias = txt;
+                    }
                     advance();
                 }
                 // variadic(N)? — `variadic` is also contextual (App. B.2).

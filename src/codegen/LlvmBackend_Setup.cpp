@@ -173,7 +173,28 @@ void Emitter::declareExterns() {
                                     ? lowerType(ed->returnType.get())
                                     : llvm::Type::getVoidTy(llvm_);
             std::vector<llvm::Type*> paramTys;
-            for (const auto& p : ed->params) {
+            // §32.11 (v0.333): `variadic(N)` declares "the named symbol is a
+            // C-variadic function whose fixed parameters are the first N
+            // declared parameters; the remaining declared parameters pass in
+            // the symbol's variadic slots". So only the first N declared
+            // parameters become FIXED slots of the emitted signature; the rest
+            // are passed as varargs and are not declared at all.
+            //
+            // Declaring ALL declared parameters fixed was wrong twice over:
+            //  - it misstates the symbol's signature (§32.11's own model), and
+            //  - it made two declarations binding ONE symbol but of different
+            //    arity (spec: "Several declarations, of any mix of shapes, may
+            //    bind one symbol") produce DIFFERENT LLVM function types. The
+            //    second reused the first via getFunction() below, and the call
+            //    site's arity check then failed — degrading the call to a
+            //    silent `store i32 0` (measured, #5687).
+            // Keyed on the Bezel parameter index, not the slot index: a
+            // `RawBytes` or by-ref parameter in a FIXED position still occupies
+            // two slots / a pointer slot respectively.
+            const uint32_t varargN = xd->variadicN;  // UINT32_MAX = not variadic
+            for (std::size_t pi = 0; pi < ed->params.size(); ++pi) {
+                if (varargN != UINT32_MAX && pi >= varargN) break;
+                const auto& p = ed->params[pi];
                 // per §32.5 *Boundary `out` and `ref`* (v0.306): "`ref p: T` —
                 // C sees `T*`, receiving the **address of the caller's
                 // storage**"; `out p: T` is "same address passing". The slot's
