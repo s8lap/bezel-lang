@@ -12397,6 +12397,27 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
                         if (!hasMod(ps->modifiers, "static")) return nullptr;
                     }
                 }
+                // fix #XXXX (§22.5, v0.334): a default-value expression may not
+                // reference instance state — the default belongs to the method's
+                // signature, not to a particular receiver's frame. Record the hit
+                // and report after visitExpr returns (the symbol is still returned
+                // to avoid cascading "unresolved identifier" errors).
+                if (inDefaultValueExpr_) {
+                    auto hasMod = [](const std::vector<std::string_view>& mods,
+                                     std::string_view mod) {
+                        for (auto x : mods) if (x == mod) return true;
+                        return false;
+                    };
+                    bool isStatic = false;
+                    if (auto* fs = dynamic_cast<FieldSymbol*>(m))
+                        isStatic = hasMod(fs->modifiers, "static");
+                    else if (auto* ps = dynamic_cast<PropertySymbol*>(m))
+                        isStatic = hasMod(ps->modifiers, "static");
+                    else if (auto* ms = dynamic_cast<MethodSymbol*>(m))
+                        isStatic = hasMod(ms->modifiers, "static");
+                    if (!isStatic)
+                        defaultValueInstanceStateRef_ = std::string(name);
+                }
                 return m;
             }
         }
@@ -12456,6 +12477,12 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
                     if (!hasMod(ps->modifiers, "static")) return nullptr;
                 }
             }
+            // fix #XXXX (§22.5, v0.334): a default-value expression may not
+            // reference instance state — the default belongs to the method's
+            // signature, not to a particular receiver's frame. Record the hit
+            // and report after visitExpr returns (the symbol is still returned
+            // to avoid cascading "unresolved identifier" errors).
+
             return m;
         }
     }
@@ -16930,7 +16957,24 @@ void ExprTC::runMethodBody(
             }
         }
         forwardParamRef_.clear();
+        bool saveDefault = inDefaultValueExpr_;
+        inDefaultValueExpr_ = true;
+        defaultValueInstanceStateRef_.clear();
         visitExpr(*params[i].defaultValue);
+        inDefaultValueExpr_ = saveDefault;
+        // fix #XXXX (§22.5, v0.334): a default-value expression may not
+        // reference instance state — instance fields, instance properties.
+        // `lookupName` records the name hit in `defaultValueInstanceStateRef_`.
+        if (!defaultValueInstanceStateRef_.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, params[i].defaultValue->span.begin,
+                "a default-value expression may not reference instance state "
+                "(`" +
+                defaultValueInstanceStateRef_ +
+                "` is an instance member) — the default belongs to the "
+                "method's signature, not to a particular receiver's frame "
+                "(§22.5)");
+        }
         // fix #4332 (§15.4, v0.298): a default-parameter-value collection
         // literal is one of §17.7's written-declared-type positions, but
         // unlike the new() shorthand (which #4208 wired), this one was never

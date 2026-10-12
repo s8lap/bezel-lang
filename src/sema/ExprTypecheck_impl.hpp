@@ -553,6 +553,15 @@ private:
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.
     bool inStaticMember_ = false;
+    // fix #XXXX (§22.5, v0.334): true while visiting a default-value
+    // expression. `lookupName` checks this to reject instance state
+    // (instance fields, instance properties) in defaults — a default
+    // belongs to the method's signature, not to a receiver's frame.
+    bool inDefaultValueExpr_ = false;
+    // fix #XXXX (§22.5, v0.334): set by `lookupName` when an instance member
+    // is resolved inside a default-value expression. Checked and reported in
+    // `visitMethodParams` after `visitExpr` returns.
+    std::string defaultValueInstanceStateRef_;
     // §5 / issue #184: when a LocalDecl has an explicit wider integer type
     // (long, ulong, uint) and the initializer is an unsuffixed int literal
     // that overflows int, widen it to the declared type instead of erroring.
