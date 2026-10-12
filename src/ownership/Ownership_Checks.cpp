@@ -6715,7 +6715,46 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
     // IdentifierExpr) are unaffected, since neither is a ParameterSymbol.
     if (reportIfParameterRoot(projRoot, e.span.begin, /*spanForm=*/true))
         return;
-    reportIfScopeBoundOwned(projRoot, e.span.begin, /*spanForm=*/true);
+    if (reportIfScopeBoundOwned(projRoot, e.span.begin, /*spanForm=*/true))
+        return;
+    // fix #5847 (§9.7, v0.334): the THIRD kind of root — a borrow-bearing
+    // HOLDER the span was stored into. The two checks above classify the root
+    // by what the root ITSELF is: a method parameter (#4428) or a tracked owned
+    // local (a scope-bound `using var` / owned local, whose own dispose is the
+    // problem). A third kind matched neither — a local whose value is a
+    // borrow-bearing HOLDER (`var spans: Array<Span<byte>> := []`), which is
+    // itself neither Owned nor a parameter, yet the span read out of it carries
+    // whatever the stores into `spans` contributed. Both checks fall through and
+    // the projection is admitted, though the span's real source is disposed at
+    // this frame's scope end — a use-after-free, not a warning gap. Measured
+    // false ACCEPT (#5847): `spans.Add(buf.AsSpan()); return spans[0];` compiled
+    // clean and the runtime SEGV'd in memcpy on the freed buffer.
+    //
+    // §9.7's own model resolves this: a value held at a named location "is read
+    // with **one source set** … a member store … adds the sources of the borrows
+    // `e` carries to that set, never removing one" (spec §9.7, v0.334). The set
+    // is what the RETURN of a span out of that location must be judged against,
+    // so consult it here — exactly as checkArg's (b) transitivity arm and
+    // checkIndirectEscapeOnReturn already do for their roots. The set itself is
+    // populated by collectCollectionBorrowStoreSource from the §28.11 store
+    // sinks; nothing new is computed here.
+    //
+    // The escape-boundness test lives inside carriedEscapeBoundSourceLiveAt, and
+    // that is what keeps this a fix rather than a narrowing: a span stored from a
+    // PARAMETER (`View(buf: OwningBuffer<byte>)`, byte-identical to the repro
+    // but for the source's lifetime) records the same set, but
+    // `isEscapeBoundLocal` is false for a parameter — the caller supplied it and
+    // it outlives this frame — so nothing is reported and that row stays
+    // admitted. The receiver-sourced (`this`-rooted) and static-storage-sourced
+    // arms are unaffected for the same reason: neither `this` nor a static field
+    // is escape-bound. // per §9.7, §28.11, §4.14, §4.15
+    if (projRoot) {
+        if (sema::Symbol* carried = carriedEscapeBoundSourceLiveAt(
+                ctx_.exprSymbol(*projRoot), projRoot->span.begin.offset)) {
+            reportCarriedSource(carried, e.span.begin, /*spanForm=*/true);
+            return;
+        }
+    }
 }
 
 bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
@@ -13252,6 +13291,11 @@ void MethodOwnership::collectBorrowUses(
 void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
         if (as->value) recordBorrowUseExpr(*as->value);
+        // fix #5847 (§9.7, v0.334): the indexer-set sink
+        // (`spans[0] := buf.AsSpan();`) contributes to its collection local's
+        // one source set. Runs BEFORE the plain-rebind arm below so the
+        // entry is in place for every later read of the holder.
+        collectCollectionBorrowStoreSource(s);
         if (as->target) {
             // A bare-identifier target of a plain `:=` is a pure WRITE (rebind),
             // not a read, so it must not count as a use of the holder — it would
@@ -13339,6 +13383,10 @@ void MethodOwnership::collectBorrowUsesStmt(const ast::Stmt& s) {
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr) recordBorrowUseExpr(*es->expr);
+        // fix #5847 (§9.7, v0.334): the storing-CALL sink
+        // (`spans.Add(buf.AsSpan());`) contributes to its collection local's
+        // one source set.
+        collectCollectionBorrowStoreSource(s);
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
@@ -13521,6 +13569,131 @@ void MethodOwnership::collectRecordBorrowSource(const ast::Node& ld) {
     // straight-line reassignment retires it.
     const std::uint32_t from = init->span.begin.offset;
     std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[lsym];
+    for (const sema::Symbol* src : srcs)
+        entries.push_back({src, from, UINT32_MAX});
+}
+
+// fix #5847 (§9.7, v0.334): record the source set a BORROWING-COLLECTION local
+// accumulates from the §28.11 stores into it, so the return-site §9.7 checks can
+// read what a value held at that location carries.
+//
+// §9.7's model is "one source set" per named location — "a whole-value
+// assignment gives the location the assigned value's set, and a member store …
+// adds the sources of the borrows `e` carries to that set, **never removing
+// one**" (spec §9.7, v0.334). §28.11's collection store is the element-wise
+// analogue of that member store: `spans.Add(buf.AsSpan())` puts a borrow of
+// `buf` INTO the location `spans`, so `spans` thereafter reads with a source set
+// containing `buf`.
+//
+// Measured false ACCEPT (#5847): `var spans: Array<Span<byte>> := [];
+// using var buf := new OwningBuffer<byte>(16); spans.Add(buf.AsSpan());
+// return spans[0];` compiled clean and the runtime read a freed buffer
+// (rc=0 at compile, SEGV / ASan SEGV on address 0xd in memcpy at run time,
+// reproduced 156/156 plain runs). The root cause is that
+// collectRecordBorrowSource — the ONLY writer of the source set — fires solely
+// from a LocalDecl / LocalConstDecl whose OWN type is a borrow-bearing record /
+// span / choice. A collection local's own type (`Array<Span<byte>>`) is none of
+// those, so the set stayed EMPTY and carriedEscapeBoundSourceLiveAt found
+// nothing through it. The return-site projection branch
+// (checkRecordBorrowEscapesOnReturn) then rooted the returned expression at
+// `spans` and asked only whether that root was a method parameter (#4428) or a
+// tracked owned local — a THIRD kind of local, a borrow-bearing holder, matched
+// neither and the escape was admitted.
+//
+// This is the missing WRITER, not a new check: with the set populated, the
+// existing resolution (carriedEscapeBoundSourceLiveAt) and the existing
+// return-site arms consume it unchanged. Deliberately conservative in three
+// directions:
+//
+//  (a) Only a LOCAL receiver records. An escaping receiver (a field, a
+//      parameter, or a chain reachable through one) is rejected at the store
+//      site outright by checkCollectionBorrowStoreEscape's Escapes leg, so an
+//      entry for it would be describing a program that does not compile.
+//  (b) Only a borrow-bearing ELEMENT contributes a source. §28.11's element
+//      slot policy copies a value-typed / string / runtime-managed element, and
+//      such a copy carries no borrow — recording its root would manufacture a
+//      freeze and a rejection out of nothing.
+//  (c) The stored expression is peeled exactly as collectRecordBorrowRoots
+//      peels a LocalDecl initializer (the same identifierRoot walk, the same
+//      TypeSymbol skip), so a `spans.Add(buf.AsSpan())` contributes `buf` and a
+//      `spans.Add(p.AsSpan())` over a parameter contributes `p` — which
+//      carriedEscapeBoundSourceLiveAt then correctly declines to treat as
+//      escape-bound, keeping the parameter control admitted. That asymmetry IS
+//      the differential control: the source is recorded either way, and only
+//      the escape-boundness test at the consumer distinguishes them. // per
+//      §9.7, §28.11, §28.3, §4.14, §4.15
+void MethodOwnership::collectCollectionBorrowStoreSource(const ast::Node& stmt) {
+    // The stored expression and the store's target, from either §28.11 sink:
+    // the storing-method CALL (`spans.Add(e)`) or the indexer-set
+    // (`spans[0] := e`).
+    const ast::Expr* stored = nullptr;
+    const ast::Expr* receiver = nullptr;
+    if (const auto* as = dynamic_cast<const ast::AssignmentStmt*>(&stmt)) {
+        if (as->op != ":=" || !as->value) return;
+        const auto* ix = dynamic_cast<const ast::IndexExpr*>(as->target.get());
+        if (!ix) return;
+        // An owning-collection / inline-array slot is an ownership TRANSFER
+        // (§28.11's element slot policy: indexer-set takes `owned`), not a
+        // borrow store — it carries no borrow to add to any source set. Same
+        // exclusion checkIndexerSetBorrowStoreEscape makes.
+        if (indexerSetterTakesOwned(*as->target) ||
+            targetIsOwningInlineArraySlot(*as->target))
+            return;
+        stored = as->value.get();
+        receiver = ix->target.get();
+    } else if (const auto* es =
+                   dynamic_cast<const ast::ExpressionStmt*>(&stmt)) {
+        if (!es->expr) return;
+        const auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
+        if (!call || !call->callee) return;
+        const auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+        if (!ma || !ma->target) return;
+        // The §28.11 storing-method whitelist, identical to
+        // checkCollectionBorrowStoreEscape's. `AddRange` is excluded: it takes a
+        // COLLECTION (bulk store), not a single borrow-bearing element, and its
+        // elements are copies rather than borrows of the argument's own storage.
+        const std::string_view m = ma->member;
+        if (m != "Add" && m != "Insert" && m != "TryAdd" &&
+            m != "AddFirst" && m != "AddLast" && m != "AddBefore" &&
+            m != "AddAfter" && m != "Push" && m != "Enqueue")
+            return;
+        if (call->args.empty() || !call->args[0].value) return;
+        stored = call->args[0].value.get();
+        receiver = ma->target.get();
+    } else {
+        return;
+    }
+    // Only a LOCAL borrowing-family collection carries a source set here; see
+    // (a) above. The head test mirrors checkCollectionBorrowStoreEscape's
+    // `!declaration` builtin-collection resolution — a user type has its own
+    // §28.14 formals, not this rule.
+    const auto* rid = dynamic_cast<const ast::IdentifierExpr*>(receiver);
+    if (!rid) return;
+    sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+    auto* rlsym = dynamic_cast<sema::LocalSymbol*>(rsym);
+    if (!rlsym) return;
+    const sema::TypeRef* tt = ctx_.exprType(*receiver);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return;
+    const std::string_view cn = tt->headName();
+    if (cn != "Array" && cn != "Dictionary" && cn != "SortedDictionary" &&
+        cn != "Set" && cn != "SortedSet" && cn != "Stack" && cn != "Queue" &&
+        cn != "LinkedList")
+        return;
+    // (b) above: a non-borrow-bearing element carries no borrow.
+    const sema::TypeRef* et = tt->genericArgs.empty() ? nullptr
+                                                      : tt->genericArgs[0];
+    if (!isBorrowBearingRecordOrSpan(et) && !isBorrowBearingChoice(et)) return;
+    std::vector<const sema::Symbol*> srcs;
+    collectRecordBorrowRoots(*stored, rlsym, srcs);
+    if (srcs.empty()) return;
+    // §9.7: the store ADDS to the location's one source set, "never removing
+    // one" — so unlike a plain rebind (which retires the old window, #1741) an
+    // element store only ever appends, and the window opens at the store and
+    // stays open. §9.7, v0.334.
+    const std::uint32_t from = stored->span.begin.offset;
+    std::vector<RecordBorrowSource>& entries = recordBorrowLocalSource_[rlsym];
     for (const sema::Symbol* src : srcs)
         entries.push_back({src, from, UINT32_MAX});
 }

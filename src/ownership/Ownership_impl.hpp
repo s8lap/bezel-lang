@@ -3114,6 +3114,20 @@ private:
     // bare-type-parameter call result is §21.1-admissible and carries the same
     // union borrow a `var` does.
     void collectBareTypeParamCallBorrowSource(const ast::Node& ld);
+    // fix #5847 (§9.7, v0.334): the §9.7 "one source set per named location"
+    // model, applied to a BORROWING-COLLECTION holder — the sibling of
+    // collectRecordBorrowSource for the case where the borrow-bearing value is
+    // stored INTO the location rather than bound to it as the location's own
+    // value. A statement `spans.Add(buf.AsSpan());` (§28.11's storing-call
+    // sink) or `spans[0] := buf.AsSpan();` (§28.11's indexer-set sink) adds
+    // the sources the stored expression carries to `spans`'s one source set,
+    // never removing one (§9.7's member-store clause, which the collection
+    // store is the element-wise analogue of). Called from the same freeze
+    // pre-pass, so the set is populated before any return-site check reads it.
+    // Records only into a LOCAL borrowing-family collection; an escaping
+    // receiver (field / parameter) is rejected at the store site outright by
+    // checkCollectionBorrowStoreEscape, so it needs no provenance entry.
+    void collectCollectionBorrowStoreSource(const ast::Node& stmt);
     // §28.3 (#1741): re-collect the carried source of a borrow-bearing-record /
     // span local `s` when it is REASSIGNED (`s := <producer>;`) at source offset
     // `reassignOffset`. The old source windows are closed at that offset and the
