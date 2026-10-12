@@ -63,16 +63,6 @@ constexpr const char* kR =
     "class R public N: int; "
     "  public constructor(n: int) N := n; end constructor; end R; ";
 
-// Was this JitResult a SKIP (toolchain unavailable) rather than a real failure?
-// A SKIP is reported via ran=false with a diagnostic containing "SKIP" — the
-// same file-local helper the other runAotChecked call sites carry.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // True when the compile was rejected AND the rejection is §8.6's move-only one,
 // naming the offending type — not some unrelated downstream error, and not the
 // LLVM verifier abort two of these positions produced before the fix.
@@ -280,7 +270,6 @@ BEZEL_TEST(sema_move_only_cannot_be_boxed_2912,
         "  var own: [2 owned]R := [new R(20), new R(22)]; "
         "  return own[0].N + own[1].N; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
