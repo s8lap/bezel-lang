@@ -4485,9 +4485,12 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         }
         ref.kind = TypeRef::Kind::Named;
         ref.declaration = tsym;
-        // Generic-arity check.
-        if (!t.genericArgs.empty() &&
-            t.genericArgs.size() != tsym->genericParams.size()) {
+        // Generic-arity check (§14.1 / §2.8.3 / Appendix C.1): every type reference
+        // supplies exactly the declared number of type arguments.  A bare reference
+        // to a generic type (arity 0) must be rejected just as a wrong-arity
+        // reference is; the first conjunct (`!t.genericArgs.empty()`) suppressed
+        // precisely the bare-reference case that §14.1 makes an error.
+        if (t.genericArgs.size() != tsym->genericParams.size()) {
             // fix #5172 (§2.2, v0.310): if the type's bare name has a
             // matching builtin arity in `builtinTypeArity` (a §2.3
             // always-available candidate the local non-generic declaration
