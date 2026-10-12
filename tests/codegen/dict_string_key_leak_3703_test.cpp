@@ -117,15 +117,6 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — mirrors dict_family_tryadd_3372_test.cpp / box_inline_array_2804.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 std::string prog(const std::string& mainBody) {
     return "module M; class C public static method Main(): int " + mainBody +
            " end Main; end C;";
@@ -170,7 +161,6 @@ BEZEL_TEST(dict_string_key_leak_3703, indexer_set_and_get_built_key_leak_free_4_
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText,
                     "total=" + std::to_string(200 * (10 + 20)) + "\n");
@@ -198,7 +188,6 @@ BEZEL_TEST(dict_string_key_leak_3703, add_and_tryadd_both_edges_built_key_leak_f
         "end; "
         "return int(okAdd = 200) * 4 + int(okInsert = 200) * 2 + "
         "       int(okDup = 200); "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -223,7 +212,6 @@ BEZEL_TEST(dict_string_key_leak_3703, contains_remove_and_in_operator_built_key_
         // later, "z{i}" are ever present); Remove($"z{i}") correctly HITS. So
         // hits must land at exactly 200 (one per iteration, from Remove alone).
         "return int(hits <> 200); "));  // 0 on the expected outcome
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -253,7 +241,6 @@ BEZEL_TEST(dict_string_key_leak_3703, trygetvalue_and_getornull_built_key_sum_an
         "end; "
         "Console.WriteLine($\"sum={sum}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int i = 0; i < 200; ++i) expected += 2 * i;  // TryGetValue hit + GetOrNull hit
@@ -285,7 +272,6 @@ BEZEL_TEST(dict_string_key_leak_3703, getoradd_owning_built_key_leak_free_4_9) {
         "  i := i + 1; "
         "end; "
         "return R._n; "));  // every MISS-path R is disposed at scope end
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 200);
 }
@@ -312,7 +298,6 @@ BEZEL_TEST(dict_string_key_leak_3703, popvalue_and_trypopvalue_owning_built_key_
         "end; "
         "Console.WriteLine($\"sum={sum}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int i = 0; i < 200; ++i) expected += i + (i + 1);
@@ -335,7 +320,6 @@ BEZEL_TEST(dict_string_key_leak_3703, dict_literal_built_key_leak_free_15_4) {
         "  m := m + 1; "
         "end; "
         "return int(total = 199 * 200 / 2); "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -374,7 +358,6 @@ BEZEL_TEST(dict_string_key_leak_3703, reused_key_local_not_prematurely_released_
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // "shared" + digits(j): 7 chars for j in [0,9], 8 for [10,99], 9 for [100,199].
     int expected = 0;
@@ -407,7 +390,6 @@ BEZEL_TEST(dict_string_key_leak_3703, move_found_key_built_key_leak_free_4_9) {
         "end; "
         "Console.WriteLine($\"sum={sum}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int i = 0; i < 200; ++i) expected += i;
@@ -439,7 +421,6 @@ BEZEL_TEST(dict_string_key_leak_3703, move_absent_key_throw_path_built_key_leak_
         "  i := i + 1; "
         "end; "
         "return caught; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 200);
 }
@@ -464,7 +445,6 @@ BEZEL_TEST(dict_string_key_leak_3703, add_duplicate_key_throw_path_borrowing_bui
         "  i := i + 1; "
         "end; "
         "return int(caught = 200); "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -488,7 +468,6 @@ BEZEL_TEST(dict_string_key_leak_3703, add_duplicate_key_throw_path_owning_built_
         "  i := i + 1; "
         "end; "
         "return int(caught = 200); "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }

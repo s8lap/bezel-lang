@@ -47,14 +47,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // A `Cell` whose live count is the exactly-once disposal oracle.
 const char* kCountedCell =
     "class Cell "
@@ -88,7 +80,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, virtual_on_plain_generic_class_sp
         "  using var s := new GBase<string>(); "
         "  return s.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);
 }
@@ -118,7 +109,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, override_on_generic_derived_spec_
         "  using var d := new DGen<string>(); "
         "  return d.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 49);
@@ -153,7 +143,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, dynamic_dispatch_through_generic_
         "  var g: GBase<string> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 149);
@@ -191,7 +180,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, three_level_renamed_params_spec_1
         "  using var x := new L1<string>(); "
         "  return x.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 13 + 11 + 7 + 3 + 3 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -220,7 +208,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, virtual_writes_inherited_field_sp
         "  b.Bump(5); "
         "  return b.Read(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 46 + 4
     BEZEL_EXPECT_EQ(r.exitCode, 50);
@@ -253,7 +240,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, permuted_parameters_via_base_spec
         "  var g: B2<string, int> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 149);
@@ -281,7 +267,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, several_instantiations_spec_14_2)
         "  using var d := new GBase<double>(); "
         "  return s.Show() + l.Show() + i.Show() + d.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 4 * 44
     BEZEL_EXPECT_EQ(r.exitCode, 176);
@@ -317,7 +302,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, exactly_once_disposal_loop_spec_2
         "  end; "
         "  return (acc - 564) + Cell.live * 100 + (Cell.made - 24); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // per iteration 41 + 3 + 3 = 47; 12 iterations = 564; 24 cells, 0 live.
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -356,7 +340,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, non_generic_subclass_via_generic_
         "  var g: GBase<string> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 149);
 }
@@ -382,7 +365,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, generic_subclass_without_override
         "  var g: GBase<string> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);
 }
@@ -425,7 +407,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, control_int_arg_and_non_generic_p
         "  end; "
         "  return n - 151; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 44 + 107
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -450,7 +431,6 @@ BEZEL_TEST(generic_virtual_erased_layout_2896, control_method_level_generic_virt
         "  var b: Base := d; "
         "  return b.Echo(7).Length + b.Echo(\"ab\").Length; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // "d7".Length == 2, "dab".Length == 3
     BEZEL_EXPECT_EQ(r.exitCode, 5);
