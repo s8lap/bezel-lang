@@ -80,15 +80,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required
-// to build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Diagnostic TEXT, not merely "did not run": runAot synthesizes an Error for a
 // runtime SIGSEGV too, so a bare rejects() cannot tell a genuine reject from a
@@ -116,7 +107,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, from_cstring_compiles_spec_32_6) {
         "  return s.Length; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
@@ -140,7 +130,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, cstring_round_trip_astral_stdlib_10_4) 
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -159,7 +148,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, wstring_round_trip_astral_stdlib_10_4) 
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -189,7 +177,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, from_cstring_parameter_stdlib_9_6) {
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -225,7 +212,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, source_not_consumed_spec_32_6) {
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -248,7 +234,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, repeated_read_no_leak_spec_32_6) {
         "  return count; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -276,7 +261,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, from_cstring_pointer_spec_32_6) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -300,7 +284,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, from_wstring_pointer_spec_32_6) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -340,7 +323,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, null_pointer_raises_stdlib_10_4) {
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -376,7 +358,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, ill_formed_raises_stdlib_3_2) {
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -402,7 +383,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, nested_temporary_reclaimed_spec_28_3) {
         "  return count; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 20);
 }
@@ -435,7 +415,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, temporary_reclaimed_on_throw_spec_28_3)
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 20);
 }
@@ -458,7 +437,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, char_and_buffer_overloads_stdlib_9_6) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -578,7 +556,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, wstring_bom_is_content_stdlib_10_4) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -600,7 +577,6 @@ BEZEL_TEST(codegen_string_from_ffi_2734, intptr_zero_and_conversions_spec_32_7) 
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
