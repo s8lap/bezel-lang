@@ -8760,31 +8760,64 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
 void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
                                         std::string_view formalParamModifier) {
     if (!a.value) return;
-    if (a.modifier != "ref" && a.modifier != "out") return;
+    // `out var` / `out using var` have their own compatibility checks below;
+    // only bare `ref` and `out` reach the structural-shape checks after.
+    if (a.modifier != "ref" && a.modifier != "out" &&
+        a.modifier != "out var" && a.modifier != "out using var")
+        return;
     const ast::Expr& target = *a.value;
     const char* kind = (a.modifier == "ref") ? "ref" : "out";
-    // §22.3 / §22.4 / fix #2320: when the formal parameter is `out owned`,
-    // the call-site recipient must be an INLINE declaration — `out var x`
-    // (adopting, v0.289 L2) or `out using var x`. Any other shape (an indexer
-    // slot, a property, a pre-existing local, a discard) reaches the callee
-    // through a path
-    // §22.4 does not bless: codegen's accessor-ref-arg bracket (#1302) was
-    // deliberately narrowed to plain `ref`/`out` precisely so an `out owned`
-    // indexer slot wouldn't silently become a write-into-a-borrowing-slot
-    // (§28.6 leak prevention / §28.11 "collections do not own elements");
-    // the result is the `internal: … — #1386` fallback at buildOrderedArgs.
-    // Reject upfront with the §22.3/§22.4 citation so the user sees a clear
-    // "must be an inline `out var x` / `out using var x`" instead of an
-    // internal error message. Inline `out var` / `out using var` declarations
-    // (modifier == "out var" / "out using var") keep working — those
-    // declare a fresh local, no pre-existing-location question.
+    // §22.3 / §22.4: two specialised checks for the `out owned` parameter
+    // case, and the plain `out` + `out using var` incompatibility.
     if (formalParamModifier == "out owned") {
-        // §A.4 / §22.4 (v0.289 L2, fix #3842): `out owned var x` is deleted, so
-        // the two admitted inline forms are `out var x` (adopting) and
-        // `out using var x` (scope-bound owned). The needle "must be an inline"
-        // is pinned by tests/module/xmod_three_formal_3220_test.cpp.
-        std::string msg = std::string("an `out owned` argument must be an inline `out var x` or `out using var x` declaration (§22.3 / §22.4, v0.289 L2); a pre-existing storage location has no place to discharge the value the callee produces");
-        ctx_.diagnostics().report(Severity::Error, target.span.begin, msg);
+        // fix #5811 (spec §22.4, v0.334): admit a pre-declared local in an
+        // adoptable state — uninitialised (`var c: T?;` with no initializer)
+        // or polymorphic-null (`var c: T? := null;`).  The local adopts owned
+        // on every normal-return path of the call (§28.3 adoption clause).
+        // Detect adoptability from the AST: the LocalDecl's initializer is null
+        // (uninitialised) or a NullLiteralExpr (polymorphic-null).
+        bool isAdoptablePreDeclaredLocal = false;
+        if (a.modifier == "out" && !a.isDiscard) {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
+                if (auto* lsym = ctx_.exprSymbol(*id)) {
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(lsym->decl)) {
+                        if (!ld->initializer) {
+                            isAdoptablePreDeclaredLocal = true;  // uninitialised
+                        } else if (dynamic_cast<const ast::NullLiteralExpr*>(
+                                       ld->initializer.get())) {
+                            isAdoptablePreDeclaredLocal = true;  // polymorphic-null
+                        }
+                    }
+                }
+            }
+        }
+        if (isAdoptablePreDeclaredLocal) {
+            // §22.4: pre-declared local in an adoptable state is admitted.
+            // Let the ownership pass mark it Owned on the normal-return path.
+        } else if (a.modifier != "out var" &&
+                   a.modifier != "out using var") {
+            // §A.4 / §22.4 (v0.289 L2, fix #3842): `out owned var x` is
+            // deleted, so the two admitted inline forms are `out var x`
+            // (adopting) and `out using var x` (scope-bound owned).  The needle
+            // "must be an inline" is pinned by
+            // tests/module/xmod_three_formal_3220_test.cpp.
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                "an `out owned` argument must be an inline `out var x` or "
+                "`out using var x` declaration, or a pre-declared local in an "
+                "adoptable state (§22.3 / §22.4, v0.334); a pre-existing "
+                "storage location that is not in an adoptable state has no "
+                "place to discharge the value the callee produces");
+            return;
+        }
+    } else if (formalParamModifier == "out" && a.modifier == "out using var") {
+        // fix #5811 (spec §22.4, v0.334): `out using var x` is accepted only
+        // against `out owned`; against a plain `out` parameter it has no owned
+        // source and is a compile error.
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            "a caller cannot write `out using var` against a plain `out` "
+            "parameter — the result has no owned source (§22.4, v0.334)");
         return;
     }
     // §9.4: in a record method body (not ctor, not static), the receiver is
