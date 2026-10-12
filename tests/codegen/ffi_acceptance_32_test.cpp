@@ -331,13 +331,18 @@ BEZEL_TEST(ffi_acceptance_32, variadic_n_equals_arity_32_11) {
 }
 
 // §32.11: variadic(N) with N less than arity (passes one variadic arg).
+//
+// #5230: the `open` target lives under the harness scratch dir rather than a
+// hardcoded /tmp path, so the row does not depend on a fixed filesystem
+// location (and does not write outside it).
 BEZEL_TEST(ffi_acceptance_32, variadic_n_less_than_arity_32_11) {
+    const std::string openTarget = (wtDir() / "bezel_var_test").string();
     auto r = runAot(
         "module M; "
         "extern \"c\" public method OpenCreate(path: CString, flags: int, mode: uint): int "
         "    := symbol \"open\" variadic(2); end; "
         "class C public static method Main(): int "
-        "  using var f := CString.From(\"/tmp/bezel_var_test\"); "
+        "  using var f := CString.From(\"" + openTarget + "\"); "
         "  var fd := OpenCreate(f, 577, 420); "
         "  if fd < 0 then return 1; end; "
         "  return 0; "
