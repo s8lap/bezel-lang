@@ -105,20 +105,26 @@ BEZEL_TEST(ffi_acceptance_32, float_double_params_32_5) {
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// §32.5: bool marshalling at the FFI boundary.
+// §32.5: bool is an FFI-compatible scalar type (spec: 1-byte, 0/1 representation).
+// NOTE: Testing Bezel-bool-to-C-bool marshalling end-to-end requires a custom C
+// shim — no standard C function takes a single bool parameter and produces
+// observable output. This test verifies bool production from FFI data (atoi
+// returns int; int comparison produces Bezel bool) and bool-to-int coercion
+// across the FFI boundary (printf %d receives int 1 for true).
 BEZEL_TEST(ffi_acceptance_32, bool_marshalling_32_5) {
-    // Use putchar to output ASCII codes for '1' (49), space (32), '0' (48), newline (10).
+    // atoi("1") returns int 1. The comparison "1 <> 0" produces Bezel bool true.
+    // Passing that bool to printf with %d shows it coerces to int 1 at the FFI
+    // boundary (the variadic int slot receives the bool's int representation).
     std::string out = compileAndCapture(
         "module M; "
-        "extern \"c\" public method putchar(c: int): int; end; "
+        "extern \"c\" public method atoi(s: CString): int; end; "
+        "extern \"c\" public method printf(fmt: CString, arg: int): int; end; "
         "class C public static method Main(): int "
-        "  _ := putchar(49); "
-        "  _ := putchar(32); "
-        "  _ := putchar(48); "
-        "  _ := putchar(10); "
+        "  var i := atoi(CString.From(\"1\")); "
+        "  _ := printf(CString.From(\"%d\\n\"), i <> 0); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_EQ(out, std::string("1 0\n"));
+    BEZEL_EXPECT_EQ(out, std::string("1\n"));
 }
 
 // ===========================================================================
