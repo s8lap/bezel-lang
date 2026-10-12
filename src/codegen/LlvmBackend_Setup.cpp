@@ -480,7 +480,56 @@ llvm::Value* Emitter::choiceCaseConstant(const ast::Expr& e) {
     if (cc->caseDecl && !cc->caseDecl->payload.empty()) return nullptr;
     std::size_t tag = 0;
     if (!choiceCaseByName(choiceTy, cc->name, &tag)) return nullptr;
-    auto* st = choiceStruct(choiceTy);
+    // fix §35.3 / §14.1 (v0.334): a payload-free case access on a CONCRETE
+    // generic instantiation (`Res<int>.Bad`) must materialize the SAME
+    // specialized struct the type-annotation side produces. `choiceStruct` here
+    // ran with no substitution active (a non-generic body such as `Main`), so it
+    // took its unspecialized arm and returned the ERASED `%choice.Res` — a
+    // structurally identical but NOMINALLY DISTINCT LLVM type from the
+    // `%choice.Res$spec0` that lowerTypeRef's concrete-choice branch
+    // (LlvmBackend_Layout.cpp) gives the same choice as a callee parameter or a
+    // declared result. The two then disagreed at the boundary and verifyModule
+    // rejected the whole module: "Call parameter type does not match function
+    // signature!" when the value was passed to a method specialized on the
+    // choice, "Function return type does not match operand type of return inst!"
+    // when a `(): Res<int>` returned one. This is the choice twin of the record
+    // defect the same branch's `allUnbound` rule records (`%record.Box$spec0` vs
+    // `%record.Box`), and the fix is the same one — route through lowerTypeRef so
+    // the case value and its annotation share a single spelling, including that
+    // branch's all-unbound-template-args guard, which keeps an unspecialized
+    // generic template body on the base struct.
+    //
+    // WHERE the instantiation is recovered. §35.3 requires the type arguments to
+    // be WRITTEN at the construction, and for a generic receiver the parser puts
+    // them on the qualifier identifier (`IdentifierExpr::typeArgs`, §14.1 / §22.12
+    // issue #520). But this function's OWN exprType cannot supply them: sema's
+    // choice-case member-access arm types the access as the BARE parent
+    // declaration — `ct->declaration = cc->parent`, with `genericArgs` left empty
+    // (src/sema/ExprTypecheck_Calls.cpp, the `ChoiceCaseSymbol` arm) — which is
+    // exactly why the payload-carrying form, typed by `typeCall` from the same
+    // qualifier and installed through `RecordSubstGuard`'s `choiceCtorSubst`
+    // (LlvmBackend_Calls2.cpp), worked while only the payload-free form aborted.
+    // The QUALIFIER's own resolved type does carry them (measured: this expr's
+    // type has `genericArgs.size() == 0` while `ma->target`'s has 1, both naming
+    // the same declaration), so read the instantiation from there.
+    //
+    // Guarded on the qualifier naming this same choice non-nullably:
+    // lowerTypeRef routes a nullable value type to nullableValueStructTy and a
+    // null/foreign type to the i32 default, neither of which is the choice struct.
+    // The `choiceStruct(choiceTy)` fallback preserves the pre-existing behavior
+    // for those shapes, for an unqualified access, and for every non-generic
+    // choice (where lowerTypeRef's own choice branch returns choiceStruct
+    // unchanged).
+    const sema::TypeRef* inst = nullptr;
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
+        ma && ma->target)
+        inst = ctx_.exprType(*ma->target);
+    if (!inst) inst = ctx_.exprType(e);
+    llvm::StructType* st = nullptr;
+    if (inst && !inst->nullable && inst->kind == sema::TypeRef::Kind::Named &&
+        inst->declaration == choiceTy)
+        st = llvm::dyn_cast_or_null<llvm::StructType>(lowerTypeRef(inst));
+    if (!st) st = choiceStruct(choiceTy);
     // Build the struct constant: tag = caseIndex, all payload slots undef.
     std::vector<llvm::Constant*> fields;
     fields.push_back(llvm::ConstantInt::get(i32(), tag));
