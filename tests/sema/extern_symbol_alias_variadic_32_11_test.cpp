@@ -24,6 +24,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -343,5 +344,11 @@ BEZEL_TEST(extern_symbol_alias_variadic_32_11,
         "  public static method Main() Console.WriteLine(4242); end Main; "
         "end Program; ");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // A compile-time rejection pinned by hasErrors()/!ran alone cannot tell a
+    // genuine rejection from a crash, a signal, a timeout or an ASan report
+    // (#3892, `check_ambiguous_ran_false`). Name the §32.11 arity diagnostic
+    // this row is actually about, so the row cannot pass for the wrong reason.
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "names more fixed parameters than the declaration has"));
     BEZEL_EXPECT_FALSE(r.ran);
 }
