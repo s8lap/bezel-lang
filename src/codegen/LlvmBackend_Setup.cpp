@@ -23900,19 +23900,28 @@ struct UnwindIneligibleWalker {
             bool branchSensitiveOwnedTransfer = false;
             if (untaintOwnedLocalTransfer && a.value &&
                 (a.modifier == "owned" || pm == "owned")) {
-                // Also handle `move x`: MoveExpr wrapping an IdentifierExpr.
-                // per §A.4 / proposal 0090 (v0.246): `owned` is not an
-                // ArgModifiers alternative; `move x` is the call-site transfer
-                // marker. Both forms need the same untaint treatment.
+                // fix #994 follow-up / §28.3: `move x` is deliberately NOT
+                // unwrapped here. This untaint is licensed by ONE invariant the
+                // rest of the design states out loud — `eligible => nulled`: the
+                // walker may leave a symbol unwind-ELIGIBLE only when the codegen
+                // NULLS its slot at the transfer, so the null-guarded unwindOnly
+                // disposal skips the transferred value on the post-transfer edge.
+                // For a USER METHOD, buildOrderedArgs nulls only a BARE-identifier
+                // source (LlvmBackend_Assign.cpp: `dynamic_cast<IdentifierExpr>`
+                // on a.value); a `move x` source is a MoveExpr and is NOT nulled —
+                // the NOTE at that site records the deliberate choice. So for
+                // `M(move x)` the invariant does NOT hold here: leaving the source
+                // eligible made the caller's unwindOnly disposal run against a
+                // value the callee already owns and disposes — ASan heap-
+                // use-after-free in the caller (measured; the callee's
+                // DisposeCore freed it first). A BUILTIN COLLECTION transfer is
+                // unaffected and stays untainted: nullTransferredOwnedLocalSlot
+                // DOES unwrap MoveExpr and runs after the call succeeds, so its
+                // null ⟹ eligible holds (cells d and the OwningArray/Stack/Queue
+                // rows stay green). Restoring taint is the walker's stated bias —
+                // "at worst a leak, NEVER a double-free". // per §28.3
                 const ast::IdentifierExpr* localId =
                     dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
-                if (!localId) {
-                    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(
-                            a.value.get()))
-                        if (u->op == "move")
-                            localId = dynamic_cast<const ast::IdentifierExpr*>(
-                                u->operand.get());
-                }
                 if (localId) {
                     sema::Symbol* asym = ctx.exprSymbol(*localId);
                     if (auto* loc =
