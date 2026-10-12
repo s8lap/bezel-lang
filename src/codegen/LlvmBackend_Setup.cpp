@@ -32100,7 +32100,8 @@ const sema::TypeRef* Emitter::owningChoiceFieldType(
 // zeroed bytes; loading tag 0 and taking the no-op switch arm is safe.
 bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
                                         llvm::Value* fieldAddr,
-                                        llvm::Value* newVal) {
+                                        llvm::Value* newVal,
+                                        const ast::Expr* rhsExpr) {
     if (!isOwnedChoiceFieldLvalue(target)) return false;
     if (!fieldAddr || !newVal) return false;
     sema::Symbol* sym = ctx_.exprSymbol(target);
@@ -32243,6 +32244,64 @@ bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
     // Store the new value. For non-nullable: always. For nullable: if we got
     // here, either hasValue was 0 (skip dispose, store anyway) or dispose ran.
     builder_.CreateStore(newVal, fieldAddr);
+    // fix #5652 (the TAKER half) / §15.3 *Move-only value types* / §28.7
+    // *Reassigning owned fields and locals — drop-on-overwrite* / §28.8.1 *The
+    // vacated location* (v0.334). The store above is a WHOLE-VALUE transfer out
+    // of a move-only taker, so the TAKER must be vacated with it — the source
+    // half of this pair is `lowerUnary`'s owning-CHOICE field arm
+    // (LlvmBackend_Exprs2.cpp, fix #5652 field spelling), which `d2a871ca`
+    // installed and which structurally CANNOT reach this: its mark is on the
+    // FIELD, and the taker at `h.C := t` is a LOCAL. Marking it is exactly
+    // `markOwningChoiceMovedFromCore`, whose rationale ("the taker stays the
+    // SOLE owner") and zero-store encoding this reuses unchanged.
+    //
+    // §28.7: "A moved-from or null location therefore stores without disposal
+    // — which is precisely how the field-restoration rule's `move`-then-reassign
+    // idiom stays single-disposal". §28.8.1 *The vacated location* generalizes
+    // the vacated-state posture to every vacated field and slot; §15.3's *Local
+    // lifetime* bullet is the local-side half — a whole-value move "leaves the
+    // local holding no value rather than a hole, so no pass walks it
+    // (…'discharge machinery skips it')".
+    //
+    // §15.3's *Rules* first bullet is the rule that makes `h.C := t` a MOVE at
+    // all, not a copy: "Assignment transfers the value from source to
+    // destination, leaving the source in moved-from state." §15.3 also states
+    // the source-side consequence for the reassignment form at *Whole-value
+    // reassignment*: "The new value arrives with its own per-slot states —
+    // `a := b;` where `b` (a whole-value move) carries moved-from slots leaves
+    // `a` carrying them, with `b`'s restoration obligations transferred to
+    // `a`." So the taker's obligations move WITH the value, and the taker's
+    // scope-end pass must not also fire.
+    //
+    // ORDER. AFTER the store, mirroring the local-target sibling
+    // `markOwningChoiceLocalMovedFrom(as->target.get(), as->value.get())` in
+    // LlvmBackend_Stmts.cpp (#4566), whose comment records the same reason: the
+    // value the store read out of the taker slot is already in the field.
+    //
+    // WHY THIS CANNOT LEAK. `markOwningChoiceMovedFromCore` marks ONLY a bare
+    // identifier naming a plain `ast::LocalDecl` local of an OWNING-CHOICE type
+    // whose alloca is exactly that choice struct — i.e. a local this backend
+    // enrolls in the scope-end active-case pass, the very pass the mark
+    // suppresses. A fresh case construction (`h.C := Slot.Full(new R)`), a
+    // field read, or a call result is not a bare identifier and is declined, so
+    // nothing the arm did not adopt is marked. The reverse failure — failing to
+    // mark a taker the field DID adopt — is the double free being fixed here.
+    //
+    // MEASURED at r23-c28 (d2a871ca) on
+    //   using var h := new Holder(); var t := move h.C; h.C := t;
+    // `restored` then `dispose c` then heap-use-after-free, READ of size 8 in
+    // bz$M.Holder$DisposeCore (ASan on the generated code), of a region freed by
+    // `t`'s scope-end active-case pass and allocated in the field initializer:
+    // the field took the payload the taker still owned. Loop-amplified by hand on
+    // the same base: the disposal-COUNT program double-freed on every one of
+    // 200 iterations (400 destructor lines, and ASan aborts the first).
+    //
+    // `!emittingDisposerBody_` is enforced inside the mark itself
+    // (LlvmBackend_Disposal.cpp), for the reason the two `lowerUnary` field arms
+    // state: inside a destructor the sole disposal site for an owned location is
+    // the auto-dispose pass, so vacating a local there would make it skip a
+    // still-owned payload — a LEAK.
+    markOwningChoiceMovedFromCore(/*targetLd=*/nullptr, rhsExpr);
     builder_.CreateBr(joinBB);
     builder_.SetInsertPoint(joinBB);
     return true;

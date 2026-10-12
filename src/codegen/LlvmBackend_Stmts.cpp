@@ -1952,8 +1952,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // the displaced value entirely. Comes after all other field helpers
                 // (which handle class/Task/collection types) and before the local
                 // helpers (which only apply to plain locals / parameters).
+                //
+                // fix #5652 (the TAKER half): `as->value` is the RHS SOURCE
+                // expression, needed so the helper can VACATE a move-only local
+                // taker at this field target (`var t := move h.C; h.C := t;`) —
+                // the source-field mark installed by `d2a871ca` cannot reach a
+                // local. Same trailing-`as->value` idiom the box and
+                // owned-collection field helpers above already take.
+                // // per §15.3, §28.7, §28.8.1
                 if (!handled)
-                    handled = lowerOwnedChoiceFieldStore(*as->target, addr, rhs);
+                    handled = lowerOwnedChoiceFieldStore(*as->target, addr, rhs,
+                                                         as->value.get());
                 if (!handled) {
                     // fix #2960 / §8.6 / §28.9 (v0.240): drop-on-overwrite
                     // for a managed Object/interface LOCAL. The pre-pass admits

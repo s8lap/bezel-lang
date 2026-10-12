@@ -19082,9 +19082,19 @@ private:
     // → store-new. Constructor first-time assignments are safe: the object is
     // calloc-zeroed so the null-guard skips disposal. The new value is stored
     // by the caller after this returns.
+    //
+    // `rhsExpr` is the RHS SOURCE EXPRESSION (the `as->value` node), not the
+    // lowered value. It is what fix #5652 (the TAKER half) needs to recognize
+    // the move-only WHOLE-VALUE transfer §28.7 + §15.3 perform out of a local
+    // taker at a field target (`var t := move h.C; h.C := t;`) and vacate that
+    // local; the lowered `newVal` has already lost the source's identity. Null
+    // is accepted and means "no local taker" — every non-identifier source
+    // (a fresh case construction, a field read, a call result) declines inside
+    // the mark itself. Same idiom the box / owned-collection field helpers use.
     bool lowerOwnedChoiceFieldStore(const ast::Expr& target,
                                    llvm::Value* fieldAddr,
-                                   llvm::Value* newVal);
+                                   llvm::Value* newVal,
+                                   const ast::Expr* rhsExpr);
 
     // fix #5440 / §35.4 (v0.315): recover the resolved TypeRef for an OWNING
     // CHOICE field. Mirrors the type-resolution shape of taskFamilyTypeFromField
