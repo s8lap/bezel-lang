@@ -20,7 +20,6 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotOut;
-using bezel::test::runJit;
 
 namespace {
 
@@ -310,7 +309,7 @@ BEZEL_TEST(arrayspan_byte_accessors_1358, read_int32_too_short_raises) {
 
 BEZEL_TEST(arrayspan_byte_accessors_1358, write_on_readonly_span_rejected) {
     // per stdlib §4.15 v0.165 (#1358): Write* requires a writable span.
-    auto r = runJit(
+    auto r = runAot(
         "module M; import System.Collections.Generic; "
         "class C public static method Main(): int "
         "  using var b := new Array<byte>(4, 0); "

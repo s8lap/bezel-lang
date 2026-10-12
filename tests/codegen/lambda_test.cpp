@@ -14,11 +14,10 @@
 #include <cctype>      // std::isspace (runStdoutInt trims before std::stoll)
 
 using bezel::test::runAot;
-using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 // Rows ported off the deprecated lenient JIT oracle (#4419). Only rows that

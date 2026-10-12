@@ -12,11 +12,10 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
-using bezel::test::runJit;
 
 namespace {
 int run(const std::string& prog) {
-    auto r = runJit(prog);
+    auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
 // AOT counterpart — used where the program exercises owned-field disposal, so
