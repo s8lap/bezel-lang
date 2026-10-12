@@ -370,7 +370,7 @@ BEZEL_TEST(xmod_ctor_owned_param_2659, t5_marker_on_borrow_formal_still_spurious
     if (rc == -2) return;
     BEZEL_EXPECT_EQ(rc, -1);  // must NOT build
     BEZEL_EXPECT_TRUE(mentions2659(
-        err, "this parameter position does not take ownership"));
+        err, "this parameter does not take ownership"));
 }
 
 // ===========================================================================
