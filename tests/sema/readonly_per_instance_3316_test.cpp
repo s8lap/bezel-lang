@@ -245,13 +245,11 @@ BEZEL_TEST(readonly_per_instance_3316,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// CONTROL: static readonly carve-out preserved. `Type._s := 99` is a
-// type-name root, NOT this-rooted, but the static modifier leaves the
-// carve-out alone — the §22.8 per-instance ruling explicitly scopes
-// static readonly out (the case is recorded as open in v0.270). Must
-// keep compiling.
+// FIX #5638 (§22.8, v0.334): a static readonly field is assignable only
+// in a static constructor — an instance constructor writing a static field
+// is a compile error regardless of spelling (`C._s` or bare `_s`).
 BEZEL_TEST(readonly_per_instance_3316,
-           ctor_type_qualified_static_readonly_assignment_accepted_spec_22_8) {
+           ctor_type_qualified_static_readonly_assignment_rejected_spec_22_8_v0_334) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
@@ -259,14 +257,16 @@ BEZEL_TEST(readonly_per_instance_3316,
         "  public constructor() C._s := 7; end constructor; "
         "  public static method Main(): int return 0; end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    auto& msg = r.diagnostics.diagnostics()[0].message;
+    BEZEL_EXPECT_TRUE(msg.find("22.8") != std::string::npos);
 }
 
-// CONTROL: bare static `_s := 99` from C's ctor — the implicit-this
-// spelling for a static field. The static modifier leaves the carve-out
-// alone (only INSTANCE readonly is narrowed). Must keep compiling.
+// FIX #5638 (§22.8, v0.334): bare static `_s := 7` from an instance
+// constructor is the bare-implicit-this spelling of the same illegal store.
+// Both spellings must be rejected.
 BEZEL_TEST(readonly_per_instance_3316,
-           ctor_bare_static_readonly_assignment_accepted_spec_22_8) {
+           ctor_bare_static_readonly_assignment_rejected_spec_22_8_v0_334) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
@@ -274,5 +274,7 @@ BEZEL_TEST(readonly_per_instance_3316,
         "  public constructor() _s := 7; end constructor; "
         "  public static method Main(): int return 0; end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    auto& msg = r.diagnostics.diagnostics()[0].message;
+    BEZEL_EXPECT_TRUE(msg.find("22.8") != std::string::npos);
 }

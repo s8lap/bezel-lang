@@ -8215,8 +8215,24 @@ void ExprTC::checkReadonlyFieldWriteTarget(const ast::Expr& target,
         bool isStatic = false;
         for (auto mod : fs->modifiers)
             if (mod == "static") { isStatic = true; break; }
-        if (isStatic ||
-            isThisRootedLValueTarget(target))
+        // fix #5638/#5651 (§22.8, v0.334): the `isStatic` arm previously
+        // returned early for ANY constructor (instance or static), but a
+        // static readonly field is assignable only in a STATIC constructor —
+        // an instance constructor writing a static field is a compile error.
+        // Require `inStaticMember_` (set when visiting a static constructor
+        // body).  Separately, the spec's assignment window is lexical and does
+        // not include a nested lambda body: a lambda written inside a
+        // constructor is outside every assignment window (§22.8), so an
+        // assignment inside it is rejected regardless of constructor context.
+        // Require `!inLambda_` for both arms.
+        //
+        // Additionally, `isThisRootedLValueTarget` returns true for bare static
+        // field names (since `fs->parent == currentType_` holds for static
+        // fields too), so the `isThisRootedLValueTarget` arm must also exclude
+        // static fields — a static field is never `this`-rooted regardless of
+        // the bare-name resolution behaviour.
+        if ((!inLambda_ && inStaticMember_ && isStatic) ||
+            (!inLambda_ && !isStatic && isThisRootedLValueTarget(target)))
             return;
     }
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
