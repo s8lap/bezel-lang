@@ -161,7 +161,10 @@ BEZEL_TEST(pure_body_22_15, pure_using_var_rejected_spec_22_15) {
 }
 
 // =========================================================================
-// §22.15 rule 5: IEnumerable-source `for` rejection (Range admitted).
+// §22.15 rule 5: `for`-source admission — a concrete Array<T> source is
+// the normative elision and is ADMITTED; a Range source is admitted; an
+// interface-typed source, and an Array<T> whose element is a type
+// parameter, remain rejected.
 // =========================================================================
 
 // §22.15 rule 5: a Range `for` loop — admitted (the normative form inside
@@ -179,14 +182,53 @@ BEZEL_TEST(pure_body_22_15, pure_range_for_loop_accepted_spec_22_15) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.15 rule 5: a `for` over an IEnumerable-typed source is rejected.
-BEZEL_TEST(pure_body_22_15, pure_enumerable_for_rejected_spec_22_15) {
+// §22.15 rule 5: a `for` over a CONCRETE Array<T> source uses direct
+// indexed loop (normative elision); accepted in pure bodies.
+// (A non-concrete Array<T> — with a type-parameter element — is rejected.)
+BEZEL_TEST(pure_body_22_15, pure_concrete_array_for_accepted_spec_22_15) {
     auto r = parseSemaAll(
         "module M; "
         "class C "
         "  public pure method M(xs: Array<int>): int "
         "    var sum: int := 0; "
         "    for var x in xs do sum := sum + x; end; "
+        "    return sum; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §22.15 rule 5, the boundary the concrete-Array admission stops at: "A
+// source whose static type is an interface (`IEnumerable<T>` included)
+// or a generic type parameter — even one instantiated at a concrete
+// sequence type — remains rejected."  An interface-typed source has no
+// concrete layout for the elision to read, so the `for` desugaring
+// constructs an enumerator and the loop is rejected.
+BEZEL_TEST(pure_body_22_15, pure_interface_source_for_rejected_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public pure method M(xs: IEnumerable<int>): int "
+        "    var sum: int := 0; "
+        "    for var x in xs do sum := sum + x; end; "
+        "    return sum; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`for` loop source"));
+}
+
+// §22.15 rule 5, the same clause's other half: a `for` over an
+// `Array<T>` whose ELEMENT is a type parameter is not a concrete
+// `Array<T>` at this body's own check site — the element's layout is
+// only known at the instantiation site, so the elision does not apply
+// and the source stays rejected.
+BEZEL_TEST(pure_body_22_15, pure_type_param_element_array_for_rejected_spec_22_15) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C<E> "
+        "  public pure method M(xs: Array<E>): int "
+        "    var sum: int := 0; "
+        "    for var x in xs do sum := sum + 1; end; "
         "    return sum; "
         "  end M; "
         "end C;");

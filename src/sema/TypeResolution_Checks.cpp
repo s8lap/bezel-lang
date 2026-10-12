@@ -16972,6 +16972,25 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
                         std::string(ps->name) + "` carries modifier `" +
                         std::string(ps->modifier) + "` (\xC2\xA7""22.15)");
                 }
+                // §22.15 "Parameters and result": move-only value parameters
+                // are rejected (owning inline arrays, owning-classified choices).
+                const TypeRef* paramType =
+                    ps->resolvedDeclType ? ps->resolvedDeclType
+                                         : (ps->declType
+                                                ? ctx_.resolvedType(*ps->declType)
+                                                : nullptr);
+                if (paramType) {
+                    const char* moveOnlyKind = nullptr;
+                    if (common::isMoveOnlyValueType(paramType, ctx_, moveOnlyKind)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, m->declLoc,
+                            std::string("a `pure` member declares no "
+                                        "move-only value parameter; method `") +
+                            std::string(ms->name) + "` parameter `" +
+                            std::string(ps->name) + "` is " +
+                            moveOnlyKind + " (\xC2\xA7""22.15)");
+                    }
+                }
             }
             // §22.15 "Parameters and result": no `owned` class-typed return.
             bool retOwned = opDecl ? opDecl->returnOwned : false;
@@ -16992,6 +17011,21 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
                         std::string(ms->name) +
                         "` returns an owned class instance "
                         "(\xC2\xA7""22.15)");
+                }
+            }
+            // §22.15 "Parameters and result": move-only value returns are
+            // rejected (owning inline arrays, owning-classified choices).
+            if (retTy) {
+                const TypeRef* rt = ctx_.resolvedType(*retTy);
+                const char* moveOnlyKind = nullptr;
+                if (common::isMoveOnlyValueType(rt, ctx_, moveOnlyKind)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("a `pure` member declares no move-only "
+                                    "value return; method `") +
+                        std::string(ms->name) +
+                        "` returns " + moveOnlyKind +
+                        " (\xC2\xA7""22.15)");
                 }
             }
             continue;

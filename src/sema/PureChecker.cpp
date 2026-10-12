@@ -148,13 +148,14 @@ private:
     bool recordConstructionIsPure(const ast::NewExpr& ne);
 
     // §22.15 rule 5: a `for` loop source must not construct an enumerator.
-    // Range<T> of primitive steppable type, inline arrays, spans, and
-    // value-typed OwningBuffer<T> are admitted; IEnumerable<T> (including
-    // Array<T> and string) is rejected.
+    // Range<T> of primitive steppable type, inline arrays, spans,
+    // value-typed OwningBuffer<T>, and a CONCRETE Array<T>/OwningArray<T>
+    // source are admitted; an IEnumerable<T> source, a `string` source,
+    // and an Array<T> whose element is a type parameter are rejected.
     bool forSourceAdmitsEnumerator(const ast::Expr& iterable) const;
 
-    // §22.15 rule 5: is `rt` an IEnumerable<T>-typed source that the `for`
-    // desugaring expands into an enumerator-constructing loop?
+    // §22.15 rule 5: is `rt` a source that the `for` desugaring expands
+    // into an enumerator-constructing loop?
     bool isEnumeratorConstructingSource(const TypeRef* rt) const;
 
     // fix #3279 (v0.263, stdlib §9.8 + spec §22.15): the `in` membership
@@ -553,14 +554,34 @@ void PureBodyWalker::checkPureCtorChainPurity(
 
 bool PureBodyWalker::isEnumeratorConstructingSource(
     const TypeRef* rt) const {
-    // §22.15 rule 5: IEnumerable<T> sources construct an enumerator class
-    // instance — Array<T>, string, IEnumerable<T>, and the stdlib
-    // collection wrappers. Range<T>, inline arrays, spans, and value-typed
-    // OwningBuffer<T> use direct counted loops.
+    // §22.15 rule 5: an IEnumerable<T> source constructs an enumerator class
+    // instance. Range<T> of primitive steppable type, inline arrays, spans,
+    // and value-typed OwningBuffer<T> use direct counted/indexed loops. A
+    // CONCRETE Array<T>/OwningArray<T> source uses the direct indexed loop,
+    // which is the NORMATIVE semantics inside a pure body; an Array<T> whose
+    // element is a type parameter is not concrete at this check site and is
+    // rejected.
     if (!rt) return false;
     std::string_view head = rt->headName();
-    if (head == "IEnumerable" || head == "Array" || head == "string" ||
-        head == "List" || head == "OwningList" || head == "OwningArray" ||
+    // Concrete Array<T> and OwningArray<T> with a non-type-parameter element
+    // type use direct indexed loops — admitted in pure bodies. Array<T> with
+    // a type-parameter element type is not concrete and is rejected.
+    if (head == "Array" || head == "OwningArray") {
+        if (rt->genericArgs.size() == 1 && rt->genericArgs[0] &&
+            rt->genericArgs[0]->kind == TypeRef::Kind::Named &&
+            !rt->genericArgs[0]->declaration) {
+            // Element type is a type parameter — not concrete, rejected.
+            return true;
+        }
+        // Concrete element type — use direct indexed loop, admitted.
+        return false;
+    }
+    // IEnumerable<T> and IEnumerator<T>: always construct an enumerator,
+    // rejected even with a concrete element type.
+    if (head == "IEnumerable" || head == "IEnumerator")
+        return true;
+    if (head == "string" ||
+        head == "List" || head == "OwningList" ||
         head == "OwningDictionary" || head == "OwningSet" ||
         head == "Dictionary" || head == "Set" || head == "Stack" ||
         head == "Queue" || head == "LinkedList" || head == "OwningStack" ||
@@ -932,8 +953,10 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
             reportPureViolation(
                 fs->span.begin, "`for` loop source",
                 "the source constructs an enumerator (an "
-                "IEnumerable<T>-typed source including Array<T> and "
-                "string); use an index loop `for var i in 0..<xs.Count`");
+                "IEnumerable<T>-typed source, a `string` source, or an "
+                "`Array<T>` whose element is a type parameter); declare "
+                "the source at a concrete sequence type, or use an index "
+                "loop `for var i in 0..<xs.Count`");
         }
         if (fs->iterable) checkExpr(fs->iterable.get());
         if (fs->withExpr) checkExpr(fs->withExpr.get());
