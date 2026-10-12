@@ -272,6 +272,10 @@ void Resolver::checkTypeMemberSignatureVisibility(TypeSymbol* t) {
         if (!astTy) return;
         const TypeRef* rt = ctx_.resolvedType(*astTy);
         if (!rt || !rt->declaration) return;  // builtin / generic param
+        // fix #2198 (§21.10, v0.310): skip local types — they are declared in
+        // method-body scope and the §13.3 visibility hierarchy does not apply.
+        if (auto* ty = dynamic_cast<TypeSymbol*>(rt->declaration))
+            if (ty->isLocalType) return;
         if (rt->declaration->visibility == ast::Visibility::Private) {
             ctx_.diagnostics().report(
                 Severity::Error, mem->declLoc,
@@ -2714,6 +2718,10 @@ void Resolver::checkTopLevelVisibility() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
+        // fix #2198 (§21.10, v0.310): skip local types — they are declared in
+        // method-body scope, not at module level, and the §13.2 rule ("top-level
+        // type visibility must be public or internal") does not apply to them.
+        if (t->isLocalType) continue;
         if (t->visibility == ast::Visibility::Private ||
             t->visibility == ast::Visibility::Protected) {
             ctx_.diagnostics().report(

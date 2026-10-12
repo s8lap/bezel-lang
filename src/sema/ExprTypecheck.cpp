@@ -19759,6 +19759,20 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     initNarrowed_.insert(lsym);
             }
         }
+    } else if (auto* localType =
+                   dynamic_cast<const ast::LocalTypeDecl*>(&s)) {
+        // §21.10: a `record` or `enum` declaration in statement position.
+        // Allocate a fresh ScopeId for the local type's region; its member
+        // scope is created inside collectTypeDecl. The enclosing type path is
+        // empty (local types are not nested inside another type).
+        ScopeId localTypeScope = ctx_.newScope();
+        TypeSymbol* tsym =
+            collectTypeDecl(*localType->decl, ctx_, localTypeScope, {});
+        // Register the type name in ExprTC's identifier-lookup scope so that
+        // lookupName finds it when the type is referenced in an expression.
+        if (currentScope_ && tsym) {
+            currentScope_->names[tsym->name] = tsym;
+        }
     } else if (auto* lc =
                    dynamic_cast<const ast::LocalConstDecl*>(&s)) {
         if (lc->value) visitExpr(*lc->value);

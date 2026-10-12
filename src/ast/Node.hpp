@@ -80,6 +80,7 @@ enum class TypeDeclKind {
 // subclasses follow.
 struct TopDecl : Node {};
 
+struct TypeDecl; // defined after Expr; used by LocalTypeDecl.
 struct Type; // defined after TypeDecl; used by TypeDecl::baseTypes.
 struct Expr; // defined further below; used by FieldDecl::initializer.
 // defined further below (with the rest of the Pattern hierarchy); used by
@@ -280,6 +281,12 @@ struct LocalConstDecl : Stmt {
     std::string_view name;
     std::unique_ptr<Type> type;        // null when no `:` annotation
     std::unique_ptr<Expr> value;
+};
+
+// A.6 `LocalTypeDecl ::= RecordDecl | EnumDecl`. Method-local type
+// declaration (§21.10). Wraps a TypeDecl as a statement.
+struct LocalTypeDecl : Stmt {
+    std::unique_ptr<TypeDecl> decl;
 };
 
 // A.6: `ReturnStmt ::= "return" Expression? ";"`.

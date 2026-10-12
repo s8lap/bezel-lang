@@ -91,11 +91,10 @@ bool isReservedPrimitiveAliasName(std::string_view n) {
 }
 
 // Forward declarations for the recursive descent.
+// Note: collectTypeDecl is defined OUTSIDE the anonymous namespace (see below)
+// so it does not need a forward declaration here.
 Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
                        ScopeId parentScope);
-TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
-                            ScopeId parentScope,
-                            std::string_view enclosingTypePath = {});
 Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
                       SemaContext& ctx);
 Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
@@ -459,165 +458,6 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
     return sym;
 }
 
-TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
-                            ScopeId parentScope,
-                            std::string_view enclosingTypePath) {
-    auto* sym = ctx.makeSymbol<TypeSymbol>();
-    sym->name = td.name;
-    // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): the enclosing-type path, set
-    // BEFORE the member walk below so a nested type nested inside THIS one
-    // reads a complete path (see the NestedTypeMember arm of collectMember).
-    // Empty for a top-level declaration, which keeps every non-nested type's
-    // mangled name byte-identical to the pre-#3529 spelling.
-    sym->enclosingTypePath = std::string(enclosingTypePath);
-    // §3.4 (#1081): reject a user type whose name is a reserved PascalCase
-    // primitive-alias (Double/Int32/String/…; NOT Single — fix #3833). The symbol is still
-    // registered so later passes have a well-formed type to resolve against; the
-    // diagnostic makes the program a compile error.
-    if (isReservedPrimitiveAliasName(td.name)) {
-        ctx.diagnostics().report(
-            Severity::Error, td.span.begin,
-            std::string("`") + std::string(td.name) +
-            "` is a reserved primitive-alias type name (§3.4) and may not be "
-            "declared as a user type — it names a built-in primitive value type "
-            "through its lowercase keyword alias; choose a different name");
-    }
-    // fix #5187 (spec §8.1, v0.311, unchanged at v0.313): the ban on a user
-    // module-level non-generic type declaration named `Object` — "User code
-    // cannot redeclare or replace `Object`. The ban is on a user module-level
-    // type declaration — a class, record, enum, interface, choice or type
-    // alias — named `Object` with no type parameters, in any user module and
-    // at any visibility." A generic `Object<T>`, a nested type, and a type
-    // parameter named `Object` are ordinary declarations that shadow the
-    // root (§8.1's own carve-outs; §2.2 arity keying and §2.7); only the bare,
-    // top-level, zero-arity `Object` is reserved — the same `Object` the
-    // stdlib §2.3 Row 1 core type table keys on and stdlib §2.13 rule 1
-    // renders `"System.Object"` for. The diagnostic message includes the word
-    // `redeclare` to keep the §8.1 corpus case's (`s8_1_0001`,
-    // baseline.tsv:256) needle functional when the banked divergence is
-    // retired. The symbol is still registered so later passes have a
-    // well-formed type to resolve against.
-    if (td.name == "Object" && enclosingTypePath.empty() &&
-        td.genericParams.empty()) {
-        ctx.diagnostics().report(
-            Severity::Error, td.span.begin,
-            std::string("`") + std::string(td.name) +
-            "` is reserved for the root type and may not be redeclared "
-            "as a user module-level type (§8.1) — choose a different name");
-    }
-    sym->kind = td.kind;
-    sym->visibility = td.visibility;
-    sym->modifiers = td.modifiers;
-    sym->decl = &td;
-    // #1488: the declaring (local, current-compilation) module's full dotted
-    // name — see TypeSymbol::moduleName. collectTypeDecl runs for both
-    // top-level and nested type declarations, and ctx.module() is already set
-    // by collectSymbols before either kind is collected.
-    sym->moduleName = moduleDottedName(ctx.module());
-    // fix #1761: copy the AST declaration's source location onto the symbol
-    // so diagnostics keyed on t->declLoc / m->declLoc point at the actual
-    // declaration site rather than reporting 0:0. The parser now stamps
-    // `td.span.begin` for top-level type decls (see Parser_Decls.cpp's
-    // parseTypeOrInterfaceDecl); for other node types that already had their
-    // span set this propagates that location to the symbol.
-    sym->declLoc = td.span.begin;
-    sym->scope = parentScope;
-    // Each type opens a fresh scope for its members + generic params. Save
-    // it on the symbol so nested-member collection can use it as the
-    // member's `scope` (a nested type lives inside the outer type's member
-    // scope, not in the outer type's enclosing scope).
-    sym->memberScope = ctx.newScope();
-    sym->genericParams =
-        collectGenericParams(td.genericParams, ctx, sym->memberScope,
-                             &td.genericConstraints);
-    for (const auto& m : td.members) {
-        if (!m) continue;
-        if (auto* member = collectMember(*m, *sym, ctx)) {
-            sym->members.push_back(member);
-        }
-    }
-    // §9.1 / §9.2 (issue #501): mirror the AST flag onto the TypeSymbol so that
-    // imported positional records (which have no ast::TypeDecl in the importer)
-    // still pass the §9.2 auto-hashable check via TypeSymbol::hasPositionalFields.
-    sym->hasPositionalFields = td.hasPositionalFields;
-    // §9.1: a record's positional fields become public read-only members,
-    // alongside any body-declared members. They carry no body `FieldDecl`, so
-    // the FieldSymbol's `decl` is the owning TypeDecl and its type is read
-    // from `posParam->type` (resolved by TypeResolution, which already walks
-    // td.positionalFields).
-    if (td.hasPositionalFields) {
-        for (const auto& pf : td.positionalFields) {
-            auto* fs = ctx.makeSymbol<FieldSymbol>();
-            fs->name = pf.name;
-            fs->visibility = ast::Visibility::Public;
-            fs->parent = sym;
-            fs->decl = &td;
-            // fix #2482 (follow-up to #2418): ast::Param now carries its own
-            // source location (stamped by the parser at the field's first
-            // token), so point at the member's own line rather than the
-            // enclosing type's. The type-fallback remains a safety net for a
-            // decl whose loc was not populated (default 0:0:0 — e.g. a
-            // synthesized prelude decl built without going through the parser).
-            fs->declLoc = (pf.loc.line != 0) ? pf.loc : sym->declLoc;
-            fs->posParam = &pf;
-            fs->scope = sym->memberScope;
-            // fix #3140 (§9.8, family F2 of umbrella #3152): the positional
-            // field's `serialized` clause, onto the SYMBOL. It rode
-            // `ast::Param::serialized` only, so every §9.8 emitter recovered it
-            // by casting `Symbol::decl` and answered "no clause" for every
-            // imported field — which drops `serialized skip` from the write
-            // loop while the header count still excludes it, the #1612 desync.
-            if (pf.serialized) {
-                fs->serializedSkip     = pf.serialized->isSkip;
-                fs->serializedOptional = pf.serialized->isOptional;
-                fs->serializedWireName = pf.serialized->name;
-            }
-            // §9.2 "The `equality skip` clause" (v0.307): the positional
-            // field's clause, onto the SYMBOL. A positional FieldSymbol's
-            // `decl` is the owning TypeDecl (not a FieldDecl), so before this
-            // even the LOCAL consumers had to recover the clause by index
-            // arithmetic back into `td.positionalFields`; the symbol bit
-            // retires that walk as well as the imported-side blind spot.
-            if (pf.equality) fs->equalitySkip = pf.equality->isSkip;
-            sym->members.push_back(fs);
-        }
-    }
-    // Enum constants live alongside members.
-    for (const auto& ec : td.enumConstants) {
-        auto* esym = ctx.makeSymbol<EnumConstantSymbol>();
-        esym->name = ec.name;
-        esym->parent = sym;
-        // fix #2482 (follow-up to #2418): ast::EnumConstant now carries its
-        // own source location (stamped at the constant's name token); fall
-        // back to the enclosing TypeDecl's location only when unpopulated.
-        esym->declLoc = (ec.loc.line != 0) ? ec.loc : sym->declLoc;
-        esym->scope = sym->memberScope;
-        // fix #3140 (§9.8): the `serialized "<name>"` rename, on the SYMBOL so
-        // the §9.8 emitters read one field for a local and an imported enum
-        // alike (the imported half is ModuleLoader's MetaMember::enumWireName).
-        if (ec.serialized && !ec.serialized->name.empty())
-            esym->serializedName = ec.serialized->name;
-        sym->members.push_back(esym);
-    }
-    // §35 (v0.200, #2044): choice cases live alongside members, like enum
-    // constants. Each case carries a pointer back to its AST so downstream
-    // passes can read its payload fields (§35.4 classification, §35.5
-    // matching, §35.3 construction).
-    for (const auto& cc : td.choiceCases) {
-        auto* csym = ctx.makeSymbol<ChoiceCaseSymbol>();
-        csym->name = cc.name;
-        csym->parent = sym;
-        csym->caseDecl = &cc;
-        // fix #2482 (follow-up to #2418): ast::ChoiceCase now carries its
-        // own source location (stamped at the case's name token); fall back
-        // to the enclosing TypeDecl's location only when unpopulated.
-        csym->declLoc = (cc.loc.line != 0) ? cc.loc : sym->declLoc;
-        csym->scope = sym->memberScope;
-        sym->members.push_back(csym);
-    }
-    return sym;
-}
-
 Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
                        ScopeId parentScope) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&decl)) {
@@ -811,6 +651,94 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
 }
 
 } // namespace
+
+// fix #2198 (§21.10, v0.310): moved outside the anonymous namespace so it can
+// be called from other translation units (TypeResolution_Names.cpp). The
+// anonymous-namespace helpers it calls (collectMember, collectGenericParams,
+// moduleDottedName) are still in scope and accessible from here.
+// Added `inline` so that calls from within the anonymous namespace (which has
+// its own forward declaration) resolve to THIS definition rather than creating
+// an ambiguity with the anonymous-namespace declaration.
+inline TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
+                            ScopeId parentScope,
+                            std::string_view enclosingTypePath) {
+    auto* sym = ctx.makeSymbol<TypeSymbol>();
+    sym->name = td.name;
+    sym->enclosingTypePath = std::string(enclosingTypePath);
+    if (isReservedPrimitiveAliasName(td.name)) {
+        ctx.diagnostics().report(
+            Severity::Error, td.span.begin,
+            std::string("`") + std::string(td.name) +
+            "` is a reserved primitive-alias type name (§3.4) and may not be "
+            "declared as a user type — it names a built-in primitive value type "
+            "through its lowercase keyword alias; choose a different name");
+    }
+    if (td.name == "Object" && enclosingTypePath.empty() &&
+        td.genericParams.empty()) {
+        ctx.diagnostics().report(
+            Severity::Error, td.span.begin,
+            std::string("`") + std::string(td.name) +
+            "` is reserved for the root type and may not be redeclared "
+            "as a user module-level type (§8.1) — choose a different name");
+    }
+    sym->kind = td.kind;
+    sym->visibility = td.visibility;
+    sym->modifiers = td.modifiers;
+    sym->decl = &td;
+    sym->moduleName = moduleDottedName(ctx.module());
+    sym->declLoc = td.span.begin;
+    sym->scope = parentScope;
+    sym->memberScope = ctx.newScope();
+    sym->genericParams =
+        collectGenericParams(td.genericParams, ctx, sym->memberScope,
+                             &td.genericConstraints);
+    for (const auto& m : td.members) {
+        if (!m) continue;
+        if (auto* member = collectMember(*m, *sym, ctx)) {
+            sym->members.push_back(member);
+        }
+    }
+    sym->hasPositionalFields = td.hasPositionalFields;
+    if (td.hasPositionalFields) {
+        for (const auto& pf : td.positionalFields) {
+            auto* fs = ctx.makeSymbol<FieldSymbol>();
+            fs->name = pf.name;
+            fs->visibility = ast::Visibility::Public;
+            fs->parent = sym;
+            fs->decl = &td;
+            fs->declLoc = (pf.loc.line != 0) ? pf.loc : sym->declLoc;
+            fs->posParam = &pf;
+            fs->scope = sym->memberScope;
+            if (pf.serialized) {
+                fs->serializedSkip     = pf.serialized->isSkip;
+                fs->serializedOptional = pf.serialized->isOptional;
+                fs->serializedWireName = pf.serialized->name;
+            }
+            if (pf.equality) fs->equalitySkip = pf.equality->isSkip;
+            sym->members.push_back(fs);
+        }
+    }
+    for (const auto& ec : td.enumConstants) {
+        auto* esym = ctx.makeSymbol<EnumConstantSymbol>();
+        esym->name = ec.name;
+        esym->parent = sym;
+        esym->declLoc = (ec.loc.line != 0) ? ec.loc : sym->declLoc;
+        esym->scope = sym->memberScope;
+        if (ec.serialized && !ec.serialized->name.empty())
+            esym->serializedName = ec.serialized->name;
+        sym->members.push_back(esym);
+    }
+    for (const auto& cc : td.choiceCases) {
+        auto* csym = ctx.makeSymbol<ChoiceCaseSymbol>();
+        csym->name = cc.name;
+        csym->parent = sym;
+        csym->caseDecl = &cc;
+        csym->declLoc = (cc.loc.line != 0) ? cc.loc : sym->declLoc;
+        csym->scope = sym->memberScope;
+        sym->members.push_back(csym);
+    }
+    return sym;
+}
 
 // §22.3 / §2.5 (v0.237, #2659, #2374): see Symbol.hpp for the contract and for
 // why every constructor-formal consumer must read BOTH sources. The local

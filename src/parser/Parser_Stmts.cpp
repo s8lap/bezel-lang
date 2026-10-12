@@ -1020,6 +1020,56 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         return std::unique_ptr<ast::Stmt>(th.release());
     }
 
+    // A.6 LocalTypeDecl (§21.10): `record` or `enum` as a statement.
+    // §21.10 restricts this to record/enum only (not class/interface/choice),
+    // with no visibility modifier and no generic params.
+    // §21.10: a visibility keyword on a local type is a compile error.
+    if (isKeyword("public") || isKeyword("private") ||
+        isKeyword("internal") || isKeyword("protected")) {
+        // Check if the next token is record or enum (a visibility keyword
+        // preceding a local type declaration).
+        auto visLoc = current_.location;
+        std::string_view visWord = current_.text;
+        advance(); // past the visibility keyword
+        if (isKeyword("record") || isKeyword("enum")) {
+            diagnostics_.report(
+                Severity::Error, visLoc,
+                std::string("a local type may not have a visibility modifier "
+                            "(§21.10)"));
+            // Parse and discard the local type so we don't cascade errors.
+            (void)parseTypeOrInterfaceDecl(ast::Visibility::Private, {});
+            return nullptr;
+        }
+        // Not a local type - visibility keyword in statement position is
+        // a parse error (fall through to expression parsing which will
+        // produce a more appropriate error).
+        // Note: we cannot put the token back, so we just proceed to
+        // expression parsing which will fail with "expected expression".
+    }
+    if (isKeyword("record") || isKeyword("enum")) {
+        auto typeDecl = parseTypeOrInterfaceDecl(ast::Visibility::Private, {});
+        // §21.10: only record and enum are allowed as local types.
+        if (typeDecl &&
+            typeDecl->kind != ast::TypeDeclKind::Record &&
+            typeDecl->kind != ast::TypeDeclKind::Enum) {
+            diagnostics_.report(
+                Severity::Error, typeDecl->span.begin,
+                "a local type may be `record` or `enum` only — `class`, "
+                "`interface`, and `choice` may not be declared locally "
+                "(§21.10)");
+        }
+        // §21.10: generic params are not permitted on a local type.
+        if (typeDecl && !typeDecl->genericParams.empty()) {
+            diagnostics_.report(
+                Severity::Error, typeDecl->span.begin,
+                "a local type may not have type parameters (§21.10)");
+        }
+        if (!typeDecl) return nullptr;
+        auto localType = std::make_unique<ast::LocalTypeDecl>();
+        localType->decl = std::move(typeDecl);
+        return std::unique_ptr<ast::Stmt>(localType.release());
+    }
+
     // Otherwise parse an expression and decide between IncrementStmt (`++`/
     // `--`), AssignmentStmt (assignment ops), and ExpressionStmt (fallback).
     // (DiscardStmt is committed on its leading `_` token above, §17.13.)

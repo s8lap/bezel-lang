@@ -33,4 +33,12 @@ namespace bezel::sema {
 // SourceFile's module symbol on the context.
 bool collectSymbols(const ast::SourceFile& src, SemaContext& ctx);
 
+// §21.10: collect a local (method-body) type declaration's symbol into
+// SemaContext. Used by ExprTC::visitStmt when walking method bodies.
+// `parentScope` is the ScopeId of the enclosing region (a fresh
+// ScopeId allocated by the caller for method-body-lifetime types).
+TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
+                            ScopeId parentScope,
+                            std::string_view enclosingTypePath = {});
+
 } // namespace bezel::sema

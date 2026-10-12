@@ -33,6 +33,7 @@
 
 #include "ast/Node.hpp"
 #include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 

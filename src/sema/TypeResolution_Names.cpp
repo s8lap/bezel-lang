@@ -3965,6 +3965,22 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 return;
             }
         }
+        // fix #2198: check module children for local types (§21.10)
+        if (ctx_.module() && t.name->parts.size() == 1) {
+            for (Symbol* child : ctx_.module()->children) {
+                if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                    if (ts->name == first) {
+                        ref.kind = TypeRef::Kind::Named;
+                        ref.declaration = ts;
+                        for (const auto& ga : t.genericArgs) {
+                            if (!ga) continue;
+                            ref.genericArgs.push_back(resolveType(*ga, scope));
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         {
             std::string msg = std::string("unresolved type name `") +
                               std::string(first) + "`";
@@ -4592,6 +4608,45 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         // fix #5111 (§14.6, v0.307): same recording for a `const` local —
         // see the `var` arm above for the full rationale.
         if (lc->type) currentAnnotatedLocals_[lc->name] = lc;
+        return;
+    }
+    if (auto* localType = dynamic_cast<const ast::LocalTypeDecl*>(&s)) {
+        // §21.10: a `record` or `enum` declaration in statement position.
+        // Create the TypeSymbol via collectTypeDecl and add it to
+        // ctx_.module()->children so that (a) resolveNamed can find it during
+        // this pass (for `var p := new Point(1, 2)` and for field types like
+        // `Inner: Point` in a later local type), and (b) ExprTC's later pass
+        // can find it and skip creating a duplicate symbol.
+        if (!scope) return;
+        // Check if a TypeSymbol for this name already exists in module children.
+        TypeSymbol* tsym = nullptr;
+        if (ctx_.module()) {
+            for (Symbol* child : ctx_.module()->children) {
+                if (auto* ts = dynamic_cast<TypeSymbol*>(child)) {
+                    if (ts->name == localType->decl->name) {
+                        tsym = ts;
+                        break;
+                    }
+                }
+            }
+        }
+        // If not found, create it via collectTypeDecl and register.
+        if (!tsym) {
+            tsym = collectTypeDecl(*localType->decl, ctx_, kModuleScope, {});
+            if (tsym) {
+                tsym->isLocalType = true;
+                if (ctx_.module()) {
+                    ctx_.module()->children.push_back(tsym);
+                }
+            }
+        }
+        // Walk members: resolve field types and any nested types' members.
+        Resolver::Scope typeScope;
+        typeScope.parent = scope;
+        for (const auto& m : localType->decl->members) {
+            if (!m) continue;
+            resolveMember(*m, &typeScope);
+        }
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {

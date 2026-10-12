@@ -176,6 +176,10 @@ struct TypeSymbol : Symbol {
     // or falls back to the ast::TypeDecl; for IMPORTED records only this
     // flag is available.
     bool hasPositionalFields = false;
+    // fix #2198 (§21.10, v0.310): true for a local (method-body) type declaration.
+    // Used by checkTopLevelVisibility to skip the §13.2 top-level-only visibility
+    // check — local types have method-body scope and are not top-level declarations.
+    bool isLocalType = false;
     // §10.3 (#740): for an ENUM, the resolved underlying-type TypeRef from the
     // `: byte|short|int|long|...` annotation. Null means the default `int`.
     // A primitive base type does not become a `baseTypes` entry (those hold
