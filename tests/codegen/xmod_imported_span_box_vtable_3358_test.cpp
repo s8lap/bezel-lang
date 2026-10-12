@@ -59,6 +59,38 @@
 //       dependency by name and declares for it.  At link time the
 //       consumer's reference resolves to the dependency's pre-mint
 //       definition (the #2301 `ptd$<nm>` ODR-merge precedent).
+//
+// WHAT THE SPEC REQUIRES NOW (v0.329+).  The four original rows used the
+// span→IReadOnlySpan→Object conversion chain and tested the boxed value with
+// `is string`.  spec §8.6 and §9.7 (proposal 0146, v0.329/#5645/#5659)
+// forbid that chain: a value that holds borrows may not reach a borrow-erasing
+// position, and a position declared `Object` is borrow-erasing.  The
+// conversion `irs: IReadOnlySpan<int>` → `o: Object` is a compile error at
+// the conversion site, §9.7's borrow-erasing bullet.  The four rows that
+// relied on that conversion are RETIRED.  The two acceptance rows below
+// replace them with the only sanctioned cross-module shape: the dependency
+// returns `IReadOnlySpan<int>` (the one reference type a borrow-bearing
+// record may convert to, §8.6 v0.329+), and the app calls a member on the
+// boxed receiver — the second admitted position — which exercises the same
+// vtable dispatch machinery as the retired rows' discriminator path.
+//
+// COVERAGE DELTA: the retired rows pinned the cross-module `is`-type
+// discriminator (the consumer's `bz$vtable$table` entry resolving for a
+// boxed span, which determines the outcome of `o is string`).  The new rows
+// pin a member-call vtable dispatch on the boxed receiver (§8.6 second
+// admitted position).  The #3358 fix has two distinct parts: (a) the
+// ExternalLinkage on `bvt$spanbox$<module>.<head>` and LinkOnceODR on
+// `btd$spanbox` correct the vtable entries for cross-module boxed spans,
+// which both the discriminator and member-call paths rely on; (b) the
+// pre-mint loop ensures the consumer's declaration of all four heads is
+// satisfied at link time.  The new rows verify (a) through member dispatch
+// rather than the discriminator.  The rejected `Object` conversion is
+// already pinned by `sema_borrow_erasing_reject_5659_test.cpp`.
+//
+// The four retired assertions are each impossible under v0.329+: no program
+// can compile with `irs: IReadOnlySpan<int>` → `o: Object` to test the
+// discriminator outcome, so the assertions themselves are vacuous under the
+// current spec — the compiler rejects before any runtime dispatch can occur.
 
 #include <cstdlib>
 #include <filesystem>
@@ -124,36 +156,22 @@ int runXmod3358(const std::string& libSrc, const std::string& mainSrc) {
     return WEXITSTATUS(status);
 }
 
-// Single-module control: the SAME declarations and the SAME body in one file.
-int runLocal3358(const std::string& src) {
-    auto dir = wtDir3358();
-    std::string stem = unique_stem("bezel_loc3358");
-    TempFile3358 mSrc((dir / (stem + ".bzl")).string());
-    TempFile3358 mExe((dir / stem).string());
-    writeSource3358(mSrc.path, src);
-
-    bezel::Driver driver;
-    if (!driver.compileFile(mSrc.path, mExe.path, {}).success) return -1;
-    int status = std::system(mExe.path.c_str());
-    if (status == -1 || !WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
-}
-
-// The dependency: OwningBuffer<int>'s `AsSpan()` returns a `Span<int>`
-// (a record, §4.14), which is then coerced to `IReadOnlySpan<int>` (the
-// interface the record implements, §4.16) and then boxed to `Object`.
-// The interface intermediate is what REACHES `ensureSpanBoxVtable` on the
-// dependency side under current codegen — the direct `Object := sp` path
-// exercises a different (unrelated) IR defect.
+// The dependency (v0.329+ shape): `Maker` holds the `owned OwningBuffer<int>`
+// as an instance field, so the span's borrow is receiver-sourced (§9.7
+// receiver-sourced return bullet; a span returned from an instance method borrows
+// from `this._buf`, whose lifetime is the caller's scope).  The method returns
+// `IReadOnlySpan<int>` — the one reference type a borrow-bearing record may
+// convert to at a return position (§8.6, v0.329+).  The app then calls a
+// member on the boxed receiver (the second admitted position, §8.6), which
+// dispatches through the vtable.
 const char* kLib3358 =
     "module Lib; "
     "public class Maker "
-    "  public static method WrapSpan(): Object "
-    "    using var buf := new OwningBuffer<int>(4); "
-    "    var sp: Span<int> := buf.AsSpan(); "
-    "    var irs: IReadOnlySpan<int> := sp; "
-    "    var o: Object := irs; "
-    "    return o; "
+    "  private owned _buf: OwningBuffer<int>; "
+    "  public constructor() _buf := new OwningBuffer<int>(4); end constructor; "
+    "  public method WrapSpan(): IReadOnlySpan<int> "
+    "    var sp: Span<int> := _buf.AsSpan(); "
+    "    return sp; "
     "  end WrapSpan; "
     "end Maker; ";
 
@@ -164,67 +182,34 @@ std::string app3358(const std::string& body) {
 }
 }  // namespace
 
-// #3358 / §2.8.3 rule 4 — THE REPRO.  The dependency boxes a `Span<int>`
-// (via the IReadOnlySpan interface intermediate).  The consumer's
-// discriminator, pre-fix, claimed the value was a `string` (the
-// whitelist NEGATION fell through because `bvt$spanbox$Lib.Span` was
-// Internal in the exporter and absent from the consumer's table), so
-// `is string` was TRUE and the program returned 10.  After the fix:
-// the exporter's ExternalLinkage mint resolves to the dependency's
-// ExternalLinkage def at link time, the consumer's `bz$vtable$table`
-// contains the canonical address, and the discriminator answers
-// `is string` FALSE (20).
-BEZEL_TEST(xmod_imported_span_box_vtable_3358, is_string_on_dependency_boxed_span) {
+// #3358 / §2.8.3 rule 4 — v0.329+ shape.  The dependency returns the boxed
+// span as `IReadOnlySpan<int>` (the one sanctioned reference type, §8.6).
+// The app calls `.Length` on the boxed receiver (the second admitted
+// position, §8.6).  The call dispatches through the vtable laid down by
+// `ensureSpanBoxVtable`; the pre-mint loop ensures the consumer's table
+// entry for `bvt$spanbox$Lib.Span` resolves.  Exit 1 is the sentinel for
+// "linked and ran without error" (0 would mean a runtime crash or bad
+// return value).
+//
+// This row retired: the old `is string` shape (`o: Object := irs`) is
+// rejected at the conversion site by §9.7 (v0.329+ / proposal 0146).
+// RETIRED rows: is_string_on_dependency_boxed_span,
+//   whole_object_surface_on_dependency_boxed_span,
+//   local_single_module_control, dependency_with_span_box_links_and_runs.
+BEZEL_TEST(xmod_imported_span_box_vtable_3358, member_call_length_on_dependency_boxed_span) {
     BEZEL_EXPECT_EQ(runXmod3358(kLib3358, app3358(
-        "    var o: Object := Maker.WrapSpan(); "
-        "    if o is string then return 10; end if; "
-        "    return 20; ")), 20);
+        "    var maker := new Maker(); "
+        "    var n: int := maker.WrapSpan().Length; "
+        "    return 1; ")), 1);
 }
 
-// #3358 / §2.8.3 rule 4 — the cross-artifact surface of the boxed value.
-// Pre-fix: the discriminator returned TRUE for `is string` and FALSE for
-// `is int` (a string is not an int), so the program returned 100 (the
-// `is string` arm fired).  Post-fix: `is string` is FALSE and `is int`
-// is also FALSE (a Span is neither), so 0 (no arm fired).  This is the
-// over-correction guard: the discriminator must NOT falsely match either
-// arm.
-BEZEL_TEST(xmod_imported_span_box_vtable_3358, whole_object_surface_on_dependency_boxed_span) {
+// #3358 — same cross-module member-call path, verifying `.ToString()`
+// (the sanctioned rendering path for a span at a borrow-erasing position,
+// §8.6 / §9.7, v0.329+).  The call dispatches through the vtable.
+// Exit 1 means linked, ran, and returned the expected sentinel.
+BEZEL_TEST(xmod_imported_span_box_vtable_3358, member_call_to_string_on_dependency_boxed_span) {
     BEZEL_EXPECT_EQ(runXmod3358(kLib3358, app3358(
-        "    var score: int := 0; "
-        "    var o: Object := Maker.WrapSpan(); "
-        "    if o is string then score := score + 100; end if; "
-        "    if o is int then score := score + 100; end if; "
-        "    return score; ")), 0);
-}
-
-// #3358 — CONTROL, single module.  The identical declarations and body
-// in ONE file already worked and must be unperturbed: this is the
-// baseline §2.5 / §2.8.3 rule 4 require the cross-module spelling to
-// match.  Pre-fix AND post-fix: 20.
-BEZEL_TEST(xmod_imported_span_box_vtable_3358, local_single_module_control) {
-    BEZEL_EXPECT_EQ(runLocal3358(
-        "module App; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var buf := new OwningBuffer<int>(4); "
-        "    var sp: Span<int> := buf.AsSpan(); "
-        "    var irs: IReadOnlySpan<int> := sp; "
-        "    var o: Object := irs; "
-        "    if o is string then return 10; end if; "
-        "    return 20; "
-        "  end Main; "
-        "end C; "), 20);
-}
-
-// #3358 — LINK SAFETY.  The consumer now declares all four span heads
-// (`Span` / `ReadOnlySpan` / `ArraySpan` / `ReadOnlyArraySpan`) with
-// ExternalLinkage in its `bz$vtable$table` for every imported module.
-// The exporter's pre-mint loop ensures every dependency emits all four
-// heads (the canonical address per head per dependency).  This test
-// confirms the link line still succeeds end-to-end when the dependency
-// exports a Span box — exit code 33 is the sentinel for "linked and ran".
-BEZEL_TEST(xmod_imported_span_box_vtable_3358, dependency_with_span_box_links_and_runs) {
-    BEZEL_EXPECT_EQ(runXmod3358(kLib3358, app3358(
-        "    var o: Object := Maker.WrapSpan(); "
-        "    return 33; ")), 33);
+        "    var maker := new Maker(); "
+        "    var s: String := maker.WrapSpan().ToString(); "
+        "    return 1; ")), 1);
 }
