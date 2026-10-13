@@ -398,3 +398,25 @@ the `Counter<K>.Increment` value-copy reject waits for `Counter<K>` itself
 `s28_11_0022` is written; `s27_6_0011` is rejected by today's parser
 ([#5814](https://github.com/s8lap/bezel-lang/issues/5814)) before the
 constraint it pins, so its diagnostic will mismatch until the parser is fixed.
+
+### v0.336 cases — 2026-10-13 (unclassified)
+
+The rules spec v0.336 introduced (proposals 0174–0176 and the #5890–#5897
+rulings): **45 new cases** (2501 → 2546), authored from the v0.336 text with
+no `bezelc` available and verified by an independent reader, so — as in the
+catch-ups above — none is banked. Spec-ahead cases name their implementing
+tracker: [#5923](https://github.com/s8lap/bezel-lang/issues/5923) (0174),
+[#5921](https://github.com/s8lap/bezel-lang/issues/5921) (0175),
+[#5924](https://github.com/s8lap/bezel-lang/issues/5924) (0176),
+[#5922](https://github.com/s8lap/bezel-lang/issues/5922) (#5894).
+
+| area | sections | cases |
+|---|---|---|
+| the replacing `move loc with e` (exchange order, nullable bare take, borrowed receiver, destructor take, K9.4 statics, collection slots) | 28.8.1, 28.11 | 19 |
+| the read-only span interface retired (`SequenceEqual` overloads, `.AsReadOnly()`, the byte read tier) | stdlib 3.3, 4.14–4.16 | 8 |
+| the own-typed `Equals` is the slot (`GetHashCode` with it, boxes, type parameters, the per-member use-site rule) | 9.2, 9.3, 25.2 | 10 |
+| rulings #5890, #5893, #5894, #5896, #5897 | 14.2, 27.7.1, 28.5, 28.6, 28.11 | 8 |
+
+Not written: rules already pinned by banked cases (`s28_8_1_0002`,
+`s15_3_0008`, `s28_8_1_0011`, re-keyed on the trackers), a move across
+`await`/`finally`, and the open questions #5913–#5920.
