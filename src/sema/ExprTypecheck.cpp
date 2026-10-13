@@ -2764,7 +2764,6 @@ bool ExprTC::rejectUnadmittedNamedSlotHead(ast::DestructuringPattern& dp,
     if (!head || head->name != headName) return false;
 
     const auto reject = [&]() {
-        for (auto& sp : dp.subPatterns) sp.hasMoveMarker = false;
         return true;
     };
     if (head->kind == ast::TypeDeclKind::Enum) {
