@@ -764,8 +764,25 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     std::unordered_set<const sema::Symbol*> spentImportedQueryRights;
     for (const sema::Symbol* s : allSpentQueryRights) {
         const auto* ls = dynamic_cast<const sema::LocalSymbol*>(s);
-        const auto* ld =
-            ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
+        // Both sets this loop fills are read ONLY from inside run()'s
+        // `for (const auto& [sym, st] : endState)` arm gated on
+        // `st.state == OwnershipState::Owned && !st.implicitDischarge` — the
+        // must-use suppression at :1147 and :1373 and the §28.3 hard-reject
+        // skip at :1465 are all under that one `if`. A §21.1 `const` local's
+        // `states_` entry is never Owned (visitStmt's LocalConstDecl arm
+        // records no obligation at all — "a `const` local carries no
+        // obligation"), so a `const` symbol this loop skips can never be `sym`
+        // at any of the three reads. Note the cast is NOT structurally
+        // unreachable: §21.1 admits a `const` bound to a BORROW of a stored
+        // lazy query (`const conn := b.Q;` compiles), and §29.11's normative
+        // consumption-point item 3 spends that right — so `ls->decl` here CAN
+        // be a LocalConstDecl. It is the OWNED gate downstream, not the
+        // binding form, that makes the skip unobservable.
+        // // per §21.1, §29.11, #3591
+        const auto* ld = ls
+            // LOCALDECL-ONLY: a `const` local's state is never Owned, so neither set's only readers can ever see one
+            ? dynamic_cast<const ast::LocalDecl*>(ls->decl)
+            : nullptr;
         if (!ld || !ld->initializer) continue;
         // Same-module sentinel: the shape the pre-widening scan admitted, so
         // the must-use set is exactly what ca860313's suppression used.
@@ -2534,6 +2551,40 @@ void scanLazyConsumptionStmt(const ast::Stmt& s, sema::SemaContext& ctx,
         scanLazyConsumptionExpr(is->target.get(), ctx, out);
     } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         scanLazyConsumptionExpr(ld->initializer.get(), ctx, out);
+    } else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        // fix #3591 (§29.11, v0.334): the `const` twin of the `var` arm above,
+        // reading `value` where `var` reads `initializer` — the two are SIBLING
+        // A.6 nodes (`LocalConstDecl ::= "const" Id (":" T)? ":=" ConstExpr ";"`),
+        // not a base/derived pair, so the `var` cast MISSES every `const`.
+        //
+        // §29.11's normative consumption-point list is about the USE of the
+        // query, not the binding form of the declaration the use happens to sit
+        // in: item 1 spends a bound query's enumeration right at "Enumeration
+        // or a terminal operator (`for`, `Count`, `First`, `ToArray`, …)"
+        // wherever that operator is spelled. And §21.1 (Runtime `const` locals)
+        // ADMITS a value-typed `const` whose initializer is exactly such an
+        // operator — `const n := q.Count();` is a runtime const of type `int`,
+        // not a rejected owned production. So before this arm the walker no-opped
+        // for the whole `const` binding form and the §29.11 suppression never
+        // fired, making the must-use lint fire on a query whose right WAS spent.
+        //
+        // MEASURED differential on this tree (bezelc rebuilt from this branch),
+        // the two programs differ ONLY in the `const`/`var` keyword and are
+        // otherwise byte-identical:
+        //     var   q := xs.Where(lambda(r) => r > 1);   // no warning
+        //     var   n := q.Count();
+        //     const n := q.Count();                      // FIRED (§28.3 must-use)
+        // §29.11 says that warning "is suppressed where the binding's
+        // enumeration right is spent at a statically visible consumption
+        // point", so the `const` row was a false positive.
+        //
+        // Direction of the change: this arm can only ADD spent rights, and
+        // every consumer of them (the two must-use suppressions and the §28.3
+        // hard-reject skip) is a `continue` on a diagnostic — so the arm can
+        // only REMOVE diagnostics, never add one. It makes the `const` spelling
+        // behave as §29.11 already makes the `var` spelling behave.
+        // // per §21.1, §29.11, #3591
+        scanLazyConsumptionExpr(lc->value.get(), ctx, out);
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         scanLazyConsumptionExpr(es->expr.get(), ctx, out);
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
