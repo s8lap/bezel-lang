@@ -225,3 +225,121 @@ BEZEL_TEST(sema_ref_move_only_residual_5986,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
 }
+
+// --- follow-up (#5986 review): further written positions ---------------------
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           indexer_type_function_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type written as an INDEXER's value type
+    // (`property [i: int]`, §23.4) carries the same `ref` slot.
+    auto r = runAot(kPrelude +
+                    "class C private _f: ((ref Bundle) -> ())? := null; "
+                    "public property [i: int]: ((ref Bundle) -> ())? get => _f; end; "
+                    "public static method Main() end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           interface_member_return_function_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type written as an INTERFACE member's
+    // return type.
+    auto r = runAot(kPrelude +
+                    "interface IF method G(): ((ref Bundle) -> ())?; end IF; "
+                    "class C public static method Main() end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           record_component_function_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type written as a RECORD component.
+    auto r = runAot(kPrelude +
+                    "record R(F: ((ref Bundle) -> ())?); "
+                    "class C public static method Main() end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           choice_payload_function_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type written as a CHOICE case payload.
+    auto r = runAot(kPrelude +
+                    "choice H Hold(f: (ref Bundle) -> ()), Empty; end H; "
+                    "class C public static method Main() end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           task_generic_argument_function_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type as the generic argument of `Task<…>`.
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var t: Task<(ref Bundle) -> ()>? := null; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           expression_new_array_function_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: an EXPRESSION-level function type, the type argument
+    // of `new Array<…>(3)`, is written at the same position rule.
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var a := new Array<(ref Bundle) -> ()>(3); end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           is_test_function_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type written in an `is` test (an
+    // expression-level type position) is rejected like any other written type.
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var o: Object := new Res(); "
+                    "if o is ((ref Bundle) -> ())? then end; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           function_type_naming_choice_declared_later_rejected_sec_22_3) {
+    // §22.3 `ref` bullet, classification-order hazard: the function type names
+    // an owning choice declared AFTER its use. The decision waits for every
+    // choice's classification, so the later declaration still decides it.
+    auto r = runAot("module M; "
+                    "class C public static method Main() "
+                    "var f: ((ref Bundle) -> ())? := null; end Main; end C; "
+                    "choice Bundle Ready(owned first: Res), Empty; end Bundle; "
+                    "class Res public constructor() end constructor; end Res;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+// --- controls: a nullable copyable choice and a nullable owning class run ----
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           function_type_ref_nullable_copyable_choice_still_accepted_sec_22_3) {
+    // §22.3 `ref` bullet, control: `Color?` is a nullable COPYABLE choice, not a
+    // move-only value type (§35.9 applies only to an owning `C`); the slot runs.
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var f: ((ref Color?) -> ())? := null; "
+                    "Console.WriteLine(\"ran\"); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           function_type_ref_nullable_owning_class_still_accepted_sec_22_3) {
+    // §22.3 `ref` bullet, control: `Res?` is the nullable of an owning CLASS,
+    // a reference type and not a move-only value type; the slot runs.
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var f: ((ref Res?) -> ())? := null; "
+                    "Console.WriteLine(\"ran\"); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
+}
