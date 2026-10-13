@@ -7082,6 +7082,34 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
         return llvm::ConstantPointerNull::get(ptrTy());
     };
 
+    // §30.11 (v0.338): the NON-GENERIC `TaskCompletionSource` has the same shape
+    // minus the `result` parameter, so `SetResult()` / `TrySetResult()` take no
+    // argument and complete the task with no value. Pre-fix this zero-argument
+    // call fell through the arm below (guarded on `!call.args.empty()`) and
+    // emitted nothing: a static-field receiver compiled to a silent no-op and
+    // an awaiting task never completed (#5984). A null result with size 0 is
+    // the void completion: bz_task_complete copies nothing when result_size is 0.
+    // Restricted to the non-generic form (no generic arguments) so the generic
+    // `TaskCompletionSource<T>` is untouched.
+    if ((mname == "TrySetResult" || mname == "SetResult") &&
+        call.args.empty() && recvTy->genericArgs.empty()) {
+        auto* tryFn = declareC("bz_tcs_try_set_result", i32(),
+                                {ptrTy(), ptrTy(), i64()});
+        llvm::Value* ok32 = builder_.CreateCall(tryFn,
+            {tcs, llvm::ConstantPointerNull::get(ptrTy()), builder_.getInt64(0)},
+            "tcs.trysetvoid");
+        llvm::Value* ok1 = builder_.CreateICmpNE(
+            ok32, llvm::ConstantInt::get(i32(), 0), "tcs.trysetvoid.b");
+        if (mname == "SetResult") {
+            // Already terminal: throw InvalidOperationException (as the
+            // generic arm does, per §30.11).
+            llvm::Value* fail = builder_.CreateNot(ok1, "tcs.setvoid.fail");
+            emitGuardThrow(fail, "InvalidOperationException");
+            return nullptr;  // unit return
+        }
+        return ok1;
+    }
+
     // TrySetResult / SetResult — pass the value through a stack slot.
     // Pattern mirrors Task.FromResult (LlvmBackend_Calls.cpp §6.7 arm above).
     // For OwningTaskCompletionSource<T>, T is a class pointer — same layout as
