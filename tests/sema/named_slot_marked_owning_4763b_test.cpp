@@ -1,5 +1,8 @@
 // Spec-derived tests for §19.3 "Named-slot bindings and ownership" (v0.334)
 // — the §35.5 rule that a MARKED named slot (`move N = var x`) DOES transfer.
+// v0.338 (proposal 0183) RETIRED the marked slot: every row whose program used
+// the marker now pins the parser rejection "`move` is not a slot spelling"
+// (§19.3, §35.5 v0.338). The positional controls below are unchanged.
 // This is the follow-up #4763 named: its two skip sites
 // (`collectOwningMatchTransferBindings`, `markOwningMatchTransferredSlots`)
 // both carried "whoever implements that admission must revisit this line".
@@ -148,7 +151,7 @@ std::string loopedProgram(int payloadCount, const std::string& arm) {
 // is only reachable if the slot was marked and the arm really does own it.
 // ===========================================================================
 BEZEL_TEST(named_slot_marked_owning_4763b,
-           marked_named_slot_transfers_its_payload_spec_19_3_35_5) {
+           marked_named_slot_is_rejected_spec_19_3_35_5_v0_338) {
     auto r = runAot(owningChoice(1) +
         "public class Program "
         "  public static method Main() "
@@ -163,12 +166,11 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
         "    Console.WriteLine(\"after\"); "
         "  end Main; "
         "end Program; ");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(outContains(r, "adopted"));
-    // Exactly ONE. Two would be the double free the codegen mark prevents.
-    BEZEL_EXPECT_EQ(countOut(r, "widget disposed"), 1);
-    BEZEL_EXPECT_TRUE(outContains(r, "after"));
+    // v0.338 (proposal 0183): the marked named slot is retired. Flipped from
+    // the admitted run row; the parser now rejects `move` at a named slot.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "positional destructure"));
 }
 
 // ===========================================================================
@@ -186,17 +188,18 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
 // this row would pass on both wrong implementations.
 // ===========================================================================
 BEZEL_TEST(named_slot_marked_owning_4763b,
-           marked_named_slot_adoption_disposes_exactly_once_looped) {
+           marked_named_slot_adoption_is_rejected_looped_v0_338) {
     auto r = runAot(loopedProgram(
         1,
         "        Fetched(move p0 = var r) => do "
         "          using var w := move r; "
         "        end, "
         "        Failed(_) => Console.WriteLine(\"failed\") "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(outContains(r, "done"));
-    BEZEL_EXPECT_EQ(countOut(r, "widget disposed"), kIters);
+    // v0.338: flipped from the looped disposal row (200 destructor lines).
+    // No program with a marked named slot now compiles, so there is no
+    // disposal to count; the positional control rows keep the oracle.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
 }
 
 // ===========================================================================
@@ -216,18 +219,16 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
 // gives 600 (the adopted one is disposed twice).
 // ===========================================================================
 BEZEL_TEST(named_slot_marked_owning_4763b,
-           marked_and_unmarked_named_slots_compose_per_slot_looped) {
+           marked_and_unmarked_named_slots_compose_per_slot_is_rejected_v0_338) {
     auto r = runAot(loopedProgram(
         2,
         "        Fetched(move p0 = var r, p1 = var b) => do "
         "          using var w := move r; "
         "        end, "
         "        Failed(_) => Console.WriteLine(\"failed\") "));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(outContains(r, "done"));
-    // 200 adopted by the arm + 200 reclaimed at construct completion.
-    BEZEL_EXPECT_EQ(countOut(r, "widget disposed"), 2 * kIters);
+    // v0.338: flipped from the looped composition row (400 destructor lines).
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
 }
 
 // DIFFERENTIAL CONTROL for the row above — the POSITIONAL spelling of the same
@@ -320,12 +321,11 @@ std::string nestedMoveOnlyProgram(const char* slotText) {
 }  // namespace
 
 BEZEL_TEST(named_slot_marked_owning_4763b,
-           marked_named_slot_over_move_only_payload_transfers_looped) {
+           marked_named_slot_over_move_only_payload_is_rejected_looped_v0_338) {
     auto r = runAot(nestedMoveOnlyProgram("move inner = var h"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(outContains(r, "done"));
-    BEZEL_EXPECT_EQ(countOut(r, "w disposed"), 200);
+    // v0.338: flipped from the admitted run row (200 "w disposed" lines).
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
 }
 
 BEZEL_TEST(named_slot_marked_owning_4763b,
@@ -392,10 +392,11 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
         "    _ := outcome; "
         "  end Main; "
         "end Program; ");
+    // v0.338: the marker is now a parse error, so the borrowing-match
+    // diagnostic is no longer reached for a marked slot.
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "borrowing match"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "19.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "35.5"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "positional destructure"));
 }
 
 // The same refusal over a PARAMETER scrutinee — conformance case s35_5_0009's
@@ -418,7 +419,7 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
         "  end Main; "
         "end Program; ");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "borrowing match"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
 }
 
 // ===========================================================================
@@ -453,9 +454,8 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
         "  end Main; "
         "end Program; ");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "plain (unmarked) class"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "owned"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "19.3"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "positional destructure"));
 }
 
 // §19.3 condition (ii), second refusal — "on a **copyable value, `string`, or
@@ -489,8 +489,8 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
         "  end Main; "
         "end Program; ");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "runtime-managed payload"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "19.3"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "positional destructure"));
 }
 
 // ===========================================================================
@@ -514,9 +514,8 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
         "  end Main; "
         "end Program; ");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "already disposed at construct completion"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "17.13"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "19.3"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "positional destructure"));
 }
 
 // The head condition — "on a **record or class** pattern head — by derivation,
@@ -546,9 +545,8 @@ BEZEL_TEST(named_slot_marked_owning_4763b,
         "  end Main; "
         "end Program; ");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "choice case head"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "28.5"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "28.6"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "positional destructure"));
     // Exactly ONE diagnostic: the head condition, not also the borrowing match.
     int errors = 0;
     for (const auto& d : r.diagnostics.diagnostics())

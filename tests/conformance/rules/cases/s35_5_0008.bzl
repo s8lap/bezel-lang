@@ -1,15 +1,14 @@
 //! case: s35_5_0008
 //! doc: spec
 //! section: 35.5
-//! title: a marked named slot transfers its payload at arm selection
-//! rule: A named slot may carry the transfer marker on its source: Fetched(move
-//!   response = var r) transfers the payload into r at arm selection, exactly as
-//!   the corresponding positional slot would.
+//! title: a marked named slot is rejected (the marker is retired at v0.338)
+//! rule: A named slot **never transfers** ... `move` is not a slot spelling
+//!   (`Fetched(move response = var r)` is a compile error at the pattern naming
+//!   the positional form — retired v0.338)
 //! cites: 35.5, 19.3
-//! expect: run
-//! output: adopted
-//!   widget disposed
-//!   after
+//! expect: reject
+//! diagnostic: is not a slot spelling
+//! issue: 5938
 module Conf;
 
 public class Widget

@@ -342,13 +342,13 @@ BEZEL_TEST(case_named_slot_2197,
 }
 
 // ===========================================================================
-// REJECT — §19.3 "Named-slot bindings and ownership": the `move` marker is
-// admitted only on a CHOICE case head — "on a record or class pattern head —
-// by derivation, not fiat: no obligation-bearing slot can exist there … so
-// marked slots are choice-case-only". A record head admits none.
+// REJECT — §19.3 (v0.338, proposal 0183): the marked named slot is retired.
+// `move` is not a slot spelling at any pattern head; the parser rejects it
+// with the positional-form diagnostic. (Before v0.338 the marker was admitted
+// only on a CHOICE case head, and this row pinned the record-head rejection.)
 //
-// This is also the row that makes `PositionalPattern::hasMoveMarker` a field
-// with a real reader. The parser test below pins that `move N = ` PARSES (the
+// This row historically made `PositionalPattern::hasMoveMarker` a field with a
+// real reader. The parser test below pins that `move N = ` PARSES (the
 // marker is spelled on the keyword `move`, which §B.1 reserves, so a parser
 // that looked for an Identifier could never reach it) and this row pins that
 // the marker is then REJECTED rather than silently ignored.
@@ -368,7 +368,9 @@ BEZEL_TEST(case_named_slot_2197,
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "`move` marker on named slot"));
+    // v0.338 (proposal 0183): `move` is not a slot spelling; the parser
+    // rejects it before sema's record-head check is reached.
+    BEZEL_EXPECT_TRUE(diagContains(r, "is not a slot spelling"));
 }
 
 // ===========================================================================

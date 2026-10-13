@@ -1652,6 +1652,15 @@ ast::PositionalPattern Parser::parsePositionalPattern() {
     // it is not a named slot and falls through to the positional path.
     if (isKeyword("move") && peekAt(1).kind == TokenKind::Identifier &&
         peekAt(2).kind == TokenKind::Punctuator && peekAt(2).text == "=") {
+        // §19.3 / §35.5 v0.338 (proposal 0183): the marked named slot is
+        // retired. `move` is not a slot spelling; a named slot never
+        // transfers, so the diagnostic names the positional destructure.
+        // The marker is still consumed so the rest of the slot parses and
+        // recovery does not cascade.
+        diagnostics_.report(Severity::Error, current_.location,
+                            "`move` is not a slot spelling — a named slot "
+                            "never transfers; write the positional destructure "
+                            "(§19.3, §35.5)");
         pp.hasMoveMarker = true;
         advance();  // `move`
     }

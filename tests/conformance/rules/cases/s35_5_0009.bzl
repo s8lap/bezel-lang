@@ -6,7 +6,7 @@
 //!   (`Fetched(move response = var r)` is a compile error at the pattern
 //!   naming the positional form — retired v0.338)
 //! expect: reject
-//! diagnostic: borrowing match
+//! diagnostic: is not a slot spelling
 //! issue: 4763
 module Conf;
 
