@@ -6082,6 +6082,80 @@ static bool overrideWideningIsAbiSafe(const TypeRef* t, bool isByRefParam) {
     return false;
 }
 
+// fix #6000 (§12.1, v0.338): "parameter types ... must match the base member
+// exactly". `typeRefEqual` identifies a Named type by its `declaration`, and a
+// compiler-known class has none (the built-in exceptions, `Stack`, `Queue`,
+// `StringBuilder`, ...): two such types of the same shape compared equal
+// whatever their names, so `override Log(e: ArgumentException)` was accepted
+// over `virtual Log(e: Exception)`. This walks the two types in parallel and
+// reports a declaration-less Named pair whose SPELLING differs. The spelling
+// is the alias-transparent head (§27.8: an alias is a pure synonym, resolved
+// before comparing; `aliasResolvedHead` holds the underlying head), else the
+// last qualifier part. A type parameter is also declaration-less; the callers
+// substitute the base's parameters first, so a mismatch there is a mismatch.
+static std::string_view declLessNamedSpelling(const TypeRef* t) {
+    if (!t->aliasResolvedHead.empty()) return t->aliasResolvedHead;
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        return t->astNode->name->parts.back();
+    return t->importedName;
+}
+
+// The names of the type parameters in scope at a member: its own and its
+// declaring type's. A type-parameter reference has the same declaration-less
+// shape as a built-in class, so the comparison below leaves any reference to
+// one of these names to the existing structural check (a method's `U` and the
+// overridden method's `T` correspond by position, not by name, §11.2).
+static std::unordered_set<std::string_view> typeParamNamesInScope(
+    const MemberSymbol* m1, const MemberSymbol* m2) {
+    std::unordered_set<std::string_view> names;
+    auto add = [&](const std::vector<Symbol*>& gps) {
+        for (const Symbol* gp : gps)
+            if (gp) names.insert(gp->name);
+    };
+    for (const MemberSymbol* m : {m1, m2}) {
+        if (!m) continue;
+        if (auto* ms = dynamic_cast<const MethodSymbol*>(m))
+            add(ms->genericParams);
+        if (m->parent) add(m->parent->genericParams);
+    }
+    return names;
+}
+
+static bool declLessNamedSpellingDiffers(
+    const TypeRef* a, const TypeRef* b,
+    const std::unordered_set<std::string_view>& tparams) {
+    if (!a || !b || a->kind != b->kind) return false;
+    switch (a->kind) {
+        case TypeRef::Kind::Named:
+            if (!a->declaration && !b->declaration) {
+                std::string_view sa = declLessNamedSpelling(a);
+                std::string_view sb = declLessNamedSpelling(b);
+                if (sa != sb && !tparams.count(sa) && !tparams.count(sb))
+                    return true;
+            }
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (declLessNamedSpellingDiffers(a->genericArgs[i],
+                                                 b->genericArgs[i], tparams))
+                    return true;
+            return false;
+        case TypeRef::Kind::InlineArray:
+            return declLessNamedSpellingDiffers(a->arrayElement,
+                                                b->arrayElement, tparams);
+        case TypeRef::Kind::Function:
+            if (a->funcParams.size() != b->funcParams.size()) return false;
+            for (std::size_t i = 0; i < a->funcParams.size(); ++i)
+                if (declLessNamedSpellingDiffers(a->funcParams[i].type,
+                                                 b->funcParams[i].type,
+                                                 tparams))
+                    return true;
+            return declLessNamedSpellingDiffers(a->funcReturn, b->funcReturn,
+                                                tparams);
+        default:
+            return false;
+    }
+}
+
 // §12.1 (v0.181, #1560): does a derived (override) parameter type MATCH a
 // base parameter type — exactly, or via the one admitted widening (base `T`,
 // derived `T?`)? Mirrors §11.2's interface-implementation-matching
@@ -6129,6 +6203,7 @@ bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
         return false;
     std::unordered_map<std::string_view, TypeRef*> genericSubst;
     buildBaseGenericSubst(derived, base, genericSubst);
+    const auto tparamNames = typeParamNamesInScope(derived, base);
     for (std::size_t i = 0; i < derived->params.size(); ++i) {
         auto* dp = dynamic_cast<ParameterSymbol*>(derived->params[i]);
         auto* bp = dynamic_cast<ParameterSymbol*>(base->params[i]);
@@ -6142,7 +6217,8 @@ bool Resolver::overrideParamsMatch(MethodSymbol* derived, MethodSymbol* base) {
         TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
         // #1592: dp->modifier == bp->modifier already (checked above), so
         // either symbol's modifier tells us whether this is a by-ref param.
-        if (!overrideParamTypeMatches(dt, btSubst,
+        if (declLessNamedSpellingDiffers(dt, btSubst, tparamNames) ||
+            !overrideParamTypeMatches(dt, btSubst,
                                       isByRefParamModifier(dp->modifier)))
             return false;
     }
@@ -6522,6 +6598,7 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
             err("`owned` return modifier");
         }
     }
+    const auto tparamNames = typeParamNamesInScope(derived, base);
     // Parameters: count, exact modifier, exact type.
     if (derived->params.size() != base->params.size()) {
         err("parameter count");
@@ -6564,8 +6641,9 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
         // #1592: dp->modifier == bp->modifier already (checked above).
         if (dt && btSubst &&
-            !overrideParamTypeMatches(dt, btSubst,
-                                      isByRefParamModifier(dp->modifier))) {
+            (declLessNamedSpellingDiffers(dt, btSubst, tparamNames) ||
+             !overrideParamTypeMatches(dt, btSubst,
+                                       isByRefParamModifier(dp->modifier)))) {
             err("parameter types");
             return;
         }
@@ -6912,6 +6990,7 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
             err("index parameter count");
             return;
         }
+        const auto tparamNames = typeParamNamesInScope(derived, base);
         for (std::size_t i = 0; i < derived->indexerParams.size(); ++i) {
             auto* dp =
                 dynamic_cast<ParameterSymbol*>(derived->indexerParams[i]);
@@ -6940,8 +7019,9 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
                              : bp->resolvedDeclType;
             TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
             if (dt && btSubst &&
-                !overrideParamTypeMatches(dt, btSubst,
-                                          isByRefParamModifier(dp->modifier))) {
+                (declLessNamedSpellingDiffers(dt, btSubst, tparamNames) ||
+                 !overrideParamTypeMatches(dt, btSubst,
+                                           isByRefParamModifier(dp->modifier)))) {
                 err("index parameter types");
                 return;
             }
