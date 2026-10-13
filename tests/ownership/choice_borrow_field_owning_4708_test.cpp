@@ -25,7 +25,8 @@
 // short-circuits `BorrowBearing` and `ValueLike` via `classifyChoiceType`, then
 // walks `Owning` choices' case payloads under §9.7's field-level predicate.
 // Plain `Owning` (no held borrows) and `ValueLike` choices remain admitted at
-// every site — a regression pin for the §35.4 final paragraph "a move-only
+// every site (the `owned` FIELD modifier on a ValueLike choice is the one
+// exception, rejected by §28.5 per #5898) — a regression pin for the §35.4 final paragraph "a move-only
 // value carrying no borrows may be a class field".
 //
 // Each `BEZEL_TEST` in this file pins one of:
@@ -250,12 +251,14 @@ BEZEL_TEST(choice_borrow_field_owning_4708, plain_owning_class_field_accepted) {
 }
 
 // ===========================================================================
-// (P) ValueLike (`VOpt`) at a class field is ADMITTED — §35.4 rule 3
-// construction: every payload is value-typed; no held borrows. Regression
-// pin: a fix that touches ValueLike at all would over-reject this.
+// (R) `owned` on a VALUE-classified choice (`VOpt`) at a class field is
+// REJECTED — §28.5 bullet 1 (v0.338): the `owned` field modifier marks only a
+// class or interface field, or is admitted-but-redundant on an owning-choice
+// field; a value-classified choice is neither. Issue #5898. The diagnostic
+// names §28.5.
 // ===========================================================================
 BEZEL_TEST(choice_borrow_field_owning_4708,
-           value_like_choice_class_field_accepted) {
+           value_like_choice_class_field_rejected) {
     auto r = parseAndCheckOwnership(
         std::string(kResLog) +
         "class Holder "
@@ -266,6 +269,31 @@ BEZEL_TEST(choice_borrow_field_owning_4708,
         "  var h := new Holder(VOpt.Some(7)); "
         "  return 0; "
         "end Main; end C;");
+    dumpDiag("value_like_choice_class_field_rejected", r);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasError(r, "§28.5"));
+    BEZEL_EXPECT_TRUE(hasError(r, "value-classified choice"));
+}
+
+// ===========================================================================
+// (P) ValueLike (`VOpt`) WITHOUT the `owned` modifier at a class field is
+// ADMITTED — §35.4 rule 3 construction: every payload is value-typed; no held
+// borrows. The field is an ordinary copyable value. Regression pin for the
+// #5898 field-only rejection: the modifier is what is rejected, not the type.
+// ===========================================================================
+BEZEL_TEST(choice_borrow_field_owning_4708,
+           value_like_choice_class_field_unmarked_accepted) {
+    auto r = parseAndCheckOwnership(
+        std::string(kResLog) +
+        "class Holder "
+        "  private _v: VOpt; "
+        "  public constructor(x: VOpt) _v := x; end constructor; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  var h := new Holder(VOpt.Some(7)); "
+        "  return 0; "
+        "end Main; end C;");
+    dumpDiag("value_like_choice_class_field_unmarked_accepted", r);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

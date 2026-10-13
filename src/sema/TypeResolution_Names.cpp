@@ -1565,6 +1565,26 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
                             "their contents (`[N owned]T?`), or drop the "
                             "field-level `owned` modifier");
                     }
+                } else if (rt->kind == TypeRef::Kind::Named &&
+                           rt->declaration &&
+                           rt->declaration->kind == ast::TypeDeclKind::Choice &&
+                           common::classifyChoiceType(rt, ctx_) ==
+                               common::ChoiceClassification::ValueLike) {
+                    // §28.5 bullet 1 (v0.338): the `owned` field modifier is
+                    // marked only on a class or interface field, or admitted-
+                    // but-redundant on an owning-choice field. A value-
+                    // classified choice is neither, so the marker is rejected.
+                    // Field-only: checkOwnedDeclType also serves parameters,
+                    // returns and lambdas, where §28.1 governs.
+                    ctx_.diagnostics().report(
+                        Severity::Error, fd->span.begin,
+                        std::string("field `") + std::string(fd->name) +
+                        "` of class is `owned` but its type is a value-"
+                        "classified choice — a value type with no disposal "
+                        "obligation to transfer. The `owned` field modifier "
+                        "marks only class and interface fields (§28.5); drop "
+                        "the modifier, the choice is an ordinary copyable "
+                        "value");
                 } else {
                     // Non-inline-array case: defer to checkOwnedDeclType's
                     // §28.1 type-requirement machinery for `string`,
