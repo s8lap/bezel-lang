@@ -694,6 +694,26 @@ static bool bz_key_eq(const char* a, int64_t alen, int8_t aw,
     return true;
 }
 
+// fix #4493 (stdlib §4.17 ordering is K's CompareTo; stdlib §9.6 ordinal,
+// code-point-based; spec §4.6): ordinal code-point order over two key buffers,
+// each read at its OWN storage width. Returns -1/0/+1 (sign is the contract,
+// stdlib §2.8). Byte order and NUL-terminated strcmp are both wrong here: a
+// width-2 buffer's low bytes do not order code points, and a zero high byte
+// would end a strcmp early. Same relation as bz_str_compare_cp (#4487).
+static int bz_key_cmp_cp(const char* a, int64_t alen, int8_t aw,
+                         const char* b, int64_t blen, int8_t bw) {
+    if (!a) alen = 0;
+    if (!b) blen = 0;
+    int64_t n = alen < blen ? alen : blen;
+    for (int64_t i = 0; i < n; i++) {
+        uint32_t ca = bz_key_cp(a, aw > 0 ? aw : 1, i);
+        uint32_t cb = bz_key_cp(b, bw > 0 ? bw : 1, i);
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+    if (alen == blen) return 0;
+    return alen < blen ? -1 : 1;
+}
+
 // fix #4499 (Defect B): copy a string key's raw bytes with malloc+memcpy.
 // The pre-fix `strndup(k, k_len)` was wrong twice over: `k` is a bz_string
 // data buffer, which is NOT a C string, and `k_len` is a code-point count, not
@@ -704,8 +724,8 @@ static bool bz_key_eq(const char* a, int64_t alen, int8_t aw,
 // past the allocation. Measured pre-fix: AddressSanitizer heap-buffer-overflow,
 // "0 bytes after 2-byte region", on `d["a\u0000b"] := 1;` twice over.
 // One extra width-sized zero slot terminates the copy the way bz_string's own
-// buffers are terminated, keeping the strcmp-based ordering scans below (#4493)
-// memory-safe.
+// buffers are terminated, keeping the ordering scans below (#4493) memory-safe
+// (the code-point comparator reads by length, so the slot is defensive only).
 static char* bz_key_dup(const char* k, int64_t cp_len, int8_t w) {
     size_t wb = (size_t)(w > 0 ? w : 1);
     size_t n  = (size_t)cp_len * wb;
@@ -1362,7 +1382,7 @@ void* bz_dict_max_key_gen(void* dp,
 // Fills *out_data (a malloc'd copy of len*width bytes), *out_len (code points)
 // and *out_w (storage width, fix #4499).  Returns false if empty.
 // Caller must free(*out_data) after use.
-// Ordinal (strcmp) comparison per §9.6.
+// Ordinal code-point comparison per §9.6 / §4.17 (fix #4493: was strcmp).
 
 bool bz_dict_min_key_str(void* dp, char** out_data, int64_t* out_len,
                          int8_t* out_w) {
@@ -1376,7 +1396,7 @@ bool bz_dict_min_key_str(void* dp, char** out_data, int64_t* out_len,
         if (slot < 0) continue;
         bz_entry_t& e = d->buckets[slot];
         if (!e.key || e.deleted) continue;
-        if (!best || strcmp(e.key, best) < 0) {
+        if (!best || bz_key_cmp_cp(e.key, e.key_len, e.key_w, best, best_len, best_w) < 0) {
             best = e.key; best_len = e.key_len; best_w = e.key_w ? e.key_w : 1;
         }
     }
@@ -1399,7 +1419,7 @@ bool bz_dict_max_key_str(void* dp, char** out_data, int64_t* out_len,
         if (slot < 0) continue;
         bz_entry_t& e = d->buckets[slot];
         if (!e.key || e.deleted) continue;
-        if (!best || strcmp(e.key, best) > 0) {
+        if (!best || bz_key_cmp_cp(e.key, e.key_len, e.key_w, best, best_len, best_w) > 0) {
             best = e.key; best_len = e.key_len; best_w = e.key_w ? e.key_w : 1;
         }
     }
@@ -1426,19 +1446,22 @@ static int bz_kv_idx_cmp_gen(const void* ia, const void* ib, void* c) {
     // keys[i]/keys[j] are void* pointing to key bytes; pass them directly.
     return ctx->cmp(ctx->keys[i], ctx->keys[j]);
 }
-struct BzKVSortCtxStr { char** keys; };
-// NOTE (#4493, not fixed here): this comparison is byte-wise `strcmp` over the
-// snapshot's raw key buffers, so it orders by storage BYTE rather than by code
-// point and stops at the first zero byte a width>1 key contains. It is
-// memory-safe (bz_key_dup terminates every copy with a width-sized zero slot)
-// but it is not §4.6's ordering; the width spine bz_sort_kv_str now carries is
-// what a code-point-aware comparator (bz_str_compare_cp's relation, #4487)
-// needs in order to be written. Fixing the relation is #4493's scope, not
-// #4499's — #4499 is identity/hashing.
+struct BzKVSortCtxStr { char** keys; int64_t* lens; int8_t* widths; };
+// fix #4493 (stdlib §4.17 via §9.6): order string keys by code point, reading
+// each key at its own storage width. The pre-fix byte-wise strcmp ordered by
+// storage bytes and stopped at the first zero byte of a width>1 key.
+// lens/widths are the snapshot's parallel spines; a null spine falls back to
+// the width-1 reading (strlen for the length).
 static int bz_kv_idx_cmp_str(const void* ia, const void* ib, void* c) {
     auto* ctx = (BzKVSortCtxStr*)c;
     int64_t i = *(const int64_t*)ia, j = *(const int64_t*)ib;
-    return strcmp(ctx->keys[i], ctx->keys[j]);
+    const char* a = ctx->keys[i];
+    const char* b = ctx->keys[j];
+    int64_t alen = ctx->lens ? ctx->lens[i] : (a ? (int64_t)strlen(a) : 0);
+    int64_t blen = ctx->lens ? ctx->lens[j] : (b ? (int64_t)strlen(b) : 0);
+    int8_t  aw = ctx->widths ? ctx->widths[i] : 1;
+    int8_t  bw = ctx->widths ? ctx->widths[j] : 1;
+    return bz_key_cmp_cp(a, alen, aw, b, blen, bw);
 }
 
 // bz_sort_kv_gen: reorder keys[] and values[] together in ascending key order.
@@ -1476,7 +1499,7 @@ void bz_sort_kv_str(char** keys, int64_t* lens, int8_t* widths, void** values,
     int64_t* idx = (int64_t*)malloc((size_t)n * sizeof(int64_t));
     if (!idx) bz_alloc_fail("sort scratch (index array)");
     for (int64_t i = 0; i < n; i++) idx[i] = i;
-    BzKVSortCtxStr ctx = {keys};
+    BzKVSortCtxStr ctx = {keys, lens, widths};
     qsort_r(idx, (size_t)n, sizeof(int64_t), bz_kv_idx_cmp_str, &ctx);
     char**   ks = (char**)malloc((size_t)n * sizeof(char*));
     if (!ks) bz_alloc_fail("sort scratch (key array)");

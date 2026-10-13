@@ -410,8 +410,8 @@ void bz_sort_kv_gen(void** keys, void** values, int64_t n,
 //
 // bz_sort_kv_str: sort char** keys + int64_t* lens + int8_t* widths +
 // void** values together by lexicographic string comparison (§9.6). The width
-// spine is permuted with the others (fix #4499); the COMPARISON itself is still
-// byte-wise strcmp and is #4493's to make code-point-aware.
+// spine is permuted with the others (fix #4499); the COMPARISON is ordinal
+// code-point order at each key's own width (fix #4493, stdlib §4.17 / §9.6).
 void bz_sort_kv_str(char** keys, int64_t* lens, int8_t* widths, void** values,
                     int64_t n);
 //
