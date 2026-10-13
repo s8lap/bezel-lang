@@ -64,14 +64,16 @@ static std::string owningRenameHint(std::string_view name) {
 // `OwningBuffer<T>` / `Span<T>` / `ReadOnlySpan<T>` are DELIBERATELY absent:
 // §14.4 names them as explicit exceptions that admit value-typed T, and they
 // carry their own §28.11 move-only obligation via
-// owningBufferSpanMoveOnlySites_. `OwningTask<T>` and the `IOwning*`
-// interfaces are absent too — they are the #4305 kNullDeclClassConstraints
-// table's subject (and #2736(b)'s residual for the task form), a different
-// recorder with a different diagnostic.
+// owningBufferSpanMoveOnlySites_. `OwningTask<T>` is listed (slot 0): the
+// §14.4 "Class-only restriction on owning generics" sentence names it with the
+// other owning types, so a value-typed written `OwningTask<T>` is rejected by
+// the same predicate and diagnostic (spec §14.4, v0.338). The `IOwning*`
+// interfaces are the #4305 kNullDeclClassConstraints table's subject, a
+// different recorder with a different diagnostic.
 static std::size_t owningCollectionOwnedSlot(std::string_view name) {
     if (name == "OwningArray" || name == "OwningSet" ||
         name == "OwningStack" || name == "OwningQueue" ||
-        name == "OwningLinkedList")
+        name == "OwningLinkedList" || name == "OwningTask")
         return 0;
     if (name == "OwningDictionary") return 1;
     return static_cast<std::size_t>(-1);

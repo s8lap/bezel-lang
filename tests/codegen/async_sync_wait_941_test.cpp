@@ -403,8 +403,12 @@ BEZEL_TEST(async_sync_wait_941, wait_in_sync_main_still_accepted_30_3_v0162) {
 BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_fault_raises_ioe_1352) {
     // §30.5 v0.162: first await faults (r=1), second await must raise IOE (r=2).
     expectValue941(
-        "module M; class C "
-        "  public static async method FaultProducer(): OwningTask<int> "
+        "module M; "
+        "public sealed class Box "
+        "  public method V(): int return 1; end V; "
+        "end Box; "
+        "class C "
+        "  public static async method FaultProducer(): OwningTask<Box> "
         "    throw new Exception(\"boom\"); "
         "  end FaultProducer; "
         "  public static async method RunTest(): Task<int> "
@@ -431,17 +435,21 @@ BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_fault_raises_ioe_1
 // §30.5 v0.162: OwningTask spend-on-success: after a SUCCESSFUL first await,
 // a second await must also raise IOE (not silently return a stale value or crash).
 BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_success_raises_ioe_1352) {
-    // §30.5 v0.162: first await succeeds (r=99), second await raises IOE (r=2).
+    // §30.5 v0.162: first await succeeds, second await raises IOE (r=2).
     expectValue941(
-        "module M; class C "
-        "  public static async method Produce99(): OwningTask<int> "
-        "    return 99; "
+        "module M; "
+        "public sealed class Box "
+        "  public method V(): int return 99; end V; "
+        "end Box; "
+        "class C "
+        "  public static async method Produce99(): OwningTask<Box> "
+        "    return new Box(); "
         "  end Produce99; "
         "  public static async method RunTest(): Task<int> "
         "    using var t := C.Produce99(); "
         "    var r: int := 0; "
         "    try "
-        "      r := await t; "               // first await — succeeds: r=99
+        "      _ := await t; "               // first await — succeeds
         "    catch Exception => r := 0; "
         "    end; "
         "    try "
