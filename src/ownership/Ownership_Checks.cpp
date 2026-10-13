@@ -17512,8 +17512,13 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
 static bool taskResultArgIsClass(const sema::TypeRef* arg) {
     if (!arg) return false;
     if (arg->kind != sema::TypeRef::Kind::Named) return false;
+    // §30.5 (v0.338, #5723): the Pattern A / Pattern B producer rows read
+    // "class or interface T" — an interface-typed result is an object
+    // reference with a class result's disposal story, so it takes the same
+    // owning-location / confinement obligations as a class result.
     if (arg->declaration)
-        return arg->declaration->kind == ast::TypeDeclKind::Class;
+        return arg->declaration->kind == ast::TypeDeclKind::Class ||
+               arg->declaration->kind == ast::TypeDeclKind::Interface;
     // §30.5 / stdlib §3.1 (#1122): a built-in OWNING collection result
     // (`OwningArray<T>` etc. — the result type of `Task.WhenAllOwned`) is a
     // heap/reference type that carries a disposal obligation, so an
