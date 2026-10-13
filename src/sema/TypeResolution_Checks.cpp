@@ -7009,6 +7009,50 @@ static bool memberBlocksHiding(SemaContext& ctx, TypeSymbol* derived,
 // `forEachTypeAndNested`. The pre-order visit sequence is identical — the old
 // copy also descended through nested types of EVERY kind and filtered only
 // what it PUSHED, which is what the lambda below does.
+// fix #6009 (§12.1 / §8.1, v0.338): the signature half of an `override` that
+// reaches an `Object` virtual member (`Equals(other: Object?): bool`,
+// `GetHashCode(): int`, `ToString(): string`, all `public`). §12.1: "Visibility,
+// return type, parameter types, and parameter modifiers must match the base
+// member exactly"; "An override declares exactly as many type parameters of
+// its own as the overridden member (none where that member declares none)";
+// "Return modifiers that must match: `owned`". Parameter TYPES are decided by
+// the caller (#5956: objectOwnSignatureMemberOf / isClassOwnTypeEquals). A
+// nullable-vs-non-null RETURN is a separate open spec question (#6011) and is
+// deliberately not compared here: the return check is on the type's kind only.
+void Resolver::checkObjectSlotOverrideSignature(const MethodSymbol* ms) {
+    auto err = [&](const char* what) {
+        ctx_.diagnostics().report(
+            Severity::Error, ms->declLoc,
+            std::string("override of `") + std::string(ms->name) +
+            "` does not match `Object." + std::string(ms->name) +
+            "`'s " + what + " (\xC2\xA7""12.1, \xC2\xA7""8.1)");
+    };
+    if (ms->visibility != ast::Visibility::Public) err("visibility");
+    if (!ms->genericParams.empty()) err("type parameter count");
+    for (Symbol* p : ms->params) {
+        auto* ps = dynamic_cast<ParameterSymbol*>(p);
+        if (!ps) continue;
+        if (!ps->modifier.empty()) {
+            err("parameter modifiers");
+            break;
+        }
+    }
+    // SEAM-ACCESSOR: `ms` is the LOCAL override being checked (a member of the
+    // module's own class `t`, never an import), the same local-side read
+    // checkOverrideSignatureMatch makes of `derived->decl` (#2386, #3152).
+    const auto* dDecl = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!dDecl) return;
+    PrimitiveType want = ms->name == "Equals" ? PrimitiveType::Bool
+                       : ms->name == "GetHashCode" ? PrimitiveType::Int
+                                                   : PrimitiveType::String;
+    const TypeRef* dRet =
+        dDecl->returnType ? ctx_.resolvedType(*dDecl->returnType) : nullptr;
+    if (!dRet || dRet->kind != TypeRef::Kind::Primitive ||
+        dRet->primitive != want)
+        err("return type");
+    if (dDecl->returnOwned) err("`owned` return modifier");
+}
+
 void Resolver::checkHidingAndOverride() {
     if (!ctx_.module()) return;
     std::vector<TypeSymbol*> classes;
@@ -7242,6 +7286,16 @@ void Resolver::checkHidingAndOverride() {
                             "`override` requires the matching one "
                             "(\xC2\xA7""12.1, \xC2\xA7""12.2)");
                     }
+                    // fix #6009 (§12.1, v0.338): an override that DOES reach
+                    // the Object slot must match the rest of Object's member
+                    // exactly — "Visibility, return type, parameter types, and
+                    // parameter modifiers must match the base member exactly".
+                    // The user-base path does this in
+                    // checkOverrideSignatureMatch; the slot has no
+                    // MethodSymbol to hand it, so the same axes are checked
+                    // against §8.1's declaration here.
+                    if (hasMod(ms, "override") && objectSig)
+                        checkObjectSlotOverrideSignature(tm);
                 }
                 if (!hasMod(ms, "override")) {
                     if (auto objName = objectOwnSignatureMemberOf(

@@ -1099,6 +1099,7 @@ private:
     // member (§12.1). Interface members are excluded — re-declaring an
     // interface member is implementation (matching), not hiding.
     void checkHidingAndOverride();
+    void checkObjectSlotOverrideSignature(const MethodSymbol* ms);
 
     bool methodIsAbstract(MethodSymbol* ms);
 
