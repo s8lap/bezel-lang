@@ -1759,6 +1759,12 @@ private:
     // CaseStmt handlers.
     void checkTopLevelNamedPattern(const ast::NamedPattern* np, TypeRef* scrutTy,
                                    TypeRef* scrutDecl = nullptr);
+    // §19.3 L3951 (#6019): a naked identifier directly after a NAMED slot's `=`
+    // resolves as at the top level of a pattern, against the slot's declared
+    // type. Forwards a NamedPattern sub-pattern of a named slot to
+    // checkTopLevelNamedPattern; a positional slot is untouched.
+    void checkNamedSlotNakedName(const ast::PositionalPattern& sp,
+                                 TypeRef* fieldTy);
     // §19.3 (v0.313, #5188): the scrutinee's DECLARED type for the
     // different-value-type reject — `declaredTypeOf` for a simple local /
     // parameter (a carrier narrowed to a value type keeps its declared

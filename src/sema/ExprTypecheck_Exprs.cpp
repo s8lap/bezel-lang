@@ -13350,6 +13350,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             // checkOrderingPatternOverUnorderedType.
                             checkOrderingPatternOverUnorderedType(
                                 fieldTy, sp.pattern.get());
+                            // §19.3 L3951 (#6019): naked name after `=`.
+                            checkNamedSlotNakedName(sp, fieldTy);
                             if (!sp.nakedBinding.empty()) {
                                 // §19.3 (#5401, v0.314): bindings of one pattern
                                 // must be distinct.
@@ -13784,6 +13786,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // checkOrderingPatternOverUnorderedType.
                     checkOrderingPatternOverUnorderedType(fieldTy,
                                                           sp.pattern.get());
+                    // §19.3 L3951 (#6019): naked name after `=`.
+                    checkNamedSlotNakedName(sp, fieldTy);
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
                         // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.

@@ -3540,6 +3540,15 @@ bool ExprTC::caseArmsExhaustive(
     return false;
 }
 
+// §19.3 L3951 (#6019): see the declaration comment (ExprTypecheck_impl.hpp).
+void ExprTC::checkNamedSlotNakedName(const ast::PositionalPattern& sp,
+                                     TypeRef* fieldTy) {
+    // `slotName` is cleared by normalization; `namedSlot` survives it.
+    if (!sp.namedSlot) return;  // positional slot: naked name is a binding
+    if (auto* np = dynamic_cast<const ast::NamedPattern*>(sp.pattern.get()))
+        checkTopLevelNamedPattern(np, fieldTy, fieldTy);
+}
+
 // §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.
 // See the declaration comment (ExprTypecheck_impl.hpp) for the defect. The
 // grammar (§A.7) makes a single-/qualified-identifier pattern a TYPE TEST when
@@ -24948,6 +24957,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // checkOrderingPatternOverUnorderedType.
                             checkOrderingPatternOverUnorderedType(
                                 fieldTy, sp.pattern.get());
+                            // §19.3 L3951 (#6019): naked name after `=`.
+                            checkNamedSlotNakedName(sp, fieldTy);
                             if (!sp.nakedBinding.empty()) {
                                 auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                                 lsym->name = sp.nakedBinding;
@@ -25336,6 +25347,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // checkOrderingPatternOverUnorderedType.
                     checkOrderingPatternOverUnorderedType(fieldTy,
                                                           sp.pattern.get());
+                    // §19.3 L3951 (#6019): naked name after `=`.
+                    checkNamedSlotNakedName(sp, fieldTy);
                     if (!sp.nakedBinding.empty()) {
                         // Bare `Pt(x, y)` — nakedBinding carries the name.
                         // Use the PositionalPattern's address (stable since
