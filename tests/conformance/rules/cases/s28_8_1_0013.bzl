@@ -1,10 +1,10 @@
 //! case: s28_8_1_0013
 //! doc: spec
 //! section: 28.8.1
-//! title: detaching via a nullable field moves the contents out and restores to null
-//! rule: A class that wants "take the resource away and leave the field
-//!   empty" declares the field nullable and assigns `null` after the move —
-//!   the reassignment to null satisfies the field-restoration rule.
+//! title: detaching via a nullable field moves the contents out and leaves the field null
+//! rule: A nullable location a bare take leaves holding `null` is an
+//!   ordinary null field: its holder's cascade disposes nothing through it,
+//!   and a later read reads `null`.
 //! cites: 28.8.1
 //! expect: run
 //! output: detached

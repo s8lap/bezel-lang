@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.332.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.336.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5). Neither needs an `import`: both modules are on spec §2.3's always-available list, and the `System.Collections.Generic` row puts every stdlib §4 name in every file's bare-name space. What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -130,7 +130,7 @@ for var t in expired do
 end;
 ```
 
-(An element-level write that changes no structure — `arr[i] := v` on an existing position — does *not* invalidate the enumerator (spec §29.12). On an owning collection it disposes the displaced element, which invalidates borrows of *that element*, not the loop — spec §29.12.) And inline arrays (`[N]T`, spec §15.1) iterate as direct indexed loops with the same slot logic: copies for value slots, borrows for class slots — including `[N owned]T` slots, which the array keeps owning. Consuming one is an explicit `move arr[i]` plus restoration, and the owning form is a move-only value (spec §15.3).
+(An element-level write that changes no structure — `arr[i] := v` on an existing position — does *not* invalidate the enumerator (spec §29.12). On an owning collection it disposes the displaced element, which invalidates borrows of *that element*, not the loop — spec §29.12.) And inline arrays (`[N]T`, spec §15.1) iterate as direct indexed loops with the same slot logic: copies for value slots, borrows for class slots — including `[N owned]T` slots, which the array keeps owning. Consuming one is an explicit `move arr[i]` — bare on `[N owned]T?`, which leaves `null`, or `move arr[i] with fresh` on `[N owned]T`, and the owning form is a move-only value (spec §15.3).
 
 ---
 
@@ -157,17 +157,13 @@ end;
 
 (The *borrowing* `Dictionary<K, V>` iterates entries directly — `for var entry in dict` yields `DictionaryEntry<K, V>` values in insertion order, `entry.Value` a borrow at class V. The owning dictionary deliberately has **no** default entry iteration: its common intent is transfer, so you either iterate `Keys` to look or `Drain()` to take — stdlib §4.8/§4.9.)
 
-For *one* element, use the take-forms: `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Pop(query)` on the owning set (stdlib §4.10). Each has a `Try*` variant except `PopAt` (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i]`. It takes the element but leaves the slot **moved-from**, and the field-restoration rule applies: restore the slot before the method can exit (spec §28.8.1/§28.11; the same discipline as `move` on a field, Guide 1 §7):
+For *one* element, use the take-forms: `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Pop(query)` on the owning set (stdlib §4.10). Each has a `Try*` variant except `PopAt` (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i] with fresh`: it stores the replacement into the slot and hands you the old element, in one step, with the slot never empty (spec §28.8.1/§28.11; the same form as `move` on a field, Guide 1 §7):
 
 ```bezel
-var fresh := Connect("fresh");   // build the replacement first — it may throw
-using var old := move pool[i];   // then take — nothing throwable follows
-pool[i] := fresh;                // restore the slot — required on every exit path
+using var old := move pool[i] with Connect("fresh");   // take the old connection, store the new one
 ```
 
-(The build-before-take order is Guide 1 §7's: a throwable call between the take and the restoration would put an exit edge there with the slot still moved-from, and the compiler rejects it.)
-
-Prefer the `Pop*` forms unless you are replacing the slot in place — they close the gap and no restoration obligation arises.
+On a nullable slot — an `OwningBuffer<T>`, a `Span<T>` over one, a `[N owned]T?` inline array — the bare `move buf[i]` takes the element and leaves `null`. On an `OwningArray<T>` or `OwningDictionary<K, V>` the replacement is required: to take an element and leave nothing, use the `Pop*` forms, which close the gap.
 
 **Writing your own iterators.** A method whose body uses `yield` is an iterator (spec §29.3); its body does not run at the call — it runs incrementally as the consumer advances (spec §29.4):
 
@@ -324,7 +320,7 @@ Three footnotes close the story. First, the tiers are the usual ones (stdlib §1
 
 ## 7. Spans and buffers, in brief
 
-For contiguous storage and zero-copy sub-ranges, the stdlib layers three things (stdlib §4.14–§4.16, §3.3, §4.19):
+For contiguous storage and zero-copy sub-ranges, the stdlib layers three things (stdlib §4.14–§4.15, §3.3, §4.19):
 
 - **`OwningBuffer<T>`** — the storage primitive: a fixed-but-runtime-sized block of slots. Class-typed T: nullable owned slots (`T?`), disposal cascades, `move buf[i]` admitted. Value-typed T: plain value slots, no per-slot disposal. The resizable owning collections are built over it.
 - **Spans** — non-allocating **views** into existing storage: `Span<T>`/`ReadOnlySpan<T>` over an `OwningBuffer<T>`, `ArraySpan<T>`/`ReadOnlyArraySpan<T>` over an `Array<T>`, `ReadOnlyStringSpan` over a `string`. Construct with the `AsSpan()`/`AsReadOnlySpan()` family; `Slice` narrows further. Range restriction is the point: a span bounds-checks against *its* length, not the whole source's.
@@ -361,7 +357,7 @@ for var line in lines do
 end;
 ```
 
-Spans iterate — `for var x in span do … end;` works — but deliberately *not* via the enumeration protocol: an enumerator is a heap object that would hold the span's borrow beyond what the tracker can bound, so the compiler emits a direct indexed loop instead (spec §29.2). Consequence: a span is not an `IEnumerable<T>` and cannot be passed as one — pass the span itself (or `IReadOnlySpan<T>`, stdlib §4.16, when abstracting over span sources). The loop variable follows the slot kind, as always: a copy for value T; for class T, a borrow of the slot's value, typed `T?`, since class-typed buffer slots are nullable. And on a writable class-typed span, `move span[i]` takes the slot's element with the same restoration rule as any owning slot — the moved-from state lives in the underlying buffer (spec §28.11, §29.2).
+Spans iterate — `for var x in span do … end;` works — but deliberately *not* via the enumeration protocol: an enumerator is a heap object that would hold the span's borrow beyond what the tracker can bound, so the compiler emits a direct indexed loop instead (spec §29.2). Consequence: a span is not an `IEnumerable<T>` and cannot be passed as one — pass the span itself (a method that accepts a read-only span of either heap backing declares one overload per span type, stdlib §4.14). The loop variable follows the slot kind, as always: a copy for value T; for class T, a borrow of the slot's value, typed `T?`, since class-typed buffer slots are nullable. And on a writable class-typed span, `move span[i]` takes the slot's element and leaves `null` in the underlying buffer, as any bare take of a nullable owning slot does (spec §28.11, §29.2).
 
 Finally, when data should stop changing and start being shared, **freeze it**:
 
@@ -384,7 +380,7 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 | Refer to one object from many places — graph edges, a cache's index, a registry — without a stored borrow | `OwningSlotMap<T>` (stdlib §4.21; not yet implemented, [#4604](https://github.com/s8lap/bezel-lang/issues/4604)): the map owns, you store the `SlotHandle` value and look it up at use; a removed entry's handle reads absent |
 | Read elements, either family | an `IEnumerable<T>` / `IReadOnlyList<T>` parameter |
 | Look at an element | indexer, `Peek`, `GetOrNull` — borrows, no obligation |
-| Take one element out | `Pop*` / `Dequeue` / `PopValue` — owned result (`move coll[i]` + restore for replace-in-place) |
+| Take one element out | `Pop*` / `Dequeue` / `PopValue` — owned result (`move coll[i] with fresh` to replace in place) |
 | Consume every element | `for var x in coll.Drain() do using var c := move x; … end;` |
 | Read query results twice | `.ToArray()` first — a bound query is single-consumption |
 | Aggregate one group many ways | `GroupBy` — outer sequence once, each group re-enumerable |

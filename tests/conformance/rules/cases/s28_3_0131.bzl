@@ -2,8 +2,9 @@
 //! doc: spec
 //! section: 28.3
 //! title: a later argument reading a binding an earlier argument moved is a moved-from read
-//! rule: **moved-from** — the obligation has transferred out; the binding or
-//!   slot is unreadable until reassigned, and discharge machinery skips it
+//! rule: **moved-from** — the obligation has transferred out; the binding — or
+//!   a field a destructor body took bare (K9.3) — is unreadable until
+//!   reassigned, and discharge machinery skips it
 //! cites: 28.3, 22.5
 //! expect: reject
 //! diagnostic: moved-from

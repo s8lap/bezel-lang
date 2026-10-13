@@ -3,7 +3,7 @@
 //! section: 8.6
 //! title: a borrow-bearing record as the receiver of an extension on a user interface is rejected
 //! rule: The receiver of an extension-block call whose head is `Object` or
-//!   another interface type is not admitted: that body reads `this` at the
+//!   an interface type is not admitted: that body reads `this` at the
 //!   head type, which announces no borrow, and may pass it to a parameter
 //!   that stores it (§28.3's field-store bullet), so the receiver position is
 //!   borrow-erasing like a parameter of that type.

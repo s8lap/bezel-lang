@@ -3,9 +3,10 @@
 //! section: 8.6
 //! title: rendering a span through its own ToString member call is admitted
 //! rule: The remedies at a rejected conversion are a parameter or local declared
-//!   at the value's own type or at `IReadOnlySpan<TElement>`, a class
-//!   implementing the interface, or — for rendering — `x.ToString()` or an
-//!   interpolation hole, which invoke a member on the value
+//!   at the value's own type (a member that accepts a read-only span of either
+//!   heap backing declares one overload per span type, stdlib §4.14), a class
+//!   implementing the target interface, or — for rendering — `x.ToString()` or
+//!   an interpolation hole, which invoke a member on the value
 //! cites: 8.6, 8.5, 9.7
 //! expect: run
 //! stdout: begin

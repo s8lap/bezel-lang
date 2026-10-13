@@ -1,10 +1,12 @@
 //! case: s28_8_1_0011
 //! doc: spec
 //! section: 28.8.1
-//! title: a move inside a destructor body needs no restoration and is discharged like any other owned value
-//! rule: Inside a destructor body, the field-restoration rule does not
-//!   require reassignment (K9.3 — teardown, no future read); the taken
-//!   value must still be discharged, for example with `using var`.
+//! title: a destructor body takes its own non-nullable field bare and discharges it like any other owned value
+//! rule: Inside a destructor body, a field of the object being torn down is
+//!   read for final disposal, and may be taken bare whatever its
+//!   nullability ... The taken value must still be discharged through one
+//!   of the standard mechanisms — assigned to a local with `using var`,
+//!   passed as `owned` to a helper, or explicitly disposed.
 //! cites: 28.8.1
 //! expect: run
 //! output: holder teardown

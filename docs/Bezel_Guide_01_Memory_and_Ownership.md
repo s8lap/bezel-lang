@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.332.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.336.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use after disposal is caught in layers: a borrow that would outlive its local source is rejected, a use of a variable after its explicit disposal is a warning on a straight line and a compile error after a conditional one, and in the default, checked build any member access through a disposed reference faults deterministically (spec §28.2). This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -84,7 +84,7 @@ var d := registry.Find("key");        // returns Buffer (no owned) -> borrowed
 var t := source.PrefetchAsync();      // returns Task<Buffer>  -> owned (task calls mint)
 var q := xs.Where(p);                 // returns a lazy query  -> owned (calls mint)
 var parts := line.Split(':');         // returns owned Array<string> -> owned (trivial-dispose: no ceremony, §2)
-var e := move holder.slot;            // move out of owned field -> owned (restore holder.slot before the method exits, §7)
+var e := move holder.slot with fresh; // take out of an owned field, storing `fresh` into it in the same step -> owned (§7)
 ```
 
 The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or — outside the mint-announcing families — a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest:
@@ -178,10 +178,8 @@ method GetTransactions(): Array<Transaction>
 end GetTransactions;
 
 method TakeTransactions(): owned Array<Transaction>
-  var fresh := new Array<Transaction>();  // build the replacement first (next section)
-  var taken := move _transactions;        // take: the field is now moved-from
-  _transactions := fresh;                 // restore — every exit path must (spec §28.8.1)
-  return taken;                           // transfer: hand the caller ownership
+  return move _transactions with new Array<Transaction>();   // one step: the field holds the fresh array,
+                                                             //   the caller owns the taken one (spec §28.8.1)
 end TakeTransactions;
 ```
 
@@ -193,31 +191,27 @@ So a caller that needs to *look at* `_transactions` gets a borrow (the bare-fiel
 
 ## 7. `move`: handing an owned field's contents away
 
-To transfer an owned field *out* of its container, use `move`. Because `move` leaves the field in moved-from state, the **field-restoration rule** (§28.8.1) requires that every path to method exit puts something back. For a *nullable* owned field the idiomatic pattern is to null the field after the move — `null` is a valid restoration for a `Logfile?`:
+To transfer an owned field *out* of its container, use `move`. A field is never left empty: `move _f with e` stores the owned replacement `e` into the field in the same step that takes the old value (spec §28.8.1, the **replacing `move`**), and for a *nullable* owned field the replacement may be left off — `move _log` stores `null`:
 
 ```bezel
-// Field declared nullable so that null is a valid post-move restoration.
+// Field declared nullable, so a bare `move` leaves null behind.
 // private owned _log: Logfile?;
 method DetachLog(): owned Logfile?
-  var d := move _log;   // _log is now in moved-from state
-  _log := null;         // restore the field — required by §28.8.1
-  return d;
+  return move _log;     // _log holds null afterwards
 end DetachLog;
 ```
 
-`move _log` reads `_log` as an owned value and leaves the field moved-from. The **field-restoration rule** applies here too: every path to the end of the method must put something back:
+For a non-nullable field the replacement is required, and the expression that builds it is evaluated before the exchange, so a constructor that throws leaves the field exactly as it was:
 
 ```bezel
 // A non-nullable owned field this time: private owned _log: Logfile;
 method Rotate()
-  var fresh := new Logfile(NextName());  // build the replacement first — it may throw
-  using var old := move _log;            // then take — nothing throwable follows
-  _log := fresh;                         // restore — a store into a moved-from slot cannot throw
+  using var old := move _log with new Logfile(NextName());   // take the old log, store the new one, in one step
   old.Flush();
-end Rotate;                              // old disposed here
+end Rotate;                                                  // old disposed here
 ```
 
-Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw. A call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form, under the same restoration rule, works on an owned field of any object you hold — a parameter, a local (`move h.item`) — so `return move h.item;` is an unrestored exit and rejected whatever `h` is: take the field into a local, restore it, return the local. It also works on owning-collection slots (`move buffer[i]`) — and, as the transfer marker, on named bindings (`move x`; §1, §8). See spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
+Forgetting the replacement on a non-nullable field is a compile error naming the fix (`move _log with fresh`, or a `Logfile?` declaration), not a runtime surprise, and there is no "restore before exit" discipline to remember: nothing is ever empty, so calls, `await`s and early returns after the `move` need no care. The same form works on an owned field of any object you hold — a parameter, a local (`move h.item with fresh`), and `return move h.item with fresh;` is fine whatever `h` is — and on owning-collection slots (`move buffer[i]`, §28.11; a nullable buffer slot takes bare, an `OwningArray<T>` slot needs `with`, or use `PopAt`). As the transfer marker, `move` also consumes named bindings (`move x`; §1, §8). See spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
 
 ---
 
@@ -514,7 +508,7 @@ When *not* to reach for it: if the thing to undo is a **value**, it has an owner
 | Hand a new object to the caller | return type `: owned T`, `return x;` |
 | Hand an owned local to a method that takes it | `M(move x)` (marker required) |
 | Take over an owned local or parameter for scope-end disposal | `using var y := move x;` — the unmarked `using var y := x;` over an owned `x` is an error; to look at `x` without taking it, `var y := x;` or `const y := x;` |
-| Move an owned field's contents out | `move _f` (then reassign `_f` before exit) |
+| Move an owned field's contents out | `move _f with fresh` — or a bare `move _f` on a nullable field, which leaves `null` |
 | Dispose an unwanted owned value now | `_ := x;` (or `x.Dispose();` for an early release) — never a `Task`-family value (§2) |
 | Make a resource-free helper (no destructor, no `owned`/inline-owned fields) | just `new` it — trivial-dispose, no `using var` needed (§2) |
 | Drain an owning collection | `for var e in coll.Drain() do using var x := move e; … end;` |

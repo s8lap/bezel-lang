@@ -5,7 +5,7 @@
 //! rule: The call is an **early release point**, not a discharge of the slot's
 //!   obligation: the slot keeps its reference and its K9 obligation, and the
 //!   containing object's teardown still runs the cascade over it (§28.4 step
-//!   2), where the second call is §28.2's no-op and the block is then
+//!   2) ... where the second call is §28.2's no-op and the block is then
 //!   reclaimed
 //! cites: 28.6, 28.2, 28.4
 //! expect: run
