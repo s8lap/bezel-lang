@@ -9931,6 +9931,29 @@ Resolver::TypeCategory Resolver::categorize(const TypeRef* a) {
     return TypeCategory::Unknown;
 }
 
+// §14.2 rule 3 / §11.8 (#5817): an interface that declares or inherits a
+// static member (a `static` method or any operator, which §11.8 makes static)
+// is conformed to by no interface. Walks the interface's transitive base set.
+static bool interfaceDeclaresOrInheritsStatics(const TypeSymbol* iface) {
+    std::vector<const TypeSymbol*> frontier{iface};
+    std::unordered_set<const TypeSymbol*> seen{iface};
+    while (!frontier.empty()) {
+        const TypeSymbol* t = frontier.back();
+        frontier.pop_back();
+        if (t->kind != ast::TypeDeclKind::Interface) continue;
+        for (const Symbol* m : t->members) {
+            const auto* ms = dynamic_cast<const MethodSymbol*>(m);
+            if (!ms) continue;
+            if (ms->isOperator) return true;
+            for (std::string_view mod : ms->modifiers)
+                if (mod == "static") return true;
+        }
+        for (const TypeSymbol* b : t->baseTypes)
+            if (b && seen.insert(b).second) frontier.push_back(b);
+    }
+    return false;
+}
+
 bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
                            SemaContext* ctx) {
     if (!arg || !bound) return false;
@@ -9938,6 +9961,15 @@ bool argSatisfiesTypeBound(const TypeRef* arg, const TypeRef* bound,
     if (bound->kind != TypeRef::Kind::Named || !bound->declaration) {
         return false;
     }
+    // §14.2 rule 3 (v0.338, #5817): an interface argument conforms to a bound
+    // interface only through the extension chain, and an interface that
+    // declares or inherits static members is conformed to by no interface.
+    // The keyed interface is the BOUND: a static-free bound that an
+    // interface argument extends still admits it.
+    if (arg->declaration->kind == ast::TypeDeclKind::Interface &&
+        bound->declaration->kind == ast::TypeDeclKind::Interface &&
+        interfaceDeclaresOrInheritsStatics(bound->declaration))
+        return false;
     // BFS over the argument's transitive base/interface set, cycle-guarded.
     // §14.2 (fix #4863, v0.307): the constraint is an interface
     // INSTANTIATION — `where T: IEquatable<Other>` requires T to conform to
