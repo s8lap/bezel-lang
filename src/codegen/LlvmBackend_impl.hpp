@@ -21457,6 +21457,15 @@ private:
     // pointer as a record-struct pointer.
     llvm::Function* buildRecordHashTrampoline(const sema::TypeSymbol* rec);
     llvm::Function* buildRecordEqTrampoline(const sema::TypeSymbol* rec);
+    // #5997 / §3.6 (v0.338): a NON-generic record or choice that declares its
+    // own equality pair (`Equals(other: T)` + `GetHashCode(): int`) is hashable
+    // on the strength of those members, so the hash-container trampolines must
+    // call the user's functions instead of the structural §9.1/§9.2 forms.
+    // Returns true only when BOTH are present and lowered; a generic instance
+    // keeps the structural form (its template body is not a call target).
+    bool userValueEqualityPair(const sema::TypeSymbol* ts,
+                               llvm::Function*& eqFn,
+                               llvm::Function*& hashFn);
     // §35.7 (v0.200, #2047): the choice-key analogues — a value-like choice used
     // as a Dictionary/Set key hashes/compares by its §35.7 tag + active-payload
     // form (emitChoiceHashCode / emitChoiceEquality). Call under the key's

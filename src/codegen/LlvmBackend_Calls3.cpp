@@ -135,6 +135,42 @@ sema::TypeRef* Emitter::elementArrayTypeRef(const sema::TypeRef* elem) {
 // reinterpret the byte pointer as a record-struct pointer, load the value, and
 // run the synthesized GetHashCode (emitRecordHashCode, §9.1/§9.2). The i32 hash
 // is zero-extended to i64 (the runtime keeps the low 32 bits for bucketing).
+// #5997 / §3.6 (v0.338): see the declaration in LlvmBackend_impl.hpp.
+bool Emitter::userValueEqualityPair(const sema::TypeSymbol* ts,
+                                    llvm::Function*& eqFn,
+                                    llvm::Function*& hashFn) {
+    eqFn = nullptr;
+    hashFn = nullptr;
+    if (!ts || !ts->genericParams.empty()) return false;
+    sema::MethodSymbol* eqMs = nullptr;
+    sema::MethodSymbol* hashMs = nullptr;
+    for (sema::Symbol* sym : ts->members) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+        if (!ms || ms->isOperator || isStaticMethod(ms)) continue;
+        if (ms->name == "Equals" && ms->params.size() == 1) {
+            // Only the own-type form `Equals(other: T)` is the §3.6 pair; an
+            // `Equals(other: int)` (IEquatable<int>-style) is not.
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[0]);
+            const sema::TypeRef* pt =
+                !ps ? nullptr
+                    : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                    : ps->resolvedDeclType);
+            if (pt && pt->kind == sema::TypeRef::Kind::Named && !pt->nullable &&
+                pt->declaration == ts)
+                eqMs = ms;
+        } else if (ms->name == "GetHashCode" && ms->params.empty()) {
+            hashMs = ms;
+        }
+    }
+    if (!eqMs || !hashMs) return false;
+    auto eit = methodFns_.find(eqMs);
+    auto hit = methodFns_.find(hashMs);
+    if (eit == methodFns_.end() || hit == methodFns_.end()) return false;
+    eqFn = eit->second;
+    hashFn = hit->second;
+    return true;
+}
+
 llvm::Function* Emitter::buildRecordHashTrampoline(const sema::TypeSymbol* rec) {
     llvm::StructType* st = recordStruct(rec);
     auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
@@ -145,8 +181,19 @@ llvm::Function* Emitter::buildRecordHashTrampoline(const sema::TypeSymbol* rec) 
     currentFn_ = fn;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
-    llvm::Value* rv = builder_.CreateLoad(st, fn->getArg(0), "key.rec");
-    llvm::Value* h = emitRecordHashCode(rv, rec);          // i32
+    // #5997 / §3.6: a declared pair is the record's hash. The key's stored
+    // bytes are the `this` a user method takes (records are passed by spilled
+    // pointer), so no load/spill is needed.
+    llvm::Function* userEq = nullptr;
+    llvm::Function* userHash = nullptr;
+    llvm::Value* h = nullptr;
+    if (userValueEqualityPair(rec, userEq, userHash))
+        h = builder_.CreateCall(userHash->getFunctionType(), userHash,
+                                {fn->getArg(0)});                // i32
+    else {
+        llvm::Value* rv = builder_.CreateLoad(st, fn->getArg(0), "key.rec");
+        h = emitRecordHashCode(rv, rec);                          // i32
+    }
     builder_.CreateRet(builder_.CreateZExt(h, i64()));
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
@@ -167,9 +214,23 @@ llvm::Function* Emitter::buildRecordEqTrampoline(const sema::TypeSymbol* rec) {
     currentFn_ = fn;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
-    llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
-    llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
-    builder_.CreateRet(emitStructEquality(a, b, st, rec));  // i1
+    // #5997 / §3.6: a declared pair is the record's equality, consistent with
+    // the declared hash (buildRecordHashTrampoline).
+    llvm::Function* userEq = nullptr;
+    llvm::Function* userHash = nullptr;
+    if (userValueEqualityPair(rec, userEq, userHash)) {
+        // Equals(other: T): `this` is the first key's stored bytes; the second
+        // parameter is the record value, or a pointer to it, per its lowering.
+        llvm::Value* other = fn->getArg(1);
+        if (!userEq->getFunctionType()->getParamType(1)->isPointerTy())
+            other = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
+        builder_.CreateRet(builder_.CreateCall(userEq->getFunctionType(), userEq,
+                                               {fn->getArg(0), other}));  // i1
+    } else {
+        llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
+        llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
+        builder_.CreateRet(emitStructEquality(a, b, st, rec));  // i1
+    }
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
     return fn;
@@ -191,8 +252,17 @@ llvm::Function* Emitter::buildChoiceHashTrampoline(const sema::TypeSymbol* cho) 
     currentFn_ = fn;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
-    llvm::Value* cv = builder_.CreateLoad(st, fn->getArg(0), "key.cho");
-    llvm::Value* h = emitChoiceHashCode(cv, cho);          // i32
+    // #5997 / §3.6: a declared pair is the choice's hash (see the record twin).
+    llvm::Function* userEq = nullptr;
+    llvm::Function* userHash = nullptr;
+    llvm::Value* h = nullptr;
+    if (userValueEqualityPair(cho, userEq, userHash))
+        h = builder_.CreateCall(userHash->getFunctionType(), userHash,
+                                {fn->getArg(0)});                // i32
+    else {
+        llvm::Value* cv = builder_.CreateLoad(st, fn->getArg(0), "key.cho");
+        h = emitChoiceHashCode(cv, cho);                          // i32
+    }
     builder_.CreateRet(builder_.CreateZExt(h, i64()));
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
@@ -214,9 +284,20 @@ llvm::Function* Emitter::buildChoiceEqTrampoline(const sema::TypeSymbol* cho) {
     currentFn_ = fn;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
-    llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
-    llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
-    builder_.CreateRet(emitChoiceEquality(a, b, cho));  // i1
+    // #5997 / §3.6: a declared pair is the choice's equality (see the record twin).
+    llvm::Function* userEq = nullptr;
+    llvm::Function* userHash = nullptr;
+    if (userValueEqualityPair(cho, userEq, userHash)) {
+        llvm::Value* other = fn->getArg(1);
+        if (!userEq->getFunctionType()->getParamType(1)->isPointerTy())
+            other = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
+        builder_.CreateRet(builder_.CreateCall(userEq->getFunctionType(), userEq,
+                                               {fn->getArg(0), other}));  // i1
+    } else {
+        llvm::Value* a = builder_.CreateLoad(st, fn->getArg(0), "eq.a");
+        llvm::Value* b = builder_.CreateLoad(st, fn->getArg(1), "eq.b");
+        builder_.CreateRet(emitChoiceEquality(a, b, cho));  // i1
+    }
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
     return fn;
