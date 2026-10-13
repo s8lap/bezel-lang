@@ -2734,6 +2734,66 @@ bool ExprTC::normalizeNamedDestructureSlots(
     return true;
 }
 
+// §19.3 "Named destructuring" (v0.338, #6018). Two rules the named-slot
+// normalization above cannot enforce, because its callers normalize only a
+// record's FieldSymbol list and skip the call when that list is empty:
+//   "Resolution honours ordinary member visibility (§13)": a named slot naming
+//   a non-public member of a record head is refused by the same
+//   checkMemberVisibility the ordinary member access uses (so an `internal`
+//   member is admitted within its module, as §13.4 allows);
+//   "Enums and primitives have no named-destructure form": an enum head with a
+//   named slot list is refused.
+// A class, choice or unresolved head is left to its own rules (§19.3's class
+// form, the choice-case path), and every positional pattern is untouched.
+bool ExprTC::rejectUnadmittedNamedSlotHead(ast::DestructuringPattern& dp,
+                                           std::string_view headName,
+                                           const SourceLocation& loc,
+                                           const TypeRef* scrutTy) {
+    bool anyNamed = false;
+    for (const auto& sp : dp.subPatterns)
+        if (!sp.slotName.empty()) { anyNamed = true; break; }
+    if (!anyNamed || headName.empty()) return false;
+
+    // The head's TYPE is the one the pattern's scrutinee already resolved,
+    // never a lookup of the head's short name: a name scan picks the wrong
+    // one when two nested types share a name (A.Item / B.Item). A head whose
+    // resolved type is unavailable, or whose name differs from it, is left to
+    // the existing rules (admitted here), never refused on a name guess.
+    if (!scrutTy || scrutTy->kind != TypeRef::Kind::Named) return false;
+    TypeSymbol* head = scrutTy->declaration;
+    if (!head || head->name != headName) return false;
+
+    const auto reject = [&]() {
+        for (auto& sp : dp.subPatterns) sp.hasMoveMarker = false;
+        return true;
+    };
+    if (head->kind == ast::TypeDeclKind::Enum) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "named slot in pattern `" + std::string(headName) +
+            "(...)`: `" + std::string(headName) + "` is an enum, and enums "
+            "have no named-destructure form (no slot surface) (§19.3)");
+        return reject();
+    }
+    if (head->kind != ast::TypeDeclKind::Record) return false;
+
+    for (const auto& sp : dp.subPatterns) {
+        if (sp.slotName.empty()) continue;
+        for (Symbol* m : head->members) {
+            if (!m || m->name != sp.slotName) continue;
+            auto* mem = dynamic_cast<MemberSymbol*>(m);
+            if (mem && (dynamic_cast<FieldSymbol*>(m) ||
+                        dynamic_cast<PropertySymbol*>(m))) {
+                // Reports its own §13.1 diagnostic at `loc` when refused.
+                if (checkMemberVisibility(mem, sp.slotName, loc))
+                    return reject();
+            }
+            break;
+        }
+    }
+    return false;
+}
+
 bool ExprTC::caseArmsExhaustive(
     const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee,
     TypeRef* scrutTy, const SourceLocation& warnLoc, bool quiet) {
@@ -14248,6 +14308,9 @@ void ExprTC::bindNestedDestructuringNames(
                     ? nd->typeName->parts.back()
                     : std::string_view{};
             auto& ndMut = const_cast<ast::DestructuringPattern&>(*nd);
+            // §19.3 (v0.338, #6018): enum-head and non-public-member refusal.
+            rejectUnadmittedNamedSlotHead(ndMut, ndHead, nd->span.begin,
+                                          ndScrutTy);
             if (ndChoiceCase && ndChoiceCase->caseDecl &&
                 !ndChoiceCase->caseDecl->payload.empty()) {
                 std::vector<std::string_view> payloadNames;
@@ -25235,6 +25298,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // named slot list to declaration order BEFORE the arity and
                 // binding logic below, which — like codegen — reads the slots
                 // positionally. A no-op for every positional pattern.
+                // §19.3 (v0.338, #6018): enum-head and non-public-member refusal.
+                rejectUnadmittedNamedSlotHead(*dp, lastName, dp->span.begin, scrutTy);
                 if (!fields.empty()) {
                     std::vector<std::string_view> memberNames;
                     memberNames.reserve(fields.size());

@@ -1426,6 +1426,20 @@ private:
         std::string_view headName, const SourceLocation& loc,
         const std::vector<ast::Param>* ccPayload = nullptr);
 
+    // §19.3 (v0.338, #6018): the head-kind rules a named slot list must pass
+    // that normalizeNamedDestructureSlots never sees, because its callers skip
+    // it for an empty member list (an enum head, a private body property).
+    // The head's type is `scrutTy` (the scrutinee's resolved type), never a
+    // name lookup; a head that does not resolve to it is admitted. Reports and
+    // returns true when the named list is refused: an enum head, or a named
+    // slot on a non-public member of a record head (judged by
+    // checkMemberVisibility, the ordinary §13 rule). Clears the slots' transfer
+    // markers on refusal, as normalizeNamedDestructureSlots does.
+    bool rejectUnadmittedNamedSlotHead(ast::DestructuringPattern& dp,
+                                       std::string_view headName,
+                                       const SourceLocation& loc,
+                                       const TypeRef* scrutTy);
+
     // §19.6 (v0.196, #1816): compose a leaf class's ROOT INSTANTIATION — the
     // instantiation of the root declaration `root` that `leaf` derives from,
     // obtained by composing the base-clause substitutions along `leaf`'s

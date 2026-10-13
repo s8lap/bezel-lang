@@ -13654,6 +13654,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // logic below, which — like codegen — reads slots positionally.
                 // The statement-position twin is in ExprTypecheck.cpp. A no-op
                 // for every positional pattern.
+                // §19.3 (v0.338, #6018): enum-head and non-public-member refusal.
+                rejectUnadmittedNamedSlotHead(*dp, lastName, dp->span.begin, scrutTy);
                 if (!fields.empty()) {
                     std::vector<std::string_view> memberNames;
                     memberNames.reserve(fields.size());
