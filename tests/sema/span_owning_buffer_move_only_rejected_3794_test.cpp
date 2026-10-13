@@ -271,14 +271,19 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
 // §14.4: "Value-like and borrow-bearing choices are copyable value types
 // (§15.3) and are admitted as value-typed T, as stdlib §4.14 sets out." A
 // value-like choice is not move-only (§15.3 lists only the owning inline
-// array and the owning-classified choice) and must stay legal.
+// array and the owning-classified choice) and must stay legal. Fix #5821
+// (§14.2 two-presentation paragraph, v0.338; stdlib §4.14): no choice type is
+// defaultable (§17.11, §35.10), so the one-argument constructor is rejected
+// for a choice element; a choice-element buffer is built with the
+// two-argument init-function constructor. The row keeps its §14.4 property
+// (admitted, not move-only, runs) on that spec-admitted form.
 BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
            owning_buffer_valuelike_choice_accepted_runs_3794) {
     BEZEL_EXPECT_TRUE(runs(
         2,
         "module M; " + kValueLikeChoiceDecl +
         "class C public static method Main(): int "
-        "  using var b := new OwningBuffer<VLC>(2); "
+        "  using var b := new OwningBuffer<VLC>(2, lambda(i: int): VLC => VLC.A); "
         "  return b.Count; "
         "end Main; end C;"));
 }

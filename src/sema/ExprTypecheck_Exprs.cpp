@@ -1497,6 +1497,48 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
         }
     }
 
+    // fix #5821 (§14.2 two-presentation paragraph, v0.338; stdlib §4.14): the
+    // VALUE-typed `OwningBuffer<T>` presentation's single-argument constructor
+    // initializes every slot to `default(T)`, so it requires `T` to be
+    // defaultable; `default(T)` is a compile error for a non-defaultable type
+    // (§17.11). Scoped to a concrete, user-declared, non-nullable record, enum
+    // or choice argument, which is the value presentation by construction:
+    // class/interface/Shared/Weak arguments keep the class-typed presentation
+    // (nullable slots, no default needed), and `string`/`Object`/function
+    // arguments are rejected by their own §4.14 "not admitted" check. A bare
+    // generic parameter (no declaration) is read at instantiation, not here.
+    if (n == "OwningBuffer" && ne.args.size() == 1 &&
+        rt->genericArgs.size() == 1 && rt->genericArgs[0]) {
+        const TypeRef* el = rt->genericArgs[0];
+        if (!el->nullable && el->kind == TypeRef::Kind::Named &&
+            el->declaration &&
+            (el->declaration->kind == ast::TypeDeclKind::Enum ||
+             el->declaration->kind == ast::TypeDeclKind::Choice ||
+             el->declaration->kind == ast::TypeDeclKind::Record) &&
+            sema::typeHasNoDefault(el, ctx_)) {
+            std::string tn(el->declaration->name);
+            std::string why;
+            if (el->declaration->kind == ast::TypeDeclKind::Enum)
+                why = "enum `" + tn + "` declares no constant of underlying "
+                      "value 0";
+            else if (el->declaration->kind == ast::TypeDeclKind::Choice)
+                why = "a choice type has no default (\xC2\xA7""35.10)";
+            else
+                why = "record `" + tn + "` has a non-defaultable component or "
+                      "is constructor-only";
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                "`new OwningBuffer<" + tn + ">(n)` with one argument is not "
+                "admitted: `" + tn + "` is not defaultable (\xC2\xA7""17.11) "
+                "(" + why + "). The value-typed `OwningBuffer<T>` "
+                "single-argument constructor initializes every slot to "
+                "`default(T)`, so it requires T to be defaultable "
+                "(\xC2\xA7""14.2 two-presentation paragraph, v0.338; stdlib "
+                "\xC2\xA7""4.14); use the two-argument constructor with an "
+                "init function, or make the type defaultable");
+        }
+    }
+
     // fix #3425 (§22.5 / §17.7, v0.283): §22.5 binding for a NAMED argument on
     // this built-in constructor. Reached with `n` already established as a
     // built-in head that is NOT a user type, NOT a generic type parameter, and
