@@ -5989,7 +5989,7 @@ static bool parseAndAttachInvariants(const MetaTypeDecl& td,
     std::vector<const ast::Expr*> exprs;
     for (const auto& member : freshTd->members) {
         auto* inv = dynamic_cast<const ast::InvariantDecl*>(member.get());
-        if (!inv || !inv->expr || inv->isStatic) continue;
+        if (!inv || !inv->expr) continue;
         exprs.push_back(inv->expr.get());
     }
     if (exprs.empty()) return false;

@@ -692,8 +692,9 @@ enum class MethodBodyKind { Expression, Block, Abstract };
 
 // §22.16 (v0.203, proposal 0043, #2053) — contract clauses.
 // A.4 `ContractClause ::= "static"? ("requires" | "ensures") Expression ";"`.
-// A clause occupies exactly one enforcement tier (proven/checked/assumed,
-// §22.16 "The tier system"); the `static` qualifier demands the proven tier,
+// A clause occupies exactly one enforcement tier (proven/checked, §22.16 "The
+// tier system"; the reserved `assumed` tier was retired at v0.338, proposal
+// 0184, #5939). The `static` qualifier demands the proven tier,
 // and is the only tier-affecting surface form in this revision.
 //
 // Slice 1 (this commit) introduces the AST and the parse — the clauses are
@@ -766,7 +767,9 @@ struct DestructorDecl : Member {
 };
 
 // §22.16 (v0.203, proposal 0043, #2053): A.4
-//   `InvariantDecl ::= "static"? "invariant" Expression ";"`
+//   `InvariantDecl ::= "invariant" "(" Expression ")" ";"`
+// (v0.338, proposal 0184, #5939: the `"static"?` qualifier is retired; a
+// `static invariant` is a compile error at the member.)
 // A class-body member declaring an instance-state predicate. The class
 // invariant of C is the conjunction of every InvariantDecl of C and every
 // base class, evaluated base-first, declaration order within each class
@@ -774,25 +777,9 @@ struct DestructorDecl : Member {
 // rejected in records, static classes, and outside class bodies (fix
 // #4115/#4186).
 //
-// fix-forward #4206 (§22.16 "Class invariants", "Out of scope in this
-// revision", v0.298; corrects this comment, no behavior change): the
-// `"static"?` qualifier on an invariant clause INSIDE AN ORDINARY (non-
-// static) class body is NOT rejected at sema in this revision — an earlier
-// revision of this comment claimed it was ("rejected at sema as
-// out-of-fragment"), but no sema check ever existed for it (issue #4206,
-// filed reviewing #4186, whose commit had quoted this comment as supporting
-// authority for a claim it did not make). §22.16's own "Out of scope in
-// this revision" list says only: "`static invariant` parses from day one
-// and is useful when the prover fragment lands" — silent on rejection, and
-// the codegen side (`Emitter::emitInvariantCheck`, `LlvmBackend_Setup.cpp`)
-// confirms the intended reading: it simply excludes `isStatic` invariants
-// from runtime instrumentation (`if (inv->expr && !inv->isStatic)`), i.e.
-// INERT-until-the-prover-lands, not rejected.
-// `checkRecordAndStaticClassInvariantMembers` / `checkEnumChoiceInvariantMembers`
-// (TypeResolution_Checks.cpp) reject the wrong BODY KIND (record / static
-// class / enum / choice); neither reads `isStatic`, and nothing else does
-// either — a `static invariant` in an ordinary class compiles clean today,
-// and per the spec text above, should.
+// v0.338 (proposal 0184, #5939): the `"static"?` qualifier is retired. An
+// invariant member takes no `static`; `static invariant(E);` is rejected at
+// the parser (Parser_Decls.cpp), so no `isStatic` bit exists on this node.
 //
 // Slice 1 carried the parsed member only. Instrumentation landed with #2941
 // (construction exit, public-method entry/exit), and the §22.16
@@ -801,7 +788,6 @@ struct DestructorDecl : Member {
 // the instrumentation set: public SETTERS (§22.16 lists them as an
 // instrumentation point; no site emits a check for one).
 struct InvariantDecl : Member {
-    bool isStatic = false;
     std::unique_ptr<Expr> expr;
     SourceLocation loc;  // the `invariant` keyword
 };

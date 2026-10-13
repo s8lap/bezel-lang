@@ -238,26 +238,29 @@ BEZEL_TEST(parser_contract_clauses_2053,
         "end C;");
     const auto* inv = firstInvariant(r);
     BEZEL_EXPECT_TRUE(inv != nullptr);
-    BEZEL_EXPECT_FALSE(inv->isStatic);
     BEZEL_EXPECT_TRUE(inv->expr != nullptr);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.16: `static invariant` parses (it carries meaning when the prover
-// fragment lands; sema in this revision rejects it as out-of-fragment).
+// §22.16 (v0.338, proposal 0184, #5939): an invariant member takes no
+// `static` qualifier. `static invariant(E);` is a parse-time compile error at
+// the member (it parsed as an inert member through v0.337).
 BEZEL_TEST(parser_contract_clauses_2053,
-           static_invariant_member_parses_spec_22_16) {
+           static_invariant_member_rejected_spec_22_16) {
     auto r = parseAll(
         "module M; "
         "class C "
         "  private _v: int := 0; "
         "  static invariant(_v >= 0); "
         "end C;");
-    const auto* inv = firstInvariant(r);
-    BEZEL_EXPECT_TRUE(inv != nullptr);
-    BEZEL_EXPECT_TRUE(inv->isStatic);
-    BEZEL_EXPECT_TRUE(inv->expr != nullptr);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool hit = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("an invariant member takes no `static` qualifier") !=
+                std::string::npos)
+            hit = true;
+    BEZEL_EXPECT_TRUE(hit);
 }
 
 // §22.16 / A.4 InvariantDecl: visibility is not admitted — a `public

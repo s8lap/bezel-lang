@@ -103,11 +103,10 @@ BEZEL_TEST(extension_invariant_4204, extension_invariant_rejected_spec_22_16) {
     BEZEL_EXPECT_TRUE(diagContains(r, "§26.3"));
 }
 
-// REJECT — the `static invariant` spelling (A.4 `InvariantDecl`'s optional
-// `"static"?` qualifier) exercises a different `InvariantDecl::isStatic`
-// value but the SAME AST node kind; this check does not read `isStatic` at
-// all (the member-KIND rejection applies before the clause qualifier is
-// even relevant), so it must reject this identically.
+// REJECT — the `static invariant` spelling. v0.338 (#5939): an invariant
+// member takes no `static` qualifier, so the qualifier is rejected at the
+// parser (its needle is pinned by tests/sema/static_invariant_*) while the
+// body-kind rejection of this file's own kind is what this row is about.
 BEZEL_TEST(extension_invariant_4204,
            extension_static_invariant_rejected_spec_22_16) {
     auto r = runAot(
@@ -124,7 +123,7 @@ BEZEL_TEST(extension_invariant_4204,
         "end Main; end C4204s;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagContains(
-        r, "an extension block may not declare an `invariant` member"));
+        r, "an invariant member takes no `static` qualifier"));
 }
 
 // REJECT — an extension on a PRIMITIVE type (§26.2 "Built-in primitive

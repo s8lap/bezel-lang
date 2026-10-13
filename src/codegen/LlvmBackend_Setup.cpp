@@ -7437,7 +7437,7 @@ void Emitter::collectInvariantChain(
             for (const auto& m : td->members) {
                 if (auto* inv =
                         dynamic_cast<const ast::InvariantDecl*>(m.get())) {
-                    if (inv->expr && !inv->isStatic) {
+                    if (inv->expr) {
                         group.push_back({c, inv->expr.get()});
                     }
                 }

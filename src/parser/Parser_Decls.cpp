@@ -1770,32 +1770,23 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         // Sema validates the recorded modifiers carry at most `static`. Any
         // stray modifier (e.g. `owned`) is left for sema to reject, so the
         // AST captures the source text faithfully.
+        // §22.16 (v0.338, proposal 0184, #5939): an invariant member takes
+        // no `static` qualifier. `static invariant(E);` is a compile error at
+        // the member — it was inert from v0.203 and warned from v0.303
+        // (#4449), and the `assumed` tier that would have given it meaning
+        // is retired. The qualifier is rejected here, at parse time, so the
+        // AST carries no `isStatic` bit for invariants.
         const bool isStatic =
             std::find(modifiers.begin(), modifiers.end(),
                       std::string_view("static")) != modifiers.end();
-        auto inv = std::make_unique<ast::InvariantDecl>();
-        inv->isStatic = isStatic;
-        inv->loc = current_.location;
-        // fix #4449 (§22.16, v0.303): a `static invariant` clause is parsed
-        // from day one and is INERT — neither rejected nor instrumented
-        // (codegen's `Emitter::emitInvariantCheck` excludes `isStatic`
-        // invariants by design) — until the contract-proving prover fragment
-        // lands. §22.16's "Out of scope in this revision" rule names the
-        // diagnostic obligation: "the compiler **must** emit a warning at
-        // the clause naming that fact". Fires once at the clause's
-        // declaration site (here, where the AST is built), on `static
-        // invariant` only — plain `invariant` is unaffected. The warning is
-        // WITHDRAWN (not silenced) when the prover fragment lands — the rule
-        // states the condition itself, so the diagnostic cannot outlive its
-        // reason. The wording is fixed by the issue for a citation trail;
-        // minor punctuation paraphrases are not.
         if (isStatic) {
             diagnostics_.report(
-                Severity::Warning, current_.location,
-                "`static invariant` is not instrumented in this revision — "
-                "the clause is parsed and otherwise inert until the "
-                "contract-proving prover fragment lands (§22.16)");
+                Severity::Error, current_.location,
+                "an invariant member takes no `static` qualifier — write "
+                "`invariant(E);`, or delete the member (§22.16)");
         }
+        auto inv = std::make_unique<ast::InvariantDecl>();
+        inv->loc = current_.location;
         advance();  // past `invariant`
         // §22.16 v0.207: structural parens around the predicate. The `;` is
         // the ordinary member terminator.

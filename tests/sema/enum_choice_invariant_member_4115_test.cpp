@@ -94,10 +94,10 @@ BEZEL_TEST(enum_choice_invariant_4115, choice_invariant_rejected_spec_22_16) {
     BEZEL_EXPECT_TRUE(diagContains(r, "§22.16"));
 }
 
-// REJECT — the `static invariant` spelling (A.4 `InvariantDecl`'s optional
-// `"static"?` qualifier) exercises a different `InvariantDecl::isStatic`
-// value but the SAME AST node kind; this check does not read `isStatic` at
-// all, so it must reject this identically.
+// REJECT — the `static invariant` spelling. v0.338 (#5939): an invariant
+// member takes no `static` qualifier, so the qualifier is rejected at the
+// parser (its needle is pinned by tests/sema/static_invariant_*) while the
+// body-kind rejection of this file's own kind is what this row is about.
 BEZEL_TEST(enum_choice_invariant_4115,
            enum_static_invariant_rejected_spec_22_16) {
     auto r = runAot(
@@ -111,7 +111,7 @@ BEZEL_TEST(enum_choice_invariant_4115,
         "end Main; end C4115s;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagContains(
-        r, "enum `Color4115s` may not declare an `invariant` member"));
+        r, "an invariant member takes no `static` qualifier"));
 }
 
 // =====================================================================

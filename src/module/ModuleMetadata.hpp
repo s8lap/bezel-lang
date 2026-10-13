@@ -469,7 +469,6 @@ enum class MetaContractKind : std::uint8_t {
 enum class MetaContractTier : std::uint8_t {
     Proven = 0,
     Checked = 1,
-    Assumed = 2,
 };
 
 struct MetaContractRecord {

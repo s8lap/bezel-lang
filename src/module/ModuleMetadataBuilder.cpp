@@ -1031,9 +1031,7 @@ MetaContractRecord convertInvariant(const ast::InvariantDecl& inv,
                                     const sema::TypeSymbol* ownerType) {
     MetaContractRecord out;
     out.kind = MetaContractKind::Invariant;
-    out.isStatic = inv.isStatic;
-    out.tier = inv.isStatic ? MetaContractTier::Proven
-                            : MetaContractTier::Checked;
+    out.tier = MetaContractTier::Checked;
     if (inv.expr)
         out.canonicalText = canonicalClauseText(
             *inv.expr, ctx, source, {}, generics, moduleName, ownerType);
@@ -2598,11 +2596,8 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // The exporter does NOT canonicalize or rewrite: the expression's span is
     // sliced out of `source` verbatim and wrapped back into an `invariant(…);`
     // member, exactly as #662c's `dtorBodyText` and #3916's `baseCtorArgsText`
-    // slice their fragments. `static` invariants are skipped: §22.16 makes one
-    // INERT in this revision ("`static invariant(false);` compiles and does
-    // nothing"), and codegen's `emitInvariantCheck` excludes them on the local
-    // side too, so carrying one would create a check across the boundary that
-    // the same program does not get in-module.
+    // slice their fragments. (v0.338, #5939: the `static` invariant form is a
+    // compile error, so every invariant member here is a checked one.)
     //
     // Conditional on the class declaring at least one, so a module whose
     // classes declare none produces BYTE-IDENTICAL metadata to a pre-#4592
@@ -2613,7 +2608,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         for (const auto& member : selfTd->members) {
             const auto* inv =
                 dynamic_cast<const ast::InvariantDecl*>(member.get());
-            if (!inv || !inv->expr || inv->isStatic) continue;
+            if (!inv || !inv->expr) continue;
             const std::size_t begin = inv->expr->span.begin.offset;
             const std::size_t end = inv->expr->span.end.offset;
             if (begin >= end || end > source.size() ||
