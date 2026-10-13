@@ -48,13 +48,13 @@
 // class` erasure guard) MUST still reject — they pin the un-lifted
 // halves of proposal 0091 §1 and §3.
 //
-// FAIL-WITHOUT (verified mechanically against the pre-fix state — see
-// the conversation that landed this fix): the §22.6 declaration guard
-// returns `false` for the `where T: IDisposable` pair, the pair
-// collapses, and the corpus row reads as `fail divergence` — same as
-// pre-fix. FAIL-WITH: the declaration guard returns `true`, the pair
-// declares, no diagnostic, no compile error, and the corpus row reads
-// as `pass`.
+// SUPERSEDED (v0.338, #5940, proposal 0185). The declaration guard
+// (proposal 0091 §1) is retired: `owned` never distinguishes overloads
+// (§22.6 *`owned` and overload resolution*, §11.3). Every ordinary-`owned`
+// / plain pair therefore clashes at the second declaration, including the
+// `where T: IDisposable` and concrete-class rows below, which flipped from
+// accept to reject. The §22.6 `scoped` and `out owned` controls are
+// unchanged.
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
@@ -68,21 +68,15 @@ using bezel::test::JitResult;
 using bezel::test::runAot;
 
 // =========================================================================
-// §22.6 — the corpus cluster row s22_6_0018's exact repro: an `owned`/plain
-// pair on a `where T: IDisposable` parameter passes the declaration guard
-// (the §8.7 closure guarantees a class-only conforming set; proposal 0091
-// §1 worked example). The pre-fix state REJECTED this pair; the post-fix
-// state ACCEPTS it. Verified both ways: against the pre-fix base and the
-// post-fix base.
+// §22.6 — the corpus cluster row s22_6_0018's repro: an `owned`/plain pair
+// on a `where T: IDisposable` parameter. v0.338 (#5940) retires the
+// declaration guard that admitted it, so the pair now clashes.
 // =========================================================================
 
-// §22.6 / proposal 0091 §1 / §8.7 (issue #4939): the `where T:
-// IDisposable` ordinary-`owned`/plain pair is DECLARABLE. The §22.6
-// declaration guard admits the class-only-interface bound; the pair is
-// distinguishable at every differing position; the declaration compiles
-// without a §22.6/§11.3 diagnostic. The `runAot` AOT path here exercises
-// declaration-site overload checking — the post-fix verdict is "compiles
-// clean".
+// §22.6 *`owned` and overload resolution* / §11.3 (v0.338, #5940): the
+// `where T: IDisposable` ordinary-`owned`/plain pair is NOT declarable.
+// `owned` never distinguishes overloads, so the second declaration clashes
+// with the "indistinguishable" diagnostic.
 BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
            where_t_idisposable_owned_plain_pair_admitted_spec_22_6_8_7) {
     auto r = runAot(
@@ -96,13 +90,9 @@ BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
         "class C\n"
         "  public static method Main(): int return 0; end Main;\n"
         "end C;\n");
-    // The §22.6/§11.3 "indistinguishable" diagnostic must NOT fire — the
-    // pair declares.
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "indistinguishable"));
-    // The §22.6/§11.3 diagnostic (when fired) names the "collapses" rule
-    // for failing positions; this row's position PASSES the guard, so no
-    // collapse wording.
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "collapses"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "indistinguishable"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`owned` and `scoped` never distinguish overloads"));
 }
 
 // =========================================================================
@@ -157,11 +147,9 @@ BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "owned"));
 }
 
-// §22.6 / proposal 0091 §1 erasure guard (issue #4939 reviewer-side
-// negative control): the `where T: class` constraint does NOT qualify
-// (admits `string` and function-type substitutions, §14.2; §28.1 erases
-// the marker at those substitutions and the pair collapses). The pair
-// still clashes.
+// §22.6 *`owned` and overload resolution* / §11.3 (v0.338, #5940): the
+// `where T: class` ordinary-`owned`/plain pair clashes (`owned` never
+// distinguishes overloads).
 BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
            where_t_class_owned_plain_pair_still_rejected_spec_22_6_14_2) {
     auto r = runAot(
@@ -174,16 +162,14 @@ BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
         "end Box;\n");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "indistinguishable"));
-    // The `where T: class` failure path names the "collapses" wording
-    // (corpus row `s22_6_0017` `//! diagnostic: collapses`).
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "collapses"));
+    // The diagnostic names the rule (v0.338 re-spelling of the old
+    // "collapses" wording).
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`owned` and `scoped` never distinguish overloads"));
 }
 
-// §22.6 / proposal 0091 §1 erasure guard (issue #4939 reviewer-side
-// negative control): an UNCONSTRAINED type parameter does NOT qualify
-// (every substitution is admissible). The pair still clashes. This is
-// the partner of the #1873 reject rows (proposal 0091 §5 calls them
-// out as standing rejects).
+// §22.6 / §11.3 (v0.338, #5940): an unconstrained type parameter's
+// ordinary-`owned`/plain pair clashes. This is the partner of the #1873
+// reject rows.
 BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
            unconstrained_t_owned_plain_pair_still_rejected_spec_22_6) {
     auto r = runAot(
@@ -197,18 +183,14 @@ BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
 }
 
 // =========================================================================
-// Companion (same-fix coverage, §22.6 lift accepts): the concrete-class
-// `Put(t: Widget)` / `Put(owned t: Widget)` pair on a non-generic class
-// — proposal 0091 §5's "one genuine flip" row, repurposed here as a
-// gtest-level pinning of the lift.
+// Companion (v0.338, #5940): the concrete-class `Put(item: Widget)` /
+// `Put(owned item: Widget)` pair on a non-generic class now clashes (it
+// flipped from accept to reject; the lit row
+// `sema_overload__owned_only_difference_diagnoses.bzl` flipped with it).
 // =========================================================================
 
-// §22.6 / proposal 0091 §5 (issue #4939): a concrete-class
-// ordinary-`owned`/plain pair is DECLARABLE. The position is a class
-// type, which always qualifies under §22.6's erasure-test declaration
-// guard. The previously-reject lit row `tests/lit/sema/sema_overload__
-// owned_only_difference_diagnoses.bzl` was the family exemplar of the
-// ban; it now reads as ACCEPT.
+// §22.6 *`owned` and overload resolution* / §11.3 (v0.338, #5940): a
+// concrete-class ordinary-`owned`/plain pair is a compile error.
 BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
            concrete_class_owned_plain_pair_admitted_spec_22_6) {
     auto r = runAot(
@@ -225,6 +207,7 @@ BEZEL_TEST(s22_6_disposable_constraint_pair_distinguishable_4939,
         "class C\n"
         "  public static method Main(): int return 0; end Main;\n"
         "end C;\n");
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "indistinguishable"));
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "collapses"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "indistinguishable"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`owned` and `scoped` never distinguish overloads"));
 }

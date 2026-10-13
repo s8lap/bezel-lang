@@ -1,13 +1,13 @@
 //! case: s22_6_0014
 //! doc: spec
 //! section: 22.6
-//! title: a move-marked owned production selects the owned member of an owned-ordinary pair
-//! rule: "An owned production is applicable only to the `owned` candidate:
-//!   a move-rooted argument (`move x` ...) ... `r.Append(move w);` //
-//!   transfer — the owned overload."
+//! title: a move-marked owned production of a same-type owned/ordinary pair is rejected at the declaration (v0.338)
+//! rule: **`owned` never distinguishes overloads (v0.338, proposal 0185).**
+//!   `Append(item: Widget)` beside `Append(owned item: Widget)` clash at the
+//!   second declaration (§22.6, §11.3); the owned production is not selected.
 //! cites: 22.6
-//! expect: run
-//! stdout: take
+//! expect: reject
+//! diagnostic: `owned` and `scoped` never distinguish overloads
 module Conf;
 
 public class Widget

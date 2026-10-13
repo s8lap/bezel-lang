@@ -1,13 +1,13 @@
 //! case: s22_6_0013
 //! doc: spec
 //! section: 22.6
-//! title: an unmarked borrow read selects the plain member of an owned-ordinary pair
-//! rule: "A borrow is applicable only to the plain candidate: an unmarked
-//!   read of a named binding ... `r.Append(w)`; // borrow — the plain
-//!   overload; w untouched."
+//! title: an unmarked borrow read of a same-type owned/ordinary pair is rejected at the declaration (v0.338)
+//! rule: **`owned` never distinguishes overloads (v0.338, proposal 0185).**
+//!   `Append(item: Widget)` beside `Append(owned item: Widget)` clash at the
+//!   second declaration (§22.6, §11.3); a borrow read is no longer selected.
 //! cites: 22.6
-//! expect: run
-//! stdout: borrow
+//! expect: reject
+//! diagnostic: `owned` and `scoped` never distinguish overloads
 module Conf;
 
 public class Widget

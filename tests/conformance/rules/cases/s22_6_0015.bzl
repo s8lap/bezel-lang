@@ -9,7 +9,7 @@
 //!   beside `TryGet(name: string, out owned c: Conn?)`
 //! cites: 22.6
 //! expect: reject
-//! diagnostic: owned qualifier
+//! diagnostic: `owned` and `scoped` never distinguish overloads
 module Conf;
 
 public class Conn

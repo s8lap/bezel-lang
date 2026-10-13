@@ -3745,7 +3745,7 @@ private:
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
 
-    // fix #5099 (§22.6 stage 8 / §22.7 / §22.10, v0.307): at `new C(...)` on a
+    // fix #5099 (§22.6 stage 7 / §22.7 / §22.10, v0.307): at `new C(...)` on a
     // LOCAL class that has both a primary constructor and body constructors,
     // rank the primary together with the body constructors and report a
     // §22.6 stage-8 ambiguity when no candidate is unambiguously better.

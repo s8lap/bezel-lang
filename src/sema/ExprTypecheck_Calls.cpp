@@ -19023,7 +19023,7 @@ bool ExprTC::recordAllowsZeroArgNew(const TypeSymbol& t) {
 // declared constructors → the implicit default ctor takes no arguments.
 // One constructor → argument count/type check. Multiple constructors →
 // §22.6 type-based overload resolution (exact-match-then-ambiguity).
-// fix #5099 (§22.6 stage 8 / §22.7 / §22.10, v0.307). See the declaration.
+// fix #5099 (§22.6 stage 7 / §22.7 / §22.10, v0.307). See the declaration.
 // The primary's parameters are the class's `positionalFields` (the same
 // `ast::Param` list the LOCAL primary-only path binds), so the primary is
 // ranked from its own syntax, with no synthesized parameter list.
@@ -19216,7 +19216,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 }
             }
             if (hasExplicitCtor) {
-                // fix #5658 (§22.6 stage 8, v0.326): the LOCAL combined-form
+                // fix #5658 (§22.6 stage 7, v0.326): the LOCAL combined-form
                 // record must check for primary/body constructor ambiguity, the
                 // same check the class combined-form path runs ~180 lines below
                 // (fix #5099). Without it, `new R(3)` against
@@ -19354,7 +19354,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // keep that fall-through to preserve the existing import-side
             // behavior (don't widen it here either).
             //
-            // fix #5099 (§22.6 stage 8 / §22.7 / §22.10, v0.307): the
+            // fix #5099 (§22.6 stage 7 / §22.7 / §22.10, v0.307): the
             // deferral must not skip §22.6 entirely. The primary constructor
             // is a constructor (§22.7), so it is a candidate at `new C(...)`
             // like any body constructor. `class C(x: int)` beside
@@ -19975,7 +19975,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                                 es.push_back(a.value.get());
                             return es;
                         }());
-        // fix #4780 (§22.6 stage 8, v0.307): resolveOverload returns
+        // fix #4780 (§22.6 stage 7, v0.307): resolveOverload returns
         // Ambiguous when it finds multiple applicable candidates with
         // identical conversions. The caller must not fall through silently.
         if (newRes.outcome == OverloadOutcome::Ambiguous) {

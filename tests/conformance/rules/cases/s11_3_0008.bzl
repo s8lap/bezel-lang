@@ -7,7 +7,7 @@
 //!   are a compile error (§22.6).
 //! cites: 11.3, 22.6
 //! expect: reject
-//! diagnostic: clash
+//! diagnostic: `owned` and `scoped` never distinguish overloads
 module Conf;
 
 public class Widget

@@ -1,13 +1,12 @@
 //! case: s11_3_0007
 //! doc: spec
 //! section: 11.3
-//! title: an owned/plain parameter pair is legal when the constraint excludes every collapsing substitution
-//! rule: An interface bound qualifies exactly when the interface's conforming
-//!   set excludes every value-kind and runtime-managed type as a matter of
-//!   language rule -- where T: IDisposable qualifies, its closure guaranteed
-//!   by §8.7.
+//! title: an owned/plain parameter pair over a where-T-IDisposable constraint is rejected (v0.338)
+//! rule: **`owned` never distinguishes overloads (v0.338, proposal 0185).**
+//!   An ordinary-`owned` / plain pair clashes at the second declaration (§11.3).
 //! cites: 11.3, 22.6
-//! expect: accept
+//! expect: reject
+//! diagnostic: `owned` and `scoped` never distinguish overloads
 module Conf;
 
 public class Registry<T> where T: IDisposable

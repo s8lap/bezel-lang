@@ -1,14 +1,13 @@
 //! case: s22_6_0018
 //! doc: spec
 //! section: 22.6
-//! title: an owned/ordinary pair over a where-T-IDisposable constraint passes the declaration guard
-//! rule: "A pair differing only by ordinary `owned` is declarable exactly
-//!   when, at every differing position, the declared type ... is a class
-//!   type, an interface type, or a type parameter whose constraints
-//!   exclude every substitution at which the pair collapses ... `where T:
-//!   IDisposable` qualifies, its closure guaranteed by §8.7."
+//! title: an owned/ordinary pair over a where-T-IDisposable constraint is rejected at the declaration (v0.338)
+//! rule: **`owned` never distinguishes overloads (v0.338, proposal 0185).**
+//!   An ordinary-`owned` / plain pair clashes at the second declaration; no
+//!   constraint lifts it (§22.6, §11.3).
 //! cites: 22.6, 28.1, 14.2
-//! expect: accept
+//! expect: reject
+//! diagnostic: `owned` and `scoped` never distinguish overloads
 module Conf;
 
 public class Box<T> where T: IDisposable

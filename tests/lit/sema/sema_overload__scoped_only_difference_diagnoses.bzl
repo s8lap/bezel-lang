@@ -5,5 +5,5 @@
 
 module M; class C public method F(cb: () -> ()) _ := 1; end F; public method F(scoped cb: () -> ()) _ := 2; end F; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: overload of `F` is indistinguishable from another overload — overloads must differ in parameter count, types, or `ref`/`out` modifiers, or by ordinary `owned` under the declaration guard; `out owned` and `scoped` never distinguish. At a position whose type fails the guard the pair collapses to one signature
-// CHECK-SAME: (§22.6/§11.3, v0.250)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: overload of `F` is indistinguishable from another overload — overloads must differ in parameter count, types, or `ref`/`out` modifiers; `owned` and `scoped` never distinguish overloads
+// CHECK-SAME: (§22.6/§11.3, v0.338)

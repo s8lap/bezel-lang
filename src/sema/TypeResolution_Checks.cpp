@@ -3094,12 +3094,11 @@ bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
 }
 
 std::string_view Resolver::overloadModifier(std::string_view mod) {
-    // per §22.6 / §11.3 (v0.250, proposal 0091): ordinary-parameter `owned`
-    // is a *candidate* for overload distinguishability under the declaration
-    // guard below; until the guard check (signaturesIndistinguishable) runs,
-    // `owned` keeps its own key so the two sides of the comparison can be
-    // recognised. `scoped` never distinguishes (no call-site marker, §28.14)
-    // and still collapses to the plain form. `out owned` collapses to `out`
+    // per §22.6 / §11.3 (v0.338): `owned` on a parameter keeps its own key so
+    // signaturesIndistinguishable can recognise the owned-vs-plain pair, which
+    // it treats as indistinguishable (the pair clashes at the second
+    // declaration). `scoped` never distinguishes (no call-site marker, §28.14)
+    // and collapses to the plain form. `out owned` collapses to `out`
     // (the v0.77 `out`/`out owned` carve-out is withdrawn). `ref` is its
     // own kind.
     if (mod == "owned") return "owned_value";
@@ -3109,180 +3108,6 @@ std::string_view Resolver::overloadModifier(std::string_view mod) {
     return mod;
 }
 
-// §22.6 (v0.250, proposal 0091) declaration guard (the erasure test):
-// does the declared TypeRef at an ordinary-`owned` differing position
-// qualify?  A type qualifies when (a) it is a class type, (b) it is an
-// interface type whose conforming set is class-only (IDisposable or any
-// IDisposable-extending interface — the closure §8.7 guarantees — and the
-// inheritance §14.2 rule 3 carries), or (c) it is a type parameter whose
-// own constraint set qualifies.  Any unqualifying position leaves the
-// pair indistinguishable (the pair still clashes at the second declaration,
-// reported under §11.3).
-//
-// All conservative branches err on the side of REJECTING (returning
-// `false` — the pair still clashes), which is the safe direction per
-// §22.6's "Never ship unsound code" posture: a TypeRef we cannot
-// confidently classify never grants the lift. The class-type and
-// IDisposable-closure arms are precise; everything else (primitives,
-// records/enums/choices, ordinary user-declared interface bounds, the
-// `class` special constraint, function types, inline arrays, value
-// constraints) is conservative — over-rejection in those rare cases.
-//
-// `pa` is the parameter the TypeRef belongs to; it is the lookup root
-// for the bare-type-parameter case (`T` resolves to a Named TypeRef
-// whose `declaration` is null — see `bareTypeParamRef` in
-// ExprTypecheck_Calls.cpp:17597 — and whose name is matched against the
-// enclosing type's and method's own `genericParams`).
-bool Resolver::positionTypePassesDeclarationGuard(
-    const TypeRef* tr, const ParameterSymbol* pa, const MemberSymbol* enclosing) {
-    if (!tr) return false;
-    // Nullability is stripped per the guard (see long comment below).
-    if (tr->nullable) return false;
-    if (tr->kind == TypeRef::Kind::Named) {
-        TypeSymbol* effectiveDecl = tr->declaration;
-        if (!effectiveDecl) {
-            // `IDisposable` (and the other §8.7 closure members — see comment
-            // below) has NO TypeSymbol of its own (`nonSymbolBaseRefs` source,
-            // SymbolCollection.cpp:955). `builtinInterfaceSym` only synthesizes
-            // for the `isSynthesizedBuiltinInterfaceName` set (IComparable,
-            // IEquatable, …) and returns null for `IDisposable`. The §8.7
-            // closure establishes that `IDisposable` (and any IDisposable-
-            // extending interface) has a class-only conforming set AS A MATTER
-            // OF LANGUAGE RULE — there is no other path to an `IDisposable`
-            // conforming class without it being a class. So at a constraint
-            // bound position (where we have only a name, no resolved
-            // TypeSymbol yet), `IDisposable` qualifies directly.
-            std::string_view nm = tr->headName();
-            if (nm == "IDisposable") return true;
-            // For non-IDisposable names, fall back to `builtinInterfaceSym`
-            // (the synthesized set, e.g. `IComparable`) — a user interface
-            // named `IComparable` does NOT qualify (§2.8.3 identity rule, and
-            // the synthesized TypeSymbol carries `isSynthesizedBuiltinInterface`
-            // so `inheritsBuiltinInterface(..., "IDisposable")` rejects it).
-            if (!nm.empty()) effectiveDecl = ctx_.builtinInterfaceSym(nm);
-        }
-        if (!effectiveDecl) {
-            // Bare type-parameter reference (`T` inside `class Box<T>`).
-            // The TypeRef's declaration is null (a §14.1 "bare" reference);
-            // its identifying name lives in `headName()`. Look it up in
-            // the enclosing method's (if any) and enclosing type's
-            // genericParams; method-level generic params SHADOW type-level
-            // ones with the same name (the same shadowing
-            // ExprTypecheck_Calls.cpp:4865 resolves by walking the method
-            // first). `pa` is the parameter; `enclosing` is the owning
-            // member (method/ctor/indexer) — ParameterSymbol itself has no
-            // back-pointer, so the caller passes the member in.
-            std::string_view nm = tr->headName();
-            if (nm.empty()) return false;
-            const GenericParamSymbol* gp = nullptr;
-            if (auto* ms = dynamic_cast<const MethodSymbol*>(enclosing)) {
-                for (Symbol* g : ms->genericParams) {
-                    if (g && g->name == nm) {
-                        gp = dynamic_cast<GenericParamSymbol*>(g);
-                        break;
-                    }
-                }
-            }
-            if (!gp && enclosing && enclosing->parent) {
-                for (Symbol* g : enclosing->parent->genericParams) {
-                    if (g && g->name == nm) {
-                        gp = dynamic_cast<GenericParamSymbol*>(g);
-                        break;
-                    }
-                }
-            }
-            (void)pa;  // reserved for future use (per-param closure tracking)
-            if (!gp) return false;
-            return typeParamConstraintSetQualifies(gp);
-        }
-        // A named TypeRef whose declaration is a GenericParamSymbol is a
-        // type-parameter reference (rare — usually an explicit alias
-        // through a method-generic-param symbol).
-        if (auto* gp = dynamic_cast<GenericParamSymbol*>(effectiveDecl)) {
-            return typeParamConstraintSetQualifies(gp);
-        }
-        if (auto* ts = dynamic_cast<TypeSymbol*>(effectiveDecl)) {
-            if (ts->kind == ast::TypeDeclKind::Class) {
-                // Every class type's marker survives §28.1's erasure
-                // (only value/runtime-managed substitutions erase).
-                return true;
-            }
-            if (ts->kind == ast::TypeDeclKind::Interface) {
-                // Qualifies iff the interface's conforming set is
-                // class-only as a matter of language rule. The §8.7
-                // closure makes this true for IDisposable and for
-                // every IDisposable-extending interface.
-                return inheritsBuiltinInterface(ts, "IDisposable");
-            }
-            // Record, enum, choice — the kind does not survive §28.1's
-            // erasure as a class.
-            return false;
-        }
-        return false;
-    }
-    // Primitive, InlineArray, Function, Unit, Error: never class-only.
-    return false;
-}
-
-// §22.6 declaration guard's constraint-set half. A constraint set qualifies
-// iff every individual constraint qualifies individually:
-//   - the special `class` constraint does NOT qualify (admits `string` and
-//     function-type substitutions, §14.2);
-//   - a class-typed bound (`where T: SomeClass`) qualifies — only class
-//     types satisfy it;
-//   - an interface-typed bound qualifies iff the interface's conforming
-//     set is class-only (IDisposable or any IDisposable-extending
-//     interface);
-//   - `value`, `notnull`, `new`, `sendable`, `hashable` and similar special
-//     constraints do NOT qualify on their own;
-//   - an unconstrained type parameter has an empty constraint set and
-//     therefore does NOT qualify (every substitution is admissible).
-//
-// We deliberately read the per-constraint qualifier in the strictest
-// interpretation of the spec text: any non-qualifying constraint in the
-// set rejects the whole set. This over-rejects on `where T: class, X`
-// where X happens to be a class-only interface (the intersection is still
-// class-only), but is the safe direction.
-bool Resolver::typeParamConstraintSetQualifies(const GenericParamSymbol* gp) {
-    if (!gp) return false;
-    if (gp->constraints.empty()) return false;
-    for (const GenericParamConstraint& c : gp->constraints) {
-        // The special `class` form — does NOT qualify.
-        if (c.kind == "class") return false;
-        // Type-bound form — qualifies iff the bound is class-typed or an
-        // IDisposable-closure interface.
-        if (c.kind == "type") {
-            TypeRef* bound =
-                c.importedBound ? c.importedBound
-                                : (c.astBound ? ctx_.resolvedType(*c.astBound)
-                                              : nullptr);
-            if (!positionTypePassesDeclarationGuard(bound, nullptr, nullptr)) {
-                // Constraint resolution is a separate late pass (#3146): on
-                // overload-signature checking the resolved TypeRef may be
-                // null. Fall back to the AST node's bare name — for
-                // `where T: IDisposable`, `astBound->name->parts.back()` is
-                // `IDisposable`, which the §22.6 guard's name-side arm
-                // (positionTypePassesDeclarationGuard) recognises. The bare
-                // name alone admits ONLY the closed IDisposable-closure set
-                // (and a few synthesized builtins via the existing
-                // fallback), so this over-rejects by construction on
-                // user-declared interface bounds whose resolution hasn't
-                // landed yet — the safe direction per §22.6.
-                if (!bound && c.astBound && c.astBound->name &&
-                    !c.astBound->name->parts.empty()) {
-                    std::string_view nm =
-                        c.astBound->name->parts.back();
-                    if (nm == "IDisposable") continue;
-                }
-                return false;
-            }
-            continue;
-        }
-        // value, notnull, new, sendable, hashable, ... — none qualify.
-        return false;
-    }
-    return true;
-}
 
 void Resolver::checkOverloadSignatures() {
     // fix #3574: routed through the ONE recursive nested-type walk
@@ -3407,7 +3232,6 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
                 }
                 if (signaturesIndistinguishable(
                         *overloads[i].first, *overloads[j].first,
-                        dynamic_cast<const MemberSymbol*>(overloads[i].second),
                         msI ? msI->genericParams
                             : std::vector<Symbol*>{},
                         msJ ? msJ->genericParams
@@ -3430,12 +3254,9 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
                             " is indistinguishable from another overload "
                             "\xe2\x80\x94 overloads must differ in "
                             "parameter count, types, or `ref`/`out` "
-                            "modifiers, or by ordinary `owned` under "
-                            "the declaration guard; `out owned` and "
-                            "`scoped` never distinguish. At a "
-                            "position whose type fails the guard the "
-                            "pair collapses to one signature "
-                            "(\xc2\xa7""22.6/\xc2\xa7""11.3, v0.250)");
+                            "modifiers; `owned` and `scoped` never "
+                            "distinguish overloads "
+                            "(\xc2\xa7""22.6/\xc2\xa7""11.3, v0.338)");
                     }
                 }
             }
@@ -3450,7 +3271,6 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
 
 bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                            const std::vector<Symbol*>& b,
-                                           const MemberSymbol* enclosing,
                                            const std::vector<Symbol*>& aGenericParams,
                                            const std::vector<Symbol*>& bGenericParams) {
     if (a.size() != b.size()) return false;
@@ -3509,34 +3329,14 @@ bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
         std::string_view ma = overloadModifier(pa->modifier);
         std::string_view mb = overloadModifier(pb->modifier);
         if (ma != mb) {
-            // §22.6 (v0.250, proposal 0091): the only modifier-pair that
-            // stays *indistinguishable* on equal types but for which the
-            // declaration guard may rescue distinguishability is the
-            // ordinary-`owned` vs plain pair (one key "value", the other
-            // "owned_value"). Every other modifier difference is a hard
-            // distinguish — the kinds differ outright.
+            // §22.6 / §11.3 (v0.338): ordinary `owned` and plain never
+            // distinguish overloads, so the owned-vs-plain pair falls through
+            // to the type comparison below and clashes on equal types. Every
+            // other modifier difference is a hard distinguish.
             bool ownedOnlyDiff =
                 (ma == "value" && mb == "owned_value") ||
                 (ma == "owned_value" && mb == "value");
             if (!ownedOnlyDiff) return false;
-            // Ordinary-`owned` difference: check the §22.6 declaration
-            // guard at this position. A TypeRef that passes the guard
-            // (class type / class-only-interface / qualifying type
-            // parameter) makes the pair DISTINGUISHABLE at this position
-            // — return false. A failing position lets the pair collapse
-            // here; fall through so the loop continues to the next
-            // position (and ultimately to the per-position type check
-            // below).
-            TypeRef* ta = pa->declType ? ctx_.resolvedType(*pa->declType)
-                                       : nullptr;
-            if (positionTypePassesDeclarationGuard(ta, pa, enclosing)) {
-                return false;
-            }
-            // Guard failed at this position — the pair still collides
-            // here; re-equalise the keys so the rest of the loop runs
-            // unchanged (every position must pass the guard for the
-            // pair to be admitted).
-            (void)0;
         }
         TypeRef* ta = pa->declType ? ctx_.resolvedType(*pa->declType)
                                    : nullptr;

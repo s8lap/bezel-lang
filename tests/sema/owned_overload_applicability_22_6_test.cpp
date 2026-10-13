@@ -1,3 +1,13 @@
+// v0.338 (#5940, proposal 0185): the v0.334 ownership-mode applicability rule
+// (§22.6 stage 4, the four clauses below) was RETIRED. `owned` never
+// distinguishes overloads, so a same-type pair differing only by ordinary
+// `owned` clashes at its second declaration (§22.6 *`owned` and overload
+// resolution*, §11.3). The rows that declared such a pair and asserted its
+// selection now assert that the pair is REJECTED with the specific clash
+// needle. No row is deleted. move_rooted_consumes_binding now uses a single
+// owned member (no pair) and is independent of the clash; the pair form is
+// pinned by move_rooted_consumes_binding_pair_rejected_spec_22_6_v0_338.
+//
 // fix §22.6 *`owned` and overload resolution* (v0.334): stage-4
 // OWNERSHIP-MODE APPLICABILITY for a pair of overloads differing only by
 // ordinary `owned`.
@@ -73,11 +83,8 @@ bool hasError(const JitResult& r, const char* sub) {
     return false;
 }
 
-// The AOT oracle captures the program's stdout in `stdoutText`; a marker is
-// present when the substring appears anywhere in it.
-bool stdoutHas(const JitResult& r, const char* sub) {
-    return r.stdoutText.find(sub) != std::string::npos;
-}
+// v0.338 (#5940): the pair clash needle, re-spelled by §22.6/§11.3.
+constexpr const char* kPairClash = "`owned` and `scoped` never distinguish overloads";
 
 void expectRejected(const JitResult& r, const char* diag) {
     if (!hasError(r, diag)) {
@@ -109,16 +116,14 @@ std::string withPair(const std::string& body) {
 // a named binding is a BORROW, so only the PLAIN member is applicable and the
 // call resolves to it. Prints "borrow".
 BEZEL_TEST(owned_overload_applicability_22_6,
-           unmarked_read_selects_plain_member_spec_22_6_clause_2) {
+           unmarked_read_pair_rejected_spec_22_6_v0_338) {
     auto r = runAot(withPair(
         "public class Program public static method Main() "
         "  using var r := new Registry(); "
         "  using var w := new Widget(); "
         "  Console.WriteLine(r.Append(w)); "
         "end Main; end Program;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(stdoutHas(r, "borrow"));
+    expectRejected(r, kPairClash);
 }
 
 // Cell 2 (POSITIVE, spec §22.6 clause 1 + example line 2): a move-rooted
@@ -126,16 +131,14 @@ BEZEL_TEST(owned_overload_applicability_22_6,
 // Prints "take". This is the row whose pre-fix fallthrough to the plain member
 // also produced the bogus §22.3 "marker does not take ownership" diagnostic.
 BEZEL_TEST(owned_overload_applicability_22_6,
-           move_rooted_selects_owned_member_spec_22_6_clause_1) {
+           move_rooted_pair_rejected_spec_22_6_v0_338) {
     auto r = runAot(withPair(
         "public class Program public static method Main() "
         "  using var r := new Registry(); "
         "  var w := new Widget(); "
         "  Console.WriteLine(r.Append(move w)); "
         "end Main; end Program;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(stdoutHas(r, "take"));
+    expectRejected(r, kPairClash);
 }
 
 // Cell 3 (NEGATIVE for cell 1 — K3.13's no-silent-consume rule, cited by
@@ -144,7 +147,7 @@ BEZEL_TEST(owned_overload_applicability_22_6,
 // "borrow" — the first borrow leaves `w` untouched. Pre-fix this is rejected
 // as ambiguous, so it cannot run at all.
 BEZEL_TEST(owned_overload_applicability_22_6,
-           unmarked_read_does_not_consume_spec_22_6_clause_2_negative) {
+           unmarked_read_does_not_consume_pair_rejected_spec_22_6_v0_338) {
     auto r = runAot(withPair(
         "public class Program public static method Main() "
         "  using var r := new Registry(); "
@@ -152,19 +155,38 @@ BEZEL_TEST(owned_overload_applicability_22_6,
         "  Console.WriteLine(r.Append(w)); "
         "  Console.WriteLine(r.Append(w)); "
         "end Main; end Program;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(stdoutHas(r, "borrow"));
+    expectRejected(r, kPairClash);
 }
 
-// Cell 4 (NEGATIVE for cell 2 — §28.3's consume-table post-state): routing the
-// move-rooted argument to the PLAIN member would leave `w` alive, so the value
-// would be owned twice — once by `w`, once by the callee. A second `move w`
-// must therefore be rejected on the ownership pass. Pre-fix this is rejected as
-// ambiguous, which is the WRONG diagnostic: it never reaches the ownership
-// check that names the actual defect.
+// Cell 4 (NEGATIVE for cell 2 — §28.3's consume-table post-state): a second
+// `move w` of a binding whose value was already transferred must be rejected
+// on the ownership pass with "already moved out". This row deliberately uses a
+// SINGLE owned member and NO pair, so its diagnostic is independent of the
+// §22.6/§11.3 pair clash (v0.338): it pins the §28.3 consume rule on its own.
+// The pair form of the same program is pinned by the row after this one.
 BEZEL_TEST(owned_overload_applicability_22_6,
            move_rooted_consumes_binding_spec_22_6_clause_1_negative) {
+    auto r = runAot(
+        "module M; "
+        "public class Widget public constructor() end constructor; end Widget; "
+        "public class Registry public constructor() end constructor; "
+        "  public method Append(owned item: Widget): string => \"take\"; "
+        "end Registry; "
+        "public class Program public static method Main() "
+        "  using var r := new Registry(); "
+        "  var w := new Widget(); "
+        "  Console.WriteLine(r.Append(move w)); "
+        "  Console.WriteLine(r.Append(move w)); "
+        "end Main; end Program;");
+    expectRejected(r, "already moved out");
+}
+
+// v0.338 (#5940): the pair form of the program above. The same double `move w`
+// over a same-type owned/plain pair is rejected at the pair's second
+// declaration (§22.6 *`owned` and overload resolution*, §11.3), before any
+// ownership pass runs.
+BEZEL_TEST(owned_overload_applicability_22_6,
+           move_rooted_consumes_binding_pair_rejected_spec_22_6_v0_338) {
     auto r = runAot(withPair(
         "public class Program public static method Main() "
         "  using var r := new Registry(); "
@@ -172,7 +194,7 @@ BEZEL_TEST(owned_overload_applicability_22_6,
         "  Console.WriteLine(r.Append(move w)); "
         "  Console.WriteLine(r.Append(move w)); "
         "end Main; end Program;"));
-    expectRejected(r, "already moved out");
+    expectRejected(r, kPairClash);
 }
 
 // Row 5 (spec §22.6 example line 3, and the paragraph that follows it): a
@@ -182,15 +204,13 @@ BEZEL_TEST(owned_overload_applicability_22_6,
 // borrow alternative "would hand a storing callee a reference that dies at the
 // statement boundary".
 BEZEL_TEST(owned_overload_applicability_22_6,
-           fresh_new_selects_owned_member_spec_22_6_clause_1) {
+           fresh_new_pair_rejected_spec_22_6_v0_338) {
     auto r = runAot(withPair(
         "public class Program public static method Main() "
         "  using var r := new Registry(); "
         "  Console.WriteLine(r.Append(new Widget())); "
         "end Main; end Program;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(stdoutHas(r, "take"));
+    expectRejected(r, kPairClash);
 }
 
 // Row 6 (spec §22.6 clause 2, the storage-read half): `obj.Item` is an
@@ -200,7 +220,7 @@ BEZEL_TEST(owned_overload_applicability_22_6,
 // member. This is the cell that separates "the argument is owned" from "the
 // argument is an owned PRODUCTION": the two are not the same test.
 BEZEL_TEST(owned_overload_applicability_22_6,
-           field_read_selects_plain_member_spec_22_6_clause_2_storage_read) {
+           field_read_pair_rejected_spec_22_6_v0_338) {
     auto r = runAot(withPair(
         "public class Box public owned Item: Widget; "
         "  public constructor() Item := new Widget(); end constructor; "
@@ -210,9 +230,7 @@ BEZEL_TEST(owned_overload_applicability_22_6,
         "  using var b := new Box(); "
         "  Console.WriteLine(r.Append(b.Item)); "
         "end Main; end Program;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(stdoutHas(r, "borrow"));
+    expectRejected(r, kPairClash);
 }
 
 // Row 7 (spec §22.6 clause 1 via the §28.3 announcement table): a call whose
@@ -221,7 +239,7 @@ BEZEL_TEST(owned_overload_applicability_22_6,
 // case splits on the CALLEE's return marker, not on the call's shape — both
 // rows are call expressions written identically apart from the declaration.
 BEZEL_TEST(owned_overload_applicability_22_6,
-           owned_returning_call_selects_owned_member_spec_22_6_clause_1) {
+           owned_returning_call_pair_rejected_spec_22_6_v0_338) {
     auto r = runAot(withPair(
         "public class Factory public constructor() end constructor; "
         "  public method Make(): owned Widget => new Widget(); "
@@ -231,16 +249,14 @@ BEZEL_TEST(owned_overload_applicability_22_6,
         "  using var f := new Factory(); "
         "  Console.WriteLine(r.Append(f.Make())); "
         "end Main; end Program;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(stdoutHas(r, "take"));
+    expectRejected(r, kPairClash);
 }
 
 // Row 8 (spec §22.6 clause 2, the plain-returning-call half): announcement-
 // table row 4 classifies a plain class-typed call result as BORROWED (sourced
 // at its receiver), so it reaches the PLAIN member.
 BEZEL_TEST(owned_overload_applicability_22_6,
-           plain_returning_call_selects_plain_member_spec_22_6_clause_2) {
+           plain_returning_call_pair_rejected_spec_22_6_v0_338) {
     // Written out in full rather than through `withPair`, because this row
     // needs a member ON `Widget` and the shared prelude closes that class.
     auto r = runAot(
@@ -257,9 +273,7 @@ BEZEL_TEST(owned_overload_applicability_22_6,
         "  using var w := new Widget(); "
         "  Console.WriteLine(r.Append(w.Self())); "
         "end Main; end Program;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(stdoutHas(r, "borrow"));
+    expectRejected(r, kPairClash);
 }
 
 // Row 9 (spec §22.6 clause 4, the "both applicable" cell): an argument with NO
@@ -299,4 +313,23 @@ BEZEL_TEST(owned_overload_applicability_22_6,
     // more applicable than the other and neither may be selected by the marker.
     BEZEL_EXPECT_FALSE(hasError(r, "does not take ownership"));
     BEZEL_EXPECT_FALSE(hasError(r, "only valid on an argument"));
+}
+
+// v0.338 (#5940) coverage gap, recorded by the issue: a same-type `Put` pair
+// at a concrete class, one plain and one `owned`, is rejected at its second
+// declaration (§22.6 *`owned` and overload resolution*, §11.3, v0.338).
+BEZEL_TEST(owned_overload_applicability_22_6,
+           concrete_class_same_type_put_pair_rejected_spec_22_6_v0_338) {
+    auto r = runAot(
+        "module M; "
+        "public class Widget public constructor() end constructor; end Widget; "
+        "public class Store public constructor() end constructor; "
+        "  public method Put(item: Widget): string => \"borrow\"; "
+        "  public method Put(owned item: Widget): string => \"take\"; "
+        "end Store; "
+        "public class Program public static method Main() "
+        "  using var s := new Store(); "
+        "  Console.WriteLine(s.Put(new Widget())); "
+        "end Main; end Program;");
+    expectRejected(r, kPairClash);
 }
