@@ -7600,6 +7600,15 @@ void Resolver::checkAbstractImplementations() {
     // equality that distinguishes declaration-less builtins/bare type params
     // by spelling (`typeRefEqual` would conflate them, treating two null-
     // declaration Named refs of the same shape as equal).
+    // #6053 / §11.2 (v0.338): a function type NESTED in a generic argument
+    // (`Array<(T) -> T>`) carries the interface's type parameters inside its
+    // parameter and return types; substGenericArg substitutes through them so
+    // the structural compare in declLessArgMatch sees `int`, not `T`. A
+    // top-level function-typed member parameter (`Take(f: (V) -> ())`) is NOT
+    // rewritten: that shape keeps the unsubstituted comparison the §28.3
+    // set-erasing rows depend on.
+    using SubstMap = std::unordered_map<std::string_view, const TypeRef*>;
+    std::function<TypeRef*(TypeRef*, const SubstMap&)> substGenericArg;
     std::function<TypeRef*(TypeRef*,
                            const std::unordered_map<std::string_view, const TypeRef*>&)>
         substTypeRef = [&](TypeRef* d,
@@ -7641,7 +7650,7 @@ void Resolver::checkAbstractImplementations() {
             std::vector<TypeRef*> newArgs;
             newArgs.reserve(d->genericArgs.size());
             for (TypeRef* ga : d->genericArgs) {
-                TypeRef* s = substTypeRef(ga, map);
+                TypeRef* s = substGenericArg(ga, map);
                 changed = changed || (s != ga);
                 newArgs.push_back(s);
             }
@@ -7652,6 +7661,24 @@ void Resolver::checkAbstractImplementations() {
             }
         }
         return d;
+    };
+    substGenericArg = [&](TypeRef* ga, const SubstMap& map) -> TypeRef* {
+        if (!ga || ga->kind != TypeRef::Kind::Function) return substTypeRef(ga, map);
+        bool changed = false;
+        TypeRef* nr = ga->funcReturn ? substGenericArg(ga->funcReturn, map) : nullptr;
+        changed = changed || (nr != ga->funcReturn);
+        std::vector<TypeRef::FuncParam> np;
+        np.reserve(ga->funcParams.size());
+        for (const TypeRef::FuncParam& fp : ga->funcParams) {
+            TypeRef* sp = fp.type ? substGenericArg(fp.type, map) : nullptr;
+            changed = changed || (sp != fp.type);
+            np.push_back(TypeRef::FuncParam{fp.modifier, fp.name, sp});
+        }
+        if (!changed) return ga;
+        TypeRef* nn = ctx_.makeTypeRef(*ga);
+        nn->funcParams = std::move(np);
+        nn->funcReturn = nr;
+        return nn;
     };
     std::function<bool(const TypeRef*, const TypeRef*)> typesMatch =
         [&](const TypeRef* a, const TypeRef* b) -> bool {
@@ -7694,8 +7721,8 @@ void Resolver::checkAbstractImplementations() {
     //                     compared by this same rule (`Array<U>` against
     //                     `Array<T>` at the same position, `Array<int>` never
     //                     against `Array<string>`, `Mutex` never `Random`).
-    // Function-typed arguments are not substituted by substTypeRef, so their
-    // pair keeps the pre-#5985 nullability-only comparison (the #5971 cells).
+    // Function-typed arguments are compared structurally (#6053, declLessArgMatch
+    // below); substGenericArg substitutes through their parameter and return types.
     auto spellOf = [](const TypeRef* t) -> std::string_view {
         // §27.8 (v0.338): "Identity, equality and method dispatch see through
         // the alias" -- compare the alias TARGET's head, recorded on the ref at
@@ -7717,6 +7744,12 @@ void Resolver::checkAbstractImplementations() {
                 return static_cast<int>(i);
         return -1;
     };
+    // #6053 / §11.2 (v0.338): one generic-argument pair, compared under the same
+    // own-parameter-by-position rule as the arguments of a Named pair. Defined
+    // below, after declLessNamedMatch, since the two recurse into each other.
+    std::function<bool(const TypeRef*, const TypeRef*, const MethodSymbol*,
+                       const MethodSymbol*)>
+        declLessArgMatch;
     std::function<bool(const TypeRef*, const TypeRef*, const MethodSymbol*,
                        const MethodSymbol*)>
         declLessNamedMatch =
@@ -7731,22 +7764,9 @@ void Resolver::checkAbstractImplementations() {
         if (a->nullable != b->nullable) return false;
         if (spellOf(a) != spellOf(b)) return false;
         if (a->genericArgs.size() != b->genericArgs.size()) return false;
-        for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
-            const TypeRef* x = a->genericArgs[i];
-            const TypeRef* y = b->genericArgs[i];
-            if (!x || !y) return false;
-            if (x->kind == TypeRef::Kind::Function &&
-                y->kind == TypeRef::Kind::Function) {
-                if (x->nullable != y->nullable) return false;
-                continue;
-            }
-            if (x->kind == TypeRef::Kind::Named && y->kind == TypeRef::Kind::Named &&
-                !x->declaration && !y->declaration) {
-                if (!declLessNamedMatch(x, y, aM, bM)) return false;
-            } else if (!typesMatch(x, y)) {
+        for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+            if (!declLessArgMatch(a->genericArgs[i], b->genericArgs[i], aM, bM))
                 return false;
-            }
-        }
         return true;
     };
     // #6013: declLessNamedMatch compares a function-typed generic argument by
@@ -7760,6 +7780,37 @@ void Resolver::checkAbstractImplementations() {
         for (const TypeRef* g : t->genericArgs)
             if (containsFunctionType(g)) return true;
         return false;
+    };
+    // #6053 / §11.2 (v0.338): "parameter types must match exactly under the
+    // substitution". A function-typed argument (`Array<(T)->T>`) is compared
+    // structurally, as typeRefEqual's Function arm does (modifiers, the owned
+    // return flag, each parameter and the return), with every component routed
+    // back through this same own-parameter rule, so a function type's own `T`
+    // corresponds by position and a concrete `int` never matches it.
+    declLessArgMatch =
+        [&](const TypeRef* x, const TypeRef* y, const MethodSymbol* aM,
+            const MethodSymbol* bM) -> bool {
+        if (!x || !y) return false;
+        if (x->kind == TypeRef::Kind::Function &&
+            y->kind == TypeRef::Kind::Function) {
+            if (x->nullable != y->nullable) return false;
+            if (x->funcReturnOwned != y->funcReturnOwned) return false;
+            if (x->funcParams.size() != y->funcParams.size()) return false;
+            for (std::size_t i = 0; i < x->funcParams.size(); ++i) {
+                if (x->funcParams[i].modifier != y->funcParams[i].modifier)
+                    return false;
+                if (!declLessArgMatch(x->funcParams[i].type,
+                                      y->funcParams[i].type, aM, bM))
+                    return false;
+            }
+            if (!x->funcReturn || !y->funcReturn)
+                return x->funcReturn == y->funcReturn;
+            return declLessArgMatch(x->funcReturn, y->funcReturn, aM, bM);
+        }
+        if (x->kind == TypeRef::Kind::Named && y->kind == TypeRef::Kind::Named &&
+            !x->declaration && !y->declaration)
+            return declLessNamedMatch(x, y, aM, bM);
+        return typesMatch(x, y);
     };
     auto resolvedOf = [&](const ast::Type* node) -> TypeRef* {
         return node ? ctx_.resolvedType(*node) : nullptr;
