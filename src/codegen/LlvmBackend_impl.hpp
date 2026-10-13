@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <map>
 #include <tuple>
@@ -1817,6 +1818,21 @@ private:
     // time (staticFieldGlobal's own Path A / Path B logic already computed it).
     std::unordered_map<llvm::GlobalVariable*, GenericInstKey>
         genericInstGlobalKeyOf_;
+    // fix #5884 (§22.12 rule 1 / §22.13, v0.334): the set of static fields each
+    // instantiation's OWN guarded sfinit (genericInstSfinitFn) actually stored
+    // into that instantiation's per-instantiation globals. #1513 gave every
+    // instantiation its own once-guarded sfinit, which made the #709 loop in
+    // emitStaticConstructorBody — the per-TYPE sfinit's twin store into every
+    // per-instantiation global — a SECOND writer of the same cell under an
+    // INDEPENDENT once-guard. §22.12 rule 1 ("a type's static initializer runs
+    // exactly once process-wide") has no room for two: whichever guard runs
+    // second re-zeroes a cell the first already initialized. This set is the
+    // precise ownership statement that lets #709 stand down for exactly the
+    // fields the instantiation's own sfinit already covers, and keep writing
+    // the ones it does not (collection-literal and inline-array initializers,
+    // which genericInstSfinitFn skips).
+    std::map<GenericInstKey, std::set<const sema::Symbol*>>
+        genericInstSfinitStored_;
 
     // CG11: enclosing-loop branch targets for `break`/`continue` (§A.6).
     // `continue` jumps to `continueTarget` (the loop's condition block),

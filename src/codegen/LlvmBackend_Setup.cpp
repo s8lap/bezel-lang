@@ -1947,6 +1947,14 @@ llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
         // instantiation's field type is skipped rather than mis-stored.
         if (val->getType() != instGV->getValueType()) continue;
         builder_.CreateStore(val, instGV);
+        // fix #5884 (§22.12 rule 1 / §22.13, v0.334): record that THIS
+        // instantiation's own once-guarded sfinit owns this field's cell, so
+        // the #709 loop in emitStaticConstructorBody can stand down for it
+        // rather than writing the same cell a second time under the per-TYPE
+        // guard. See genericInstSfinitStored_'s declaration for the measured
+        // shape (#5884) and why the two guards cannot both initialize.
+        genericInstSfinitStored_[key].insert(
+            static_cast<const sema::Symbol*>(fs2));
         // §22.13 (#1212): register an owned class/interface field for
         // program-exit disposal, exactly as emitStaticConstructorBody's #709
         // loop does. This runs exactly once (the guard in
@@ -11788,6 +11796,10 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             // contains all instantiations referenced in this compilation unit.
             // The template-level store above handles the (unreachable) template
             // path; every concrete instantiation needs its own runtime store.
+            // fix #5884: an instantiation whose OWN once-guarded sfinit already
+            // stores this field stands down — see the skip below, which this
+            // loop's original "every concrete instantiation needs its own
+            // runtime store" wording predates.
             // Note: this only covers T-independent initializers — expressions
             // that depend on T would need per-instantiation emit, which requires
             // larger machinery tracked separately.  The getValueType() guard
@@ -11797,8 +11809,49 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             // typed) val would emit malformed IR — skip those, leaving them as
             // before rather than miscompiling.
             for (auto& [key, instGV] : genericInstStaticGlobals_) {
-                if (key.first == static_cast<const sema::Symbol*>(fs) &&
-                    instGV->getValueType() == val->getType())
+                if (key.first != static_cast<const sema::Symbol*>(fs)) continue;
+                // fix #5884 (§22.12 rule 1 / §22.13, v0.334): stand down for a
+                // cell this instantiation's OWN once-guarded sfinit already
+                // initialized. #1513 gave every instantiation its own
+                // LinkOnceODR ensureinit+sfinit pair, so from then on TWO
+                // independent once-guards write the same per-instantiation
+                // cell — this per-TYPE one and that per-instantiation one —
+                // and §22.12 rule 1 ("a type's static initializer runs exactly
+                // once process-wide") has no room for both. Measured (#5884) on
+                // `class B<T> { static _c: int := 0; virtual VBump() ... }`,
+                // `class D<T>: B<T>`, a `D<string>` upcast to `B<string>` and a
+                // later direct `new B<string>()`: the per-instantiation
+                // `bz$M.B$string$sfinit` ran at the first `VBump` (state 0->2),
+                // and this per-TYPE `bz$B$sfinit` ran afterwards at the `new`,
+                // re-storing the `:= 0` initializer over a live cell — so
+                // `k.VBump()` returned 10 instead of 30 and the following
+                // `B<string>._c` read agreed with the clobbered cell. No
+                // diagnostic at any severity; exit code 0 throughout.
+                //
+                // The skip is keyed on the field ACTUALLY stored (not merely on
+                // the instantiation having an sfinit), so the shapes
+                // genericInstSfinitFn deliberately declines — collection-literal
+                // and inline-array initializers — keep this loop as their only
+                // writer, exactly as before this fix.
+                {
+                    // The key is read off the GLOBAL's own owner record rather
+                    // than re-derived from `type` here — getOrCreateGenericInstStaticGlobal
+                    // recorded exactly the (TypeSymbol*, typeArgMangle) pair
+                    // genericInstSfinitFn is keyed by, so this cannot drift on
+                    // symbol identity the way a re-derivation could.
+                    auto gk = genericInstGlobalKeyOf_.find(instGV);
+                    if (gk == genericInstGlobalKeyOf_.end()) {
+                        // no owner record => no per-instantiation sfinit => this
+                        // loop is the only writer, unchanged behaviour.
+                    } else {
+                        auto owned = genericInstSfinitStored_.find(gk->second);
+                        if (owned != genericInstSfinitStored_.end() &&
+                            owned->second.count(
+                                static_cast<const sema::Symbol*>(fs)))
+                            continue;
+                    }
+                }
+                if (instGV->getValueType() == val->getType())
                     builder_.CreateStore(val, instGV);
             }
         }
