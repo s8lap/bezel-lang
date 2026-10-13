@@ -504,6 +504,28 @@ s11_2_0031	pass
 s11_2_0032	pass	
 s11_2_0033	pass	
 s11_2_0034	pass	
+s11_2_0070	pass	
+s11_2_0071	pass	
+s11_2_0072	pass	
+s11_2_0073	pass	
+s11_2_0074	pass	
+s11_2_0075	pass	
+s11_2_0076	pass	
+s11_2_0077	pass	
+s11_2_0078	pass	
+s11_2_0079	pass	
+s11_2_0080	pass	
+s11_2_0081	pass	
+s11_2_0082	pass	
+s11_2_0083	pass	
+s11_2_0084	pass	
+s11_2_0085	pass	
+s11_2_0086	pass	
+s11_2_0087	pass	
+s11_2_0088	pass	
+s11_2_0089	pass	
+s11_2_0090	pass	
+s11_2_0091	pass	
 s11_3_0001	pass	
 s11_3_0002	pass	
 s11_3_0003	pass	
@@ -646,6 +668,8 @@ s14_2_0025	pass	fix #5640
 s14_2_0026	pass	fix #5640
 s14_2_0043	pass	
 s14_2_0044	pass	
+s14_2_0075	pass	
+s14_2_0076	pass	
 s14_2_0041	pass	
 s14_4_0001	pass	
 s14_4_0002	pass	
@@ -917,6 +941,8 @@ s19_3_0025	pass
 s19_3_0026	pass	
 s19_3_0027	pass	
 s19_3_0028	pass	
+s19_3_0069	pass	
+s19_3_0070	pass	
 s19_4_0001	pass	
 s19_5_0001	pass	
 s19_6_0001	pass	
@@ -1013,6 +1039,9 @@ s22_3_0009	pass
 s22_3_0012	pass	
 s22_3_0013	pass	
 s22_3_0014	pass	
+s22_3_0045	pass	
+s22_3_0046	pass	
+s22_3_0047	pass	
 s22_4_0001	pass	
 s22_4_0002	pass	
 s22_4_0003	pass	
@@ -1235,6 +1264,10 @@ s25_2_0007	pass
 s25_2_0008	pass	
 s25_2_0009	pass	
 s25_2_0010	pass	
+s25_2_0012	pass	
+s25_2_0013	pass	
+s25_2_0014	pass	
+s25_2_0015	pass	
 s25_3_0001	pass	
 s25_3_0002	fail	divergence
 s25_3_0003	pass	
