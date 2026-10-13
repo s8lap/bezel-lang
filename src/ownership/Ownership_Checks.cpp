@@ -17511,6 +17511,13 @@ void MethodOwnership::handleOwnedFieldAssignment(const ast::AssignmentStmt& as,
 // // per §30.5, §30.3
 static bool taskResultArgIsClass(const sema::TypeRef* arg) {
     if (!arg) return false;
+    // §30.5 (v0.338, #5949): the Pattern A / Pattern B producer rows name
+    // `Object` explicitly ("class or interface T (`Object`, a class, ...
+    // included"). `Object` is a Primitive-kind TypeRef (PrimitiveType::Object) with no
+    // declaration, so the Named-only gate below would never see it.
+    if (arg->kind == sema::TypeRef::Kind::Primitive &&
+        arg->primitive == sema::PrimitiveType::Object)
+        return true;
     if (arg->kind != sema::TypeRef::Kind::Named) return false;
     // §30.5 (v0.338, #5723): the Pattern A / Pattern B producer rows read
     // "class or interface T" — an interface-typed result is an object
