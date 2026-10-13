@@ -56,7 +56,8 @@ std::string_view paramHead(const TypeRef* sub) {
 // recursive kinds.
 TypeRef* applyBareParamSubst(const TypeRef* sub,
                               const std::unordered_map<std::string_view, TypeRef*>& subst,
-                              SemaContext& ctx) {
+                              SemaContext& ctx,
+                              SourceLocation useLoc) {
     if (!sub || sub->kind != TypeRef::Kind::Named || sub->declaration) return nullptr;
     std::string_view head = paramHead(sub);
     if (head.empty()) return nullptr;
@@ -66,6 +67,20 @@ TypeRef* applyBareParamSubst(const TypeRef* sub,
     if (sub->nullable && substituted && !substituted->nullable) {
         TypeRef* nn = ctx.makeTypeRef(*substituted);
         nn->nullable = true;
+        // §15.1 (fix #5641): a type `T?` at a type parameter substituted by an
+        // inline array is a compile error at the instantiation site (§3.6 rule 2).
+        // Report at useLoc if set (the use/instantiation site), otherwise at
+        // the type-parameter reference's AST span.
+        if (nn->kind == TypeRef::Kind::InlineArray) {
+            SourceLocation loc = useLoc;
+            if (loc.line == 0 && sub->astNode) loc = sub->astNode->span.begin;
+            ctx.diagnostics().report(
+                Severity::Error, loc,
+                "type `[N]` may not be nullable (`T?`) when `T` is substituted "
+                "by an inline array — §15.1 admits no nullable inline-array form, "
+                "and §3.6 rule 2 rejects `T?` at `T` substituted by an inline array "
+                "(spec §15.1 / §3.6 rule 2, v0.327; diagnostic: `nullable inline-array`)");
+        }
         return nn;
     }
     return substituted;
@@ -83,7 +98,7 @@ TypeRef* substituteGenericArgs(TypeRef* tr, const SubstArgs& args) {
             // (param name not in subst), fall through to the recursive walk —
             // the parameter may be a non-Named shape (rare) or a NAME not in
             // this particular subst (e.g. a different generic's parameter).
-            if (TypeRef* substituted = applyBareParamSubst(tr, args.subst, args.ctx)) {
+            if (TypeRef* substituted = applyBareParamSubst(tr, args.subst, args.ctx, args.useLoc)) {
                 return substituted;
             }
             // Not a bare-parameter reference — recurse into genericArgs so
