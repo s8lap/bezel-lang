@@ -141,7 +141,7 @@ bool Emitter::userValueEqualityPair(const sema::TypeSymbol* ts,
                                     llvm::Function*& hashFn) {
     eqFn = nullptr;
     hashFn = nullptr;
-    if (!ts || !ts->genericParams.empty()) return false;
+    if (!ts) return false;
     sema::MethodSymbol* eqMs = nullptr;
     sema::MethodSymbol* hashMs = nullptr;
     for (sema::Symbol* sym : ts->members) {
@@ -163,6 +163,36 @@ bool Emitter::userValueEqualityPair(const sema::TypeSymbol* ts,
         }
     }
     if (!eqMs || !hashMs) return false;
+    // #6089 / §3.6, §8.3 (v0.338): a GENERIC type's pair is the instantiation's
+    // own functions. The caller's trampoline holds the instantiation's
+    // substitution (RecordSubstGuard / the choice guard), so
+    // buildSpecializedMethodFn lowers `Equals`/`GetHashCode` for THAT
+    // instantiation on demand, keyed by its substitution (the same accessor a
+    // direct `g.Equals(h)` call uses). A template body in methodFns_ is not a
+    // call target for a generic type, so the non-generic lookup below would
+    // always decline it. A declined specialization returns false (the
+    // structural fallback, as before).
+    if (!ts->genericParams.empty()) {
+        CallableInfo eci;
+        CallableInfo hci;
+        if (!callableInfo(eqMs, eci) || !callableInfo(hashMs, hci)) return false;
+        // `other` is the value by value (as a direct `a.Equals(b)` passes it),
+        // so the specialization spills the struct; a ptr here made the body
+        // read the pointer's bytes as the record's fields (measured: every
+        // field-reading pair answered false inside the trampoline).
+        llvm::Type* valueTy =
+            ts->kind == ast::TypeDeclKind::Choice
+                ? static_cast<llvm::Type*>(choiceStruct(ts))
+                : static_cast<llvm::Type*>(recordStruct(ts));
+        eqFn = buildSpecializedMethodFn(eqMs, eci, {ptrTy(), valueTy});
+        hashFn = buildSpecializedMethodFn(hashMs, hci, {ptrTy()});
+        if (!eqFn || !hashFn) {
+            eqFn = nullptr;
+            hashFn = nullptr;
+            return false;
+        }
+        return true;
+    }
     auto eit = methodFns_.find(eqMs);
     auto hit = methodFns_.find(hashMs);
     if (eit == methodFns_.end() || hit == methodFns_.end()) return false;
