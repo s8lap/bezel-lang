@@ -1426,6 +1426,9 @@ private:
         std::string_view headName, const SourceLocation& loc,
         const std::vector<ast::Param>* ccPayload = nullptr);
 
+    // §19.3 L3947 (v0.338, #6045): the TypeSymbol a named-slot head names,
+    // resolved in scope, `type` alias followed. Null when unresolved.
+    TypeSymbol* resolvePatternHeadTypeInScope(const ast::QualifiedName* tn);
     // §19.3 (v0.338, #6018): the head-kind rules a named slot list must pass
     // that normalizeNamedDestructureSlots never sees, because its callers skip
     // it for an empty member list (an enum head, a private body property).

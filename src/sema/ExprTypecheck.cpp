@@ -2754,6 +2754,40 @@ bool ExprTC::normalizeNamedDestructureSlots(
     return true;
 }
 
+// §19.3 L3947 (v0.338, #6045): the TypeSymbol a named-slot pattern's head
+// names, resolved in scope with a `type` alias followed (`type R2 := Rect;`
+// makes `R2(h = var v)` the record Rect). Null when the head is not a single
+// type in scope, and for a qualified head with no alias step, which the
+// caller then leaves to the existing rules.
+TypeSymbol* ExprTC::resolvePatternHeadTypeInScope(
+        const ast::QualifiedName* tn) {
+    if (!tn || tn->parts.empty()) return nullptr;
+    if (tn->parts.size() > 1) {
+        if (TypeSymbol* ts = resolveCasePatternTypeSymbol(tn->parts)) return ts;
+        // The module-qualified alias head (`M.R2(...)`, `type R2 := Rect;` in
+        // module M): resolveCasePatternTypeSymbol follows no alias, so the
+        // qualifier is matched against this module's own name and the last
+        // part is looked up as a module-level alias.
+        if (!ctx_.module()) return nullptr;
+        auto* md = dynamic_cast<const ast::ModuleDecl*>(ctx_.module()->decl);
+        if (!md || !md->name || md->name->parts.size() + 1 != tn->parts.size())
+            return nullptr;
+        for (std::size_t i = 0; i < md->name->parts.size(); ++i)
+            if (md->name->parts[i] != tn->parts[i]) return nullptr;
+        for (const auto& sym : ctx_.symbols())
+            if (auto* alias = dynamic_cast<TypeAliasSymbol*>(sym.get()))
+                if (alias->name == tn->parts.back())
+                    return resolveAliasToTypeSymbol(alias);
+        return nullptr;
+    }
+    Symbol* s = lookupName(tn->parts.front());
+    if (auto* alias = dynamic_cast<TypeAliasSymbol*>(s))
+        return resolveAliasToTypeSymbol(alias);
+    if (auto* ts = dynamic_cast<TypeSymbol*>(s)) return ts;
+    if (auto* nts = dynamic_cast<NestedTypeSymbol*>(s)) return nts->type;
+    return nullptr;
+}
+
 // §19.3 "Named destructuring" (v0.338, #6018). Two rules the named-slot
 // normalization above cannot enforce, because its callers normalize only a
 // record's FieldSymbol list and skip the call when that list is empty:
@@ -2776,12 +2810,29 @@ bool ExprTC::rejectUnadmittedNamedSlotHead(ast::DestructuringPattern& dp,
 
     // The head's TYPE is the one the pattern's scrutinee already resolved,
     // never a lookup of the head's short name: a name scan picks the wrong
-    // one when two nested types share a name (A.Item / B.Item). A head whose
-    // resolved type is unavailable, or whose name differs from it, is left to
-    // the existing rules (admitted here), never refused on a name guess.
-    if (!scrutTy || scrutTy->kind != TypeRef::Kind::Named) return false;
-    TypeSymbol* head = scrutTy->declaration;
-    if (!head || head->name != headName) return false;
+    // one when two nested types share a name (A.Item / B.Item).
+    //
+    // §19.3 L3947 / §13 (v0.338, #6045): the pattern's HEAD names the type
+    // whose members the slots read ("the `Identifier` names a member of the
+    // pattern's type"). When the scrutinee is a plain Object, or a record whose
+    // name differs from the head (a `type` alias head: `type R2 := Rect;
+    // R2(h = var v)`), the scrutinee's own declaration is not that type, so the
+    // head is resolved in scope instead (alias-resolved). A head that does not
+    // resolve to a single type in scope is left to the existing rules, never
+    // refused on a name guess.
+    if (!scrutTy) return false;
+    TypeSymbol* head = nullptr;
+    if (scrutTy->kind == TypeRef::Kind::Named && scrutTy->declaration &&
+        scrutTy->declaration->name == headName) {
+        head = scrutTy->declaration;
+    } else if ((scrutTy->kind == TypeRef::Kind::Primitive &&
+                scrutTy->primitive == PrimitiveType::Object) ||
+               (scrutTy->kind == TypeRef::Kind::Named &&
+                scrutTy->declaration &&
+                scrutTy->declaration->kind == ast::TypeDeclKind::Record)) {
+        head = resolvePatternHeadTypeInScope(dp.typeName.get());
+    }
+    if (!head) return false;
 
     const auto reject = [&]() {
         return true;
