@@ -9301,7 +9301,18 @@ private:
         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
             for (const auto& p : pd->indexerParams) {
                 key += "#";
-                if (p.type && p.type->name && !p.type->name->parts.empty()) {
+                // #6041 (§27.8 / §12.1, v0.338): a type alias is a pure synonym,
+                // so an alias-spelled index parameter (`[e: EA]` with
+                // `type EA := Exception`) keys as its resolved head, not as the
+                // alias name. Spelled-name keys made `[e: EA]` on a base and
+                // `[e: Exception]` on its override differ, so the override got
+                // a new slot and the base body was dispatched. aliasResolvedHead
+                // is the sanctioned alias-transparent head (TypeRef::headName).
+                const sema::TypeRef* atr = p.type ? ctx_.resolvedType(*p.type) : nullptr;
+                if (atr && !atr->aliasResolvedHead.empty()) {
+                    key += std::string(atr->aliasResolvedHead);
+                    key += ".";
+                } else if (p.type && p.type->name && !p.type->name->parts.empty()) {
                     for (auto part : p.type->name->parts) {
                         key += std::string(part);
                         key += ".";
