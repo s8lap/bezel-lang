@@ -7536,7 +7536,9 @@ void Resolver::checkAbstractImplementations() {
     // built-in class such as `Mutex` is also declaration-less). Name lookup
     // resolves a method-level parameter before any built-in, so a parameter
     // that shares a built-in's name still denotes the parameter.
-    //   * own vs own   -> match (nullability agrees);
+    //   * own vs own   -> match iff both sit at the SAME position in their
+    //                     member's generic parameter list (and nullability
+    //                     agrees);
     //   * own vs other -> no match;
     //   * neither      -> an ordinary type: head spelling, nullability and
     //                     generic arguments must all be equal, each argument
@@ -7570,7 +7572,7 @@ void Resolver::checkAbstractImplementations() {
         int ai = ownParamIndex(a, aM);
         int bi = ownParamIndex(b, bM);
         if (ai >= 0 || bi >= 0)
-            return (ai >= 0) == (bi >= 0) && a->nullable == b->nullable;
+            return ai == bi && a->nullable == b->nullable;
         if (a->genericArgs.empty() && b->genericArgs.empty())
             return typesMatch(a, b);
         if (a->nullable != b->nullable) return false;
