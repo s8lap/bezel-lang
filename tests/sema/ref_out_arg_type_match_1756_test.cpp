@@ -18,16 +18,16 @@
 // against over-rejection: prior #1756 reworks repeatedly broke valid generic
 // ref/out calls, so an exact-match non-generic control must stay green.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 // True when one of the result's diagnostics contains `needle`. The §22.3
-// exact-type diagnostic is a SEMA message, so it surfaces through `runJit`'s
+// exact-type diagnostic is a SEMA message, so it surfaces through `runAot`'s
 // diagnostics engine.
 bool diagContains(const JitResult& r, const std::string& needle) {
     for (const auto& d : r.diagnostics.diagnostics())
@@ -36,7 +36,7 @@ bool diagContains(const JitResult& r, const std::string& needle) {
 }
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -52,7 +52,7 @@ int run(const std::string& program) {
 // is not an exact match — the argument aliases mismatched-width storage through
 // the parameter. Pre-fix this compiled clean.
 BEZEL_TEST(ref_out_arg_type_match_1756, ref_mismatch_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Store(ref slot: int) slot := 99; end Store; "
         "  public static method Main(): int "
@@ -69,7 +69,7 @@ BEZEL_TEST(ref_out_arg_type_match_1756, ref_mismatch_rejected_22_3) {
 // does, so the same exact-type rule applies to a pre-declared `out` argument.
 // Pre-fix this compiled clean.
 BEZEL_TEST(ref_out_arg_type_match_1756, out_mismatch_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Fill(out x: int) x := 7; end Fill; "
         "  public static method Main(): int "
@@ -107,7 +107,7 @@ BEZEL_TEST(ref_out_arg_type_match_1756, ref_exact_match_accepted_22_3) {
 // Pre-fix containsMethodTypeParam skipped arrayElement, so this compiled clean.
 BEZEL_TEST(ref_out_arg_type_match_1756,
            inline_array_nested_method_type_param_exactness_unsoundness_rejected_2280_14_5) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; static class U "
         "  public static method Fill<T>(ref r: [4]T) "
         "    r[0] := default(T); "
