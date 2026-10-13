@@ -12497,6 +12497,18 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
                         isStatic = hasMod(ps->modifiers, "static");
                     else if (auto* ms = dynamic_cast<MethodSymbol*>(m))
                         isStatic = hasMod(ms->modifiers, "static");
+                    // §22.12 (v0.334): "A class-level `const` is implicitly
+                    // static; writing `static const` is redundant but permitted
+                    // for clarity — both forms declare the same constant." The
+                    // member kind is its own `ConstMemberSymbol`, so the
+                    // modifier test above never reaches it and the `isStatic`
+                    // default below would read a constant as per-instance
+                    // state. §22.5 (v0.334) admits it on two independent
+                    // grounds: a default "may be a literal, constant, or
+                    // `default(T)`", and "may ... read other static state" —
+                    // a class-level const is both. #3213.
+                    else if (dynamic_cast<ConstMemberSymbol*>(m))
+                        isStatic = true;
                     if (!isStatic)
                         defaultValueInstanceStateRef_ = std::string(name);
                 }
