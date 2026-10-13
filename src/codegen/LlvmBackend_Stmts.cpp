@@ -11046,7 +11046,8 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
 // later arm's test point without duplicating an effect or reading stale
 // storage?".
 //
-//   - a LOCAL identifier (or a parameter, which is a local too) — `lowerExpr`
+//   - a LOCAL identifier, a PARAMETER (a distinct symbol kind, §7.4), `this`,
+//     or a bare field name (implicit `this`, §2.7; #5941) — `lowerExpr`
 //     is a load of that local's own slot, so the second evaluation reads the
 //     slot's CURRENT value. That is the whole point: a guard that reassigned
 //     the receiver or the local is observed.
@@ -11082,8 +11083,21 @@ bool Emitter::caseScrutRereadable(const ast::Expr* e, int depth) {
     // Bounded so a pathological receiver chain cannot walk the AST forever;
     // a chain this long is not one the two arms above describe.
     if (!e || depth > 8) return false;
-    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
-        return dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)) != nullptr;
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+        // §7.4 (v0.338): a stable local is "a local variable or parameter";
+        // `ParameterSymbol` is a sibling of `LocalSymbol`, not a subclass, so
+        // both are named. A bare `this` is a load of the receiver slot, the
+        // same single-load shape. Fixes #5941.
+        const sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (dynamic_cast<const sema::LocalSymbol*>(sym) ||
+            dynamic_cast<const sema::ParameterSymbol*>(sym))
+            return true;
+        if (id->name == "this") return true;
+        // A bare field name is `this.<field>` (§2.7): the same plain
+        // `FieldSymbol` GEP-and-load as the member arm below, rooted at the
+        // implicit receiver.
+        return dynamic_cast<const sema::FieldSymbol*>(sym) != nullptr;
+    }
     if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
         // §14.1 field storage only. `storageMemberOf` also accepts an
         // auto-property's backing slot, and `lowerExpr` would reach it through

@@ -128,6 +128,7 @@ using bezel::test::diagnosticMessageContains;
 using bezel::test::diagnosticMessageCount;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -555,4 +556,158 @@ BEZEL_TEST(sema_move_only_payload_binding_write_point_5870,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "1\n3\n1\n");
+}
+// ═══════════════════════════════════════════════════════════════════════════
+// fix #5941 — §19.3 (v0.338) re-read for a PARAMETER-rooted and a
+// `this`-rooted case scrutinee.
+//
+// QUOTED (§19.3, v0.338): "Each arm's case test reads the source as it stands
+// when that arm is tried (§19.4), so a write point in a declined arm's guard is
+// not a write point for a later arm's bindings." §7.4 counts "a local variable
+// or parameter" as a stable local. `ParameterSymbol` is a sibling of
+// `LocalSymbol`, so `caseScrutRereadable` declined a parameter root (and a
+// `this` / bare-field root) and `lowerCaseStmt` kept the value hoisted before
+// the arms: arm 2's binding aliased the array arm 1's guard had disposed
+// (heap-use-after-free under ASan). Oracle: `runAotChecked` (always ASan), and
+// every row asserts the post-write VALUE through stdout ("9" = arm 2 read the
+// NEW source, "0" = arm 1 was declined).
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Holder whose Decline() overwrites Slots (disposing the old array) and
+// declines the guard. `extra` adds the member under test.
+std::string holder5941(const std::string& extra) {
+    return std::string(
+        "class Holder "
+        "  public Slots: [2 owned]Cell := [new Cell(1), new Cell(3)]; "
+        "  public method Decline(): bool "
+        "    this.Slots := [new Cell(9), new Cell(9)]; return false; "
+        "  end Decline; ") + extra + " end Holder; ";
+}
+
+}  // namespace
+
+BEZEL_TEST(codegen_case_scrutinee_reread_5941,
+           by_value_parameter_root_rereads_after_declined_guard) {
+    auto r = runAotChecked(prog(
+        holder5941("") +
+        "class R "
+        "  public static method Run(h: Holder): int "
+        "    var n := 0; "
+        "    case h.Slots of "
+        "      var a when h.Decline() => do n := n + 1; end, "
+        "      var b => do Console.WriteLine($\"{b[0].V}\"); end "
+        "    end; "
+        "    Console.WriteLine($\"{n}\"); "
+        "    return 0; "
+        "  end Run; "
+        "end R; ",
+        "using var h := new Holder(); return R.Run(h); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "9\n0\n");
+}
+
+BEZEL_TEST(codegen_case_scrutinee_reread_5941,
+           ref_parameter_root_rereads_after_declined_guard) {
+    auto r = runAotChecked(prog(
+        holder5941("") +
+        "class R "
+        "  public static method Run(ref h: Holder): int "
+        "    var n := 0; "
+        "    case h.Slots of "
+        "      var a when h.Decline() => do n := n + 1; end, "
+        "      var b => do Console.WriteLine($\"{b[0].V}\"); end "
+        "    end; "
+        "    Console.WriteLine($\"{n}\"); "
+        "    return 0; "
+        "  end Run; "
+        "end R; ",
+        "using var o := new Holder(); var h: Holder := o; return R.Run(ref h); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "9\n0\n");
+}
+
+BEZEL_TEST(codegen_case_scrutinee_reread_5941,
+           this_rooted_scrutinee_rereads_after_declined_guard) {
+    auto r = runAotChecked(prog(
+        holder5941(
+            "public method Run(): int "
+            "  var n := 0; "
+            "  case this.Slots of "
+            "    var a when Decline() => do n := n + 1; end, "
+            "    var b => do Console.WriteLine($\"{b[0].V}\"); end "
+            "  end; "
+            "  Console.WriteLine($\"{n}\"); "
+            "  return 0; "
+            "end Run; "),
+        "using var h := new Holder(); return h.Run(); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "9\n0\n");
+}
+
+BEZEL_TEST(codegen_case_scrutinee_reread_5941,
+           bare_field_name_scrutinee_rereads_after_declined_guard) {
+    auto r = runAotChecked(prog(
+        holder5941(
+            "public method Run(): int "
+            "  case Slots of "
+            "    var a when Decline() => do end, "
+            "    var b => do Console.WriteLine($\"{b[0].V}\"); end "
+            "  end; "
+            "  return 0; "
+            "end Run; "),
+        "using var h := new Holder(); return h.Run(); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "9\n");
+}
+
+// Loop the parameter scenario 50x: also a leak check (every iteration's
+// replaced array and the final one must be disposed exactly once).
+BEZEL_TEST(codegen_case_scrutinee_reread_5941,
+           parameter_root_looped_50x_reads_new_value_and_does_not_leak) {
+    auto r = runAotChecked(prog(
+        holder5941("") +
+        "class R "
+        "  public static method Run(h: Holder): int "
+        "    case h.Slots of "
+        "      var a when h.Decline() => do return -1; end, "
+        "      var b => do return b[0].V; end "
+        "    end; "
+        "    return -2; "
+        "  end Run; "
+        "end R; ",
+        "var sum := 0; var i := 0; "
+        "while i < 50 do "
+        "  using var h := new Holder(); "
+        "  sum := sum + R.Run(h); "
+        "  i := i + 1; "
+        "end; "
+        "Console.WriteLine($\"{sum}\"); "
+        "return 0; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "450\n");
+}
+
+// Control: the already-fixed LOCAL-rooted shape must stay green.
+BEZEL_TEST(codegen_case_scrutinee_reread_5941,
+           local_rooted_control_still_rereads) {
+    auto r = runAotChecked(prog(
+        holder5941(""),
+        "using var h := new Holder(); "
+        "var n := 0; "
+        "case h.Slots of "
+        "  var a when h.Decline() => do n := n + 1; end, "
+        "  var b => do Console.WriteLine($\"{b[0].V}\"); end "
+        "end; "
+        "Console.WriteLine($\"{n}\"); "
+        "return 0; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "9\n0\n");
 }
