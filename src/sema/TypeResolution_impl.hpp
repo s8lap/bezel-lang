@@ -1385,6 +1385,12 @@ private:
     // the outer instantiation.
     bool isGenericParamRef(const ast::Type& t, Scope* scope);
 
+    // fix #5549 (§26.4, §14.2 v0.338): check a generic extension head's bare
+    // block-parameter arguments against the extended type's declared
+    // constraints, under the block's own `where` clause alone.
+    void checkExtensionHeadConstraints(const ast::ExtensionDecl& ext,
+                                       Scope* scope);
+
     // §14.2 / Appendix C.4 reference-vs-value classification of a resolved
     // argument TypeRef. Unknown means "can't classify here" (built-in named
     // type with no user declaration, generic param, Error) — the caller

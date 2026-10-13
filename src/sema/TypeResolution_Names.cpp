@@ -871,6 +871,180 @@ void Resolver::rejectDisallowedExtensionTarget(const ast::ExtensionDecl& ext) {
     }
 }
 
+// fix #5549 (§26.4, §14.2 v0.338): a bare non-nullable argument of a generic
+// extension head is a block-level type parameter, and the extended type's
+// declared constraint on that position is decided by the BLOCK's `where`
+// clause and nothing else (§14.2 *A type parameter as the type argument*,
+// case 1). The instantiation-site check cannot decide it: the argument is a
+// generic-parameter marker, so checkGenericConstraints defers it to
+// recordDeferredNested, which records nothing outside a type body. This pass
+// checks each such position directly. Where the clause could guarantee the
+// constraint only through a subtype relation this pass does not compute (a
+// type bound naming a different type), the head is admitted rather than
+// guessed at; that residual is named in the commit.
+namespace {
+
+// The single-segment name of a Named type node, ignoring its generic
+// arguments and nullability (a bound's name), or empty.
+std::string_view boundNameOfAst(const ast::Type* t) {
+    if (!t || !t->name || t->name->parts.size() != 1) return {};
+    return t->name->parts.front();
+}
+
+// The name of a `type` constraint's bound, from the declaring node or from
+// the imported artifact's TypeRef.
+std::string_view boundNameOfConstraint(const GenericParamConstraint& c) {
+    if (c.astBound) return boundNameOfAst(c.astBound);
+    const TypeRef* b = c.importedBound;
+    if (!b) return {};
+    if (b->declaration) return b->declaration->name;
+    std::string_view n = b->importedName;
+    std::size_t dot = n.rfind('.');
+    return dot == std::string_view::npos ? n : n.substr(dot + 1);
+}
+
+} // namespace
+
+void Resolver::checkExtensionHeadConstraints(const ast::ExtensionDecl& ext,
+                                             Scope* scope) {
+    if (!ext.targetType) return;
+    const TypeRef* head = ctx_.resolvedType(*ext.targetType);
+    if (!head || head->kind != TypeRef::Kind::Named) return;
+    const auto& argAsts = ext.targetType->genericArgs;
+
+    // The block-level parameter named by head argument `i`, or empty when
+    // that argument is not a bare non-nullable block parameter (a concrete
+    // argument, a nullable `T?` which is rejected elsewhere, or a nested one).
+    auto blockParamAt = [&](std::size_t i) -> std::string_view {
+        const ast::Type* a = argAsts[i].get();
+        if (!a || !isGenericParamRef(*a, scope)) return {};
+        if (a->nullable || !a->genericArgs.empty()) return {};
+        return a->name->parts.front();
+    };
+
+    // The block's own `where` clause items for parameter `p`.
+    auto clauseOf = [&](std::string_view p) {
+        std::vector<const ast::ConstraintItem*> items;
+        for (const auto& gc : ext.genericConstraints) {
+            if (gc.typeParam != p) continue;
+            for (const auto& item : gc.items) items.push_back(&item);
+        }
+        return items;
+    };
+
+    // A builtin owning collection carries no GenericParamSymbol constraints;
+    // its element slot is `where <slot>: class` (§14.4, the same slot
+    // ownedSlot table as owningCollectionOwnedSlot). Only that slot is decided
+    // here. The remaining builtin table entries are not yet covered (residual).
+    if (!head->declaration || head->declaration->genericParams.empty()) {
+        if (!ext.targetType->name || ext.targetType->name->parts.empty())
+            return;
+        std::size_t slot =
+            owningCollectionOwnedSlot(ext.targetType->name->parts.back());
+        if (slot == static_cast<std::size_t>(-1) || slot >= argAsts.size())
+            return;
+        std::string_view param = blockParamAt(slot);
+        if (param.empty()) return;
+        bool guaranteedClass = false;
+        for (const ast::ConstraintItem* item : clauseOf(param)) {
+            if (item->kind == "class" || item->kind == "type")
+                guaranteedClass = true;  // a type bound may be a class
+        }
+        if (!guaranteedClass) {
+            ctx_.diagnostics().report(
+                Severity::Error, ext.targetType->span.begin,
+                "type argument `" + std::string(param) +
+                "` does not satisfy the constraint `where " +
+                std::string(param) + ": class` (\xC2\xA7""14.2): the owning "
+                "collection `" + std::string(ext.targetType->name->parts.back()) +
+                "` requires its element parameter to be a class, and an "
+                "extension block's `where` clause must state it, since a block "
+                "parameter inherits no constraint from the extended type "
+                "(\xC2\xA7""26.4)");
+        }
+        return;
+    }
+    const TypeSymbol& tsym = *head->declaration;
+    if (argAsts.size() != tsym.genericParams.size()) return;
+
+    // Does the block clause `items` guarantee the extended type's constraint
+    // `c` on its position `i`? `items` is the clause of that position's block
+    // parameter. The clause guarantees `c` only by the rules below; a `type`
+    // item naming a different type leaves the subtype question open, and the
+    // constraint is then admitted (undecided, not guessed).
+    auto guaranteed = [&](const std::vector<const ast::ConstraintItem*>& items,
+                          const GenericParamConstraint& c, std::size_t i,
+                          std::string& spelled) -> bool {
+        if (c.kind == "type") {
+            std::string_view want = boundNameOfConstraint(c);
+            // A bound naming another parameter of the extended type is read
+            // at that position's block parameter (`where T: U` over
+            // `Rel<A, B>` needs `where A: B`).
+            for (std::size_t k = 0; k < tsym.genericParams.size(); ++k) {
+                if (tsym.genericParams[k] &&
+                    tsym.genericParams[k]->name == want) {
+                    want = blockParamAt(k);
+                    break;
+                }
+            }
+            if (want.empty()) return true;  // not a bare block parameter
+            spelled = std::string(want);
+            bool undecided = false;
+            for (const ast::ConstraintItem* item : items) {
+                if (item->kind != "type") continue;
+                std::string_view n = boundNameOfAst(item->typeArg.get());
+                if (n == want) return true;
+                undecided = true;  // a different bound may still conform
+            }
+            return undecided;
+        }
+        if (c.kind == "new") spelled = "new()"; else spelled = std::string(c.kind);
+        for (const ast::ConstraintItem* item : items) {
+            std::string_view k = item->kind;
+            if (c.kind == "class") {
+                if (k == "class" || k == "type") return true;  // type: open
+            } else if (c.kind == "value") {
+                if (k == "value") return true;
+            } else if (c.kind == "notnull") {
+                if (k == "class" || k == "value" || k == "notnull" ||
+                    k == "type")
+                    return true;
+            } else if (c.kind == "new") {
+                if (k == "new") return true;
+            } else if (k == c.kind) {
+                // sendable / hashable: a derived-property constraint is
+                // guaranteed only by carrying the same constraint (§14.2).
+                return true;
+            }
+        }
+        // An unrecognised kind is admitted (no rule here decides it).
+        return c.kind != "class" && c.kind != "value" && c.kind != "notnull" &&
+               c.kind != "new" && c.kind != "sendable" && c.kind != "hashable";
+    };
+
+    for (std::size_t i = 0; i < tsym.genericParams.size(); ++i) {
+        auto* gp = dynamic_cast<GenericParamSymbol*>(tsym.genericParams[i]);
+        if (!gp) continue;
+        const std::string_view param = blockParamAt(i);
+        if (param.empty()) continue;
+        const auto items = clauseOf(param);
+        for (const GenericParamConstraint& c : gp->constraints) {
+            std::string spelled;
+            if (guaranteed(items, c, i, spelled)) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, ext.targetType->span.begin,
+                "type argument `" + std::string(param) +
+                "` does not satisfy the constraint `where " +
+                std::string(param) + ": " + spelled + "` (\xC2\xA7""14.2): "
+                "the extended type `" + std::string(tsym.name) +
+                "` requires it of its parameter `" + std::string(gp->name) +
+                "`, and an extension block's `where` clause must state it, "
+                "since a block parameter inherits no constraint from the "
+                "extended type (\xC2\xA7""26.4)");
+        }
+    }
+}
+
 void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&decl)) {
         resolveTypeDecl(*td, parent);
@@ -924,6 +1098,9 @@ void Resolver::resolveTopDecl(const ast::TopDecl& decl, Scope* parent) {
                                           functionSlotDiagReported);
         }
         if (ext->targetType) resolveType(*ext->targetType, &extScope);
+        // fix #5549 (§26.4, v0.338): the head's block parameters are checked
+        // against the extended type's constraints under the block's clause.
+        if (ext->targetType) checkExtensionHeadConstraints(*ext, &extScope);
         // fix #4144 (§26.2, v0.295): reject a target kind the closed
         // extendable list excludes, before any member of the block is
         // resolved further or reaches codegen.
