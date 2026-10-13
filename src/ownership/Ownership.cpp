@@ -135,6 +135,13 @@ void scanLazyConsumptionStmts(const std::vector<std::unique_ptr<ast::Stmt>>& bod
                              sema::SemaContext& ctx,
                              std::unordered_set<const sema::Symbol*>& out);
 
+// The two lazy-query type tests run() splits the scan's output on. The wide
+// one is the scan's own over-approximation (it also sees the cross-module
+// spelling); the narrow one is the §29.11 must-use suppression's predicate.
+// Definitions live below with the other body walkers.
+bool isLazyQueryExprType(const ast::Expr& e, sema::SemaContext& ctx);
+bool isSameModuleLazyQuerySentinel(const ast::Expr& e, sema::SemaContext& ctx);
+
 // §29.8 / §30.1 (#973a): can a frame's terminal-state disposal reclaim this
 // `owned` parameter through its capture slot? All three frame-disposal loops
 // (sync iterator, async iterator, plain async) LOAD the slot as a pointer,
@@ -737,8 +744,40 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // is what narrows the §29.11 producerState arm (a deferred-activation
     // call result classified Owned) to draw the lint only on a bound query
     // whose right is NEVER spent.
+    std::unordered_set<const sema::Symbol*> allSpentQueryRights;
+    scanLazyConsumptionStmts(body, ctx_, allSpentQueryRights);
+    // §29.11 (v0.334): split the scan's result on the DECLARATION, because
+    // only the declaration can tell a §29.11 lazy query from an ordinary owned
+    // `IEnumerable` local — `isLazyQueryExprType` above is an over-
+    // approximation that had to be widened to reach the cross-module spelling.
+    //
+    //   spentLazyQueryRights      — the §29.11 MUST-USE suppression set,
+    //                               narrowed back to the same-module sentinel,
+    //                               so this commit changes no must-use
+    //                               behaviour at all.
+    //   spentImportedQueryRights  — every deferred-activation binding the §29.11
+    //                               producerState arm classified Owned whose
+    //                               right is spent, in EITHER spelling. Read at
+    //                               ONE place: the §28.3 hard reject, and only
+    //                               inside a `yield` method.
     std::unordered_set<const sema::Symbol*> spentLazyQueryRights;
-    scanLazyConsumptionStmts(body, ctx_, spentLazyQueryRights);
+    std::unordered_set<const sema::Symbol*> spentImportedQueryRights;
+    for (const sema::Symbol* s : allSpentQueryRights) {
+        const auto* ls = dynamic_cast<const sema::LocalSymbol*>(s);
+        const auto* ld =
+            ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl) : nullptr;
+        if (!ld || !ld->initializer) continue;
+        // Same-module sentinel: the shape the pre-widening scan admitted, so
+        // the must-use set is exactly what ca860313's suppression used.
+        if (isLazyQueryExprType(*ld->initializer, ctx_) &&
+            isSameModuleLazyQuerySentinel(*ld->initializer, ctx_))
+            spentLazyQueryRights.insert(s);
+        const auto* ce =
+            dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+        if (ce && isDeferredActivationCallResult(*ce) &&
+            !common::calleeMethodDecl(*ce, ctx_))
+            spentImportedQueryRights.insert(s);
+    }
     // §28.3 / §28.7 (v0.180, #1465): of those, the plain owned class/interface
     // locals whose drop-on-overwrite codegen implements
     // (disposeDisplacedOwnedClassLocal) — the displaced value is disposed at each
@@ -1376,6 +1415,37 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             if (auto* psOut = dynamic_cast<sema::ParameterSymbol*>(sym)) {
                 if (psOut->modifier == "out owned") continue;
             }
+            // §29.11 (v0.334): a bound lazy query whose enumeration right is
+            // SPENT is not an undischarged container obligation — in a `yield`
+            // method. That is the one method kind where the two halves of §29.11
+            // disagree about who reclaims the frame:
+            //
+            //   * The arm that sets `autoDropAtScopeEnd` and draws K3.14's
+            //     must-use warning — §29.11's "the auto-drop still running" — is
+            //     gated on `!sawYield_`. Inside a `yield` method it cannot run,
+            //     so a binding it would have handled falls through to here.
+            //   * §29.7 / #3468 is the reclamation that DOES apply: the
+            //     enumerator's `Dispose` reclaims the frame the reserved frame
+            //     field holds. That is why #3468 had to reserve and wire the
+            //     field for a for-in source in the first place, and why the
+            //     control row in that test pins `rc == 7` — the program must
+            //     compile and run.
+            //
+            // So without this skip, c1e6187a — correctly, per §29.11's "an
+            // ordinary minted caller-owned frame" — classifies the binding Owned,
+            // and the very next thing that Owned does is reject a program §29.7
+            // requires to accept, in the generator shape §29.11's subject is
+            // overwhelmingly produced in. That is the regression.
+            //
+            // GATED ON `sawYield_` ON PURPOSE. Outside a `yield` method this arm
+            // is unreachable for the shape at issue: the auto-drop arm above has
+            // already run and `continue`d, so the binding never reaches here.
+            // The gate therefore costs nothing outside a generator and keeps the
+            // skip from ever reading as a general undischarged-owned waiver.
+            //
+            // An UNSPENT query still rejects: it is in neither set.
+            // // per §29.11, §29.7
+            if (sawYield_ && spentImportedQueryRights.count(sym) != 0) continue;
             ctx_.diagnostics().report(
                 Severity::Error,
                 obligationDiagLoc(sym, st),
@@ -2264,8 +2334,43 @@ void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
 // same-named inner binding is never confused with the outer one.
 // `isLazyQueryExprType` must match DefiniteAssignment::isLazyEnumerableExprType
 // and codegen's isLazyEnumerableType (the three copies of this sentinel
-// shape; see the cross-reference at the §29.11 producerState arm). // per §29.11
+// shape; see the cross-reference at the §29.11 producerState arm).
+//
+// WIDENED, deliberately, to the cross-module spelling of the same value. The
+// three sentinel copies above all require an EMPTY `importedName`, which holds
+// only when the query was minted in the SAME module; across a module boundary
+// ModuleLoader puts the head in `importedName` instead (§2.5) — the
+// reconstruction #3187 introduced, and the very shape
+// xmod_forin_imported_enumerable_frame_slot_3468's subject has. Requiring the
+// empty name therefore made the §29.11 scan blind to every cross-module query.
+//
+// This is an OVER-APPROXIMATION on purpose, and is narrowed back at its two
+// consumers in run(): only the DECLARATION can tell a §29.11 lazy query from
+// an ordinary owned `IEnumerable` local, so the split is made there, not
+// here. Widening here alone would silence the §28.3 must-use warning on a
+// cross-module NON-yield `var seq := Other.Make();` enumerated by a for-in —
+// measured, and wrong; see the split in run(). // per §29.11
 static bool isLazyQueryExprType(const ast::Expr& e, sema::SemaContext& ctx) {
+    const sema::TypeRef* ty = ctx.exprType(e);
+    if (!ty || ty->kind != sema::TypeRef::Kind::Named) return false;
+    if (ty->declaration || ty->astNode) return false;
+    if (ty->genericArgs.empty()) return false;
+    // Same-module spelling: the synthetic §29.11 sentinel itself.
+    if (ty->importedName.empty()) return true;
+    // Cross-module spelling: the head is in `importedName`, and it must be
+    // the iteration-interface family — the same table codegen's
+    // `classifyBuiltinForInSource` gates the frame-slot decision on, so this
+    // arm and the lowering that reserves the field cannot drift apart the way
+    // #3468's hand-written mirror did.
+    return common::isBuiltinForInEnumerableHead(ty->importedName);
+}
+
+// The NARROW half of `isLazyQueryExprType`: the §29.11 lazy-query sentinel
+// proper, the same-module spelling only (empty `importedName`). This is the
+// must-use suppression's own predicate, so widening the test above to see the
+// cross-module spelling cannot leak into the §28.3 lint.
+static bool isSameModuleLazyQuerySentinel(const ast::Expr& e,
+                                          sema::SemaContext& ctx) {
     const sema::TypeRef* ty = ctx.exprType(e);
     return ty && ty->kind == sema::TypeRef::Kind::Named && !ty->declaration &&
            !ty->astNode && !ty->genericArgs.empty() && ty->importedName.empty();
