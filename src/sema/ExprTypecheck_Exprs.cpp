@@ -450,6 +450,16 @@ static bool typeTest5146ReferenceTargetKind(
     return true;
 }
 
+// §35.5, v0.334: returns true if the call is a fresh-producer
+// (new-expr or call returning Owned, including owning-choice case constructors).
+static bool isFreshProducerCall(const ast::CallExpr& call,
+                                sema::SemaContext& ctx) {
+    if (common::calleeReturnsOwned(call, ctx)) return true;
+    if (auto cv = common::classifyChoiceType(ctx.exprType(call), ctx))
+        if (*cv == common::ChoiceClassification::Owning) return true;
+    return false;
+}
+
 // fix #5146: display name for the diagnostic's REFERENCE TARGET (already
 // confirmed by `typeTest5146ReferenceTargetKind` to be `string`/`Object` or a
 // Named class/interface) — `exprsNamedTypeSimpleName` alone answers empty for
@@ -9173,6 +9183,27 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         }
     } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         if (ue->operand) visitExpr(*ue->operand);
+        // §35.5, v0.334: reject `move` on a fresh-producer scrutinee.
+        // An unmarked read never silently consumes, and a fresh producer
+        // needs no marker.
+        if (ue->op == "move" && &e == caseScrutineeSlot_) {
+            const ast::Expr* operand = ue->operand.get();
+            if (operand) {
+                bool isFreshProducer =
+                    dynamic_cast<const ast::NewExpr*>(operand) ||
+                    (dynamic_cast<const ast::CallExpr*>(operand) &&
+                     isFreshProducerCall(
+                         *static_cast<const ast::CallExpr*>(operand), ctx_));
+                if (isFreshProducer) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        "the `move` marker is not written on a fresh-producer "
+                        "scrutinee \xe2\x80\x94 an unmarked read never silently "
+                        "consumes, and a fresh producer needs no marker; "
+                        "remove `move` (\xc2\xa7""35.5, v0.334)");
+                }
+            }
+        }
     } else if (auto* ma =
                    dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         // §11.8 (v0.176, #807): mark the target node while visiting it so the
