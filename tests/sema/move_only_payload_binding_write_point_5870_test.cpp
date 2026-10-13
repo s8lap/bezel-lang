@@ -711,3 +711,38 @@ BEZEL_TEST(codegen_case_scrutinee_reread_5941,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "9\n0\n");
 }
+
+// fix-forward #5941: `case this of` inside a CHOICE method. `this` there is
+// the by-pointer receiver, and the entry read loads the choice struct through
+// it (§35.5); the per-arm re-read must load it too. Before the fix-forward the
+// second arm's test was handed the raw pointer and the COMPILER crashed
+// (SIGSEGV in patternMatches). Both arms are exercised, so the re-read arm's
+// payload binding is observed.
+BEZEL_TEST(codegen_case_scrutinee_reread_5941,
+           choice_this_scrutinee_second_arm_binds_payload_spec_35_5) {
+    auto r = runAotChecked(
+        "module M5941C; "
+        "choice Outcome "
+        "  Won(code: int), "
+        "  Lost(code: int); "
+        "  public method CodeOf(): int "
+        "    var res := 0; "
+        "    case this of "
+        "      Outcome.Won(c) => res := c;, "
+        "      Outcome.Lost(c) => res := c + 100 "
+        "    end case; "
+        "    return res; "
+        "  end CodeOf; "
+        "end Outcome; "
+        "class C "
+        "  public static method Main(): int "
+        "    var a := Outcome.Won(5); "
+        "    var b := Outcome.Lost(6); "
+        "    Console.WriteLine($\"{a.CodeOf()} {b.CodeOf()}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "5 106\n");
+}

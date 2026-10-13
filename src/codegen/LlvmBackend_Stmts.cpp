@@ -11141,6 +11141,10 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     // block below; when true, arms after the first RE-READ the source instead
     // of reusing the value hoisted before the arms. See caseScrutRereadable.
     bool scrutRereadable = false;
+    // The struct type the §35.5 choice-`this` recovery below loaded the
+    // scrutinee at (null when it loaded nothing). A per-arm re-read lowers the
+    // same by-pointer `this` and must load it the same way.
+    llvm::Type* scrutThisLoadTy = nullptr;
     if (cs.scrutinee) {
         scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
@@ -11157,9 +11161,11 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             !scrutTy->declaration ||
             scrutTy->declaration->kind != ast::TypeDeclKind::Choice) {
             if (const sema::TypeSymbol* chTy = choiceTypeOf(*cs.scrutinee)) {
-                if (scrut->getType()->isPointerTy())
-                    scrut = builder_.CreateLoad(choiceStruct(chTy), scrut,
+                if (scrut->getType()->isPointerTy()) {
+                    scrutThisLoadTy = choiceStruct(chTy);
+                    scrut = builder_.CreateLoad(scrutThisLoadTy, scrut,
                                                 "choice.this.val");
+                }
                 choiceScrutStorage.kind = sema::TypeRef::Kind::Named;
                 choiceScrutStorage.declaration =
                     const_cast<sema::TypeSymbol*>(chTy);
@@ -11307,8 +11313,17 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         // becomes a new failure mode.
         llvm::Value* armScrut = scrut;
         if (armIdx > 0 && scrutRereadable) {
-            if (llvm::Value* reread = lowerExpr(*cs.scrutinee))
-                armScrut = reread;
+            if (llvm::Value* reread = lowerExpr(*cs.scrutinee)) {
+                // §35.5: `this` inside a choice method lowers to the receiver
+                // POINTER, and the entry read loaded the struct through it;
+                // the re-read loads it again, which is the receiver as it
+                // stands. Any other representation mismatch keeps the hoisted
+                // value: the arm tests below are typed for `scrut`.
+                if (scrutThisLoadTy && reread->getType()->isPointerTy())
+                    reread = builder_.CreateLoad(scrutThisLoadTy, reread,
+                                                 "choice.this.reread");
+                if (reread->getType() == scrut->getType()) armScrut = reread;
+            }
         }
         llvm::Value* pm = nullptr;
         if (!cs.scrutinee) {
