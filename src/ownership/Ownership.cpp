@@ -3325,6 +3325,18 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
         // node is on `block.sourceStmt` (set by visitCase — see
         // src/flow/CFG.cpp).
         const ast::Expr* scrut = block.caseScrutinee;
+        // fix-forward #3575 (§35.5 form 2, §28.3 K3.4, v0.338): the marked
+        // owning-match scrutinee `case move a of …` is a K3.4 consume -- "the
+        // consumed binding is left moved-from when the construct completes".
+        // It is the same `move <identifier>` transfer `var b := move a;`
+        // records through recordMovesIn / markMovedByName, so route it
+        // through that accessor rather than a second spelling of the rule.
+        // Without it `a` stayed Owned and drew the §28.3 must-use warning at
+        // its declaration although the match consumed it.
+        if (const auto* mv = dynamic_cast<const ast::UnaryExpr*>(scrut);
+            mv && mv->op == "move" && owningMatchScrutineeForm(scrut)) {
+            recordMovesIn(*mv);
+        }
         if (!suppressDiag_ && producerState(*scrut) == OwnershipState::Owned) {
             const sema::TypeRef* rt = ctx_.exprType(*scrut);
             bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&

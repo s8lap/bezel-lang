@@ -16741,8 +16741,9 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
     // type is a MOVE-ONLY VALUE TYPE is owned-bearing WITHOUT the `owned`
     // modifier — §28.5 lists "owning-inline-array fields and/or owning-choice
     // fields" among the fields whose generated cleanup the class destructor
-    // performs, and admits `owned` only on class- and interface-typed fields, so
-    // the modifier is not available to write. The declaration-form counterpart
+    // performs, and on an owning-choice field the `owned` modifier is
+    // admitted-but-redundant (§28.5, §35.4), so the field is owned-bearing
+    // whether or not the modifier is written. The declaration-form counterpart
     // of targetIsMoveOnlyValueField; without it `private _o: Bundle :=
     // Bundle.Ready(r);` is rejected while the same store spelled as an
     // assignment is admitted.
