@@ -4225,6 +4225,43 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 llvm::BasicBlock::Create(llvm_, "entry", dtorFn);
             builder_.SetInsertPoint(dtorEntry);
 
+            // fix #4135 follow-on (§27.5 / §28.9, v0.334): emit the envdtor
+            // BODY with `currentFn_` naming the envdtor itself. `currentFn_` is
+            // the BLOCK-AUTHORITY for every `llvm::BasicBlock::Create(...,
+            // currentFn_)` in the helpers this body calls, and the envdtor body
+            // reaches one: a #4135 DrainedEntry<K,V> capture calls
+            // emitDisposeAndReclaim -> emitReclaimBlock, which since 2eb170bc
+            // (#5872) splits the physical free across two new basic blocks
+            // (`obj.free` / `obj.keeplive`, Disposal.cpp:2892-2896). With
+            // `currentFn_` still the ENCLOSING function those blocks were
+            // parented to the enclosing `llvm::Function` while builder_ was
+            // emitting into the envdtor — so the envdtor's `br` branched into
+            // another function's blocks, the `free`/`bz_freed_slot` store were
+            // appended to the ENCLOSING function, and the envdtor's own
+            // `ret void` landed there too (against an `i32` return type):
+            //     Referring to an instruction in another function!
+            //       call void @free(ptr %dde.val)
+            //     Referring to a basic block in another function!
+            //       br i1 %obj.notro, label %obj.free, label %obj.keeplive
+            //     Function return type does not match operand type of return inst!
+            // and `bezelc` rejected the module outright (the closure-capture
+            // row of #4135's own regression test could not compile at all).
+            // Every OTHER site that moves builder_ into a freshly created
+            // llvm::Function pins currentFn_ to it (Async.cpp:1321/1610/2401/
+            // 3559/3679/4265/5779, Iterators.cpp:1907/2105, and the lambda
+            // TRAMPOLINE body itself at 3140); this envdtor emission was the
+            // one that did not. Restored below, before the insert point goes
+            // back to `preDtorBB` — the enclosing function's closure-object
+            // construction that follows is genuinely the enclosing function's
+            // code. Only currentFn_ moves: no helper called from the envdtor
+            // body gates BEHAVIOUR on it (emitStringRelease / emitClosureRelease
+            // / emitBoxRelease are bare `bz_*_release` calls; emitDynamicDispose
+            // reads no emitter state; emitReclaimBlock uses it only as the
+            // parent of the blocks above), so this changes block placement and
+            // nothing else.
+            llvm::Function* savedDtorOuterFn = currentFn_;
+            currentFn_ = dtorFn;
+
             llvm::Value* envArg = &*dtorFn->args().begin();
             auto* envTyD = llvm::StructType::get(llvm_, envFieldTys);
 
@@ -4411,7 +4448,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             }
             builder_.CreateRetVoid();
 
-            // Restore builder to the outer-function BB.
+            // Restore builder to the outer-function BB. currentFn_ goes back
+            // with it — the save is paired here, and `savedDtorOuterFn` is
+            // this scope's own name for the enclosing function (the trampoline
+            // body's restore at 4097 already ran, so currentFn_ was that
+            // function on entry to this block).
+            currentFn_ = savedDtorOuterFn;
             builder_.SetInsertPoint(preDtorBB);
 
             // Store envdtor fn ptr at cell field 3 (off 24).
