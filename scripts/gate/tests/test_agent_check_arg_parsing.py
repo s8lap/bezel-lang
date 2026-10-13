@@ -112,6 +112,7 @@ AREA=""
 %(setargs)s
 %(block)s
 echo "RESULT AREA=[$AREA] NO_LIT=[$NO_LIT] ARGS=[$*]"
+echo "LITFLAG RUN_LIT=[$RUN_LIT]"
 '''
 
 
@@ -167,6 +168,29 @@ class AgentCheckNoLitAreaOrderingTest(unittest.TestCase):
 
     def test_no_lit_alone_after_stripping_leaves_no_filter_and_dies(self):
         r = _run(["--no-lit"])
+        self.assertEqual(r.returncode, 42)
+        self.assertIn("no test filter given", r.stderr)
+
+    def test_lit_is_opt_in_and_composes_with_area_in_either_order(self):
+        """R30: the lit track is opt-in. No flag leaves RUN_LIT=0; `--lit`
+        sets it wherever it is typed and never leaks into the filter list or
+        hides `--area` (the #3923 shape, for the new flag)."""
+        def run_lit(argv):
+            r = _run(argv)
+            line = next(ln for ln in r.stdout.splitlines()
+                        if ln.startswith("LITFLAG "))
+            return line.split("RUN_LIT=[", 1)[1].split("]", 1)[0]
+        self.assertEqual(run_lit(["--area", "codegen", "f1"]), "0")
+        self.assertEqual(run_lit(["f1"]), "0")
+        for argv in (["--lit", "--area", "codegen", "f1", "f2"],
+                     ["--area", "codegen", "--lit", "f1", "f2"],
+                     ["--area", "codegen", "f1", "f2", "--lit"]):
+            area, no_lit, args = _result(argv)
+            self.assertEqual((area, no_lit, args), ("codegen", "0", ["f1", "f2"]), argv)
+            self.assertEqual(run_lit(argv), "1", argv)
+
+    def test_lit_alone_leaves_no_filter_and_dies(self):
+        r = _run(["--lit"])
         self.assertEqual(r.returncode, 42)
         self.assertIn("no test filter given", r.stderr)
 

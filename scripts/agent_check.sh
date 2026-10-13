@@ -53,6 +53,10 @@
 #                                                     Still a targeted lane check
 #                                                     — NOT acceptance; the gate
 #                                                     remains the authority.
+#   scripts/agent_check.sh --lit [--area <group>] <filter>
+#                                                     same, and ALSO run the lit
+#                                                     diagnostic track (opt-in;
+#                                                     once per commit, see below)
 #   scripts/agent_check.sh --build-only               reconfigure + build bezel_tests
 #   scripts/agent_check.sh --probe FILE.bzl [args..]  compile ONE .bzl with bezelc
 #                                                     (output -> the scratch dir)
@@ -244,8 +248,10 @@ fi
 
 # --- --no-lit: strip it from ANYWHERE in the remaining args, before any mode
 # is dispatched (issue #3923). --no-lit skips the lit diagnostic track (see
-# the default-run section below) for pure codegen-value lanes that never
-# touch a diagnostic string; default is to RUN it. This used to be stripped
+# the default-run section below). Since R30 the lit track is OPT-IN: `--lit`
+# runs it, the default is to SKIP it, and `--no-lit` is still accepted (an
+# explicit skip, which also wins over `--lit`) so older briefs keep working.
+# `--lit` is stripped by the same loop, for the same reason. This used to be stripped
 # only INSIDE the default filter-run path's own arg loop, so `--no-lit` typed
 # BEFORE `--area` (a natural thing to type - a real lane hit exactly this:
 # `agent_check.sh --no-lit --area codegen f1 f2 f3`) never reached that loop:
@@ -257,10 +263,12 @@ fi
 # --area/--build-only/--select are dispatched, means the two flags now
 # compose in EITHER order.
 NO_LIT=0
+RUN_LIT=0
 _ac_args=()
 for _a in "$@"; do
   case "$_a" in
     --no-lit) NO_LIT=1 ;;
+    --lit) RUN_LIT=1 ;;
     *) _ac_args+=("$_a") ;;
   esac
 done
@@ -368,7 +376,7 @@ for f in "$@"; do
     # instead of silently running it as a filter substring (which
     # previously could explode scope to nearly a whole area with no
     # indication anything was wrong — see the issue's measured repro).
-    -*) die "'$f' looks like a mistyped or misplaced flag, not a filter — refusing to treat it as one (a gtest suite-or-name substring can never start with '-'). Recognized flags: --area <group>, --no-lit, --probe, --build-only, --select (see the usage comment at the top of this script). If you meant --area, it must be followed by its group name." ;;
+    -*) die "'$f' looks like a mistyped or misplaced flag, not a filter — refusing to treat it as one (a gtest suite-or-name substring can never start with '-'). Recognized flags: --area <group>, --lit, --no-lit, --probe, --build-only, --select (see the usage comment at the top of this script). If you meant --area, it must be followed by its group name." ;;
   esac
 done
 
@@ -449,7 +457,12 @@ for f in "$@"; do
   fi
 done
 
-# --- lit diagnostic track (default-on; --no-lit to skip) ----------------------
+# --- lit diagnostic track (opt-in: --lit; default is to skip) -----------------
+# Opt-in since R30: with ~17 lanes each calling this script many times per
+# fix, a default-on lit run (2461 bezelc compiles; ~6s idle, ~40s measured on
+# the loaded box) was paid on every iteration. A lane runs `--lit` ONCE per
+# commit, before committing, whenever the commit touches src/ or tests/lit;
+# the integrator runs it on staging per batch and the gate always runs it.
 # A gtest FILTER cannot catch a change to a SHARED diagnostic STRING: a lane
 # editing one diagnostic breaks lit tests filed under UNRELATED issue numbers
 # (e.g. a #2159 change broke the #2145 reject lits — invisible to a `2159` gtest
@@ -457,17 +470,19 @@ done
 # the drift HERE saves a full gate cycle. The whole track is ~6s on the
 # already-built bezelc; run it via the same `check-lit` target the gate uses
 # (config/bezelc wiring guaranteed) unless the lane is pure codegen-value work.
-if [ "${NO_LIT:-0}" != 1 ]; then
+if [ "${RUN_LIT:-0}" = 1 ] && [ "${NO_LIT:-0}" != 1 ]; then
   echo "== agent_check: lit diagnostic track (real bezelc + FileCheck) — catches shared-diagnostic drift a gtest filter cannot =="
   litlog="$SCRATCH/test_lit.log"
   "$DH" suite cmake --build "$BUILD_DIR" --target check-lit 2>&1 | tee "$litlog"
   litrc=${PIPESTATUS[0]}
   if [ "$litrc" -ne 0 ]; then
-    echo "agent_check: LIT diagnostic track FAILED — a change to a shared diagnostic string likely broke a pinned CHECK (grep '$litlog' for 'FAIL: Bezel-lit'); update the expectation or fix the diagnostic. Skip with --no-lit ONLY if your change cannot affect any diagnostic."
+    echo "agent_check: LIT diagnostic track FAILED — a change to a shared diagnostic string likely broke a pinned CHECK (grep '$litlog' for 'FAIL: Bezel-lit'); update the expectation or fix the diagnostic."
     rc_all=1
   else
     echo "agent_check: lit diagnostic track green"
   fi
+else
+  echo "agent_check: lit diagnostic track NOT RUN (opt-in) — before committing a change that touches src/ or tests/lit, run once with --lit and quote its 'Passed:' line"
 fi
 
 [ "$rc_all" -eq 0 ] && echo "== agent_check: ALL requested filters green ==" \
