@@ -256,3 +256,122 @@ BEZEL_TEST(sema_type_param_bound_open_identity_5948,
     BEZEL_EXPECT_TRUE(hasBoundDiagnostic(
         r, "type argument `Box` does not satisfy the constraint `where T: Box`"));
 }
+
+// Local prelude for the reordered / derived-over-a-different-argument rows: a
+// two-parameter `Pair`, and `Sub2<T>` that derives from `Box<int>` (a class
+// over a concrete argument, so its base never mentions the enclosing `A`).
+const std::string kPairPrelude = kPrelude +
+    "public class Pair<X, Y> public constructor() end constructor; end Pair; "
+    "public class Sub2<T>: Box<int> public constructor() end constructor; end Sub2; ";
+
+BEZEL_TEST(sema_type_param_bound_open_identity_5948,
+           nullable_open_identity_rejected_sec_14_2) {
+    // §14.2 (v0.338, L2387): a nullable substitution for `T` is not
+    // non-nullable, so `Rel<Box<A>?, Box<A>?>` is rejected whatever `A` is.
+    auto r = runAot(kPrelude +
+        "public class H<A> "
+        "  public constructor() end constructor; "
+        "  public method Run(): int "
+        "    var r: Rel<Box<A>?, Box<A>?>? := null; "
+        "    return 1; "
+        "  end Run; "
+        "end H; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasBoundDiagnostic(
+        r, "does not satisfy the constraint `where T: U`"));
+}
+
+BEZEL_TEST(sema_type_param_bound_open_identity_5948,
+           nullable_derived_open_arg_rejected_sec_14_2) {
+    // §14.2 (v0.338, L2387): `Sub<A>?` is nullable, so it is not a subtype of
+    // the substitution `Box<A>?` for `U` whatever `A` is.
+    auto r = runAot(kPrelude +
+        "public class H<A> "
+        "  public constructor() end constructor; "
+        "  public method Run(): int "
+        "    var r: Rel<Sub<A>?, Box<A>?>? := null; "
+        "    return 1; "
+        "  end Run; "
+        "end H; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasBoundDiagnostic(
+        r, "does not satisfy the constraint `where T: U`"));
+}
+
+BEZEL_TEST(sema_type_param_bound_open_identity_5948,
+           nullable_open_identity_method_level_rejected_sec_14_2) {
+    // §14.2 (v0.338, L2387): the nullable open identity formed inside a
+    // method-level generic `K.M<A>()` is rejected at its own declaration.
+    auto r = runAot(kPrelude +
+        "public class K "
+        "  public static method M<A>(): int "
+        "    var r: Rel<Box<A>?, Box<A>?> := new Rel<Box<A>?, Box<A>?>(); "
+        "    return 3; "
+        "  end M; "
+        "end K; "
+        "public class C "
+        "  public static method Main(): int "
+        "    Console.WriteLine(K.M<int>().ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasBoundDiagnostic(
+        r, "does not satisfy the constraint `where T: U`"));
+}
+
+BEZEL_TEST(sema_type_param_bound_open_identity_5948,
+           reordered_pair_open_arguments_rejected_sec_14_2) {
+    // §14.2 (v0.338, L2387): `Pair<B,A>` is not identical to `Pair<A,B>` (its
+    // parameters are swapped), and no class is derived from it; the bound is
+    // not satisfied whatever `A` and `B` are.
+    auto r = runAot(kPairPrelude +
+        "public class H<A, B> "
+        "  public constructor() end constructor; "
+        "  public method Run(): int "
+        "    var r: Rel<Pair<A, B>, Pair<B, A>>? := null; "
+        "    return 1; "
+        "  end Run; "
+        "end H; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasBoundDiagnostic(
+        r, "type argument `Pair` does not satisfy the constraint `where T: Pair`"));
+}
+
+BEZEL_TEST(sema_type_param_bound_open_identity_5948,
+           derived_over_different_argument_rejected_sec_14_2) {
+    // §14.2 (v0.338, L2387): `Sub2<A>` derives from `Box<int>`, not from
+    // `Box<A>`; at `A := string` it is still a `Box<int>`, which is not
+    // `Box<string>`, so the bound fails whatever `A` is.
+    auto r = runAot(kPairPrelude +
+        "public class H<A> "
+        "  public constructor() end constructor; "
+        "  public method Run(): int "
+        "    var r: Rel<Sub2<A>, Box<A>>? := null; "
+        "    return 1; "
+        "  end Run; "
+        "end H; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasBoundDiagnostic(
+        r, "type argument `Sub2` does not satisfy the constraint `where T: Box`"));
+}
