@@ -20,6 +20,12 @@
 // on function values (equality, §27.7.1), a function type as a Dictionary
 // VALUE, and Set<int>.
 
+// NOTE (#5967): the accept controls below run on runAot, not runAotChecked.
+// A method-reference function value that is copied or stored into a collection
+// leaks its 48 B function object on the BASE compiler too (LSan, exit 99), so
+// runAotChecked reports ran=false ("sanitizer fired") independent of #5827.
+// Re-port them to runAotChecked when #5967 lands.
+
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
@@ -288,6 +294,39 @@ BEZEL_TEST(sema_function_type_not_hashable_5827,
         "  public static method Run(): int "
         "    var f: (int) -> int := Demo.Twice; "
         "    using var s := new Stack<(int) -> int>(); s.Push(f); if s.Contains(f) then return 1; end if; return 0; "
+        "  end Run; "
+        "end Demo; "
+        "class C public static method Main(): int return Demo.Run(); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 1);
+}
+
+// §27.7.1 / §14.2: a generic body's unconstrained `items.Contains(x)` at a
+// function-type instantiation is the native equality search (first kind), not
+// the §5 hashable block: accepted, and found/not-found are correct. runAot for
+// the #5967 reason above.
+BEZEL_TEST(sema_function_type_not_hashable_5827,
+           generic_bag_contains_at_function_type_accepted_spec_27_7_1) {
+    auto r = runAot(
+        "module M5827R; "
+        "class Bag<T> "
+        "  private owned items: Array<T>; "
+        "  public constructor() items := new Array<T>(); end constructor; "
+        "  public method Put(x: T) items.Add(x); end Put; "
+        "  public method Has(x: T): bool => items.Contains(x); "
+        "end Bag; "
+        "static class Demo "
+        "  public static method Twice(n: int): int => n * 2; "
+        "  public static method Thrice(n: int): int => n * 3; "
+        "  public static method Run(): int "
+        "    var f: (int) -> int := Demo.Twice; "
+        "    var o: (int) -> int := Demo.Thrice; "
+        "    using var b := new Bag<(int) -> int>(); "
+        "    b.Put(f); "
+        "    var n := 0; "
+        "    if b.Has(f) then n := n + 1; end if; "
+        "    if b.Has(o) then n := n + 10; end if; "
+        "    return n; "
         "  end Run; "
         "end Demo; "
         "class C public static method Main(): int return Demo.Run(); end Main; end C;");
