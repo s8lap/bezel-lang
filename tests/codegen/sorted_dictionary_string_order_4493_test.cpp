@@ -216,3 +216,66 @@ BEZEL_TEST(sorted_dictionary_string_order_4493,
     BEZEL_EXPECT_TRUE(ran);
     BEZEL_EXPECT_EQ(out, "sd=a,b,c,");
 }
+
+// ---------------------------------------------------------------------------
+// Control-character keys (stdlib §4.17 / §9.6, v0.338). U+0001 < U+001F < "a"
+// (0x61) < U+007F (0x7F) in code-point order. Keys are inserted scrambled and
+// printed as their numeric code points (int(c)), so the stdout carries no raw
+// control bytes. Post-fix: "sd=1,31,97,127, first=1 last=127".
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sorted_dictionary_string_order_4493,
+           sorted_dictionary_control_char_keys_codepoint_order_spec_4_17_stdlib_9_6) {
+    bool ran = false;
+    std::string out = checkedOut(wrap(
+        "  using var d := new SortedDictionary<string,int>(); "
+        "  d[\"\\u007F\"] := 4; d[\"a\"] := 3; d[\"\\u001F\"] := 2; d[\"\\u0001\"] := 1; "
+        "  var acc: string := \"\"; "
+        "  for var e in d do "
+        "    var k: int := int(e.Key[0]); "
+        "    acc := acc + k.ToString() + \",\"; "
+        "  end; "
+        "  var f := d.FirstKey; var l := d.LastKey; "
+        "  var fc: int := int(f[0]); var lc: int := int(l[0]); "
+        "  Console.WriteLine($\"sd={acc} first={fc} last={lc}\"); "
+        "  return 0; "), ran);
+    BEZEL_EXPECT_TRUE(ran);
+    BEZEL_EXPECT_EQ(out, "sd=1,31,97,127, first=1 last=127");
+}
+
+// ---------------------------------------------------------------------------
+// One relation (stdlib §4.17 / §4.18 / §9.6, v0.338): the same key set, with
+// "" and the code points where byte, UTF-16 and code-point orders diverge,
+// inserted in two different scrambled orders into a SortedSet and a
+// SortedDictionary. Both enumerations must equal the explicit code-point
+// order below, and must equal each other, so a bug shared by both cannot hide.
+// Code-point order: "" < "a" < "ab" < é(U+00E9) < Ā(U+0100) < €(U+20AC)
+// < 日(U+65E5) < U+D7FF < U+E000 < U+FF5E < U+1F600. Post-fix stdout:
+// "eq=1 ss=<order> sd=<order>", each element followed by ",". The empty key
+// contributes a bare ",".
+// ---------------------------------------------------------------------------
+BEZEL_TEST(sorted_dictionary_string_order_4493,
+           sortedset_and_sorteddictionary_one_relation_spec_4_17_4_18_stdlib_9_6) {
+    bool ran = false;
+    std::string out = checkedOut(wrap(
+        std::string("  using var s := new SortedSet<string>(); "
+        "  s.Add(\"\\uE000\"); s.Add(\"€\"); s.Add(\"\"); s.Add(\"日\"); "
+        "  s.Add(\"") + kEmoji + "\"); s.Add(\"ab\"); s.Add(\"é\"); s.Add(\"\\uD7FF\"); "
+        "  s.Add(\"Ā\"); s.Add(\"a\"); s.Add(\"" + kFullwidthTilde + "\"); "
+        "  using var d := new SortedDictionary<string,int>(); "
+        "  d[\"ab\"] := 6; d[\"" + kFullwidthTilde + "\"] := 11; d[\"\\uD7FF\"] := 8; "
+        "  d[\"€\"] := 5; d[\"" + kEmoji + "\"] := 12; d[\"a\"] := 2; d[\"\"] := 1; "
+        "  d[\"\\uE000\"] := 9; d[\"Ā\"] := 4; d[\"日\"] := 7; d[\"é\"] := 3; "
+        "  var a: string := \"\"; "
+        "  for var x in s do a := a + x + \",\"; end; "
+        "  var b: string := \"\"; "
+        "  for var e in d do b := b + e.Key + \",\"; end; "
+        "  var eq: int := (if a = b then 1 else 0); "
+        "  Console.WriteLine($\"eq={eq} ss={a} sd={b}\"); "
+        "  return 0; "), ran);
+    BEZEL_EXPECT_TRUE(ran);
+    // Expected element list in code-point order; U+D7FF and U+E000 as UTF-8.
+    std::string order = std::string(",a,ab,\xC3\xA9,\xC4\x80,\xE2\x82\xAC,\xE6\x97\xA5,"
+                                    "\xED\x9F\xBF,\xEE\x80\x80,") +
+                        kFullwidthTilde + "," + kEmoji + ",";
+    BEZEL_EXPECT_EQ(out, "eq=1 ss=" + order + " sd=" + order);
+}
