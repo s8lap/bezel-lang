@@ -21,6 +21,7 @@
 //   §28.13 "Shared ownership: Shared<T> and Weak<T>"
 //   stdlib §2.16 "Shared<T> and Weak<T>"
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -47,12 +48,12 @@
 #include "support/unique_stem.hpp"
 
 namespace fs = std::filesystem;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -194,10 +195,14 @@ BEZEL_TEST(codegen_shared_weak_nullable_620, spec_28_13_nullable_local_force_unw
         "  end TryGet; "
         "  public static method Main(): int "
         "    var s: Shared<Inner>? := null; "
-        "    return C.TryGet(s); "
+        "    Console.WriteLine(C.TryGet(s)); "
+        "    return 0; "
         "  end Main; "
         "end C;";
-    BEZEL_EXPECT_EQ(run(src), -1);
+    // Value printed, not returned: the exit status is 8-bit and -1 reads as 255.
+    auto r = runAot(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "-1\n");
 }
 
 
