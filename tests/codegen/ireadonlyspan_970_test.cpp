@@ -14,10 +14,11 @@
 // populated arrays use Add() rather than indexer assignment (which would
 // bounds-check against count and throw IndexOutOfRangeException at init time).
 
+#include "support/aot_support.hpp"   // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include <string>
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 using bezel::test::JitResult;
 
 #include "test_harness.hpp"
@@ -25,12 +26,12 @@ using bezel::test::JitResult;
 namespace {
 
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 bool rejected(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
@@ -127,7 +128,8 @@ BEZEL_TEST(ireadonlyspan_970, indexof_found_spec_4_16) {
 
 // §4.16 (#970): IndexOf — not-found returns -1.
 BEZEL_TEST(ireadonlyspan_970, indexof_notfound_spec_4_16) {
-    BEZEL_EXPECT_EQ(run(
+    // Value printed, not returned: the exit status is 8-bit and -1 reads as 255.
+    auto r = runAot(
         "module M; "
         "class C "
         "  public static method Find(sp: IReadOnlySpan<int>, v: int): int "
@@ -136,11 +138,13 @@ BEZEL_TEST(ireadonlyspan_970, indexof_notfound_spec_4_16) {
         "  public static method Main(): int "
         "    using var a := new Array<int>(3); "
         "    a.Add(1); a.Add(2); a.Add(3); "
-        "    return C.Find(a.AsReadOnlySpan(), 99); "
+        "    Console.WriteLine(C.Find(a.AsReadOnlySpan(), 99)); "
+        "    return 0; "
         "  end; "
-        "end C;"),
-        // not found → IndexOf returns -1; JIT captures raw return value, not exit status
-        -1);
+        "end C;");
+    // not found → IndexOf returns -1
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "-1\n");
 }
 
 // §4.16 (#970): Contains through IReadOnlySpan interface — found.
