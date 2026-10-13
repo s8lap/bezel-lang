@@ -1,30 +1,22 @@
 //! case: s14_2_0040
 //! doc: spec
 //! section: 14.2
-//! title: a class with an internal parameterless constructor does not satisfy where T: new()
-//! rule: A class substitution satisfies `where T: new()` exactly when the
-//!   class declares a parameterless constructor that is `public` — not
-//!   merely accessible from some scope — (§14.2, v0.315). A class declaring
-//!   only an `internal` parameterless constructor does not satisfy the
-//!   constraint.
+//! title: a class bound beside value admits no type by language rule and is rejected
+//! rule: A constraint combination that admits no type — `class, value`;
+//!   `value` with `IDisposable` or an interface extending it ... and every
+//!   other combination whose admitted sets are disjoint as a matter of
+//!   language rule — is a compile error at the declaration.
 //! cites: 14.2
 //! expect: reject
-//! diagnostic: new()
+//! diagnostic: admits no type
 module Conf;
 
-// A class with only an internal parameterless constructor.
-// It should NOT satisfy `where T: new()`.
-public class Widget
-  internal constructor()
+public sealed class Leaf
+  public constructor()
   end constructor;
-end Widget;
+end Leaf;
 
-public static class Factory
-  public static method Make<T>(): owned T where T: new() => new T();
-end Factory;
-
-public class Program
-  public static method Main()
-    var w := Factory.Make<Widget>();
-  end Main;
-end Program;
+public class Holder<T> where T: Leaf, value
+  public constructor()
+  end constructor;
+end Holder;

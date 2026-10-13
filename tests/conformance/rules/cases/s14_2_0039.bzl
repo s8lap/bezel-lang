@@ -1,30 +1,25 @@
 //! case: s14_2_0039
 //! doc: spec
 //! section: 14.2
-//! title: a class with a protected parameterless constructor does not satisfy where T: new()
-//! rule: A class substitution satisfies `where T: new()` exactly when the
-//!   class declares a parameterless constructor that is `public` — not
-//!   merely accessible from some scope — (§14.2, v0.315). A class declaring
-//!   only a `protected` parameterless constructor does not satisfy the
-//!   constraint.
+//! title: a sealed class bound beside an interface the class does not implement is well-formed
+//! rule: A combination empty only by declaration — a class bound naming a
+//!   `sealed` class beside an interface that class does not implement — is
+//!   not: it is well-formed, and no type argument satisfies it until the
+//!   declarations it names change.
 //! cites: 14.2
-//! expect: reject
-//! diagnostic: new()
+//! expect: accept
 module Conf;
 
-// A class with only a protected parameterless constructor.
-// It should NOT satisfy `where T: new()`.
-public class Widget
-  protected constructor()
+public interface IShape
+  method Area(): int;
+end IShape;
+
+public sealed class Leaf
+  public constructor()
   end constructor;
-end Widget;
+end Leaf;
 
-public static class Factory
-  public static method Make<T>(): owned T where T: new() => new T();
-end Factory;
-
-public class Program
-  public static method Main()
-    var w := Factory.Make<Widget>();
-  end Main;
-end Program;
+public class Holder<T> where T: Leaf, IShape
+  public constructor()
+  end constructor;
+end Holder;

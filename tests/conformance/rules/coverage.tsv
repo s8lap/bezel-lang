@@ -72,8 +72,8 @@ spec	8.6	Boxing	0	4	10	1	0	6	0	3	covered
 spec	8.7	Dispose is not on Object	0	0	0	0	0	0	0	0	n/a
 spec	9	Records	0	0	0	0	0	0	0	0	n/a
 spec	9.1	Positional records	1	0	6	2	0	1	0	3	covered
-spec	9.2	Body records	0	5	20	0	0	8	0	12	covered
-spec	9.3	Combined form	7	1	5	0	0	3	0	2	covered
+spec	9.2	Body records	0	5	28	0	0	12	0	16	covered
+spec	9.3	Combined form	7	1	6	0	0	3	0	3	covered
 spec	9.4	Mutability	0	3	9	2	0	3	0	4	covered
 spec	9.5	Non-destructive update: with	6	2	7	1	0	3	0	3	covered
 spec	9.6	Records and inheritance	1	1	4	1	0	2	0	1	covered
@@ -117,7 +117,7 @@ spec	13.6	Accessor visibility	2	0	2	1	0	1	0	0	covered
 spec	13.7	Visibility and inheritance	5	0	6	3	0	3	0	0	covered
 spec	14	Generics	0	0	0	0	0	0	0	0	n/a
 spec	14.1	Generic declarations	2	6	3	1	0	1	0	1	covered
-spec	14.2	Constraints	8	15	38	14	0	22	0	2	covered
+spec	14.2	Constraints	8	15	40	15	0	23	0	2	covered
 spec	14.3	Variance	0	0	0	0	0	0	0	0	n/a
 spec	14.4	owned and generic type arguments	0	2	10	4	0	6	0	0	covered
 spec	14.5	Type-argument inference for generic methods	11	2	8	0	0	4	0	4	covered
@@ -212,7 +212,7 @@ spec	23.5	Restrictions	5	0	4	0	0	4	0	0	covered
 spec	24	Events (retired member kind)	0	0	0	0	0	0	0	0	n/a
 spec	25	Operator Overloading	1	0	1	0	0	0	0	1	covered
 spec	25.1	Overloadable operators	2	1	5	1	0	4	0	0	covered
-spec	25.2	Restrictions and resolution	7	3	10	3	0	7	0	0	covered
+spec	25.2	Restrictions and resolution	7	3	11	4	0	7	0	0	covered
 spec	25.3	Examples	0	0	3	1	0	1	0	1	covered
 spec	25.4	No user-defined conversion operators	0	0	2	0	0	1	0	1	covered
 spec	26	Extension Blocks	0	0	0	0	0	0	0	0	n/a
@@ -233,21 +233,21 @@ spec	27.4	Parameter type inference	1	0	6	0	0	3	0	3	covered
 spec	27.5	Closures	5	3	10	2	0	6	0	2	covered
 spec	27.6	Method references	10	5	14	1	0	5	0	8	covered
 spec	27.7	Calling function values	1	0	3	0	0	0	0	3	covered
-spec	27.7.1	Equality of function values	3	1	6	0	0	0	0	6	covered
+spec	27.7.1	Equality of function values	3	1	7	0	0	0	0	7	covered
 spec	27.8	Type aliases	1	1	2	0	0	1	0	1	covered
 spec	28	Resource Management	2	0	2	0	1	0	0	1	covered
 spec	28.1	Where the owned modifier can appear	1	3	10	7	0	3	0	0	covered
 spec	28.2	The IDisposable contract	0	5	12	4	0	4	2	2	covered
 spec	28.3	Local variables, ownership, and borrows	1	29	150	39	15	65	9	22	covered
 spec	28.4	The destructor	1	1	8	0	0	2	0	6	covered
-spec	28.5	Owned fields	9	1	20	8	0	8	0	4	covered
-spec	28.6	Leak prevention	3	3	37	17	0	17	0	3	covered
+spec	28.5	Owned fields	9	1	22	8	0	9	0	5	covered
+spec	28.6	Leak prevention	3	3	38	17	0	17	0	4	covered
 spec	28.7	Reassigning owned fields and locals — drop-on-overwrite	1	2	8	1	0	1	0	6	covered
 spec	28.8	Ownership transfer	1	1	4	1	1	1	0	1	covered
-spec	28.8.1	The move expression	1	2	16	5	0	7	0	4	covered
+spec	28.8.1	The move expression	1	2	30	7	0	14	0	9	covered
 spec	28.9	Runtime-managed types	7	5	20	1	6	5	5	3	covered
 spec	28.10	using var	6	4	14	3	0	4	0	7	covered
-spec	28.11	Collection element ownership	0	5	30	6	3	15	2	4	covered
+spec	28.11	Collection element ownership	0	5	37	7	3	18	2	7	covered
 spec	28.12	Asynchronous disposal	0	6	14	0	1	0	2	11	covered
 spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	1	8	0	0	3	0	5	covered
 spec	28.14	Scoped callback parameters: storage-bounded capture	21	10	30	1	1	17	0	11	covered
@@ -355,7 +355,7 @@ stdlib	2.21	ScopeGuard	1	0	5	0	0	0	0	5	covered
 stdlib	3	System.Text (auto-imported)	0	0	0	0	0	0	0	0	n/a
 stdlib	3.1	StringBuilder	2	0	6	0	0	0	0	6	covered
 stdlib	3.2	Encoding	6	0	5	0	0	0	0	5	covered
-stdlib	3.3	ReadOnlyStringSpan	1	0	5	0	0	0	0	5	covered
+stdlib	3.3	ReadOnlyStringSpan	1	0	6	0	0	0	0	6	covered
 stdlib	3.4	ReadOnlyAsciiByteSpan (retired)	0	0	0	0	0	0	0	0	n/a
 stdlib	4	System.Collections.Generic (auto-imported)	1	0	0	0	0	0	0	0	UNCOVERED
 stdlib	4.1	Borrowing collection interfaces	0	0	4	0	0	0	0	4	covered
@@ -371,9 +371,9 @@ stdlib	4.10	Set<T> and OwningSet<T>	1	0	5	0	0	1	0	4	covered
 stdlib	4.11	Stack<T>, OwningStack<T>, Queue<T>, and OwningQueue<T>	2	0	6	0	0	0	0	6	covered
 stdlib	4.12	Borrowing enumeration interfaces	1	0	3	0	0	0	0	3	covered
 stdlib	4.13	Owning enumeration interfaces	1	0	6	0	0	0	1	5	covered
-stdlib	4.14	OwningBuffer<T>, Span<T>, ReadOnlySpan<T>	2	0	15	0	0	9	0	6	covered
-stdlib	4.15	ArraySpan<T>, ReadOnlyArraySpan<T>	0	0	6	0	0	3	0	3	covered
-stdlib	4.16	IReadOnlySpan<TElement> (retired)	0	0	1	0	0	0	0	1	covered
+stdlib	4.14	OwningBuffer<T>, Span<T>, ReadOnlySpan<T>	2	0	18	0	0	10	0	8	covered
+stdlib	4.15	ArraySpan<T>, ReadOnlyArraySpan<T>	0	0	8	0	0	4	0	4	covered
+stdlib	4.16	IReadOnlySpan<TElement> (retired)	0	0	3	0	0	1	0	2	covered
 stdlib	4.17	SortedDictionary<K, V>	1	0	6	0	0	0	0	6	covered
 stdlib	4.18	SortedSet<T>	0	0	4	0	0	0	0	4	covered
 stdlib	4.19	FrozenArray<T>	3	0	6	0	0	2	0	4	covered

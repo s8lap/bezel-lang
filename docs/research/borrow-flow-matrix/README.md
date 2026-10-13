@@ -17,8 +17,9 @@ Some escapes are specific routes inside a cell (a stdlib copy member, a span ove
 | 3 | v0.332 | 3 of 117 | 0 of 7 | R6/C4 (#5726, new), R6/C9 and R6/C10 (#5715); also the editorial issue #5727; all decided in v0.333 (proposals 0156–0158) |
 | 4 | v0.333 | 2 of 117 | 2 of 10 | R3/C4 and R6/C4 (#5739 equality search into `Equals(Object?)`, #5740 generic `as T` over a span), routes R6/C3·equality (#5739) and R2–R6/C11·loopvar (#5741); editorial items #5742; all decided in v0.334 (proposals 0159–0169) |
 | 5 | v0.334 | 3 of 117 | 1 of 13 | R6/C4, R7/C4, R8/C4 on one root: an `is` test narrows a carrier that announces borrows with no conversion written (#5835); route R7–R8/C6·objmint (#5798) |
+| 6 | v0.336 | 0 of 117 | 0 of 19 (one n/a) | targeted re-run (68 cells re-derived, 49 carried with `"carried": true`): v0.334's three R*/C4 cells decided by #5835 and proposal 0175, objmint by 0172; six new routes for the replacing `move`, the own-typed `Equals` slot, the span overloads and `where T: class`; editorial items filed as #5926 |
 
-Each run re-derives every cell from the text current at that revision, rather than carrying the previous verdict forward, and records `prev_status` against the run before.
+Each run re-derives every cell from the text current at that revision, rather than carrying the previous verdict forward, and records `prev_status` against the run before. From run 6 a run may be targeted: every cell whose quote is no longer verbatim, every open cell and every cell the revision's trains name is re-derived, and the rest is carried with `"carried": true` after its quotes check verbatim against the current text.
 
 ## Files
 

@@ -1,26 +1,23 @@
 //! case: l4_14_0017
 //! doc: stdlib
 //! section: 4.14
-//! title: OwningBuffer at a borrow-bearing record element is not sendable
-//! rule: `OwningBuffer<T>` is sendable iff its element type is a sendable
-//!   class type or a sendable value type: a buffer of a borrow-bearing record
-//!   is not sendable.
-//! cites: 4.14, 30.14
+//! title: a buffer span's SequenceEqual does not take a writable array span
+//! rule: Every span type declares it for its own type and for the read-only
+//!   span of each heap backing — here `Span<T>`, `ReadOnlySpan<T>` and
+//!   `ReadOnlyArraySpan<T>` ... — so a comparison across backings needs no
+//!   common type, and a writable span passed as the argument converts by
+//!   `.AsReadOnly()`.
+//! cites: 4.14, 4.15
 //! expect: reject
-//! diagnostic: not sendable
+//! diagnostic: SequenceEqual
+//! issue: 5921
 module Conf;
 
-import System.Threading;
-
-public class Widget
-  public constructor()
-  end constructor;
-end Widget;
-
-public record Node(Owner: Widget);  // borrow-bearing: class field
-
 public class Program
-  public method Demo()
-    using var ch := new Channel<OwningBuffer<Node>>();
-  end Demo;
+  public static method Same(): bool
+    using var buf := new OwningBuffer<int>(2);
+    using var xs: Array<int> := [0, 0];
+    var s := buf.AsSpan();
+    return s.SequenceEqual(xs.AsSpan());
+  end Same;
 end Program;

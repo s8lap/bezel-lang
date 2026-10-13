@@ -10,6 +10,7 @@ This matrix asks whether a generic body, checked once and never re-checked, stay
 |---|---|---|---|---|
 | 1 | v0.333 | 61 of 140 | 13 of 13 | 29 root causes, each filed as an issue (listed in the run file's `groups`); all decided in v0.334 (proposals 0159–0169) |
 | 2 | v0.334 | 18 of 140 | 5 of 20 | 8 issues: `is` narrowing (#5835), generic function-value routes (#5836), second-kind ambiguity (#5837), `where T: U` assignability (#5838), assembly-time cycle edges (#5839), and existing #5792, #5798, #5800 |
+| 3 | v0.336 | 1 of 140 | 0 of 22 | targeted re-run (81 cells re-derived, 59 carried): R3/C5, `=` at a value-like choice declaring its own `Equals` (#5917, generic face added); Appendix C.3 *Exported mint slots* editorial item in #5926 |
 
 ## Files
 
