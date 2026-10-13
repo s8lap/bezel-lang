@@ -14419,6 +14419,53 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 std::string(m) + "()` (\xC2\xA7""30.11, "
                                 "stdlib \xC2\xA7""6.6)");
                         }
+                        // fix #6077 (§30.11, stdlib §6.6): the void-completion
+                        // `SetCancelled()` / `TrySetCancelled(): bool` take no
+                        // argument on any form (no optional parameter is
+                        // declared), so any argument on the non-generic
+                        // receiver is an arity error.
+                        if (rcn == "TaskCompletionSource" &&
+                            recvTy->genericArgs.empty() &&
+                            (m == "SetCancelled" || m == "TrySetCancelled") &&
+                            !ce.args.empty()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`") + std::string(m) +
+                                "` has no overload that accepts " +
+                                std::to_string(ce.args.size()) +
+                                " argument(s): the non-generic "
+                                "`TaskCompletionSource` has no parameter, "
+                                "so the call is `" + std::string(m) +
+                                "()` (\xC2\xA7""30.11, stdlib \xC2\xA7""6.6)");
+                        }
+                        // fix #6077 (§30.11, stdlib §6.6): the generic forms
+                        // declare exactly one result argument on
+                        // `SetResult(result: T)` / `TrySetResult(result: T): bool`
+                        // (and the `owned result: T` twin). The arm types them
+                        // without checking the argument list, so an extra
+                        // argument, or a zero-argument `TrySetResult()`, was
+                        // silently accepted. A zero-argument `SetResult()` is
+                        // left alone: it already takes the codegen
+                        // no-dispatch-arm rejection, and a second sema report
+                        // here would double it.
+                        if (!recvTy->genericArgs.empty() &&
+                            (m == "SetResult" || m == "TrySetResult")) {
+                            const std::size_t argc = ce.args.size();
+                            const bool badArity =
+                                argc > 1 ||
+                                (argc == 0 && m == "TrySetResult");
+                            if (badArity) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("`") + std::string(m) +
+                                    "` has no overload that accepts " +
+                                    std::to_string(argc) +
+                                    " argument(s): the generic `" +
+                                    std::string(rcn) + "<T>` takes exactly "
+                                    "one result argument (\xC2\xA7""30.11, "
+                                    "stdlib \xC2\xA7""6.6)");
+                            }
+                        }
                         if (m == "TrySetResult" || m == "TrySetException" ||
                             m == "TrySetCancelled") {
                             // TrySet* → bool return.
