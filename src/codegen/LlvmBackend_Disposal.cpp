@@ -2843,15 +2843,17 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
     //
     // Scope: this covers every reclaim that funnels through this function —
     // catch-arm dispose, using-var / owned-field scope-end dispose, and a
-    // faulted task's scope-end fault-exception dispose. It deliberately does
-    // NOT cover the handful of pure-runtime "vtable-Dispose-then-free" sites
-    // that bypass codegen entirely (bz_dispose_class_obj —
-    // Task.FireAndForget's abandoned-task continuation and the
-    // WhenAll/WhenAllOwned aggregate fault/result cleanup — and
-    // bz_domain_spawn's DomainFaultedException wrap-and-dispose of the
-    // original fault): those run in bezel_runtime_concurrency.cpp with no
-    // access to the codegen-built vtable table this gate needs. Filed as a
-    // follow-up (see the issue tracker) rather than fixed silently here.
+    // faulted task's scope-end fault-exception dispose. The pure-runtime
+    // "vtable-Dispose-then-free" sites that bypass codegen entirely cannot
+    // reach this gate (they have no access to the codegen-built vtable table),
+    // so each consults bz_exc_is_runtime_owned directly, with the same
+    // exemption this branch encodes: bz_dispose_class_obj (Task.FireAndForget's
+    // abandoned-task continuation and the WhenAll/WhenAllOwned aggregate
+    // fault/result cleanup), bz_domain_spawn's DomainFaultedException
+    // wrap-and-dispose of the original fault, and bz_scope_dispose_exc's
+    // first-fault-wins swallow. Those three are the complete set; if a fourth
+    // terminal free of an exception object is added to
+    // bezel_runtime_concurrency.cpp it must carry the same guard.
     builder_.CreateCall(
         declareC("bz_exc_reclaim_causechain", llvm::Type::getVoidTy(llvm_),
                  {ptrTy(), ptrTy(), ptrTy()}),

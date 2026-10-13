@@ -890,7 +890,6 @@ int8_t bz_task_fault_borrowed(void* tp) {
 // in/absent from the set is a no-op.
 static thread_local std::unordered_set<void*> g_borrowed_exc;
 
-
 extern "C" void bz_mark_exc_borrowed(void* obj) {
     if (obj) g_borrowed_exc.insert(obj);
 }
@@ -3722,21 +3721,23 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                 dfe_obj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
                 memcpy(dfe_obj, &sc->dfe_vtable, sizeof(void*));
                 if (msg_ptr) memcpy((char*)dfe_obj + 8, &msg_ptr, sizeof(void*));
-                // Dispose the original fault exception. Dynamic dispatch via
-                // vtable slot 2 (Dispose), then free.
-                void** fault_vtbl = nullptr;
-                memcpy(&fault_vtbl, fault_exc, sizeof(void*));
-                if (fault_vtbl && fault_vtbl[2]) {
-                    typedef void (*DispFn)(void*);
-                    ((DispFn)fault_vtbl[2])(fault_exc);
-                }
-                // issue 2330 / §31.4: the wrapped-and-discarded original owns a
-                // CauseChain snapshot if it was built by the (message, cause)
-                // constructor; the shared Dispose above does not free it (see
-                // bz_dispose_class_obj). Reclaim it at this terminal free, the
-                // same order codegen's reclaim site uses.
-                bz_exc_reclaim_causechain_registered(fault_exc);
-                free(fault_exc);
+                // Dispose the original fault exception. This block was a
+                // hand-inlined duplicate of bz_dispose_class_obj_impl (vtable
+                // slot 2 Dispose, then issue 2330's CauseChain reclaim, then
+                // free) — it is now routed through the §31.4-gated entry point
+                // so a runtime-owned instance is skipped rather than freed.
+                //
+                // #5872 fix-forward: an entry function that touches a type in
+                // the §22.7 failed state faults with the CACHED
+                // TypeInitializationException, not a fresh one, so this free
+                // was reclaiming the process-lifetime instance out from under
+                // excGV — the next touch of that type re-read freed heap
+                // (heap-use-after-free, measured). §31.4 makes that instance
+                // runtime-owned for the life of the process, and bz_
+                // dispose_class_obj is the one place that exemption is
+                // honoured. The DomainFaultedException is still built and
+                // completed below; only the reclaim of the ORIGINAL is skipped.
+                bz_dispose_class_obj(fault_exc);
             }
             bz_task_complete_error_obj(sc->join_task, dfe_obj);
         } else {
@@ -3991,6 +3992,17 @@ static void* bz_scope_invoke_task_closure(void* closure) {
 // slot 2 (Dispose) then free — the bz_domain_spawn fault-wrap pattern.
 static void bz_scope_dispose_exc(void* exc) {
     if (!exc) return;
+    // #5872 fix-forward: a scope.Spawn child whose entry touches a type in the
+    // §22.7 failed state faults with the CACHED TypeInitializationException.
+    // On the first-fault-wins path every LATER faulting child's errObj is
+    // swallowed here, and that cached instance is the same one every later
+    // touch of the failed type re-raises — freeing it was a heap-use-after-free
+    // (measured, ASan). §31.4 makes it runtime-owned for the life of the
+    // process; bz_dispose_class_obj is the existing holder of that exemption.
+    // Guard the WHOLE dispose, not just the free: running the vtable Dispose
+    // would set the per-instance disposed flag, so the next access would fault
+    // with DisposedAccessException instead of re-raising a live instance.
+    if (bz_exc_is_runtime_owned(exc)) return;
     void** vtbl = nullptr;
     memcpy(&vtbl, exc, sizeof(void*));
     if (vtbl && vtbl[2]) {

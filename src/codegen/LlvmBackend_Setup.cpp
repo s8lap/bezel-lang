@@ -2192,9 +2192,11 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
 
     // setfail: bz_exc holds the TypeInitializationException genericInstSfinitFn's
     // own propagate block already wrapped. #5872: cache the TIE itself and mark
-    // it BORROWED — §22.7 requires this exact instance to be rethrown on every
-    // later access, and the borrow mark is what keeps a catch-arm disposer from
-    // reclaiming it out from under the next access.
+    // it RUNTIME-OWNED (bz_exc_mark_runtime_owned, not bz_mark_exc_borrowed —
+    // see emitEnsureInitFns's failB comment for why the thread-local borrowed
+    // set is the wrong mechanism) — §22.7 requires this exact instance to be
+    // rethrown on every later access, and the runtime-owned mark is what keeps
+    // a catch-arm disposer from reclaiming it out from under the next access.
     builder_.SetInsertPoint(failB);
     llvm::Value* tie0 = builder_.CreateLoad(ptrTy(), emitExcSlot());
     builder_.CreateStore(tie0, excGV);
@@ -12187,12 +12189,25 @@ void Emitter::emitEnsureInitFns() {
         //
         // #5872: the cached TIE must NOT be reclaimed by any handler that catches
         // it, or the next access re-reads a freed block (heap-use-after-free,
-        // measured). It is marked BORROWED — the same mechanism §30.4/§30.9 already
-        // uses for an exception that is in flight but not handler-owned — so every
-        // disposal site that consults bz_is_exc_borrowed skips it. The mark is
-        // permanent by design: the instance is process-lifetime by §31.4 (the
-        // runtime-owned exemption from §31.1's dispose-after-arm rule), so it is
-        // never unmarked and never becomes reclaimable.
+        // measured). It is marked RUNTIME-OWNED via bz_exc_mark_runtime_owned —
+        // a process-wide registry, NOT the thread-local g_borrowed_exc that
+        // bz_is_exc_borrowed consults — so every disposal site that calls
+        // bz_exc_is_runtime_owned skips it: emitReclaimBlock's terminal free
+        // here in codegen, plus bz_dispose_class_obj, bz_domain_spawn's
+        // fault-wrap and bz_scope_dispose_exc in the runtime. It is deliberately
+        // NOT bz_mark_exc_borrowed, for two reasons: that mark is erased when
+        // the caught arm exits, and g_borrowed_exc is thread-local while this
+        // instance is process-global. The mark is permanent by design: the
+        // instance is process-lifetime by §31.4 (the runtime-owned exemption
+        // from §31.1's dispose-after-arm rule), so it is never unmarked and
+        // never becomes reclaimable.
+        //
+        // The block is never freed, and LeakSanitizer stays silent about it only
+        // because excGV below is a module-scope global still pointing at it, so
+        // the allocation is REACHABLE from a root at exit rather than leaked.
+        // That is incidental, not designed: nothing clears or replaces excGV
+        // (the two failB sites are its only writers), but any future path that
+        // did would turn this bounded per-failed-type leak into a reported one.
         builder_.SetInsertPoint(failB);
         llvm::Value* tie0 = builder_.CreateLoad(ptrTy(), emitExcSlot());
         builder_.CreateStore(tie0, excGV);
@@ -12223,8 +12238,9 @@ void Emitter::emitEnsureInitFns() {
         // cached TypeInitializationException instance"). #5872: the cached TIE is
         // the block built by emitStaticConstructorBody's self-wrap, already a
         // uniform kExcObjSize (40) allocation carrying the TIE vtable and its
-        // inner at offset 16, and marked borrowed above so no handler reclaims it
-        // — so it is safe to raise the same pointer on every later access.
+        // inner at offset 16, and marked runtime-owned above so no handler
+        // reclaims it — so it is safe to raise the same pointer on every later
+        // access.
         builder_.SetInsertPoint(failedB);
         builder_.CreateStore(builder_.CreateLoad(ptrTy(), excGV), emitExcSlot());
         builder_.CreateBr(retB);
