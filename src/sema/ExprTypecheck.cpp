@@ -474,41 +474,69 @@ void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
     // to find any whose type is (or contains) a type parameter in a nullable
     // position, and check whether the corresponding instantiation arg is an
     // inline array.
-    if (t->decl) {
-        if (auto* cd = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
-            for (const auto& m : cd->members) {
-                auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get());
-                if (!fd || !fd->type) continue;
-                // Check if this field's type is a nullable type parameter reference
-                // to any of t's generic params.
-                const ast::Type* ft = fd->type.get();
-                // A bare type-parameter reference in nullable position: T?
-                if (ft->kind == ast::TypeKind::Named && ft->nullable &&
-                    ft->name && ft->name->parts.size() == 1) {
-                    std::string_view fpn = ft->name->parts.front();
-                    for (std::size_t i = 0; i < t->genericParams.size(); ++i) {
-                        Symbol* gp = t->genericParams[i];
-                        if (gp && gp->name == fpn) {
-                            TypeRef* arg = rt->genericArgs[i];
-                            if (arg &&
-                                arg->kind == TypeRef::Kind::InlineArray) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ne.span.begin,
-                                    "type `" + argNameOf(arg) +
-                                    "` may not be nullable (`" +
-                                    std::string(fpn) +
-                                    "?`) when `" + std::string(fpn) +
-                                    "` is substituted by an inline array — "
-                                    "§15.1 admits no nullable inline-array "
-                                    "form, and §3.6 rule 2 rejects `T?` at `T` "
-                                    "substituted by an inline array "
-                                    "(spec §15.1 / §3.6 rule 2, v0.327; "
-                                    "diagnostic: `nullable inline-array`)");
-                            }
-                            break;
-                        }
-                    }
+    //
+    // fix-forward #5641 (the imported case was a SILENT ACCEPTANCE): the
+    // original walked `dynamic_cast<const ast::TypeDecl*>(t->decl)->members`,
+    // and `t->decl` is null for EVERY imported type (#3141) — so a generic
+    // imported from another module and instantiated with an inline array at a
+    // nullable field position compiled clean where §15.1 requires a reject.
+    // MEASURED two-module (`bezelc -c lib.bzl -o lib.o`, then
+    // `bezelc --import lib.o app.bzl`): imported `Box<[3]int>` with a
+    // `public _v: T?` field → rc=0 (accepted, silently); the byte-identical
+    // single-module program → rc=1 with `nullable inline-array`. A same-module
+    // test cannot detect this class at all, which is why the original commit's
+    // conformance row (s15_1_0007, single-module) stayed green.
+    //
+    // REWRITTEN onto the symbol side, per the audit's rule that a rewrite is
+    // available when the fact rides the symbol (`docs/proposals/
+    // imported-symbol-audit-2026-08-13.md` §4: "An accessor must consult both
+    // sources, not switch on which one exists"). Both sources carry the fact
+    // today and neither needs a schema change:
+    //   - the FIELD LIST: `TypeSymbol::members`, populated by
+    //     `SymbolCollection::collectMember` for a local type and by
+    //     `ModuleLoader::convertMember` for an imported one;
+    //   - the FIELD'S DECLARED TYPE: `sema::storageComponentType(fs, ctx)`,
+    //     THE both-sources accessor for exactly this question — `posParam->type`,
+    //     then the body `FieldDecl`'s type via `ctx.resolvedType`, then
+    //     `ctx.importedMemberType(m)`, the loader's `fieldTypes_` side table
+    //     filled from `MetaMember::type`. That is the same accessor
+    //     #3145 built for the §9.7 borrow-bearing-record family, whose audit
+    //     row is the same silent-acceptance shape this is.
+    // The name test uses `TypeRef::headName()` (aliasResolvedHead, else
+    // `astNode->name->parts[0]`, else `importedName`) rather than reading
+    // `ft->name->parts`: for a LOCAL TypeRef the name rides `astNode`, and for
+    // an IMPORTED one `astNode` is null (there is no AST for a dependency) while
+    // `MetaMember::type`'s `namedName` carries the type-parameter name into
+    // `importedName`. `headName()` is the ONE read both spellings agree on.
+    for (Symbol* m : t->members) {
+        auto* fs = dynamic_cast<const FieldSymbol*>(m);
+        if (!fs) continue;
+        const TypeRef* ft = storageComponentType(fs, ctx_);
+        if (!ft) continue;
+        // A bare type-parameter reference in nullable position: T?
+        if (ft->kind != TypeRef::Kind::Named || !ft->nullable) continue;
+        std::string_view fpn = ft->headName();
+        if (fpn.empty()) continue;
+        for (std::size_t i = 0; i < t->genericParams.size(); ++i) {
+            Symbol* gp = t->genericParams[i];
+            if (gp && gp->name == fpn) {
+                TypeRef* arg = rt->genericArgs[i];
+                if (arg &&
+                    arg->kind == TypeRef::Kind::InlineArray) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne.span.begin,
+                        "type `" + argNameOf(arg) +
+                        "` may not be nullable (`" +
+                        std::string(fpn) +
+                        "?`) when `" + std::string(fpn) +
+                        "` is substituted by an inline array — "
+                        "§15.1 admits no nullable inline-array "
+                        "form, and §3.6 rule 2 rejects `T?` at `T` "
+                        "substituted by an inline array "
+                        "(spec §15.1 / §3.6 rule 2, v0.327; "
+                        "diagnostic: `nullable inline-array`)");
                 }
+                break;
             }
         }
     }
