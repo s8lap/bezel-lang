@@ -11885,6 +11885,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     "lambda returns its task at the first suspension "
                     "point (§30.6, v0.184)");
             }
+            // §22.3 (v0.338, #5986): a lambda's written `ref` parameter at a
+            // move-only value type is a compile error at the lambda, as a
+            // method's `ref` parameter is (checkRefParamMoveOnlyDeclarations).
+            // Only the written modifier is judged here; an inferred one is
+            // decided where its function type is written (checkRefSlotFunctionTypes).
+            if (p.modifier == "ref" && p.type) {
+                if (TypeRef* lamParamType = ctx_.resolvedType(*p.type)) {
+                    const char* moveOnlyKind = nullptr;
+                    if (common::isMoveOnlyValueType(lamParamType, ctx_,
+                                                    moveOnlyKind)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, lam->span.begin,
+                            "a `ref` parameter `" + std::string(p.name) +
+                            "` of `lambda` may not be declared at " +
+                            moveOnlyKind +
+                            ", a move-only value type — no argument can bind "
+                            "a `ref` parameter of move-only type; take the "
+                            "value as a plain parameter and return it, or use "
+                            "`out` (\xC2\xA7""22.3)");
+                    }
+                }
+            }
             if (p.type) ps->declType = p.type.get();
             else if (eventParamType && lam->params.size() == 1)
                 ps->resolvedDeclType = eventParamType;  // §24 handler param
