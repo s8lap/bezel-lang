@@ -24,7 +24,7 @@
 // in isolation; the type-driven back-edge wiring (Downgrade post-construction)
 // is a later slice's concern, not eligibility's.
 //
-// Tested at the SEMA layer only (parseAndCheckOwnership) — no codegen/JIT —
+// Tested at the SEMA layer only (parseAndCheckOwnership) — no codegen —
 // because the type-driven SYNTHESIS (Shared identity tagging, Weak back-refs)
 // lands in later slices (S2+). Asserting at the sema layer isolates the
 // eligibility change and avoids triggering not-yet-implemented synthesis.
@@ -49,7 +49,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "support/ownership_support.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
@@ -62,7 +62,7 @@
 namespace {
 
 using bezel::test::parseAndCheckOwnership;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 // Per-process unique working dir, under the shared scratch base (never
 // /tmp — see support/scratch_dir.hpp) and reaped at process exit.
@@ -70,9 +70,9 @@ static const std::filesystem::path& wtDir703() {
     return wtScratchDir("wt-703");
 }
 
-// Run a program through the JIT; return its exit code, or -999 if it did not run.
+// Run a program through runAot; return its exit code, or -999 if it did not run.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -155,7 +155,7 @@ bool rejectsAsIneligible(std::string_view src) {
 // clean "Shared/Weak wire codegen not yet implemented" error that prevents a
 // silent miscompile of a Shared/Weak component once S1 admits it at sema.
 bool guardedAtCodegen(std::string_view src) {
-    auto r = runJit(std::string(src));
+    auto r = runAot(std::string(src));
     if (r.ran || !r.diagnostics.hasErrors()) return false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.message.find("not yet implemented in codegen") !=
