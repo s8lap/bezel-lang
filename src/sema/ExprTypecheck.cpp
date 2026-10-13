@@ -15145,8 +15145,12 @@ bool ExprTC::narrowFromOutPostcond(const ast::Expr* cond, bool forTrueBranch) {
 //   TryDequeue/TryPeek (0); OwningArray/OwningLinkedList TryPopFirst/TryPopLast
 //   (0); Channel TryReceive (0); Dictionary/SortedDictionary/OwningDictionary
 //   TryGetValue(key, out) (1); OwningDictionary TryPopValue(key, out) (1);
-//   OwningSet TryPop(query, out) (1). (`OwningSlotMap`, the other shape-(a)
-//   holder, is not yet a type in this compiler.) `IParsable<T>.TryParse` is a
+//   OwningSet TryPop(query, out) (1). (`OwningSlotMap<T>.TryGetValue` and
+//   `TryPopValue` are the other shape-(a) holders and ARE registered as a type;
+//   they form `T?` at `genericArgs[0]`, but `where T: class` excludes an
+//   inline-array `T`, so they are unreachable here — by the constraint, not by
+//   omission. Relaxing that constraint would require adding them.)
+//   `IParsable<T>.TryParse` is a
 //   synthesized MethodSymbol and takes the declared-clause path above. Only a
 //   BUILTIN receiver counts (`!declaration`, as at the out-var typing site): a
 //   user type of the same name has a MethodSymbol and a clause only if it

@@ -1818,12 +1818,22 @@ std::string spellTypeRefForDiag(const TypeRef* a) {
 // Reading "any inline-array argument" instead over-rejects, which is what
 // #5641's rejected `05e2661b` did.
 //
-// ONE predicate, so the question cannot drift between the two sites that ask
-// it: `narrowFromBuiltinShapeA` (ExprTypecheck.cpp) reads the same stdlib
-// §1 shape-(a) table for the out-argument POSITION, and the `posElem` /
-// `valElem` / `popValElem` / `ownSetElem` arms in
-// `ExprTypecheck_Exprs.cpp` read it for the recipient's type — the same
-// per-member split, keyed the same way.
+// This is a FOURTH table, not a consolidation of the other three. They answer
+// related-but-different questions and are keyed differently:
+//   - `narrowFromBuiltinShapeA` (ExprTypecheck.cpp) keys (head, member) and
+//     returns the out-argument POSITION;
+//   - the `posElem` / `valElem` / `popValElem` / `ownSetElem` arms in
+//     `ExprTypecheck_Exprs.cpp` key (head, member, pos) and return the
+//     recipient TypeRef;
+//   - this one keys (head, member) and returns the GENERIC-ARGUMENT index.
+// They agree per member today, but each is spelled out independently, so a
+// member added to one is not automatically added to the others.
+//
+// The two `typeCall` sites are complementary by construction, which is what
+// keeps this table from over-rejecting: the site that calls it requires
+// `!recvTy->declaration` (BUILTIN receivers, so no `MethodSymbol` exists and
+// the member must be named), while the user-receiver site resolves the
+// declared parameter structurally and consults no table at all.
 //
 // The members and their signatures are stdlib §1 (shape (a)) as listed per
 // type: element type — `Stack`/`OwningStack` `TryPop`/`TryPeek`,
@@ -1831,8 +1841,13 @@ std::string spellTypeRefForDiag(const TypeRef* a) {
 // `OwningArray`/`OwningLinkedList` `TryPopFirst`/`TryPopLast`, `Channel`
 // `TryReceive`, `OwningSet` `TryPop`; value type — `Dictionary`/
 // `SortedDictionary`/`OwningDictionary` `TryGetValue`, `OwningDictionary`
-// `TryPopValue`. A member not named here forms no `T?` at a receiver type
-// argument and is not in the register.
+// `TryPopValue`.
+//
+// Two members form `T?` at a receiver type argument and are deliberately
+// ABSENT here: `OwningSlotMap<T>.TryGetValue` and `TryPopValue` (stdlib §1
+// shape (a), at `genericArgs[0]`). They are excluded by the type's `where
+// T: class` constraint, NOT because they form no `T?` — so relaxing that
+// constraint would silently admit them.
 int builtinNullableOutTypeArgIndex(std::string_view head,
                                    std::string_view member) {
     auto isOneOf = [](std::initializer_list<std::string_view> names,
