@@ -12,6 +12,49 @@
 
 namespace bezel::sema {
 
+namespace {
+
+// §12.4 (v0.338, #5636): true when the simple name `n` of a built-in base is a
+// compiler-known CLASS whose text does not open it to user subclasses, so a
+// base-type reference to it in a user class is a compile error. The opened set
+// is Encoding, Stream, TextReader, TextWriter (stdlib §1 *Extensibility*) and
+// the built-in exception family (§31.4, which includes ContractViolationException
+// as an edge of the exception hierarchy table). Interfaces, value types and
+// `Object` (every class's implicit base, §8.1) are not reached. Membership is the
+// class rows of the builtin class table, which lists every reserved built-in
+// class with its module path.
+bool isClosedCompilerKnownClass(std::string_view n) {
+    static constexpr std::string_view kOpenedOrNotReached[] = {
+        "Encoding", "Stream", "TextReader", "TextWriter", "Object",
+    };
+    static constexpr std::string_view kValueShaped[] = {
+        "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid", "Range",
+        "IntPtr", "UIntPtr", "ExceptionInfo", "JsonOptions",
+    };
+    for (std::string_view s : kOpenedOrNotReached)
+        if (s == n) return false;
+    for (std::string_view s : kValueShaped)
+        if (s == n) return false;
+    if (common::isBuiltinExceptionName(n) || common::isBuiltinInterfaceHead(n))
+        return false;
+    // Stdlib classes with no row in the builtin class table (checked against
+    // the section headings of stdlib §2.1-§10: each is a `public class` or
+    // `public static class` listing). Static classes cannot be a base at all;
+    // they are listed so the rule's population is complete, not left to the
+    // table's coverage.
+    static constexpr std::string_view kClassesOutsideTable[] = {
+        "Task", "OwningTask", "OwningSlotMap", "Locked", "RwLocked", "LockGuard",
+        "ReadGuard", "WriteGuard", "ScopeGuard", "BitConverter", "Console",
+        "Debug", "Directory", "Environment", "File", "Path", "Json",
+        "Interop", "Parallel",
+    };
+    for (std::string_view s : kClassesOutsideTable)
+        if (s == n) return true;
+    return !common::builtinClassModulePathOf(n).empty();
+}
+
+}  // namespace
+
 // v0.168 (#1372): the owning `Owned*` family was renamed `Owning*` (and the
 // owning interfaces gained the standard `I` prefix; `GetOwnedEnumerator`
 // followed as `GetOwningEnumerator`). When an OLD family name fails to resolve,
@@ -1176,6 +1219,26 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
             std::string_view bn = bt->name->parts.back();
             if (common::isBuiltinExceptionName(bn))
                 tsym->builtinExceptionBase = std::string(bn);
+        }
+        // §12.4 (v0.338, #5636): a compiler-known class is a valid base only
+        // where its text opens it to user subclasses. A built-in base resolves
+        // with no user TypeSymbol (`declaration == nullptr`), so the rule keys
+        // on the simple name against the registry's closed set; a user class
+        // of the same name resolves to a declaration and is not reached here.
+        if (td.kind == ast::TypeDeclKind::Class && ref &&
+            ref->kind == TypeRef::Kind::Named && !ref->declaration &&
+            bt->name && !bt->name->parts.empty()) {
+            std::string_view bn = bt->name->parts.back();
+            if (isClosedCompilerKnownClass(bn)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, bt->span.begin,
+                    std::string("cannot inherit from compiler-known class `") +
+                    std::string(bn) + "`: it is closed to inheritance, as a "
+                    "`sealed` class is, because its text does not open it to "
+                    "user subclasses (only Encoding, Stream, TextReader, "
+                    "TextWriter and the built-in exception types are opened) "
+                    "(§12.4, §31.4)");
+            }
         }
         // §9.8 / §18.5 / §21.4 / §14.2 (#3139, family F1 of #3152): a declared
         // base that resolves to NO user TypeSymbol cannot ride the parallel
