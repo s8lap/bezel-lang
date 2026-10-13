@@ -1502,8 +1502,27 @@ std::string_view builtinClassModulePathOf(std::string_view name) {
 
 // fix #4698 (§2.2, v0.313): see the header. `Debug` (stdlib §8.2) is a static
 // class with no §8.5 row, so it is added here rather than to the table.
+//
+// fix #6080 (spec §2.3, v0.338; §2.7 rule 2): `IGrouping<TKey, T>` is the one
+// named declaration of the auto-imported `System.Collections.Linq` module
+// (§2.3's "Auto-imported module" row). It is an INTERFACE head, so it is
+// deliberately absent from `kBuiltinClassModulePaths` (the §8.5 rendering
+// table: an interface never names itself there). Its home is read only by
+// the alias/qualifier resolution, so the row lives in this home-only table
+// and cannot change any §8.5 rendering. Without it, `System.Collections.Linq.
+// IGrouping<K, V>` fell through to "unresolved type name `System`".
+struct BuiltinHomeOnlyModulePath {
+    std::string_view name;
+    std::string_view modulePath;
+};
+constexpr std::array<BuiltinHomeOnlyModulePath, 1> kBuiltinHomeOnlyModulePaths = {{
+    {"IGrouping", "System.Collections.Linq"},
+}};
+
 std::string_view builtinTypeHomeModuleOf(std::string_view name) {
     if (name == "Debug") return "System.Diagnostics";
+    for (const auto& e : kBuiltinHomeOnlyModulePaths)
+        if (e.name == name) return e.modulePath;
     return builtinClassModulePathOf(name);
 }
 
