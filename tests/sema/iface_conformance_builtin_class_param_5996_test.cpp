@@ -265,3 +265,343 @@ BEZEL_TEST(iface_conformance_builtin_class_param_5996,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("2\n"));
 }
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_on_interface_side_runs_spec_27_8) {
+    // §27.8 (v0.338): an alias is a pure synonym. `type A := Array<int>` on the interface side.
+    auto r = runAot(
+        "module M; "
+        "type A := Array<int>; "
+        "public interface ISink "
+        "  method Show(xs: A); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: Array<int>) "
+        "    Console.WriteLine(\"ran-\" + xs.Count.ToString()); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show([1, 2]); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran-2\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_on_implementer_side_runs_spec_27_8) {
+    // §27.8: alias on the implementer side.
+    auto r = runAot(
+        "module M; "
+        "type A := Array<int>; "
+        "public interface ISink "
+        "  method Show(xs: Array<int>); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: A) "
+        "    Console.WriteLine(\"ran-\" + xs.Count.ToString()); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show([1, 2, 3]); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran-3\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           two_aliases_of_one_type_run_spec_27_8) {
+    // §27.8: two different aliases of one type.
+    auto r = runAot(
+        "module M; "
+        "type A := Array<int>; type B := Array<int>; "
+        "public interface ISink "
+        "  method Show(xs: A); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: B) "
+        "    Console.WriteLine(\"ran-\" + xs.Count.ToString()); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show([4]); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran-1\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_of_alias_runs_spec_27_8) {
+    // §27.8: alias of an alias.
+    auto r = runAot(
+        "module M; "
+        "type A := Array<int>; type B := A; "
+        "public interface ISink "
+        "  method Show(xs: B); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: Array<int>) "
+        "    Console.WriteLine(\"ran-\" + xs.Count.ToString()); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show([4, 5, 6, 7]); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran-4\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           generic_alias_runs_spec_27_8) {
+    // §27.8: generic alias `type L<T> := Array<T>` at `L<int>`.
+    auto r = runAot(
+        "module M; "
+        "type L<T> := Array<T>; "
+        "public interface ISink "
+        "  method Show(xs: L<int>); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: Array<int>) "
+        "    Console.WriteLine(\"ran-\" + xs.Count.ToString()); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show([1, 2]); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran-2\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           nested_alias_argument_runs_spec_27_8) {
+    // §27.8: `Array<A>` against `Array<Array<int>>`.
+    auto r = runAot(
+        "module M; "
+        "type A := Array<int>; "
+        "public interface ISink "
+        "  method Show(xs: Array<A>); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: Array<Array<int>>) "
+        "    Console.WriteLine(\"ran-\" + xs.Count.ToString()); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show([[1], [2]]); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran-2\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_of_builtin_class_runs_spec_27_8) {
+    // §27.8: `type M := Mutex` against `Mutex`.
+    auto r = runAot(
+        "module M; "
+        "type M := Mutex; "
+        "public interface ISink "
+        "  method Show(xs: M); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: Mutex) "
+        "    Console.WriteLine(\"mutex\"); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show(new Mutex()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("mutex\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_in_return_type_runs_spec_27_8) {
+    // §27.8: alias in the return type.
+    auto r = runAot(
+        "module M; "
+        "type A := Array<int>; "
+        "public interface ISink "
+        "  method Show(): A; "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(): Array<int> "
+        "    return [1, 2, 3]; "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    Console.WriteLine(s.Show().Count.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_to_different_array_rejected_spec_27_8) {
+    // `type A := Array<string>` is not `Array<int>`.
+    auto r = runAot(
+        "module M; "
+        "type A := Array<string>; "
+        "public interface ISink "
+        "  method Show(xs: A); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: Array<int>) "
+        "     "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasConformanceDiagnostic(
+        r, "method `Show` does not match interface `ISink`'s member `Show`"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_to_exception_vs_stringbuilder_rejected_spec_27_8) {
+    // `type E := Exception` is not `StringBuilder`.
+    auto r = runAot(
+        "module M; "
+        "type E := Exception; "
+        "public interface ISink "
+        "  method Show(xs: E); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: StringBuilder) "
+        "     "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasConformanceDiagnostic(
+        r, "method `Show` does not match interface `ISink`'s member `Show`"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           alias_to_mutex_vs_random_rejected_spec_27_8) {
+    // `type M := Mutex` is not `Random`.
+    auto r = runAot(
+        "module M; "
+        "type M := Mutex; "
+        "public interface ISink "
+        "  method Show(xs: M); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(xs: Random) "
+        "     "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasConformanceDiagnostic(
+        r, "method `Show` does not match interface `ISink`'s member `Show`"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           nullable_widening_on_builtin_class_runs_spec_11_2) {
+    // §11.2 rule 1: a parameter may widen T -> T?; `Mutex` against `Mutex?`.
+    auto r = runAot(
+        "module M; "
+        "public interface ISink "
+        "  method Show(m: Mutex); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(m: Mutex?) "
+        "    Console.WriteLine(\"widened\"); "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var s: ISink := new Feeder(); "
+        "    s.Show(new Mutex()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("widened\n"));
+}
+
+BEZEL_TEST(iface_conformance_builtin_class_param_5996,
+           nullable_narrowing_on_builtin_class_rejected_spec_11_2) {
+    // The reverse (`Mutex?` -> `Mutex`) is not admitted.
+    auto r = runAot(
+        "module M; "
+        "public interface ISink "
+        "  method Show(m: Mutex?); "
+        "end ISink; "
+        "public class Feeder: ISink "
+        "  public constructor() end constructor; "
+        "  public method Show(m: Mutex) "
+        "  end Show; "
+        "end Feeder; "
+        "public class C "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasConformanceDiagnostic(
+        r, "method `Show` does not match interface `ISink`'s member `Show`"));
+}

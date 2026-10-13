@@ -7513,6 +7513,9 @@ void Resolver::checkAbstractImplementations() {
         if (a->kind == TypeRef::Kind::Named && b->kind == TypeRef::Kind::Named &&
             !a->declaration && !b->declaration) {
             auto spell = [](const TypeRef* t) -> std::string_view {
+                // §27.8: an alias is a pure synonym; the head recorded at
+                // alias resolution is the target's (`type M := Mutex`).
+                if (!t->aliasResolvedHead.empty()) return t->aliasResolvedHead;
                 if (t->astNode && t->astNode->name &&
                     !t->astNode->name->parts.empty())
                     return t->astNode->name->parts.back();
@@ -7548,6 +7551,10 @@ void Resolver::checkAbstractImplementations() {
     // Function-typed arguments are not substituted by substTypeRef, so their
     // pair keeps the pre-#5985 nullability-only comparison (the #5971 cells).
     auto spellOf = [](const TypeRef* t) -> std::string_view {
+        // §27.8 (v0.338): "Identity, equality and method dispatch see through
+        // the alias" -- compare the alias TARGET's head, recorded on the ref at
+        // alias resolution (also for a chained alias), not the use-site name.
+        if (!t->aliasResolvedHead.empty()) return t->aliasResolvedHead;
         if (t->astNode && t->astNode->name &&
             !t->astNode->name->parts.empty())
             return t->astNode->name->parts.back();
@@ -7556,7 +7563,7 @@ void Resolver::checkAbstractImplementations() {
     auto ownParamIndex = [&](const TypeRef* t,
                              const MethodSymbol* m) -> int {
         if (!m || t->kind != TypeRef::Kind::Named || t->declaration ||
-            !t->genericArgs.empty())
+            !t->genericArgs.empty() || !t->aliasResolvedHead.empty())
             return -1;
         std::string_view sp = spellOf(t);
         for (std::size_t i = 0; i < m->genericParams.size(); ++i)
@@ -8309,6 +8316,12 @@ void Resolver::checkAbstractImplementations() {
                             // Generic built-ins (`Array<V>`) compare their
                             // arguments too (§11.2, v0.338, #5985).
                             match = declLessNamedMatch(itSub, ctSub, im, candidate);
+                            // §11.2 rule 1: the T -> T? parameter widening applies here too.
+                            if (!match && !itSub->nullable && ctSub->nullable) {
+                                TypeRef stripped = *ctSub;
+                                stripped.nullable = false;
+                                match = declLessNamedMatch(itSub, &stripped, im, candidate);
+                            }
                         } else {
                             match = typesMatch(itSub, ctSub);
                             if (!match && itSub && ctSub &&
@@ -8810,6 +8823,12 @@ void Resolver::checkAbstractImplementations() {
                         itSub->kind == TypeRef::Kind::Named &&
                         ctSub->kind == TypeRef::Kind::Named) {
                         match = declLessNamedMatch(itSub, ctSub, im, impl);
+                        // §11.2 rule 1: the T -> T? parameter widening applies here too.
+                        if (!match && !itSub->nullable && ctSub->nullable) {
+                            TypeRef stripped = *ctSub;
+                            stripped.nullable = false;
+                            match = declLessNamedMatch(itSub, &stripped, im, impl);
+                        }
                     } else {
                         match = typesMatch(itSub, ctSub);
                         if (!match && itSub && ctSub &&
