@@ -26,7 +26,7 @@
 // `groundSatisfiesNew`'s own #4446 fix, retrofitted — now call ONE shared
 // predicate, `sema::isAbstractOrClosedClass` (TypeResolution.hpp, defined
 // TypeResolution_Checks.cpp), per this project's "unify to one call, not
-// two agreeing copies" convention (docs/proposals/next-run-queue-2026-08-13.md
+// two agreeing copies" convention (docs/proposals/papers/next-run-queue-2026-08-13.md
 // batch B). See that function's own header comment for the full rationale.
 //
 // Row map:

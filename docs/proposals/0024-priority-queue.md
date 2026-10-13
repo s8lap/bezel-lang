@@ -6,7 +6,7 @@
 | **Tracking issue** | [#1451](https://github.com/s8lap/bezel-lang/issues/1451) |
 | **Target module(s)** | `System.Collections.Generic` (stdlib §4) — new §4.19 |
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |
-| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #11 (P0), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
+| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #11 (P0), wave D3 of the [stdlib gap DESIGN plan](papers/stdlib-gap-design-plan-2026-07.md) |
 | **Scope** | Borrowing form only. The owning form (`OwningPriorityQueue<TElement, TPriority>` where `TElement: class`) is explicitly deferred to the #1334 two-axis review, which governs the owning-collection family shape. |
 | **Currency note** | Refreshed 2026-08-11 to v0.246: `auto-hashable` vocabulary (v0.242; formerly *auto-equality-bearing*). Re-verified at v0.306 (2026-09-17 sweep): no tier-1 respells — both stdlib §4.17 quotations ("there is no separate comparer parameter…", "iteration visits entries in ascending key order") still match the landed text, and `Array<T>`'s `constructor()` / `constructor(capacity: int)` pair is a recorded keep under v0.290's overload-pair rule, so D1/D5 and the §4.19 constructor pair stand as written. ⚠ **One tier-2 flag** recorded in `proposals-currency-2026-09-17.md` §3: v0.282's comparer-injection reconciliation (rationale §17.14) re-grounds the single-order rule as *identity must not fork*, which is the premise D1's decline rests on. Written-against pin unchanged. |
 

@@ -6,7 +6,7 @@
 | **Target modules** | `System.Text` (§3, auto-imported) · `System` / `Convert` (§2.3, auto-imported) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1434](https://github.com/s8lap/bezel-lang/issues/1434) |
-| **Gap-review item** | #3 (P0+P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
+| **Gap-review item** | #3 (P0+P1) in [stdlib-gap-review-2026-07.md](papers/stdlib-gap-review-2026-07.md) |
 | **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); refreshed 2026-09-17 to v0.306: the §3 usage example's `out owned var bytes` respelled `out var bytes` (v0.289 retired the `out owned var` recipient; §22.4's adoption clause makes the plain `out var` local adopt the callee's announced `out owned` classification, so the example's meaning is unchanged). Declaration-side `out owned result: Array<byte>?` and the v0.244-kept `using var _ := bytes!;` are unchanged. One tier-2 flag recorded in `proposals-currency-2026-09-17.md` §3 (the `when true` out-postcondition). Written-against pin unchanged. |
 
 Blocks web auth headers, JWTs, binary-in-JSON, data: URIs, and hash-digest display; entirely absent today. This proposal is also the prerequisite for proposal 0010 (serialization `ISerializer.WriteBytes`), which will use standard-alphabet Base64 as its text-wire encoding.

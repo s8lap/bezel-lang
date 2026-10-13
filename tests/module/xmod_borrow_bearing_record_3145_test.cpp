@@ -3,7 +3,7 @@
 //
 // §9.7 (borrow-bearing records) / §28.3 (borrow-lifetime rule) /
 // §2.8.3 rule 4 (imported artifacts), v0.252. Audit:
-// docs/proposals/imported-symbol-audit-2026-08-13.md, family F10.
+// docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F10.
 //
 // ── WHY THIS IS THE AUDIT'S HIGHEST-SEVERITY ENTRY ─────────────────────────
 //

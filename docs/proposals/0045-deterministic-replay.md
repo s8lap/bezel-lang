@@ -6,7 +6,7 @@
 **Target:** Almost entirely **runtime + tooling** (a journaling/replaying runtime mode and driver verbs on proposal [0040](0040-build-system.md)'s `bezel` surface). Docs delta is deliberately minimal: **one proposed normative paragraph** in spec [§30.13](../Bezel_Language_Spec.md#sec-runtime-model) (the determinism statement, §3.2 below), **one clarification sentence** in stdlib §4.9/§4.10 (owning-hash-container order is deterministic given history, §3.7), **one stdlib conventions note** naming the intercept points (§3.8), and — the one representation ruling — the identity-hash pinning in spec [§8.3](../Bezel_Language_Spec.md#sec-equals-and-gethashcode) (§3.7). No grammar change, no new user-facing syntax, no new stdlib types.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
 
-This proposal expands item **P5** of [`future-directions-2026-07-18.md`](future-directions-2026-07-18.md) to graduation depth. Where it sharpens or diverges from the P5 sketch, the divergence is recorded explicitly in §9.
+This proposal expands item **P5** of [`future-directions-2026-07-18.md`](papers/future-directions-2026-07-18.md) to graduation depth. Where it sharpens or diverges from the P5 sketch, the divergence is recorded explicitly in §9.
 
 ## 0. Summary
 

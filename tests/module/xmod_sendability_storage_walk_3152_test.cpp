@@ -39,7 +39,7 @@
 // imported type have — and asking the shared BOTH-SOURCES accessors for each
 // member's facts: `sema::storageComponentType` (#3145) for the type, and a new
 // `sema::isAutoPropertyStorageSymbol` for auto-vs-computed. Per the audit
-// (docs/proposals/imported-symbol-audit-2026-08-13.md §4): "An accessor must
+// (docs/proposals/papers/imported-symbol-audit-2026-08-13.md §4): "An accessor must
 // consult both sources, not switch on which one exists."
 //
 // WHAT EACH TEST IS FOR (proven mechanically, not asserted):

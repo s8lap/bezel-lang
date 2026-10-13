@@ -369,7 +369,7 @@ four. Use the measured numbers.
 
 ## Coverage pass — 2026-09-21 (191 → 254 active)
 
-Batch G of `docs/proposals/next-run-queue-2026-08-13.md` ("the spec is already a
+Batch G of `docs/proposals/papers/next-run-queue-2026-08-13.md` ("the spec is already a
 test suite, and we run a quarter of it"). Every number below names the command
 that produced it; the oracle is `build/bezelc` built at this worktree's HEAD
 (`d3b36b1c`) against docs v0.306.

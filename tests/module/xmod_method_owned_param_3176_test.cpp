@@ -2,7 +2,7 @@
 // §28.14 "Scoped callback parameters" / §2.5 "Dependency resolution"; v0.254)
 // — an argument to an IMPORTED METHOD's `owned` / `scoped` formal.
 // Family M1 of umbrella #3152; see
-// docs/proposals/member-symbol-audit-2026-08-13.md.
+// docs/proposals/papers/member-symbol-audit-2026-08-13.md.
 //
 // WHAT THE DEFECT WAS. #2659 fixed exactly this for the CONSTRUCTOR path and
 // wrote its fix in the shape of a shared accessor "so the eventual sweep is

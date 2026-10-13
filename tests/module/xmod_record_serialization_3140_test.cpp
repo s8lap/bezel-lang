@@ -4,7 +4,7 @@
 //
 // §9.8 (synthesized `Serialize` / `Deserialize`, the `serialized`
 // skip/optional/rename clause) / §2.8.3 rule 4 (imported artifacts), v0.252.
-// Audit: docs/proposals/imported-symbol-audit-2026-08-13.md, family F2.
+// Audit: docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F2.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

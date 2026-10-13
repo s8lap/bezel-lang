@@ -3,9 +3,9 @@
 // to emit ExternalLinkage wrappers for VIRTUAL members too.
 //
 // §12.3 (`base.Member`) / §23 (Properties) / §23.4 (Indexers) / §2.8.3 rule 4,
-// v0.252. Audit: docs/proposals/member-symbol-audit-2026-08-13.md, family M6
+// v0.252. Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md, family M6
 // (rank 3, "imported-ABI function maps not consulted"). Umbrella-B programme:
-// docs/proposals/imported-symbol-programme-status-2026-08-14.md.
+// docs/proposals/papers/imported-symbol-programme-status-2026-08-14.md.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

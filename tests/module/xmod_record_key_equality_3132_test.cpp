@@ -3,7 +3,7 @@
 //
 // §9.1 (positional records synthesize value semantics) / §9.2 / §8.3 (a record
 // hashes and compares structurally) / §2.8.3 rule 4 (imported artifacts),
-// v0.252. Audit: docs/proposals/imported-symbol-audit-2026-08-13.md, family F7.
+// v0.252. Audit: docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F7.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

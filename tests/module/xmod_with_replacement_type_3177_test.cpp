@@ -2,7 +2,7 @@
 // resolution at a use site") of the imported-symbol classification seam
 // (umbrella #3152). §9.5 (non-destructive update `with`) / §5.1 (assignability)
 // / §9.1 (positional records) / §2.5 + §2.8.3 rule 4, v0.254.
-// Audit: docs/proposals/member-symbol-audit-2026-08-13.md, Appendix A.4 rows
+// Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md, Appendix A.4 rows
 // `Exprs.cpp:8573` (marked LATENT) and `:8594`.
 //
 // ── MEASURED, on ec6a02f, with a real two-module build ─────────────────────

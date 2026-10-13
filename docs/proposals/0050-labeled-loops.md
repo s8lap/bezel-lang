@@ -5,7 +5,7 @@
 **Target:** Spec [§1.6](../Bezel_Language_Spec.md#sec-statements-and-termination) (two bullet clauses), [§21.3](../Bezel_Language_Spec.md#sec-the-while-statement)/[§21.4](../Bezel_Language_Spec.md#sec-the-for-statement) (one sentence each), [§21.5](../Bezel_Language_Spec.md#sec-break-and-continue) (rewritten; full proposed text in §2.2), [§29.2](../Bezel_Language_Spec.md#sec-desugaring-of-for) (label carry + edge-list generalization), Appendix [A.6](../Bezel_Language_Spec.md#sec-appendix-a-statements) (four production edits), Appendix [C](../Bezel_Language_Spec.md#sec-appendix-c) (invariant bullet). Rationale [§17.3](../Bezel_Design_Rationale.md#sec-goto) (amended into the decision record; the `goto` decline stands). **No stdlib change. No new keyword. No Appendix D change** (Core, see §4.12).
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
 
-This proposal expands item **P10** of [future-directions-2026-07-18.md](future-directions-2026-07-18.md). Divergences from that sketch are recorded explicitly in §0.1.
+This proposal expands item **P10** of [future-directions-2026-07-18.md](papers/future-directions-2026-07-18.md). Divergences from that sketch are recorded explicitly in §0.1.
 
 ## 0. Summary
 

@@ -18,7 +18,7 @@
 #                          (the #3676 shape, post-fix zero).
 #
 # See scripts/check_native_asan_leg_skips.py module docstring and
-# docs/proposals/oracle-ratchets-2026-09.md §2 / issue #3682.
+# docs/proposals/papers/oracle-ratchets-2026-09.md §2 / issue #3682.
 
 [swallowing_guards]
 6    tests/codegen/builtin_owned_transfer_leak_1388_test.cpp

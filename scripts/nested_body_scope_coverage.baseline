@@ -12,6 +12,6 @@
 #
 # Two ints per row: uncovered_emitters first, incomplete_field_saves second.
 # See check_nested_body_scope_coverage.py's module docstring and
-# docs/proposals/defect-campaign-2026-09.md §2.8 (Family L) for the six
+# docs/proposals/papers/defect-campaign-2026-09.md §2.8 (Family L) for the six
 # open members.
 

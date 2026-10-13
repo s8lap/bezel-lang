@@ -7,8 +7,8 @@
 | **Target module** | `System` (§2.7 `Random`, auto-imported) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Currency note** | Re-verified clean at v0.306 (2026-09-17 sweep): §1's transcribed §2.7 `Random` surface still matches the landed member list (no `:=` defaults there, so v0.290's overload-pair rule takes no edit), and `Span<byte>`/`ArraySpan<byte>`/`ReadOnlySpan<byte>` are all live type names. No tier-1 respells, no tier-2 flags. Written-against pin unchanged. |
-| **Gap-review item** | #30 (P2) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
-| **Wave** | D3 — library breadth, per [stdlib-gap-design-plan-2026-07.md](stdlib-gap-design-plan-2026-07.md) |
+| **Gap-review item** | #30 (P2) in [stdlib-gap-review-2026-07.md](papers/stdlib-gap-review-2026-07.md) |
+| **Wave** | D3 — library breadth, per [stdlib-gap-design-plan-2026-07.md](papers/stdlib-gap-design-plan-2026-07.md) |
 
 Four additive fills to `Random` (stdlib §2.7). Nothing here changes the seeding contract or the underlying generator; the additions are new output shapes and a shuffle utility.
 

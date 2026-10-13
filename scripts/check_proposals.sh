@@ -17,9 +17,10 @@
 #                   then the prose record), and its README row's status cell
 #                   leads with the SAME token.
 #   3. Section    — each README row sits in the section its token belongs to:
-#                   `under-review`/`accepted`/`study` in **Live queue**,
+#                   `under-review`/`study` in **Pending decision**, `accepted`
+#                   in **Accepted, awaiting graduation or implementation**,
 #                   `graduated-v0.NNN` in **Graduated**, `declined` in
-#                   **Declined and superseded-without-graduation**.
+#                   **Declined**.
 #
 # Usage:  scripts/check_proposals.sh
 #
@@ -41,10 +42,10 @@ README = os.path.join(PROPDIR, 'README.md')
 EXCLUDE = {'0046-audit-v0.199.md', '0118-audit-v0.281.md'}
 
 TOKEN_RE = re.compile(r'^(under-review|accepted|graduated-v0\.\d+|declined|study)(?: — |$)')
-LIVE_TOKENS = ('under-review', 'accepted', 'study')
-SEC_LIVE = 'Live queue'
+SEC_PEND = 'Pending decision'
+SEC_ACC = 'Accepted, awaiting graduation or implementation'
 SEC_GRAD = 'Graduated'
-SEC_DECL = 'Declined and superseded-without-graduation'
+SEC_DECL = 'Declined'
 
 def section_for(token):
     if token is None:
@@ -53,7 +54,9 @@ def section_for(token):
         return SEC_GRAD
     if token == 'declined':
         return SEC_DECL
-    return SEC_LIVE  # under-review / accepted / study
+    if token == 'accepted':
+        return SEC_ACC
+    return SEC_PEND  # under-review / study
 
 fail = 0
 
@@ -170,7 +173,7 @@ else:
 
 # ---- 3. Section ------------------------------------------------------------
 bad = []
-counts = {SEC_LIVE: 0, SEC_GRAD: 0, SEC_DECL: 0}
+counts = {SEC_PEND: 0, SEC_ACC: 0, SEC_GRAD: 0, SEC_DECL: 0}
 for num, target, status_cell, sec, ln in rows:
     tok = readme_token.get(num)
     want = section_for(tok)
@@ -185,7 +188,7 @@ if bad:
     print(f"SECTION: {len(bad)} violation(s):")
     print("\n".join(bad))
 else:
-    print(f"SECTION: clean (live {counts[SEC_LIVE]} / graduated {counts[SEC_GRAD]} / "
+    print(f"SECTION: clean (pending {counts[SEC_PEND]} / accepted {counts[SEC_ACC]} / graduated {counts[SEC_GRAD]} / "
           f"declined {counts[SEC_DECL]})")
 
 

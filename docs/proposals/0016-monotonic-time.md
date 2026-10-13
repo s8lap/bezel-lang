@@ -196,6 +196,6 @@ A `double` has 53 bits of mantissa, which covers ~9 × 10^15 nanoseconds (about 
 
 ## 8. Relationship to existing issues and proposals
 
-- Gap-review item #26; wave D2 per the [stdlib gap design plan](stdlib-gap-design-plan-2026-07.md).
+- Gap-review item #26; wave D2 per the [stdlib gap design plan](papers/stdlib-gap-design-plan-2026-07.md).
 - The gap review dedup note: "Instant, Stopwatch.ElapsedTicks/Frequency, and TimeSpan.FromNanoseconds merged into one monotonic-time cluster (one shared decision: specify tick resolution as nanoseconds)." This proposal implements that cluster.
 - Unblocks: any caller that needs a monotonic deadline without a `Stopwatch` allocation (timeout checks in tight loops, tracing, micro-benchmarks).

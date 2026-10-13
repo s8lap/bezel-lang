@@ -2,7 +2,7 @@
 // "Identity is one type at runtime, too" + §14.1 *Instantiation and its site*,
 // v0.306.
 //
-// Family I1 (docs/proposals/defect-campaign-2026-09.md §2): a substitution
+// Family I1 (docs/proposals/papers/defect-campaign-2026-09.md §2): a substitution
 // installed under the WRONG SET OF PARAMETER NAMES. `fix #3530` made the
 // class-comparator thunk (`bz$classcmp$<C>`) call the MONOMORPHIZED `CompareTo`
 // instead of the placeholder template, installing the substitution from

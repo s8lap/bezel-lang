@@ -12,7 +12,7 @@
 # One row per file: the number of BARE dynamic_cast<[const] ast::
 # LocalDecl*> sites - see check_localdecl_only_walkers.py's module
 # docstring for the scope-based classifier and
-# docs/proposals/duplication-census-2026-08-30.md hotspot 8 / issue #3591
+# docs/proposals/papers/duplication-census-2026-08-30.md hotspot 8 / issue #3591
 # for the six prior instances of this exact defect shape.
 
 1    src/codegen/LlvmBackend_Assign.cpp

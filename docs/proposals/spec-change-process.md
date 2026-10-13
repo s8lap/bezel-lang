@@ -170,7 +170,7 @@ The paired records that support the queue:
 
 - `docs/proposals/README.md` — the index and status of every proposal + the supporting records.
 - `docs/proposals/DECLINED.md` — the declined register and the decline index: the register carries this folder's own declined-with-reasons entries, and the index above it is the single ground-truth for *where* every recorded decline, deferral, non-goal, and retirement lives across all five homes (it points; it never restates a reason).
-- `docs/proposals/implementation-roadmap-2026-07.md` — the sequenced work-list for turning accepted proposals and landed-but-unimplemented rulings into compiler work.
+- `docs/proposals/papers/implementation-roadmap-2026-07.md` — the sequenced work-list for turning accepted proposals and landed-but-unimplemented rulings into compiler work.
 
 ---
 

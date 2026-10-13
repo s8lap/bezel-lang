@@ -6,7 +6,7 @@
 | **Tracking issue** | — (none yet) |
 | **Target module(s)** | `System.IO` (extends stdlib §7.3 `File`; new `FileStatus`/`FileKind` types in a new §7.3b — numbering at docs-editor discretion, the 0009 precedent; 0017 already claims §7.3a) |
 | **Written against** | spec/stdlib **v0.227** |
-| **Gap-review item** | — (not among the [gap review](stdlib-gap-review-2026-07.md)'s 31 items; see §0) |
+| **Gap-review item** | — (not among the [gap review](papers/stdlib-gap-review-2026-07.md)'s 31 items; see §0) |
 | **Currency note** | Refreshed 2026-08-11 to v0.246: §17.11's zero-constant diagnostic is an error since v0.242 (was a warning) — the §8 claim conformed; the design is unaffected (`FileKind` has the zero constant). Written-against pin unchanged. **2026-09-17 sweep — refreshed to v0.306:** `DateTime` ordering respelled to `CompareTo` at D3's instant-idiom sentence and in §9's `NeedsRebuild` example (`src.ModifiedAt > built.ModifiedAt` → `src.ModifiedAt.CompareTo(built.ModifiedAt) > 0`) — stdlib §2.5 deleted the claimed `<`/`>`/`<=`/`>=` operator group at v0.274 and now states *"Ordering is CompareTo only"*; tick-order semantics and the design are unchanged. No tier-2 flag. Written-against pin unchanged. |
 
 ---
@@ -19,7 +19,7 @@ Stdlib §7.3 `File` declares exactly: `ReadAllText`, `WriteAllText`, `ReadAllByt
 - a file's **modification time** is entirely unreachable;
 - **existence-with-kind** requires two racing calls (`File.Exists` + `Directory.Exists`), with no symlink story at all.
 
-The [2026-07 stdlib gap review](stdlib-gap-review-2026-07.md)'s io-fs items are **#1** (concrete stream family), **#22** (async File family), and **#25** (temp files + Path/Directory utilities) — none includes stat: #25, the closest, is path *manipulation* and temp-file *lifecycle* (its designed form, proposal 0017 §1, lists "what is missing" and metadata is not on the list). The nine-domain survey simply missed this gap; a subsequent adversarial review pass confirmed it. Services and tools need it constantly — cache invalidation, log rotation, directory walking with sizes (§2). This proposal extends the gap map.
+The [2026-07 stdlib gap review](papers/stdlib-gap-review-2026-07.md)'s io-fs items are **#1** (concrete stream family), **#22** (async File family), and **#25** (temp files + Path/Directory utilities) — none includes stat: #25, the closest, is path *manipulation* and temp-file *lifecycle* (its designed form, proposal 0017 §1, lists "what is missing" and metadata is not on the list). The nine-domain survey simply missed this gap; a subsequent adversarial review pass confirmed it. Services and tools need it constantly — cache invalidation, log rotation, directory walking with sizes (§2). This proposal extends the gap map.
 
 ## 1. What exists today (the substrate this builds on)
 
@@ -252,5 +252,5 @@ var etag := $"\"{st2.Size}-{st2.ModifiedAt.Ticks}\"";
 - **Proposal 0016** — `Instant`: D3 records why the monotonic type is the wrong mtime type by its own charter; the truncation-direction divergence is stated.
 - **Proposal 0010** — the serialization dependency gating a future `FileStatus` conformance (§7).
 - **Proposals 0002 / 0021 / 0040** — downstream consumers named in §2 (static serving, log rotation, build scanning).
-- **[Stdlib gap review 2026-07](stdlib-gap-review-2026-07.md)** — not among the 31 items; the io-fs domain's #1/#22/#25 are each shown not to cover metadata (§0). This proposal extends the map.
+- **[Stdlib gap review 2026-07](papers/stdlib-gap-review-2026-07.md)** — not among the 31 items; the io-fs domain's #1/#22/#25 are each shown not to cover metadata (§0). This proposal extends the map.
 - **[DECLINED.md](DECLINED.md)** — checked: no conflict (the gap review's eight declines and D-0001…D-0004 touch none of this ground).

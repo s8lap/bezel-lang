@@ -5,7 +5,7 @@
 **Target:** Spec — one new top-level section ("Choices", placed after §10 Enums; final number is the landing editor's mechanical choice) plus scoped edits to §3.1/§3.2/§3.6 (type kinds, storage classes, derived-property table), §8.6/§8.7 (boxing, `Dispose`), §9.7 (borrow-carrying transitivity), §9.8 (serialization synthesis, stage 3 only), §14.2 (conformance clause; `new()` consequence), §15.3 (move-only category membership), §17.11 (`default`), §19.3/§19.6 (patterns, exhaustiveness), §28.1 (`owned` positions; the v0.196 erasure list), §28.3 (producers rows, owned-consuming positions, consume-site freeze list), §28.11 (element category), §30.14 (sendable), §32.5 (FFI not-allowed list), Appendix A.2/A.3/A.7, Appendix B.1, Appendix C (C.1/C.3/C.7 rows), Appendix D.2. Stdlib — one new `System` section for `Result<T, E>` (stage 4 only). Rationale — decision records (a new §9-family entry; the §18 sum-types deferred entry resolved; pointers from §5.14/§5.15).
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
 
-This proposal expands item **P1** of [`future-directions-2026-07-18.md`](future-directions-2026-07-18.md) to graduation depth. Where it sharpens or diverges from the P1 sketch, the divergence is recorded explicitly in §11.
+This proposal expands item **P1** of [`future-directions-2026-07-18.md`](papers/future-directions-2026-07-18.md) to graduation depth. Where it sharpens or diverges from the P1 sketch, the divergence is recorded explicitly in §11.
 
 ## 0. Summary
 

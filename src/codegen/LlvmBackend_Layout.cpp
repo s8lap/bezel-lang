@@ -2641,7 +2641,7 @@ Emitter::RecordSubstGuard::RecordSubstGuard(Emitter* em, const sema::TypeRef* rt
     // fix #3143 (§14.1 / §2.5, v0.254): ONE branch. This used to be a local
     // (`rtd`) arm and #428's separate imported arm, byte-identical apart from
     // where they read the parameter NAMES from — the shape the audit
-    // (docs/proposals/imported-symbol-audit-2026-08-13.md §4) names as the one
+    // (docs/proposals/papers/imported-symbol-audit-2026-08-13.md §4) names as the one
     // to collapse, because two copies of a predicate reading different sources
     // is how the `recordTypeOfRef` and §8.5-rendering divergences happened.
     // `sema::genericParamNames` reads the AST decl for a local record and

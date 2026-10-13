@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_native_asan_leg_skips.py - ratchet the native ASan-leg skip surface.
 
-WHY (#3682, adjacent #3676, spec §2 of docs/proposals/oracle-ratchets-2026-09.md).
+WHY (#3682, adjacent #3676, spec §2 of docs/proposals/papers/oracle-ratchets-2026-09.md).
 The per-file native ASan leg funnels through `tests/support/run_under_asan.hpp`
 (or one of the per-file copies of that helper, of which ~82 still exist).
 Its first act is
@@ -634,7 +634,7 @@ def write_baseline(swallow, conflate):
         '#                          (the #3676 shape, post-fix zero).',
         '#',
         '# See scripts/check_native_asan_leg_skips.py module docstring and',
-        '# docs/proposals/oracle-ratchets-2026-09.md §2 / issue #3682.',
+        '# docs/proposals/papers/oracle-ratchets-2026-09.md §2 / issue #3682.',
         '',
         '[swallowing_guards]',
     ]
@@ -1255,7 +1255,7 @@ def main():
               'row reports a clean PASS while the leg is off. A conflation '
               'helper returns -1 on a -fsanitize=address link failure '
               '(should be -3). See scripts/check_native_asan_leg_skips.py '
-              'and docs/proposals/oracle-ratchets-2026-09.md §2 / '
+              'and docs/proposals/papers/oracle-ratchets-2026-09.md §2 / '
               '#3682.')
         return 1 if a.strict else 0
 

@@ -6,7 +6,7 @@
 | **Target module** | `System` (auto-imported): `SignalKind` enum + `Signals` static class; callers `import System.Threading` to use the returned `Channel<SignalKind>` |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1442](https://github.com/s8lap/bezel-lang/issues/1442) |
-| **Gap-review item** | #14 (P1) in [stdlib-gap-review-2026-07.md](stdlib-gap-review-2026-07.md) |
+| **Gap-review item** | #14 (P1) in [stdlib-gap-review-2026-07.md](papers/stdlib-gap-review-2026-07.md) |
 | **Unblocked by** | Bounded `Channel<T>` (v0.174, #809, stdlib §6.9) |
 | **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); re-verified clean at v0.306 (2026-09-17 sweep) — no tier-1 respell: stdlib §6.9's `Channel<T>`/`ChannelSender<T>` surface (including `TryReceive`'s out shape at a value `T`), §6.10's `TaskScope` (`Token`/`Cancel`/`Spawn`/`Join`), `ChannelFullException`, and spec §30.12/§30.14/§30.15 all still read as cited. **Pinned-claim record:** §4's note that bounding-object self-capture inside a `scoped` `Spawn` body is "in flight" is now landed — spec §28.14 states it normatively, with `scope.Spawn(lambda() => Work(scope.Token))` as its own example; the example needs no change. Written-against pin unchanged. |
 

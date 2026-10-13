@@ -5,7 +5,7 @@
 // §7.5 (null-conditional member access) / §9.1 (positional records) /
 // §9.2 (body records) / §2.5 + §2.8.3 rule 4 (imported artifacts) /
 // §14.1 (generic substitution), v0.254.
-// Audit: docs/proposals/member-symbol-audit-2026-08-13.md, family M4 and
+// Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md, family M4 and
 // drift-pair #13 of §6.
 //
 // ── WHAT WAS MEASURED, on ec6a02f, with real two-module builds ─────────────

@@ -1,6 +1,6 @@
 // fix #4911 (§14.2 / §22.10 / §22.16, r20-c25): confirm 4 ALREADY-CORRECT
 // SEAM-DEBT verdicts from the R20 batch 1 import-symbol audit
-// (docs/proposals/imported-symbol-audit-2026-08-13.md §5) with 2-module
+// (docs/proposals/papers/imported-symbol-audit-2026-08-13.md §5) with 2-module
 // imported-symbol tests.
 //
 // The imported-symbol ratchet (#3152) banked 4 AST decl reads in R20 batch 1:

@@ -4,7 +4,7 @@
 //
 // §11.2 (interface conformance and the `matches` rule, including "`owned` in
 // interface signatures") / §2.8.2 clause 1 / §2.8.3 rule 4, v0.254.
-// Audit: docs/proposals/member-symbol-audit-2026-08-13.md, family M13 (rank 2).
+// Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md, family M13 (rank 2).
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

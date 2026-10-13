@@ -202,7 +202,7 @@ This is a mechanical async-dual mirror of the §7.3 `File` surface; it was verif
 
 ## 9. Relationship to existing issues and proposals
 
-- Gap-review item #22; wave D2 per the [stdlib gap design plan](stdlib-gap-design-plan-2026-07.md).
+- Gap-review item #22; wave D2 per the [stdlib gap design plan](papers/stdlib-gap-design-plan-2026-07.md).
 - The gap review note: "Mechanical after D1 streams" — confirmed; no dependency on proposal 0006 (stream family) because the `File` convenience methods are high-level and do not expose streams.
 - Issue [#1438](https://github.com/s8lap/bezel-lang/issues/1438): the borrow-bearing-async-param restriction that excludes the `ReadOnlySpan<byte>` async form.
 - Precedent: `Stream.ReadAllAsync(): OwningTask<Array<byte>>` (stdlib §7.1) — the `OwningTask` pattern for allocated byte results is already established.

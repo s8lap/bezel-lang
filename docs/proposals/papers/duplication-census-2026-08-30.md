@@ -3,9 +3,9 @@
 **Status:** audit, read-only. No `src/` change was made. **Base:** `main` @ `907ce0f`, spec
 v0.286. Written by lane A3 of Run 9 (the deduplication close-out).
 
-**Why this document exists.** `docs/proposals/imported-symbol-audit-2026-08-13.md` and
-`docs/proposals/member-symbol-audit-2026-08-13.md` (with
-`docs/proposals/imported-symbol-programme-status-2026-08-14.md` as the handoff) drove a large,
+**Why this document exists.** `docs/proposals/papers/imported-symbol-audit-2026-08-13.md` and
+`docs/proposals/papers/member-symbol-audit-2026-08-13.md` (with
+`docs/proposals/papers/imported-symbol-programme-status-2026-08-14.md` as the handoff) drove a large,
 successful fix programme — but they are now 17 days and dozens of commits stale, and the
 programme's own issue tracker reads as "complete" (every umbrella issue closed) in a way that
 does not match the code. This document supersedes nothing normative; it is a working snapshot
@@ -269,12 +269,12 @@ cleanup.
 
 | # | title | verdict |
 |---|---|---|
-| [#3587](../../issues/3587) | await-site walk is 4 copies, BindExpr-drifted | latent landmine, not live — independently confirmed by both census passes |
-| [#3588](../../issues/3588) | §28.9 trivial-dispose is a self-documented 4-copy family | live duplication, one measured propagation failure |
-| [#3589](../../issues/3589) | LINQ operator name list, 10 spellings, 44≠37 sets | live divergence, extends open #3444 |
-| [#3600](../../issues/3600) | `recordIsPositional` re-derived ~9x (all correct today) | REVISED from a 6-site "broken" claim (both this census's own §1 and the now-closed #3594 made the same mistake); filed as the corrected, narrower finding |
-| [#3579](../../issues/3579) (comment) | 4 more write-only dead members added to existing dead-map issue | extends scope, not a new issue — added once, a duplicate follow-up comment from the second pass was deleted |
-| [#3591](../../issues/3591) | `LocalDecl`-only walker family (76 bare sites measured) has NO ratchet, unlike 3 sibling duplication families | tooling gap, not a call-site unification — see hotspot 8 above |
+| [#3587](../../../issues/3587) | await-site walk is 4 copies, BindExpr-drifted | latent landmine, not live — independently confirmed by both census passes |
+| [#3588](../../../issues/3588) | §28.9 trivial-dispose is a self-documented 4-copy family | live duplication, one measured propagation failure |
+| [#3589](../../../issues/3589) | LINQ operator name list, 10 spellings, 44≠37 sets | live divergence, extends open #3444 |
+| [#3600](../../../issues/3600) | `recordIsPositional` re-derived ~9x (all correct today) | REVISED from a 6-site "broken" claim (both this census's own §1 and the now-closed #3594 made the same mistake); filed as the corrected, narrower finding |
+| [#3579](../../../issues/3579) (comment) | 4 more write-only dead members added to existing dead-map issue | extends scope, not a new issue — added once, a duplicate follow-up comment from the second pass was deleted |
+| [#3591](../../../issues/3591) | `LocalDecl`-only walker family (76 bare sites measured) has NO ratchet, unlike 3 sibling duplication families | tooling gap, not a call-site unification — see hotspot 8 above |
 
 **Also closed as duplicates during cleanup** (same findings, filed by other agent instances that
 landed in this same worktree slot within minutes of each other — see the process note above):

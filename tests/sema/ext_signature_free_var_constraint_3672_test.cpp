@@ -1,6 +1,6 @@
 // Spec-derived tests for §26.4 / §26.5 (v0.286, issue #3672).
 //
-// Census row 15 (docs/proposals/duplication-census-2026-08-30.md §2):
+// Census row 15 (docs/proposals/papers/duplication-census-2026-08-30.md §2):
 // `extSignatureUsesFreeVar` (src/sema/ExprTypecheck.cpp:~7472) decides
 // whether a user-declared generic extension's method needs the
 // per-instantiation T-substitution codegen that #773 left deferred — a

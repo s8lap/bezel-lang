@@ -3,7 +3,7 @@
 // "Operator overloading restrictions" / §28.14 "Scoped callback parameters" /
 // §2.5 "Dependency resolution"; v0.254) — the `owned`-RETURN channel across a
 // module boundary. Family M2 of umbrella #3152; see
-// docs/proposals/member-symbol-audit-2026-08-13.md, §7 rank 6.
+// docs/proposals/papers/member-symbol-audit-2026-08-13.md, §7 rank 6.
 //
 // ── WHAT THE DEFECT WAS ────────────────────────────────────────────────────
 //
