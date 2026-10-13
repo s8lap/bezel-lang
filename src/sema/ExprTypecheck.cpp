@@ -464,6 +464,54 @@ void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
         recordGenericInstantiationSite(t->decl, gp->name, arg,
                                        argNameOf(arg), ne.span.begin);
     }
+    // fix #5641 (§15.1 / §3.6 rule 2, v0.327): a type parameter `T` used in
+    // a nullable position (`T?`, a field/local/param typed `T?`) is a
+    // compile error when `T` is substituted by an inline array at the
+    // instantiation site. Unlike the `where T: value` check which gates on
+    // the constraint (and records into `defaultTypeParamUses_` only when
+    // constrained), this check fires for ANY nullable use of a type parameter
+    // whose instantiation arg is an inline array. Walk the class's fields
+    // to find any whose type is (or contains) a type parameter in a nullable
+    // position, and check whether the corresponding instantiation arg is an
+    // inline array.
+    if (t->decl) {
+        if (auto* cd = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
+            for (const auto& m : cd->members) {
+                auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get());
+                if (!fd || !fd->type) continue;
+                // Check if this field's type is a nullable type parameter reference
+                // to any of t's generic params.
+                const ast::Type* ft = fd->type.get();
+                // A bare type-parameter reference in nullable position: T?
+                if (ft->kind == ast::TypeKind::Named && ft->nullable &&
+                    ft->name && ft->name->parts.size() == 1) {
+                    std::string_view fpn = ft->name->parts.front();
+                    for (std::size_t i = 0; i < t->genericParams.size(); ++i) {
+                        Symbol* gp = t->genericParams[i];
+                        if (gp && gp->name == fpn) {
+                            TypeRef* arg = rt->genericArgs[i];
+                            if (arg &&
+                                arg->kind == TypeRef::Kind::InlineArray) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ne.span.begin,
+                                    "type `" + argNameOf(arg) +
+                                    "` may not be nullable (`" +
+                                    std::string(fpn) +
+                                    "?`) when `" + std::string(fpn) +
+                                    "` is substituted by an inline array — "
+                                    "§15.1 admits no nullable inline-array "
+                                    "form, and §3.6 rule 2 rejects `T?` at `T` "
+                                    "substituted by an inline array "
+                                    "(spec §15.1 / §3.6 rule 2, v0.327; "
+                                    "diagnostic: `nullable inline-array`)");
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Extension-level (#3644's currentExtension_ family): every LOCAL
     // extension targeting `t` by name at matching arity gets one
     // instantiation-site record per bare free-parameter position in its
