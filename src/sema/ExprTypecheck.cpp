@@ -9990,6 +9990,14 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
     if (!a || !b) return a == b;
     if (a->kind != b->kind) return false;
     if (a->kind == TypeRef::Kind::Primitive) return a->primitive == b->primitive;
+    // fix #6102 (§5.1, §27.1, v0.338): the unit type `()` has exactly one
+    // value, so two `Unit` refs are the same base. Without this arm they fell
+    // through to `return false`, so a function type whose return is `()`
+    // (`(int) -> ()`) was never identical to itself as a generic argument
+    // (`Array<(int) -> ()>` passed to a parameter of the same type). The
+    // nullable flag is part of the type (§5.1, §12.9 invariance): `()?` is not
+    // `()`, so a nullability mismatch is not identity.
+    if (a->kind == TypeRef::Kind::Unit) return a->nullable == b->nullable;
     if (a->kind == TypeRef::Kind::Named) {
         if (a->declaration && b->declaration)
             return a->declaration == b->declaration;
@@ -10014,6 +10022,10 @@ static bool typeArgSameBase(const TypeRef* a, const TypeRef* b) {
     if (a->kind == TypeRef::Kind::Function) {
         // Structural shape: parameter count + per-parameter modifiers + return
         // ownedness. Parameter/return TYPE identity is typeArgIdentical's job.
+        // fix #6102 (§5.1, §12.9, v0.338): a nullable function type `F?` is not
+        // identical to `F`; the nullability check here keeps the unit-return
+        // identity fix from accepting `Array<F?>` for `Array<F>` (or back).
+        if (a->nullable != b->nullable) return false;
         if (a->funcParams.size() != b->funcParams.size()) return false;
         for (std::size_t i = 0; i < a->funcParams.size(); ++i)
             if (a->funcParams[i].modifier != b->funcParams[i].modifier)
