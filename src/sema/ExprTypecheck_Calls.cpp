@@ -1031,6 +1031,12 @@ bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
            n == "OwningDictionary";
 }
 
+bool ExprTC::isBuiltinExceptionRef(const TypeRef* ref) {
+    return ref && ref->kind == TypeRef::Kind::Named && !ref->declaration &&
+           ref->genericArgs.empty() &&
+           common::isBuiltinExceptionName(namedRefSimpleName(ref));
+}
+
 // §22.6 classify how `argTy` matches `paramTy` at one argument position.
 // Exact when the types are equal (Resolver::typeRefEqual); Convert when a
 // §5.1 implicit conversion applies; NotApplicable otherwise (the candidate
@@ -1038,6 +1044,28 @@ bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
 ExprTC::ArgMatch ExprTC::classifyArg(const TypeRef* argTy,
                                      const TypeRef* paramTy) {
     if (!argTy || !paramTy) return ArgMatch::Exact;  // can't judge → don't filter
+    // fix #5862 (§22.6 / §5.1 / §12 / §31.4, v0.338): a BUILT-IN exception
+    // class reference carries no TypeSymbol (`declaration == nullptr`), so
+    // `typeRefEqual` (declaration-pointer identity) calls `ArgumentException`
+    // and `Exception` equal, and `implicitlyConvertible` (declaration-keyed)
+    // cannot see a subtype relation to one. Grade a built-in exception
+    // PARAMETER by name: same name is exact, a §12 descendant (built-in or
+    // user-derived, via the same `hasNamedAncestor` walk `checkAssignable`
+    // uses) converts, anything else is inapplicable; §7 forbids nullable →
+    // non-nullable.
+    if (isBuiltinExceptionRef(paramTy)) {
+        if (argTy->kind != TypeRef::Kind::Named || !argTy->genericArgs.empty())
+            return ArgMatch::NotApplicable;
+        if (argTy->nullable && !paramTy->nullable) return ArgMatch::NotApplicable;
+        if (!argTy->declaration &&
+            namedRefSimpleName(argTy) == namedRefSimpleName(paramTy))
+            return argTy->nullable == paramTy->nullable ? ArgMatch::Exact
+                                                        : ArgMatch::Convert;
+        return hasNamedAncestor(const_cast<TypeRef*>(argTy),
+                                namedRefSimpleName(paramTy))
+                   ? ArgMatch::Convert
+                   : ArgMatch::NotApplicable;
+    }
     if (typeRefEqual(argTy, paramTy)) return ArgMatch::Exact;
     if (implicitlyConvertible(argTy, paramTy)) return ArgMatch::Convert;
     return ArgMatch::NotApplicable;
@@ -1064,6 +1092,9 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     // without risking a spurious ambiguous/unreachable diagnostic, so we
     // fall back to arity-based selection. (Per the project's
     // conservative-typing stance — cf. checkAssignable.)
+    // fix #5862 (§22.6 / §31.4, v0.338): a built-in exception class reference
+    // (declaration-less, see `isBuiltinExceptionRef`) is judgeable too, graded
+    // by name in `classifyArg`.
     auto judgeable = [](const TypeRef* t) {
         if (!t) return false;
         switch (t->kind) {
@@ -1072,7 +1103,8 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                 return true;
             case TypeRef::Kind::Named:
                 // Non-generic, resolved named types only.
-                return t->declaration != nullptr && t->genericArgs.empty();
+                return (t->declaration != nullptr && t->genericArgs.empty()) ||
+                       isBuiltinExceptionRef(t);
             default:
                 return false;  // Error, InlineArray, Function
         }
@@ -1085,6 +1117,24 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             res.outcome = OverloadOutcome::Undecidable;
             return res;
         }
+    // fix #5862 (§22.6, v0.338): an argument that is a built-in exception
+    // class reference is ranked only when EVERY candidate's parameter at that
+    // position is one `classifyArg` can grade (a primitive, a resolved
+    // non-generic named type, or a built-in exception class). A candidate
+    // naming some other declaration-less type there (a built-in interface, a
+    // generic instantiation) keeps the pre-existing Undecidable fallback, so no
+    // call that resolved before this change is newly judged inapplicable.
+    for (std::size_t i = 0; i < nArg; ++i) {
+        if (!isBuiltinExceptionRef(argTypes[i])) continue;
+        for (const auto& pts : paramTypes) {
+            const TypeRef* pt = i < pts.size() ? pts[i] : nullptr;
+            if (!pt || !judgeable(pt)) {
+                res.applicable.assign(nCand, false);
+                res.outcome = OverloadOutcome::Undecidable;
+                return res;
+            }
+        }
+    }
     // fix #NNNN (§22.6, v0.298): moved grid/applicable before the per-param
     // judgeable check so we can mark individual candidates inapplicable rather
     // than returning early and leaving all applicable[] at true (which caused
@@ -1996,6 +2046,15 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                            dp->modifier == "out owned" ||
                            dp->modifier == "out owned var" ||
                            dp->modifier == "out using var";
+            // fix #5862 (§22.6 / §31.4, v0.338): two DIFFERENT built-in
+            // exception classes are different parameter types, so neither
+            // overload shadows the other. `overrideParamTypeMatches` compares
+            // declaration pointers, which are null for both, and would
+            // otherwise drop the second same-class overload from the
+            // candidate set before ranking runs.
+            if (isBuiltinExceptionRef(dt) && isBuiltinExceptionRef(bt) &&
+                namedRefSimpleName(dt) != namedRefSimpleName(bt))
+                return false;
             if (!overrideParamTypeMatches(dt, bt, isByRef)) return false;
         }
         return true;

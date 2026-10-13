@@ -2232,6 +2232,10 @@ private:
     // for a non-Named ref. Shared by `commonTypeOf`'s `convertsInto` and
     // `catchArmNcb`'s ancestor walk so both name a type identically.
     static std::string_view namedRefSimpleName(const TypeRef* ref);
+    // fix #5862 (§31.4, v0.338): true for a non-generic, declaration-less Named
+    // TypeRef whose simple name is a built-in exception class
+    // (`common::isBuiltinExceptionName`) -- `Exception` and its family.
+    static bool isBuiltinExceptionRef(const TypeRef* ref);
 
     // #1621 / §31.2.1: mint a headless Named TypeRef standing for a built-in
     // exception ancestor name reached only through

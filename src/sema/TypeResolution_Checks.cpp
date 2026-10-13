@@ -3324,6 +3324,28 @@ void Resolver::checkTypeOverloads(TypeSymbol* t) {
     checkGroup(indexers, "indexer");  // §23.4 (#774)
 }
 
+// fix #5862 (§22.6 / §11.3 / §31.4, v0.338): a built-in exception class
+// reference (`Exception` and its family) is a Named TypeRef with
+// `declaration == nullptr`, so `typeRefEqual` (declaration-pointer identity)
+// calls any two of them equal. Two such references that name DIFFERENT
+// built-in exception classes are different types, hence distinguishable
+// parameter types. The head name is the only identity such a TypeRef carries;
+// membership in the built-in exception family (`isBuiltinExceptionName`)
+// keeps a same-named bare type parameter out of the comparison. Deliberately
+// top-level and non-generic only: the call side (`ExprTC::classifyArg`) grades
+// exactly this shape, so accepting the declaration is never ahead of selection.
+static std::string_view builtinExceptionName(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named || t->declaration ||
+        !t->genericArgs.empty())
+        return {};
+    std::string_view n;
+    if (!t->importedName.empty())
+        n = t->importedName;
+    else if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        n = t->astNode->name->parts.back();
+    return common::isBuiltinExceptionName(n) ? n : std::string_view{};
+}
+
 bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                            const std::vector<Symbol*>& b,
                                            const std::vector<Symbol*>& aGenericParams,
@@ -3398,6 +3420,12 @@ bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
         TypeRef* tb = pb->declType ? ctx_.resolvedType(*pb->declType)
                                    : nullptr;
         if (!typeRefEqual(ta, tb)) return false;
+        {
+            // fix #5862: two different built-in exception classes.
+            std::string_view na = builtinExceptionName(ta);
+            std::string_view nb = builtinExceptionName(tb);
+            if (!na.empty() && !nb.empty() && na != nb) return false;
+        }
     }
     return true;
 }
