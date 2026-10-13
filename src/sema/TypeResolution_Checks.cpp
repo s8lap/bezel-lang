@@ -7695,6 +7695,13 @@ void Resolver::checkAbstractImplementations() {
     // rewritten: that shape keeps the unsubstituted comparison the §28.3
     // set-erasing rows depend on.
     using SubstMap = std::unordered_map<std::string_view, const TypeRef*>;
+    // #6110 / §11.2 (v0.338): a ref substituted IN by substTypeRef (a class
+    // type parameter written as the interface argument: `K<T>: I<T>`) is an
+    // ordinary type of the comparison, never one of the member's OWN type
+    // parameters, even when it is spelled like one (`P<T>` on the interface,
+    // class parameter `T`). Own-parameter classification is by spelling, so
+    // the substituted refs are recorded here and ownParamIndex skips them.
+    std::unordered_set<const TypeRef*> substOrigin;
     std::function<TypeRef*(TypeRef*, const SubstMap&)> substGenericArg;
     std::function<TypeRef*(TypeRef*,
                            const std::unordered_map<std::string_view, const TypeRef*>&)>
@@ -7723,9 +7730,11 @@ void Resolver::checkAbstractImplementations() {
             auto it = map.find(d->headName());
             if (it != map.end() && it->second) {
                 const TypeRef* s = it->second;
+                substOrigin.insert(s);
                 if (d->nullable && !s->nullable) {
                     TypeRef* nn = ctx_.makeTypeRef(*s);
                     nn->nullable = true;
+                    substOrigin.insert(nn);
                     return nn;
                 }
                 return const_cast<TypeRef*>(s);
@@ -7750,6 +7759,17 @@ void Resolver::checkAbstractImplementations() {
         return d;
     };
     substGenericArg = [&](TypeRef* ga, const SubstMap& map) -> TypeRef* {
+        // #6088: an inline array nested in a generic argument (`Box<[3]S>`)
+        // substitutes its element, so the position compare in
+        // declLessArgMatch sees the instantiation, not the interface's `S`.
+        if (ga && ga->kind == TypeRef::Kind::InlineArray) {
+            TypeRef* ne = ga->arrayElement ? substGenericArg(ga->arrayElement, map)
+                                           : nullptr;
+            if (ne == ga->arrayElement) return ga;
+            TypeRef* nn = ctx_.makeTypeRef(*ga);
+            nn->arrayElement = ne;
+            return nn;
+        }
         if (!ga || ga->kind != TypeRef::Kind::Function) return substTypeRef(ga, map);
         bool changed = false;
         TypeRef* nr = ga->funcReturn ? substGenericArg(ga->funcReturn, map) : nullptr;
@@ -7823,7 +7843,8 @@ void Resolver::checkAbstractImplementations() {
     auto ownParamIndex = [&](const TypeRef* t,
                              const MethodSymbol* m) -> int {
         if (!m || t->kind != TypeRef::Kind::Named || t->declaration ||
-            !t->genericArgs.empty() || !t->aliasResolvedHead.empty())
+            !t->genericArgs.empty() || !t->aliasResolvedHead.empty() ||
+            substOrigin.count(t))
             return -1;
         std::string_view sp = spellOf(t);
         for (std::size_t i = 0; i < m->genericParams.size(); ++i)
@@ -7845,6 +7866,17 @@ void Resolver::checkAbstractImplementations() {
                a->declaration == b->declaration && !a->genericArgs.empty() &&
                a->genericArgs.size() == b->genericArgs.size();
     };
+    // #6088: a function-typed or inline-array parameter pair, compared
+    // structurally by declLessArgMatch (own parameters by position). The
+    // parameter call sites use it only when the interface carries no
+    // substitution: a top-level function-typed parameter of a generic
+    // interface keeps the unsubstituted compare the §28.3 set-erasing rows
+    // (s28_3_0193..0197) depend on.
+    auto structuralPair = [](const TypeRef* a, const TypeRef* b) -> bool {
+        return a && b && a->kind == b->kind &&
+               (a->kind == TypeRef::Kind::Function ||
+                a->kind == TypeRef::Kind::InlineArray);
+    };
     std::function<bool(const TypeRef*, const TypeRef*, const MethodSymbol*,
                        const MethodSymbol*)>
         declLessNamedMatch =
@@ -7855,6 +7887,9 @@ void Resolver::checkAbstractImplementations() {
         // arguments under the own-parameter-by-position rule, so `Box<T>`
         // against `Box<B>` is decided by the position of `T` and `B`, not by
         // typeRefEqual (which sees two declaration-less refs as equal).
+        // #6088: a function-typed or inline-array pair (a parameter itself)
+        // is compared structurally by declLessArgMatch.
+        if (structuralPair(a, b)) return declLessArgMatch(a, b, aM, bM);
         if (sameGenericDeclPair(a, b)) {
             if (a->nullable != b->nullable) return false;
             for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
@@ -7875,6 +7910,19 @@ void Resolver::checkAbstractImplementations() {
             if (!declLessArgMatch(a->genericArgs[i], b->genericArgs[i], aM, bM))
                 return false;
         return true;
+    };
+    // #6110: the `T -> T?` widening compares the impl's type with its `?`
+    // dropped; the copy of a substituted-in ref stays a substituted-in ref.
+    auto declLessNamedMatchWidened =
+        [&](const TypeRef* itSub, const TypeRef* ctSub, const MethodSymbol* aM,
+            const MethodSymbol* bM) -> bool {
+        TypeRef stripped = *ctSub;
+        stripped.nullable = false;
+        const bool marked = substOrigin.count(ctSub) != 0;
+        if (marked) substOrigin.insert(&stripped);
+        const bool r = declLessNamedMatch(itSub, &stripped, aM, bM);
+        if (marked) substOrigin.erase(&stripped);
+        return r;
     };
     // #6053 / §11.2 (v0.338): "parameter types must match exactly under the
     // substitution". A function-typed argument (`Array<(T)->T>`) is compared
@@ -7901,6 +7949,18 @@ void Resolver::checkAbstractImplementations() {
             if (!x->funcReturn || !y->funcReturn)
                 return x->funcReturn == y->funcReturn;
             return declLessArgMatch(x->funcReturn, y->funcReturn, aM, bM);
+        }
+        // #6088: an inline array (`[3]T`) compares its element by position;
+        // the length and ownership marker must agree. A length that did not
+        // fold keeps the whole-type comparison.
+        if (x->kind == TypeRef::Kind::InlineArray &&
+            y->kind == TypeRef::Kind::InlineArray) {
+            if (x->arraySizeValue < 0 || y->arraySizeValue < 0)
+                return typesMatch(x, y);
+            if (x->nullable != y->nullable || x->arrayOwned != y->arrayOwned ||
+                x->arraySizeValue != y->arraySizeValue)
+                return false;
+            return declLessArgMatch(x->arrayElement, y->arrayElement, aM, bM);
         }
         if (x->kind == TypeRef::Kind::Named && y->kind == TypeRef::Kind::Named &&
             !x->declaration && !y->declaration)
@@ -8616,7 +8676,8 @@ void Resolver::checkAbstractImplementations() {
                         if ((!itSub->declaration && !ctSub->declaration &&
                              itSub->kind == TypeRef::Kind::Named &&
                              ctSub->kind == TypeRef::Kind::Named) ||
-                            sameGenericDeclPair(itSub, ctSub)) {
+                            sameGenericDeclPair(itSub, ctSub) ||
+                            (obl.subst.empty() && structuralPair(itSub, ctSub))) {
                             // Both are method-level type params: accept regardless of
                             // spelling (the renaming is intentional per §11.2).
                             // Generic built-ins (`Array<V>`) compare their
@@ -8624,9 +8685,7 @@ void Resolver::checkAbstractImplementations() {
                             match = declLessNamedMatch(itSub, ctSub, im, candidate);
                             // §11.2 rule 1: the T -> T? parameter widening applies here too.
                             if (!match && !itSub->nullable && ctSub->nullable) {
-                                TypeRef stripped = *ctSub;
-                                stripped.nullable = false;
-                                match = declLessNamedMatch(itSub, &stripped, im, candidate);
+                                match = declLessNamedMatchWidened(itSub, ctSub, im, candidate);
                             }
                         } else {
                             match = typesMatch(itSub, ctSub);
@@ -9128,13 +9187,12 @@ void Resolver::checkAbstractImplementations() {
                     if ((!itSub->declaration && !ctSub->declaration &&
                          itSub->kind == TypeRef::Kind::Named &&
                          ctSub->kind == TypeRef::Kind::Named) ||
-                        sameGenericDeclPair(itSub, ctSub)) {
+                        sameGenericDeclPair(itSub, ctSub) ||
+                        (obl.subst.empty() && structuralPair(itSub, ctSub))) {
                         match = declLessNamedMatch(itSub, ctSub, im, impl);
                         // §11.2 rule 1: the T -> T? parameter widening applies here too.
                         if (!match && !itSub->nullable && ctSub->nullable) {
-                            TypeRef stripped = *ctSub;
-                            stripped.nullable = false;
-                            match = declLessNamedMatch(itSub, &stripped, im, impl);
+                            match = declLessNamedMatchWidened(itSub, ctSub, im, impl);
                         }
                     } else {
                         match = typesMatch(itSub, ctSub);
