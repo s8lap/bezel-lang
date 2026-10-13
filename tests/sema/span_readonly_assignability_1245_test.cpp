@@ -25,23 +25,23 @@
 //   §4.15 regression: ReadOnlyArraySpan read-only surface (Length/indexer/for-in)
 //   §4.15 regression: ArraySpan writable surface (indexer-set) still compiles
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 // Returns true iff the source is rejected at compile-time with at least one
 // diagnostic error (i.e. no exe produced).
 bool rejectedAtCompile(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
-// Returns the exit code from a JIT run; -999 on compile/JIT failure.
+// Returns the exit code from an AOT run; -999 on compile/link failure.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
