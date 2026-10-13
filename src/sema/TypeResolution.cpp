@@ -595,6 +595,9 @@ void Resolver::run(const ast::SourceFile& src) {
     // the same reason: every instantiation site has been recorded by now,
     // and a choice's classification needs every member type resolved.
     checkElementCategoryInstantiations();
+    // §22.3 (v0.338, #5566): no `ref` parameter at a move-only value type
+    // (declaration side; the call-site and ownership rules are separate).
+    checkRefParamMoveOnlyDeclarations();
     // §14.4 / §15.3 (#3794): OwningBuffer<T>/Span<T>/ReadOnlySpan<T> reject
     // the §15.3 move-only kinds (owning inline arrays, owning-classified
     // choices) per the §14.4 exception's own clause. Pass 1 (concrete slot)

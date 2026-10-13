@@ -3818,6 +3818,92 @@ void Resolver::checkIndexerRefOutParams() {
     }
 }
 
+// §22.3 (v0.338, #5566): "A `ref` parameter whose declared type is a
+// move-only value type (§15.3; an owning choice's nullable wrapper `C?`
+// among them), a function type's `ref` slot included, is a compile error at
+// the declaration: no argument can bind it." A `ref` parameter whose declared
+// type is or contains a type parameter is not rejected here; it is checked at
+// each instantiation that substitutes a move-only type.
+//
+// Walks every method and constructor parameter of every module-level type,
+// then recurses into function-typed parameter types so a `ref` slot of a
+// function type is checked too. Mirrors checkIndexerRefOutParams' walk.
+static void checkRefSlotsOfType(SemaContext& ctx, const TypeRef* t,
+                                SourceLocation loc) {
+    if (!t) return;
+    for (const auto& fp : t->funcParams) {
+        if (fp.modifier == "ref" && fp.type) {
+            const char* moveOnlyKind = nullptr;
+            if (common::isMoveOnlyValueType(fp.type, ctx, moveOnlyKind)) {
+                ctx.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("a function type's `ref` slot may not be "
+                                "declared at ") + moveOnlyKind +
+                    ", a move-only value type — no argument can bind a "
+                    "`ref` slot of move-only type; take the value as a plain "
+                    "parameter and return it, or use `out` (\xC2\xA7""22.3)");
+            }
+        }
+        checkRefSlotsOfType(ctx, fp.type, loc);
+    }
+}
+
+void Resolver::checkRefParamMoveOnlyDeclarations() {
+    if (!ctx_.module()) return;
+    auto checkParams = [&](const std::vector<Symbol*>& params,
+                           std::string_view memberName) {
+        for (Symbol* p : params) {
+            auto* ps = dynamic_cast<ParameterSymbol*>(p);
+            if (!ps) continue;
+            const TypeRef* paramType =
+                ps->resolvedDeclType
+                    ? ps->resolvedDeclType
+                    : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                    : nullptr);
+            if (ps->modifier == "ref" && paramType) {
+                const char* moveOnlyKind = nullptr;
+                if (common::isMoveOnlyValueType(paramType, ctx_, moveOnlyKind)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ps->declLoc,
+                        "a `ref` parameter `" + std::string(ps->name) +
+                        "` of `" + std::string(memberName) +
+                        "` may not be declared at " + moveOnlyKind +
+                        ", a move-only value type — no argument can bind a "
+                        "`ref` parameter of move-only type; take the value as "
+                        "a plain parameter and return it, or use `out` "
+                        "(\xC2\xA7""22.3)");
+                }
+            }
+            checkRefSlotsOfType(ctx_, paramType, ps->declLoc);
+        }
+    };
+    for (Symbol* child : ctx_.module()->children) {
+        // §26: an extension block's methods are checked like a type's own.
+        if (auto* ext = dynamic_cast<ExtensionSymbol*>(child)) {
+            for (Symbol* m : ext->members) {
+                if (auto* ms = dynamic_cast<MethodSymbol*>(m))
+                    checkParams(ms->params, ms->name);
+            }
+            continue;
+        }
+        auto* top = dynamic_cast<TypeSymbol*>(child);
+        if (!top) continue;
+        // §11.6 (v0.286): nested types at any depth, and nested types of
+        // generic classes, are checked like top-level ones. The shared walk
+        // (NestedTypeWalk.hpp, #3574/#3597) reaches them all; a method or
+        // constructor inside a nested class is otherwise never visited.
+        visitTypeAndNested(top, [&](TypeSymbol* t) {
+            for (Symbol* m : t->members) {
+                if (auto* ms = dynamic_cast<MethodSymbol*>(m)) {
+                    checkParams(ms->params, ms->name);
+                } else if (auto* cs = dynamic_cast<ConstructorSymbol*>(m)) {
+                    checkParams(cs->params, t->name);
+                }
+            }
+        });
+    }
+}
+
 // fix #4494 (§22.5 "Defaults and modifiers", v0.306). The paragraph's closing
 // sentence, verbatim: "Every parameter after the first defaulted parameter must
 // itself have a default."

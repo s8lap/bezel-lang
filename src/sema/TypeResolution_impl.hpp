@@ -656,6 +656,10 @@ private:
     // §23.5: `ref` and `out` parameters are not allowed in indexer parameter
     // lists.
     void checkIndexerRefOutParams();
+    // §22.3 (v0.338, #5566): a `ref` parameter (method, constructor, interface
+    // member, or function-type slot) may not be declared at a move-only value
+    // type. Runs after every member type and choice classification resolves.
+    void checkRefParamMoveOnlyDeclarations();
     // fix #4494 (§22.5 "Defaults and modifiers", v0.306): "Every parameter
     // after the first defaulted parameter must itself have a default." Runs
     // over every LOCAL formal list that admits a default, reading the rule's
