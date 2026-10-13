@@ -1935,7 +1935,8 @@ void Resolver::checkGenericConstraintConsistency() {
         kRulesAll = 0xFu,
     };
     // The rules an extension block's `where` clauses currently run under.
-    constexpr unsigned kRulesExtension = kRuleObjectBound | kRuleClassValue;
+    constexpr unsigned kRulesExtension =
+        kRuleObjectBound | kRuleClassValue | kRuleSelfCycle;
     auto checkList =
         [&](const std::vector<ast::GenericConstraint>& gcs,
             const std::vector<std::string_view>& paramOrder, SourceLocation loc,
