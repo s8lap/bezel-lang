@@ -37,6 +37,7 @@
 
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -685,4 +686,364 @@ BEZEL_TEST(case_named_slot_2197,
         "end Program;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ===========================================================================
+// §19.3 (v0.338, #5966): "a named list may name any subset of the type's
+// members: a member it omits is not read (an owning match disposes the
+// un-transferred remainder at construct completion, §35.5)."
+//
+// Before #5966 the normalization reordered a named list into declaration order
+// but left it SHORT, and the downstream positional arity rule then rejected it
+// ("binds 1 value(s) but record `Rect` has 2 positional field(s)"). The
+// normalization now pads each omitted member with a `_` slot, so a named list
+// always reaches the binding walk at the record's full arity and the positional
+// rule is still enforced for POSITIONAL lists only (see the negative rows).
+// ===========================================================================
+namespace {
+
+bool stdoutIs(const bezel::test::JitResult& r, const char* expected) {
+    return r.stdoutText == std::string(expected) + "\n" ||
+           r.stdoutText == std::string(expected) + "\r\n";
+}
+
+std::size_t countOccurrences(const std::string& hay, const char* needle) {
+    std::size_t n = 0, pos = 0;
+    const std::string nd(needle);
+    while ((pos = hay.find(nd, pos)) != std::string::npos) {
+        ++n;
+        pos += nd.size();
+    }
+    return n;
+}
+
+}  // namespace
+
+// THE ISSUE REPRO (#5966; conformance row s19_3_0016). `Rect(Height = var h)`
+// names a SUBSET of the two members. Prints 4.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_record_subset_prints_4) {
+    auto r = runAot(
+        "module M; "
+        "public record Rect2197(Width: int, Height: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var r := new Rect2197(3, 4); "
+        "    case r of "
+        "      Rect2197(Height = var h) => Console.WriteLine(h.ToString());, "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(stdoutIs(r, "4"));
+}
+
+// Two named slots written OUT OF DECLARATION ORDER, both bound: the reorder
+// must give each name its own member (Height=4 to h, Width=3 to w).
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_two_named_slots_out_of_order) {
+    auto r = runAot(
+        "module M; "
+        "public record Rect2197(Width: int, Height: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var r := new Rect2197(3, 4); "
+        "    case r of "
+        "      Rect2197(Height = var h, Width = var w) => do "
+        "        Console.WriteLine(w.ToString()); "
+        "        Console.WriteLine(h.ToString()); "
+        "      end, "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "3\n4\n" || r.stdoutText == "3\r\n4\r\n");
+}
+
+// A subset whose ONE named slot is a constant that REFUTES: the omitted Width
+// is not read, and Height=9 fails, so the `_` arm runs. Pins that the padded
+// discard does not turn the arm into an unconditional match.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_refuting_subset_falls_through) {
+    auto r = runAot(
+        "module M; "
+        "public record Rect2197(Width: int, Height: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var r := new Rect2197(3, 4); "
+        "    case r of "
+        "      Rect2197(Height = 9) => Console.WriteLine(\"nine\"), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(stdoutIs(r, "other"));
+}
+
+// A class-typed FIELD of a record, read by a named subset that omits the
+// sibling Tag: the named read yields the class instance and its method runs.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_class_typed_field_subset) {
+    auto r = runAot(
+        "module M; "
+        "public class Widget2197 "
+        "  public constructor() end constructor; "
+        "  public method Id(): int => 42; "
+        "end Widget2197; "
+        "public record Holder2197(Tag: int, Item: Widget2197); "
+        "public class Program "
+        "  public static method Main() "
+        "    using var w := new Widget2197(); "
+        "    var h := new Holder2197(7, w); "
+        "    case h of "
+        "      Holder2197(Item = var it) => Console.WriteLine(it.Id().ToString()), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(stdoutIs(r, "42"));
+}
+
+// An UNNAMED class-typed field is not read and is not disposed by the match:
+// the owning local `w` is disposed once at its own scope end. Looped 100 times
+// through the checked harness (generated-code ASan) so a leak or double-free of the
+// class instance would show; the count of disposals must be exactly 101 (`0..100`).
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_unnamed_class_field_disposed_once_loop) {
+    auto r = runAotChecked(
+        "module M; "
+        "public class Widget2197 "
+        "  public constructor() end constructor; "
+        "  destructor Console.WriteLine(\"widget disposed\"); end destructor; "
+        "end Widget2197; "
+        "public record Holder2197(Tag: int, Item: Widget2197); "
+        "public class Program "
+        "  public static method Main() "
+        "    var n := 0; "
+        "    for var i in 0..100 do "
+        "      using var w := new Widget2197(); "
+        "      var h := new Holder2197(7, w); "
+        "      case h of "
+        "        Holder2197(Tag = 7) => n := n + 1;, "
+        "        _ => Console.WriteLine(\"other\"); "
+        "      end case; "
+        "    end for; "
+        "    Console.WriteLine(n.ToString()); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "widget disposed"), 101u);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("101") != std::string::npos);
+}
+
+// The OWNED payload case of §19.3/§35.5: `Fetched(status = 200)` omits the
+// `owned response` payload. The owning match disposes the un-transferred
+// remainder at construct completion, once per iteration, over 101 iterations
+// (generated-code ASan through the checked harness; `0..100` is 101 iterations).
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_owned_omitted_payload_disposed_once_loop) {
+    auto r = runAotChecked(
+        "module M; "
+        "public class Widget2197 "
+        "  public constructor() end constructor; "
+        "  destructor Console.WriteLine(\"widget disposed\"); end destructor; "
+        "end Widget2197; "
+        "public choice Outcome2197 "
+        "  Fetched(owned response: Widget2197, status: int), "
+        "  Failed(code: int); "
+        "end Outcome2197; "
+        "public class Program "
+        "  public static method Main() "
+        "    var n := 0; "
+        "    for var i in 0..100 do "
+        "      case Outcome2197.Fetched(new Widget2197(), 200) of "
+        "        Fetched(status = 200) => n := n + 1;, "
+        "        _ => Console.WriteLine(\"other\"); "
+        "      end case; "
+        "    end for; "
+        "    Console.WriteLine(n.ToString()); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "widget disposed"), 101u);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("101") != std::string::npos);
+}
+
+// NEGATIVE — an unknown member name is still a compile error at the pattern,
+// naming the rule (§19.3), and the list of valid names.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_unknown_name_rejected_with_rule) {
+    auto r = runAot(
+        "module M; "
+        "public record Rect2197(Width: int, Height: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var r := new Rect2197(3, 4); "
+        "    case r of "
+        "      Rect2197(Depth = var d) => Console.WriteLine(d.ToString());, "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "names no member of `Rect2197`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "(§19.3)"));
+}
+
+// NEGATIVE — mixing positional and named slots in one list is still rejected.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_mixed_positional_and_named_rejected) {
+    auto r = runAot(
+        "module M; "
+        "public record Rect2197(Width: int, Height: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var r := new Rect2197(3, 4); "
+        "    case r of "
+        "      Rect2197(3, Height = var h) => Console.WriteLine(h.ToString());, "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "mixes positional and named slots"));
+}
+
+// NEGATIVE — a POSITIONAL list with too few slots is still the count error:
+// the positional arity rule is unchanged by the subset relaxation.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_positional_too_few_still_rejected) {
+    auto r = runAot(
+        "module M; "
+        "public record Rect2197(Width: int, Height: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var r := new Rect2197(3, 4); "
+        "    case r of "
+        "      Rect2197(var w) => Console.WriteLine(w.ToString());, "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "binds 1 value(s) but record `Rect2197` has 2 positional field(s); "
+           "the binding count must match (§19.3)"));
+}
+
+// NEGATIVE — a duplicate name in one named slot list is still rejected.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_duplicate_name_rejected) {
+    auto r = runAot(
+        "module M; "
+        "public record Rect2197(Width: int, Height: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var r := new Rect2197(3, 4); "
+        "    case r of "
+        "      Rect2197(Width = var a, Width = var b) => Console.WriteLine(a.ToString());, "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "bound twice"));
+}
+
+// §19.3 (v0.338, #5966): a named subset over a CHOICE case payload. `Click`
+// has two payload fields; `Click(y = var yy)` names only `y` and must match the
+// case the same way the record subset does (the omitted `x` is not read).
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_choice_payload_subset) {
+    auto r = runAot(
+        "module M; "
+        "public choice Ev5966 Click5966(x: int, y: int), Other5966(code: int); end Ev5966; "
+        "public class Program "
+        "  public static method Main() "
+        "    var e: Ev5966 := Ev5966.Click5966(3, 4); "
+        "    case e of "
+        "      Click5966(y = var yy) => Console.WriteLine(yy.ToString()), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(stdoutIs(r, "4"));
+}
+
+// §19.3 (v0.338, #5966; nested follow-up #5991): a NESTED named slot list that
+// is a strict subset, or is written out of declaration order, is refused with
+// a rule-citing diagnostic until nested named lists are resolved to declaration
+// order (#5991). Before this refusal the nested walk bound it by written
+// position and silently read the wrong member, so the refusal is the only
+// sound behaviour for this commit. The top-level subset rows above are
+// unaffected.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_nested_subset_rejected_until_supported) {
+    auto r = runAot(
+        "module M; "
+        "public record In5966(A: int, B: int); "
+        "public record Out5966(X: int, I: In5966, Z: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var o := new Out5966(1, new In5966(2, 3), 4); "
+        "    case o of "
+        "      Out5966(I = In5966(B = var b)) => Console.WriteLine(b.ToString()), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "must name every member in declaration order"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "(§19.3)"));
+}
+
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_nested_reordered_rejected_until_supported) {
+    auto r = runAot(
+        "module M; "
+        "public record In5966(A: int, B: int); "
+        "public record Out5966(X: int, I: In5966, Z: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var o := new Out5966(1, new In5966(2, 3), 4); "
+        "    case o of "
+        "      Out5966(X = var x, I = In5966(B = var b, A = var a), Z = var z) => "
+        "        Console.WriteLine(a.ToString()), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "must name every member in declaration order"));
+}
+
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_nested_mixed_rejected) {
+    auto r = runAot(
+        "module M; "
+        "public record In5966(A: int, B: int); "
+        "public record Out5966(X: int, I: In5966, Z: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var o := new Out5966(1, new In5966(2, 3), 4); "
+        "    case o of "
+        "      Out5966(I = In5966(2, B = var b)) => Console.WriteLine(b.ToString()), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "mixes positional and named slots"));
 }

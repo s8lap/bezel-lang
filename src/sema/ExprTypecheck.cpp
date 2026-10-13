@@ -2774,14 +2774,35 @@ bool ExprTC::normalizeNamedDestructureSlots(
     // makes `targetIndex` injective, so every slot lands on exactly one
     // distinct member and none is dropped; a named list may still cover FEWER
     // members than the type has (§19.3 states the arity rule for the POSITIONAL
-    // form only — #5864), which leaves the downstream positional arity check to
-    // report.
+    // form only — #5864). §19.3 (v0.338): "a named list may name any subset of
+    // the type's members: a member it omits is not read". An omitted member is
+    // therefore padded with a `_` slot at its declaration index: a discard reads
+    // nothing, and an owning match disposes the un-transferred remainder at
+    // construct completion exactly as it does for a written `_` (§35.5). The
+    // padding makes the downstream positional arity check hold by construction
+    // for a named list; the positional arity rule is unchanged, since a
+    // positional list never reaches this reorder.
     std::vector<ast::PositionalPattern> reordered;
-    reordered.reserve(dp.subPatterns.size());
-    for (std::size_t idx = 0; idx < memberNames.size(); ++idx)
+    reordered.reserve(memberNames.size());
+    for (std::size_t idx = 0; idx < memberNames.size(); ++idx) {
+        bool named = false;
         for (std::size_t i = 0; i < targetIndex.size(); ++i)
-            if (targetIndex[i] == idx)
+            if (targetIndex[i] == idx) {
                 reordered.push_back(std::move(dp.subPatterns[i]));
+                named = true;
+                break;
+            }
+        if (named) continue;
+        ast::PositionalPattern pad;
+        pad.pattern = std::make_unique<ast::DiscardPattern>();
+        pad.pattern->span = dp.span;
+        // The padded slot is an UNMARKED named slot (§19.3 "a member it omits
+        // is not read"): its spelling survives normalization, so ownership and
+        // codegen classify it like any other unmarked named slot and never as a
+        // transfer (#4763).
+        pad.namedSlot = true;
+        reordered.push_back(std::move(pad));
+    }
     for (auto& sp : reordered) {
         sp.slotName = std::string_view{};
         // fix #4763 follow-up (v0.334): `hasMoveMarker` SURVIVES for an ADMITTED
@@ -14292,6 +14313,50 @@ void ExprTC::bindNestedDestructuringNames(
         std::vector<FieldSymbol*> ndFields =
             ndChoiceCase ? std::vector<FieldSymbol*>{}
                          : fieldsOfRecord(nd->typeName.get());
+        // §19.3 "Named destructuring" (v0.338, #5966): a NESTED named slot list
+        // is not yet resolved to declaration order by this walk (the top-level
+        // callers do that reorder; this walk binds by written position). A
+        // nested named list that is a subset or out of declaration order would
+        // therefore bind the wrong member, so it is refused here rather than
+        // compiled. A positional nested pattern and a complete in-order named
+        // nested list are unaffected.
+        {
+            std::vector<std::string_view> ndNames;
+            if (ndChoiceCase && ndChoiceCase->caseDecl)
+                for (const auto& p : ndChoiceCase->caseDecl->payload)
+                    ndNames.push_back(p.name);
+            else
+                for (const auto* f : ndFields) ndNames.push_back(f->name);
+            bool anyNamedN = false, anyPosN = false, inOrder = true;
+            for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
+                const auto& sp = nd->subPatterns[i];
+                if (sp.slotName.empty()) { anyPosN = true; continue; }
+                anyNamedN = true;
+                if (i >= ndNames.size() || sp.slotName != ndNames[i]) inOrder = false;
+            }
+            if (anyNamedN && anyPosN) {
+                ctx_.diagnostics().report(
+                    Severity::Error, nd->span.begin,
+                    "destructuring pattern `" +
+                    std::string(nd->typeName && !nd->typeName->parts.empty()
+                                    ? nd->typeName->parts.back()
+                                    : std::string_view{}) +
+                    "(...)` nested in another pattern mixes positional and named "
+                    "slots; a slot list is either positional or named, never "
+                    "mixed in one pattern (§19.3)");
+            } else if (anyNamedN &&
+                       (!inOrder || nd->subPatterns.size() != ndNames.size())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, nd->span.begin,
+                    "nested named slot list in pattern `" +
+                    std::string(nd->typeName && !nd->typeName->parts.empty()
+                                    ? nd->typeName->parts.back()
+                                    : std::string_view{}) +
+                    "(...)` must name every member in declaration order: a nested "
+                    "named subset or reordered list is not yet supported by this "
+                    "compiler (§19.3)");
+            }
+        }
         for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
             const auto& s = nd->subPatterns[i];
             TypeRef* fieldTy = nullptr;
