@@ -14403,6 +14403,9 @@ void ExprTC::bindNestedDestructuringNames(
             // violation as `case o of > 5`, and without this call it reached
             // codegen and emitted `icmp sgt ptr %obj, i32 5`.
             checkOrderingPatternOverUnorderedType(fieldTy, s.pattern.get());
+            // §19.3 L3951 (#6037): a naked name after a NESTED named slot's
+            // `=` resolves as at the top level, same as the top-level loops.
+            checkNamedSlotNakedName(s, fieldTy);
             if (!s.nakedBinding.empty()) {
                 // §19.3 (#5401, v0.314): bindings of one pattern must be distinct.
                 if (s.nakedBinding != "_" &&
