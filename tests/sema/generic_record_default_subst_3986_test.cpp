@@ -131,6 +131,9 @@
 // own suite), `default_t`, `17_11`, `generic_record`, `subst`, `record` --
 // see the commit body for exact pass counts and which binaries each hit.
 
+#include <string>
+#include <vector>
+
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation, diagnosticMessageContains
 #include "support/aot_support.hpp"         // runAot
 #include "test_harness.hpp"
@@ -681,4 +684,215 @@ BEZEL_TEST(generic_default_unconstrained_5820,
         "end P5820d;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// ── #5962 residual (b) (§17.11 v0.338, L3519: "the rule below rejects at the
+// instantiation site every substitution that is not **defaultable** ... read
+// through any chain of user declarations (§3.6 rule 2)"): the substitution is
+// judged at EVERY instantiation of a generic that reaches an unconstrained
+// `default(T)` through other generics, not only at the instantiation of the
+// generic that spells `default(T)`. `Y.Y1<string>()` over
+// `Y1<S> => U.Z<S>()`, `Z<T> => default(T)` compiled and ran before.
+//
+// Shared fixture: `UZ.Z` takes `default(T)`; `C1..C3` pass their `S` on one,
+// two and three links deep.
+namespace {
+
+const char* const kChain5962b =
+    "class W end W; "
+    "record RS(A: string); "
+    "enum E1 One := 1, Two := 2; end E1; "
+    "static class UZ "
+    "  public static method Z<T>(): int var t := default(T); return 1; end Z; "
+    "end UZ; "
+    "static class C1 "
+    "  public static method F<S>(): int return UZ.Z<S>(); end F; "
+    "end C1; "
+    "static class C2 "
+    "  public static method F<S>(): int return C1.F<S>(); end F; "
+    "end C2; "
+    "static class C3 "
+    "  public static method F<S>(): int return C2.F<S>(); end F; "
+    "end C3; ";
+
+std::string chainProgram5962b(const std::string& mod, const std::string& main) {
+    return "module " + mod + "; " + kChain5962b + "class P " +
+           "  public static method Main(): int " + main +
+           "  end Main; end P;";
+}
+
+}  // namespace
+
+// The issue's repro: an `owned S` chain, instantiated at a non-nullable
+// reference type and at a task type.
+BEZEL_TEST(generic_default_chain_5962b, issue_repro_string_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module CH5962a; "
+        "static class U public static method Z<T>(): owned T "
+        "  return default(T); end Z; end U; "
+        "static class Y public static method Y1<S>(): owned S "
+        "  return U.Z<S>(); end Y1; end Y; "
+        "class P public static method Main(): int "
+        "  var s := Y.Y1<string>(); return 0; end Main; end P;");
+}
+
+BEZEL_TEST(generic_default_chain_5962b, issue_repro_task_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module CH5962b; "
+        "static class U public static method Z<T>(): owned T "
+        "  return default(T); end Z; end U; "
+        "static class Y public static method Y1<S>(): owned S "
+        "  return U.Z<S>(); end Y1; end Y; "
+        "class P public static method Main(): int "
+        "  var s := Y.Y1<Task<int>>(); return 0; end Main; end P;");
+}
+
+// Table-driven REJECT matrix: every non-defaultable class through chains of
+// 1, 2 and 3 links is rejected exactly where the direct `default(X)` is.
+BEZEL_TEST(generic_default_chain_5962b,
+           non_defaultable_matrix_rejected_at_every_depth_spec_17_11) {
+    const std::vector<std::string> types = {
+        "string", "Object", "W", "RS", "E1", "Task<int>", "Array<int>",
+        "Dictionary<string,int>", "OwningArray<W>", "(int) -> int"};
+    for (const auto& ty : types) {
+        // Agreement anchor: the direct `default(X)` is itself rejected.
+        auto direct = runAot(chainProgram5962b(
+            "CH5962d", "var d := default(" + ty + "); return 0; "));
+        BEZEL_EXPECT_FALSE(direct.ran);
+        BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(direct));
+        for (const char* depth : {"C1", "C2", "C3"}) {
+            expectUnconstrainedDefaultRejected(chainProgram5962b(
+                "CH5962e", std::string("return ") + depth + ".F<" + ty +
+                               ">(); "));
+        }
+    }
+}
+
+// Table-driven ACCEPT matrix (zero false rejects): every defaultable class
+// agrees with the direct `default(X)` at depth 0 and runs through 1-, 2- and
+// 3-deep chains. 12 types x 4 depths = 48 calls of 1.
+BEZEL_TEST(generic_default_chain_5962b,
+           defaultable_matrix_runs_at_every_depth_spec_17_11) {
+    const std::vector<std::string> types = {
+        "int", "bool", "DateTime", "Guid", "string?", "Object?", "W?", "R5962",
+        "E0", "Task<int>?", "Array<int>?", "((int) -> int)?"};
+    std::string body;
+    int n = 0;
+    for (const auto& ty : types) {
+        body += "var d" + std::to_string(n++) + " := default(" + ty + "); ";
+    }
+    body += "var sum := 0; ";
+    for (const auto& ty : types)
+        body += "sum := sum + UZ.Z<" + ty + ">() + C1.F<" + ty +
+                ">() + C2.F<" + ty + ">() + C3.F<" + ty + ">(); ";
+    body += "return sum; ";
+    auto r = runAot("module CH5962f; record R5962(A: int, B: bool); "
+                    "enum E0 Zero := 0, One := 1; end E0; " +
+                    std::string(kChain5962b) + "class P "
+                    "  public static method Main(): int " + body +
+                    "  end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 48);
+}
+
+// Class-level type-parameter owner: `Box<T>.M` passes its `T` on, so
+// `new Box<string>()` is the rejected instantiation.
+BEZEL_TEST(generic_default_chain_5962b, class_level_owner_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module CH5962g; " + std::string(kChain5962b) +
+        "class Box<T> public method M(): int return UZ.Z<T>(); end M; "
+        "end Box; "
+        "class P public static method Main(): int "
+        "  var b := new Box<string>(); return b.M(); end Main; end P;");
+}
+
+BEZEL_TEST(generic_default_chain_5962b, class_level_owner_int_runs_spec_17_11) {
+    auto r = runAot(
+        "module CH5962h; " + std::string(kChain5962b) +
+        "class Box<T> public method M(): int return UZ.Z<T>(); end M; "
+        "end Box; "
+        "class P public static method Main(): int "
+        "  var b := new Box<int>(); return b.M(); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// Nested generic class chain: `Outer<T>` constructs `Inner<T>`, whose method
+// reaches the `default(T)`; the rejected instantiation is `Outer<string>`.
+BEZEL_TEST(generic_default_chain_5962b, outer_inner_chain_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module CH5962i; " + std::string(kChain5962b) +
+        "class Inner<T> public method M(): int return UZ.Z<T>(); end M; "
+        "end Inner; "
+        "class Outer<T> public method N(): int "
+        "  var i := new Inner<T>(); return i.M(); end N; end Outer; "
+        "class P public static method Main(): int "
+        "  var o := new Outer<string>(); return o.N(); end Main; end P;");
+}
+
+BEZEL_TEST(generic_default_chain_5962b, outer_inner_chain_int_runs_spec_17_11) {
+    auto r = runAot(
+        "module CH5962j; " + std::string(kChain5962b) +
+        "class Inner<T> public method M(): int return UZ.Z<T>(); end M; "
+        "end Inner; "
+        "class Outer<T> public method N(): int "
+        "  var i := new Inner<T>(); return i.M(); end N; end Outer; "
+        "class P public static method Main(): int "
+        "  var o := new Outer<int>(); return o.N(); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// Mutual recursion A<S> -> B<S> -> A<S> terminates (fixpoint), and still
+// rejects at a non-defaultable substitution / runs at a defaultable one.
+BEZEL_TEST(generic_default_chain_5962b,
+           mutual_recursion_terminates_and_rejects_spec_17_11) {
+    const std::string mutual =
+        std::string(kChain5962b) +
+        "static class A public static method Fa<S>(n: int): int "
+        "  if n > 0 then return B.Fb<S>(n - 1); end if; "
+        "  return UZ.Z<S>(); end Fa; end A; "
+        "static class B public static method Fb<S>(n: int): int "
+        "  return A.Fa<S>(n); end Fb; end B; ";
+    expectUnconstrainedDefaultRejected(
+        "module CH5962k; " + mutual +
+        "class P public static method Main(): int "
+        "  return B.Fb<string>(1); end Main; end P;");
+    auto r = runAot(
+        "module CH5962l; " + mutual +
+        "class P public static method Main(): int "
+        "  return B.Fb<int>(1); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// A cycle that never reaches a `default(T)` stays accepted (no derived use).
+BEZEL_TEST(generic_default_chain_5962b, cycle_without_default_runs_spec_17_11) {
+    auto r = runAot(
+        "module CH5962m; " + std::string(kChain5962b) +
+        "static class A public static method Fa<S>(n: int): int "
+        "  if n > 0 then return B.Fb<S>(n - 1); end if; return 3; end Fa; "
+        "end A; "
+        "static class B public static method Fb<S>(n: int): int "
+        "  return A.Fa<S>(n); end Fb; end B; "
+        "class P public static method Main(): int "
+        "  return B.Fb<string>(1); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 3);
+}
+
+// A link that passes a NULLABLE or a CONCRETE argument is not a chain on `S`:
+// `Z<S?>` is defaultable at every `S` (null / zero), `Z<int>` ignores `S`.
+BEZEL_TEST(generic_default_chain_5962b,
+           nullable_or_concrete_link_does_not_propagate_spec_17_11) {
+    auto r = runAot(
+        "module CH5962n; " + std::string(kChain5962b) +
+        "static class N1 public static method F<S>(): int "
+        "  return UZ.Z<S?>(); end F; end N1; "
+        "static class N2 public static method F<S>(): int "
+        "  return UZ.Z<int>(); end F; end N2; "
+        "class P public static method Main(): int "
+        "  return N1.F<string>() + N2.F<string>(); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);
 }

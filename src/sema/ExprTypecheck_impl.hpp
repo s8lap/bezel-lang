@@ -1186,7 +1186,16 @@ private:
         // item of any kind names it); the join then judges the substitution
         // by defaultIllFormed alone, with the unconstrained wording.
         bool unconstrained = false;
+        // #5962 (§17.11 v0.338, §3.6 rule 2): true for a use DERIVED by the
+        // join from a call chain (`U.Z<S>()` inside a generic `Y1<S>`), not
+        // recorded from a `default(T)` expression; `loc` stays the original
+        // `default(T)` site.
+        bool derived = false;
     };
+    // #5962 (§17.11 v0.338, §3.6 rule 2): joins the call/construction sites
+    // whose type argument is a bare type parameter of the enclosing generic
+    // owner into derived `DefaultTypeParamUse`s (see the definition).
+    void propagateDefaultTypeParamChains();
     struct GenericInstantiationSite {
         const void* owner;        // fix #3719: the ast::MethodDecl being
                                    // called (checkMethodGenericConstraints),
@@ -1199,6 +1208,10 @@ private:
         TypeRef* arg = nullptr;   // the substituted type argument
         std::string argName;      // its spelling, for the diagnostic
         SourceLocation loc;       // the instantiation site
+        // #5962: the generic owners enclosing the site (null outside a
+        // method / class), stamped at record time.
+        const ast::MethodDecl* inMethod = nullptr;
+        const TypeSymbol* inType = nullptr;
     };
     std::vector<DefaultTypeParamUse> defaultTypeParamUses_;
     std::vector<GenericInstantiationSite> genericInstantiationSites_;

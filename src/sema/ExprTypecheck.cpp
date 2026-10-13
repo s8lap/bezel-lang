@@ -370,13 +370,68 @@ void ExprTC::recordGenericInstantiationSite(const void* owner,
         if (e.owner == owner && e.param == param && e.argName == argName &&
             e.loc.line == loc.line && e.loc.column == loc.column)
             return;
-    genericInstantiationSites_.push_back(
-        {owner, std::string(param), arg, std::move(argName), loc});
+    // #5962: stamp the enclosing generic owners (the member being visited),
+    // read by `propagateDefaultTypeParamChains`.
+    GenericInstantiationSite site{owner, std::string(param), arg,
+                                  std::move(argName), loc};
+    site.inMethod = currentMethodDecl_;
+    site.inType = currentType_;
+    genericInstantiationSites_.push_back(std::move(site));
+}
+
+// #5962 (§17.11 v0.338: "the rule below rejects at the instantiation site
+// every substitution that is not defaultable ... read through any chain of
+// user declarations (§3.6 rule 2)"). A site whose type argument is a bare
+// type parameter S of the enclosing generic owner (`U.Z<S>()` inside
+// `Y1<S>`, or `new Inner<T>()` inside `Outer<T>`), against a callee that
+// takes an unconstrained `default(T)`, makes the enclosing owner take
+// `default(S)` too: record that as a DERIVED use, so the per-instantiation
+// join rejects `Y1<string>` itself. Iterated to a fixpoint; each round only
+// adds a not-yet-recorded (owner, param) pair out of a finite set, so mutual
+// recursion (`A<S>` -> `B<S>` -> `A<S>`) terminates. An imported owner has a
+// null decl (#3141) and is never a key, so it stays unjudged.
+void ExprTC::propagateDefaultTypeParamChains() {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& site : genericInstantiationSites_) {
+            const TypeRef* a = site.arg;
+            if (!a || a->kind != TypeRef::Kind::Named || a->declaration ||
+                a->nullable || !a->genericArgs.empty())
+                continue;
+            const DefaultTypeParamUse* use = nullptr;
+            for (const auto& u : defaultTypeParamUses_)
+                if (u.owner == site.owner && u.param == site.param &&
+                    u.unconstrained) {
+                    use = &u;
+                    break;
+                }
+            if (!use) continue;
+            std::string_view s = a->headName();
+            const void* key = nullptr;
+            if (site.inMethod)
+                for (const auto& gp : site.inMethod->genericParams)
+                    if (gp.name == s) key = site.inMethod;
+            if (!key && site.inType && site.inType->decl)
+                for (const Symbol* gp : site.inType->genericParams)
+                    if (gp && gp->name == s) key = site.inType->decl;
+            if (!key) continue;
+            bool have = false;
+            for (const auto& u : defaultTypeParamUses_)
+                if (u.owner == key && u.param == s) { have = true; break; }
+            if (have) continue;
+            DefaultTypeParamUse d{key, std::string(s), use->loc, true};
+            d.derived = true;
+            defaultTypeParamUses_.push_back(std::move(d));
+            changed = true;
+        }
+    }
 }
 
 void ExprTC::checkDeferredDefaultInstantiations() {
     if (defaultTypeParamUses_.empty() || genericInstantiationSites_.empty())
         return;
+    propagateDefaultTypeParamChains();
     // §3.6 rule 4: "a diagnostic produced by a property-dependent rule names
     // the property, the offending type argument, and the structural reason."
     auto structuralReason = [&](const TypeRef* a) -> std::string {
@@ -401,11 +456,13 @@ void ExprTC::checkDeferredDefaultInstantiations() {
     for (const auto& site : genericInstantiationSites_) {
         bool bodyTakesDefault = false;
         bool useUnconstrained = false;
+        bool useDerived = false;
         SourceLocation useLoc{};
         for (const auto& u : defaultTypeParamUses_) {
             if (u.owner != site.owner || u.param != site.param) continue;
             bodyTakesDefault = true;
             useUnconstrained = u.unconstrained;
+            useDerived = u.derived;
             useLoc = u.loc;
             break;
         }
@@ -427,8 +484,10 @@ void ExprTC::checkDeferredDefaultInstantiations() {
             ctx_.diagnostics().report(
                 Severity::Error, site.loc,
                 "type argument `" + site.argName +
-                "` is not defaultable (§17.11): the generic body takes "
-                "`default(" + site.param + ")` (line " +
+                "` is not defaultable (§17.11): the generic body " +
+                (useDerived ? "passes `" + site.param + "` on to a generic "
+                              "whose chain ends in a `default(T)` (line "
+                            : "takes `default(" + site.param + ")` (line ") +
                 std::to_string(useLoc.line) + "), which has no well-defined "
                 "zero value for this substitution, but " + structuralReason(a));
             continue;
