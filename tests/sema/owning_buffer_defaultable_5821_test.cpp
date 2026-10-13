@@ -81,3 +81,78 @@ BEZEL_TEST(sema_owning_buffer_defaultable_5821,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(r.exitCode == 4);
 }
+
+// REJECT — a choice element: `default(Shape)` is not defined (§35.10 / §17.11),
+// so the one-argument constructor is rejected with the choice-specific reason.
+BEZEL_TEST(sema_owning_buffer_defaultable_5821,
+           owning_buffer_one_arg_choice_rejected_spec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "choice Shape "
+        "  Circle(r: int), "
+        "  Square(s: int); "
+        "end Shape; "
+        "class Main "
+        "  public static method Main(): int "
+        "    using var b := new OwningBuffer<Shape>(4); "
+        "    return b.Length; "
+        "  end Main; "
+        "end Main;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "`new OwningBuffer<Shape>(n)` with one argument is not admitted"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a choice type has no default (§35.10)"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§14.2"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§17.11"));
+}
+
+// REJECT — a record with a non-nullable `string` field: the record is not
+// defaultable (§17.11, a record carrying a non-nullable reference field), so
+// the one-argument constructor is rejected naming the record.
+BEZEL_TEST(sema_owning_buffer_defaultable_5821,
+           owning_buffer_one_arg_string_record_rejected_spec_17_11) {
+    auto r = runAot(
+        "module M; "
+        "record Name(s: string); "
+        "class Main "
+        "  public static method Main(): int "
+        "    using var b := new OwningBuffer<Name>(4); "
+        "    return b.Length; "
+        "  end Main; "
+        "end Main;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "`new OwningBuffer<Name>(n)` with one argument is not admitted"));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "record `Name` has a non-defaultable component"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§14.2"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§17.11"));
+}
+
+// REJECT — a constructor-only record (§9.9): a body-form record whose
+// constructor carries a `requires` clause has no zero value, so the
+// one-argument constructor is rejected naming the constructor-only property.
+BEZEL_TEST(sema_owning_buffer_defaultable_5821,
+           owning_buffer_one_arg_constructor_only_rejected_spec_9_9) {
+    auto r = runAot(
+        "module M; "
+        "record Port "
+        "  public readonly property Value: int; "
+        "  public constructor(value: int) "
+        "    requires(value >= 0 and value <= 65535) "
+        "    Value := value; "
+        "  end constructor; "
+        "end Port; "
+        "class Main "
+        "  public static method Main(): int "
+        "    using var b := new OwningBuffer<Port>(4); "
+        "    return b.Length; "
+        "  end Main; "
+        "end Main;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "`new OwningBuffer<Port>(n)` with one argument is not admitted"));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "record `Port` has a non-defaultable component or is constructor-only"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§17.11"));
+}
