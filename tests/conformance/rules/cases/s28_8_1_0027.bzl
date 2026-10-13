@@ -1,14 +1,17 @@
 //! case: s28_8_1_0027
 //! doc: spec
 //! section: 28.8.1
-//! title: after a destructor's bare take of a non-nullable field a read of the field is rejected
-//! rule: at a non-nullable field the field holds no value for the rest of the
-//!   body — a later read of it there through the field's own spelling is a
-//!   read of a moved-from location ... and is rejected until the field is
-//!   reassigned.
+//! title: a destructor body's bare take of a non-nullable field is rejected as in any other body
+//! rule: Inside a destructor body, the fields of the object being torn down are
+//!   owned locations like any other: `move x.f with e` exchanges, `move x.f`
+//!   at a nullable field stores `null`, and a non-nullable field is not taken
+//!   bare — the compile error names, beside the two remedies above, the
+//!   field's explicit `Dispose()` where the destructor's class declares the
+//!   field.
 //! cites: 28.8.1, 28.4
 //! expect: reject
-//! diagnostic: moved-from
+//! diagnostic: with
+//! issue: 5923
 module Conf;
 
 public class Res

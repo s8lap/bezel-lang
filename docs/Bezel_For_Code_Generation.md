@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.336. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.337. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.336 and `Bezel_Standard_Library.md` v0.336 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.337 and `Bezel_Standard_Library.md` v0.337 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -156,8 +156,8 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter. A `this(...)` chain must end at a constructor with no `this(...)`; a cycle is rejected. A **class** that declares no instance constructor has an implicit `public` parameterless one, so `new C()` compiles; declaring any instance constructor (a primary parameter list included) removes it, and a **body record** has no such implicit constructor | §22.7, §12.8 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
-| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). Declaring `Equals` at all obliges `GetHashCode` beside it — on a record, enum or choice in either spelling, except on a choice owning at every instantiation (v0.317; records v0.336). | §25.2, §9.2, §8.3 |
-| `override` on a value kind | only `Equals`, `GetHashCode` and `ToString` take it, `override` or plain (§9.2); on a record, an enum and a choice alike the `Equals` is the one taking the type's **own** type — `public override method Equals(other: Priority): bool`, `public method Equals(other: Money): bool` — and it **is** the `Object` slot: a boxed value and an `Object?` argument reach it (a non-own-typed argument is unequal), an `Equals(o: Object?)` is **rejected** on every value kind, `override` or plain, and the own-typed `Equals` obliges `GetHashCode` beside it (§8.3) | §9.2, §10.5, §35.2, §8.3 |
+| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record or value-like choice of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. Declaring `Equals` or `GetHashCode` (either spelling) strips the same package on a record or value-like choice; the type is then **hashable** on the declared pair, and `=`/`<>` are rejected until the overloads are written (§3.6, §9.2, §35.7). A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). Declaring `Equals` at all obliges `GetHashCode` beside it — on a record, enum or choice in either spelling, except on a choice owning at every instantiation (v0.317; records v0.336). | §25.2, §9.2, §8.3 |
+| `override` on a value kind | only `Equals`, `GetHashCode` and `ToString` take it, `override` or plain (§9.2); on a record, an enum and a choice alike the `Equals` is the one taking the type's **own** type — `public override method Equals(other: Priority): bool`, `public method Equals(other: Money): bool` — and it **is** the `Object` slot: a boxed value and an `Object?` argument reach it (a non-own-typed argument is unequal), an `Equals(o: Object?)` is **rejected** on every value kind, `override` or plain, and the own-typed `Equals` obliges `GetHashCode` beside it (§8.3); an interface member `Equals(other: Object?)`, `GetHashCode(): int` or `ToString(): string` is satisfied by the member filling that slot — none, no conformance (§14.2) | §9.2, §10.5, §35.2, §8.3, §14.2 |
 | Invariant | `invariant(_bal + _limit >= 0m);` — class bodies only, no visibility, keeps its `;` | §22.16 |
 | Nested type | `public record Token(…);` inside a class body — visibility **required**; one type per declaration, blind to an enclosing generic's type parameters (declare its own: `Node<U>` inside `Tree<T>`, used there as `Node<T>`); outside `Tree` and the bodies of types deriving from it, it has no type spelling (`Tree.Node<int>` is an arity error and `Tree<int>.Node<int>` does not parse in a type): reach it through a chain head (`Tree<int>.Node<int>.Create()`) or an inferred local, or declare it top-level | §11.6 |
 
@@ -381,6 +381,7 @@ async lambda(u: string) => await Fetch(u)
 lambda(_, x) => x                           // `_` ignore; duplicates legal
 lambda(Entry(k, v)) => $"{k}: {v}"          // positional-record destructuring parameter (§27.4)
 lambda(owned h) => _handlers.Add(h)         // modifiers when the target type declares them
+Vec.Scaled   /   v.Scaled                   // extension-method reference, type-qualified `(Vec) -> int` / receiver-qualified `() -> int` (captures `v`)
 
 (int, int) -> int      () -> ()      (owned T) -> ()      (ref int) -> ()
 (out owned T) -> ()    ((int) -> bool)?                   // parens required before `?`
@@ -474,7 +475,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 **The no-silent-consume rule.** An unmarked read of a class-typed binding *never* consumes. `var b := a;` is always a borrow of `a`. This is the single most important spelling fact in the language (§28.3).
 
-**Field and slot moves replace, never empty** (§28.8.1). `move obj.f with e` evaluates the receiver, then `e`, then stores `e` and yields the old value in one step: the field holds `e` afterwards, nothing is ever left to restore, and the `move` may sit anywhere — before or after a call, across an `await`, in a `return`. `e` is an owned value (a fresh producer, a `move` result, a named owned binding written **unmarked** — the position is a store into an owned location — or `null` at a nullable location); a borrow or a `using var` is rejected. Where the field's or slot's declared type is **non-nullable** the `with` clause is **required**: `return move _f;` at `owned _f: T` is a compile error naming `move _f with fresh` and the nullable declaration (and `PopAt`/`PopValue` at an `OwningArray<T>`/`OwningDictionary<K, V>` slot). Where it is nullable the bare form stores `null` (`return move _c!;` is the detach). An exception in the receiver, the index or `e` leaves the location untouched. Only a `destructor` body takes a field of its own object bare whatever its nullability (the cascade skips it). Static owned storage admits no `move` at all (K9.4).
+**Field and slot moves replace, never empty** (§28.8.1). `move obj.f with e` evaluates the receiver, then `e`, then stores `e` and yields the old value in one step: the field holds `e` afterwards, nothing is ever left to restore, and the `move` may sit anywhere — before or after a call, across an `await`, in a `return`. `e` is an owned value (a fresh producer, a `move` result, a named owned binding written **unmarked** — the position is a store into an owned location — or `null` at a nullable location); a borrow or a `using var` is rejected. Where the field's or slot's declared type is **non-nullable** the `with` clause is **required**: `return move _f;` at `owned _f: T` is a compile error naming `move _f with fresh` and the nullable declaration (and `PopAt`/`PopValue` at an `OwningArray<T>`/`OwningDictionary<K, V>` slot). Where it is nullable the bare form stores `null` (`return move _c!;` is the detach). An exception in the receiver, the index or `e` leaves the location untouched. Static owned storage admits no `move` at all (K9.4).
 
 **`using var`** (§28.10): owned, disposed at the block's end on **every** exit edge, non-reassignable, and **never movable out of**. `using var fresh := new Buffer(); … return fresh;` is a compile error; a factory uses plain `var`.
 
@@ -673,7 +674,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.336 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.337 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1461,7 +1462,7 @@ Every absence below was verified by a full-document search. Reaching for one of 
 
 **Query operators.** `ToList`, `ToLookup`, `Join`, `GroupJoin`, `Cast<T>`, `AsEnumerable`, `DefaultIfEmpty`, `Prepend`, `Append`, `Chunk`, `DistinctBy`, `UnionBy`/`IntersectBy`/`ExceptBy`, `MinBy`, `MaxBy`, `Order()`/`OrderDescending()`, `TakeLast`, `SkipLast`, `LongCount`, `Enumerable.Empty`/`Range`/`Repeat` (**there is no `Enumerable` class at all**), `SequenceEqual` over `IEnumerable<T>` (it exists only on the span types), `SelectMany` with a result selector, `Zip` without a combiner, `Where`/`Select` with an index, and an instance `ForEach(action)` on any sequence (`Array<T>` and `string` included — write the `for` loop). Replacements: `ToList` → `ToArray()`; `MinBy(f)` → `OrderBy(f).First()`; `Enumerable.Range` → the language's `1..n`, which is `IEnumerable<T>` (`(1..100).Sum()` works); `Append`/`Prepend` → `Concat` with a one-element `Array<T>`.
 
-**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `SlotMap`/`Arena`/`GenerationalArena`/`Pool` as plain names and any borrowing slot map (→ `OwningSlotMap<T>` with `SlotHandle` keys, v0.307 — the only form; a handle from another map faults), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`; `Counter<K>` has no `ContainsKey` (→ `Contains(key)`, `key in tally`, v0.290); `IReadOnlySpan<T>` does not exist (→ two overloads, `(ReadOnlySpan<T>)` and `(ReadOnlyArraySpan<T>)`; a writable span passes `.AsReadOnly()`).
+**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `SlotMap`/`Arena`/`GenerationalArena`/`Pool` as plain names and any borrowing slot map (→ `OwningSlotMap<T>` with `SlotHandle` keys, v0.307 — the only form; a handle from another map faults), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay) and no `Hypot`/`Cbrt`/`PI` (never documented) — the compiler rejects every one of these with a removed-at-v0.284 diagnostic (#3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559, rejected likewise); `Console` has no `Clear` since v0.284 (rejected as an unknown `Console` static, #3572); `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`; `Counter<K>` has no `ContainsKey` (→ `Contains(key)`, `key in tally`, v0.290); `IReadOnlySpan<T>` does not exist (→ two overloads, `(ReadOnlySpan<T>)` and `(ReadOnlyArraySpan<T>)`; a writable span passes `.AsReadOnly()`); no `Swap(i, j)` on any owning collection or inline array (two non-nullable owned slots exchange through a third value — `var t := move xs[i] with (move xs[j] with placeholder); xs[j] := t;` — or by `PopAt`/`Insert`; two nullable slots need none: `var t := move a[i] with (move a[j]); a[j] := t;`).
 
 **Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting, `string.IsNullOrEmpty` (→ `s = null or s.IsEmpty`, v0.290), the static `string.Compare(a, b[, ignoreCase])` (→ `a.CompareTo(b)`, `a.CompareTo(b, ignoreCase := true)`, v0.290).
 
@@ -1962,6 +1963,21 @@ end GetAsync;
 ```
 
 ```bezel
+destructor
+  using var t := move _resource;   // ERROR: `_resource` is non-nullable — `_resource.Dispose();` releases it here, `move _resource with fresh` exchanges, or declare it `FileStream?`
+end destructor;
+```
+
+> §28.8.1 *Constructors and destructors*: a destructor body is no exception to the required `with` — its fields are owned locations like any other. To release a field before the rest of the body runs, dispose it in place (§28.6's early release point; the cascade's own call afterwards is the no-op); to hand its value onward, declare the field nullable.
+
+```bezel
+destructor
+  _resource.Dispose();             // early release; the cascade's own call afterwards is a no-op
+  Console.WriteLine("closed");
+end destructor;
+```
+
+```bezel
 var t := move xs[0];               // ERROR: an `OwningArray<T>` slot is non-nullable — `move xs[0] with fresh`, or `xs.PopAt(0)`
 using var taken := move d[key];    // ERROR: same — `move d[key] with fresh`, or `d.PopValue(key)`
 var w := move a[0];                // ERROR: same at a `[2 owned]Cell` — `move a[0] with fresh`, or declare `[2 owned]Cell?`
@@ -2165,6 +2181,20 @@ var first := verts.FirstOrNull();                // ERROR: the member's `T?` res
 ```bezel
 public method Bumped(): Tally => this with(Hits := Hits + 1);   // return the updated value
 ```
+
+```bezel
+public choice Tag
+  A(n: int),
+  B;
+  public method Equals(other: Tag): bool => true;   // takes over equality: the generated `=`, `Equals`, `GetHashCode` and `ToString` go (§35.7)
+  public method GetHashCode(): int => 0;
+end Tag;
+var same := Tag.A(1) = Tag.A(2);     // ERROR: no `=` without the operator overloads — declare `operator =`/`<>`, or call `.Equals` (§35.7, §25.2)
+var seen := new Set<Tag>();         // fine: the declared pair makes `Tag` hashable (§3.6)
+Console.WriteLine($"{Tag.B}");      // ERROR: no generated `ToString` beside a declared `Equals` — declare `ToString()` (§35.7, §8.5)
+```
+
+> §35.7 / §9.2: on a record and a value-like choice alike, declaring `Equals` or `GetHashCode` in either spelling takes over equality — the generated package goes, `=`/`<>` need the operator overloads, and the declared pair alone makes the type **hashable** (`Set<Key>`, `where T: hashable`). A record declaring `Equals(other: Key)` with `GetHashCode` and no `=` is a hash key on the same terms. An interface member `Equals(other: Object?)` is satisfied by a value kind's own `Equals`, declared or generated; a kind with none does not conform (§14.2).
 
 A record whose constructor carries a contract clause:
 

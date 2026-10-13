@@ -2,9 +2,10 @@
 //! doc: spec
 //! section: 9.2
 //! title: overriding Equals and GetHashCode disqualifies auto-hashable and equality use is rejected
-//! rule: An override of Equals or GetHashCode means the author has taken over
-//!   equality; the record is therefore not auto-hashable, and =/<> are a compile
-//!   error unless the author also declares the operator =/<> overloads.
+//! rule: An `override` of `Equals` or `GetHashCode` ... Declaring either means
+//!   the author has taken over equality ... the record is therefore not
+//!   auto-hashable ... and `=`/`<>` are a compile error unless the author also
+//!   declares the `operator =`/`<>` overloads
 //! expect: reject
 //! diagnostic: auto-hashable
 module Conf;

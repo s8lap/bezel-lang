@@ -4,7 +4,8 @@
 //! title: a class conforming to a static-member interface satisfies its recurrence constraint
 //! rule: An interface that declares or inherits **static** members (§11.8) is
 //!   conformed to by no interface under this rule ... so `interface IThing:
-//!   IZero<IThing>` is a well-formed declaration that satisfies `where T:
+//!   IZero<IThing>`, over an `IZero<T>` declared without §11.8's recurrence
+//!   constraint, is a well-formed declaration that satisfies `where T:
 //!   IZero<T>` at no instantiation site — `Gen.Make<IThing>()` is a compile
 //!   error naming the constraint
 //! cites: 14.2, 11.8

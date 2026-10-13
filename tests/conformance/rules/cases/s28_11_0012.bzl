@@ -3,7 +3,8 @@
 //! section: 28.11
 //! title: a RemoveAt at the borrow's index after an intervening Insert draws no warning
 //! rule: `RemoveAt(i)` where the borrow was taken as `coll[i]` with the same
-//!   index expression, and no structural operation of §29.12's list on the
+//!   index expression — a constant, or a local read not reassigned between —
+//!   and no structural operation of §29.12's list on the
 //!   same collection binding between the borrow and the kill: a reposition or
 //!   removal ahead of the slot would change which element the index names.
 //! cites: 28.11, 29.12, 28.2
