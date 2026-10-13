@@ -12258,6 +12258,30 @@ void Emitter::emitEnsureInitFns() {
 // initialized (lazy, §22.13) before the access, routing a possible
 // TypeInitializationException through the current unwind target. No-op for a type
 // with no lazy ensureinit (a type with no static initializer at all).
+//
+// fix #5878 (§22.7, v0.334): the member-kind walk the `$ensureinit` exporter
+// gates on (see the lambda at the ensureinit emission loop below), hoisted so
+// `emitImplicitBase`'s new call site can share the rule instead of restating it.
+bool Emitter::hasAnyStaticMember(const sema::TypeSymbol* t) {
+    if (!t) return false;
+    auto isStaticMod = [](const sema::MemberSymbol* m) {
+        return std::find(m->modifiers.begin(), m->modifiers.end(),
+                         std::string_view("static")) != m->modifiers.end();
+    };
+    for (const sema::Symbol* m : t->members) {
+        if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
+            if (isStaticMod(fs)) return true;
+        } else if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(m)) {
+            if (isStaticMod(ms)) return true;
+        } else if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(m)) {
+            if (isStaticMod(ps)) return true;
+        } else if (auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m)) {
+            if (cs->isStatic) return true;
+        }
+    }
+    return false;
+}
+
 void Emitter::emitEnsureStaticInit(const sema::TypeSymbol* owner) {
     if (!owner) return;
     auto it = ensureInitFns_.find(owner);
@@ -15515,6 +15539,62 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                const sema::TypeSymbol* root) {
     const sema::TypeSymbol* b = baseClassOf(cls);
     if (!b) return;
+    // fix #5878 (§22.7, v0.334): "A static constructor runs once before the
+    // type's first use." Constructing `b` as a base SUBOBJECT is a first use
+    // of `b`, so `b`'s static constructor must run here — before its field
+    // initializers, which may read `b`'s own statics.
+    //
+    // Pre-fix this ran only via `emitInstanceInit`, which is reached on a
+    // DIRECT `new B()`. A base reached through the inheritance clause never
+    // goes through it: `emitImplicitBase` is the only construction path for a
+    // primary-base subobject, and it emitted no static-init guard at all. So
+    // `class D(a, b): B` printed nothing from `B`'s static constructor and left
+    // `B`'s static fields at their §7.9 defaults, with no diagnostic — a
+    // silent MISSING SIDE EFFECT, measured: `B` with
+    // `static constructor() Console.WriteLine("base-static-ran")` printed only
+    // the derived field's value.
+    //
+    // It must be emitted HERE and not at the base's own field-init: this is the
+    // one site every base-subobject construction converges on, in-module and
+    // imported alike (`emitInitEntryBody`'s steps 1+2 and the in-module `new`
+    // path both call `emitImplicitBase`), and it precedes every read of `b`'s
+    // statics below. `emitEnsureStaticInit` is idempotent (§22.13's
+    // once-per-type state machine), so the direct-`new` path's own call is
+    // unaffected by this one.
+    //
+    // GATED on a NON-GENERIC base, and that gate is load-bearing rather than
+    // cautious. §3.6 rule 2: a generic's statics are PER-INSTANTIATION, so the
+    // type to initialize is `B<string>`, not the `B<T>` template — and this
+    // function is handed `mostDerived` (`root`) exactly to resolve which
+    // instantiation an ancestor denotes (`computeAncestorGenericSubst` walks
+    // `ty->declaration`'s base chain positionally). Calling it here without
+    // that substitution targets `B<T>`'s erased template cell, and
+    // `emitEnsureStaticInit` then RUNS `B<T>`'s static initializer against it:
+    // MEASURED REGRESSION, `virtual_method_per_inst_static_vtable_4966.
+    // probe_q5_d_generic_derived` (green pre-fix, red with an ungated call) —
+    // `class B<T> { static _c } / class D<T>: B<T>`, constructing `D<string>`
+    // reset `B<string>._c` from 20 back to 0, so the next `new B<string>()`
+    // printed `10` where `30` was expected. `D<T>`'s OWN `emitInstanceInit` call
+    // already covers the per-instantiation case for a DIRECT `new D<string>()`;
+    // the subobject gap this fixes is the non-generic one, where the base has
+    // exactly one cell and no substitution to get wrong. Narrowing the gate to
+    // `b->genericParams.empty()` is the same condition `emitInitEntryBody` and
+    // the `$initprimary` arm already use to decide an exported init is safe to
+    // emit.
+    //
+    // `hasAnyStaticMember` is the second half of the same guard and is NOT
+    // optional: on an IMPORTED base `emitEnsureStaticInit` unconditionally
+    // references the exported `bz$<T>$ensureinit`, which the exporter emits only
+    // for a type with static state or any static member. Calling it for a base
+    // that has neither emits a reference to an undefined symbol — an
+    // UNRESOLVED EXTERNAL that surfaces as a LINK error with no compile
+    // diagnostic. MEASURED: `class Local: M.Base` over an imported base with
+    // only a non-static property stopped linking
+    // (`undefined reference to bz$M.Base$ensureinit`, the
+    // `sema_base_abstract_xmod_3238` T3 row, green before / red after). A base
+    // with no static member is never init-triggered, so skipping it is also the
+    // correct behaviour, not merely the linkable one.
+    if (b->genericParams.empty() && hasAnyStaticMember(b)) emitEnsureStaticInit(b);
     // fix #2908 (§14.1 / §12 / §22.8 step 1-2, v0.240): the class this
     // construction sequence started at — see the declaration comment. At an
     // entry point (`root == nullptr`) this is `cls`, so nothing changes there;

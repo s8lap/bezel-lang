@@ -16040,6 +16040,25 @@ private:
     // type without lazy static state (generic types, types with no static init).
     void emitEnsureStaticInit(const sema::TypeSymbol* owner);
 
+    // fix #5878 (§22.7, v0.334): true iff `t` has ANY static member — a static
+    // field, static method, static property, or a `static constructor`. This is
+    // the SAME predicate the `$ensureinit` exporter gates on (Setup.cpp:11886,
+    // a local lambda over exactly these four member kinds), hoisted to a member
+    // function so a new CALL SITE can ask the question without duplicating the
+    // rule and drifting from it.
+    //
+    // It exists because `emitEnsureStaticInit` on an IMPORTED type unconditionally
+    // references `bz$<T>$ensureinit`, and the exporter emits that symbol only for
+    // a type with static state or (for a local public non-generic type) any static
+    // member. Calling it for a type with NO static member at all therefore emits a
+    // reference to a symbol that is never defined — an UNRESOLVED EXTERNAL at
+    // link, not a compile diagnostic. Measured: `class Local: M.Base` over an
+    // imported base declaring only a non-static property failed to LINK with
+    // `undefined reference to bz$M.Base$ensureinit` (the
+    // `sema_base_abstract_xmod_3238.imported_concrete_base_property_via_base_
+    // still_accepted_12_3` row, green before this fix and red after).
+    static bool hasAnyStaticMember(const sema::TypeSymbol* t);
+
     // #1513 / §2.8.3 rule 4 / §22.12 rule 1: get-or-create the shared,
     // LinkOnceODR, per-instantiation static-field global for `fs` under the
     // substitution described by (substTypes, substIds, substSemaTys,
