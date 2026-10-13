@@ -1397,6 +1397,33 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     for (const auto& cc : td.choiceCases) {
         for (const auto& pf : cc.payload) {
             if (pf.type) resolveType(*pf.type, &typeScope);
+            // §35.1 (v0.334): "The `owned` payload marker's admissibility
+            // follows §28.1's type requirement verbatim: admissible on class
+            // types, interface types, and bare type parameters;
+            // admitted-but-redundant on move-only value types; a compile
+            // error on any other type." §28.1 lists choice payloads among
+            // its admissible positions and clause 2 makes `owned` on a
+            // primitive / `string` / `Type` / function type / record / enum /
+            // non-owning inline array / unit type a compile error.
+            //
+            // Payload fields were never wired through that check (the same
+            // gap #4685 closed for class `owned` FIELDS — see the field
+            // branch in resolveMember below), so the class-side admission
+            // silently accepted every inadmissible payload type.
+            //
+            // Unlike the class-FIELD branch, there is no §28.5 double-marking
+            // carve-out to make room for here: a non-owning inline array
+            // payload is rejected and an owning one is admitted-but-redundant
+            // by §28.1's own move-only clause, which is exactly what
+            // checkOwnedDeclType's InlineArray arm already implements. So the
+            // payload position defers to that machinery wholesale.
+            if (pf.modifier == "owned" && pf.type) {
+                if (const TypeRef* rt = ctx_.resolvedType(*pf.type))
+                    checkOwnedDeclType(
+                        rt, pf.loc,
+                        std::string("payload `") + std::string(pf.name) +
+                            "` of case `" + std::string(cc.name) + "`");
+            }
         }
     }
     // SerializedClassClause polymorphic case types.
