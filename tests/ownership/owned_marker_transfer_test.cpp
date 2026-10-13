@@ -24,12 +24,12 @@
 #include <string>
 #include <string_view>
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"       // runAot — AOT oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::parseAndCheckOwnership;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
@@ -340,7 +340,7 @@ BEZEL_TEST(owned_marker, marked_transfer_disposes_once_value) {
         "    return Cell.live; "                        // 0 — disposed exactly once
         "  end Main; "
         "end C;";
-    auto r = runJit(src);
+    auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
