@@ -1467,15 +1467,6 @@ struct PositionalPattern {
     // keyword (§B.1) and lexes as TokenKind::Keyword, so the parser must test
     // it with isKeyword(), never under an Identifier guard.
     //
-    // fix #4763 follow-up (v0.334): an ADMITTED marker SURVIVES sema, beside
-    // `namedSlot` and where `slotName` does not. §19.3's ownership rule is
-    // keyed on the slot's SPELLING and the marker's operand is the payload
-    // field, so ownership and codegen must be able to tell a MARKED named slot
-    // — which DOES transfer, "exactly as the corresponding positional slot
-    // would" — from an unmarked one, which never does. Only meaningful together
-    // with `namedSlot` (a positional slot never carries it: the parser sets it
-    // on the `move Identifier "="` branch alone).
-    bool hasMoveMarker = false;
     // §19.3 "Named-slot bindings and ownership" (v0.334): TRUE when this slot
     // was WRITTEN in the named form (`N = p`). Unlike `slotName` — which
     // normalization clears once the name has been resolved to a declaration
@@ -1487,10 +1478,9 @@ struct PositionalPattern {
     // spelling therefore does not merely lose information, it inverts the
     // ownership class of the binding (#4763).
     //
-    // A slot reaching ownership or codegen with this set is either UNMARKED or
-    // MARKED; `hasMoveMarker` beside it says which, and the two passes that
-    // must agree (`collectOwningMatchTransferBindings`,
-    // `markOwningMatchTransferredSlots`) key their skip on exactly that pair.
+    // A named slot never transfers (v0.338 retired the marked slot); the two
+    // passes that must agree (`collectOwningMatchTransferBindings`,
+    // `markOwningMatchTransferredSlots`) key their skip on this field.
     bool namedSlot = false;
 };
 

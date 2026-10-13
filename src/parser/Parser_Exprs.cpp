@@ -1672,7 +1672,6 @@ ast::PositionalPattern Parser::parsePositionalPattern() {
                             "`move` is not a slot spelling — a named slot "
                             "never transfers; write the positional destructure "
                             "(§19.3, §35.5)");
-        pp.hasMoveMarker = true;
         advance();  // `move`
     }
     // A named slot is an Identifier followed by `=`. `=` cannot occur in a

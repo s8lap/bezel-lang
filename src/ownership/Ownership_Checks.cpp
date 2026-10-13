@@ -8115,24 +8115,9 @@ void MethodOwnership::collectOwningMatchTransferBindings(
         // remainder ("unlisted fields, unmarked named slots, discarded
         // siblings").
         //
-        // A MARKED named slot DOES transfer: §19.3 "Named-slot bindings and
-        // ownership" — "A named slot may instead carry the transfer marker on
-        // its **source**: `move N = var x` … On arm selection each marked
-        // payload transfers into its binding exactly as the corresponding
-        // positional slot would: `x` is an owned local of the arm body's scope
-        // under §35.5's standard arm-binding rules". §15.3 says the same for a
-        // move-only payload ("a case-payload of move-only value type matched by
-        // a **positional slot or a marked named slot** instead **transfers into
-        // its binding at arm selection**").
-        //
-        // So the skip is UNMARKED named slots only. Sema admits the marker and
-        // PRESERVES `hasMoveMarker` through normalization (it used to clear it
-        // with `slotName`, which is why this line could once be unconditional);
-        // codegen's `markOwningMatchTransferredSlots` skips exactly the
-        // complement of this set, and the two error directions are asymmetric —
-        // marking a slot the arm did not adopt LEAKS it, failing to mark one it
-        // did DOUBLE-FREES — so neither side may be widened alone.
-        if (sp.namedSlot && !sp.hasMoveMarker) continue;
+        // No named slot transfers (`move` is not a slot spelling, §19.3,
+        // v0.338): every named slot stays in the un-transferred remainder.
+        if (sp.namedSlot) continue;
         // §35.5: only a WHOLE-slot binding receives the transfer. A discard,
         // a constant, a range, and a nested pattern beneath the slot are "the
         // un-transferred remainder", disposed at construct completion — and a
@@ -8960,28 +8945,6 @@ void MethodOwnership::collectArmBindingAnchors(
     // introduce no binding.
 }
 
-// §19.3 "Named-slot bindings and ownership" (v0.334): does `arm` carry a
-// MARKED named slot at all — the shape condition (i) is checked against.
-//
-// Only the arm's OWN top level is scanned, deliberately: §19.3 conditions (ii)
-// and (iii) constrain a slot's own payload and its own right-hand side, and
-// sema enforces both at the slot, so a marker can only be admitted on a
-// top-level slot of a choice case. A `PositionalPattern` nested under another
-// slot's pattern is never a named slot at all (the `Identifier "="` form is
-// only reachable from `parsePositionalPattern`), which is what makes this
-// whole-shape scan exact rather than a heuristic.
-//
-// Used only by the condition-(i) refusal, so over-reporting here costs a
-// missing diagnostic, never a wrong verdict. // per §19.3, §35.5, v0.334
-bool MethodOwnership::armHasMarkedNamedSlot(const ast::CaseArm& arm) {
-    const auto* dp =
-        dynamic_cast<const ast::DestructuringPattern*>(arm.pattern.get());
-    if (!dp) return false;
-    for (const ast::PositionalPattern& sp : dp->subPatterns)
-        if (sp.namedSlot && sp.hasMoveMarker) return true;
-    return false;
-}
-
 // §19.3 "Named-slot bindings and ownership" (v0.334): the WHOLE-SLOT anchors
 // of `p`'s UNMARKED NAMED slots — exactly the set
 // `collectOwningMatchTransferBindings` now skips, so the two agree on which
@@ -8998,11 +8961,7 @@ void MethodOwnership::collectNamedSlotAnchors(const ast::Pattern* p,
     const auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p);
     if (!dp) return;   // a BindingPattern / AltPattern head names no slot
     for (const ast::PositionalPattern& sp : dp->subPatterns) {
-        // UNMARKED only, and that is now a FILTER rather than a consequence:
-        // since #4763's follow-up a MARKED named slot is a transfer
-        // (`collectOwningMatchTransferBindings` admits it), so its binding is
-        // never borrow-only and this map never carries it.
-        if (!sp.namedSlot || sp.hasMoveMarker) continue;
+        if (!sp.namedSlot) continue;
         if (!sp.nakedBinding.empty()) {
             if (sp.nakedAnchor) out.push_back(sp.nakedAnchor.get());
         } else if (auto* bp =
@@ -9049,36 +9008,6 @@ void MethodOwnership::registerBorrowOnlyArmBindings(
     const bool owning = owningMatchScrutineeForm(scrutinee);
     const sema::TypeRef* scrutRef = ctx_.exprType(*scrutinee);
     for (const ast::CaseArm& arm : arms) {
-        // §19.3 "Named-slot bindings and ownership", condition (i) (v0.334):
-        // "The marked slot is admitted exactly when **(i)** the match is an
-        // **owning match** (§35.5 — either trigger)". This is where that
-        // condition lives: `owningMatchScrutineeForm` is the ONE authority for
-        // "owning match" (§35.5 announces it in exactly two scrutinee forms),
-        // and sema cannot decide it — the marker is a property of the SLOT, the
-        // owning-ness of the SCRUTINEE.
-        //
-        // The spec names the refusal and its two remedies: "The marker anywhere
-        // else is a compile error naming the failed condition: on a slot of a
-        // **borrowing match** (the scrutinee retains ownership, so no slot can
-        // mint an obligation from it — the diagnostic names both routes: mark
-        // the scrutinee, `case move x of`, or match the temporary)".
-        //
-        // Placed before the anchor loop and `continue`s past it so this is the
-        // ONE diagnostic the arm produces: the marker's rejection explains the
-        // borrow the arm binding would otherwise get, so letting
-        // `reportIfBorrowOnlyArmBindingMove` fire as well would add a second
-        // message whose text assumes the slot was unmarked.
-        if (!owning && armHasMarkedNamedSlot(arm)) {
-            if (!suppressDiag_)
-                report(Severity::Error, arm.pattern->span.begin,
-                    "`move` marker on a named slot in this pattern is admitted "
-                    "only in an owning match (§35.5, either trigger); this "
-                    "scrutinee leaves a borrowing match — it retains ownership, "
-                    "so no slot can mint an obligation from it. Mark the "
-                    "scrutinee (`case move x of`), or match the temporary "
-                    "(§19.3, §35.5)");
-            continue;
-        }
         std::vector<const ast::Node*> anchors;
         collectArmBindingAnchors(arm.pattern.get(), anchors);
         if (anchors.empty()) continue;
@@ -9255,8 +9184,8 @@ void MethodOwnership::reportIfBorrowOnlyArmBindingMove(
         it->second.owningMatch
             ? std::string(
                   "Read through the binding without transferring, or write the "
-                  "positional destructure / marked named slot that does "
-                  "transfer it (\xc2\xa7""35.5).")
+                  "positional destructure, which transfers it "
+                  "(\xc2\xa7""19.3, \xc2\xa7""35.5).")
             : std::string(
                   "Announce the consume at the SCRUTINEE instead (`case move "
                   "<scrutinee> of \xe2\x80\xa6`, \xc2\xa7""35.5's owning "
@@ -9325,8 +9254,8 @@ void MethodOwnership::reportIfBorrowOnlyMoveOnlyArmBindingConsume(
         it->second.owningMatch
             ? std::string(
                   "this binding is not one the owning match transfers into "
-                  "(only a positional slot or a marked named slot of a "
-                  "move-only payload receives the transfer at arm selection)")
+                  "(only a positional slot of a move-only payload "
+                  "receives the transfer at arm selection)")
             : std::string(
                   "a borrowing match transfers nothing to its bindings");
     report(Severity::Error, id->span.begin,
