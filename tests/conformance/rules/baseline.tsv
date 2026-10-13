@@ -277,10 +277,8 @@ s8_6_0005	pass
 s8_6_0006	pass	
 s8_6_0007	pass	#5659
 s8_6_0008	pass	
-s8_6_0009	pass	#5659
 s8_6_0010	pass	#5659
 s8_6_0011	pass	
-s8_6_0012	pass	
 s9_1_0001	pass	
 s9_1_0002	pass	
 s9_1_0003	pass	
@@ -321,7 +319,6 @@ s9_4_0006	pass
 s9_4_0007	pass	
 s9_4_0008	fail	output mismatch: expected 'faulted', got 'True'
 s9_4_0009	pass	
-s9_4_0010	fail	program crashed (exit -11)
 s9_5_0001	pass	
 s9_5_0002	pass	
 s9_5_0003	pass	
@@ -361,7 +358,6 @@ s9_7_0025	fail	#5649
 s9_7_0026	pass	
 s9_7_0027	pass	#5659
 s9_7_0028	pass	#5659
-s9_7_0029	pass	#5659
 s9_7_0030	pass	
 s9_7_0037	pass	#5590
 s9_7_0038	pass	#5590
@@ -592,9 +588,6 @@ s15_1_1_0005	pass
 s15_1_1_0006	pass	
 s15_1_1_0007	pass	
 s15_1_1_0008	pass	
-s15_1_1_0009	fail	#5652
-s15_1_1_0010	pass	#5652
-s15_1_1_0011	fail	divergence
 s15_1_2_0001	pass	
 s15_1_2_0002	pass	
 s15_1_3_0001	pass	
@@ -2150,9 +2143,6 @@ l4_15_0004	pass
 l4_15_0005	pass	
 l4_15_0006	pass	
 l4_16_0001	pass	
-l4_16_0002	pass	
-l4_16_0003	pass	
-l4_16_0004	pass	
 l4_17_0001	pass	
 l4_17_0002	pass	
 l4_17_0003	pass	
