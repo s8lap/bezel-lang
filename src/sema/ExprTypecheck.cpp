@@ -476,6 +476,26 @@ void ExprTC::checkDeferredDefaultInstantiations() {
         // `OwningTask<int>`), and DEFERS (returns false) for an unresolved
         // bare type parameter (a generic body instantiating another generic
         // with its own `T`), which its own instantiation sites judge.
+        // fix #6008 (§17.11 v0.338, §3.6 rule 2): a bare argument that names
+        // a type parameter of the ENCLOSING generic owner (`U.Dflt<Array>()`
+        // inside `ViaDflt<Array>`, where `Array` shadows the built-in) is
+        // that parameter, not the built-in of the same spelling. Its own
+        // substitution is judged at that owner's instantiation sites through
+        // the derived chain (propagateDefaultTypeParamChains), so skip it
+        // here rather than judging the name as a collection.
+        if (a->kind == TypeRef::Kind::Named && !a->declaration &&
+            !a->nullable && a->genericArgs.empty() &&
+            !a->isAliasQualifiedBuiltin()) {
+            std::string_view an = a->headName();
+            bool enclosingParam = false;
+            if (site.inMethod)
+                for (const auto& gp : site.inMethod->genericParams)
+                    if (gp.name == an) enclosingParam = true;
+            if (!enclosingParam && site.inType && site.inType->decl)
+                for (const Symbol* gp : site.inType->genericParams)
+                    if (gp && gp->name == an) enclosingParam = true;
+            if (enclosingParam) continue;
+        }
         if (!defaultIllFormed(a)) continue;
         // #5820 (§17.11 v0.338, generic-body list bullet 1): an unconstrained
         // `default(T)` is rejected at every non-defaultable substitution; the

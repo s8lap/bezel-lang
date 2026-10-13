@@ -5687,7 +5687,24 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // diagnostic — its remedy is "declaring a zero-valued
                 // constant", not the `default(T?)` the shared reference-type
                 // message prescribes.
-                if (defaultIllFormed(rt) && rt->kind == TypeRef::Kind::Named &&
+                // fix #6008 (§17.11, v0.338; §3.6, §2.2): a bare, non-nullable
+                // reference to an IN-SCOPE type parameter is a parameter, not
+                // the built-in of the same spelling — `Direct<Array>(): ...
+                // default(Array)` has no well-defined zero for every
+                // substitution, but the substitution decides, and the
+                // instantiation-site join judges it. Defer here (the same
+                // answer defaultIllFormed gives for an unresolved bare
+                // parameter) instead of judging the name `Array` as the
+                // built-in collection. `D.Stopwatch` (§2.2 alias qualifier)
+                // still names the built-in, so it is excluded.
+                const bool bareInScopeTypeParamRef =
+                    rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    !rt->nullable && rt->genericArgs.empty() &&
+                    !rt->isAliasQualifiedBuiltin() &&
+                    isInScopeTypeParam(rt->headName());
+                const bool rtIllFormed =
+                    !bareInScopeTypeParamRef && defaultIllFormed(rt);
+                if (rtIllFormed && rt->kind == TypeRef::Kind::Named &&
                     rt->declaration &&
                     rt->declaration->kind == ast::TypeDeclKind::Enum) {
                     ctx_.diagnostics().report(
@@ -5697,7 +5714,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "` — it declares no constant of underlying value 0, so "
                         "it has no well-defined zero value; declare a "
                         "zero-valued constant (§17.11)");
-                } else if (defaultIllFormed(rt) && rt->kind == TypeRef::Kind::Named &&
+                } else if (rtIllFormed && rt->kind == TypeRef::Kind::Named &&
                            rt->declaration &&
                            rt->declaration->kind == ast::TypeDeclKind::Record &&
                            recordIsConstructorOnly(rt->declaration)) {
@@ -5721,7 +5738,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "a constructor call, so there is no zero value to "
                         "materialize; the remedy is a constructor call "
                         "(\xC2\xA7""9.9, \xC2\xA7""17.11)");
-                } else if (defaultIllFormed(rt) && rt->kind == TypeRef::Kind::Named &&
+                } else if (rtIllFormed && rt->kind == TypeRef::Kind::Named &&
                            rt->declaration == ctx_.builtinClassSym("Range")) {
                     // fix #3108 (§16.3/§16.4, v0.242): `default(Range<T>)` is a
                     // compile error — the all-zeroes `Range<T>` would have step=0,
@@ -5734,7 +5751,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             "the all-zeroes value would have step=0, falsifying "
                             "§16.4's no-zero-step invariant; the empty range is "
                             "spelled `0..<0` (§17.11)"));
-                } else if (defaultIllFormed(rt)) {
+                } else if (rtIllFormed) {
                     std::string detail;
                     if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
                         rt->declaration->kind == ast::TypeDeclKind::Record)

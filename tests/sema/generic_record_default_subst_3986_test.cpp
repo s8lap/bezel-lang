@@ -896,3 +896,97 @@ BEZEL_TEST(generic_default_chain_5962b,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }
+
+// fix #6008 (§17.11 v0.338, L3519; §3.6 rule 2; §2.2): a type parameter whose
+// NAME shadows a built-in collection (`Array`, `Set`, `Task`, ...) is the
+// parameter, not the built-in, so `default(T)` at its substitution is judged
+// by the substituted type. The issue's repro: `ViaDflt<Array>` passes its own
+// `Array` to `Dflt<T>` (`default(T)`), and `Y.ViaDflt<int>()` is defaultable.
+namespace {
+
+const char* const kShadow6008 =
+    "static class U6008 "
+    "  public static method Dflt<T>(): int var t := default(T); return 7; end Dflt; "
+    "end U6008; "
+    "static class Y6008 "
+    "  public static method ViaDflt<Array>(): int return U6008.Dflt<Array>(); end ViaDflt; "
+    "end Y6008; "
+    "static class D6008 "
+    "  public static method Direct<Array>(): int "
+    "    var a: Array := default(Array); return 5; end Direct; "
+    "end D6008; ";
+
+}  // namespace
+
+// Accept: the substitution `int` is defaultable, so the shadowed name never
+// reaches the built-in classification.
+BEZEL_TEST(generic_default_builtin_name_6008,
+           via_dflt_shadowed_array_int_runs_spec_17_11) {
+    auto r = runAot(
+        "module SH6008a; " + std::string(kShadow6008) +
+        "class P public static method Main(): int "
+        "  return Y6008.ViaDflt<int>(); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// Reject stays: `string` is non-defaultable at the instantiation site of
+// `ViaDflt`. The rejection is reported ONCE, at the outer call (the
+// `Array`-spelled inner link is no longer judged as a built-in collection).
+BEZEL_TEST(generic_default_builtin_name_6008,
+           via_dflt_shadowed_array_string_rejected_once_spec_17_11) {
+    auto r = runAot(
+        "module SH6008b; " + std::string(kShadow6008) +
+        "class P public static method Main(): int "
+        "  return Y6008.ViaDflt<string>(); end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "type argument `string` is not defaultable (\xC2\xA7""17.11)"));
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "is not defaultable"), 1);
+}
+
+// Direct form: `Direct<Array>` writes `default(Array)` on its own type
+// parameter. Base rejected the body by the built-in name; with `int` it runs.
+BEZEL_TEST(generic_default_builtin_name_6008,
+           direct_default_shadowed_array_int_runs_spec_17_11) {
+    auto r = runAot(
+        "module SH6008c; " + std::string(kShadow6008) +
+        "class P public static method Main(): int "
+        "  return D6008.Direct<int>(); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+// Direct form, rejected substitution: the body is not judged by name (no
+// "compile error for a non-nullable reference type" at `default(Array)`);
+// the `string` instantiation site is the one rejection.
+BEZEL_TEST(generic_default_builtin_name_6008,
+           direct_default_shadowed_array_string_rejected_at_site_spec_17_11) {
+    auto r = runAot(
+        "module SH6008d; " + std::string(kShadow6008) +
+        "class P public static method Main(): int "
+        "  return D6008.Direct<string>(); end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "type argument `string` is not defaultable (\xC2\xA7""17.11)"));
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(
+                        r, "is a compile error for a non-nullable reference"),
+                    0);
+}
+
+// Guard: a NON-shadowing built-in is still a non-defaultable reference type
+// (`default(Array<int>)` in a non-generic body), so the fix is not a blanket
+// accept of built-in collection names.
+BEZEL_TEST(generic_default_builtin_name_6008,
+           builtin_array_default_still_rejected_spec_17_11) {
+    auto r = runAot(
+        "module SH6008e; "
+        "class P public static method Main(): int "
+        "  var a: Array<int> := default(Array<int>); return 0; end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "is a compile error for a non-nullable reference type"));
+}
