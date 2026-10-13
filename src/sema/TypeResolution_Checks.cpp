@@ -6075,6 +6075,16 @@ static bool overrideWideningIsAbiSafe(const TypeRef* t, bool isByRefParam) {
             return !isByRefParam;  // #1592: enum/record value types.
         return false;
     }
+    // fix #6039 (§12.1, v0.338): a compiler-known class (the built-in exceptions,
+    // Stack, Queue, StringBuilder, ...) has no sema declaration, but it is a
+    // reference type: a heap-pointer builtin lowered to `ptr` (its `T?` is the
+    // same pointer slot, null = absent), so the widening is ABI-safe exactly as
+    // for a user class above. Keyed on the head name via the shared registries;
+    // a bare type parameter is not a registered name and stays declined below.
+    if (t->kind == TypeRef::Kind::Named && !t->declaration &&
+        (common::isBuiltinExceptionName(t->headName()) ||
+         common::isHeapPointerReferenceBuiltin(t->headName())))
+        return true;
     // Unresolved / declaration-less Named type (a generic type parameter, or
     // a builtin whose concrete shape isn't visible here): the concrete
     // instantiation could be a value type behind a ref/out parameter, so
