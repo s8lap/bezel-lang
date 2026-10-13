@@ -61,7 +61,6 @@
 #include "llvm/IR/Module.h"
 
 namespace fs = std::filesystem;
-using bezel::test::runJit;
 using bezel::test::runAot;
 using bezel::test::JitResult;
 
@@ -78,7 +77,7 @@ static const std::filesystem::path& wtDir647() {
 }
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -432,14 +431,21 @@ BEZEL_TEST(codegen_atomic_integer_overflow_6_4_6_1,
 // §6.4 / §6.1: Non-overflowing Add succeeds (no exception raised).
 BEZEL_TEST(codegen_atomic_integer_overflow_6_4_6_1,
            add_no_overflow_succeeds_6_4) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "using var a := new AtomicInteger<int>(2147483640); "
-        "try "
-        "  var v := a.Add(5); "
-        "  return v; "
-        "catch OverflowException => return 0; "
-        "end; "
-    )), 2147483645);
+    // Value printed, not returned: the exit status is 8-bit and 2147483645 is
+    // not representable in it.
+    auto r = runAot(
+        "module M; "
+        "class C public static method Main(): int "
+        "  using var a := new AtomicInteger<int>(2147483640); "
+        "  try "
+        "    var v := a.Add(5); "
+        "    Console.WriteLine(v); "
+        "  catch OverflowException => Console.WriteLine(0); "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2147483645\n");
 }
 
 // ===========================================================================
