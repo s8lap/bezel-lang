@@ -11252,6 +11252,88 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
 // spellers.
 static const char* primitiveKeyword(PrimitiveType p);
 
+// fix #5948 (§14.2 *Type-parameter bounds*, v0.338): an argument or `U`
+// substitution that is an instantiation over a type parameter of an enclosing
+// declaration (`Box<A>` in `class H<A>`) is compared structurally, with the
+// parameter read as the same name on both sides. typeRefEqual compares a
+// parameter marker by declaration alone (both nullptr), so `A` and `B` would
+// compare equal; this comparison compares the spelled name instead.
+namespace {
+
+// The spelled name of a Named TypeRef (its last path segment, or the imported
+// name for a metadata-reconstructed reference).
+std::string_view namedLeafName(const TypeRef* t) {
+    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+        return t->astNode->name->parts.back();
+    return t->importedName;
+}
+
+// A type-parameter marker: a Named TypeRef with no declaration that is not a
+// built-in type name.
+bool isOpenParamLeaf(const TypeRef* t) {
+    return t && t->kind == TypeRef::Kind::Named && !t->declaration &&
+           !Resolver::isBuiltinTypeName(namedLeafName(t));
+}
+
+// True when `t` mentions a type parameter anywhere in its generic arguments.
+bool mentionsOpenParam(const TypeRef* t) {
+    if (!t) return false;
+    if (isOpenParamLeaf(t)) return true;
+    for (const TypeRef* g : t->genericArgs)
+        if (mentionsOpenParam(g)) return true;
+    return false;
+}
+
+// Structural identity of two types that may name type parameters by spelling.
+bool openTypeEqual(const TypeRef* a, const TypeRef* b) {
+    if (!a || !b) return false;
+    if (a->kind != b->kind || a->nullable != b->nullable) return false;
+    if (a->kind != TypeRef::Kind::Named) return Resolver::typeRefEqual(a, b);
+    if (a->declaration != b->declaration) return false;
+    if (!a->declaration && namedLeafName(a) != namedLeafName(b)) return false;
+    if (a->genericArgs.size() != b->genericArgs.size()) return false;
+    for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+        if (!openTypeEqual(a->genericArgs[i], b->genericArgs[i])) return false;
+    return true;
+}
+
+// True when `arg` or the base chain it reaches contains an instantiation of
+// `uSubst`'s declaration structurally identical to `uSubst` (identity, or a
+// class derived from `uSubst` over the same type-parameter arguments). Only
+// that admits. An instantiation of the same declaration whose arguments differ
+// at an open parameter is NOT admitted here: identity then depends on the
+// parameters' instantiations, and §14.2 decides it "at instantiation, after
+// both parameters are substituted". Admitting it at declaration would accept
+// e.g. `H<string>` with `Rel<Box<A>, Box<int>>` (Box<string> is no subtype of
+// Box<int>); the caller keeps the pre-existing rejection for that case.
+bool openBoundAdmits(SemaContext& ctx, const TypeRef* arg,
+                     const TypeRef* uSubst) {
+    std::vector<const TypeRef*> frontier{arg};
+    std::unordered_set<const TypeSymbol*> expanded;
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        const TypeRef* t = frontier[i];
+        if (!t || t->kind != TypeRef::Kind::Named || !t->declaration) continue;
+        if (t->declaration == uSubst->declaration && openTypeEqual(t, uSubst))
+            return true;
+        if (!expanded.insert(t->declaration).second) continue;
+        const TypeSymbol* decl = t->declaration;
+        if (decl->genericParams.size() != t->genericArgs.size()) continue;
+        std::unordered_map<std::string_view, TypeRef*> subst;
+        for (std::size_t k = 0; k < decl->genericParams.size(); ++k)
+            if (decl->genericParams[k] && t->genericArgs[k])
+                subst[decl->genericParams[k]->name] = t->genericArgs[k];
+        for (const TypeRef* b : decl->baseTypeRefs) {
+            if (!b) continue;
+            SubstArgs sa = {ctx, subst};
+            frontier.push_back(
+                sema::substituteGenericArgs(const_cast<TypeRef*>(b), sa));
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 // §14.2 *Type-parameter bounds* (v0.338, #5906): decides a `where T: U` whose
 // substitution for `U` (`uSubst`) is NOT a user declaration. A substitution S
 // satisfies the bound only when S is non-nullable and is identical to `U`'s
@@ -11441,7 +11523,15 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                         // Both substitutions are user types: route through
                         // the ordering-safe recheck (a base set may still be
                         // mid-population at this instantiation site).
-                        if (!argSatisfiesTypeBound(arg, uSubst, &ctx_))
+                        // fix #5948 (§14.2, v0.338): an instantiation over an
+                        // enclosing type parameter that is structurally
+                        // identical to `uSubst` (or derived from it over the
+                        // same arguments) is admitted here.
+                        const bool openAdmitted =
+                            (mentionsOpenParam(arg) || mentionsOpenParam(uSubst)) &&
+                            openBoundAdmits(ctx_, arg, uSubst);
+                        if (!openAdmitted &&
+                            !argSatisfiesTypeBound(arg, uSubst, &ctx_))
                             deferredTypeBoundFailures_.push_back(
                                 DeferredTypeBoundFailure{
                                     t.span.begin, std::string(gp->name),
