@@ -24,7 +24,8 @@ constexpr const char* kVersion = "bezelc " BEZEL_VERSION;
 
 void printUsage(std::ostream& out) {
     out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
-           "[--import <artifact>]... [--checked-disposal] [--checked-contracts] "
+           "[--import <artifact>]... [--checked-disposal | --unchecked-disposal] "
+           "[--checked-contracts] "
            "[--sanitize=address] [--experimental-scoped-await-bind] "
            "[--report-trust-admissions] "
            "<source-file>\n"
@@ -43,6 +44,11 @@ void printUsage(std::ostream& out) {
            "member access on a\n"
            "                     disposed instance raises DisposedAccess"
            "Exception (§31.4)\n"
+           "  --unchecked-disposal select unchecked (release) disposal mode "
+           "(§28.2): use of a\n"
+           "                     disposed instance is undefined behavior; "
+           "cannot be combined\n"
+           "                     with --checked-disposal\n"
            "  --checked-contracts enable checked-contracts mode (§22.16): "
            "`ensures`\n"
            "                     clauses evaluate at every normal-completion "
@@ -116,6 +122,9 @@ int main(int argc, char** argv) {
     // one path fills both Dependency fields.
     bool compileObjectOnly = false;
     bezel::codegen::CodegenOptions codegenOpts;
+    // §28.2 (#4602): the two disposal-mode switches are mutually exclusive.
+    bool sawCheckedDisposal = false;
+    bool sawUncheckedDisposal = false;
     std::vector<bezel::Dependency> deps;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
@@ -144,6 +153,17 @@ int main(int argc, char** argv) {
             // instance-member entry emits a disposed-flag test; access on a
             // disposed instance raises DisposedAccessException (§31.4).
             codegenOpts.checkedDisposal = true;
+            sawCheckedDisposal = true;
+            continue;
+        }
+        if (arg == "--unchecked-disposal") {
+            // §28.2 (proposal 0128 §2.1, #4602): select the unchecked (release)
+            // disposal mode explicitly. The default is not flipped here, so this
+            // sets the field to the value a switch-less build already uses; it
+            // only records the selection. Given together with --checked-disposal
+            // it is a usage error (proposal 0128 §9 Q1; changelog v0.307).
+            codegenOpts.checkedDisposal = false;
+            sawUncheckedDisposal = true;
             continue;
         }
         if (arg == "--checked-contracts") {
@@ -208,6 +228,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         inputPath = arg;
+    }
+
+    if (sawCheckedDisposal && sawUncheckedDisposal) {
+        std::cerr << "bezelc: error: --checked-disposal and --unchecked-disposal "
+                     "cannot be given together (a build selects one "
+                     "disposal-checking mode, §28.2)\n";
+        return 2;
     }
 
     if (inputPath.empty()) {
