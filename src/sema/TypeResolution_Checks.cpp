@@ -1935,8 +1935,10 @@ void Resolver::checkGenericConstraintConsistency() {
         kRulesAll = 0xFu,
     };
     // The rules an extension block's `where` clauses currently run under.
-    constexpr unsigned kRulesExtension =
-        kRuleObjectBound | kRuleClassValue | kRuleSelfCycle;
+    // §14.2 (v0.338) with §26.4: a record/enum/choice bound is rejected on an
+    // extension block and on its members as on any declaration (#4689 class).
+    constexpr unsigned kRulesExtension = kRuleObjectBound | kRuleClassValue |
+                                         kRuleSelfCycle | kRuleRecordEnumChoice;
     auto checkList =
         [&](const std::vector<ast::GenericConstraint>& gcs,
             const std::vector<std::string_view>& paramOrder, SourceLocation loc,
