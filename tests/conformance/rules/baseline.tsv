@@ -493,7 +493,7 @@ s11_2_0020	pass
 s11_2_0021	pass	
 s11_2_0022	pass	
 s11_2_0023	pass	
-s11_2_0024	fail	#6102: Array<(int) -> ()> argument to a parameter of the identical type is rejected (§5.1)
+s11_2_0024	pass	
 s11_2_0025	pass	
 s11_2_0026	pass	
 s11_2_0027	pass	
@@ -2380,7 +2380,7 @@ l6_5_0006	pass
 l6_5_0007	pass	
 l6_5_0008	pass	
 l6_5_0009	pass	
-l6_5_0010	fail	divergence
+l6_5_0010	pass	
 l6_5_0011	pass	
 l6_5_0012	pass	
 l6_5_0013	pass	
