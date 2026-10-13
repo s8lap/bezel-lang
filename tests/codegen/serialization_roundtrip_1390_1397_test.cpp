@@ -259,7 +259,7 @@ const char* kHandWrittenSerialize =
     "  using var s := new BinarySerializer(); "
     "  b.Serialize(s); "
     "  using var bytes := s.ToBytes(); "
-    "  return (if bytes.Count > 0 then 42 else 91); "
+    "  return (if bytes.Length > 0 then 42 else 91); "
     "end Main; end C;";
 
 BEZEL_TEST(serialization_iserializer_ptr_1390, hand_written_serialize_aot_no_truncation) {

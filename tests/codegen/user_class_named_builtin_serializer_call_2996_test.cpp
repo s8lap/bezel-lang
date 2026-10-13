@@ -214,7 +214,7 @@ BEZEL_TEST(user_class_named_builtin_serializer_call_2996,
         "  using var s := new BinarySerializer(); "
         "  s.WriteInt(42); "
         "  using var bytes := s.ToBytes(); "
-        "  if bytes.Count <> 8 then return 1; end; "
+        "  if bytes.Length <> 8 then return 1; end; "
         "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
         "  if d.ReadInt() <> 42 then return 2; end; "
         "  return 7; "

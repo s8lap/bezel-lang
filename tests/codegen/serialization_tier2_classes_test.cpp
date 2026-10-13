@@ -1030,7 +1030,7 @@ BEZEL_TEST(codegen_serialization_t2_classes,
         "  b.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
         // ToBytes produces a non-empty buffer; we verify run completes.
-        "  return (if bytes.Count > 0 then 42 else 91); "
+        "  return (if bytes.Length > 0 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 

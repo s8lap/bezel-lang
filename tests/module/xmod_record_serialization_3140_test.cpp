@@ -844,7 +844,7 @@ BEZEL_TEST(xmod_record_serialization_3140,
         "  using var s := new BinarySerializer(); "
         "  v.Serialize(s); "
         "  using var b := s.ToBytes(); "
-        "  if b.Count <> 50 then return 1; end if; "   // T13's local width
+        "  if b.Length <> 50 then return 1; end if; "   // T13's local width
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var v2 := InlineArrF2.Deserialize(d); "
         "  if v2.N <> 5 then return 2; end if; "
@@ -874,7 +874,7 @@ BEZEL_TEST(xmod_record_serialization_3140,
         "  using var s := new BinarySerializer(); "
         "  v.Serialize(s); "
         "  using var b := s.ToBytes(); "
-        "  if b.Count <> 50 then return 1; end if; "   // the measured width
+        "  if b.Length <> 50 then return 1; end if; "   // the measured width
         "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
         "  var v2 := InlineArrF2.Deserialize(d); "
         "  if v2.N <> 5 then return 2; end if; "

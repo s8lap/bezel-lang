@@ -596,7 +596,7 @@ BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
         "  using var s := new BinarySerializer(); "
         "  d1.Serialize(s); "
         "  using var bytes := s.ToBytes(); "
-        "  return (if bytes.Count > 0 then 42 else 91); "
+        "  return (if bytes.Length > 0 then 42 else 91); "
         "end Main; end C;"), 42);
 }
 
