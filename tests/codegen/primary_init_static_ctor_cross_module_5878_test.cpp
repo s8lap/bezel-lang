@@ -304,12 +304,28 @@ BEZEL_TEST(primary_init_static_ctor_cross_module_5878,
         "  end Main; "
         "end C; ";
     // Main returns 0; runUnderAsanValue checks the program's own exit code AND
-    // that ASan stayed quiet. -1 = ASan runtime unavailable on this host (SKIP);
-    // -2/-3/-4 are the harness's INFRA classes, which it marks FAILED itself
-    // (#4504), so a positive assertion here must not launder them into a pass.
+    // that ASan stayed quiet. It returns -1 ONLY when the ASan runtime object
+    // cannot be found (`asanRuntimeObject()` empty), and -2/-3/-4 are the
+    // harness's INFRA classes, which it marks FAILED itself (#4504).
+    //
+    // There is deliberately NO early-return guard on the -1 result here. That
+    // shape is a "swallowing guard" (#3682): a missing ASan runtime reads as a
+    // SKIP and the row then reports a clean PASS while the leg is off — the row
+    // asserts nothing about memory safety in either direction. The family
+    // already carries ~40 grandfathered sites; adding a new one is exactly
+    // what `check_native_asan_leg_skips.py` refuses, and it is why this file is
+    // absent from `scripts/native_asan_leg_skips.grandfather`.
+    // (This comment deliberately avoids quoting that guard's source text: the
+    // checker matches it textually, so reproducing it here would manufacture
+    // the very violation it is warning about.)
+    //
+    // ASan is available on this host — proven by a planted sentinel that fires
+    // `LeakSanitizer: detected memory leaks` — so there is no debt to
+    // grandfather and nothing to skip. If the runtime ever does go missing,
+    // `a >= 0` below FAILS the row, which is the correct outcome: the oracle
+    // cannot be trusted, and silence would be a lie.
     int a = bezel::test::runUnderAsanValue(src, 0, "5878_static_ctor_asan");
-    if (a == -1) return;        // toolchain unavailable: SKIP (#3626)
-    BEZEL_EXPECT_TRUE(a >= 0);  // -2 compile / -3 link / -4 system() -> FAIL
+    BEZEL_EXPECT_TRUE(a >= 0);  // -1 runtime absent / -2 compile / -3 link / -4 system()
     BEZEL_EXPECT_EQ(a, 0);      // sanitizer report -> 1, non-zero exit -> mismatch
 }
 
