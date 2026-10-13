@@ -12,6 +12,16 @@
 //   R2  `Util.Id` with no list over a generic-only method is rejected with the
 //       list-required wording.
 //   R3  a list of the wrong length is rejected.
+//   R5  record receiver: captured BY COPY (§27.6 "by copy for value-shaped
+//       (record, enum or primitive) receivers"), formed and invoked.
+//   R6  a choice receiver has no generic thunk: located error, no miscompile.
+//   R7  constraint matrix (§27.6 "the formation is an instantiation site":
+//       §14.2's constraints read at the formation as at a call): a method with
+//       a `where` clause is never accepted unchecked at a formation.
+//   R8  overload selection with a list is independent of declaration order.
+//   R9  a by-value `a: T` slot at a function-type argument is §28.14's
+//       set-erasing formation ("a bare type parameter that the formation's
+//       substitution makes a function type").
 //   R4  `b.Put<() -> int>` over `Put<T>(ref x: T)` is the §28.14 set-erasing
 //       formation and is rejected (it parsed as an error before the fix, so
 //       the reject must survive the parser change).
@@ -92,6 +102,168 @@ BEZEL_TEST(sema_generic_method_reference_list_5814,
         "  using var b := new Util(); "
         "  var put: (ref () -> int) -> () := b.Put<() -> int>; "
         "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "a set-erasing position"));
+}
+
+// R5 — record receiver by copy.
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           record_receiver_captured_by_copy_27_6) {
+    auto r = runAotChecked(
+        "module Conf; "
+        "public record Pt(X: int, Y: int) "
+        "  public method Sum<T>(z: int, t: T): int => this.X + this.Y + z; "
+        "end Pt; "
+        "public class Prog "
+        "  public static method Run(f: (int, string) -> int): int => "
+        "    f(1, \"a\") + f(2, \"b\"); "
+        "  public static method Main() "
+        "    var p := new Pt(3, 4); "
+        "    Console.WriteLine(Run(p.Sum<string>)); "
+        "    var p2 := new Pt(10, 10); "
+        "    var q: (int, string) -> int := p2.Sum<string>; "
+        "    Console.WriteLine(q(0, \"x\")); "
+        "  end Main; end Prog;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("17\n20\n"));
+}
+
+// R6 — choice receiver.
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           choice_receiver_has_no_generic_thunk_located_error_27_6) {
+    auto r = runAot(
+        "module Conf; "
+        "public choice Shape Circle(R: int), Dot; "
+        "  public method Tag<T>(t: T): int => 1; "
+        "end Shape; "
+        "public class Prog public static method Main() "
+        "  var s := Shape.Circle(3); "
+        "  var f: (string) -> int := s.Tag<string>; "
+        "end Main; end Prog;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "a value-shaped receiver other than a record has no generic thunk"));
+}
+
+namespace {
+std::string constrainedProg(const char* constraint, const char* usage) {
+    return std::string("module Conf; public record NoEq(A: int); "
+                       "public class Util "
+                       "  public static method F<T>(a: T): int where T: ") +
+           constraint + " return 5; end F; end Util; "
+           "public class Prog public static method Main() " + usage +
+           " end Main; end Prog;";
+}
+}  // namespace
+
+// R7 — each constraint kind, non-conforming and conforming reference: never
+// accepted unchecked at a formation (the call is rejected for the first of
+// each pair by §14.2, the formation by the not-yet-supported error).
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           where_class_nonconforming_formation_rejected_14_2) {
+    auto r = runAot(constrainedProg("class",
+        "var f: (int) -> int := Util.F<int>;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not yet supported at a formation"));
+}
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           where_value_nonconforming_formation_rejected_14_2) {
+    auto r = runAot(constrainedProg("value",
+        "var f: (string) -> int := Util.F<string>;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not yet supported at a formation"));
+}
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           where_notnull_nonconforming_formation_rejected_14_2) {
+    auto r = runAot(constrainedProg("notnull",
+        "var f: (string?) -> int := Util.F<string?>;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not yet supported at a formation"));
+}
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           where_new_nonconforming_formation_rejected_14_2) {
+    auto r = runAot(constrainedProg("new()",
+        "var f: (string) -> int := Util.F<string>;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not yet supported at a formation"));
+}
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           where_idisposable_nonconforming_formation_rejected_14_2) {
+    auto r = runAot(constrainedProg("IDisposable",
+        "var f: (int) -> int := Util.F<int>;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not yet supported at a formation"));
+}
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           where_class_conforming_formation_not_accepted_unchecked_14_2) {
+    auto r = runAot(constrainedProg("class",
+        "var f: (string) -> int := Util.F<string>;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not yet supported at a formation"));
+}
+// The call with the same list keeps its own §14.2 verdict.
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           where_class_call_with_same_list_still_rejected_14_2) {
+    auto r = runAot(constrainedProg("class",
+        "var r := Util.F<int>(1);"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "does not satisfy the constraint"));
+}
+
+// R8 — overload order independence (§27.6 / §14.5).
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           list_selects_generic_overload_declared_after_nongeneric_14_5) {
+    auto r = runAotChecked(
+        "module Conf; public class Util "
+        "  public static method Over(x: int): int => x + 1; "
+        "  public static method Over<T>(x: T): T => x; "
+        "  public static method Id<T>(x: T): T => x; "
+        "  public static method Id<A, B>(x: A, y: B): A => x; "
+        "end Util; "
+        "public class Prog "
+        "  public static method Ap(f: (int) -> int): int => f(10); "
+        "  public static method Main() "
+        "    var b: (int) -> int := Util.Over<int>; "
+        "    Console.WriteLine(b(1)); "
+        "    Console.WriteLine(Ap(Util.Over<int>)); "
+        "    var c: (int, string) -> int := Util.Id<int, string>; "
+        "    Console.WriteLine(c(7, \"x\")); "
+        "    var d: (int) -> int := Util.Id<int>; "
+        "    Console.WriteLine(d(8)); "
+        "  end Main; end Prog;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("1\n10\n7\n8\n"));
+}
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           list_selects_generic_overload_declared_before_nongeneric_14_5) {
+    auto r = runAotChecked(
+        "module Conf; public class Util "
+        "  public static method Over<T>(x: T): T => x; "
+        "  public static method Over(x: int): int => x + 1; "
+        "end Util; "
+        "public class Prog "
+        "  public static method Ap(f: (int) -> int): int => f(10); "
+        "  public static method Main() "
+        "    Console.WriteLine(Ap(Util.Over<int>)); "
+        "    var g: (int) -> int := Util.Over; "
+        "    Console.WriteLine(g(1)); "
+        "  end Main; end Prog;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("10\n2\n"));
+}
+
+// R9 — by-value `a: T` at a function-type argument (§28.14 formation bar).
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           by_value_type_param_slot_at_function_type_is_set_erasing_28_14) {
+    auto r = runAot(
+        "module Conf; public class Util "
+        "  public static method Take<T>(a: T): int => 1; end Util; "
+        "public class Prog public static method Main() "
+        "  var f: (() -> int) -> int := Util.Take<() -> int>; "
+        "end Main; end Prog;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "a set-erasing position"));
 }

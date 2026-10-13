@@ -22874,9 +22874,12 @@ TypeRef* ExprTC::substituteMethodRefTypeArgs(
 // list only candidates declaring no type parameters take part, so the error is
 // reported only where every candidate in the group is generic.
 TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
-                                        const MethodSymbol& ms, TypeRef* ft) {
+                                        const MethodSymbol& ms0, TypeRef* ft0) {
+    const MethodSymbol* msp = &ms0;
+    TypeRef* ft = ft0;
     if (!ft || &ma == calleeOfCallCtx_) return ft;
     if (ma.typeArgs.empty()) {
+        const MethodSymbol& ms = ms0;
         if (ms.genericParams.empty()) return ft;
         if (ms.parent) {
             std::vector<MethodSymbol*> group;
@@ -22898,6 +22901,32 @@ TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
                 "binds them from the target (\xC2\xA7""27.6, \xC2\xA7""14.5, v0.338)");
         return nullptr;
     }
+    if (ms0.genericParams.size() != ma.typeArgs.size() && ms0.parent) {
+        const MethodSymbol& ms = ms0;
+        // §27.6 / §14.5 (v0.338): with a list only the candidates declaring
+        // that many own type parameters take part, whatever their declaration
+        // order. A unique such candidate is the reference's method; several
+        // are left to target-typed selection (selectMethodRefOverload).
+        std::vector<MethodSymbol*> group;
+        collectHierarchyOverloads(ms.parent, ms.name, group);
+        std::vector<MethodSymbol*> fits;
+        for (MethodSymbol* ov : group)
+            if (ov->genericParams.size() == ma.typeArgs.size())
+                fits.push_back(ov);
+        if (fits.size() > 1) return ft;
+        if (fits.size() == 1) {
+            TypeRef* oft = buildMethodRefType(fits[0]);
+            TypeRef* sub =
+                oft ? substituteMethodRefTypeArgs(ma.typeArgs, *fits[0], oft)
+                    : nullptr;
+            if (sub) {
+                ctx_.setMethodRefSelectedOverload(&ma, fits[0]);
+                msp = fits[0];
+                ft = oft;
+            }
+        }
+    }
+    const MethodSymbol& ms = *msp;
     if (ms.genericParams.size() != ma.typeArgs.size()) {
         ctx_.diagnostics().report(
             Severity::Error, ma.span.begin,
@@ -22912,6 +22941,39 @@ TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
     }
     TypeRef* out = substituteMethodRefTypeArgs(ma.typeArgs, ms, ft);
     if (!out) return ft;
+    // per §27.6 / §14.1 (v0.338): the formation is an instantiation site, so
+    // §3.6 rule 2's body requirements and §14.2's constraints are read at it
+    // exactly as at a call with that list. Rule-2 bindings are recorded for
+    // the end-of-pass join the call site feeds (`default(T)` under
+    // `where T: value`). The constraint predicate itself lives inside
+    // typeCall's call-site lambda and is not reusable from here, so a method
+    // that declares any `where` clause is rejected rather than accepted
+    // unchecked (#5814 follow-up).
+    bool constrained = false;
+    for (std::size_t i = 0; i < ms.genericParams.size(); ++i) {
+        auto* gps = dynamic_cast<GenericParamSymbol*>(ms.genericParams[i]);
+        if (!gps) continue;
+        if (!gps->constraints.empty()) constrained = true;
+        if (ms.decl && i < ma.typeArgs.size()) {
+            if (TypeRef* ar = ctx_.resolvedType(*ma.typeArgs[i])) {
+                std::string an = ar->declaration
+                                     ? std::string(ar->declaration->name)
+                                     : std::string(ar->headName());
+                recordGenericInstantiationSite(ms.decl, gps->name, ar, an,
+                                               ma.span.begin);
+            }
+        }
+    }
+    if (constrained) {
+        ctx_.diagnostics().report(
+            Severity::Error, ma.span.begin,
+            "the method reference `" + std::string(ms.name) +
+                "` forms a generic method that declares `where` constraints, "
+                "which are not yet checked at a formation \xE2\x80\x94 not yet "
+                "supported at a formation (\xC2\xA7""27.6, \xC2\xA7""14.2, v0.338; "
+                "#5814): call the method, or write a lambda that calls it");
+        return nullptr;
+    }
     // per §28.14 (v0.338): a formation whose slot, bound to a callee parameter
     // other than `out` declared at a bare type parameter, is substituted with
     // a function type is a set-erasing position

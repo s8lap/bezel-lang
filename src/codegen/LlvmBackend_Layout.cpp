@@ -5556,6 +5556,19 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     }
 
     const bool instMethod = !isStaticMethod(ms);
+    // per §27.6 (v0.338): the instance is captured by reference for a class
+    // receiver and BY COPY for a value-shaped one. A record receiver's env
+    // holds the struct bytes (as makeMethodThunk's #5237 path); an enum,
+    // choice or other value-shaped receiver has no generic thunk yet.
+    const bool recordRecv = instMethod && ms->parent &&
+        ms->parent->kind == ast::TypeDeclKind::Record;
+    if (instMethod && ms->parent &&
+        ms->parent->kind != ast::TypeDeclKind::Class &&
+        ms->parent->kind != ast::TypeDeclKind::Record)
+        return unsupported("a value-shaped receiver other than a record has "
+                           "no generic thunk yet");
+    if (recordRecv && receiverVal && receiverVal->getType()->isPointerTy())
+        receiverVal = builder_.CreateLoad(recordStruct(ms->parent), receiverVal);
     // The formed function type's slots, lowered in the caller's scope.
     std::vector<llvm::Type*> thunkParamTys{ptrTy()};  // env
     for (const auto& fp : fnTy->funcParams) {
@@ -5627,7 +5640,14 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
     auto argIt = thunk->args().begin();
     llvm::Value* envPtrArg = &*argIt++;
     std::vector<llvm::Value*> callArgs;
-    if (instMethod) callArgs.push_back(builder_.CreateLoad(ptrTy(), envPtrArg));
+    if (recordRecv) {
+        llvm::Type* st = recordStruct(ms->parent);
+        llvm::AllocaInst* tmp = entryAlloca(st);
+        builder_.CreateStore(builder_.CreateLoad(st, envPtrArg), tmp);
+        callArgs.push_back(tmp);
+    } else if (instMethod) {
+        callArgs.push_back(builder_.CreateLoad(ptrTy(), envPtrArg));
+    }
     for (; argIt != thunk->args().end(); ++argIt) callArgs.push_back(&*argIt);
 
     // The body lowers under the reference's substitution only.
