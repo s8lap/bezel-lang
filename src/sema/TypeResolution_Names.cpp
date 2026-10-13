@@ -878,14 +878,26 @@ void Resolver::rejectDisallowedExtensionTarget(const ast::ExtensionDecl& ext) {
 // case 1). The instantiation-site check cannot decide it: the argument is a
 // generic-parameter marker, so checkGenericConstraints defers it to
 // recordDeferredNested, which records nothing outside a type body. This pass
-// checks each such position directly. Where the clause could guarantee the
-// constraint only through a subtype relation this pass does not compute (a
-// type bound naming a different type), the head is admitted rather than
-// guessed at; that residual is named in the commit.
+// checks each such position directly.
+//
+// Requirement kinds (§14.2 case 1 and *Interface conformance* rule 6):
+//  - `class` is guaranteed by `class`, by a bound naming a class, and by a
+//    bound naming IDisposable or an interface extending it (line 2391); an
+//    ordinary interface bound does not guarantee it (its conforming set is
+//    open).
+//  - `notnull` is implied by any type bound (§14.2 *Type-bound* paragraph).
+//  - `new()` and `value` are guaranteed only by the same item.
+//  - `hashable` / `sendable` (derived-property constraints) only by the same
+//    item.
+//  - `where U: I` (a type bound) is guaranteed by a block bound that names I
+//    or an interface extending I (rule 6); a named class requirement by a
+//    bound naming that class or one derived from it.
+// Where a bound's declaration is imported or unresolved, the requirement is
+// ADMITTED (undecided), not guessed; that residual is named in the commit.
 namespace {
 
-// The single-segment name of a Named type node, ignoring its generic
-// arguments and nullability (a bound's name), or empty.
+// The single-segment name of a bound node, ignoring generic arguments and
+// nullability, or empty.
 std::string_view boundNameOfAst(const ast::Type* t) {
     if (!t || !t->name || t->name->parts.size() != 1) return {};
     return t->name->parts.front();
@@ -902,6 +914,9 @@ std::string_view boundNameOfConstraint(const GenericParamConstraint& c) {
     std::size_t dot = n.rfind('.');
     return dot == std::string_view::npos ? n : n.substr(dot + 1);
 }
+
+// Three-valued answer of a conformance / derivation walk.
+enum class Tri { Yes, No, Unknown };
 
 } // namespace
 
@@ -932,95 +947,107 @@ void Resolver::checkExtensionHeadConstraints(const ast::ExtensionDecl& ext,
         return items;
     };
 
+    // A module-local type declaration named `n`, or null (imported,
+    // builtin, or unknown).
+    auto moduleType = [&](std::string_view n) -> TypeSymbol* {
+        if (n.empty() || !ctx_.module()) return nullptr;
+        for (Symbol* c : ctx_.module()->children)
+            if (c && c->name == n)
+                if (auto* ts = dynamic_cast<TypeSymbol*>(c)) return ts;
+        return nullptr;
+    };
+    // Does the type `t` have `target` among its base types, directly or
+    // through its bases? Yes when found; No when every base resolves to a
+    // symbol that does not lead to it; Unknown otherwise. A base without a
+    // declaration (imported, builtin, or unresolved) is Unknown, never No.
+    // Reads the sema base list (baseTypes), not the AST.
+    std::function<Tri(const TypeSymbol&, std::string_view, int)> walk =
+        [&](const TypeSymbol& t, std::string_view target, int depth) -> Tri {
+        if (depth > 32) return Tri::Unknown;
+        for (const TypeSymbol* b : t.baseTypes)
+            if (b && b->name == target) return Tri::Yes;
+        bool unknown = !t.nonSymbolBaseRefs.empty();
+        for (const TypeSymbol* b : t.baseTypes) {
+            if (!b || !b->decl) { unknown = true; continue; }
+            Tri r = walk(*b, target, depth + 1);
+            if (r == Tri::Yes) return Tri::Yes;
+            if (r == Tri::Unknown) unknown = true;
+        }
+        return unknown ? Tri::Unknown : Tri::No;
+    };
+
+    // Is the block clause `items` a guarantee of `class` (§14.2 line 2391)?
+    // Undecided (an unresolved or imported type bound) is reported true, i.e.
+    // admitted.
+    auto classGuaranteed = [&](const std::vector<const ast::ConstraintItem*>& items) {
+        bool undecided = false;
+        for (const ast::ConstraintItem* item : items) {
+            if (item->kind == "class") return true;
+            if (item->kind != "type") continue;
+            std::string_view n = boundNameOfAst(item->typeArg.get());
+            if (n == "IDisposable") return true;  // §14.2 line 2391
+            TypeSymbol* bs = moduleType(n);
+            if (!bs || !bs->decl) { undecided = true; continue; }
+            if (bs->kind == ast::TypeDeclKind::Class) return true;
+            if (bs->kind == ast::TypeDeclKind::Interface) {
+                Tri t = walk(*bs, "IDisposable", 0);
+                if (t == Tri::Yes) return true;
+                if (t == Tri::Unknown) undecided = true;
+            }
+        }
+        return undecided;
+    };
+
     // A builtin owning collection carries no GenericParamSymbol constraints;
-    // its element slot is `where <slot>: class` (§14.4, the same slot
-    // ownedSlot table as owningCollectionOwnedSlot). Only that slot is decided
-    // here. The remaining builtin table entries are not yet covered (residual).
+    // its stated `class` requirement on the owning slot is the table below
+    // (stdlib owning collections). The hash-keyed builtins (Dictionary, Set)
+    // are NOT in this table: their key rule is the type-level §3.6 rule 2 at
+    // the instantiation site, not a declared `where` head constraint (#5998
+    // item 2 withdrawn). A builtin not listed here is not checked (residual).
+    struct BuiltinRequirement {
+        std::string_view name;
+        std::size_t slot;
+        std::string_view constraint;
+    };
+    static constexpr BuiltinRequirement kBuiltinHeadRequirements[] = {
+        {"OwningArray", 0, "class"},      {"OwningSet", 0, "class"},
+        {"OwningStack", 0, "class"},      {"OwningQueue", 0, "class"},
+        {"OwningLinkedList", 0, "class"}, {"OwningDictionary", 1, "class"},
+    };
+
     if (!head->declaration || head->declaration->genericParams.empty()) {
         if (!ext.targetType->name || ext.targetType->name->parts.empty())
             return;
-        std::size_t slot =
-            owningCollectionOwnedSlot(ext.targetType->name->parts.back());
-        if (slot == static_cast<std::size_t>(-1) || slot >= argAsts.size())
-            return;
-        std::string_view param = blockParamAt(slot);
-        if (param.empty()) return;
-        bool guaranteedClass = false;
-        for (const ast::ConstraintItem* item : clauseOf(param)) {
-            if (item->kind == "class" || item->kind == "type")
-                guaranteedClass = true;  // a type bound may be a class
-        }
-        if (!guaranteedClass) {
+        const std::string_view headName = ext.targetType->name->parts.back();
+        for (const BuiltinRequirement& req : kBuiltinHeadRequirements) {
+            if (headName != req.name || req.slot >= argAsts.size()) continue;
+            std::string_view param = blockParamAt(req.slot);
+            if (param.empty()) continue;
+            const auto items = clauseOf(param);
+            bool ok = false;
+            if (req.constraint == "class") {
+                ok = classGuaranteed(items);
+            } else {
+                for (const ast::ConstraintItem* item : items)
+                    if (item->kind == req.constraint) ok = true;
+            }
+            if (ok) continue;
             ctx_.diagnostics().report(
                 Severity::Error, ext.targetType->span.begin,
                 "type argument `" + std::string(param) +
                 "` does not satisfy the constraint `where " +
-                std::string(param) + ": class` (\xC2\xA7""14.2): the owning "
-                "collection `" + std::string(ext.targetType->name->parts.back()) +
-                "` requires its element parameter to be a class, and an "
-                "extension block's `where` clause must state it, since a block "
-                "parameter inherits no constraint from the extended type "
-                "(\xC2\xA7""26.4)");
+                std::string(param) + ": " + std::string(req.constraint) +
+                "` (\xC2\xA7""14.2): the builtin `" + std::string(headName) +
+                "` requires its parameter to be " +
+                "a class" +
+                ", and an extension block's `where` clause must state it, "
+                "since a block parameter inherits no constraint from the "
+                "extended type (\xC2\xA7""26.4)");
         }
         return;
     }
     const TypeSymbol& tsym = *head->declaration;
     if (argAsts.size() != tsym.genericParams.size()) return;
-
-    // Does the block clause `items` guarantee the extended type's constraint
-    // `c` on its position `i`? `items` is the clause of that position's block
-    // parameter. The clause guarantees `c` only by the rules below; a `type`
-    // item naming a different type leaves the subtype question open, and the
-    // constraint is then admitted (undecided, not guessed).
-    auto guaranteed = [&](const std::vector<const ast::ConstraintItem*>& items,
-                          const GenericParamConstraint& c, std::size_t i,
-                          std::string& spelled) -> bool {
-        if (c.kind == "type") {
-            std::string_view want = boundNameOfConstraint(c);
-            // A bound naming another parameter of the extended type is read
-            // at that position's block parameter (`where T: U` over
-            // `Rel<A, B>` needs `where A: B`).
-            for (std::size_t k = 0; k < tsym.genericParams.size(); ++k) {
-                if (tsym.genericParams[k] &&
-                    tsym.genericParams[k]->name == want) {
-                    want = blockParamAt(k);
-                    break;
-                }
-            }
-            if (want.empty()) return true;  // not a bare block parameter
-            spelled = std::string(want);
-            bool undecided = false;
-            for (const ast::ConstraintItem* item : items) {
-                if (item->kind != "type") continue;
-                std::string_view n = boundNameOfAst(item->typeArg.get());
-                if (n == want) return true;
-                undecided = true;  // a different bound may still conform
-            }
-            return undecided;
-        }
-        if (c.kind == "new") spelled = "new()"; else spelled = std::string(c.kind);
-        for (const ast::ConstraintItem* item : items) {
-            std::string_view k = item->kind;
-            if (c.kind == "class") {
-                if (k == "class" || k == "type") return true;  // type: open
-            } else if (c.kind == "value") {
-                if (k == "value") return true;
-            } else if (c.kind == "notnull") {
-                if (k == "class" || k == "value" || k == "notnull" ||
-                    k == "type")
-                    return true;
-            } else if (c.kind == "new") {
-                if (k == "new") return true;
-            } else if (k == c.kind) {
-                // sendable / hashable: a derived-property constraint is
-                // guaranteed only by carrying the same constraint (§14.2).
-                return true;
-            }
-        }
-        // An unrecognised kind is admitted (no rule here decides it).
-        return c.kind != "class" && c.kind != "value" && c.kind != "notnull" &&
-               c.kind != "new" && c.kind != "sendable" && c.kind != "hashable";
-    };
 
     for (std::size_t i = 0; i < tsym.genericParams.size(); ++i) {
         auto* gp = dynamic_cast<GenericParamSymbol*>(tsym.genericParams[i]);
@@ -1029,8 +1056,95 @@ void Resolver::checkExtensionHeadConstraints(const ast::ExtensionDecl& ext,
         if (param.empty()) continue;
         const auto items = clauseOf(param);
         for (const GenericParamConstraint& c : gp->constraints) {
+            bool ok = true;
             std::string spelled;
-            if (guaranteed(items, c, i, spelled)) continue;
+            if (c.kind == "type") {
+                std::string_view want = boundNameOfConstraint(c);
+                // A bound naming another parameter of the extended type is
+                // read at that position's block parameter (`where T: U` over
+                // `Rel<A, B>` needs `where A: B`). Such a requirement is
+                // guaranteed only by the identical bound name.
+                bool viaParam = false;
+                for (std::size_t k = 0; k < tsym.genericParams.size(); ++k) {
+                    if (tsym.genericParams[k] &&
+                        tsym.genericParams[k]->name == want) {
+                        want = blockParamAt(k);
+                        viaParam = true;
+                        break;
+                    }
+                }
+                if (want.empty()) continue;  // not a bare block parameter
+                spelled = std::string(want);
+                // A local interface or class requirement is decided by its
+                // kind; an imported or unknown one is admitted.
+                TypeSymbol* reqSym = viaParam ? nullptr : moduleType(want);
+                if (!viaParam && !reqSym) continue;
+                const bool reqIface =
+                    reqSym && reqSym->kind == ast::TypeDeclKind::Interface;
+                const bool reqClass =
+                    reqSym && reqSym->kind == ast::TypeDeclKind::Class;
+                if (!viaParam && !reqIface && !reqClass) continue;
+                bool undecided = false;
+                ok = false;
+                for (const ast::ConstraintItem* item : items) {
+                    if (item->kind != "type") continue;
+                    std::string_view n = boundNameOfAst(item->typeArg.get());
+                    if (n == want) { ok = true; break; }
+                    // A different bound on a block-parameter requirement:
+                    // not decided here, admitted (named in the commit).
+                    if (viaParam) { undecided = true; continue; }
+                    TypeSymbol* bs = moduleType(n);
+                    if (!bs || !bs->decl) { undecided = true; continue; }
+                    if (reqIface) {
+                        // Rule 6 (L2428): a bound naming I or an interface
+                        // extending I. A class bound conforms to the
+                        // interfaces in its own base list (rule 1), so a
+                        // class whose base chain reaches I satisfies I at
+                        // every substitution (L2391: "exactly when its
+                        // constraints guarantee it at every substitution they
+                        // admit"). The walk covers both kinds.
+                        Tri t = walk(*bs, want, 0);
+                        if (t == Tri::Yes) { ok = true; break; }
+                        if (t == Tri::Unknown) undecided = true;
+                    } else {
+                        // A class requirement: a bound naming that class or
+                        // a class derived from it (§14.2 line 2391).
+                        if (bs->kind != ast::TypeDeclKind::Class) continue;
+                        Tri t = walk(*bs, want, 0);
+                        if (t == Tri::Yes) { ok = true; break; }
+                        if (t == Tri::Unknown) undecided = true;
+                    }
+                }
+                if (undecided) ok = true;
+            } else if (c.kind == "class") {
+                ok = classGuaranteed(items);
+                spelled = "class";
+            } else if (c.kind == "notnull") {
+                spelled = "notnull";
+                ok = false;
+                for (const ast::ConstraintItem* item : items)
+                    if (item->kind == "class" || item->kind == "value" ||
+                        item->kind == "notnull" || item->kind == "type")
+                        ok = true;
+            } else if (c.kind == "value") {
+                spelled = "value";
+                ok = false;
+                for (const ast::ConstraintItem* item : items)
+                    if (item->kind == "value") ok = true;
+            } else if (c.kind == "new") {
+                spelled = "new()";
+                ok = false;
+                for (const ast::ConstraintItem* item : items)
+                    if (item->kind == "new") ok = true;
+            } else {
+                // sendable / hashable: a derived-property constraint is
+                // guaranteed only by carrying the same constraint (§14.2).
+                spelled = std::string(c.kind);
+                ok = false;
+                for (const ast::ConstraintItem* item : items)
+                    if (item->kind == c.kind) ok = true;
+            }
+            if (ok) continue;
             ctx_.diagnostics().report(
                 Severity::Error, ext.targetType->span.begin,
                 "type argument `" + std::string(param) +
