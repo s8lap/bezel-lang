@@ -103,6 +103,17 @@ const char* kNonAeqDiag =
 
 BEZEL_TEST(generic_bare_typeparam_tostring_interp_2503,
            non_auto_equality_bearing_bare_t_interpolation_diagnosed) {
+    // §35.3 (v0.334): `Holder.Filled(item: Widget)` is a PLAIN class-typed
+    // payload slot, so its argument is a borrow, and §9.7's
+    // no-temporary-source rule applies verbatim — `Holder.Filled(new
+    // Widget())` is rejected before the program ever reaches the ToString
+    // check this row exists to pin. The row's INTENT is the §35.7
+    // diagnostic on the interpolation hole, so the source is bound to a
+    // named local first — §35.3's own stated remedy ("bind the source to a
+    // named local first"). Measured: with the temporary the program now
+    // draws the §35.3 reject and never reaches §35.7; with the named local
+    // it draws exactly the kNonAeqDiag / #2479 pair this row asserts, so the
+    // rule under test is unchanged.
     const std::string program =
         std::string("module M; ") + kNonAutoEqBearing +
         "class C "
@@ -110,7 +121,8 @@ BEZEL_TEST(generic_bare_typeparam_tostring_interp_2503,
         "    return $\"{val}\"; "
         "  end F; "
         "  public static method Main(): int "
-        "    var s := F(Holder.Filled(new Widget())); "
+        "    var w := new Widget(); "
+        "    var s := F(Holder.Filled(w)); "
         "    return (if s = \"\" then 1 else 0); "
         "  end Main; "
         "end C;";
