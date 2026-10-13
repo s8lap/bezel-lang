@@ -34,19 +34,19 @@
 //      typechecks, passes ownership checking with no diagnostics, and still
 //      runs to the correct result.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
-// Run via JIT; return the int return value, or -999 on compile/JIT failure.
+// Run via runAot; return the int return value, or -999 on compile failure.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
