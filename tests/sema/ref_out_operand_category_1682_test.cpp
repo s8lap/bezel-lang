@@ -26,34 +26,35 @@
 // distinguish the fix from the pre-fix state). Each POSITIVE control asserts
 // no §22.3 diagnostic fires for a category the section admits.
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::OwnershipResult;
 using bezel::test::parseAndCheckOwnership;
-using bezel::test::runJit;
+using bezel::test::diagnosticMessageContains;
+using bezel::test::runAot;
 
 namespace {
 
-// Works for both a JitResult (the sema-only `runJit` path) and an
-// OwnershipResult (the `parseAndCheckOwnership` path) — both expose a
-// `.diagnostics` DiagnosticEngine. The owned-state ref/out rejections
-// (§22.3's dataflow half) are emitted by the OWNERSHIP pass, which
-// `runJit`'s diagnostics never carry (runJit bails after sema at
-// codegen_support.hpp's `hasErrors()` gate and runs `checkOwnership` only
-// into a throwaway engine); those tests therefore drive
-// `parseAndCheckOwnership`, whose engine does carry ownership diagnostics.
+// Works for both a JitResult (the `runAot` path) and an OwnershipResult (the
+// `parseAndCheckOwnership` path) — both expose a `.diagnostics`
+// DiagnosticEngine. The owned-state ref/out rejections (§22.3's dataflow half)
+// are emitted by the OWNERSHIP pass; those tests therefore drive
+// `parseAndCheckOwnership` directly, so the assertion pins that pass itself.
+// (The deprecated in-process JIT harness never carried that pass's diagnostics
+// into its result, which is why these rows were not written against it.)
 template <class Result>
-bool diagContains(const Result& r, const std::string& needle) {
+bool ownershipDiagContains(const Result& r, const std::string& needle) {
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find(needle) != std::string::npos) return true;
     return false;
 }
 
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -70,7 +71,7 @@ int run(const std::string& program) {
 // reached codegen and produced "internal: lowerExpr returned null ... —
 // #1386", not a §22.3 diagnostic.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_call_result_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method GetInt(): int return 5; end GetInt; "
         "  public static method Bump(ref x: int) x := x + 1; end Bump; "
@@ -79,14 +80,14 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_call_result_rejected_22_3) {
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_FALSE(diagContains(r, "internal:"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.3"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "internal:"));
 }
 
 // §22.3: an arbitrary expression (not even a call) is likewise not a
 // storage location.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_arbitrary_expression_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static method Bump(ref x: int) x := x + 1; end Bump; "
         "  public static method Main(): int "
@@ -95,8 +96,8 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_arbitrary_expression_rejected_2
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_FALSE(diagContains(r, "internal:"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.3"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "internal:"));
 }
 
 // §22.3 / §22.8: a readonly field is assignable only in a field initializer
@@ -104,7 +105,7 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_arbitrary_expression_rejected_2
 // ordinary method is outside that context. Pre-fix: compiled clean (rc=0),
 // no diagnostic at all.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_readonly_field_outside_ctor_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public readonly V: int; "
         "  public constructor(v: int) this.V := v; end constructor; "
@@ -115,8 +116,8 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_readonly_field_outside_ctor_rej
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.8"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.3"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.8"));
 }
 
 // §22.3: a readonly field passed by `ref` FROM WITHIN its own constructor
@@ -141,8 +142,8 @@ BEZEL_TEST(ref_out_operand_category_1682, out_to_readonly_field_inside_ctor_acce
 //
 // This is the OWNERSHIP-pass half of §22.3 (a live-lattice `lookupState`
 // query in Ownership_Checks.cpp's checkRefOutOwnedOperand): the rejection is
-// emitted by `checkOwnership`, which `runJit` does not carry into its
-// diagnostics — so drive `parseAndCheckOwnership`, whose engine does.
+// emitted by `checkOwnership`, which the deprecated JIT harness never carried
+// into its diagnostics — so drive `parseAndCheckOwnership`, whose engine does.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_plain_owned_local_rejected_22_3) {
     auto r = parseAndCheckOwnership(
         "module M; class Box public V: int := 0; end Box; "
@@ -155,15 +156,15 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_plain_owned_local_rejected_22_3
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "owned local"));
+    BEZEL_EXPECT_TRUE(ownershipDiagContains(r, "§22.3"));
+    BEZEL_EXPECT_TRUE(ownershipDiagContains(r, "owned local"));
 }
 
 // §22.3 / §28.10: a `using var` binding's disposal is pinned to scope exit;
 // a `ref` write through it is invisible to that machinery. Pre-fix: compiled
 // clean, no diagnostic.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_using_var_local_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class Box public V: int := 0; end Box; "
         "class C "
         "  public static method Swallow(ref x: Box) x := new Box(); end Swallow; "
@@ -174,8 +175,8 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_using_var_local_rejected_22_3) 
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "using var"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.3"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "using var"));
 }
 
 // §22.3: an `owned` field is owned state — same alias-write hazard as an
@@ -196,8 +197,8 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_owned_field_rejected_22_3) {
         "  using var h := new Holder(); h.Do(); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "owned"));
+    BEZEL_EXPECT_TRUE(ownershipDiagContains(r, "§22.3"));
+    BEZEL_EXPECT_TRUE(ownershipDiagContains(r, "owned"));
 }
 
 // §22.3: an owning-collection indexer slot (`OwningArray<T>[i]`) is owned
@@ -207,9 +208,10 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_owned_field_rejected_22_3) {
 // in checkRefOutOwnedOperand), so drive `parseAndCheckOwnership`.
 //
 // The "internal:" assertion below pins a HARNESS artifact, not a compiler
-// bug: through `runJit` this program passes sema (the slot IS a structurally
-// valid indexer target that sema admits) and — because runJit does not carry
-// the ownership pass into its diagnostics — proceeds to codegen's lvalueAddr,
+// bug: through the deprecated in-process JIT harness this program passes sema
+// (the slot IS a structurally valid indexer target that sema admits) and —
+// because that harness did not carry the ownership pass into its diagnostics —
+// proceeds to codegen's lvalueAddr,
 // which has no copy-in/copy-out bracketing for an accessor-mediated ref/out
 // target (tracked at #1302) and emits "internal: lowerExpr returned null …
 // #1386". `parseAndCheckOwnership` stops after the ownership pass — which
@@ -230,15 +232,15 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_owning_array_slot_rejected_22_3
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_FALSE(diagContains(r, "internal:"));
+    BEZEL_EXPECT_TRUE(ownershipDiagContains(r, "§22.3"));
+    BEZEL_EXPECT_FALSE(ownershipDiagContains(r, "internal:"));
 }
 
 // §22.3 / §22.12 rule 2: a mutable (non-readonly, non-`const`) static
 // field's store semantics are defined for direct assignment only. Pre-fix:
 // compiled clean.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_mutable_static_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public static Count: int := 0; "
         "  public static method Bump(ref x: int) x := x + 1; end Bump; "
@@ -247,15 +249,15 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_mutable_static_rejected_22_3) {
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.12"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.3"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.12"));
 }
 
 // §22.3: a property with no setter is not a storage location at all.
 // (Property is expression-bodied; per §23.2 (v0.214) `readonly` is no longer
 // admitted on expression-bodied properties — the keyword has been dropped.)
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_no_setter_property_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public property P: int => 5; "
         "  public static method Bump(ref x: int) x := x + 1; end Bump; "
@@ -263,14 +265,14 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_no_setter_property_rejected_22_
         "  public static method Main(): int return 0; end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "no setter"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.3"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "no setter"));
 }
 
 // §22.3: a `const` member is a compile-time constant, not a storage
 // location.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_const_member_rejected_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  public const K: int := 5; "
         "  public static method Bump(ref x: int) x := x + 1; end Bump; "
@@ -279,8 +281,8 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_const_member_rejected_22_3) {
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(diagContains(r, "§22.3"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "const"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§22.3"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "const"));
 }
 
 // =============================================================================
@@ -345,7 +347,7 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_param_forwarded_accepted_22_3) {
 // this test targets), so the compile as a whole still fails past sema. The
 // assertion here is narrowly that §22.3 itself does not reject the operand.
 BEZEL_TEST(ref_out_operand_category_1682, ref_to_settable_property_not_rejected_by_22_3) {
-    auto r = runJit(
+    auto r = runAot(
         "module M; class C "
         "  private _p: int := 0; "
         "  public property P: int get => this._p; set => this._p := value; end; "
@@ -353,7 +355,7 @@ BEZEL_TEST(ref_out_operand_category_1682, ref_to_settable_property_not_rejected_
         "  public method Do() C.Bump(ref this.P); end Do; "
         "  public static method Main(): int return 0; end Main; "
         "end C;");
-    BEZEL_EXPECT_FALSE(diagContains(r, "§22.3"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "§22.3"));
 }
 
 // §22.3: the inline declaration forms (`out var` / `out using var` /
