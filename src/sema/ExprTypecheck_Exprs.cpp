@@ -6290,7 +6290,32 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         if (pt->kind == TypeRef::Kind::Primitive) {
             // §5.1: identity or numeric widening; string/bool/Object convert
             // to no other primitive.
-            if (at->kind != TypeRef::Kind::Primitive) return Quality::Inapplicable;
+            if (at->kind != TypeRef::Kind::Primitive) {
+                // fix #6005 (§22.6 / §5.1, v0.338): a reference-typed operand
+                // converts to the `Object` root by the ordinary reference
+                // conversion, so an `Object` parameter is an applicable
+                // candidate here, graded Converting like any other
+                // conversion (§22.6: `M(a: Animal)` versus `M(o: Object)` on
+                // a `Dog` argument is ambiguous). Previously it was classed
+                // Inapplicable, leaving the Animal overload the only survivor
+                // and silently selected.
+                // Restricted to REFERENCE declarations (§4.6): a class or an
+                // interface, or a built-in exception class. A value kind
+                // (enum, record, choice) reaches Object only by boxing, which
+                // operator lowering does not perform, so it stays
+                // Inapplicable (the pre-#6005 rejection).
+                const bool refOperand =
+                    at->declaration
+                        ? (at->declaration->kind == ast::TypeDeclKind::Class ||
+                           at->declaration->kind ==
+                               ast::TypeDeclKind::Interface)
+                        : isBuiltinExceptionRef(at);
+                if (pt->primitive == PrimitiveType::Object &&
+                    at->kind == TypeRef::Kind::Named && refOperand &&
+                    implicitlyConvertible(at, pt))
+                    return Quality::Converting;
+                return Quality::Inapplicable;
+            }
             if (pt->primitive == at->primitive)
                 return sameNullability ? Quality::Exact : Quality::Converting;
             if (primitiveWidens(at->primitive, pt->primitive))
