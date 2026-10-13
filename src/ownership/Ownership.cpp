@@ -127,6 +127,14 @@ void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        sema::SemaContext& ctx,
                        std::unordered_set<const sema::Symbol*>& out);
 
+// §29.11 (v0.334) *Consumption points*: the bound lazy queries in `body`
+// whose enumeration right is spent at a statically visible consumption
+// point, by which K3.14's must-use warning is suppressed (the auto-drop
+// still runs). Definition lives below with the other body walkers.
+void scanLazyConsumptionStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                             sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out);
+
 // §29.8 / §30.1 (#973a): can a frame's terminal-state disposal reclaim this
 // `owned` parameter through its capture slot? All three frame-disposal loops
 // (sync iterator, async iterator, plain async) LOAD the slot as a pointer,
@@ -722,6 +730,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // reassignedDropCovered_ (#1465); the rest keep the exclusion.
     std::unordered_set<const sema::Symbol*> reassignedLocals;
     scanReassignStmts(body, ctx_, reassignedLocals);
+    // §29.11 (v0.334): the bindings whose enumeration right is SPENT at a
+    // statically visible consumption point. K3.14's must-use warning is
+    // SUPPRESSED for exactly these — the auto-drop still runs, §29.11's
+    // suppression being the one that discharges no container obligation. This
+    // is what narrows the §29.11 producerState arm (a deferred-activation
+    // call result classified Owned) to draw the lint only on a bound query
+    // whose right is NEVER spent.
+    std::unordered_set<const sema::Symbol*> spentLazyQueryRights;
+    scanLazyConsumptionStmts(body, ctx_, spentLazyQueryRights);
     // §28.3 / §28.7 (v0.180, #1465): of those, the plain owned class/interface
     // locals whose drop-on-overwrite codegen implements
     // (disposeDisplacedOwnedClassLocal) — the displaced value is disposed at each
@@ -1065,7 +1082,13 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // suppressed. (Suppressing the free instead would leak
                         // the instance's memory, which §28.9 still requires be
                         // reclaimed.)
-                        if (!localIsTrivialDisposeNewBinding(*ld)) {
+                        if (!localIsTrivialDisposeNewBinding(*ld) &&
+                            // §29.11 (v0.334): a bound lazy query whose
+                            // enumeration right is spent at a statically
+                            // visible consumption point is silent — the
+                            // value was used, and the auto-drop set just
+                            // above still runs. // per §29.11
+                            spentLazyQueryRights.count(sym) == 0) {
                                 ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -1287,6 +1310,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             taskElementBorrowingCollectionSuspendLocal) {
                             const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
                                 true;
+                            // §29.11 (v0.334): the async twin of the sync
+                            // site's suppression — the body kind does not
+                            // move §29.11's closed suppression set. The
+                            // auto-drop set just above still runs. // per §29.11
+                            if (spentLazyQueryRights.count(sym) != 0) continue;
                                 ctx_.diagnostics().report(
                                 Severity::Warning,
                                 st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -2207,6 +2235,250 @@ void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        sema::SemaContext& ctx,
                        std::unordered_set<const sema::Symbol*>& out) {
     for (const auto& s : body) if (s) scanReassignStmt(*s, ctx, out);
+}
+
+// §29.11 (v0.334) *Consumption points* (the normative list). A BOUND lazy
+// query's enumeration right is spent by exactly these uses:
+//
+//   1. Enumeration or a terminal operator (`for`, `Count`, `First`,
+//      `ToArray`, ...)
+//   2. Applying a further deferred operator: `var q2 := q.Select(f);`
+//   3. Passing the query as an `IEnumerable<T>` argument.
+//
+// Points 1 and 2 are ONE syntactic shape — a member-access call whose
+// receiver is the bound query (a terminal operator exhausts the right; a
+// further deferred operator transfers it into the composed query, the
+// container obligation staying put) — so one arm admits both. Point 3 is
+// the query appearing as a plain (non-`ref`/`out`) call argument.
+//
+// The consumer is the §28.3 must-use warning: §29.11 suppresses it "where
+// the binding's enumeration right is spent", the auto-drop STILL running —
+// the suppression discharges no container obligation. So this set is what
+// keeps the enablement that marks a deferred-activation call result Owned
+// (the §29.11 arm in producerState) from drawing the lint on a query that
+// IS enumerated.
+//
+// Every use is keyed on the READ site's resolved type being the §29.11
+// lazy-query sentinel, and the identifier is resolved to its symbol through
+// `ctx.exprSymbol` — the channel `scanReassignArgs` above uses — so a
+// same-named inner binding is never confused with the outer one.
+// `isLazyQueryExprType` must match DefiniteAssignment::isLazyEnumerableExprType
+// and codegen's isLazyEnumerableType (the three copies of this sentinel
+// shape; see the cross-reference at the §29.11 producerState arm). // per §29.11
+static bool isLazyQueryExprType(const ast::Expr& e, sema::SemaContext& ctx) {
+    const sema::TypeRef* ty = ctx.exprType(e);
+    return ty && ty->kind == sema::TypeRef::Kind::Named && !ty->declaration &&
+           !ty->astNode && !ty->genericArgs.empty() && ty->importedName.empty();
+}
+
+// Record `id` in `out` when it reads as a bound lazy query at this use
+// site. The caller has already established the syntactic shape.
+static void markLazyRightSpent(const ast::IdentifierExpr& id,
+                               sema::SemaContext& ctx,
+                               std::unordered_set<const sema::Symbol*>& out) {
+    if (sema::Symbol* s = ctx.exprSymbol(id)) out.insert(s);
+}
+
+void scanLazyConsumptionExpr(const ast::Expr* e, sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out);
+void scanLazyConsumptionStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                             sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out);
+void scanLazyConsumptionArm(const ast::CaseArm& arm, sema::SemaContext& ctx,
+                            std::unordered_set<const sema::Symbol*>& out);
+
+void scanLazyConsumptionArgs(const std::vector<ast::CallArgument>& args,
+                             sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out) {
+    for (const auto& a : args) {
+        // §29.11 point 3: a PLAIN argument transfers the single-enumeration
+        // right to the callee (the frame's disposal obligation stays here,
+        // the plain argument being an ordinary borrow). A `ref` argument is
+        // a borrow and an `out` argument an out-write — neither enumerates —
+        // mirroring DefiniteAssignment's own Point 3 gate.
+        if (a.value && a.modifier != "ref" &&
+            a.modifier.find("out") == std::string_view::npos &&
+            isLazyQueryExprType(*a.value, ctx)) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
+                markLazyRightSpent(*id, ctx, out);
+        }
+        scanLazyConsumptionExpr(a.value.get(), ctx, out);
+    }
+}
+
+// §29.11 points 1 and 2, on the call shape: a member-access call whose
+// receiver is the bound lazy query. Mirrors DefiniteAssignment's "LINQ
+// chain operator" arm, widened to the terminal operators the normative
+// list's `Count`, `First`, `ToArray`, ... name in the same item.
+static void scanLazyConsumptionCallee(const ast::Expr* callee,
+                                      sema::SemaContext& ctx,
+                                      std::unordered_set<const sema::Symbol*>& out) {
+    // `q.Count()` and `q?.Count()` are the same consumption point. The two
+    // differ in WHICH node is the member access, not in where the receiver
+    // sits: `q.Count()` is a CallExpr over a MemberAccessExpr, while
+    // `q?.Count()` is a plain CallExpr whose callee is a NullCondMemberExpr
+    // (the parser builds that node directly for a `?.` member read — see
+    // Parser_Exprs.cpp's `?.` branch — and then wraps it in an ordinary
+    // CallExpr for the argument list). So the receiver is `ma->target` in one
+    // spelling and `ncm->target` in the other; testing only the first would
+    // leave the `?.` spelling false-positiveing.
+    const ast::Expr* recv = nullptr;
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        recv = ma->target.get();
+    else if (const auto* ncm =
+                 dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        recv = ncm->target.get();
+    if (!recv || !isLazyQueryExprType(*recv, ctx)) return;
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv))
+        markLazyRightSpent(*id, ctx, out);
+}
+
+void scanLazyConsumptionExpr(const ast::Expr* e, sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out) {
+    if (!e) return;
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+        scanLazyConsumptionCallee(c->callee.get(), ctx, out);
+        scanLazyConsumptionExpr(c->callee.get(), ctx, out);
+        scanLazyConsumptionArgs(c->args, ctx, out);
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        scanLazyConsumptionCallee(nc->callee.get(), ctx, out);
+        scanLazyConsumptionExpr(nc->callee.get(), ctx, out);
+        scanLazyConsumptionArgs(nc->args, ctx, out);
+    } else if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+        scanLazyConsumptionArgs(n->args, ctx, out);
+    } else if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        scanLazyConsumptionExpr(m->target.get(), ctx, out);
+    } else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+        scanLazyConsumptionExpr(ncm->target.get(), ctx, out);
+    } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        scanLazyConsumptionExpr(ix->target.get(), ctx, out);
+        scanLazyConsumptionArgs(ix->indices, ctx, out);
+    } else if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        scanLazyConsumptionExpr(b->left.get(), ctx, out);
+        scanLazyConsumptionExpr(b->right.get(), ctx, out);
+    } else if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        scanLazyConsumptionExpr(u->operand.get(), ctx, out);
+    } else if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        scanLazyConsumptionExpr(p->operand.get(), ctx, out);
+    } else if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+        scanLazyConsumptionExpr(t->operand.get(), ctx, out);
+    } else if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        scanLazyConsumptionExpr(co->thenValue.get(), ctx, out);
+        scanLazyConsumptionExpr(co->condition.get(), ctx, out);
+        scanLazyConsumptionExpr(co->elseValue.get(), ctx, out);
+    } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+        scanLazyConsumptionExpr(th->operand.get(), ctx, out);
+    } else if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+        scanLazyConsumptionExpr(r->lo.get(), ctx, out);
+        scanLazyConsumptionExpr(r->hi.get(), ctx, out);
+        scanLazyConsumptionExpr(r->step.get(), ctx, out);
+    } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& el : cl->elements)
+            scanLazyConsumptionExpr(el.get(), ctx, out);
+        for (const auto& k : cl->keys)
+            scanLazyConsumptionExpr(k.get(), ctx, out);
+    } else if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+        // The EXPRESSION-position twin of the CaseStmt arm: `case o of var y
+        // => q.Count(), … end` spends the right just as the statement form's
+        // block arm does. Without this the expression form would leave the
+        // same false positive the statement form did.
+        scanLazyConsumptionExpr(ce->scrutinee.get(), ctx, out);
+        for (const auto& arm : ce->arms) scanLazyConsumptionArm(arm, ctx, out);
+    }
+    // InterpolatedString / WithExpr / LambdaExpr, as in scanReassignExpr: a
+    // lambda body carries its own ownership scope, and an enumeration cannot
+    // cross into it from here.
+}
+
+// One `case` arm, shared by the statement and expression forms: the `when`
+// guard and the expression body are both ordinary expressions in which a
+// consumption point is as visible as anywhere else.
+void scanLazyConsumptionArm(const ast::CaseArm& arm, sema::SemaContext& ctx,
+                            std::unordered_set<const sema::Symbol*>& out) {
+    scanLazyConsumptionExpr(arm.guard.get(), ctx, out);
+    scanLazyConsumptionExpr(arm.exprBody.get(), ctx, out);
+    scanLazyConsumptionStmts(arm.stmts, ctx, out);
+}
+
+void scanLazyConsumptionStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                             sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out);
+
+void scanLazyConsumptionStmt(const ast::Stmt& s, sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out) {
+    // §29.11 point 1, enumeration: `for var x in q` spends the right. The
+    // iterable is read to obtain an enumerator, an ordinary borrow — it
+    // moves no container ownership, so the §28.3 auto-drop is untouched and
+    // only the must-use lint is suppressed.
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) {
+            if (isLazyQueryExprType(*fs->iterable, ctx)) {
+                if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        fs->iterable.get()))
+                    markLazyRightSpent(*id, ctx, out);
+            }
+            scanLazyConsumptionExpr(fs->iterable.get(), ctx, out);
+        }
+        scanLazyConsumptionExpr(fs->withExpr.get(), ctx, out);
+        scanLazyConsumptionStmts(fs->body, ctx, out);
+    } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        scanLazyConsumptionExpr(as->target.get(), ctx, out);
+        scanLazyConsumptionExpr(as->value.get(), ctx, out);
+    } else if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        scanLazyConsumptionExpr(is->target.get(), ctx, out);
+    } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        scanLazyConsumptionExpr(ld->initializer.get(), ctx, out);
+    } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        scanLazyConsumptionExpr(es->expr.get(), ctx, out);
+    } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        scanLazyConsumptionExpr(rs->value.get(), ctx, out);
+    } else if (auto* ths = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        scanLazyConsumptionExpr(ths->value.get(), ctx, out);
+    } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        scanLazyConsumptionExpr(ds->value.get(), ctx, out);
+    } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        // §29.2: `yield return Expr;` — the yielded expression is an ordinary
+        // expression, so a terminal operator over the query spends the right
+        // here as anywhere else. (`yield break;` carries no value.)
+        scanLazyConsumptionExpr(ys->value.get(), ctx, out);
+    } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        scanLazyConsumptionExpr(ifs->ifBranch.condition.get(), ctx, out);
+        scanLazyConsumptionStmts(ifs->ifBranch.body, ctx, out);
+        for (const auto& el : ifs->elifBranches) {
+            scanLazyConsumptionExpr(el.condition.get(), ctx, out);
+            scanLazyConsumptionStmts(el.body, ctx, out);
+        }
+        scanLazyConsumptionStmts(ifs->elseBody, ctx, out);
+    } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        scanLazyConsumptionExpr(ws->condition.get(), ctx, out);
+        scanLazyConsumptionStmts(ws->body, ctx, out);
+    } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        scanLazyConsumptionStmts(dob->body, ctx, out);
+    } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        // §19.6 / §35.5: a `case` STATEMENT's arms. An arm body is either an
+        // expression or a `do … end` statement block, and a consumption point
+        // is as statically visible inside an arm as it is in the straight-line
+        // body around it — a `for` over the query under a `var y => do … end`
+        // arm spends the right exactly as the same `for` outside the match
+        // does. (scanReassignStmt, the model this walker follows, has no arm
+        // for CaseStmt; here the arm is load-bearing, because omitting it
+        // leaves a false positive — the lint firing on a query that IS
+        // enumerated.)
+        scanLazyConsumptionExpr(cs->scrutinee.get(), ctx, out);
+        for (const auto& arm : cs->arms) scanLazyConsumptionArm(arm, ctx, out);
+    } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        scanLazyConsumptionStmts(ts->body, ctx, out);
+        for (const auto& arm : ts->catches)
+            if (arm.body) scanLazyConsumptionStmt(*arm.body, ctx, out);
+        scanLazyConsumptionStmts(ts->finallyBody, ctx, out);
+    }
+}
+
+void scanLazyConsumptionStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
+                             sema::SemaContext& ctx,
+                             std::unordered_set<const sema::Symbol*>& out) {
+    for (const auto& s : body) if (s) scanLazyConsumptionStmt(*s, ctx, out);
 }
 
 // §28.3 "Exception-path discharge": when control transfers along an
