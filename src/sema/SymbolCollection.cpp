@@ -2451,6 +2451,14 @@ bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
 // or a choice that is not value-like auto-hashable (§35.7, v0.214).
 bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx) {
     if (!ty) return true;                              // unresolved: conservative
+    // §3.6 clause (e) (v0.338, #5827): a function type is not hashable. A
+    // lambda equals only itself and a method reference equals by (method,
+    // receiver) per §27.7.1, so a hash container of function values would
+    // hold evaluations apart. `T?` over a function type is excluded too,
+    // by §3.6 clause (c). The native `Array<fn>.Contains`
+    // equality search (stdlib §4) stays admitted: linqHashableGateApplies
+    // skips this predicate for it.
+    if (ty->kind == TypeRef::Kind::Function) return false;
     // The underlying type carries the equality contract; a nullable key `K?`
     // is hashable iff `K` is (the null-safe `=` of §8.4 handles null).
     if (ty->kind != TypeRef::Kind::Named || !ty->declaration)
@@ -2516,6 +2524,11 @@ bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx) {
 // the flat message) when the type is not the record/choice failure shape.
 std::string hashableFailureComponentPath(const TypeRef* ty,
                                          SemaContext& ctx) {
+    // §3.6 clause (e) (v0.338, #5827): a function type is not hashable.
+    if (ty && ty->kind == TypeRef::Kind::Function)
+        return ": it is a function type, which is not **hashable** (§3.6 "
+               "clause (e); §27.7.1: a lambda equals only itself) — keep "
+               "callbacks in an `Array<...>` and use its `Contains`";
     if (!ty || ty->kind != TypeRef::Kind::Named || !ty->declaration) return {};
     const TypeSymbol* ts = ty->declaration;
     // Fragment prefix — reads naturally after the parent §14.2 citation:

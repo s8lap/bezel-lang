@@ -1373,8 +1373,21 @@ bool isLinqHashableOperator(std::string_view m) {
 // hand-written `colName == "SortedSet"` copy at that site would have been
 // exactly the duplicated-predicate defect class lane rules §6 warns
 // against; this is the one authority both sites consult instead.
-bool linqHashableGateApplies(std::string_view colName, std::string_view m) {
-    return !(colName == "SortedSet" && m == "Contains");
+//
+// §3.6 clause (e) / §27.7.1 (v0.338, #5827): a function type is not hashable,
+// yet `Array<(int) -> int>.Contains` stays admitted — the native, unconstrained
+// equality search of stdlib §4 (`Array`, `Stack`, `Queue`, `LinkedList`) is
+// §27.7.1's first-kind equality and never hashes. So `Contains` at a FUNCTION
+// element type on those four heads skips the gate; `IEnumerable<fn>.Contains`
+// (§5's hashable block) and every other operator keep it.
+bool linqHashableGateApplies(std::string_view colName, std::string_view m,
+                             const TypeRef* srcElem = nullptr) {
+    if (colName == "SortedSet" && m == "Contains") return false;
+    if (m == "Contains" && srcElem && srcElem->kind == TypeRef::Kind::Function &&
+        (colName == "Array" || colName == "Stack" || colName == "Queue" ||
+         colName == "LinkedList"))
+        return false;
+    return true;
 }
 
 // #1937 / §14.1 / §2.5: does `rt` structurally reference any of the
@@ -8437,7 +8450,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // operators, and every other receiver family, are
                     // unaffected).
                     if (isLinqHashableOperator(m) &&
-                        linqHashableGateApplies(colName, m) &&
+                        linqHashableGateApplies(colName, m, srcElem) &&
                         !linqHashableCheck(m, srcElem, ce.span.begin, ctx_))
                         return false;  // diagnostic reported; do not type
                     // fix #3726 (stdlib §5 `System.Collections.Linq`, v0.286):
@@ -9900,6 +9913,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                    applies to its own Contains */
                             }
                             else if (m == "Contains" &&
+                                linqHashableGateApplies(colName, m,
+                                                        recvTy->genericArgs[0]) &&
                                 !linqHashableCheck(m, recvTy->genericArgs[0],
                                                    ce.span.begin, ctx_))
                                 linqHashableRejected = true;  // gate fired — suppress typeLinqOperator fallback's duplicate

@@ -4348,6 +4348,12 @@ void Resolver::checkHashContainerKeys() {
     // key-position half). The reason clause is kind-aware so an owning-choice
     // key does not draw the record-worded message.
     auto reasonClause = [&](const TypeRef* keyRef) -> std::string {
+        // §3.6 clause (e) (v0.338, #5827): a function type is not hashable.
+        if (keyRef && keyRef->kind == TypeRef::Kind::Function)
+            return "it is a function type, which is not **hashable** "
+                   "(\xC2\xA7""3.6 clause (e); \xC2\xA7""27.7.1: a lambda "
+                   "equals only itself). Use a named type as the key, or "
+                   "an `Array<...>` and its `Contains` for callbacks.";
         const TypeSymbol* d = keyRef ? keyRef->declaration : nullptr;
         if (d && d->kind == ast::TypeDeclKind::Choice) {
             auto v = common::classifyChoiceType(keyRef, ctx_);
