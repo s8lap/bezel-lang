@@ -672,6 +672,25 @@ static bool isCountOnlyCollection(std::string_view cn) {
            cn == "IReadOnlyCollection";
 }
 
+// fix #6128 (stdlib §4.14, v0.338): `OwningBuffer<T>` is `IEnumerable<T?>`
+// only for a class `T`, so the §5 LINQ `Count()` operator applies there and
+// nowhere else. True when `el` is DEFINITELY a value type (a non-string
+// primitive, or a user record / enum / choice); every other shape (class,
+// interface, string, built-in head, type parameter, unresolved) is left to the
+// existing handling so no program the base accepted is newly rejected on an
+// uncertain read.
+static bool isDefinitelyValueTypedElem(const TypeRef* el) {
+    if (!el) return false;
+    if (el->kind == TypeRef::Kind::Primitive)
+        return el->primitive != PrimitiveType::String;
+    if (el->kind == TypeRef::Kind::Named && el->declaration) {
+        auto k = el->declaration->kind;
+        return k == ast::TypeDeclKind::Record ||
+               k == ast::TypeDeclKind::Enum || k == ast::TypeDeclKind::Choice;
+    }
+    return false;
+}
+
 // Simple (last-component) name of a Named TypeRef, or empty for non-Named.
 // (A file-local copy of ExprTypecheck.cpp's `namedTypeSimpleName`, which is
 // static to its own translation unit.)
@@ -25444,9 +25463,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 bool ok = ma.member == "Count" ? hasCount : hasCapacity;
                 // fix #6081 (stdlib §4.14, v0.338): `OwningBuffer<T>` declares
                 // `Length` (the stored extent) and no `Count`; the bare `.Count`
-                // reference has no member to resolve. The call spelling
-                // (`b.Count()`, the §5 LINQ operator) is untouched.
-                if (ok && cn == "OwningBuffer" && &ma != calleeOfCallCtx_) {
+                // reference has no member to resolve. fix #6128: the call
+                // spelling `b.Count()` is the §5 LINQ operator, which applies
+                // only to a class `T` (`IEnumerable<T?>`); on a value-typed `T`
+                // (no IEnumerable conformance, §4.14) it is rejected the same
+                // way. A same-named user extension (§26.5) keeps the call
+                // accepted.
+                if (ok && cn == "OwningBuffer" &&
+                    (&ma != calleeOfCallCtx_ ||
+                     (!tt->genericArgs.empty() &&
+                      isDefinitelyValueTypedElem(tt->genericArgs[0]) &&
+                      !lookupExtensionMember(tt, ma.member, nullptr,
+                                             ma.span.begin,
+                                             /*reportAmbiguity=*/false)))) {
                     auto loc = ma.span.begin;
                     if (loc.line == 0 && ma.target)
                         loc = ma.target->span.begin;
@@ -25506,8 +25535,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // no `Count`; `ICollection<T>` declares `Count` (inherited from
         // IReadOnlyCollection<T>, §4.1) and no `Length`. Gated on the callee
         // slot, not on the call arity, so an argument-position read is covered.
-        if (ma.target && (ma.member == "Count" || ma.member == "Length") &&
-            &ma != calleeOfCallCtx_) {
+        // fix #6128: the call spellings (`sb.Count()`, `c.Length()`) are the
+        // same undeclared members and take the same arm (`StringBuilder` is no
+        // `IEnumerable`, so `Count()` is not the §5 operator there). A
+        // same-named user extension (§26.5) keeps the call accepted.
+        if (ma.target && (ma.member == "Count" || ma.member == "Length")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
                 bool isBuiltin =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
@@ -25526,7 +25558,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // that §4.1 also declares with `Count` only.
                     msg = "no member `Length` on `" + std::string(cn) +
                           "<T>`: use `Count` (stdlib §4.1)";
-                if (!msg.empty()) {
+                if (!msg.empty() &&
+                    (&ma != calleeOfCallCtx_ ||
+                     !lookupExtensionMember(tt, ma.member, nullptr,
+                                            ma.span.begin,
+                                            /*reportAmbiguity=*/false))) {
                     auto loc = ma.span.begin;
                     if (loc.line == 0 && ma.target)
                         loc = ma.target->span.begin;
@@ -30769,8 +30805,12 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         // fix #6081 (stdlib §3.1 / §4.1 / §4.14, v0.338): the `?.` twins of the
         // bare reads above. `StringBuilder` and `OwningBuffer<T>` declare no
         // `Count` (§3.1, §4.14); `ICollection<T>` declares no `Length` (§4.1).
-        // Gated on the callee slot, as the #6071 `string` arm above.
-        if (!member && recvTy && &nm != calleeOfCallCtx_ &&
+        // fix #6128: the call spellings (`sb?.Count()`, `b?.Count()`,
+        // `c?.Length()`) take the same arm (`!member` already excludes a
+        // same-named user extension, §26.5); `Count()` on an `OwningBuffer` is
+        // the §5 LINQ operator and stays accepted unless `T` is a value type
+        // (§4.14). The #6071 `string` arm above stays callee-gated.
+        if (!member && recvTy &&
             (nm.member == "Count" || nm.member == "Length") &&
             recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
             recvTy->astNode && recvTy->astNode->name &&
@@ -30780,7 +30820,10 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             if (nm.member == "Count" && cn == "StringBuilder")
                 msg = "no member `Count` on `StringBuilder`: use `Length` "
                       "(stdlib §3.1)";
-            else if (nm.member == "Count" && cn == "OwningBuffer")
+            else if (nm.member == "Count" && cn == "OwningBuffer" &&
+                     (&nm != calleeOfCallCtx_ ||
+                      (!recvTy->genericArgs.empty() &&
+                       isDefinitelyValueTypedElem(recvTy->genericArgs[0]))))
                 msg = "no member `Count` on `OwningBuffer<T>`: use `Length` "
                       "(stdlib §4.14)";
             else if (nm.member == "Length" && isCountOnlyCollection(cn))
