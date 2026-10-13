@@ -7660,6 +7660,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     }
                 }
+                // §35.8, v0.334: reject `Dispose()` on a choice value.
+                // Choices do not implement IDisposable; an owning choice's
+                // disposal obligation is discharged by its holder, never by
+                // calling Dispose() on it.
+                if (ma->member == "Dispose" && ma->target) {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                        recvTy->declaration &&
+                        recvTy->declaration->kind == ast::TypeDeclKind::Choice) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("`Dispose` is not admitted on a choice "
+                                       "value \xe2\x80\x94 choices do not implement "
+                                       "IDisposable; an owning choice\xe2\x80\x99s "
+                                       "disposal obligation is discharged by its "
+                                       "holder, never by calling Dispose() on it "
+                                       "(\xc2\xa7""35.8, v0.334)"));
+                    }
+                }
                 // #466 / §26.5 / §3: reject chaining a member call/access onto the
                 // VOID result of an in-place collection method. Per §26.5
                 // ("instance members win"), `a.Reverse()` on a concrete Array<T>
