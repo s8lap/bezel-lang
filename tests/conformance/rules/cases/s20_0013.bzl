@@ -19,8 +19,8 @@ end Resource;
 
 public class Program
   public static method Main()
-    using var a := new Resource();
-    using var b := new Resource();
+    var a := new Resource();
+    var b := new Resource();
     var r := (if true then move a else b);
   end Main;
 end Program;
