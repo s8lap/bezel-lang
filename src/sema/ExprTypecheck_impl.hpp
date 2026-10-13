@@ -1771,8 +1771,12 @@ private:
     // §19.6); in expression position `case.end` was left unterminated (malformed
     // IR / ICE). Engaged for a top-level NamedPattern from both the CaseExpr and
     // CaseStmt handlers.
+    // `namedSlot` (#6038): the NamedPattern sits after a named slot's `=`, so
+    // the value diagnostic names the slot-binding spelling `var w` (§19.3
+    // L3951) instead of the top-level guard text.
     void checkTopLevelNamedPattern(const ast::NamedPattern* np, TypeRef* scrutTy,
-                                   TypeRef* scrutDecl = nullptr);
+                                   TypeRef* scrutDecl = nullptr,
+                                   bool namedSlot = false);
     // §19.3 L3951 (#6019): a naked identifier directly after a NAMED slot's `=`
     // resolves as at the top level of a pattern, against the slot's declared
     // type. Forwards a NamedPattern sub-pattern of a named slot to
@@ -1801,8 +1805,10 @@ private:
     // §19.3 (#1847): shared diagnostic for a top-level bare-identifier pattern
     // that resolves to a runtime VALUE (a local, parameter, or field) rather
     // than a type or constant.
+    // `namedSlot` (#6038): see checkTopLevelNamedPattern.
     void reportNamedPatternIsValue(const ast::NamedPattern* np,
-                                   std::string_view name);
+                                   std::string_view name,
+                                   bool namedSlot = false);
 
     // §35.5 (v0.200, #2045): find a choice case by bare name on a choice
     // scrutinee's declaration. Returns null when `scrutTy` is not a choice

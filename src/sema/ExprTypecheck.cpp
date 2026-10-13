@@ -3625,7 +3625,7 @@ void ExprTC::checkNamedSlotNakedName(const ast::PositionalPattern& sp,
     // `slotName` is cleared by normalization; `namedSlot` survives it.
     if (!sp.namedSlot) return;  // positional slot: naked name is a binding
     if (auto* np = dynamic_cast<const ast::NamedPattern*>(sp.pattern.get()))
-        checkTopLevelNamedPattern(np, fieldTy, fieldTy);
+        checkTopLevelNamedPattern(np, fieldTy, fieldTy, /*namedSlot=*/true);
 }
 
 // §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.
@@ -3639,7 +3639,8 @@ void ExprTC::checkNamedSlotNakedName(const ast::PositionalPattern& sp,
 // malformed IR).
 void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
                                        TypeRef* scrutTy,
-                                       TypeRef* scrutDecl) {
+                                       TypeRef* scrutDecl,
+                                       bool namedSlot) {
     if (!scrutDecl) scrutDecl = scrutTy;
     if (!np || !np->name || np->name->parts.empty()) return;
     // A scrutinee-less `case`/`when` (its arms are boolean CONDITION patterns,
@@ -3897,13 +3898,13 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
                 ctx_.setPatternSymbol(np, ls);  // codegen folds via this
                 return;  // compile-time const local — valid constant pattern
             }
-            reportNamedPatternIsValue(np, last);
+            reportNamedPatternIsValue(np, last, namedSlot);
             return;
         }
         if (dynamic_cast<ParameterSymbol*>(s) ||
             dynamic_cast<FieldSymbol*>(s) ||
             dynamic_cast<PropertySymbol*>(s)) {
-            reportNamedPatternIsValue(np, last);
+            reportNamedPatternIsValue(np, last, namedSlot);
             return;
         }
         // §19.3 / Appendix C.1 (v0.313, #5238): a bare name resolving to an
@@ -4009,7 +4010,19 @@ void ExprTC::rejectOtherValueTypeNamedPattern(const ast::NamedPattern* np,
 // resolves to a runtime VALUE (a local, parameter, or field) rather than a type
 // or constant.
 void ExprTC::reportNamedPatternIsValue(const ast::NamedPattern* np,
-                                       std::string_view name) {
+                                       std::string_view name,
+                                       bool namedSlot) {
+    // §19.3 L3951 (#6038): in a named slot a binding is spelled `var w`, so
+    // name that spelling rather than the top-level guard form.
+    if (namedSlot) {
+        ctx_.diagnostics().report(
+            Severity::Error, np->span.begin,
+            "`" + std::string(name) + "` is a value, not a type or constant, so it "
+            "cannot be a named-slot pattern (\xC2\xA7""19.3): a naked name after "
+            "a named slot's `=` is a type test or constant, and a binding there is "
+            "spelled `var " + std::string(name) + "`");
+        return;
+    }
     ctx_.diagnostics().report(
         Severity::Error, np->span.begin,
         "`" + std::string(name) + "` is a value, not a type or constant, so it "
