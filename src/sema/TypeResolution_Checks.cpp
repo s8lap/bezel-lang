@@ -4437,19 +4437,37 @@ void Resolver::checkEqualsHashCodePairing() {
         const bool valueKind = t->kind == ast::TypeDeclKind::Record ||
                                t->kind == ast::TypeDeclKind::Enum ||
                                t->kind == ast::TypeDeclKind::Choice;
-        // §8.3 (v0.338, #5955): a choice owning at every instantiation has no
-        // `Object` slot to fill and carries no plain-spelling obligation
-        // (§35.4, §35.11). Only a non-generic choice is classified here; a
-        // generic owning choice keeps the obligation (narrow #5955: a false
-        // reject, since the instantiation is not classified). The "no boxing
-        // reaches" conjunct of the spec wording is not checked (HYPOTHESIS).
+        // §8.3 (v0.338, #5955; #6032): a choice owning at every instantiation
+        // has no `Object` slot to fill and carries no plain-spelling obligation
+        // (§35.4, §35.11). "Owning at every instantiation" is decided at the
+        // most relaxing instantiation: each type parameter is substituted by
+        // `int`, a value type that holds no borrow. A marked `owned T` payload
+        // is erased there (§35.11), so the choice is Owning at `int` only when
+        // some payload is owning independently of its parameters, which is
+        // owning at every instantiation. A parameter with a class, interface or
+        // other constraint `int` may not satisfy keeps the obligation (narrow
+        // #5955). The "no boxing reaches" conjunct of the spec wording is not
+        // checked (HYPOTHESIS).
         bool owningChoice = false;
-        if (t->kind == ast::TypeDeclKind::Choice && t->genericParams.empty()) {
-            TypeRef self;
-            self.kind = TypeRef::Kind::Named;
-            self.declaration = t;
-            auto verdict = common::classifyChoiceType(&self, ctx_);
-            owningChoice = verdict && *verdict == common::ChoiceClassification::Owning;
+        if (t->kind == ast::TypeDeclKind::Choice) {
+            bool substitutable = true;
+            for (Symbol* gp : t->genericParams) {
+                auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
+                if (!gps) { substitutable = false; break; }
+                for (const auto& c : gps->constraints)
+                    if (c.kind != "value") substitutable = false;
+            }
+            if (substitutable) {
+                TypeRef self;
+                self.kind = TypeRef::Kind::Named;
+                self.declaration = t;
+                for (size_t i = 0; i < t->genericParams.size(); ++i)
+                    self.genericArgs.push_back(
+                        ctx_.primitiveTypeRef(PrimitiveType::Int));
+                auto verdict = common::classifyChoiceType(&self, ctx_);
+                owningChoice =
+                    verdict && *verdict == common::ChoiceClassification::Owning;
+            }
         }
         if (valueKind && equalsOwnTyped) {
             // The owning-choice exemption is taken for the plain spelling

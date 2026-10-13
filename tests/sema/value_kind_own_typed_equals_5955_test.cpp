@@ -361,3 +361,65 @@ class Program public static method Main(): int return 0; end Main; end Program;
     BEZEL_EXPECT_TRUE(hasHashObligationDiagAt(r, "declaring `Equals(R)`", 4, 3));
     BEZEL_EXPECT_FALSE(r.ran);
 }
+
+// §8.3 (v0.338, #5955; #6032): a generic choice owning at EVERY instantiation
+// has no `Object` slot and carries no plain own-typed obligation. The payload
+// `owned v: R` (R an owning class) is owning independently of `T`, so the
+// choice is owning at every instantiation (§35.4 rule 1, §35.11). Repro of
+// #6032. The program does not call `Equals` (a call of a generic owning
+// choice's `Equals` is a separate codegen defect, IR verification failure).
+BEZEL_TEST(value_kind_own_typed_equals_5955,
+           generic_owning_choice_plain_own_typed_equals_no_obligation_spec_8_3) {
+    auto r = runAot(R"(
+module M;
+class R public V: int := 0; destructor end destructor; end R;
+choice Res<T> Ok(owned v: R), No;
+  public method Equals(o: Res<T>): bool => true;
+end Res;
+class Program public static method Main(): int
+  var a := Res<R>.No;
+  Console.WriteLine("run");
+  return 0;
+end Main; end Program;
+)");
+    BEZEL_EXPECT_FALSE(hasAnyHashDiag(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("run\n"));
+}
+
+// §8.3 (v0.338, #5955; #6032): a generic choice owning only at SOME
+// instantiations keeps the obligation. `owned v: T` is owning at a class
+// substitution and value-like at `int` (§35.11: the marker is erased there), and
+// §8.3 requires "owning at every instantiation" for the exemption, so the plain
+// own-typed `Equals` is rejected at its declaration (line 4, column 3).
+BEZEL_TEST(value_kind_own_typed_equals_5955,
+           generic_choice_owning_only_at_some_instantiations_keeps_obligation_spec_8_3) {
+    auto r = runAot(R"(
+module M;
+choice Wrap<T> Has(owned v: T), None;
+  public method Equals(o: Wrap<T>): bool => true;
+end Wrap;
+class Program public static method Main(): int return 0; end Main; end Program;
+)");
+    BEZEL_EXPECT_TRUE(hasHashObligationDiagAt(r, "declaring `Equals(Wrap)`", 4, 3));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §8.3 (v0.338, #5955; #6032): the `override Equals` spelling on a generic
+// owning choice is not exempt: the owning-choice exemption is for the plain
+// spelling only (the spec-question remains open whether "its declared Equals"
+// covers the override). Rejected at the override declaration (line 5, column 3).
+BEZEL_TEST(value_kind_own_typed_equals_5955,
+           generic_owning_choice_override_equals_stays_rejected_spec_8_3) {
+    auto r = runAot(R"(
+module M;
+class R public V: int := 0; destructor end destructor; end R;
+choice Res<T> Ok(owned v: R), No;
+  public override method Equals(o: Res<T>): bool => true;
+end Res;
+class Program public static method Main(): int return 0; end Main; end Program;
+)");
+    BEZEL_EXPECT_TRUE(hasHashObligationDiagAt(
+        r, "a type that overrides `Equals`", 5, 3));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
