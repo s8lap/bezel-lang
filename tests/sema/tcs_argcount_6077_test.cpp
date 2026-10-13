@@ -194,3 +194,105 @@ BEZEL_TEST(sema_tcs_argcount_6077,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("ok\n"));
 }
+
+// REJECT — generic TaskCompletionSource<int>.SetCancelled with one argument
+// (stdlib §6.6 declares SetCancelled() with no parameter on every form).
+BEZEL_TEST(sema_tcs_argcount_6077,
+           generic_setcancelled_one_arg_rejected_spec_30_11) {
+    auto r = runAot(
+        "module M;\n"
+        "public class C\n"
+        "  public static method Main(): int\n"
+        "    using var t := new TaskCompletionSource<int>();\n"
+        "    t.SetCancelled(1);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, ":5:5: `SetCancelled` has no overload that "
+                                      "accepts 1 argument(s)"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§30.11"));
+}
+
+// REJECT — generic TaskCompletionSource<int>.TrySetCancelled with one argument.
+BEZEL_TEST(sema_tcs_argcount_6077,
+           generic_trysetcancelled_one_arg_rejected_spec_30_11) {
+    auto r = runAot(
+        "module M;\n"
+        "public class C\n"
+        "  public static method Main(): int\n"
+        "    using var t := new TaskCompletionSource<int>();\n"
+        "    var b: bool := t.TrySetCancelled(1);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, ":5:20: `TrySetCancelled` has no overload "
+                                      "that accepts 1 argument(s)"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§30.11"));
+}
+
+// REJECT — OwningTaskCompletionSource<Res>.SetCancelled with one argument.
+BEZEL_TEST(sema_tcs_argcount_6077,
+           owning_setcancelled_one_arg_rejected_spec_30_11) {
+    auto r = runAot(
+        "module M;\n"
+        "public class C\n"
+        "  public static method Main(): int\n"
+        "    using var t := new OwningTaskCompletionSource<Res>();\n"
+        "    t.SetCancelled(1);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n"
+        "public class Res\n"
+        "end Res;\n");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, ":5:5: `SetCancelled` has no overload that "
+                                      "accepts 1 argument(s)"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§30.11"));
+}
+
+// REJECT — OwningTaskCompletionSource<Res>.TrySetCancelled with one argument.
+BEZEL_TEST(sema_tcs_argcount_6077,
+           owning_trysetcancelled_one_arg_rejected_spec_30_11) {
+    auto r = runAot(
+        "module M;\n"
+        "public class C\n"
+        "  public static method Main(): int\n"
+        "    using var t := new OwningTaskCompletionSource<Res>();\n"
+        "    var b: bool := t.TrySetCancelled(1);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n"
+        "public class Res\n"
+        "end Res;\n");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, ":5:20: `TrySetCancelled` has no overload "
+                                      "that accepts 1 argument(s)"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§30.11"));
+}
+
+// ACCEPT (control) — the zero-argument cancel forms stay accepted on the
+// generic and owning receivers (the non-generic zero-argument form is covered
+// by nongeneric_cancel_zero_args_accepted_spec_30_11 above).
+BEZEL_TEST(sema_tcs_argcount_6077,
+           generic_and_owning_cancel_zero_args_accepted_spec_30_11) {
+    auto r = runAot(
+        "module M;\n"
+        "public class C\n"
+        "  public static method Main(): int\n"
+        "    using var t := new TaskCompletionSource<int>();\n"
+        "    t.SetCancelled();\n"
+        "    var b: bool := t.TrySetCancelled();\n"
+        "    using var o := new OwningTaskCompletionSource<Res>();\n"
+        "    o.SetCancelled();\n"
+        "    var c: bool := o.TrySetCancelled();\n"
+        "    Console.WriteLine(\"ok\");\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n"
+        "public class Res\n"
+        "end Res;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ok\n"));
+}

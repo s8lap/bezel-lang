@@ -14419,23 +14419,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 std::string(m) + "()` (\xC2\xA7""30.11, "
                                 "stdlib \xC2\xA7""6.6)");
                         }
-                        // fix #6077 (§30.11, stdlib §6.6): the void-completion
-                        // `SetCancelled()` / `TrySetCancelled(): bool` take no
-                        // argument on any form (no optional parameter is
-                        // declared), so any argument on the non-generic
-                        // receiver is an arity error.
-                        if (rcn == "TaskCompletionSource" &&
-                            recvTy->genericArgs.empty() &&
-                            (m == "SetCancelled" || m == "TrySetCancelled") &&
+                        // fix #6077 (§30.11, stdlib §6.6): `SetCancelled()` /
+                        // `TrySetCancelled(): bool` take no argument on every
+                        // form of the family (generic, owning and non-generic;
+                        // no optional parameter is declared), so any argument
+                        // is an arity error. The non-generic receiver was
+                        // gated in the first #6077 narrow; this widens the
+                        // gate to the generic and owning receivers too.
+                        if ((m == "SetCancelled" || m == "TrySetCancelled") &&
                             !ce.args.empty()) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 std::string("`") + std::string(m) +
                                 "` has no overload that accepts " +
                                 std::to_string(ce.args.size()) +
-                                " argument(s): the non-generic "
-                                "`TaskCompletionSource` has no parameter, "
-                                "so the call is `" + std::string(m) +
+                                " argument(s): `" + std::string(rcn) +
+                                "` has no parameter on `" + std::string(m) +
+                                "`, so the call is `" + std::string(m) +
                                 "()` (\xC2\xA7""30.11, stdlib \xC2\xA7""6.6)");
                         }
                         // fix #6077 (§30.11, stdlib §6.6): the generic forms
