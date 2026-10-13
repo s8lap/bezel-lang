@@ -319,8 +319,15 @@ BEZEL_TEST(xmod_three_formal_3220,
     BEZEL_EXPECT_TRUE(mentions3220(r.error, "must be an inline"));
     // The citation gained ", v0.289 L2" at fix #3842, which reworded the
     // remedy to name the two admitted inline forms (`out var x` / `out using
-    // var x`) after `out owned var x` was retired per §A.4.
-    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4, v0.289 L2)"));
+    // var x`) after `out owned var x` was retired per §A.4. Fix #5811
+    // rewrote the remedy again (it now also names the pre-declared-local
+    // adoptable state) and re-cited the section at the then-current revision,
+    // so the needle moves from "v0.289 L2" to "v0.334".
+    //
+    // The VERDICT is unchanged: this row still asserts a rejection, and the
+    // "must be an inline" assertion above is untouched. Only the citation
+    // suffix moved.
+    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4, v0.334)"));
 }
 
 // T1b — the local twin of T1. Rejects before the fix and must keep rejecting.
@@ -340,8 +347,10 @@ BEZEL_TEST(xmod_three_formal_3220,
     BEZEL_EXPECT_TRUE(mentions3220(r.error, "must be an inline"));
     // The citation gained ", v0.289 L2" at fix #3842, which reworded the
     // remedy to name the two admitted inline forms (`out var x` / `out using
-    // var x`) after `out owned var x` was retired per §A.4.
-    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4, v0.289 L2)"));
+    // var x`) after `out owned var x` was retired per §A.4. Fix #5811 rewrote
+    // the remedy again and re-cited the section at the then-current revision;
+    // only the citation suffix moved, not the verdict.
+    BEZEL_EXPECT_TRUE(mentions3220(r.error, "(§22.3 / §22.4, v0.334)"));
 }
 
 // T1c — over-widening control: the accessor's local arm must be UNCHANGED.
