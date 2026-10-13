@@ -982,15 +982,14 @@ BEZEL_TEST(case_named_slot_2197,
     BEZEL_EXPECT_TRUE(stdoutIs(r, "4"));
 }
 
-// §19.3 (v0.338, #5966; nested follow-up #5991): a NESTED named slot list that
-// is a strict subset, or is written out of declaration order, is refused with
-// a rule-citing diagnostic until nested named lists are resolved to declaration
-// order (#5991). Before this refusal the nested walk bound it by written
-// position and silently read the wrong member, so the refusal is the only
-// sound behaviour for this commit. The top-level subset rows above are
-// unaffected.
+// §19.3 (v0.338, #5966; nested follow-up #5991): a NESTED named slot list is
+// resolved to declaration order by the nested walk, exactly as a top-level one
+// is by its caller. Before #5991 the nested walk bound by written position, so
+// a nested subset or out-of-order list read the wrong member (the nested
+// subset printed 2 for `In(B = var b)`; the reversed full list swapped a and b).
+// The subset rows here assert the spec's reading by name.
 BEZEL_TEST(case_named_slot_2197,
-           named_slot_subset_spec_19_3_nested_subset_rejected_until_supported) {
+           named_slot_subset_spec_19_3_nested_subset_binds_by_name) {
     auto r = runAot(
         "module M; "
         "public record In5966(A: int, B: int); "
@@ -1004,13 +1003,14 @@ BEZEL_TEST(case_named_slot_2197,
         "    end case; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "must name every member in declaration order"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "(§19.3)"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(stdoutIs(r, "3"));
 }
 
+// The reversed FULL nested list: `a` must be A (2) and `b` must be B (3).
 BEZEL_TEST(case_named_slot_2197,
-           named_slot_subset_spec_19_3_nested_reordered_rejected_until_supported) {
+           named_slot_subset_spec_19_3_nested_reversed_full_binds_by_name) {
     auto r = runAot(
         "module M; "
         "public record In5966(A: int, B: int); "
@@ -1019,14 +1019,72 @@ BEZEL_TEST(case_named_slot_2197,
         "  public static method Main() "
         "    var o := new Out5966(1, new In5966(2, 3), 4); "
         "    case o of "
-        "      Out5966(X = var x, I = In5966(B = var b, A = var a), Z = var z) => "
-        "        Console.WriteLine(a.ToString()), "
+        "      Out5966(X = var x, I = In5966(B = var b, A = var a), Z = var z) => do "
+        "        Console.WriteLine(a.ToString()); "
+        "        Console.WriteLine(b.ToString()); "
+        "      end, "
         "      _ => Console.WriteLine(\"other\"); "
         "    end case; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "must name every member in declaration order"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "2\n3\n" || r.stdoutText == "2\r\n3\r\n");
+}
+
+// A nested constant slot tests the nested member by name: B is 3, so `B = 3`
+// matches; `B = 99` refutes and falls through to `_`.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_nested_constant_slot_by_name) {
+    auto r = runAot(
+        "module M; "
+        "public record In5966(A: int, B: int); "
+        "public record Out5966(X: int, I: In5966, Z: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var o := new Out5966(1, new In5966(2, 3), 4); "
+        "    case o of "
+        "      Out5966(I = In5966(B = 99)) => Console.WriteLine(\"m99\"), "
+        "      _ => Console.WriteLine(\"fell\"); "
+        "    end case; "
+        "    case o of "
+        "      Out5966(I = In5966(B = 3)) => Console.WriteLine(\"m3\"), "
+        "      _ => Console.WriteLine(\"nomatch\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "fell\nm3\n" || r.stdoutText == "fell\r\nm3\r\n");
+}
+
+// A nested CHOICE payload subset inside a record, and a nested record inside a
+// GENERIC record. Prints 4 then 3.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_nested_choice_and_generic_subset) {
+    auto r = runAot(
+        "module M; "
+        "public choice Ev5966 Click5966(x: int, y: int), Other5966(code: int); end Ev5966; "
+        "public record Wrap5966(Tag: int, C: Ev5966); "
+        "public record In5966(A: int, B: int); "
+        "public record GOut5966<T>(X: int, I: T, Z: int); "
+        "public class Program "
+        "  public static method Main() "
+        "    var w := new Wrap5966(1, Ev5966.Click5966(3, 4)); "
+        "    case w of "
+        "      Wrap5966(C = Click5966(y = var yy)) => Console.WriteLine(yy.ToString()), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "    var g := new GOut5966<In5966>(1, new In5966(2, 3), 4); "
+        "    case g of "
+        "      GOut5966(I = In5966(B = var gb)) => Console.WriteLine(gb.ToString()), "
+        "      _ => Console.WriteLine(\"other\"); "
+        "    end case; "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "4\n3\n" || r.stdoutText == "4\r\n3\r\n");
 }
 
 BEZEL_TEST(case_named_slot_2197,
@@ -1046,4 +1104,44 @@ BEZEL_TEST(case_named_slot_2197,
         "end Program;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagContains(r, "mixes positional and named slots"));
+}
+
+// §19.3 "Named-slot bindings and ownership" + §35.5 (v0.338, #5991): an OWNED
+// payload of a NESTED choice, omitted by a nested named subset
+// (`Fetched5966(status = 200)` omits `owned response`), is not read and is
+// disposed once at construct completion, per iteration. Looped 101 times
+// (`0..100`) through the checked harness so a leak or double-free shows; the
+// outer `k` sum proves every arm ran.
+BEZEL_TEST(case_named_slot_2197,
+           named_slot_subset_spec_19_3_nested_owned_omitted_payload_disposed_once_loop) {
+    auto r = runAotChecked(
+        "module M; "
+        "public class W5966 "
+        "  public constructor() end constructor; "
+        "  destructor Console.WriteLine(\"widget disposed\"); end destructor; "
+        "end W5966; "
+        "public choice Oc5966 "
+        "  Fetched5966(owned response: W5966, status: int), "
+        "  Failed5966(code: int); "
+        "end Oc5966; "
+        "public choice Outer5966 "
+        "  Got5966(owned inner: Oc5966, k: int), "
+        "  Nope5966(c: int); "
+        "end Outer5966; "
+        "public class Program "
+        "  public static method Main() "
+        "    var n := 0; "
+        "    for var i in 0..100 do "
+        "      case Outer5966.Got5966(Oc5966.Fetched5966(new W5966(), 200), 5) of "
+        "        Got5966(inner = Fetched5966(status = 200), k = var k) => n := n + k;, "
+        "        _ => Console.WriteLine(\"other\"); "
+        "      end case; "
+        "    end for; "
+        "    Console.WriteLine(n.ToString()); "
+        "  end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "widget disposed"), 101u);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("505") != std::string::npos);
 }

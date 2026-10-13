@@ -14314,47 +14314,34 @@ void ExprTC::bindNestedDestructuringNames(
             ndChoiceCase ? std::vector<FieldSymbol*>{}
                          : fieldsOfRecord(nd->typeName.get());
         // §19.3 "Named destructuring" (v0.338, #5966): a NESTED named slot list
-        // is not yet resolved to declaration order by this walk (the top-level
-        // callers do that reorder; this walk binds by written position). A
-        // nested named list that is a subset or out of declaration order would
-        // therefore bind the wrong member, so it is refused here rather than
-        // compiled. A positional nested pattern and a complete in-order named
-        // nested list are unaffected.
+        // is resolved to declaration order here, exactly as the top-level
+        // callers do before their arity and binding walks. Without it the
+        // nested slots were bound positionally by written order, so
+        // `Out(I = In(B = var b))` bound `b` to field A (MEASURED: prints 2,
+        // must print 3) and a nested full list written out of order swapped
+        // its bindings. Codegen reads the AST positionally, so the reorder
+        // must land here in sema. A no-op for a positional nested pattern.
         {
-            std::vector<std::string_view> ndNames;
-            if (ndChoiceCase && ndChoiceCase->caseDecl)
+            const std::string_view ndHead =
+                nd->typeName && !nd->typeName->parts.empty()
+                    ? nd->typeName->parts.back()
+                    : std::string_view{};
+            auto& ndMut = const_cast<ast::DestructuringPattern&>(*nd);
+            if (ndChoiceCase && ndChoiceCase->caseDecl &&
+                !ndChoiceCase->caseDecl->payload.empty()) {
+                std::vector<std::string_view> payloadNames;
+                payloadNames.reserve(ndChoiceCase->caseDecl->payload.size());
                 for (const auto& p : ndChoiceCase->caseDecl->payload)
-                    ndNames.push_back(p.name);
-            else
-                for (const auto* f : ndFields) ndNames.push_back(f->name);
-            bool anyNamedN = false, anyPosN = false, inOrder = true;
-            for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
-                const auto& sp = nd->subPatterns[i];
-                if (sp.slotName.empty()) { anyPosN = true; continue; }
-                anyNamedN = true;
-                if (i >= ndNames.size() || sp.slotName != ndNames[i]) inOrder = false;
-            }
-            if (anyNamedN && anyPosN) {
-                ctx_.diagnostics().report(
-                    Severity::Error, nd->span.begin,
-                    "destructuring pattern `" +
-                    std::string(nd->typeName && !nd->typeName->parts.empty()
-                                    ? nd->typeName->parts.back()
-                                    : std::string_view{}) +
-                    "(...)` nested in another pattern mixes positional and named "
-                    "slots; a slot list is either positional or named, never "
-                    "mixed in one pattern (§19.3)");
-            } else if (anyNamedN &&
-                       (!inOrder || nd->subPatterns.size() != ndNames.size())) {
-                ctx_.diagnostics().report(
-                    Severity::Error, nd->span.begin,
-                    "nested named slot list in pattern `" +
-                    std::string(nd->typeName && !nd->typeName->parts.empty()
-                                    ? nd->typeName->parts.back()
-                                    : std::string_view{}) +
-                    "(...)` must name every member in declaration order: a nested "
-                    "named subset or reordered list is not yet supported by this "
-                    "compiler (§19.3)");
+                    payloadNames.push_back(p.name);
+                normalizeNamedDestructureSlots(ndMut, payloadNames, ndHead,
+                                               nd->span.begin,
+                                               &ndChoiceCase->caseDecl->payload);
+            } else if (!ndFields.empty()) {
+                std::vector<std::string_view> memberNames;
+                memberNames.reserve(ndFields.size());
+                for (const auto* f : ndFields) memberNames.push_back(f->name);
+                normalizeNamedDestructureSlots(ndMut, memberNames, ndHead,
+                                               nd->span.begin);
             }
         }
         for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
