@@ -8787,7 +8787,41 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
                                        ld->initializer.get())) {
                             isAdoptablePreDeclaredLocal = true;  // polymorphic-null
                         }
-                    }
+                    }                    } else if (dynamic_cast<const ast::LocalConstDecl*>(
+                                   lsym->decl)) {
+                        // fix #5875 (§21.1 / §22.3 / §22.4 / §28.3, v0.334): a
+                        // §21.1 `const` local is NOT in an adoptable state, and
+                        // the POSITION is separately forbidden. Stated here
+                        // rather than left to fall through, because the answer
+                        // rests on three rules that a reader cannot see from
+                        // the `var` arm alone:
+                        //
+                        //  * §28.3's adoptable list is CLOSED — "Two states
+                        //    qualify, and no others" — and both are spelled
+                        //    `var`; a `const` binding is in neither.
+                        //  * grammar A.6 makes a local `const`'s initializer
+                        //    MANDATORY (`LocalConstDecl ::= "const" Id (":" T)?
+                        //    ":=" ConstExpr ";"` has no optional group), so a
+                        //    `const` local is never uninitialized — and §21.1
+                        //    confirms it is "initialized exactly once, at its
+                        //    declaration".
+                        //  * §21.1 says outright that a `const` local "is not
+                        //    an assignable location: assignment, compound
+                        //    assignment, `++`/`--`, and BINDING TO A `ref` OR
+                        //    `out` PARAMETER are compile errors naming the
+                        //    declaration" — the prohibition is explicit, not
+                        //    inferred from §28.3. §22.3's gate agrees: an `out`
+                        //    location must be "an assignable storage
+                        //    location", enumerated as "a MUTABLE local
+                        //    variable".
+                        //
+                        // So `isAdoptablePreDeclaredLocal` stays false and the
+                        // site falls to the §22.4 rejection below. That is the
+                        // behaviour this function already had — the `const`
+                        // case reached it by not matching the `var` cast. The
+                        // arm makes that a stated decision rather than an
+                        // accident of which AST node the symbol carries.
+
                 }
             }
         }
