@@ -709,6 +709,11 @@ void Resolver::checkTypeMemberModifierOrder(TypeSymbol* t) {
     }
 }
 
+// Defined below, with the enum/choice dispatch checks it shares a predicate
+// with (fix #3837 / #5610).
+static bool isObjectVirtualReplacementMember(
+    const MethodSymbol* ms, const SemaContext& sema, TypeSymbol* owner);
+
 // §9.2 (v0.297): reject `virtual`, `abstract`, and `sealed override` on
 // record members, and `override` on any record member other than the three
 // Object-slot names `Equals` / `GetHashCode` / `ToString`. Records are
@@ -765,6 +770,57 @@ void Resolver::checkRecordMemberModifiers() {
                     "` may not be declared `override` — `override` is "
                     "admitted on a record only on the Object-slot names "
                     "`Equals`, `GetHashCode`, or `ToString` (§9.2)");
+            }
+            // fix #5994 (§9.2 L1228, §10 L1719, §8.1): on a record, `override`
+            // of the trio is admitted only at the Object-virtual signature the
+            // trio names (`Equals` taking the record's own type, `GetHashCode():
+            // int`, `ToString(): string`); any other parameter list or return
+            // type of those names is rejected at the declaration. Plain (non-
+            // override) members are not governed by this rule.
+            if (hasOverride && !hasSealed && dynamic_cast<MethodSymbol*>(m)) {
+                const auto* ms = static_cast<const MethodSymbol*>(m);
+                const bool trioName = mem->name == "Equals" ||
+                    mem->name == "GetHashCode" || mem->name == "ToString";
+                bool atObjectSignature = false;
+                // `Equals` at `Object` (either nullability) is `Object`'s own
+                // parameter type, a nullability widening the helper does not
+                // cover; it stays admitted as it was (out of #5994's scope).
+                bool paramAdmitted = trioName &&
+                    isObjectVirtualReplacementMember(ms, ctx_, t);
+                if (trioName && !paramAdmitted && mem->name == "Equals" &&
+                    ms->params.size() == 1) {
+                    auto* param =
+                        dynamic_cast<ParameterSymbol*>(ms->params.front());
+                    const TypeRef* pt = (param && param->declType)
+                        ? ctx_.resolvedType(*param->declType) : nullptr;
+                    paramAdmitted = pt &&
+                        pt->kind == TypeRef::Kind::Primitive &&
+                        pt->primitive == PrimitiveType::Object;
+                }
+                if (paramAdmitted) {
+                    const TypeRef* ret = methodReturnResolvedType(*ms, ctx_);
+                    const PrimitiveType want =
+                        mem->name == "Equals" ? PrimitiveType::Bool
+                        : mem->name == "GetHashCode" ? PrimitiveType::Int
+                        : PrimitiveType::String;
+                    // Nullability of the return is not judged here: a nullable
+                    // return (`string?`, `int?`, `bool?`) is admitted as on
+                    // base, pending #6011. Only a different base type rejects.
+                    atObjectSignature = ret &&
+                        ret->kind == TypeRef::Kind::Primitive &&
+                        ret->primitive == want;
+                }
+                if (trioName && !atObjectSignature) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("record method `") +
+                        std::string(mem->name) +
+                        "` may not be declared `override` at this signature — "
+                        "on a record `override` is admitted only at the "
+                        "Object-virtual signature of `Equals` (taking the "
+                        "record's own type), `GetHashCode(): int`, or "
+                        "`ToString(): string` (§9.2, §10)");
+                }
             }
         }
     });
