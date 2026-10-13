@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 28.3
 //! title: an undischarged owned parameter draws the must-use warning at its declaration
-//! rule: The rule is uniform across body kinds: the must-use warning attaches at
-//!   the implicit-drop site of a plain-`var` owned local **or `owned` parameter**
-//!   that is not trivial-dispose.
+//! rule: At the implicit-drop site of a plain-`var` owned local or an
+//!   undischarged `owned` parameter that is not trivial-dispose under §28.9's
+//!   ceremony exemption ... the compiler emits a **warning** (not an error)
 //! cites: 28.3, 22.3
 //! expect: warn
 //! diagnostic: must use

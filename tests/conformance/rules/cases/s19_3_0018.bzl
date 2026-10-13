@@ -1,12 +1,13 @@
 //! case: s19_3_0018
 //! doc: spec
 //! section: 19.3
-//! title: a marked named slot with a discard right-hand side is rejected
-//! rule: A `_` right-hand side (`move N = _`) is already inadmissible under
-//!   condition (iii) — `_` is no binding
+//! title: the transfer marker on a named slot is rejected (the marked slot is retired)
+//! rule: A named slot **never transfers** ... `move` is not a slot spelling
+//!   (`Fetched(move response = var r)` is a compile error at the pattern naming
+//!   the positional form — retired v0.338)
 //! cites: 19.3, 35.5
 //! expect: reject
-//! diagnostic: binding
+//! diagnostic: positional
 //! issue: 2197
 module Conf;
 

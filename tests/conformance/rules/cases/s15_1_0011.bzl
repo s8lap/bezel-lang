@@ -6,7 +6,7 @@
 //!   parameter of its receiver type ... the `*OrNull` tier (`FirstOrNull`)
 //!   and the `Try*(out item: T?)` family (`TryPop`, `TryReceive`) among them,
 //!   is a conditionally-admitted member where that type argument is an
-//!   inline array (§14.2's register): a compile error at the use
+//!   inline array (§14.2): a compile error at the use
 //! cites: 15.1, 14.2
 //! expect: reject
 //! diagnostic: inline array

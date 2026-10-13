@@ -2,9 +2,11 @@
 //! doc: spec
 //! section: 35.5
 //! title: an unmarked named slot does not transfer, so its binding cannot be moved
-//! rule: An unmarked named slot never transfers: in an owning match an owned payload
-//!   matched by an unmarked named slot is borrowed during the arm and disposed at
-//!   construct completion, exactly as a discarded slot.
+//! rule: A named slot **never transfers**: a getter may not return a fresh
+//!   owned value (§28.6), so no slot read can mint an obligation, and in an
+//!   **owning match** (§35.5) an owned or move-only value payload matched by
+//!   a named slot is borrowed during the arm and disposed at construct
+//!   completion by the standard §35.5 machinery, exactly as a discarded slot
 //! cites: 35.5, 19.3
 //! expect: reject
 //! diagnostic: never transfers

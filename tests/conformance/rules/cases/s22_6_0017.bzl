@@ -2,11 +2,11 @@
 //! doc: spec
 //! section: 22.6
 //! title: an owned/ordinary pair over a where-T-class constraint fails the declaration guard
-//! rule: "**`where T: class` does not qualify** — it admits `string` and
-//!   function-type substitutions, at which §28.1 erases the marker and the
-//!   pair collapses to identical signatures. At any failing position the
-//!   pair clashes: the declaration-site error ..., reported at the second
-//!   declaration."
+//! rule: **`owned` never distinguishes overloads.** Two same-name members
+//!   that differ only by `owned` on a parameter — an ordinary parameter or an
+//!   `out` parameter — are indistinguishable and clash at the second
+//!   declaration (§11.3): `Append(item: Widget)` beside `Append(owned item:
+//!   Widget)` is a compile error
 //! cites: 22.6, 28.1, 14.2
 //! expect: reject
 //! diagnostic: collapses

@@ -2,15 +2,15 @@
 //! doc: spec
 //! section: 28.3
 //! title: a bare-T result lent from a lambda's capture may not be stored past the captured local
-//! rule: A function-typed argument bound to a source parameter whose declared
-//!   type, nullability stripped, is a function type that mentions the
-//!   returned parameter in its return slot or in a `ref` or `out` parameter
-//!   slot, other than a slot declared `owned` (`f: () -> T`, `f: (T) -> T`,
-//!   `f: () -> () -> T`, `f: (out T) -> bool`), and the function value of a
-//!   function-value invocation, contribute their source sets. `static method
-//!   Apply<T>(f: () -> T): T => f();` therefore lends, at `T = Item`, from
-//!   what its argument captures: the result of `Apply<Item>(lambda() => x)`
-//!   is usable only where `x` is live.
+//! rule: What each operand contributes: ... a function-typed argument bound
+//!   to a source parameter whose declared type, nullability stripped, is a
+//!   function type that mentions the returned parameter in its return slot or
+//!   in a `ref` or `out` parameter slot, other than a slot declared `owned`
+//!   (`f: () -> T`, `f: (T) -> T`, `f: () -> () -> T`, `f: (out T) -> bool`),
+//!   and the function value of a function-value invocation, their source sets
+//!   ... `static method Apply<T>(f: () -> T): T => f();` lends, at `T =
+//!   Item`, from what its argument captures ... The result is usable only
+//!   where every contributing source is still live
 //! cites: 28.3, 9.7
 //! expect: reject
 //! diagnostic: outlive

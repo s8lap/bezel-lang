@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 9.7
 //! title: a whole-value assignment resets a record local's set before a later member store
-//! rule: a whole-value assignment gives the location the assigned value's set, and a
+//! rule: A whole-value assignment gives the location the assigned value's set, and a
 //!   member store ... adds the sources of the borrows `e` carries to that set
 //! cites: 9.7, 28.3
 //! expect: accept

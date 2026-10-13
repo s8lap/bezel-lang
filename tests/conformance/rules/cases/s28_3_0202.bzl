@@ -4,7 +4,7 @@
 //! title: a caller keeps a static witness's result as a borrow within its sources' scope
 //! rule: A `static` method or `operator` declaration ... whose declared return
 //!   type is a class or interface type is a **compile error** unless the
-//!   declared type itself announces the classification ... — a static method
+//!   declared type itself announces the classification ... a static method
 //!   implementing a static interface member so declared (§11.8) takes that
 //!   row too: its witness signature is spelled at the conforming type and
 //!   classified at the interface member ..., its return paths are checked

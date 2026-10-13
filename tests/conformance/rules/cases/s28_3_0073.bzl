@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 28.3
 //! title: an explicit Dispose suppresses the must-use warning on an owned local
-//! rule: The warning is **suppressed** ... when it is explicitly disposed or
-//!   discarded.
+//! rule: The warning is **suppressed** by exactly these conditions ... it is
+//!   explicitly disposed or discarded
 //! cites: 28.3, 28.2
 //! expect: quiet
 module Conf;

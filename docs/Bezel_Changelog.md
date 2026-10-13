@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.337 — October 2026**
+**Companion to the Bezel Language Specification, v0.338 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -14161,6 +14161,261 @@ The other places two lanes touch read together unchanged:
   - **Disposal** (`Z1`): route R4/C5·dtor-bare-take closes (no residue), and route R1, R4–R6/C6·abandoned-overwrite closes (NR-D1). R4/C5, R4/C1, R4/C12 and route R4/C3·re-entrant lose their residue notes, and R1/C6, R4/C6, R5/C6 and R6/C6 their pointer notes; no verdict moves.
   - **Generics** (`Z2`): R3/C5, the v0.336 run's one open cell, is decided (verdict `conditional` unchanged). R4/C5's quoted hashable-row sentence and the R3/C4 and R2/C5 #5916 notes change wording, verdicts kept.
   - **Borrow-flow** (`Z2`): R3/C4's residual sentence reads "the member filling the slot is the witness; a kind with none does not conform", verdict `rejected` unchanged.
+  - Each lane re-walked its cells' row and column neighbours and found none opened.
+
+---
+
+### v0.338 changelog (v0.337 → v0.338)
+
+**The spec diet: an editorial pass over the heaviest sections, and five retirements.** On 2026-10-13 the owner approved an editorial pass over the specification's heaviest sections ("Yes, run it") and, for the removal candidates the 2026-10 survey listed, directed: "Make a judgement on what should be retired based on how useful the feature is and how easy it is to write code differently to work around the absence of the feature". The coordinator applied that criterion row by row. A feature is retired when its measured real-code reach is negligible **and** the workaround is a short, local, obvious rewrite with no loss of safety; it is kept when it carries a common idiom or its workaround is clumsy. Six candidates were marked RETIRE or DO, and nine KEEP or DEFER. One RETIRE was reversed after measurement: the `polymorphic` serialization registry (§9.8) stays. Re-measured, it has 19 registry declarations in 9 gtest files and 2 lit programs, and no short local rewrite exists (a `choice` cannot carry class, owned or heap-collection payloads; the hand-written discriminator pair is about 30 lines per base, unchecked for completeness, and changes the flat `$type` wire form). Proposal number 0182 was reserved for it and is left unused.
+
+The two kinds of work were kept apart:
+- **Editorial, no verdict moves.** One deciding sentence per rule; a restatement replaced by a pointer to the rule's single home; reasoning moved to the rationale, or confirmed already there; oversized paragraphs split into a short rule and numbered clauses. Anchors, cited clause numbers, cited bold paragraph names and `(derives: …)` tags are kept. Every lane delivered a verdict-equivalence table, and every critique re-walked it.
+- **Retirements, design changes.** One proposal each, with spec-change-process §10's subtraction review. They are [0181](proposals/0181-retire-the-use-after-removal-warning.md), [0183](proposals/0183-retire-the-marked-named-slot.md), [0184](proposals/0184-retire-the-assumed-tier-and-static-invariant.md) and [0185](proposals/0185-owned-overload-pair-retired.md), plus one carrier change, [0186](proposals/0186-conditional-member-conditions-at-the-declaration.md). All five are delegated rulings (process §8, `accepted (delegated)`) and all five graduate here.
+
+Four lanes:
+- `W1`: editorial §28.3 and §9.7.
+- `W2`: editorial §28.11, §28.14 and §30.5, and proposal 0181.
+- `W3`: editorial §9.8, §19.3 and §22.16; §2.8.6 relocated to a new Appendix E; proposals 0183 and 0184.
+- `W4`: editorial §14.2 and §22.6, and proposals 0185 and 0186.
+
+Each lane passed its author's adversarial pass and an independent critique. Every critique accepted its lane with fixes. The `W3` critique reversed one lane decision, the `polymorphic` registry's retirement (above). The 217 drafted documentation edits (`W1` 40, `W2` 42, `W3` 84, `W4` 51) were applied as one sequence in the order `W1`, `W2`, `W3`, `W4`, with `W4`'s three edits to `scripts/check_docs.sh` after them. None was dropped or re-anchored. The composition step added 23 edits of its own, and the rule corpus took 35 header refreshes (below).
+
+**Words, before and after** (whitespace tokens, measured on the composed documents against v0.337):
+
+| document | v0.337 | v0.338 | Δ |
+|---|---|---|---|
+| specification | 290,552 | 280,941 | **−9,611 (−3.3%)** |
+| standard library | 77,644 | 77,731 | +87 |
+| rationale | 127,740 | 130,305 | +2,565 (the dated records of the moved grounds and the five proposals) |
+| code-generation reference | 36,144 | 36,368 | +224 |
+| Guides 02, 03, 06 | 10,021 | 10,006 | −15 |
+
+| spec section | v0.337 | v0.338 | Δ | lane: editorial / retirement |
+|---|---|---|---|---|
+| §28.3 Local variables, ownership, and borrows | 31,876 | 29,712 | −2,164 | `W1` editorial (−2,140); 0181's indexer-row clause; 0185's field-store remedy |
+| §9.7 Records and disposal | 4,132 | 3,807 | −325 | `W1` editorial |
+| §28.11 Collection element ownership | 4,050 | 3,548 | −502 | `W2` editorial −183; 0181 −319 |
+| §28.14 Scoped callback parameters | 5,142 | 4,532 | −610 | `W2` editorial |
+| §30.5 Result lifetime and task disposal | 6,112 | 5,215 | −897 | `W2` editorial |
+| §9.8 Serialization synthesis | 6,307 | 5,744 | −563 | `W3` editorial |
+| §19.3 Patterns | 4,764 | 4,066 | −698 | `W3` editorial −152; 0183 −546 |
+| §22.16 Contract clauses | 4,503 | 4,113 | −390 | `W3` editorial −303; 0184 −87 |
+| §2.8 Module identity, artifact interface, and program assembly | 5,768 | 3,640 | −2,128 | `W3`: §2.8.6's body relocated, a 79-word pointer left |
+| Appendix E: Interface delta classification (new) | — | 2,101 | +2,101 | `W3`: the relocated body |
+| §14.2 Constraints | 6,440 | 5,358 | −1,082 | `W4` editorial −290; 0186 −791 |
+| §22.6 Overloading | 5,071 | 3,256 | −1,815 | `W4` editorial −247; 0185 −1,568 |
+| §35.5 Matching | 2,606 | 2,396 | −210 | 0183 |
+| Appendix C.3, C.7, C.1 | 7,682 | 7,524 | −158 | 0181 (C.3), 0183 (C.7), 0185 (C.1) |
+| Appendix A.7, A.4, A | 5,372 | 5,306 | −66 | 0183 (A.7), 0184 (A.4) |
+| §11.3, §22.3, §19.6, §15.3, §35.4, §3.6, §15.1, §27.6, §22.4, C.15, D.4, contents | — | — | −110 | 0183–0186 and the composition |
+
+Section counts exclude heading lines, so they sum to 6 words more than the document total. The editorial passes account for about 5,700 of the specification's 9,611 words. The retirements account for about 3,900: about 1,700 are 0185's, 900 0183's, 800 0186's, 430 0181's and 80 0184's. The §2.8.6 relocation is word-neutral (−27).
+
+The critiques recorded **30 findings**: `W1` 9, `W2` 10, `W3` 2 and `W4` 9. The substantive ones:
+- `W1`:
+  - **The lane's "zero quotes lost" check had only read each corpus header up to its first ellipsis.** Re-run on every ellipsis segment, the check showed 13 corpus cases had lost a verbatim fragment. Each fragment is restored.
+  - **One dropped rule.** A captured function value or deferred-activation frame contributes its sources transitively to the capture-set contribution. The sentence saying so had no other home and is restored.
+  - **Two equivalence repairs.** Bare-`T` caller clause 3 again states the holds-borrows exception before "every other value instantiation". *Calls mint* clause 5's open "any source an `owned` return admits" is restored.
+- `W2`:
+  - The `OwningBuffer<T>` `init` aside of §28.11 *Value-copy members* is restored.
+  - §30.5's Pattern A escape list is open again ("any binding other than the scoped await-bind's").
+  - 0181's deleted stdlib sentence is in §4.21 `OwningSlotMap<T>`, not §4.9.
+  - The code-generation §7.5 pair ran `PopAt(0)` on an empty array.
+  - The rationale contrasted lint A's exception with "no backstop", but the runtime raises it in every build.
+  - The tracker list was incomplete.
+- `W3`:
+  - **0182 dropped** (above).
+  - **0184's workaround.** It said `invariant(E);` was checked "at the same points". The retired form was inert, so the verdict-faithful rewrite is to delete the member; `invariant(E);` *starts* enforcing the predicate.
+- `W4`:
+  - **`W1`'s §28.3 field-store remedy, "add an `owned` overload", survived the retirement**, and so did its code-generation mirror. Both now name a distinct-name owning member.
+  - **0185 had undercounted its reach.** A second gtest row flips, proposal 0091 §5's "one genuine flip".
+  - §15.1.2 and Appendix C.1 still cited "§14.2's register".
+  - 0186 overclaimed that every member states its condition at its declaration. The nullable-companion family is carried by stdlib §1's index row and §15.1.
+  - The code-generation §7.4 pair is renamed `Hold`/`Adopt` so its existing lines read against an owning callee.
+
+**Outcomes the owner should see.**
+- **The specification is 9,611 words shorter (−3.3%).**
+  - **The editorial passes:**
+    - nine §28.3 paragraphs over 500 words become one;
+    - §30.5 loses 15%;
+    - §28.14 loses 12%;
+    - §14.2 loses 1,082 words, most of them the register.
+  - **No verdict moves in the editorial passes.** No cell or case was re-quoted for an editorial edit, except three borrow-flow matrix cells the composition found (*Matrix status*, below).
+- **Five features are gone, each at zero or test-only reach:**
+  - the element-borrow use-after-removal warning (a warning, never implemented);
+  - the marked named slot `move N = var x` (never parsed);
+  - the reserved `assumed` tier;
+  - `static invariant` (inert);
+  - ordinary-`owned` overload pairs. The standard library declares none.
+
+  The register of conditionally-admitted members is no longer the carrier: the standard library states each member's condition itself.
+- **What programs see.**
+  - **Newly rejected:** `static invariant(E);`, which ten gtest programs accept today, and a same-type pair differing only by ordinary `owned`, which two gtest rows, one lit program and four banked rule cases accept today.
+  - **Rejected by the specification but already rejected by the compiler:** a `move` at a named slot.
+  - **Warned:** one mandated warning, never implemented, is withdrawn.
+  - Nothing is newly admitted.
+- **The registry stays.** It is the one candidate whose workaround failed the criterion.
+- **Every new rejection is ahead of the compiler.**
+  - 3 trackers are filed.
+  - One issue closes as not planned: [#3087](https://github.com/s8lap/bezel-lang/issues/3087), proposal 0092's catch-up, whose subject 0183 retires.
+  - 8 existing issues get notes.
+  - 2 issues are filed: a spec question and a tooling issue (Migration, below).
+
+The composition step resolved these seams:
+- **The two cross-lane anchors held as designed.** `W4`'s 0185 edit lands inside `W1`'s rewritten §28.3 field-store clause 3. `W4`'s two §2.8.6 edits (*Member matching*'s key; the *member added* row) resolve inside `W3`'s Appendix E, so the relocation is applied first. `W2`'s 0181 edit lands inside §28.3's producers-table indexer row, which `W1` does not touch.
+- **The proposals folder.** All lanes anchored their README and `DECLINED.md` rows on the group-closing headings, so sequential insertion lands them in lane order. The five proposals then leave the live queue for *Graduated*, after 0178. `DECLINED.md` is recounted at 981 rows. Its per-site-suppression row is retitled, since four lints remain, and its collection-lint widenings row is annotated, since the element-borrow legs widen a retired warning.
+- **Pointers left by the lanes.**
+  - §22.16's `when`-clause sentence now cites Appendix E's modifier row directly, not §2.8.6's pointer.
+  - §22.4's "§22.6's `c!` becomes plain `c`" pointed at a `c!` the practical pattern has not had since v0.336. It now reads "`c` needs no `!`", pointing at §22.6's callers.
+  - Guide 03's "Extracting by name from an owning match" bullet, whose example is now positional, is retitled "Owning a payload in an owning match".
+  - Proposal 0185 §8 counts both flipped gtest rows.
+  - Proposal 0186 §8 and stdlib §4.4's comment no longer call #3325 open. The owning-side `Sort()` gate landed in 2026-08.
+- **Surviving statements of the retired features.** The composed spec, stdlib, guides, rationale and code-generation reference were searched for each retired feature:
+  - "use-after-removal", "lint B", "five lints", "five statically";
+  - "marked named slot", "marked slot", `move N = `, "proposal 0092";
+  - `assumed`, "static invariant";
+  - "owned overload", "ordinary-`owned`", "declaration guard", "erasure test", "ownership-mode";
+  - "§14.2's register", "register row", "conditionally-admitted".
+
+  Four live statements were respelled:
+  - two stdlib sentences citing "§14.2's register" (the `*OrNull` paragraph of §1 and the hashable-key paragraph of §5);
+  - the rationale's present-tense "the five lints' signal";
+  - the `DECLINED.md` row title above.
+
+  What remains is dated rationale history, each record followed by the v0.338 note or paragraph that retires it: the v0.250 lift and marked-slot records, the v0.203 tier record, the v0.307 fifth-instance record, and the v0.320–v0.328 register records. Also remaining are the deliberate *Looks right, is rejected* lines and the retirement sentences themselves.
+
+**`scripts/check_docs.sh`** passes on the composed tree with this entry, the four version headers and the code-generation reference's three pin lines at v0.338. PIN, FENCE, ANCHOR, VERSION, FACTS, TABLE, SETS, REGISTER, STYLE and EXTRACT are clean:
+- REGISTER reports "5 conditional-member families", read from stdlib §1's row.
+- EXTRACT finds 519 fragments; v0.337 had 522. The specification loses four example blocks (§22.6's `Registry` example and two practical-pattern blocks; §19.3's marked-slot example), and the code-generation reference gains two (§7.2's and §7.5's pairs).
+- The one CITATION advisory, `§4.12`, was already present at v0.337.
+
+`scripts/check_src_citations.py`, run over `src/` against the composed documents, is clean. The eight compiler comments citing §2.8.6 resolve to its pointer heading. `scripts/check_proposals.sh` passes (183 ↔ 183; live 48, graduated 135). `corpus.py lint --strict` is clean (2,546 cases), `corpus.py check` finds the manifest up to date, and the rule-corpus and conformance-harness self-tests pass.
+
+- **§28.3 (*Factory methods and sourceless returns*, *Borrow lifetime rules*, *Unbound owned temporaries*, the state-match paragraph, the announcement table's row 5, the consume-site freeze's *Scope*, the must-use warning, the trust-admission report) and §9.7; rationale §5.26, §9.1 — editorial (the spec diet, lane `W1`; no verdict moves).** Each rule keeps one deciding sentence. Restatements of a rule stated at its home become pointers, the oversized paragraphs become a rule plus numbered clauses, and the grounds the text carried move to two dated rationale addenda. §28.3 loses 2,140 words (31,826 → 29,686) and §9.7 loses 325 (4,132 → 3,807). Nine §28.3 paragraphs over 500 words become one; §9.7's two become none. No anchor, cited clause number, bold paragraph name or `(derives: …)` tag changes. The draft of `W1` had been measured against the v0.334 matrix runs; it was rebuilt against v0.337 and three v0.336-run quotes were restored.
+- **§28.11, §28.14, §30.5; rationale §5.11, §5.26 — editorial (lane `W2`; no verdict moves).**
+  - §30.5: the Pattern A consumer admission, stated four times, is one rule with three operand bullets. The scoped await-bind's producer list (a restatement of §28.3's unbound-temporary classification) and its "slot's semantics, worked" (a restatement of §28.10's cleanup stack) become one paragraph each.
+  - §28.14: *Set-erasing positions* is cited from §28.3 instead of restated, and *Call-bounded × deferred activation* becomes two numbered shapes.
+  - §28.11: *Storing a borrow* is a rule with four numbered clauses, and *Value-copy members* a rule with three bulleted shapes. The storage-order ground and the declined handle-field freeze move to the rationale.
+  - Totals: §30.5 −897, §28.14 −610, §28.11 −183.
+  - Twelve worked-instance bold leads of §30.5 that nothing cites are dissolved. A `src/` comment (`Ownership_Checks.cpp`, about line 16744) and a test comment (`await_site_stmt_walk_3074_test.cpp:10`) name *Which binding forms qualify*, now *Which declarations qualify*. These are prose, not `§`-citations, and left for the next touch.
+- **§9.8, §19.3, §22.16; §2.8.6 → Appendix E; rationale — editorial (lane `W3`; no verdict moves).**
+  - §9.8: *Constructor selection* becomes the single home of the matching rule for classes and records, and the "Deserialize has no owner" argument is stated once. The write-only decline gets its own `rejected` row. Every `polymorphic` registry sentence is kept verbatim. §9.8 −563.
+  - §19.3: the `=`-versus-`:=` argument moves to the rationale (§3.14, which already records it). The named-slot ownership paragraph names *Pattern binding and ownership* instead of restating it. §19.3 −152.
+  - §22.16: the lead no longer summarises each subsection, and the `when`-clause derivation is compressed. §22.16 −303.
+  - **§2.8.6 *Interface delta classification* moves verbatim to a new Appendix E.** It is tooling vocabulary that no compiler rule reads. The `#### 2.8.6` heading and its anchor stay as a 79-word pointer, so every §2.8.6 citation (spec, rationale, `DECLINED.md`, eight compiler comments, Guide 06) still resolves. The one reading the compiler applies, that a contract-opaque artifact makes no record claim, is now stated at §2.8.2 *Contract records*.
+- **§14.2, §22.6; rationale §10 — editorial (lane `W4`; no verdict moves).**
+  - §14.2: the `new()` paragraph is ordered by arm, *A type parameter as the type argument* is one rule with two numbered cases, and the worked examples are folded into prose. The reasons (the accessibility ground, the abstract/`closed` ground, the nullable-value representation) move to a dated rationale paragraph.
+  - §22.6: the practical pattern keeps its idiom and points at stdlib §4.9, §28.8.1 and §22.4 for the implementation walkthrough. Its stale `move _slot!` + `_slot := null` (stale since proposal 0174) becomes the bare `move _slot` at a nullable field.
+- **§28.11 *Owning collections*, §28.3 (the producers table's indexer row), Appendix C.3; stdlib §4.5, §4.21; rationale §5.28; the code-generation reference §4.5, §4.6, §7.5 — the element-borrow use-after-removal warning is retired (design change, a §10 subtraction; [proposal 0181](proposals/0181-retire-the-use-after-removal-warning.md); [#4603](https://github.com/s8lap/bezel-lang/issues/4603) lint B; the diet's D-D).**
+  - **The problem.** Since v0.307 the compiler "must warn" when an owning-collection element borrow is used after a dominating `Clear()`, `Remove(b)` or same-index `RemoveAt(i)` on the same binding. The warning changed no verdict and was implemented nowhere. It named one straight-line shape of a dangle the checked-mode backstop faults deterministically, and recorded two chosen silences and an `Equals` over-warn beside it: about 625 normative words for a diagnostic no program depended on.
+  - **The rule.** An owning-collection element borrow is valid until its slot is mutated and is not statically tracked per slot. A use afterwards is a mid-scope kill under the checked-mode backstop (K4.1, §28.2). Re-take the borrow after the mutation, take the element out first with `PopAt`/`Pop`/`PopValue`, or mutate after the last use; the code-generation reference's new §7.5 pair shows the fault beside the `PopAt` spelling. Lint A, §29.12's mutation-during-iteration warning, is unchanged.
+  - **Declined:** the status quo; keeping the shape as non-normative advice in the specification; widening the warning to the recorded silences; a tooling appendix. The warning itself is a `retired` row.
+  - **Measured reach.** Zero gtest, lit, `src/`, guide and doc-corpus sites. Five banked rule cases name it. Of those, `s28_11_0008` and `0009` (`warn`, baseline `fail #4603`) become `quiet` at the tracker. `s28_11_0010`–`0012` (`quiet`) keep their verdicts, and their headers were refreshed.
+- **§19.3 (*Named destructuring*, *Named-slot bindings and ownership*; the marked-slot paragraphs, example and parse note deleted), §15.3, §19.6, §35.4, §35.5, Appendix A.7, C.7; rationale §3.14; the code-generation reference §3.5, §6, §7.2; Guide 03 §2 — the marked named slot `move N = var x` is retired (design change, a §10 subtraction; [proposal 0183](proposals/0183-retire-the-marked-named-slot.md); the diet's D-E).**
+  - **The form.** Since v0.250 (proposal 0092) a named slot in an owning match could carry the transfer marker on its source, `Fetched(move response = var r)`, transferring that payload while unmarked siblings stayed borrows. It came with six admission conditions, a five-case rejection set, a three-token parse commit, a §19.6 clause, a §35.5 paragraph and an Appendix C.7 row, all for one capability: borrowing one payload while transferring another in the same list.
+  - **The rule now.** A named slot never transfers, in an owning match included: a named-matched owned or move-only value payload is borrowed during the arm and disposed at construct completion. To own a payload, destructure positionally: every obligation-bearing slot transfers at once, and `_` discards a sibling with the construct. `move` at a named slot is a compile error naming the positional form.
+  - **Declined:** the form kept for choice cases only; a slot-list-level `move`. Unmarked symmetry stays declined on its v0.250 ground. The marked slot is a `retired` row.
+  - **Measured reach.** Zero gtest or lit programs and no parser arm; the compiler never parsed it. Affected: the four documentation examples that introduced the form, one guide example, and three rule cases written from the text. `s35_5_0008` (banked `fail`) flips `run` → `reject` at the tracker.
+- **§22.16 (the lead, *The tier system: proven / checked*, *Discharge sites*, *Class invariants*, *Out of scope in this revision*, *Scope*), §2.8.2, Appendix E, A.4 `InvariantDecl`, C.15; rationale §9.8; Guide 06 §4 — the `assumed` contract tier and `static invariant` are retired (design change, a §10 subtraction; [proposal 0184](proposals/0184-retire-the-assumed-tier-and-static-invariant.md); the diet's D-C with D-G′).**
+  - **The reservations.** The v0.203 design named a stated-but-unverified tier for contract clauses on `extern` declarations and never populated it. `static invariant` parsed, instrumented nothing, and since v0.303 ([#4256](https://github.com/s8lap/bezel-lang/issues/4256)) had to warn that it did nothing.
+  - **The rule now.** Every clause occupies exactly one tier, proven or checked. An invariant member takes no `static` qualifier: `static invariant(E);` is a compile error at the member. Contract clauses on `extern` declarations stay a deferred design, and their `DECLINED.md` row is respelled.
+  - **Declined:** reading `static invariant` as a checked invariant plus a warning; keeping `assumed` as the word for a clause an implementation chose not to evaluate. Two `retired` rows.
+  - **Measured reach.** No program names the tier. `static invariant` is pinned by six gtest files: ten accepting programs flip to rejects, and three reject files may change diagnostic. These are the compiler's pins of the inert behaviour.
+  - **Workaround:** delete the member, which is verdict-faithful because it was inert, or write `invariant(E);`, which starts enforcing it.
+- **§22.6 (*`owned` and overload resolution* rewritten; the resolution pipeline's stage 4 removed, stages 5–8 renumbered 4–7; the ambiguity paragraph's exception), §22.3, §11.3, §14.2, §28.3, Appendix E, C.1; stdlib §1; rationale §3.9, §3.10, §10; the code-generation reference §4.3, §5.2, §7.4; Guide 02 — `owned` never distinguishes overloads: the v0.250 ordinary-parameter lift is retired (design change, a §10 subtraction; [proposal 0185](proposals/0185-owned-overload-pair-retired.md); the diet's D-A).**
+  - **The problem.** Since v0.250 two same-name members could differ only by `owned` on an ordinary parameter. The argument's ownership classification resolved the call, under a 460-word declaration guard. Measured at v0.337, the standard library declares no such pair and the tests hold seven sites, each a test of the rule. The lift carried about 1,500 words and a compiler guard that had over-rejected once ([#4939](https://github.com/s8lap/bezel-lang/issues/4939)).
+  - **The rule now.** `owned` (on an ordinary parameter as on an `out` parameter) and `scoped` never distinguish overloads; a pair differing only by one of them clashes at the second declaration (§11.3). A borrowing and an owning form of one operation take distinct names (`TryGetValue`/`TryPopValue`; `Append(item)` beside `Adopt(owned item)`) or differ in parameter type (`Task.WhenAll`). §22.3's marker discipline is unchanged. §28.3's field-store clause 3 and the code-generation reference §4.3 no longer name "an `owned` overload" as a remedy.
+  - **Declined:** keeping the lift; the concrete-types-only pair; marker-only routing. The lift is a `retired` row. The v0.250 soundness argument stands and is not the ground.
+- **§14.2 (*Conditionally-admitted members* rewritten), §3.6, §15.1, §15.1.2, §22.6, §27.6, Appendix C.1; stdlib §1 (the new *Conditional members* row), §4.4, §4.5, §4.14; rationale §5.15; the code-generation reference §7.3; `scripts/check_docs.sh` — the condition moves to the declaration: §14.2's register of conditionally-admitted members is retired as a carrier (design change, a carrier change under the §10 review; [proposal 0186](proposals/0186-conditional-member-conditions-at-the-declaration.md); the diet's D-H).**
+  - **The change.** The register's rows each recorded that they would lapse once "a member-level condition" was the member's declared form. Now the standard library states each member's condition itself:
+    - `Array<T>.Sort() where T: IComparable<T>`, with `Sorted()` and `OwningArray<T>.Sort()` likewise, as a `where` clause on the enclosing type's parameter, a form a user declaration still may not write;
+    - `DangerousPointer()`, `Result<T, E>`'s combinators and the equality search by naming the defining section;
+    - the nullable-companion members through §15.1 and the index row.
+
+    Stdlib §1's *Conditional members* row indexes the closed set, and `check_docs.sh`'s REGISTER check reads it there. §14.2 keeps the definition, the reading rule (as §14.5 *Constraints* reads a method's own clause, the v0.321 generic-body reading unchanged), the diagnostic, the ordinary-call rule and the user bar.
+  - **No verdict moves:** every condition, rejection site and remedy is the row's.
+  - **Declined:** the register as carrier; renaming the natural-order `Sort()`; a `value-like` constraint form. §2.8.6's dispatched-generic and requirement-summary rows (D-K) are not touched: D-H does not make them redundant.
+- **Migration.**
+
+  *Newly rejected (spec-ahead-of-impl):*
+  - 0184: `static invariant(E);`. Ten gtest programs: `static_invariant_inertness_warning_4449` (7), `static_invariant_ordinary_class_4206` (3) and `contract_clauses_2053` (one parse accept). Three reject files may change diagnostic.
+  - 0185: a same-type pair differing only by ordinary `owned`:
+    - two gtest rows of `s22_6_disposable_constraint_pair_distinguishable_4939`;
+    - the lit `sema_overload__owned_only_difference_diagnoses.bzl`, back to its pre-v0.250 reject;
+    - the banked `s22_6_0013`, `s22_6_0014` (`run` → `reject`), `s22_6_0018` and `s11_3_0007` (accept → `reject`);
+    - the doc-corpus block `spec_0141` (a `skip` row) is deleted with §22.6's example.
+  - 0183: `move` at a named slot. It is relative to the specification only: the compiler parses no named slot today. The banked `s35_5_0008` flips `run` → `reject`.
+
+  *Newly admitted:* nothing.
+
+  *Newly warned:* nothing. One mandated warning (0181's lint B) is withdrawn, never having been emitted.
+
+  *Doc-only:*
+  - 0186;
+  - the `assumed` tier;
+  - every editorial edit;
+  - the §2.8.6 relocation;
+  - the composition's pointer repairs.
+
+  *Spec-ahead-of-impl (tracking issues filed at landing):*
+  - 0183: [#5938](https://github.com/s8lap/bezel-lang/issues/5938): the two ownership diagnostics that name the marked slot as a remedy; the "`move` is not a slot spelling" diagnostic once the named destructure parses; `s35_5_0008`'s flip and `s35_5_0009`'s needle; the four doc-corpus cases. [#3087](https://github.com/s8lap/bezel-lang/issues/3087), proposal 0092's catch-up, closes as not planned, and [#2197](https://github.com/s8lap/bezel-lang/issues/2197), the named destructure, gets a note.
+  - 0184: [#5939](https://github.com/s8lap/bezel-lang/issues/5939): the #4449 warning becomes the rejection; `MetaContractTier::Assumed` is deleted; the six gtest files.
+  - 0185: [#5940](https://github.com/s8lap/bezel-lang/issues/5940). It deletes `positionTypePassesDeclarationGuard` and `typeParamConstraintSetQualifies` (`src/sema/TypeResolution_Checks.cpp:3004–3180`) and re-spells the clash diagnostic. It also carries the test flips above, the two #1873 lit needles, `s22_6_0017`'s needle and the pipeline-stage comments. [#3086](https://github.com/s8lap/bezel-lang/issues/3086), proposal 0091's catch-up, gets a note withdrawing its items 1–2; its stdlib-merge item is unaffected.
+  - 0181: a note on [#4603](https://github.com/s8lap/bezel-lang/issues/4603) withdraws its lint-B leg (nothing was built). `s28_11_0008` and `0009` are re-cut to `quiet` and re-banked there.
+  - 0186: no tracker. Notes go on [#1717](https://github.com/s8lap/bezel-lang/issues/1717) (`DangerousPointer()`'s condition is now stated at its declaration; still unimplemented) and on the four open trackers whose titles cite the register: [#5520](https://github.com/s8lap/bezel-lang/issues/5520), [#5641](https://github.com/s8lap/bezel-lang/issues/5641), [#5656](https://github.com/s8lap/bezel-lang/issues/5656) and [#5821](https://github.com/s8lap/bezel-lang/issues/5821). Their work is unchanged.
+
+  *Owner decisions recorded:*
+  - The owner's 2026-10-13 approval of the editorial pass, and the 2026-10-13 retirement criterion.
+  - The coordinator's retire/keep table under that criterion. D-F (class- and interface-typed `scoped`), D-G (class `invariant` members), D-I (class serialization synthesis), D-J (the scoped await-bind and `.Result` lockstep) and D1-C1 to C5 are KEEP. D-L and D-M are deferred until a compiler run measures their reach. D-B was KEEP after measurement.
+  - Proposals 0181 and 0183–0186 were accepted as delegated rulings and graduate here.
+
+  *Filed:*
+  - [#5936](https://github.com/s8lap/bezel-lang/issues/5936) (`spec-question`): does §29.12's mutation-during-iteration warning (lint A), unimplemented and verdict-free like the retired lint B, earn its place? The ruling is to come at a later train (low).
+  - [#5937](https://github.com/s8lap/bezel-lang/issues/5937) (tooling): `check_docs.sh` REGISTER's member-name regex splits bare names (`MapError` → `apError`, `out` → `ut`). As a result direction A finds a "member" in almost any window, and an unmapped term-use passes. This is pre-existing and unchanged by 0186.
+
+  *Decided or recorded rather than filed:*
+  - §22.4's dangling "§22.6's `c!`" pointer is repaired here (editorial).
+  - The "§2.8.6's modifier row" citation now names Appendix E.
+  - #3325 is closed, so the owning-side `Sort()` gate is not spec-ahead.
+  - `W3`'s question on the stdlib `KeyNotFoundException` constructors belonged to the dropped 0182 idiom and is not filed.
+
+  *Guides:*
+  - Guide 02: one sentence (0185).
+  - Guide 03 §2: the marked-slot bullet and example respelled to the positional form (0183); the bullet retitled at composition.
+  - Guide 06 §4: the tiers sentence (0184).
+
+  No guide pin moves. Guide 05's lint-A teaching is unchanged.
+
+  *Corpus:*
+  - The rule corpus stays at 2,546 cases. No case is retired, and no banked verdict, needle or baseline row is touched.
+  - **Header refreshed, verdict unchanged:**
+    - unbanked: `s19_3_0017`, `s19_3_0018` (0183; `s19_3_0018`'s title and needle `positional` as the `W3` critique left them, its quote made an ellipsis-split one so it holds verbatim); `s27_6_0007`, `s27_6_0008` (0186); `s15_1_0008`, `s15_1_0011` (0186); `s28_3_0099`, `0100`, `0118`, `0119`, `0152`, `0201`, `0202`, `s9_7_0033` (`W1`'s respelling).
+    - banked:
+      - `s28_3_0071`–`0079`, the must-use paragraph (`W1`; `0074`, `0076` and `0079` were paraphrases, respelled verbatim);
+      - `s28_3_0090`, `0093`, `0095`, the trust-admission report's clauses (`W1`);
+      - `s30_5_0004` (`W2`);
+      - `s28_11_0010`–`0012` (0181);
+      - `s22_6_0015`, `s22_6_0017`, `s11_3_0006` (0185);
+      - `s35_5_0009`, `s35_5_0010` (0183).
+  - Every refreshed quote holds verbatim on the composed text.
+  - The stale quotes were found by an all-ellipsis, normalized comparison. Several `W1` fragments the lanes' raw comparison counted as kept had changed case, link or emphasis around them.
+  - **Left for their trackers, verdicts banked:** the seven banked flips. These are `s22_6_0013`, `0014`, `0018` and `s11_3_0007` (0185), `s28_11_0008` and `0009` (0181), and `s35_5_0008` (0183). A header quoting the new rule would contradict each one's banked expectation.
+  - **Paraphrases left as written** (verdict-true, wording drifted from the composed text): `l4_4_0006`, `l4_4_0007`, `s11_3_0008`, `s14_2_0011`, `s27_5_0008`, `s28_3_0002` and `s28_3_0039`.
+  - The doc-example corpus is not regenerated ([#1380](https://github.com/s8lap/bezel-lang/issues/1380)). `spec_0117`, `codegen_0012`, `codegen_0039` and `guide3_0002` (0183) and `spec_0141` (0185) change at regeneration.
+  - **Coverage gaps not written** (recorded in the trackers):
+    - a checked-mode `run` case faulting on a use after `RemoveAt` (0181);
+    - `move` at a named slot rejected naming the positional form (0183);
+    - `static invariant(…)` rejected (0184);
+    - a same-type `Put`/`Put(owned)` pair rejected at a concrete class (0185);
+    - a user `method Sort() where T: IComparable<T>` on `class Bag<T>` still rejected under rule 1 (0186).
+
+  *Matrix status after this train* (the v0.336 run files are pinned and not edited; the next re-runs re-quote):
+  - **Disposal** (0181): R5/C1, R5/C6, R5/C7 and R5/C9 quote the deleted warning. Re-quote the replacement sentence ("is not statically tracked per slot: a use of it afterwards is a mid-scope kill under the checked-mode backstop"). No verdict moves.
+  - **Generics** (0185): R1/C4 quotes the guard fragment "a class bound (`where T: SomeClass`) qualifies — only class types satisfy it" among several grounds; the verdict does not turn on it.
+  - **Generics** (0186): R5/C12, R7/C12 and R9/C12 quote "the nullable-companion row's not-an-inline-array condition", now "the nullable-companion members' …". Verdicts are unchanged.
+  - **Generics** (the relocation): R5/C14's fragment now lives in Appendix E. That is a `cite` change, not a re-quote.
+  - **Borrow-flow** (`W1`, found at composition): R3/C10, R4/C10 and R5/C10 quote "contributes the sources of the borrows it carries, as the closure bullet's provenance clause 1 and *The sources an argument contributes* item 3 count it". The deferred-activation rewrite moved that rule to its home, the closure bullet's provenance clause 1 ("a captured local or parameter of a value type that holds borrows … the sources of the borrows it carries, the count *The sources an argument contributes* item 3 gives the same value as an argument"). Re-quote it; the verdicts are unchanged.
   - Each lane re-walked its cells' row and column neighbours and found none opened.
 
 ---
