@@ -7295,6 +7295,20 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         m != "Equals" && m != "GetHashCode") return nullptr;
 
     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    // §9.2 *Through a type parameter* (v0.338, #5806): "the three kinds read at
+    // the instantiation" — a receiver typed by a bare type parameter `T` that
+    // this monomorphization binds to an inline array is that inline array here,
+    // so `a.Equals(b)` / `a.Equals(o)` / `a.GetHashCode()` reach §15.1.2's
+    // element-wise members exactly as on a directly-typed `[N]T` receiver.
+    // The dead template body (no substitution active) keeps the unresolved `T`
+    // and declines below, as before.
+    if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+        !recvTy->declaration && !recvTy->nullable) {
+        const sema::TypeRef* c = resolveTypeParamRef(recvTy);
+        if (c && c != recvTy && c->kind == sema::TypeRef::Kind::InlineArray &&
+            !c->nullable)
+            recvTy = c;
+    }
     if (!recvTy || recvTy->kind != sema::TypeRef::Kind::InlineArray) return nullptr;
 
     sema::TypeRef* elemRef = recvTy->arrayElement;
@@ -7555,6 +7569,39 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         // an alloca (rvalue) — same path as ToArray/Contains above. Load the
         // value from the address.
         llvm::Value* lhsVal = builder_.CreateLoad(arrTy, arrAddr, "iae.l");
+
+        // §9.2 *Through a type parameter* (v0.338, #5806) / §8.3 / §8.6: the
+        // SECOND kind — an argument whose static type is not an inline array
+        // (`Object?`, `Object`, a boxed value) is read at the boxed-argument
+        // rule: "a boxed S of the same type compares element-wise, and any
+        // other argument compares unequal" (null included). Box the receiver
+        // and dispatch through its box vtable's Equals thunk
+        // (ensureInlineArrayBoxVtable), which owns exactly that rule, instead
+        // of reading the argument pointer as an unboxed array. Both boxes are
+        // dead after the pure thunk returns (`pureBoxBindings_`), so each is
+        // released here.
+        {
+            const sema::TypeRef* at = ctx_.exprType(*call.args[0].value);
+            if (at && at->kind == sema::TypeRef::Kind::Named &&
+                !at->declaration && !at->nullable)
+                if (const sema::TypeRef* c = resolveTypeParamRef(at))
+                    at = c;
+            if (at && at->kind != sema::TypeRef::Kind::InlineArray) {
+                llvm::Value* mint = nullptr;
+                llvm::Value* other =
+                    lowerUniversalEqualsArg(*call.args[0].value, &mint);
+                llvm::Value* savedMint = lastBoxMint_;
+                llvm::Value* box = boxValue(lhsVal, recvTy);
+                lastBoxMint_ = savedMint;
+                if (!other || !box || !box->getType()->isPointerTy())
+                    return nullptr;
+                llvm::Value* r = lowerObjectEquals(box, other);
+                if (!r) return nullptr;
+                emitBoxRelease(box);
+                if (mint) emitBoxRelease(mint);  // null-safe (§28.9)
+                return r;
+            }
+        }
 
         // Argument: same lowering shape — lvalue first, spill to alloca if
         // the call site is a computed expression (e.g. method return).

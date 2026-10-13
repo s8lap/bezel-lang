@@ -12033,6 +12033,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         bool isDeclLessNamedBuiltinRecv =
                             recvTy && recvTy->kind == K::Named &&
                             !recvTy->declaration;
+                        // §9.2 *Through a type parameter* (v0.338, #5806): a
+                        // bare `T` whose active instantiation binds it to a
+                        // type this backend has no §8.1 lowering for (e.g.
+                        // `GetHashCode` at `int?`) is tracked by #5953, not by
+                        // the closed #2457 (a collection-family issue).
+                        const bool instantiatedTypeParamRecv =
+                            isDeclLessNamedBuiltinRecv && recvTy->astNode &&
+                            recvTy->astNode->name &&
+                            recvTy->astNode->name->parts.size() == 1 &&
+                            genericSubstSemaTy_.count(recvTy->headName()) != 0;
                         if (isObjectContractMember &&
                                 isDeclLessNamedBuiltinRecv) {
                             // #2874's rule: locate the diagnostic on EVERY
@@ -12053,7 +12063,9 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 "` is declared via the universal Object "
                                 "contract (language spec \xC2\xA7""8.1) but is "
                                 "not yet implemented by this compiler for this "
-                                "receiver (tracked #2457)");
+                                "receiver (tracked " +
+                                std::string(instantiatedTypeParamRecv
+                                                ? "#5953" : "#2457") + ")");
                             return nullptr;
                         }
                         // ⚠ NOT extended to a receiver with NO inferred
