@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 30.1
 //! title: an async method may return OwningTask<T> for a class-typed T
-//! rule: `OwningTask<T>` for some class type T — a result whose ownership
-//!   transfers to the awaiter (§30.5).
+//! rule: `OwningTask<T>` for some class or interface type T — a result whose
+//!   ownership transfers to the awaiter (§30.5).
 //! cites: 30.1, 30.5
 //! expect: accept
 module Conf;

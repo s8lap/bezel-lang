@@ -2,11 +2,12 @@
 //! doc: spec
 //! section: 28.3
 //! title: a capture-bearing function value as the receiver of an extension on Object is rejected
-//! rule: As the receiver of an extension call whose head is `Object` — which
+//! rule: as the receiver of an extension call whose head is `Object` — which
 //!   §26.5 rule 2 reaches from a function-typed receiver, a function type
-//!   reaching `Object` through its inheritance chain (§3.1) — it is: the
-//!   extension's receiver parameter is declared at the head, and the body
-//!   reads `this` there and may pass it on to a parameter that stores it
+//!   reaching `Object` through its inheritance chain (§3.1) — it is, the twin
+//!   of §9.7's *borrow-erasing position* clause for the receiver of such a
+//!   call. At every set-erasing position **a function value with a non-empty
+//!   source set is rejected, and a capture-free one is admitted**
 //! cites: 28.3, 26.5
 //! expect: reject
 //! diagnostic: set-erasing

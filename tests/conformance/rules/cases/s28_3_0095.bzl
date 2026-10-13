@@ -2,11 +2,11 @@
 //! doc: spec
 //! section: 28.3
 //! title: under the trust-admission report mode, abandoning a task minted over a borrowed receiver reports
-//! rule: In the trust-admission report mode, a borrow held by a pending frame
-//!   past the call that minted it — a task passed to Task.FireAndForget —
-//!   is an admission resting on a K4.3-recorded trust clause (spec §30.1's
-//!   settlement obligation), and the compiler emits a warning naming the rule
-//!   and its clause.
+//! rule: In that mode, at every site where the compiler makes an admission that
+//!   rests on a K4.3-recorded trust clause — ... the frame-held clause (§30.1,
+//!   §30.5) ... — the compiler emits a warning naming the rule and its clause
+//!   ... The site is the admitting site — the store, the call, the abandon or
+//!   the `await` the clause admits
 //! cites: 28.3, 30.1, 30.10
 //! expect: warn
 //! diagnostic: trust

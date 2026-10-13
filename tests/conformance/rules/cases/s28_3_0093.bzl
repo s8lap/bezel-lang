@@ -2,11 +2,12 @@
 //! doc: spec
 //! section: 28.3
 //! title: under the report mode, a parameter borrow added to a borrowing collection field reports
-//! rule: In the trust-admission report mode, a parameter-, receiver- or
-//!   field-path-sourced borrow stored into a borrowing-family collection
-//!   (spec §28.11's store rule) is an admission resting on a K4.3-recorded
-//!   trust clause, and the compiler emits a warning naming the rule and its
-//!   clause.
+//! rule: In that mode, at every site where the compiler makes an admission that
+//!   rests on a K4.3-recorded trust clause — ... the collection-held clause
+//!   (§28.11's store rule, a store whose receiver the structural check leaves
+//!   unclassified included) ... — the compiler emits a warning naming the rule
+//!   and its clause ... The trust-admission report (§28.3) names a parameter-,
+//!   receiver- or field-path-sourced element at its store
 //! cites: 28.3, 28.11
 //! expect: warn
 //! diagnostic: trust
