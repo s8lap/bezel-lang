@@ -1152,6 +1152,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 const auto* ls =
                     dynamic_cast<const sema::LocalSymbol*>(sym);
                 const auto* ld =
+                    // LOCALDECL-ONLY: reached only under `st.maybeConsumed`; a `const` local's state is never Owned, so never maybe-consumed
                     ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl)
                        : nullptr;
                 if (ld) {
