@@ -314,11 +314,11 @@ BEZEL_TEST(type_alias_family_4052,
         "type AliasClsInner4052 := ClsChained4052; "
         "public class ClsChained4052 "
         "  destructor end destructor; "
-        "  public static method Equals(): bool => true; "
+        "  public static method AliasProbe4052(): bool => true; "
         "end ClsChained4052; "
         "class C "
         "  public static method Main(): int "
-        "    if AliasClsOuter4052.Equals() then return 1; else return 0; end if; "
+        "    if AliasClsOuter4052.AliasProbe4052() then return 1; else return 0; end if; "
         "  end Main; "
         "end C;"), 1);
 }

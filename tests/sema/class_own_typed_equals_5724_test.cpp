@@ -160,7 +160,7 @@ BEZEL_TEST(class_own_typed_equals_5724,
 module M;
 class C
   public constructor() end constructor;
-  public static method Equals(a: C, b: C): bool => true;
+  public method Equals(a: C, b: C): bool => true;
 end C;
 class Program public static method Main(): int return 0; end Main; end Program;
 )");

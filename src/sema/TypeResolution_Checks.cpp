@@ -7084,6 +7084,35 @@ void Resolver::checkHidingAndOverride() {
                 // reaches the slot and nothing else does. Any other signature
                 // of the three names stays admitted as an overload (§12.2,
                 // resolved by §22.6), and `override` is checked by its own path.
+                // fix #5961 (§12.2, v0.338): "a static member of the three
+                // names stays blocked" — the admission covers instance
+                // members only, so a static `Equals`/`GetHashCode`/`ToString`
+                // is blocked at every parameter list (Object's own signature
+                // keeps the hiding message below). A `static class` is left
+                // as it was: the normative stdlib declares
+                // `public static class Convert` with static `ToString`
+                // overloads (spec question, see the commit body).
+                if (auto* tm = dynamic_cast<const MethodSymbol*>(ms);
+                    tm && !tm->isOperator && hasMod(ms, "static") &&
+                    (tm->name == "Equals" || tm->name == "GetHashCode" ||
+                     tm->name == "ToString") &&
+                    objectOwnSignatureMemberOf(tm, ctx_).empty()) {
+                    bool staticClass = false;
+                    for (std::string_view mod : t->modifiers)
+                        if (mod == "static") staticClass = true;
+                    if (!staticClass) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string("static member `") +
+                            std::string(ms->name) +
+                            "` hides the inherited `Object." +
+                            std::string(ms->name) +
+                            "`; a static member of `Equals`, `GetHashCode` or "
+                            "`ToString` is blocked at any parameter list "
+                            "(\xC2\xA7""12.2)");
+                        continue;
+                    }
+                }
                 if (!hasMod(ms, "override")) {
                     if (auto objName = objectOwnSignatureMemberOf(
                             dynamic_cast<const MethodSymbol*>(ms), ctx_);
