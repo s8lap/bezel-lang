@@ -225,7 +225,7 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
         "module M; " + kOwningChoiceDecl +
         "class H<T> where T: class "
         "  private owned f: OwningBuffer<T> := new OwningBuffer<T>(); "
-        "  public method N(): int return f.Count; end N; "
+        "  public method N(): int return f.Length; end N; "
         "end H; "
         "class C public static method Main(): int "
         "  using var h := new H<Wrap>(); "
@@ -239,6 +239,11 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
 // ACCEPT CONTROLS — a false reject is worse than the bug (LANE_RULES §7).
 // =============================================================================
 
+// fix #6081 (stdlib §4.14): the probe bodies below read the buffer through
+// `Length` (its declared member); `OwningBuffer<T>` declares no `Count`, so
+// the former `.Count` reads are now "no member" rejects. The admission or
+// move-only property each row pins is unchanged.
+//
 // §14.4 OwningBuffer/Span/ReadOnlySpan exception clause: T may be a
 // CLASS TYPE (with ownership semantics as above) — `Resource` is a
 // non-owned class.
@@ -250,7 +255,7 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
         "class Resource public x: int := 0; end Resource; "
         "class C public static method Main(): int "
         "  using var b := new OwningBuffer<Resource>(3); "
-        "  return b.Count; "
+        "  return b.Length; "
         "end Main; end C;"));
 }
 
@@ -264,7 +269,7 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
         "module M; "
         "class C public static method Main(): int "
         "  using var b := new OwningBuffer<int>(7); "
-        "  return b.Count; "
+        "  return b.Length; "
         "end Main; end C;"));
 }
 
@@ -284,7 +289,7 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
         "module M; " + kValueLikeChoiceDecl +
         "class C public static method Main(): int "
         "  using var b := new OwningBuffer<VLC>(2, lambda(i: int): VLC => VLC.A); "
-        "  return b.Count; "
+        "  return b.Length; "
         "end Main; end C;"));
 }
 
@@ -302,7 +307,7 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
         "module M; "
         "class H<T> where T: class "
         "  private owned f: OwningBuffer<T> := new OwningBuffer<T>(); "
-        "  public method N(): int return f.Count; end N; "
+        "  public method N(): int return f.Length; end N; "
         "end H; "
         "class C public static method Main(): int return 5; end Main; "
         "end C;"));
@@ -319,7 +324,7 @@ BEZEL_TEST(sema_span_owning_buffer_move_only_rejected_3794,
         "class Resource public x: int := 0; end Resource; "
         "class H<T> where T: class "
         "  private owned f: OwningBuffer<T> := new OwningBuffer<T>(); "
-        "  public method N(): int return f.Count; end N; "
+        "  public method N(): int return f.Length; end N; "
         "end H; "
         "class C public static method Main(): int "
         "  using var h := new H<Resource>(); "

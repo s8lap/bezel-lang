@@ -176,13 +176,16 @@ BEZEL_TEST(ownedbuffer_span_636, asreadonly_chained_tobytes_spec_4_14_9_8_issue_
 // §4.14 Count / Length on OwningBuffer<byte>
 // ===========================================================================
 
-// §4.14 / #636: OwningBuffer<byte>.Count returns the buffer capacity.
+// §4.14 / #636: OwningBuffer<byte> reports its capacity through `Length`. This
+// row was `buf.Count`; `OwningBuffer<T>` declares no `Count` (stdlib §4.14), so
+// that read is now a "no member" reject (fix #6081; see
+// sema/member_set_residual_6081_test.cpp R5). The expected value is unchanged.
 BEZEL_TEST(ownedbuffer_span_636, count_byte_buffer_jit_spec_4_14_issue_636) {
     BEZEL_EXPECT_EQ(run(
         "module M; import System.Serialization; "
         "class C public static method Main(): int "
         "  using var buf := new OwningBuffer<byte>(12); "
-        "  return buf.Count; "
+        "  return buf.Length; "
         "end Main; end C;"), 12);
 }
 

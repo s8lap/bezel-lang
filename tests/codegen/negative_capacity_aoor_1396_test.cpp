@@ -112,10 +112,13 @@ BEZEL_TEST(negative_capacity_aoor_1396, owning_buffer_negative_length_init_raise
         "catch ArgumentOutOfRangeException => return 42; end;"), 42);
 }
 
-// Control: length 0 is a valid empty buffer.
+// Control: length 0 is a valid empty buffer. Read through `Length` (stdlib
+// §4.14): `OwningBuffer<T>` declares no `Count`, so the bare `.Count` read this
+// row used to make is now a "no member" reject (fix #6081; see
+// sema/member_set_residual_6081_test.cpp R5). The expected value is unchanged.
 BEZEL_TEST(negative_capacity_aoor_1396, owning_buffer_zero_length_is_valid) {
     BEZEL_EXPECT_EQ(run(
-        "using var b := new OwningBuffer<int>(0); return b.Count;"), 0);
+        "using var b := new OwningBuffer<int>(0); return b.Length;"), 0);
 }
 
 // ---------------------------------------------------------------------------

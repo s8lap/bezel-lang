@@ -25432,6 +25432,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     cn == "OwningBuffer";
                 bool hasCapacity = cn == "Array" || cn == "OwningArray";
                 bool ok = ma.member == "Count" ? hasCount : hasCapacity;
+                // fix #6081 (stdlib §4.14, v0.338): `OwningBuffer<T>` declares
+                // `Length` (the stored extent) and no `Count`; the bare `.Count`
+                // reference has no member to resolve. The call spelling
+                // (`b.Count()`, the §5 LINQ operator) is untouched.
+                if (ok && cn == "OwningBuffer" && &ma != calleeOfCallCtx_) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0 && ma.target)
+                        loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "no member `Count` on `OwningBuffer<T>`: use `Length` "
+                        "(stdlib §4.14)");
+                    return;
+                }
                 if (ok) {
                     // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): the
                     // receiver's declared surface includes an instance
@@ -25473,6 +25487,37 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     }
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    return;
+                }
+            }
+        }
+        // fix #6081 (stdlib §3.1 / §4.1, v0.338): the bare `.` reads that the
+        // stdlib does not declare. `StringBuilder` declares `Length` (§3.1) and
+        // no `Count`; `ICollection<T>` declares `Count` (inherited from
+        // IReadOnlyCollection<T>, §4.1) and no `Length`. Gated on the callee
+        // slot, not on the call arity, so an argument-position read is covered.
+        if (ma.target && (ma.member == "Count" || ma.member == "Length") &&
+            &ma != calleeOfCallCtx_) {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isBuiltin =
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty();
+                std::string_view cn = isBuiltin
+                    ? std::string_view(tt->headName())
+                    : std::string_view();
+                const char* msg = nullptr;
+                if (ma.member == "Count" && cn == "StringBuilder")
+                    msg = "no member `Count` on `StringBuilder`: use `Length` "
+                          "(stdlib §3.1)";
+                else if (ma.member == "Length" && cn == "ICollection")
+                    msg = "no member `Length` on `ICollection<T>`: use `Count` "
+                          "(stdlib §4.1)";
+                if (msg) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0 && ma.target)
+                        loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(Severity::Error, loc, msg);
                     return;
                 }
             }
@@ -30707,6 +30752,33 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 Severity::Error, loc,
                 "no member `Count` on `string`: use `Length` (stdlib §9.6)");
             return;
+        }
+        // fix #6081 (stdlib §3.1 / §4.1 / §4.14, v0.338): the `?.` twins of the
+        // bare reads above. `StringBuilder` and `OwningBuffer<T>` declare no
+        // `Count` (§3.1, §4.14); `ICollection<T>` declares no `Length` (§4.1).
+        // Gated on the callee slot, as the #6071 `string` arm above.
+        if (!member && recvTy && &nm != calleeOfCallCtx_ &&
+            (nm.member == "Count" || nm.member == "Length") &&
+            recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty()) {
+            std::string_view cn = recvTy->headName();
+            const char* msg = nullptr;
+            if (nm.member == "Count" && cn == "StringBuilder")
+                msg = "no member `Count` on `StringBuilder`: use `Length` "
+                      "(stdlib §3.1)";
+            else if (nm.member == "Count" && cn == "OwningBuffer")
+                msg = "no member `Count` on `OwningBuffer<T>`: use `Length` "
+                      "(stdlib §4.14)";
+            else if (nm.member == "Length" && cn == "ICollection")
+                msg = "no member `Length` on `ICollection<T>`: use `Count` "
+                      "(stdlib §4.1)";
+            if (msg) {
+                SourceLocation loc = nm.span.begin;
+                if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+                ctx_.diagnostics().report(Severity::Error, loc, msg);
+                return;
+            }
         }
         // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
         // collection/string head. The `.` form types these `int` in
