@@ -473,7 +473,7 @@ s12_4_0001	pass
 s12_4_0002	pass	
 s12_4_0003	fail	#4391
 s12_4_0004	pass	
-s12_4_0005	fail	#5636
+s12_4_0005	pass	
 s12_4_0006	pass	
 s12_5_0001	pass	
 s12_5_0002	pass	
@@ -557,7 +557,7 @@ s14_4_0001	pass
 s14_4_0002	pass	
 s14_4_0003	pass	
 s14_4_0004	pass	
-s14_4_0005	fail	#4367
+s14_4_0005	pass	
 s14_4_0006	pass	
 s14_5_0001	pass	
 s14_5_0002	pass	
@@ -1246,7 +1246,7 @@ s28_2_0008	pass
 s28_2_0009	pass	
 s28_2_0010	pass	
 s28_2_0011	fail	#4602
-s28_2_0012	fail	#4602
+s28_2_0012	pass	
 s28_3_0001	pass	
 s28_3_0002	pass	
 s28_3_0003	pass	
@@ -1860,7 +1860,7 @@ s35_4_0003	pass
 s35_4_0004	pass	
 s35_4_0005	pass	
 s35_4_0006	pass	
-s35_4_0007	fail	divergence
+s35_4_0007	pass	
 s35_4_0008	pass	
 s35_4_0009	pass	
 s35_4_0010	pass	

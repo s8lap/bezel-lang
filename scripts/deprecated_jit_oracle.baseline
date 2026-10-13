@@ -14,6 +14,6 @@
 #             that distinguishes a real new call site from a recipe
 #             discrepancy - see the script header).
 # checked   : `runJitChecked(` under the live_calls filters.
-live_calls = 55
-bare_grep = 57
-checked = 3
+live_calls = 29
+bare_grep = 31
+checked = 0

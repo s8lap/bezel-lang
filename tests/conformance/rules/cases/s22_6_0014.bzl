@@ -1,7 +1,7 @@
 //! case: s22_6_0014
 //! doc: spec
 //! section: 22.6
-//! title: a move-marked owned production of a same-type owned/ordinary pair is rejected at the declaration (v0.338)
+//! title: a move-marked production of a same-type owned/ordinary pair is rejected at the declaration (v0.338)
 //! rule: **`owned` never distinguishes overloads (v0.338, proposal 0185).**
 //!   `Append(item: Widget)` beside `Append(owned item: Widget)` clash at the
 //!   second declaration (§22.6, §11.3); the owned production is not selected.
