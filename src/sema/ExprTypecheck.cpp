@@ -8787,7 +8787,7 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
                                        ld->initializer.get())) {
                             isAdoptablePreDeclaredLocal = true;  // polymorphic-null
                         }
-                    }                    } else if (dynamic_cast<const ast::LocalConstDecl*>(
+                    } else if (dynamic_cast<const ast::LocalConstDecl*>(
                                    lsym->decl)) {
                         // fix #5875 (§21.1 / §22.3 / §22.4 / §28.3, v0.334): a
                         // §21.1 `const` local is NOT in an adoptable state, and
@@ -8821,7 +8821,7 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
                         // case reached it by not matching the `var` cast. The
                         // arm makes that a stated decision rather than an
                         // accident of which AST node the symbol carries.
-
+                    }
                 }
             }
         }
@@ -25531,13 +25531,31 @@ bool ExprTC::caseSourceProvablyUnwritten(const ast::Expr* scrutinee,
         // "a property or indexer read" is never such a source, and neither is
         // any other member (a method reference, a const). Only a FIELD.
         if (!fs) return false;
-        if (fs->decl) {
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                for (auto m : fd->modifiers)
-                    if (m == "readonly")
-                        return true;  // outside its construction window
-            }
-        }
+        // fix #5876 (§19.3 whitelist bullet 3 / §7.4, v0.334): read the
+        // `readonly` fact off the SYMBOL, through §7.4's both-sources
+        // predicate `isReadonlyField`, not off `FieldSymbol::decl`.
+        //
+        // `ModuleLoader::convertMember` sets `MemberSymbol::decl` only where it
+        // re-parsed body text for a GENERIC type, so for every imported field
+        // `fs->decl` is null and the `ast::FieldDecl` cast below answered "not
+        // readonly" for ALL of them. An imported `readonly` field therefore
+        // fell through to the receiver walk below and an imported field
+        // reached through a class-typed hop — `this`, a `ref` formal, a
+        // payload binding — was REJECTED as a non-admitted source, a denial of
+        // the shape §19.3 admits. `MetaMember::modifiers` carries "readonly"
+        // on the wire (ModuleMetadata.hpp:579-580) and the loader's Field case
+        // interns it, so the fact does cross the artifact boundary.
+        //
+        // The accessor also admits a POSITIONAL-RECORD field, whose
+        // auto-property has no setter (§9.1: a body constructor "initializes
+        // the positional storage by assigning the auto-generated read-only
+        // properties") and which the `FieldDecl` cast could never match — its
+        // `decl` is the synthetic `ast::Param` of #2516, not a FieldDecl.
+        // Both arms only ever turn a `false` into a `true`, i.e. they move the
+        // whitelist toward admitting a source that provably has no writer;
+        // neither can turn an admitted source into a rejected one.
+        if (isReadonlyField(fs))
+            return true;  // outside its construction window
         // Otherwise the field is mutable, so the question is whether the store
         // that could rewrite it can land: it needs the RECEIVER's storage, and
         // that is provably unwritten only when the receiver is itself one of
