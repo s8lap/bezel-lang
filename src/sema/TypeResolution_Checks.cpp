@@ -4397,9 +4397,11 @@ void Resolver::checkOperatorGroups() {
 // An `Equals` at any other parameter type obliges nothing.
 void Resolver::checkEqualsHashCodePairing() {
     if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
+    // fix #5954 (§8.3, v0.338): the pairing applies at every nesting depth, so
+    // the walk goes through the one recursive nested-type walk (a nested
+    // class's `Equals` obliges its own `GetHashCode` exactly as a top-level
+    // class's does), not `ctx_.module()->children` alone.
+    forEachTypeAndNested([&](TypeSymbol* t) {
         auto isOwnTypeEquals = [&](const MethodSymbol* ms) {
             return isClassOwnTypeEquals(t, ms, ctx_);
         };
@@ -4426,7 +4428,7 @@ void Resolver::checkEqualsHashCodePairing() {
                 Severity::Error, equalsOwnTyped->declLoc,
                 "a class declaring `Equals(" + std::string(t->name) +
                 ")` must override `GetHashCode` (§8.3)");
-            continue;
+            return;
         }
         if (equalsOverride && !overridesHashCode) {
             ctx_.diagnostics().report(
@@ -4434,7 +4436,7 @@ void Resolver::checkEqualsHashCodePairing() {
                 "a type that overrides `Equals` must also override "
                 "`GetHashCode` (§8.3)");
         }
-    }
+    });
 }
 
 // §25.2 (v0.158, #1338; enum spelling corrected v0.183, #1381/#1582; choices
