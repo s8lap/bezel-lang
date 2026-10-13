@@ -30,13 +30,13 @@
 #include <string>
 #include <string_view>
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"       // runAotCheckedDisposal — AOT oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::hasAutoDropWarning;
 using bezel::test::parseAndCheckOwnership;
-using bezel::test::runJitChecked;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 
@@ -158,7 +158,7 @@ BEZEL_TEST(consume_site_freeze,
 // leak, no use-after-dispose fault).
 BEZEL_TEST(consume_site_freeze,
            unborrowed_reassign_runs_disposes_once_1465_spec_28_7) {
-    auto r = runJitChecked(mod(
+    auto r = runAotCheckedDisposal(mod(
         "    var r := new Res(0); "
         "    r := new Res(1); "));
     BEZEL_EXPECT_TRUE(r.ran);
@@ -239,7 +239,7 @@ BEZEL_TEST(consume_site_freeze,
 // by `Take`, each exactly once, and `b`'s pre-reassignment read is valid.
 BEZEL_TEST(consume_site_freeze,
            borrow_of_prior_value_runs_clean_spec_28_7) {
-    auto r = runJitChecked(mod(
+    auto r = runAotCheckedDisposal(mod(
         "    var a := new Res(1); "
         "    var b := a; "
         "    var seen := b.N(); "
