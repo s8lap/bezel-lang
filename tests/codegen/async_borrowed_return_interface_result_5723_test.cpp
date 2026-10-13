@@ -5,14 +5,16 @@
 // `isAsyncPatternAClassResultType` (the gate of
 // `checkAsyncPatternABorrowedIdentifierReturn` for async methods and of the
 // async-lambda twin) asked `isNonTrivialDisposeClass`, which is class-only,
-// so `Task<IShape>` / `Task<Object>` returning a plain parameter was ACCEPTED:
+// so `Task<IShape>` returning a plain parameter was ACCEPTED:
 // the task's teardown then disposed an object the caller owned. MEASURED on
 // the pre-fix tree: `using var s := new Sq(); using var t := Id(s);
 // var r := await t;` at `Task<IShape>` -> ASan heap-use-after-free; the same
 // program at a destructor-bearing class `Task<Dq>` -> rejected.
 //
 // The trivial-dispose CLASS gap (a class with no destructor is still accepted)
-// is #5704's scope and is not touched here.
+// and the `Object` gap are #5704's scope and are not touched here: an Object
+// operand may be a runtime-managed box (`var o: Object := 7; return o;`),
+// which §28.3 item 5 says is no borrow (async_await_extra_kinds_2226).
 #include <string>
 
 #include "support/aot_result_asserts.hpp"
@@ -44,18 +46,6 @@ BEZEL_TEST(async_borrowed_return_interface_result_5723,
         "  public static async method Main(): Task<int> "
         "    using var s := new Sq(); using var t := Id(s); "
         "    var r := await t; return r.Area(); end Main; "
-        "end Program;");
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kNoFourthKind));
-}
-
-BEZEL_TEST(async_borrowed_return_interface_result_5723,
-          reject_async_method_returns_plain_param_task_object_30_5) {
-    auto r = runAot(
-        "module M; public class Program "
-        "  public static async method Id(p: Object): Task<Object> "
-        "    return p; end Id; "
-        "  public static async method Main(): Task<int> return 0; end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kNoFourthKind));

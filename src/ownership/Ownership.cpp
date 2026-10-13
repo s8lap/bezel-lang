@@ -15278,15 +15278,15 @@ bool isAsyncPatternAClassResultType(const sema::TypeRef* rt,
     const sema::TypeRef* arg = rt->genericArgs.front();
     // User class with a disposal obligation — the primary arm.
     if (common::isNonTrivialDisposeClass(arg, ctx)) return true;
-    // narrow #5723 / #5949 (§30.5 *No fourth kind*, v0.338): the rule reads
-    // "`Task<T>` for class or interface T" and the Pattern A row names `Object`.
-    // An interface T has no destructor of its own to classify, and the kinds
-    // are read off the operand's ownership state, not the disposal ceremony
-    // (K1.6), so an interface or Object result is gated unconditionally. The
-    // trivial-dispose CLASS gap is #5704's scope and is left as is.
-    if (arg->kind == sema::TypeRef::Kind::Primitive &&
-        arg->primitive == sema::PrimitiveType::Object)
-        return true;
+    // narrow #5723 (§30.5 *No fourth kind*, v0.338): the rule reads
+    // "`Task<T>` for class or interface T". An interface T has no destructor of
+    // its own to classify, and the kinds are read off the operand's ownership
+    // state, not the disposal ceremony (K1.6), so an interface result is gated
+    // unconditionally. `Object` is deliberately NOT gated here: its operand may
+    // be a runtime-managed box (`var o: Object := 7; return o;`), which §28.3
+    // item 5 says is no borrow and is not reached, and this identifier check
+    // cannot tell a box from an object reference. The trivial-dispose CLASS and
+    // Object gaps are #5704's scope.
     if (arg->kind == sema::TypeRef::Kind::Named && arg->declaration &&
         arg->declaration->kind == ast::TypeDeclKind::Interface)
         return true;
