@@ -364,3 +364,37 @@ every comparer-implementing class), the §2.8.6 compatibility rows (they need
 two versions of one module), and `s28_3_0022`'s rewrite (parked with its
 compiler fix). Two existing cases, `s20_0013` and `s20_0014`, move out of a
 `using var` and are left unedited pending re-classification ([#5663](https://github.com/s8lap/bezel-lang/issues/5663)).
+
+### v0.330–v0.335 catch-up — 2026-10-13 (unclassified)
+
+The coverage gaps recorded in the v0.330–v0.335 changelog entries and the
+v0.334/v0.335 trackers, written: **197 new cases** (2314 → 2511), authored from
+the v0.335 text with no `bezelc` available, so — as in the previous catch-up —
+**none is banked**: every new case is UNCLASSIFIED and is banked by the next
+classification from observed verdicts. Each was written by one lane and
+verified by an independent reader against the spec (no compiler run); every
+`rule:` quote was checked verbatim by script and `names.py` reports nothing.
+Rules the v0.336 train replaces (the restoration window, the read-only span
+interface, record and class equality spellings) were excluded and get cases
+after it lands.
+
+| area | sections | cases |
+|---|---|---|
+| disposal, statics and async (#5807's form (iv) retirement, §22.7's static-constructor "first use", unobserved faults, async-iterator disposal) | 15.1.1, 17, 20, 22, 28.6, 28.12, 29, 30, 33, stdlib 6 | 56 |
+| generics, interfaces and member references (0170–0173, the expanding-cycle rule, type-argument lists at a formation, method-reference equality and hashing) | 3.6, 7, 12, 14.2, 14.6, 26, 27, 28.3, 35 | 86 |
+| borrow soundness (captured-binding unions, report-mode trust admissions, §9.7, the collection value-copy rule) | 9.7, 19.3, 27.1.1, 28.3, 28.11, 28.14, 29.2 | 55 |
+
+Existing cases: stale `rule:` headers refreshed with verdicts unchanged (among
+them `s14_2_0017`, `s28_3_0090`/`0093`/`0095`/`0110`/`0116`–`0119`), and one
+banked flip: `s22_13_0015` (a mutable static `[N owned]T`) is now a compile
+error, and the compiler still only warns
+(`src/sema/TypeResolution_Checks.cpp`), so its row is `fail #5807`.
+
+Not written or left as is, and why: `s15_1_1_0008` (banked `pass`) declares the
+same now-rejected static and needs its `static readonly` rewrite proved by a
+compiler probe ([#5807](https://github.com/s8lap/bezel-lang/issues/5807));
+the `Counter<K>.Increment` value-copy reject waits for `Counter<K>` itself
+([#3848](https://github.com/s8lap/bezel-lang/issues/3848)), whose accept twin
+`s28_11_0022` is written; `s27_6_0011` is rejected by today's parser
+([#5814](https://github.com/s8lap/bezel-lang/issues/5814)) before the
+constraint it pins, so its diagnostic will mismatch until the parser is fixed.

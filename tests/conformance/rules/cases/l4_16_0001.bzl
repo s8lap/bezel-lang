@@ -1,11 +1,11 @@
 //! case: l4_16_0001
 //! doc: stdlib
 //! section: 4.16
-//! title: SequenceEqual on the interface admits cross-source comparison between span families
-//! rule: SequenceEqual is on the interface, with parameter type
-//!   IReadOnlySpan<TElement> -- this admits cross-source equality: a
-//!   ReadOnlySpan<byte> can be compared against a ReadOnlyArraySpan<byte>.
-//! cites: 4.16
+//! title: a buffer span's SequenceEqual takes an array span of the other backing
+//! rule: `SequenceEqual` is declared on each span type for its own type and
+//!   for the read-only span of each heap backing (§4.14, §4.15; §3.3 for
+//!   `char`)
+//! cites: 4.16, 4.14, 4.15
 //! expect: run
 //! stdout: True
 module Conf;

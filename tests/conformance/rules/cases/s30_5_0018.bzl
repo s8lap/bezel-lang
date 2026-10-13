@@ -1,42 +1,49 @@
 //! case: s30_5_0018
 //! doc: spec
 //! section: 30.5
-//! title: a Pattern A kind-2 chained slot disposes the source task transitively, exactly once
-//! rule: 2. **`return await` over an owned Pattern A source — the chained
-//!   slot** ... ownership of the **source task** transfers into the outer
-//!   task's state ... and the outer destructor disposes the chained source
-//!   task, never the borrowed result directly. "Disposing the task disposes
-//!   the result" thereby holds *transitively*.
-//! cites: 30.5
+//! title: a kind-2 chain over an owned parameter formed after outer disposal is disposed by the continuation
+//! rule: the `Dispose()` call attaches a **continuation** that runs at the
+//!   terminal state and disposes there whatever the frame delivers into the
+//!   task — ... the source task a kind-2 slot chains ... Every disposal the
+//!   task's teardown would have performed at or after settlement is performed
+//!   by the continuation instead, exactly once
+//! cites: 30.5, 30.1
 //! expect: run
-//! output: got
-//!   res disposed
+//! output: disposed
+//!   closed
+//!   done
+//! issue: 5831
 module Conf;
+import System.Threading;
 
 public class Res
+  public constructor()
+  end constructor;
+
   destructor
-    Console.WriteLine("res disposed");
+    Console.WriteLine("closed");
+    Demo.Done.SetResult();
   end destructor;
 end Res;
 
-public class Inner
+public class Demo
+  public static owned readonly Done: TaskCompletionSource := new TaskCompletionSource();
+
   public static async method MakeAsync(): Task<Res>
-    await Task.Delay(0);
+    await Task.Delay(50);
     return new Res();
   end MakeAsync;
-end Inner;
 
-public class Outer
-  public static async method RelayAsync(): Task<Res>
-    using var src := Inner.MakeAsync();
-    return await src;
-  end RelayAsync;
-end Outer;
+  public static async method Pass(owned inner: Task<Res>): Task<Res>
+    return await inner;
+  end Pass;
 
-public class Program
   public static async method Main(): Task
-    using var t := Outer.RelayAsync();
-    var r := await t;
-    Console.WriteLine("got");
+    do
+      using var t := Pass(MakeAsync());
+    end;
+    Console.WriteLine("disposed");
+    await Demo.Done.Task;
+    Console.WriteLine("done");
   end Main;
-end Program;
+end Demo;

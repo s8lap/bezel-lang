@@ -1,43 +1,43 @@
 //! case: s9_7_0032
 //! doc: spec
 //! section: 9.7
-//! title: a borrow-bearing choice with a non-null reference-typed payload may not be an instance field
-//! rule: A borrow-bearing choice may not be stored in an instance field of a class,
-//!   except when every reference-typed payload is null (the null-source form). The
-//!   quantifier is over reference-typed payloads, not borrow-carrying payloads alone:
-//!   a payload whose declared type is reference-typed but not borrow-carrying —
-//!   a string, a function type — must be null too. Tagged.Named("a", null)
-//!   is rejected even though the borrow-carrying payload is null.
-//! cites: 22.12, 28.9, 35.4, #3291
-//! expect: reject
-//! diagnostic: borrow-bearing choice may not be stored in an instance field
-//! issue: 5590
+//! title: a member store of a same-block using var into a record local is admitted
+//! rule: A record value held at a named location — a local or parameter, a field,
+//!   a slot of an inline array held at one — is read with one source set ... a
+//!   member store ... adds the sources of the borrows `e` carries to that set,
+//!   never removing one, and is checked as an assignment of the updated value to
+//!   the location that holds it ... so a source declared in the holder's own block or an enclosing one is
+//!   admitted, as at an inline-array slot
+//! cites: 9.7, 28.3
+//! expect: run
+//! stdout: 1
+//! issue: 5734
 module Conf;
 
-public class Src
+public class Item
   public constructor()
   end constructor;
-end Src;
 
-// Tagged with Named case: name (string — reference-typed NOT borrow-carrying),
-// src (Src? — borrow-carrying)
-public choice Tagged
-  Named(name: string, src: Src?),
-  Missing;
-end Tagged;
+  public method N(): int => 1;
+end Item;
 
-public class Container
-    private _tag: Tagged?;
+public record Box
+  public property Held: Item?;
 
-    public constructor()
-        // name is "a" (reference-typed NOT borrow-carrying — must be null),
-        // src is null (borrow-carrying payload, ok)
-        // Per §9.7: ALL reference-typed payloads must be null for null-source form
-        _tag := Tagged.Named("a", null);
-    end constructor;
-end Container;
+  public constructor()
+    Held := null;
+  end constructor;
+end Box;
 
 public class Program
-    public static method Main()
-    end Main;
+  public static method Run(): int
+    var p := new Box();
+    using var it := new Item();
+    p.Held := it;
+    return p.Held!.N();
+  end Run;
+
+  public static method Main()
+    Console.WriteLine(Run().ToString());
+  end Main;
 end Program;

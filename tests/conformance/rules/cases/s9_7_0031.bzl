@@ -1,38 +1,25 @@
 //! case: s9_7_0031
 //! doc: spec
 //! section: 9.7
-//! title: a borrow-bearing record with a non-null reference-typed field may not be an instance field (record)
-//! rule: A borrow-bearing record may not be stored in an instance field of a class,
-//!   except when every reference-typed field is null (the null-source form). The
-//!   quantifier is over reference-typed fields, not borrow-carrying fields alone:
-//!   a field whose declared type is reference-typed but not borrow-carrying —
-//!   a string, a function type — must be null too. new Tok(null, "missing")
-//!   is rejected even though the borrow-carrying field is null.
-//! cites: 22.12, 28.9, #3291
+//! title: a closure over a span later reassigned to a local array's span bounds the frame it rides
+//! rule: the capture contributes the sources of the borrows the record carries to
+//!   the closure's source set, every value the captured binding is assigned, in
+//!   the enclosing body or in a lambda body, counted ... and the results of
+//!   invoking it, and every deferred-activation frame or storage-bounded holder
+//!   it rides, are bounded by them
+//! cites: 9.7, 28.3
 //! expect: reject
-//! diagnostic: borrow-bearing record may not be stored in an instance field
-//! issue: 5590
+//! diagnostic: outlive
+//! issue: 5718
 module Conf;
 
-public class Src
-  public constructor()
-  end constructor;
-end Src;
 
-// Tok: src is borrow-carrying (Src?), name is reference-typed NOT borrow-carrying (string)
-public record Tok(src: Src?, name: string);
-
-public class Container
-    private _tok: Tok;
-
-    public constructor()
-        // src is null (borrow-carrying field, ok), name is "missing" (reference-typed NOT borrow-carrying — must also be null)
-        // Per §9.7: ALL reference-typed fields must be null for null-source form
-        _tok := new Tok(null, "missing");
-    end constructor;
-end Container;
-
-public class Program
-    public static method Main()
-    end Main;
-end Program;
+public class Maker
+  public method Window(a: Array<int>): IEnumerable<int>
+    var s := a.AsSpan();
+    var f := lambda(x: int) => s[0] + x;
+    var zs: Array<int> := [9];
+    s := zs.AsSpan();
+    return a.Select(f);
+  end Window;
+end Maker;

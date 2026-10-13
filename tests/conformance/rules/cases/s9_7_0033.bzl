@@ -1,32 +1,42 @@
 //! case: s9_7_0033
 //! doc: spec
 //! section: 9.7
-//! title: non-owning inline array of interface in instance field is not a span
-//! rule: A non-owning inline array ([N]T, [N]T?) is an ordinary value type. Its
-//!   element type being a class or interface does not make the array borrow-bearing
-//!   or a span. A span may not be stored in an instance field (§9.7); an inline
-//!   array of a borrow-carrying element type may — it is not a span.
-//! cites: 8.6, 9.7, 15.1
-//! expect: run
-//! stdout: 5
-//! issue: 5662
-module M;
+//! title: a whole-value assignment resets a record local's set before a later member store
+//! rule: a whole-value assignment gives the location the assigned value's set, and a
+//!   member store ... adds the sources of the borrows `e` carries to that set
+//! cites: 9.7, 28.3
+//! expect: accept
+//! issue: 5734
+module Conf;
 
-interface IHolder
-  method GetV(): string;
-end IHolder;
+public class Item
+  public constructor()
+  end constructor;
 
-record RecHolder(V: string): IHolder
-  public method GetV(): string => V;
-end RecHolder;
+  public method N(): int => 1;
+end Item;
 
-class Holder
-  public Items: [1]IHolder := [new RecHolder("hello")];
-end Holder;
+public record Box
+  public property Held: Item?;
 
-public class C
-  public static method Main()
-    var h: Holder := new Holder();
-    Console.WriteLine(h.Items[0].GetV().Length);
-  end Main;
-end C;
+  public constructor()
+    Held := null;
+  end constructor;
+end Box;
+
+public class Keeper
+  private owned _item: Item;
+
+  public constructor()
+    _item := new Item();
+  end constructor;
+
+  public method Make(): Box
+    using var it := new Item();
+    var p := new Box();
+    p.Held := it;
+    p := new Box();
+    p.Held := _item;
+    return p;
+  end Make;
+end Keeper;

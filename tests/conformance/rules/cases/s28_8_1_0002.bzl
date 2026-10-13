@@ -1,11 +1,11 @@
 //! case: s28_8_1_0002
 //! doc: spec
 //! section: 28.8.1
-//! title: a terminal move is rejected even under an owned return
-//! rule: There is no terminal-move dispensation — a terminal move
-//!   (`return move x.f;`, or any return whose operand evaluation performs
-//!   the move with no restoring assignment before the exit) is rejected,
-//!   the return edge being itself an unrestored exit.
+//! title: a terminal bare move of a non-nullable field is rejected even under an owned return
+//! rule: Where the location's declared type is nullable ... the `with`
+//!   clause may be omitted: `move x.f` stores `null`. Where it is not, the
+//!   clause is required; its absence is a compile error naming the two
+//!   remedies — `move x.f with fresh`, or a nullable declaration
 //! cites: 28.8.1
 //! expect: reject
 //! diagnostic: not reassigned

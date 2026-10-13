@@ -1,52 +1,37 @@
 //! case: s30_9_0005
 //! doc: spec
 //! section: 30.9
-//! title: the WithCleanupAsync example -- await in a catch arm and in a finally, then a bare re-raise
-//! rule: `await` has no syntactic restrictions on its placement inside
-//!   `try`/`catch`/`finally` *bodies*. The state machine handles suspension
-//!   across exception-handling boundaries correctly. ... a bare `throw;`
-//!   faults the body's task, and awaiting that task re-raises the exception.
-//! cites: 30.9, 21.8
+//! title: a fault escaping into an outer task stays live for every awaiter of the outer task
+//! rule: An instance that an `await` or a `Result` read re-raised from a task
+//!   ... and that then leaves the body ... faults the body's task, which does
+//!   **not** become its owner: the instance stays owned by the task that owned
+//!   it, the faulted task carries it as a **borrow**, and the faulted task
+//!   **retains the operand task** whose fault it carries
+//! cites: 30.9, 30.4
 //! expect: run
-//! output: logged bad
-//!   released
-//!   faulted: bad
+//! output: boom
+//!   boom
+//! issue: 5831
 module Conf;
 
-public class Work
-  public static async method DoWorkAsync(): Task
-    await Task.Delay(0);
-    throw new InvalidOperationException("bad");
-  end DoWorkAsync;
-  public static async method LogErrorAsync(m: string): Task
-    await Task.Delay(0);
-    Console.WriteLine("logged " + m);
-  end LogErrorAsync;
-  public static async method ReleaseResourcesAsync(): Task
-    await Task.Delay(0);
-    Console.WriteLine("released");
-  end ReleaseResourcesAsync;
-  public static async method WithCleanupAsync(): Task
-    try
-      await DoWorkAsync();
-    catch
-      var ex: Exception => do
-        await LogErrorAsync(ex.Message);
-        throw;
-      end
-    finally
-      await ReleaseResourcesAsync();
-    end try;
-  end WithCleanupAsync;
-end Work;
+public class Demo
+  public static async method Inner(): Task
+    await Task.Delay(10);
+    throw new InvalidOperationException("boom");
+  end Inner;
 
-public class Program
+  public static async method Outer(): Task
+    await Inner();
+  end Outer;
+
   public static async method Main(): Task
-    try
-      await Work.WithCleanupAsync();
-      Console.WriteLine("unreached");
-    catch
-      var ex: InvalidOperationException => Console.WriteLine("faulted: " + ex.Message)
-    end try;
+    using var o := Outer();
+    for var i in 1..2 do
+      try
+        await o;
+      catch
+        var e: InvalidOperationException => Console.WriteLine(e.Message)
+      end try;
+    end;
   end Main;
-end Program;
+end Demo;

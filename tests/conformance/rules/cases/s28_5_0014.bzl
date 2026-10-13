@@ -2,11 +2,12 @@
 //! doc: spec
 //! section: 28.5
 //! title: a generic owned field instantiated at a runtime-managed type is rejected
-//! rule: When a generic class declares `private owned _slot: T`, the
-//!   restriction "only fields of class or interface types may be `owned`" is
-//!   checked at instantiation. Instantiating with a type that satisfies
-//!   `where T: class` but is neither a class nor an interface (`string`,
-//!   function types) is a compile error at the instantiation site.
+//! rule: When a generic class declares `private owned _slot: T` (where T is a
+//!   type parameter), the restrictions above are checked at each
+//!   instantiation, reading the substituted type as they read a declared
+//!   one ... every other substitution — `string`, `Type`, a function type,
+//!   a copyable value type, and an owning inline array ... — is a compile
+//!   error at the instantiation site
 //! cites: 14.2, 28.5
 //! expect: reject
 //! diagnostic: instantiation

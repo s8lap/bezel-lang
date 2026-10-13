@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.335 — October 2026**
+**Companion to the Bezel Language Specification, v0.336 — October 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -45,7 +45,7 @@ The conventions below hold throughout this document. Each row states one convent
 | **Negative magnitudes fault (#1396)** | Every constructor parameter that states a magnitude — `capacity`, `size`, `length` — raises `ArgumentOutOfRangeException` when passed a negative value: `StringBuilder(capacity)`, `Array<T>(capacity)`, `Array<T>(size, fill)`, `OwningArray<T>(capacity)`, the `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms, and `OwningBuffer<T>(length)` with its `init` overloads. Zero is valid (an empty container or zero-length buffer). A negative magnitude is a programming error, not a request — the defined-fault stance of `DateTime`'s component validation (§2.5), chosen over a silent empty fallback. `Channel<T>(capacity)` is stricter under its own contract: `capacity >= 1`, `ArgumentException` otherwise. | this document |
 | **The `Async` suffix** | The suffix marks the asynchronous member of a sync/async pair (`Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`); an operation that exists only in asynchronous form carries no suffix (`Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`). `Receive` beside `SendAsync` on the §6.9 endpoint pair is this rule at work, not an inconsistency. | this document |
 | **Acronyms and widths (#1359)** | Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces carry the `I-` prefix (#1372). | this document |
-| **`Count` vs `Length`** | `Length` measures a fixed or contiguous extent — text (`String`, `StringBuilder`, `ReadOnlyStringSpan`), buffers and spans (§4.14–§4.16), `FrozenArray<T>`, `Stream`, and the §10 FFI carriers; `Count` counts the elements of a collection whose membership grows and shrinks (the `Add`/`Remove`/`Push`/`Enqueue` families). A type declares one or the other, never both, and new types follow the same line — which is why the resizable `Array<T>` says `Count` where .NET's fixed array says `Length`. | this document |
+| **`Count` vs `Length`** | `Length` measures a fixed or contiguous extent — text (`String`, `StringBuilder`, `ReadOnlyStringSpan`), buffers and spans (§4.14–§4.15), `FrozenArray<T>`, `Stream`, and the §10 FFI carriers; `Count` counts the elements of a collection whose membership grows and shrinks (the `Add`/`Remove`/`Push`/`Enqueue` families). A type declares one or the other, never both, and new types follow the same line — which is why the resizable `Array<T>` says `Count` where .NET's fixed array says `Length`. | this document |
 | **Key membership is `Contains(key)`** | A map-like type spells key membership `Contains(key)`, so that `key in m` resolves (spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)'s structural `Contains` lookup); `ContainsKey` on `Dictionary<K, V>`, `OwningDictionary<K, V>` and `SortedDictionary<K, V>` is the inherited .NET alias (rationale [§15.x](Bezel_Design_Rationale.md#sec-convert-is-a-familiarity-alias)'s familiarity ground) and is not minted on new types — `Counter<K>` ([§4.20](#sec-counterk)) declares `Contains` alone. | spec §17.5 |
 | **Window parameters** | A parameter pair naming a sub-range of a sequence is spelled **`(start, length)`** — `startIndex` stands as the string family's established spelling of the start position — and every new windowed signature follows it; parameter names are API surface (named arguments, spec §22.5). The one recorded exception is the **`Stream` byte-window family** (`Read`/`Write(buffer, offset, count)`, §7.1), which keeps `(offset, count)` deliberately: those are the signatures C-family muscle memory types unprompted. The convention names are `String.From(buffer, start, length)` and `String.Remove(startIndex, length)`; `String.From` keeps its window because `Array<char>` has no span-shaped route to `string` — a span twin, if one is wanted, retires the window with it. **Slice first:** the reads and writes of the span accessors ([§4.14](#sec-owned-buffers-and-spans)'s byte and bit tiers, and their [§4.15](#sec-arrayspant-readonlyarrayspant) members) and the span-taking overloads (`Stream`'s span `Read`/`Write`, [§7.1](#sec-stream); the [§3.2](#sec-encoding) span-source `GetString`) take no offset parameter — each operates from the start of its span (bit 0 of a bit view), and an offset is reached by slicing first, with the one-argument `Slice(start)` every span type declares (`Slice(bitStart)` on a bit view): `header.Slice(8).ReadInt32LittleEndian()`. A window over an `Array<byte>` is likewise not a parameter pair but a slice — `Encoding.GetString(bytes.AsReadOnlySpan(start, length))`. (`destOffset` on `RawBytes.CopyTo` names a write *position*, not a window, and is untouched.) | this document |
 | **Replay intercept points** | The members of this library that consult the world outside the process — the clock and elapsed-time reads (§2.5, §8.1), entropy (§2.6, and §2.7's parameterless constructor), environment, argument, and process information (§2.4), console input (§2.1), and the file system (§7) — together with the scheduling and synchronized-object operations the language spec enumerates, are **intercept points**: a conforming runtime may record their results and later substitute the recorded values, and no program may observe the substitution except through the values themselves. Everything not so designated is pure computation and is deliberately not interceptable. A future addition to this library that reads the world must declare itself an intercept point in its own section at the time it is added. | spec [§30.13](Bezel_Language_Spec.md#sec-determinism) (*Determinism*) |
@@ -1448,7 +1448,7 @@ The span-source decode overloads (#1809) are the same operation over a caller-se
 A read-only view over a contiguous range of code points in a `string`. The natural companion to `string.AsSpan()` for zero-allocation substring operations — tokenization, parsing, prefix/suffix checks — without materializing intermediate string instances.
 
 ```bezel
-public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IReadOnlySpan<char>
+public record ReadOnlyStringSpan(Source: string, Start: int, Length: int)
 
   public property [i: int]: char
     get => do
@@ -1490,7 +1490,8 @@ public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IRead
   // Equality (span and string forms)
   public pure method SequenceEqual(other: ReadOnlyStringSpan): bool;
   public pure method SequenceEqual(other: string): bool;
-  public pure method SequenceEqual(other: IReadOnlySpan<char>): bool; // — interface form
+  public pure method SequenceEqual(other: ReadOnlySpan<char>): bool;      // — the buffer-backed char span (§4.14)
+  public pure method SequenceEqual(other: ReadOnlyArraySpan<char>): bool; // — the array-backed char span (§4.15)
 
   // Bulk copy
   public method CopyTo(destination: Span<char>);    // copy chars to destination;
@@ -1552,7 +1553,7 @@ The naming convention (#1372): borrowing collection types use their plain names 
 **Value-copy members are stores.** A member that places element values taken from its receiver or from an argument into a fresh collection it returns, or into a collection, buffer or array the caller already holds, is a **value-copy member**, and a call to one is judged as a store of each placed value into that destination, at the call and over the declared signature. Which members are value-copy members is read off their signatures by language spec [§28.11](Bezel_Language_Spec.md#sec-borrowing-collections)'s *Value-copy members* — three shapes over this section's collections, spans and buffers and over [§5](#sec-system-collections-linq)'s operators: an `owned` collection result, a borrowing-family or span receiver taking `IEnumerable<T>`, a read-only span or a `T` with no return, and a written span argument — which also names the four members a shape reads that copy nothing: `Set<T>.IntersectWith` and `ExceptWith` ([§4.10](#sec-sett-and-ownedsett)), which only remove, and `Span<T>`'s class-typed `MoveFrom` and `MoveTo` ([§4.14](#sec-owned-buffers-and-spans)), which move. No declaration carries a marker: the signature is the register. The single-element stores — `Add`, `Insert`, `LinkedList<T>`'s `AddFirst`, `AddLast`, `AddBefore` and `AddAfter`, `Push`, `Enqueue`, `TryAdd`, `GetOrAdd`, `Counter<K>.Increment` and an indexer-set, a span view's included, which writes the buffer or array the span views — are stores in their own right under the slot policy's store row (language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)), whatever they return.
 
 <a id="sec-collection-equality-search"></a>
-**Equality search at an element type with no equality.** The members that compare an argument with stored elements by `Equals` are the equality search: `Contains` and `Remove(item)` of `ICollection<T>` and of its implementations here at an unconstrained element type (`Array<T>`, `LinkedList<T>`), `Contains` of `Stack<T>` and `Queue<T>`, `Array<T>.IndexOf` and `LastIndexOf`, `LinkedList<T>.Find`, and the span family's `IndexOf`, `Contains` and `SequenceEqual` ([§4.14](#sec-owned-buffers-and-spans)–[§4.16](#sec-ireadonlyspan)). Their signatures are unconstrained, and they are conditionally-admitted members (language spec [§14.2](Bezel_Language_Spec.md#sec-conditionally-admitted-members)): a call is admitted only where the element type, nullability stripped, has a member for the comparison language spec [§9.2](Bezel_Language_Spec.md#sec-equality-through-a-type-parameter) calls the first kind, `Equals` with an argument of that type. It has none exactly where the same comparison between two values of the type draws §9.2's, §35.7's or §15.1.2's use-site error, as for a record or choice that is neither auto-hashable nor declares an `Equals` of its own, or an inline array of one, or is spec [§22.6](Bezel_Language_Spec.md#sec-overloading)'s ambiguity, as for a class declaring `Equals(other: I)` for an interface `I` it implements but no `Equals` at its own type (spec §9.2, §12.2). There the call is a compile error, `x in xs` (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) and a method reference formed over the member (language spec [§27.6](Bezel_Language_Spec.md#sec-method-references)) included, and the collection type is unaffected: `Array<R>` is well-formed at such an `R`, and only its equality search is refused. Inside a generic body whose element type involves a type parameter, the call is the body's own comparison, read at each instantiation of the declaration that declares the parameter exactly as the same `Equals` written on that element type would be (language spec §14.2 rule 2, §9.2, [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2); a user `ICollection<T>` implementation called through its own type is its own declaration, under §3.6 rule 2, and only a call through `ICollection<T>` takes this rule. A record that holds borrows declares no `Equals(Object?)` (spec §9.2), so at such an element type the first kind reaches its `Equals(T)` or nothing, and the search never boxes a value that holds borrows. At the element type `IReadOnlySpan<TElement>` itself ([§4.16](#sec-ireadonlyspan)) the stored values are boxes and the first kind reaches `Object`'s `Equals` on them, no span record declaring `Equals(Object?)`: the search compares by **box identity** — `Contains(s)` is true only for the box `s` names — and a `Set<IReadOnlySpan<int>>` or a dictionary keyed at that type keys by box identity and the identity hash; the element-wise comparison is `SequenceEqual`. The remedy is to declare equality on the element type, which makes it **hashable**, or to search with a predicate (`xs.Any(lambda(x) => x.Id = id)`, [§5](#sec-system-collections-linq)). The owning collections' members of the same names fire the rule only at that ambiguity, since their `where T: class` element type otherwise always has the member; `SortedSet<T>` compares by `CompareTo` ([§4.18](#sec-sorted-set)), and `Set<T>`, `Dictionary<K, V>` and §5's hashable block require **hashable**: `Set<T>` and `Dictionary<K, V>` by their structural check at every naming of the instantiation ([§4.8](#sec-dictionaryk-v), [§4.10](#sec-sett-and-ownedsett)), §5's block by constraint.
+**Equality search at an element type with no equality.** The members that compare an argument with stored elements by `Equals` are the equality search: `Contains` and `Remove(item)` of `ICollection<T>` and of its implementations here at an unconstrained element type (`Array<T>`, `LinkedList<T>`), `Contains` of `Stack<T>` and `Queue<T>`, `Array<T>.IndexOf` and `LastIndexOf`, `LinkedList<T>.Find`, and the span family's `IndexOf`, `Contains` and `SequenceEqual` ([§4.14](#sec-owned-buffers-and-spans), [§4.15](#sec-arrayspant-readonlyarrayspant)). Their signatures are unconstrained, and they are conditionally-admitted members (language spec [§14.2](Bezel_Language_Spec.md#sec-conditionally-admitted-members)): a call is admitted only where the element type, nullability stripped, has a member for the comparison language spec [§9.2](Bezel_Language_Spec.md#sec-equality-through-a-type-parameter) calls the first kind, `Equals` with an argument of that type. It has none exactly where the same comparison between two values of the type draws §9.2's, §35.7's or §15.1.2's use-site error, as for a record or choice that is neither auto-hashable nor declares an `Equals` of its own, or an inline array of one, or is spec [§22.6](Bezel_Language_Spec.md#sec-overloading)'s ambiguity, as for a class declaring `Equals(other: I)` for an interface `I` it implements but no `Equals` at its own type (spec §9.2, §12.2). There the call is a compile error, `x in xs` (language spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)) and a method reference formed over the member (language spec [§27.6](Bezel_Language_Spec.md#sec-method-references)) included, and the collection type is unaffected: `Array<R>` is well-formed at such an `R`, and only its equality search is refused. Inside a generic body whose element type involves a type parameter, the call is the body's own comparison, read at each instantiation of the declaration that declares the parameter exactly as the same `Equals` written on that element type would be (language spec §14.2 rule 2, §9.2, [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2); a user `ICollection<T>` implementation called through its own type is its own declaration, under §3.6 rule 2, and only a call through `ICollection<T>` takes this rule. A value kind's member for the first kind is its own-typed `Equals`, declared or generated, its `Object` slot, and no value kind declares an `Equals` at `Object?` (spec §9.2), so the search never boxes a value that holds borrows. The remedy is to declare equality on the element type, which makes it **hashable**, or to search with a predicate (`xs.Any(lambda(x) => x.Id = id)`, [§5](#sec-system-collections-linq)). The owning collections' members of the same names fire the rule only at that ambiguity, since their `where T: class` element type otherwise always has the member; `SortedSet<T>` compares by `CompareTo` ([§4.18](#sec-sorted-set)), and `Set<T>`, `Dictionary<K, V>` and §5's hashable block require **hashable**: `Set<T>` and `Dictionary<K, V>` by their structural check at every naming of the instantiation ([§4.8](#sec-dictionaryk-v), [§4.10](#sec-sett-and-ownedsett)), §5's block by constraint.
 
 <a id="sec-ireadonlycollectiont-ireadonlylistt-and-ilistt"></a>
 <a id="sec-borrowing-collection-interfaces"></a>
@@ -1791,7 +1792,7 @@ end OwningArray;
 
 `OwningArray<T>` owns each element. `Add`, `Insert`, and the indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's own `Dispose()` dispose the affected elements. `Sort`'s comparer parameter takes borrows of T (the comparer doesn't consume; it inspects).
 
-The indexer getter produces a borrow of the slot's owned element; the borrow is valid until the slot is mutated (by indexer set, RemoveAt, Clear, or any operation that disposes the slot's contents). A use of that borrow after a dominating `Clear()`, `Remove` of the borrow, or `RemoveAt` at the same index with no structural operation in between draws the language spec's element-borrow use-after-removal warning ([§28.11](Bezel_Language_Spec.md#sec-owning-collections)); re-take the borrow after the mutation, or take the element out first with `PopAt(i)`. To take an element out, use `PopAt(i)` (returns owned T and removes the slot) or `move arr[i]` (returns owned T and leaves the slot in moved-from state; the caller must reassign before the next exit point — see language spec [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression)).
+The indexer getter produces a borrow of the slot's owned element; the borrow is valid until the slot is mutated (by indexer set, RemoveAt, Clear, or any operation that disposes the slot's contents). A use of that borrow after a dominating `Clear()`, `Remove` of the borrow, or `RemoveAt` at the same index with no structural operation in between draws the language spec's element-borrow use-after-removal warning ([§28.11](Bezel_Language_Spec.md#sec-owning-collections)); re-take the borrow after the mutation, or take the element out first with `PopAt(i)`. To take an element out, use `PopAt(i)` (returns owned T and removes the slot) or `move arr[i] with fresh` (returns owned T and stores `fresh` in the slot in the same step; a bare `move arr[i]` is rejected, the slot being non-nullable — see language spec [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression)).
 
 **The `TryPopAt` gap, recorded.** The `Pop*` surface is asymmetric against [§1](#sec-conventions)'s access tiers: the positional egress has a throwing form (`PopAt`) and no `Try` form, while its two convenience specializations (`PopFirst`/`PopLast`) have both. A coherent reading exists — an out-of-range index is the assert-shaped tier, a bug like the throwing indexer's — but the same argument applies to `PopFirst`/`PopLast` on an empty collection, and those *did* get `Try` forms. The surface currently asserts neither resolution; closing the gap means either declaring `TryPopAt(index: int, out owned item: T?): bool` (shape (a), the `when true` postcondition riding it per §1) or writing the band sentence that says positional egress is deliberately assert-only. Recorded as a gap with the reasoning on both sides, not closed.
 
@@ -1874,14 +1875,10 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollec
 
   public method PopAt(index: int): owned T
     BoundsCheck(index);
-    var taken := move _storage[index];             // taken: T? (owned)
-    _storage[index] := null;                        // restore slot
+    var taken := move _storage[index];             // taken: T? (owned); the slot holds null (§28.8.1)
     for var j in index..<(_count - 1) do
-      var k := j + 1;                                // the moved index, bound first (spec §28.11)
-      var shifted := move _storage[k];               // shifted: T? (owned)
-      _storage[k] := null;                            // restore the shifted-from slot, at k
-      _storage[j] := shifted;                        // setter on moved-from slot;
-                                                      //   no previous to dispose
+      _storage[j] := move _storage[j + 1];          // shift down: take slot j+1 (it holds null afterwards),
+                                                     //   store into slot j (null: nothing to dispose)
     end;
     _count := _count - 1;
     return taken!;                                   // i < _count guaranteed non-null
@@ -1894,8 +1891,7 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollec
   public method Clear()
     for var i in 0..<_count do
       var slot := _count - 1 - i;                  // reverse index order
-      var item := move _storage[slot];             // item: T? (owned)
-      _storage[slot] := null;                       // restore moved-from slot
+      var item := move _storage[slot];             // item: T? (owned); the slot holds null
       item!.Dispose();                              // slot was non-null
                                                      //   (slot < _count guarantees it)
     end;
@@ -1914,9 +1910,8 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollec
   private method GrowTo(newCapacity: int)
     var fresh := new OwningBuffer<T>(newCapacity);
     for var i in 0..<_count do
-      var moved := move _storage[i];                 // moved: T? (owned)
-      _storage[i] := null;                            // restore moved-from slot
-      fresh[i] := moved;                              // setter on moved-from slot of fresh
+      fresh[i] := move _storage[i];                  // take from the old slot (it holds null afterwards),
+                                                      //   store into the fresh one
     end;
     _storage.Dispose();                              // dispose old buffer
                                                       //   (now all-null, no slots leak)
@@ -1929,11 +1924,11 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T>, IOwningCollec
 end OwningArray;
 ```
 
-The implementation is straightforward Bezel: a class with an owned `OwningBuffer<T>` field, a count, and the standard ownership-transferring operations. The `move`-and-null pattern from [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) of the language spec discharges every slot before reassignment; the compiler verifies the field-restoration rule statically.
+The implementation is straightforward Bezel: a class with an owned `OwningBuffer<T>` field, a count, and the standard ownership-transferring operations. Every slot take is the replacing `move` of [§28.8.1](Bezel_Language_Spec.md#sec-the-replacing-move) of the language spec: on the buffer's nullable slots the bare `move _storage[i]` takes the element and stores `null` in the same step, so no slot is ever observed empty-but-owning and nothing is left to restore.
 
-`GrowTo` is the resize operation. It allocates a fresh buffer, moves every live element from the old buffer to the new one (nulling the old slot after each move to satisfy the restoration rule), then disposes the old buffer. The old buffer's destructor sees only null slots and does no further work.
+`GrowTo` is the resize operation. It allocates a fresh buffer, moves every live element from the old buffer to the new one (each `move` leaving `null` behind), then disposes the old buffer. The old buffer's destructor sees only null slots and does no further work.
 
-`Drain()`, `PopFirst()`, `PopLast()`, and the rest follow the same pattern: take from a slot via `move`, restore the slot with `null`, adjust `_count`. None of the operations require compiler-intrinsic knowledge of `OwningArray<T>` itself — the intrinsic surface is confined to `OwningBuffer<T>`.
+`Drain()`, `PopFirst()`, `PopLast()`, and the rest follow the same pattern: take from a slot via `move`, adjust `_count`. None of the operations require compiler-intrinsic knowledge of `OwningArray<T>` itself — the intrinsic surface is confined to `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
 
 The implementation example above omits some methods for brevity; the production standard library version provides the full surface listed in the class declaration above, all built over the same `OwningBuffer<T>` primitive.
 
@@ -2021,7 +2016,7 @@ end OwningLinkedList;
 
 `LinkedListNode<T>` (declared in [§4.6](#sec-linkedlistt)) is reused. On `OwningLinkedList<T>`, the node's `Value` property returns a borrow of the node's element; the node still owns the element until the node is removed. To take an element out, use `RemoveNode` (which disposes), `PopFirst` / `PopLast` (transfer ownership to caller), or `Drain()`.
 
-The `move` operator does not extend to linked-list nodes in this version — removing a value from a specific node would leave the node in an inconsistent state, and the surrounding-node-pointer integrity makes the move-out-and-restore pattern impractical. Future revisions may add a node-level move form.
+The `move` operator does not extend to linked-list nodes in this version — removing a value from a specific node would leave the node in an inconsistent state, and the surrounding-node-pointer integrity makes a slot exchange impractical. Future revisions may add a node-level move form.
 
 **There is no source constructor.** `OwningLinkedList<T>` declares `constructor()` and no populate-from-source form, deliberately, and the absence is the answer rather than a gap. A borrowing source has no elements to give: a borrowing collection never owns its elements and never disposes them ([§4.1](#sec-borrowing-collection-interfaces); spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)), so copying out of an `IEnumerable<T>` into an owning list would mint a second owner for every element — the duplicate ownership [§4.5](#sec-ownedarrayt) refuses for `OwningArray<T>.ToArray()`, for the same reason. A source that *does* own its elements is **drained**, not copied, and the original ceases to own them; the spelling already exists. Build an owning list from owned elements with a collection literal (`using var l: OwningLinkedList<Connection> := [Connect("a"), Connect("b")];` — [§4.6](#sec-linkedlistt)), or add them one at a time, taking them out of the source as you go: `for var c in src.Drain() do dst.AddLast(move c); end;` (`Drain()` above; the call-site transfer marker is spec [§22.3](Bezel_Language_Spec.md#sec-parameter-modifiers)). `LinkedList<T>`'s `constructor(source: IEnumerable<T>)` ([§4.6](#sec-linkedlistt)) therefore has no owning twin.
 
@@ -2232,13 +2227,13 @@ If a literal contains duplicate keys that are not all compile-time constants, th
 
 `OwningDictionary<K, V>` composes over `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)) in pure Bezel. The implementation is more involved than `OwningArray<T>`'s because mutation through a chain of borrowed pointers is incompatible with Bezel's borrow-lifetime tracker (see "Note on chain mutation" below); the implementation works in terms of *drain-and-rebuild* on each bucket.
 
-The structure: each bucket of an `OwningBuffer<Entry<K, V>>` holds an owned `Entry<K, V>` (or null), where each entry has an `owned Next: Entry<K, V>?` field forming a chain of synonym-hash entries. The `Value` field is declared nullable (`owned Value: V?`) so the `move`-and-null restoration pattern can be used during take operations; in committed state every entry's `Value` is non-null.
+The structure: each bucket of an `OwningBuffer<Entry<K, V>>` holds an owned `Entry<K, V>` (or null), where each entry has an `owned Next: Entry<K, V>?` field forming a chain of synonym-hash entries. The `Value` field is declared nullable (`owned Value: V?`) so a bare `move chain.Value` can take it, leaving `null` ([§28.8.1](Bezel_Language_Spec.md#sec-the-replacing-move) of the language spec); in committed state every entry's `Value` is non-null.
 
 ```bezel
 // Internal entry type.
 private class Entry<K, V> where V: class
   public Key: K;
-  public owned Value: V?;          // nullable for move-and-null restoration;
+  public owned Value: V?;          // nullable so a bare `move` takes it (§28.8.1);
                                     //   non-null in committed dictionary state
   public owned Next: Entry<K, V>?;  // chain link
   public constructor(key: K, owned value: V, owned next: Entry<K, V>?)
@@ -2260,8 +2255,7 @@ public class OwningDictionary<K, V>: IDisposable where V: class
     // Reverse the chain as we walk; if we don't find the key, the new entry
     // is prepended to the reversed chain — chain reversal is unobservable
     // because OwningDictionary doesn't promise insertion order.
-    var chain := move _buckets[idx];
-    _buckets[idx] := null;
+    var chain := move _buckets[idx];   // the bucket holds null while the chain is rebuilt
     // A comparer that throws mid-walk unwinds over `chain` and `rebuilt`: both are
     //   disposed, so the bucket's entries are lost (none is disposed twice) and `_count`
     //   still counts them; this sketch does not rebuild the bucket on unwind.
@@ -2269,15 +2263,14 @@ public class OwningDictionary<K, V>: IDisposable where V: class
     var foundDup := false;
     while chain <> null do
       if not foundDup and _comparer.Equals(chain.Key, key) then
-        foundDup := true;              // test the key BEFORE the take: a throwing comparer
-      end;                             //   must not unwind over a vacated `Next` (K9.2)
-      var rest := move chain.Next;
-      chain.Next := rebuilt;           // restore at once (with the rebuilt-chain head)
+        foundDup := true;
+      end;
+      var rest := move chain.Next with rebuilt;   // one step: take the tail, link the rebuilt head
       rebuilt := move chain;           // ownership transfers in (transfer marker)
       chain := move rest;              // (transfer marker)
     end;
     if foundDup then
-      _buckets[idx] := rebuilt;       // restore bucket with unchanged chain
+      _buckets[idx] := rebuilt;       // put the unchanged chain back
       throw new ArgumentException("duplicate key");
       // The owned `value` parameter is auto-disposed on throw per the
       // [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) exception-path discharge rule.
@@ -2289,29 +2282,25 @@ public class OwningDictionary<K, V>: IDisposable where V: class
 
   public method PopValue(key: K): owned V
     var idx := BucketIndex(key);
-    var chain := move _buckets[idx];
-    _buckets[idx] := null;
+    var chain := move _buckets[idx];   // the bucket holds null while the chain is rebuilt
     // As in `Add`: a comparer that throws mid-walk unwinds over `chain` and
     //   `rebuilt`, and the bucket's entries are lost, each disposed exactly once (`_count` unchanged).
     var rebuilt: Entry<K, V>? := null;
     var taken: V? := null;
     while chain <> null do
-      var isTarget := taken = null and _comparer.Equals(chain.Key, key);   // compare BEFORE the take (K9.2)
-      var rest := move chain.Next;
+      var isTarget := taken = null and _comparer.Equals(chain.Key, key);
+      var rest := move chain.Next;     // the tail; `chain.Next` holds null
       if isTarget then
-        // Target: take its Value, dispose the entry node.
-        taken := move chain.Value;
-        chain.Value := null;             // restore (with null)
-        chain.Next := null;              // restore (with null)
+        taken := move chain.Value;     // `chain.Value` holds null
         chain.Dispose();                  // value and next are both null;
                                           //   destructor's auto-dispose passes are no-ops
       else
-        chain.Next := rebuilt;            // restore (with rebuilt-chain head)
+        chain.Next := rebuilt;            // link the rebuilt-chain head (a store into a null field)
         rebuilt := move chain;           // (transfer marker)
       end;
       chain := move rest;                // (transfer marker)
     end;
-    _buckets[idx] := rebuilt;             // restore bucket
+    _buckets[idx] := rebuilt;             // put the rebuilt chain back
     if taken = null then
       throw new KeyNotFoundException();
     end;
@@ -2331,13 +2320,13 @@ public class OwningDictionary<K, V>: IDisposable where V: class
 end OwningDictionary;
 ```
 
-The structural insight: **every bucket mutation is expressed as taking the chain head with `move`, walking the owned chain as local state, and storing a rebuilt chain back into the bucket**. No method mutates a chain through a borrow into shared storage. Every `move buf[i]` and `move entry.X` is followed by an explicit restoration (`buf[i] := newValue`, `entry.X := null` or `entry.X := newOwner`). The compiler verifies the field-restoration rule statically.
+The structural insight: **every bucket mutation is expressed as taking the chain head with `move`, walking the owned chain as local state, and storing a rebuilt chain back into the bucket**. No method mutates a chain through a borrow into shared storage. Every `move buf[i]` and `move entry.X` is the replacing `move` of [§28.8.1](Bezel_Language_Spec.md#sec-the-replacing-move): it leaves `null` (the bucket and the entry fields are nullable) or the replacement named by `with` in the same step, so no slot or field is ever observed empty-but-owning.
 
 **Note on chain mutation.** A naïve implementation might walk the chain with a borrow `probe: Entry<K, V>?` and surgically modify links (`prev.Next := probe.Next`, etc.). Bezel's borrow-lifetime tracker rejects this pattern: `probe`'s borrow source is rooted in `_buckets[idx]`, and mutating any link along the chain — or mutating the slot itself — invalidates the borrow chain, after which subsequent reads of `probe.X` are borrow-after-mutation errors. The drain-and-rebuild pattern sidesteps the issue by walking the chain as owned local state. The cost is `O(chain length)` work per mutation rather than `O(1)`. In practice, chain lengths are bounded by the dictionary's load factor (typically ≤ 8), so the constant factor is small; for use cases where this cost is unacceptable, an open-addressing implementation can be substituted without changing the public API.
 
 **Note on iteration order.** The drain-and-rebuild pattern reverses chain order on every bucket mutation. Iteration over `OwningDictionary<K, V>` therefore yields entries in an order that depends on insertion-and-mutation history rather than purely on insertion order. The standard library makes no insertion-order guarantee for `OwningDictionary` (in contrast to `Dictionary<K, V>` at [§4.8](#sec-dictionaryk-v), which does); programs that need ordered iteration use a different collection. The order, while unspecified, is **deterministic**: it is a pure function of the sequence of mutating operations performed and the key hash values involved — two instances built by identical operation sequences over keys with identical hash values iterate identically. This is a determinism statement, not an order statement; programs must still not rely on any particular order.
 
-**Why no compiler intrinsic for `OwningDictionary`.** None of the operations above require compiler-intrinsic knowledge of `OwningDictionary<K, V>`. Every `move` goes through the field-restoration rule that the compiler enforces on `move buf[i]` and on `move entry.X`. The intrinsic surface of the owning-collection family is once again confined to `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
+**Why no compiler intrinsic for `OwningDictionary`.** None of the operations above require compiler-intrinsic knowledge of `OwningDictionary<K, V>`. Every `move` is the replacing `move` the compiler lowers for `move buf[i]` and `move entry.X` alike. The intrinsic surface of the owning-collection family is once again confined to `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)).
 
 <a id="sec-sett"></a>
 <a id="sec-sett-and-ownedsett"></a>
@@ -2560,7 +2549,7 @@ A runtime-sized storage primitive and two non-owning view types built over it. T
 
 The slot semantics dispatch on T's category:
 
-- **Class-typed T** (classes, interfaces): slots hold `T?` (nullable references) and the buffer owns each non-null slot's referent. Setter takes `owned T?` and disposes the previous value before storing the new one. `move buf[i]` is admitted; the field-restoration rule applies. The buffer's destructor cascades through slots, disposing every non-null one.
+- **Class-typed T** (classes, interfaces): slots hold `T?` (nullable references) and the buffer owns each non-null slot's referent. Setter takes `owned T?` and disposes the previous value before storing the new one. `move buf[i]` is admitted — the replacing `move` of [§28.8.1](Bezel_Language_Spec.md#sec-the-replacing-move): bare, it takes the element and stores `null`; `move buf[i] with e` stores `e`. The buffer's destructor cascades through slots, disposing every non-null one.
 - **Value-typed T** (primitives, records, enums, **value-like and borrow-bearing choices** ([§35.4](Bezel_Language_Spec.md#sec-choice-classification)), non-move-only inline arrays — language spec [§15.3](Bezel_Language_Spec.md#sec-move-only-value-types)'s copyable set, whose complement is the exclusion list below): slots hold `T` directly (no nullability wrapper). Setter takes `T` and overwrites the slot. `move buf[i]` is *not* admitted (values have no ownership to transfer; reading is sufficient). The buffer's destructor releases its backing storage but performs no per-slot disposal. A **value-like** choice slot is an ordinary copyable value ([§35.4](Bezel_Language_Spec.md#sec-choice-classification) rule 3) and needs nothing further; a **borrow-bearing** choice slot carries the borrow obligations of *Borrow-bearing slots* below. The **owning** classification is a move-only value type and is not admitted (the exclusion list below).
 
 The two categories share the same `Length`, indexer-access, `AsSpan`/`AsReadOnlySpan` factories, and other category-agnostic surface; they differ in the slot type, the setter modifier, and the admissibility of `move`. (`Slice` is a member of the span *views*, not of the buffer — a buffer is range-restricted by taking a span of it.)
@@ -2586,8 +2575,8 @@ public class OwningBuffer<T>: IEnumerable<T?>            // class T only
     set(owned);                                           // takes owned T?; disposes previous
   end;
 
-  // move buf[i] admitted (returns owned T?, leaves slot moved-from;
-  //   the field-restoration rule of language spec §28.8.1 applies)
+  // move buf[i] admitted (returns owned T? and stores null in the same step;
+  //   `move buf[i] with e` stores e — language spec §28.8.1)
 
   // Span views
   public method AsSpan(): Span<T>;                          // full buffer, writable
@@ -2644,7 +2633,7 @@ end OwningBuffer;
 
 The two presentations are different specializations of the same generic class. The compiler resolves T's category at instantiation and emits the appropriate slot semantics. Users see the form corresponding to the T they instantiate.
 
-**Class-typed T.** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T?` (a nullable reference). Once allocated, `Length` is immutable. Non-null slots are owned by the buffer; the buffer's destructor disposes every non-null slot in implementation-defined order. The single-argument constructor produces a buffer with all slots initialized to `null`. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, taking ownership of each returned value. The indexer's setter takes ownership of the assigned value and disposes whatever the slot previously held. `move buf[i]` is admitted and produces an owned `T?` value, leaving the slot in moved-from state; the field-restoration rule of [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) applies. The natural restoration for a nullable slot is `buf[i] := null`.
+**Class-typed T.** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T?` (a nullable reference). Once allocated, `Length` is immutable. Non-null slots are owned by the buffer; the buffer's destructor disposes every non-null slot in implementation-defined order. The single-argument constructor produces a buffer with all slots initialized to `null`. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, taking ownership of each returned value. The indexer's setter takes ownership of the assigned value and disposes whatever the slot previously held. `move buf[i]` is admitted and produces an owned `T?` value, storing `null` into the slot in the same step; `move buf[i] with e` stores `e` instead ([§28.8.1](Bezel_Language_Spec.md#sec-the-replacing-move)). No slot is ever left empty-but-owning.
 
 **Value-typed T.** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T` directly (no nullability wrapper). Once allocated, `Length` is immutable. The single-argument constructor requires T to be **defaultable** — an instantiation-site rule, read at a concrete argument and, where a generic body names `OwningBuffer<T>` at a type argument that is or contains its own type parameter, at each instantiation substituting the argument (language spec [§14.2](Bezel_Language_Spec.md#sec-conditionally-admitted-members), the two-presentation paragraph; [§17.11](Bezel_Language_Spec.md#sec-the-default-operator)'s "any other site that supplies a `default(T)`") — note that **no choice type is defaultable** (language spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator), [§35.10](Bezel_Language_Spec.md#sec-choice-default-with): *"`default(C)` is a compile error for every choice type"*), so a choice-element buffer is always built with the two-argument init-function constructor below — (language spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator)) — every primitive is; a record is when every declared field is and the record is not constructor-only (language spec [§9.9](Bezel_Language_Spec.md#sec-constructor-only-records)); an enum is when it declares a zero-valued constant; any type §17.11 does not admit has no default. It initializes every slot to `default(T)`. For types without a default, only the two-argument constructor with an explicit init function is admitted. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, copying the returned value into the slot. The indexer's setter overwrites the slot's previous value with the new one — no disposal is performed (values are not owned). `move buf[i]` is not admitted; values are read with the plain indexer and copied at the use site.
 
@@ -2672,7 +2661,7 @@ The declaration's surface, like `OwningBuffer<T>`'s, depends on T's category.
 For class-typed T:
 
 ```bezel
-public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int)
   // class T
 
   // Indexer (bounds-checked against span Length).
@@ -2700,7 +2689,8 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOn
 
   // Equality.
   public method SequenceEqual(other: Span<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T?>): bool; // — interface form
+  public method SequenceEqual(other: ReadOnlySpan<T>): bool;      // — the read-only span of this backing
+  public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool; // — the read-only span of the other backing (§4.15)
 
   // Range construction.
   public method Slice(start: int, length: int): Span<T> =>
@@ -2734,7 +2724,7 @@ end Span;
 For value-typed T:
 
 ```bezel
-public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int)
   // value T (primitive, record, enum, value-like or borrow-bearing choice,
   //   non-move-only inline array — spec §15.3's copyable set)
 
@@ -2763,7 +2753,8 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOn
 
   // Equality.
   public method SequenceEqual(other: Span<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // — interface form
+  public method SequenceEqual(other: ReadOnlySpan<T>): bool;      // — the read-only span of this backing
+  public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool; // — the read-only span of the other backing (§4.15)
 
   // Range construction.
   public method Slice(start: int, length: int): Span<T> =>
@@ -2794,7 +2785,7 @@ A `Span<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec-recor
 
 The indexer bounds-checks against the span's `Length` (not just the underlying buffer's length). If `i < 0` or `i >= Length`, `IndexOutOfRangeException` is thrown. The check fires even when `Start + i` would be in the underlying buffer's range — the point of the span's range restriction is to enforce that callers cannot read outside the slice the span advertises.
 
-**Write access.** For class T: `span[i] := value` takes ownership of the assigned value (per the `set(owned)` setter) and stores it in the underlying buffer slot. The underlying buffer's owned-setter disposes whatever the slot previously held; the new value replaces it. `move span[i]` is also admitted: it takes ownership of the slot's current contents (an owned `T?`) and leaves the slot moved-from; the field-restoration rule of [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) applies, and the natural restoration is `span[i] := null`. The setter and `move` form bounds-check against the span's `Length` (same rule as the getter).
+**Write access.** For class T: `span[i] := value` takes ownership of the assigned value (per the `set(owned)` setter) and stores it in the underlying buffer slot. The underlying buffer's owned-setter disposes whatever the slot previously held; the new value replaces it. `move span[i]` is also admitted: it takes ownership of the underlying slot's current contents (an owned `T?`) and stores `null` into that slot in the same step, or the replacement named by `with` ([§28.8.1](Bezel_Language_Spec.md#sec-the-replacing-move)). The setter and `move` form bounds-check against the span's `Length` (same rule as the getter).
 
 For value T: `span[i] := value` overwrites the slot with the new value. No ownership transfer happens; no previous value is disposed. `move span[i]` is *not* admitted — values are read with the plain indexer and copied at the use site. Writing through a value-typed span is mechanically the same as writing through a value-typed buffer directly.
 
@@ -2806,9 +2797,9 @@ The **Range overload** `Slice(r: Range<int>)` (#2662) is the view counterpart of
 
 `AsReadOnly()` returns a `ReadOnlySpan<T>` viewing the same buffer range. Bezel has no implicit record-to-record conversions, so passing a `Span<T>` where a `ReadOnlySpan<T>` is expected requires the explicit call. This is friction the C# precedent does not have (C# admits an implicit conversion from `Span<T>` to `ReadOnlySpan<T>`); Bezel's choice trades that convenience for the broader principle that record-type identity is nominal and conversions between records are always explicit. The `AsReadOnly()` call is cheap (record construction, no allocation) and makes the API-boundary intent visible at the call site.
 
-**Iteration.** `for var x in span do ... end` is admitted for any T. The desugaring is a direct indexed loop over the span's range, parallel to the inline-array rule of [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) of the language spec: spans do not implement `IEnumerable<T?>` (the enumerator that `IEnumerable<T>.GetEnumerator()` returns is a heap object that would hold the span's borrow across its own, unbounded lifetime, which the borrow tracker cannot bound — a *different* situation from the **call-bounded** box of a span into `IReadOnlySpan<T?>` ([§4.16](#sec-ireadonlyspan)), which the language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records) permits because it cannot escape the borrow's source scope), so the standard enumerator path does not apply. The iteration variable's type follows the slot type: `T?` for class T, `T` for value T. For class T, the loop body sees a borrow of each slot's value; for value T, a copy of the slot's value carrying the slot's borrows (for primitive T, simply the value) — a member store through the variable updates the copy, never the slot (spec §29.2, note 2). To consume slot contents inside the loop body for class T, use `move span[i]` followed by an explicit assignment to restore the slot.
+**Iteration.** `for var x in span do ... end` is admitted for any T. The desugaring is a direct indexed loop over the span's range, parallel to the inline-array rule of [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) of the language spec: spans do not implement `IEnumerable<T?>` (the enumerator that `IEnumerable<T>.GetEnumerator()` returns is a heap object that would hold the span's borrow across its own, unbounded lifetime, which the borrow tracker cannot bound — a *different* situation from the **call-bounded** box of a span as the receiver of a member call, which the language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records) permits because it cannot escape the borrow's source scope), so the standard enumerator path does not apply. The iteration variable's type follows the slot type: `T?` for class T, `T` for value T. For class T, the loop body sees a borrow of each slot's value; for value T, a copy of the slot's value carrying the slot's borrows (for primitive T, simply the value) — a member store through the variable updates the copy, never the slot (spec §29.2, note 2). To consume slot contents inside the loop body for class T, use `move span[i]`, which stores `null` into the underlying slot in the same step (language spec §28.8.1).
 
-**Search and equality.** `IndexOf` walks the span's range and returns the first index whose slot's value equals the target. The comparison uses `Equals` (records, classes, primitives), null-safe for class T, and a call at an element type with no equality is rejected ([§4](#sec-collection-equality-search)). `Contains` is `IndexOf(value) >= 0`. `SequenceEqual(other: Span<T>)` compares two spans element-by-element; lengths differ → false; otherwise pairwise `Equals`. There is no *concrete* overload for `SequenceEqual(other: ReadOnlySpan<T>)`, but none is needed: the interface form `SequenceEqual(other: IReadOnlySpan<T?>)` above admits a `ReadOnlySpan<T>` (and any other span family) directly, under the call-bounded boxing of language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records) — see [§4.16](#sec-ireadonlyspan), *SequenceEqual and the interface*. `.AsReadOnly()` remains available for callers who prefer a concrete-typed comparison.
+**Search and equality.** `IndexOf` walks the span's range and returns the first index whose slot's value equals the target. The comparison uses `Equals` (records, classes, primitives), null-safe for class T, and a call at an element type with no equality is rejected ([§4](#sec-collection-equality-search)). `Contains` is `IndexOf(value) >= 0`. `SequenceEqual` compares two spans element-by-element; lengths differ → false; otherwise pairwise `Equals`. Every span type declares it for its own type and for the read-only span of each heap backing — here `Span<T>`, `ReadOnlySpan<T>` and `ReadOnlyArraySpan<T>` ([§4.15](#sec-arrayspant-readonlyarrayspant)) — so a comparison across backings needs no common type, and a writable span passed as the argument converts by `.AsReadOnly()`. The overloads are declared at the receiver's own `T`: at a class `T` the buffer span's `T?` slots compare with an array span's `T` slots, `Equals` null-safe on the nullable side, so a null slot equals no element. The span types implement no common interface ([§4.16](#sec-ireadonlyspan)); a member that accepts a read-only span of either heap backing declares one overload per span type, each the direct-dispatch path.
 
 **Bulk mutation — class T.** `Clear()` assigns `null` to every slot in the span's range. Each assignment goes through the underlying buffer's owned-setter, which disposes the slot's previous contents. After `Clear()`, every slot in the range is null; slots outside the span's range are unaffected.
 
@@ -2838,7 +2829,7 @@ The declaration's surface mirrors `Span<T>`'s but exposes only the read-side ope
 For class-typed T:
 
 ```bezel
-public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int)
   // class T
 
   public property [i: int]: T?
@@ -2856,7 +2847,7 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
   public method Contains(value: T?): bool;
 
   public method SequenceEqual(other: ReadOnlySpan<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T?>): bool; // — interface form
+  public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool; // — the read-only span of the other backing (§4.15)
 
   public method Slice(start: int, length: int): ReadOnlySpan<T> =>
     new ReadOnlySpan<T>(Buffer, this.Start + start, length);
@@ -2870,7 +2861,7 @@ end ReadOnlySpan;
 For value-typed T:
 
 ```bezel
-public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int)
   // value T
 
   public property [i: int]: T
@@ -2888,7 +2879,7 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
   public method Contains(value: T): bool;
 
   public method SequenceEqual(other: ReadOnlySpan<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // — interface form
+  public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool; // — the read-only span of the other backing (§4.15)
 
   public method Slice(start: int, length: int): ReadOnlySpan<T> =>
     new ReadOnlySpan<T>(Buffer, this.Start + start, length);
@@ -2908,11 +2899,11 @@ A read-only counterpart to `Span<T>`. Mechanically, `ReadOnlySpan<T>` is the sam
 
 **Iteration.** `for var x in roSpan do ... end` is admitted, with the same direct-indexed-loop desugaring as `Span<T>`. See the iteration paragraph under `Span<T>` above.
 
-**Search and equality.** `IndexOf`, `Contains`, and `SequenceEqual` mirror `Span<T>`'s read-only methods. `SequenceEqual(other: ReadOnlySpan<T>)` compares two read-only spans element-by-element. To compare against a `Span<T>`, the caller either passes it to the interface form `SequenceEqual(other: IReadOnlySpan<T?>)` (which admits every span family — [§4.16](#sec-ireadonlyspan)) or converts the writable span via `.AsReadOnly()` for a concrete-typed comparison.
+**Search and equality.** `IndexOf`, `Contains`, and `SequenceEqual` mirror `Span<T>`'s read-only methods. `SequenceEqual(other: ReadOnlySpan<T>)` compares two read-only spans element-by-element. `SequenceEqual(other: ReadOnlyArraySpan<T>)` compares against the array-backed read-only span ([§4.15](#sec-arrayspant-readonlyarrayspant)); to compare against a writable span of either backing, the caller converts it via `.AsReadOnly()`.
 
 **No materialization on this family.** `ReadOnlySpan<T>` declares no `ToArray(): owned Array<T>`, and the compiler never admitted the call: the span family's member surface is a closed allow-list ending in a *no member* diagnostic that enumerates the surface and omits the name, so for the fifty-five revisions the declaration stood this document asserted a call that does not compile — and no call site of it exists in any document, guide, or test. The absence is now uniform across the two span families: [§4.15](#sec-arrayspant-readonlyarrayspant) records the array-backed one, whose source `Array<T>` carries its own `ToArray()` ([§4.4](#sec-arrayt)). It is a recorded decision rather than a gap. To move a buffer-backed span's contents into the collection world, copy with a loop or an explicit `Array<T>`. For class-typed `T` no materializer was ever admissible in the first place — the buffer owns the class slots, and materializing them would require duplicating ownership or implicit cloning, both foreclosed — so consume those with `move span[i]` or through the owning collections' transfer surface. The role `ToString()` plays on `ReadOnlyStringSpan` ([§3.3](#sec-readonlystringspan)) has no counterpart here. **Recorded liftable:** a materializer for *both* span families, specified together and implemented rather than only declared, is a standard-library pass on its own merits.
 
-**Why not stack-allocated like C#'s `Span<T>`?** C#'s `Span<T>` is a `ref struct` — stack-only, cannot escape to the heap. This gives it the strongest possible lifetime guarantees but constrains where it can appear (no `Span<T>` fields in classes, no `Span<T>` in async state machines, no `Span<T>` returned across await points). Bezel's `Span<T>` is an ordinary record subject to borrow-bearing-record rules; it lives wherever the borrow-lifetime rules admit a value that holds borrows — a local, a parameter, a return over a receiver-sourced buffer (*Construction patterns* below), a component of another such value, a slot of a method-local collection its source outlives — never a class instance field or a static ([§4.16](#sec-ireadonlyspan), *Boxing and lifetime*), and, for a span *local* whose source is co-resident in the same async frame (an owned local, `using var`, or `owned` parameter of that method), across `await` points in that method. A span may **not** be an async method's parameter or result — a caller-side source cannot be shown to outlive the frame (spec §30.1, #1438). Programs whose buffer lifetimes cannot be statically proven sufficient are rejected by the borrow tracker. The Bezel choice trades the unconditional stack-only safety of C# for a much smaller language footprint — no new "ref struct" type kind is introduced. The lifetime tracker handles the common cases (parser scratch buffers, byte-buffer reads, slice-and-walk patterns, async pipelines whose buffer outlives the awaits) without a special type kind.
+**Why not stack-allocated like C#'s `Span<T>`?** C#'s `Span<T>` is a `ref struct` — stack-only, cannot escape to the heap. This gives it the strongest possible lifetime guarantees but constrains where it can appear (no `Span<T>` fields in classes, no `Span<T>` in async state machines, no `Span<T>` returned across await points). Bezel's `Span<T>` is an ordinary record subject to borrow-bearing-record rules; it lives wherever the borrow-lifetime rules admit a value that holds borrows — a local, a parameter, a return over a receiver-sourced buffer (*Construction patterns* below), a component of another such value, a slot of a method-local collection its source outlives — never a class instance field or a static (language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s instance-field and static-field bullets: a span declares its `Buffer` non-nullable, so it has no null-source form), and, for a span *local* whose source is co-resident in the same async frame (an owned local, `using var`, or `owned` parameter of that method), across `await` points in that method. A span may **not** be an async method's parameter or result — a caller-side source cannot be shown to outlive the frame (spec §30.1, #1438). Programs whose buffer lifetimes cannot be statically proven sufficient are rejected by the borrow tracker. The Bezel choice trades the unconditional stack-only safety of C# for a much smaller language footprint — no new "ref struct" type kind is introduced. The lifetime tracker handles the common cases (parser scratch buffers, byte-buffer reads, slice-and-walk patterns, async pipelines whose buffer outlives the awaits) without a special type kind.
 
 **Construction patterns.** A buffer's owner produces spans by handing out `new Span<T>(buf, start, length)` or `new ReadOnlySpan<T>(buf, start, length)` directly, or by exposing helper methods. The direct constructors of the five span records do **not** range-check `(Start, Length)` against the source: a mis-constructed span faults at each out-of-range *access* instead — the span-level check passes and the source's own bounds check throws `IndexOutOfRangeException` (the §4.15 caveat describes the same composition). The `AsSpan`/`AsReadOnlySpan` factories validate eagerly and are the recommended construction path:
 
@@ -2938,10 +2929,10 @@ In either case, the returned span borrows the `FrameBuffer` instance (transitive
 <a id="sec-byte-buffer-accessors"></a>
 #### Byte-buffer accessors
 
-When T is `byte`, the spans are commonly used for binary I/O — file formats, network protocols, image headers, serialization. The endianness-aware accessors below read and write multi-byte numeric types without bit-shuffling at the call site. The **read tier** is declared once, as an extension of `IReadOnlySpan<byte>` ([§4.16](#sec-ireadonlyspan)): language spec [§26.2](Bezel_Language_Spec.md#sec-what-can-be-extended) admits interfaces as extension heads and [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 2 searches a receiver's implemented interfaces, so every byte span — `ReadOnlySpan<byte>`, `Span<byte>`, and [§4.15](#sec-arrayspant-readonlyarrayspant)'s `ReadOnlyArraySpan<byte>`/`ArraySpan<byte>` — is a receiver of the one block; the receiver box is call-bounded (language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records), which admits the receiver of an extension call headed `IReadOnlySpan<TElement>` and reads its `this` as holding the span's borrows), and an accessor body reads only `this.Length` and `this[i]`, both interface members, and returns a value. The **write tier** has no interface to hang on ([§4.16](#sec-ireadonlyspan), *What about writable spans*) and is declared per writable span.
+When T is `byte`, the spans are commonly used for binary I/O — file formats, network protocols, image headers, serialization. The endianness-aware accessors below read and write multi-byte numeric types without bit-shuffling at the call site. The **read tier** is declared on the read-only span of each heap backing: `extension ReadOnlySpan<byte>` below, and `extension ReadOnlyArraySpan<byte>` ([§4.15](#sec-arrayspant-readonlyarrayspant)) with the same members, name for name and with identical semantics. A writable byte span — `Span<byte>`, or §4.15's `ArraySpan<byte>` — reads through `AsReadOnly()` (`sp.AsReadOnly().ReadInt32LittleEndian()`), a record construction with no allocation; an accessor body reads only `this.Length` and `this[i]` and returns a value. The **write tier** is declared per writable span.
 
 ```bezel
-public extension IReadOnlySpan<byte>                       // public: spec §26.1 defaults extensions to internal; one block, four byte-span receivers
+public extension ReadOnlySpan<byte>                        // public: spec §26.1 defaults extensions to internal; §4.15 declares the same block on ReadOnlyArraySpan<byte>
   // 16-bit integers
   public method ReadInt16LittleEndian(): short;
   public method ReadInt16BigEndian(): short;
@@ -2986,8 +2977,8 @@ public extension IReadOnlySpan<byte>                       // public: spec §26.
 end;
 
 public extension Span<byte>
-  // Reads and TryReads: the IReadOnlySpan<byte> block above — Span<byte> implements
-  // IReadOnlySpan<byte> (§4.16), so nothing is re-declared here.
+  // Reads and TryReads: through AsReadOnly() — the ReadOnlySpan<byte> block above;
+  // nothing is re-declared here.
 
   // Writes — Span<byte> only
   public method WriteInt16LittleEndian(value: short);
@@ -3029,7 +3020,7 @@ end;
 **Example implementation (one Read, one Write).** The remaining methods follow the same pattern.
 
 ```bezel
-public extension IReadOnlySpan<byte>
+public extension ReadOnlySpan<byte>
   public method ReadInt32LittleEndian(): int
     if this.Length < 4 then
       throw new IndexOutOfRangeException();
@@ -3182,7 +3173,7 @@ Records carrying borrows of an `Array<T>` ([§4.4](#sec-arrayt)) plus a `(Start,
 
 `ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwningBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwningBuffer<T>` owns its slots for class T, while `Array<T>` borrows them. Both types declare the three `Slice` overloads of the §4.14 family, including the `Slice(r: Range<int>)` Range form under [§4.14](#sec-owned-buffers-and-spans)'s normalization contract.
 
-**Byte-buffer accessors (#1358):** the §4.14 endianness-aware read tier — every `Read*{Little,Big}Endian`/`TryRead*` form — is declared once on `IReadOnlySpan<byte>` and is a member of `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>` by their [§4.16](#sec-ireadonlyspan) conformance, not by mirroring; the `Write*`/`TryWrite*` forms are mirrored onto `ArraySpan<byte>` with identical semantics (no offset parameters: [§1](#sec-conventions), *Window parameters*). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy. The chained form is admitted although `File.ReadAllBytes` returns `owned Array<byte>` unbound: §4.14's *no construction from a temporary* is language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s syntactic rule on a `new`-expression's **construction argument**, and the factory route supplies `this` — a named location — instead; the array is an unbound owned temporary whose borrowing uses, receiver position included, run before its end-of-full-expression disposal (spec [§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)). **Binding** the view is the rejected shape: `var s := File.ReadAllBytes(p).AsReadOnlySpan();` leaves `s` borrowing a source disposed at that statement's end. Bind the array, not the span — `using var bytes := File.ReadAllBytes(p); var s := bytes.AsReadOnlySpan();`.
+**Byte-buffer accessors (#1358):** the §4.14 endianness-aware read tier — every `Read*{Little,Big}Endian`/`TryRead*` form — is declared again as `extension ReadOnlyArraySpan<byte>`, member for member and with identical semantics (`ArraySpan<byte>` reads through `AsReadOnly()`, as `Span<byte>` does); the `Write*`/`TryWrite*` forms are mirrored onto `ArraySpan<byte>` with identical semantics (no offset parameters: [§1](#sec-conventions), *Window parameters*). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy. The chained form is admitted although `File.ReadAllBytes` returns `owned Array<byte>` unbound: §4.14's *no construction from a temporary* is language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s syntactic rule on a `new`-expression's **construction argument**, and the factory route supplies `this` — a named location — instead; the array is an unbound owned temporary whose borrowing uses, receiver position included, run before its end-of-full-expression disposal (spec [§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)). **Binding** the view is the rejected shape: `var s := File.ReadAllBytes(p).AsReadOnlySpan();` leaves `s` borrowing a source disposed at that statement's end. Bind the array, not the span — `using var bytes := File.ReadAllBytes(p); var s := bytes.AsReadOnlySpan();`.
 
 **Bit-granular accessors:** the §4.14 bit tier is mirrored the same way, as `ArrayBitReader` and `ArrayBitWriter` — see [below](#sec-array-bit-granular-accessors).
 
@@ -3190,7 +3181,7 @@ Records carrying borrows of an `Array<T>` ([§4.4](#sec-arrayt)) plus a `(Start,
 #### `ArraySpan<T>`
 
 ```bezel
-public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int)
 
   public property [i: int]: T
     get => do
@@ -3226,7 +3217,8 @@ public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnly
 
   // Equality
   public method SequenceEqual(other: ArraySpan<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // — interface form
+  public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool; // — the read-only span of this backing
+  public method SequenceEqual(other: ReadOnlySpan<T>): bool;      // — the read-only span of the other backing (§4.14)
 
   // Bulk mutation
   public method Fill(value: T);                              // copy `value` into every slot
@@ -3251,7 +3243,7 @@ An `ArraySpan<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec
 
 **Iteration.** `for var x in arrSpan do ... end` is admitted. The desugaring is a direct indexed loop over the span's range, parallel to the OwningBuffer-backed span rule of language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for). The iteration variable's type is T and the loop body sees a borrow of each slot (the borrow's source is the underlying array, reached through the span's `Source` field).
 
-**Search and equality.** `IndexOf` walks the span's range, returning the first index whose slot equals `value`, or `-1` if none. `Contains` returns `IndexOf(value) >= 0`. The comparison uses `Equals` per the standard convention, and a call at an element type with no equality is rejected ([§4](#sec-collection-equality-search)). `SequenceEqual(other: ArraySpan<T>)` compares two writable array spans pairwise. There is no concrete cross-mode overload, and none is needed: the interface form `SequenceEqual(other: IReadOnlySpan<T>)` admits a `ReadOnlyArraySpan<T>` (and any other span family at element type `T`) directly, under the call-bounded boxing of language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records) — the rule [§4.14](#sec-owned-buffers-and-spans) states for `Span<T>`; see [§4.16](#sec-ireadonlyspan), *SequenceEqual and the interface*.
+**Search and equality.** `IndexOf` walks the span's range, returning the first index whose slot equals `value`, or `-1` if none. `Contains` returns `IndexOf(value) >= 0`. The comparison uses `Equals` per the standard convention, and a call at an element type with no equality is rejected ([§4](#sec-collection-equality-search)). `SequenceEqual(other: ArraySpan<T>)` compares two writable array spans pairwise; `SequenceEqual(other: ReadOnlyArraySpan<T>)` and `SequenceEqual(other: ReadOnlySpan<T>)` compare against the read-only span of either backing — the rule [§4.14](#sec-owned-buffers-and-spans) states for `Span<T>`, a writable argument converting by `.AsReadOnly()`.
 
 **Bulk mutation.** Unlike `Span<T>` (whose mutation API splits by T's category — `Clear`/`MoveFrom`/`MoveTo` for class T owning slots, `Fill`/`CopyFrom`/`CopyTo` for value T), `ArraySpan<T>` provides a single uniform mutation surface for all T: `Fill(value)` assigns `value` to every slot; `CopyFrom(source)` copies slot-by-slot from a source span (lengths must match, else `ArgumentException`); `CopyTo(destination)` copies slot-by-slot to a destination span (lengths must match); `Reverse()` reverses the slot ordering in place. The uniform API is admissible because `Array<T>` slots do not own their contents — there is no ownership transfer to worry about, no dispose-previous semantics, no need for the category-dependent split. For class T, the assigned-into slot stores a borrow (`Fill(myClass)` makes every slot borrow `myClass`); for value T, the slot stores a copy. Both fit naturally under `Fill`.
 
@@ -3265,7 +3257,7 @@ An `ArraySpan<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec
 #### `ReadOnlyArraySpan<T>`
 
 ```bezel
-public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnlySpan<T>
+public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int)
 
   public property [i: int]: T
     get => do
@@ -3289,7 +3281,7 @@ public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): I
   public method Contains(value: T): bool;
 
   public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // — interface form
+  public method SequenceEqual(other: ReadOnlySpan<T>): bool;      // — the read-only span of the other backing (§4.14)
 
   public method CopyTo(destination: ArraySpan<T>);            // — copy slot-by-slot to destination;
                                                                //   lengths must match
@@ -3352,58 +3344,9 @@ end;
 
 <a id="sec-ireadonlyspan"></a>
 <a id="sec-ireadonlyspantelement"></a>
-### 4.16 `IReadOnlySpan<TElement>`
+### 4.16 `IReadOnlySpan<TElement>` (retired)
 
-An interface unifying the read-only access surface of every span type in the standard library. Implemented by the five standard-library span records — `Span<T>`, `ReadOnlySpan<T>`, `ArraySpan<T>`, `ReadOnlyArraySpan<T>`, `ReadOnlyStringSpan` — and by **no other type**: the interface is closed to user implementations, and a user class, record, choice or interface naming it in its interface list — a user interface extending it included, so no user type implements it indirectly — is a compile error at that declaration (spec §9.7 reads every value of this type as the span it boxes, which only these five records are; a user view type exposes its buffer or array and returns a real span). The element type is parameterized to match each concrete type's natural indexer return type. A member declared to return it, a `static` method included, is classified as a span return (spec §28.3's announcement table, row 7), each return expression checked by spec §9.7's return bullet.
-
-```bezel
-public interface IReadOnlySpan<TElement>
-  readonly property Length: int;
-  readonly property IsEmpty: bool;
-  property [i: int]: TElement
-    get;
-  end;
-
-  method IndexOf(value: TElement): int;
-  method Contains(value: TElement): bool;
-  method SequenceEqual(other: IReadOnlySpan<TElement>): bool;
-end IReadOnlySpan;
-```
-
-**Element-type parameterization.** Each concrete span type implements `IReadOnlySpan<TElement>` with `TElement` set to whatever its indexer actually returns:
-
-| Concrete type | Implements |
-|---|---|
-| `Span<T>` for class T | `IReadOnlySpan<T?>` (OwningBuffer slots are nullable) |
-| `Span<T>` for value T | `IReadOnlySpan<T>` |
-| `ReadOnlySpan<T>` for class T | `IReadOnlySpan<T?>` |
-| `ReadOnlySpan<T>` for value T | `IReadOnlySpan<T>` |
-| `ArraySpan<T>` | `IReadOnlySpan<T>` (Array slots are non-nullable T or nullable T?, whichever T was instantiated as) |
-| `ReadOnlyArraySpan<T>` | `IReadOnlySpan<T>` |
-| `ReadOnlyStringSpan` | `IReadOnlySpan<char>` |
-
-A method that wants to accept any read-only span of `MyClass` typically takes `IReadOnlySpan<MyClass?>` (which matches both OwningBuffer-backed nullable-slot spans and Array-backed `MyClass?` spans). Code holding a non-nullable Array span (`ArraySpan<MyClass>`) cannot pass it to that parameter directly — it implements `IReadOnlySpan<MyClass>`, not `IReadOnlySpan<MyClass?>` — because the interface's TElement parameter is invariant. Authors who want full breadth across nullability provide two overloads (one for `IReadOnlySpan<T>`, one for `IReadOnlySpan<T?>`); authors who want the nullable form should use it consistently and accept that callers may need an explicit conversion at the boundary.
-
-**Boxing and lifetime.** The buffer- and array-backed spans are borrow-bearing records ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal) of the language spec); `ReadOnlyStringSpan`, whose only source is a runtime-managed `string`, is an ordinary record and exempt from the borrow-lifetime constraints below ([§3.3](#sec-readonlystringspan)). A buffer- or array-backed span is therefore **never storable in a static field or in a class instance field**: §9.7 admits a borrow-bearing record into either only in the null-source form, and each of these records declares its `Buffer`/`Source` non-nullable, so no span value has that form. Store the source — an `owned OwningBuffer<T>` or `Array<T>` field — and re-derive the span at the use site. A span passed as an `IReadOnlySpan<TElement>` parameter is boxed per the standard rule for borrow-bearing records (language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records)): the boxed copy holds the same borrows as the original, and a value declared `IReadOnlySpan<TElement>` is **read as holding those borrows** under every borrow-lifetime rule of the language spec ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)), so the boxed value is bounded exactly as the span is. The interface parameter therefore admits any span whose source outlives the call frame — which is the common case for synchronous calls — without further annotation. It is the one interface at which a buffer- or array-backed span converts other than as the receiver of a member call or of an extension call on this interface (*Extensions on the interface* below): a span passed to a parameter declared `Object` or any other interface type, or bound to a local or stored at such a type, is rejected at the conversion, and so is a retyping that would carry an `IReadOnlySpan<TElement>` value to such a type with no value converted — `IReadOnlyList<IReadOnlySpan<int>>` to `IReadOnlyList<Object>`, `(IReadOnlySpan<int>) -> IReadOnlySpan<int>` to `(IReadOnlySpan<int>) -> Object`, a method reference over a callee declaring `Object` at a span slot (language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s borrow-erasing position bullet; [§12.9](Bezel_Language_Spec.md#sec-variance), [§27.1.1](Bezel_Language_Spec.md#sec-function-type-assignability)).
-
-A method declaring `IReadOnlySpan<TElement>` cannot store the parameter in a field that outlives the call, return it from a method whose return-lifetime rules do not establish source lifetime, capture it in a closure that escapes, or pass it on at a parameter declared `Object` or another interface type. These are the standard borrow-bearing-record constraints, read on the parameter as a value that holds borrows (language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)); nothing new is added by the interface.
-
-**Performance cost.** Indexer access through an `IReadOnlySpan<TElement>` parameter is a virtual dispatch — vtable lookup, indirect call, no inlining at the call site. For tight loops over many elements, this is meaningfully slower than the direct-dispatch path available when the parameter is typed concretely. For code that accesses spans in inner loops, the recommended pattern is to take the concrete span type (possibly via overloads) rather than the interface. The interface is the right choice when breadth across span sources matters more than peak per-element throughput.
-
-```bezel
-public method Sum(s: ReadOnlySpan<int>): int;    // fast inner loop — direct dispatch
-public method Sum(s: IReadOnlySpan<int>): int;   // convenient and broad — virtual dispatch
-```
-
-Authors of performance-sensitive APIs typically provide the concrete-type signatures (one per common span family). Authors of utility code that runs outside hot paths typically use the interface for the smaller surface.
-
-**Slice and the interface.** The interface deliberately omits `Slice`. Each concrete span type has its own `Slice` returning the same concrete type — `ReadOnlySpan<T>.Slice` returns `ReadOnlySpan<T>`, `ReadOnlyArraySpan<T>.Slice` returns `ReadOnlyArraySpan<T>`, and so on. Putting `Slice` on the interface would require the return type to be `IReadOnlySpan<TElement>`, which would propagate the interface-typed handle (and its virtual-dispatch cost) through the slicing chain. Callers who hold an `IReadOnlySpan<TElement>` and want to slice can do so by reading the relevant elements through the interface in a loop, or by recovering the concrete type via a pattern match (`if s is ReadOnlySpan<T> then ... else if s is ReadOnlyArraySpan<T> then ...`) and slicing on the concrete handle — a match that is exhaustive over the five records, the interface being closed. In practice, slicing through the interface is rare enough that the explicit pattern is acceptable.
-
-**SequenceEqual and the interface.** `SequenceEqual` *is* on the interface, with parameter type `IReadOnlySpan<TElement>`; it is the element-wise comparison, while `Equals` on two `IReadOnlySpan<TElement>` values reached through `Object` — the equality search at this element type ([§4](#sec-system-collections-generic)) — is box identity. This admits cross-source equality through the interface — `bufSpan.SequenceEqual(arrSpan)` where one is a `ReadOnlySpan<byte>` (buffer-backed) and the other is a `ReadOnlyArraySpan<byte>` (array-backed) compiles with a concrete receiver and the argument boxed to `IReadOnlySpan<byte>`, the receiver's own interface overload resolving it. The cost is one virtual-dispatched indexer read per element (the argument side; the receiver's reads stay direct), or two where the receiver is itself interface-typed; the convenience is real for comparison code that doesn't care which source type the operands came from.
-
-**Extensions on the interface.** [§4.14](#sec-owned-buffers-and-spans)'s byte read tier is declared as `extension IReadOnlySpan<byte>`. That adds nothing to the interface's own surface — an extension block declares no interface members (language spec [§26.3](Bezel_Language_Spec.md#sec-extension-blocks-restrictions)) — and reaches every conformer at element type `byte` through [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 2, the receiver boxed for the call's duration under [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records)'s admission of the receiver of an extension call headed `IReadOnlySpan<TElement>`, whose `this` is read as holding the span's borrows — the same reading as for a parameter of this interface. The accessors are not `pure`; making them so runs through the recorded deferral on pure-body iteration over this interface (`DECLINED.md`, *Pure-body `for` over `IReadOnlySpan<TElement>`*).
-
-**What about writable spans.** No writable-span interface (`IMutableSpan` or similar) is provided. The writable side has substantive semantic differences across span families — `Span<T>`'s class-T setter takes `owned T?` and disposes previous slot contents; `ArraySpan<T>`'s setter takes a borrow with no disposal; value-T setters are plain copies. Unifying these under a single writable interface would either pick one model and exclude the others, or fork the contract by source kind, which defeats the unification. The read-only side is genuinely uniform: every span supports indexer-get returning the slot's element, and that's enough for one interface. The writable side may be revisited if a partial unification (e.g. covering only the non-owned-slot writable spans) proves valuable.
+Retired. There is no `IReadOnlySpan<TElement>`. The span types are four borrow-bearing records — `Span<T>` and `ReadOnlySpan<T>` over an `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)), `ArraySpan<T>` and `ReadOnlyArraySpan<T>` over an `Array<T>` ([§4.15](#sec-arrayspant-readonlyarrayspant)) — and the ordinary record `ReadOnlyStringSpan` over a `string` ([§3.3](#sec-readonlystringspan)). They implement no common interface, and every rule of the language spec reads them as the records they are (language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)): no reference type is read as holding borrows, and a value that holds borrows converts to `Object` or an interface only as the receiver of a member call (language spec [§8.6](Bezel_Language_Spec.md#sec-boxing-of-borrow-bearing-records)). A member that accepts a read-only span of either heap backing declares two overloads, `(ReadOnlySpan<T>)` and `(ReadOnlyArraySpan<T>)`, each the direct-dispatch path; a writable span passes `.AsReadOnly()`. `SequenceEqual` is declared on each span type for its own type and for the read-only span of each heap backing (§4.14, §4.15; §3.3 for `char`), and the endianness-aware byte read tier is declared on `ReadOnlySpan<byte>` and on `ReadOnlyArraySpan<byte>` with identical member lists (§4.14, *Byte-buffer accessors*; §4.15). The section number is retained so later-section citations stay stable; the prior definition and the decision record are in the v0.336 changelog entry ([`Bezel_Changelog.md`](Bezel_Changelog.md)) and in [proposal 0175](proposals/0175-retire-the-read-only-span-interface.md).
 
 <a id="sec-sorted-dictionary"></a>
 ### 4.17 `SortedDictionary<K, V>`
@@ -4120,7 +4063,7 @@ An **event** is a named publication point on a class: the class controls when th
 
 - **An async handler *written as an `async` lambda* cannot take a borrow-bearing payload**, because [§30.1](Bezel_Language_Spec.md#sec-async-methods) rejects such a parameter there; a plain lambda or a method reference returning an already-completed task is unaffected.
 - **A move-only payload is not admitted at the source classes.** `EventSource<T>` and `AsyncEventSource<T>` admit no move-only value type (language spec [§15.3](Bezel_Language_Spec.md#sec-move-only-value-types) — an owning inline array or an owning choice) as `T`: a compile error at the instantiation site, through any chain of user declarations (language spec [§28.11](Bezel_Language_Spec.md#sec-collection-element-ownership), [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2). The ground is the interaction itself: a move-only payload is passed by value-move, leaving the argument moved-from after the first handler's call, which does not compose with more than one subscriber. `IEvent<T>` and `IAsyncEvent<T>` carry no such rule: a user implementation's own raise is checked where it reads the payload.
-- **`RaiseAsync` retains its payload until the returned task settles** — it awaits each handler's task before invoking the next (*Raising*, below), so the payload outlives `RaiseAsync`'s synchronous return exactly as an `async` method's parameters outlive theirs ([§30.1](Bezel_Language_Spec.md#sec-async-methods)); the absence of an `async` marker on the declaration is a fact about signatures ([§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)), not about the frame. That retention is normative, and so is the obligation it places on the **raiser**: every borrow the payload carries must outlive the settlement of the task `RaiseAsync` returns, and the borrowed object must not be transferred to another domain before that settlement — [§30.1](Bezel_Language_Spec.md#sec-async-methods)'s held-until-settlement obligation, in its entirety, discharged trivially by `await`ing the raise in the scope that owns the borrow sources and carried live only by the abandonment shapes ([§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers)). The payload's carried borrows are class- or interface-typed, and the obligation has the ordinary checked-mode backstop ([§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)): **`AsyncEventSource<T>` admits no payload type that is a value type that holds borrows** (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)'s holds-borrows property: a borrow-bearing record — a span ([§4.14](#sec-owned-buffers-and-spans), [§4.15](#sec-arrayspant-readonlyarrayspant)) among them — a borrow-bearing inline array, or a choice that holds borrows; a `T` declared `IReadOnlySpan<TElement>` is read as the span it boxes). `AsyncEventSource<Pair>`, `AsyncEventSource<ReadOnlySpan<byte>>` and `AsyncEventSource<[2]Item>` are **compile errors at the instantiation**, wherever the type is formed — explicit, inferred, or through a user generic's substitution (`class Fan<T>` holding an `AsyncEventSource<T>` is rejected at `Fan<Pair>` wherever it is named: an instantiation-site rule in language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2's sense). `CancellationToken` is excepted on [§30.1](Bezel_Language_Spec.md#sec-async-methods)'s certified footing (axiom A10), its source obligation [§30.8](Bezel_Language_Spec.md#sec-cancellation)'s. The ground is §30.1's for an `async` parameter: the raise frame holds the payload past the synchronous call, a position whose lifetime the payload's carried sources do not provably bound, and a value type that holds borrows is stored past its bound at no position ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s instance-field bullet; an `async` frame, [§30.1](Bezel_Language_Spec.md#sec-async-methods); a task result, [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)). The remedy is a class payload — the buffer or collection object itself, or a class holding it with an offset and a length — raised under the obligation above, or borrow-free data; a synchronous `EventSource<T>`, whose `Raise` is call-bounded, takes any payload type ([proposal 0154](proposals/0154-no-async-event-payload-that-holds-borrows.md)).
+- **`RaiseAsync` retains its payload until the returned task settles** — it awaits each handler's task before invoking the next (*Raising*, below), so the payload outlives `RaiseAsync`'s synchronous return exactly as an `async` method's parameters outlive theirs ([§30.1](Bezel_Language_Spec.md#sec-async-methods)); the absence of an `async` marker on the declaration is a fact about signatures ([§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)), not about the frame. That retention is normative, and so is the obligation it places on the **raiser**: every borrow the payload carries must outlive the settlement of the task `RaiseAsync` returns, and the borrowed object must not be transferred to another domain before that settlement — [§30.1](Bezel_Language_Spec.md#sec-async-methods)'s held-until-settlement obligation, in its entirety, discharged trivially by `await`ing the raise in the scope that owns the borrow sources and carried live only by the abandonment shapes ([§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers)). The payload's carried borrows are class- or interface-typed, and the obligation has the ordinary checked-mode backstop ([§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)): **`AsyncEventSource<T>` admits no payload type that is a value type that holds borrows** (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)'s holds-borrows property: a borrow-bearing record — a span ([§4.14](#sec-owned-buffers-and-spans), [§4.15](#sec-arrayspant-readonlyarrayspant)) among them — a borrow-bearing inline array, or a choice that holds borrows). `AsyncEventSource<Pair>`, `AsyncEventSource<ReadOnlySpan<byte>>` and `AsyncEventSource<[2]Item>` are **compile errors at the instantiation**, wherever the type is formed — explicit, inferred, or through a user generic's substitution (`class Fan<T>` holding an `AsyncEventSource<T>` is rejected at `Fan<Pair>` wherever it is named: an instantiation-site rule in language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2's sense). `CancellationToken` is excepted on [§30.1](Bezel_Language_Spec.md#sec-async-methods)'s certified footing (axiom A10), its source obligation [§30.8](Bezel_Language_Spec.md#sec-cancellation)'s. The ground is §30.1's for an `async` parameter: the raise frame holds the payload past the synchronous call, a position whose lifetime the payload's carried sources do not provably bound, and a value type that holds borrows is stored past its bound at no position ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s instance-field bullet; an `async` frame, [§30.1](Bezel_Language_Spec.md#sec-async-methods); a task result, [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)). The remedy is a class payload — the buffer or collection object itself, or a class holding it with an offset and a length — raised under the obligation above, or borrow-free data; a synchronous `EventSource<T>`, whose `Raise` is call-bounded, takes any payload type ([proposal 0154](proposals/0154-no-async-event-payload-that-holds-borrows.md)).
 
 Whether the first should become a restriction on `EventSource<T>`/`AsyncEventSource<T>` instantiation is an open question, not settled here; the reopening bar recorded in [`DECLINED.md`](proposals/DECLINED.md) stands for it. The second is the source classes' instantiation-site rule above. The third is `AsyncEventSource<T>`'s rule above, stated at the type as language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)'s `Task<T>` row is ([proposal 0154](proposals/0154-no-async-event-payload-that-holds-borrows.md)). For a synchronous event the handler type is `(T) -> ()`; for an asynchronous event, `(T) -> Task`.
 

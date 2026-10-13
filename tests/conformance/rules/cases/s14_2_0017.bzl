@@ -2,10 +2,9 @@
 //! doc: spec
 //! section: 14.2
 //! title: int satisfies where T: hashable
-//! rule: `where T: hashable` admits types whose hashable derived type property
-//!   holds — every type except a non-auto-hashable record (or choice) with no
-//!   user equality, and a nullable type or inline array over an excluded type
-//!   (§14.2, §3.6).
+//! rule: Types whose **hashable** derived type property (§3.6) holds —
+//!   consistent `Equals`/`GetHashCode`, usable as hash-container keys and
+//!   elements — decided per instantiation by §3.6's computation.
 //! cites: 14.2, 3.6
 //! expect: accept
 //! issue: 4367
