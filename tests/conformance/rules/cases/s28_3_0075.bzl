@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 28.3
 //! title: a move into an owned argument suppresses the must-use warning
-//! rule: The warning is **suppressed** ... when it is moved or returned (no
-//!   implicit drop occurs).
+//! rule: The warning is **suppressed** by exactly these conditions ... it is
+//!   moved or returned (no implicit drop occurs)
 //! cites: 28.3, 28.8.1
 //! expect: quiet
 module Conf;

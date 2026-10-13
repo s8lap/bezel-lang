@@ -633,22 +633,25 @@ else:
 #   B. every register row's members are (i) declared in the stdlib and
 #      (ii) claimed conditional by a positive term-use near one of its names.
 REG_TERM = re.compile(r'conditionall?y[-\s/]+admitted\s+member', re.I)  # [-\s/]+ spans fence-comment line wraps ('...LY\n// ADMITTED')
-_regsec = re.search(r'<a id="sec-conditionally-admitted-members"></a>(.*?)\n### ',
-                    text['spec'], re.S)
+# v0.338 (proposal 0186): the register moved from a spec table to stdlib §1's
+# *Conditional members* conventions row; each member family is one
+# semicolon-separated clause of that row, read as a "row" below.
+_regsec = re.search(r'\n\| \*\*Conditional members\*\* \|([^\n]*)\|[^|\n]*\|\n',
+                    text['stdlib'])
 if not _regsec:
-    print('REGISTER: cannot find spec section sec-conditionally-admitted-members '
+    print('REGISTER: cannot find the stdlib §1 "Conditional members" row '
           '-- the check has lost its anchor')
     fail = 1
 else:
     _rows = []
-    for _r in re.finditer(r'\n\| (`[^|]+`) \|', _regsec.group(1)):
-        _names = re.findall(r'`([A-Za-z_][A-Za-z0-9_<>, ]*?)\.?([A-Za-z_][A-Za-z0-9_]*)(?:\(\))?`', _r.group(1))
-        _mem = [n[1] for n in _names if n[1] not in ('T', 'E', 'U', 'F')]
+    for _r in _regsec.group(1).split(';'):
+        _names = re.findall(r'`([A-Za-z_][A-Za-z0-9_<>, ]*?)\.?([A-Za-z_][A-Za-z0-9_]*)(?:\(\))?`', _r)
+        _mem = [n[1] for n in _names if n[1] not in ('T', 'E', 'U', 'F', 'K', 'V')]
         if _mem:
-            _rows.append((_r.group(1)[:60], set(_mem)))
+            _rows.append((_r.strip()[:60], set(_mem)))
     _bad = []
     if not _rows:
-        _bad.append('  no rows parsed from the register table')
+        _bad.append('  no member families parsed from the Conditional members row')
     # direction A: positive term uses name a register member nearby
     _all_members = set().union(*[m for _, m in _rows]) if _rows else set()
     _pos_sites = []
@@ -660,9 +663,9 @@ else:
             _ln = text[_k][:_m.start()].count('\n') + 1
             _para = text[_k][max(0, _m.start()-1500):_m.start()+1500]
             _named = {n for n in _all_members if n in _para}
-            if _m.start() >= (_regsec.start() if _k == 'spec' else 10**12) and \
-               _m.start() <= (_regsec.end() if _k == 'spec' else -1):
-                continue  # the register section itself
+            if _m.start() >= (_regsec.start() if _k == 'stdlib' else 10**12) and \
+               _m.start() <= (_regsec.end() if _k == 'stdlib' else -1):
+                continue  # the index row itself
             if not _named:
                 _bad.append(f'  [A] [{_k}] line {_ln}: the term appears with no '
                             'register member named in its paragraph -- add the row '
@@ -685,7 +688,7 @@ else:
         print('\n'.join(_bad))
         fail = 1
     else:
-        print(f'REGISTER: clean ({len(_rows)} register rows; {len(_pos_sites)} '
+        print(f'REGISTER: clean ({len(_rows)} conditional-member families; {len(_pos_sites)} '
               'positive term-sites, all mapped; negated exemptions skipped)')
 
 sys.exit(1 if fail else 0)

@@ -2,11 +2,11 @@
 //! doc: spec
 //! section: 11.3
 //! title: an owned/plain parameter pair fails the declaration guard when it can collapse
-//! rule: owned on an ordinary parameter distinguishes overloads exactly where
-//!   §22.6's declaration guard admits the pair; a pair failing the guard
-//!   clashes at the second declaration. where T: class does not qualify --
-//!   it admits string and function-type substitutions, at which the marker
-//!   is erased and the pair collapses.
+//! rule: **`owned` never distinguishes overloads.** Two same-name members
+//!   that differ only by `owned` on a parameter — an ordinary parameter or an
+//!   `out` parameter — are indistinguishable and clash at the second
+//!   declaration (§11.3): `Append(item: Widget)` beside `Append(owned item:
+//!   Widget)` is a compile error
 //! cites: 11.3, 22.6
 //! expect: reject
 //! diagnostic: clash

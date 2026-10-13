@@ -2,10 +2,9 @@
 //! doc: spec
 //! section: 30.5
 //! title: move is rejected on a Pattern B await operand
-//! rule: The position is **marker-free** — the transfer marker is not
-//!   admitted where the target already announces the consume; Pattern B
-//!   await therefore deliberately joins no consume-site freeze list and
-//!   takes no operand marker.
+//! rule: The position is **marker-free** (K3.13's set): the transfer marker
+//!   is not admitted where the target already announces the consume ... and
+//!   so joins no consume-site freeze list
 //! cites: 30.5, 28.3
 //! expect: reject
 //! diagnostic: marker-free

@@ -2,8 +2,9 @@
 //! doc: spec
 //! section: 35.5
 //! title: a marked named slot in a borrowing match is rejected
-//! rule: The marker on a slot of a borrowing match is a compile error: the scrutinee
-//!   retains ownership, so no slot can mint an obligation from it.
+//! rule: A named slot **never transfers** ... `move` is not a slot spelling
+//!   (`Fetched(move response = var r)` is a compile error at the pattern
+//!   naming the positional form — retired v0.338)
 //! expect: reject
 //! diagnostic: borrowing match
 //! issue: 4763

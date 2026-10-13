@@ -2,9 +2,8 @@
 //! doc: spec
 //! section: 28.3
 //! title: returning an owned local under an owned return suppresses the must-use warning
-//! rule: The warning is **suppressed** ... when it is moved or returned (no
-//!   implicit drop occurs); a `return` operand under an `owned` return is a
-//!   marker-free position.
+//! rule: The warning is **suppressed** by exactly these conditions ... it is
+//!   moved or returned (no implicit drop occurs)
 //! cites: 28.3, 28.8
 //! expect: quiet
 module Conf;

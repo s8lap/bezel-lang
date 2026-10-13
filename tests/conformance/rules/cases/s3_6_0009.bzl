@@ -4,10 +4,10 @@
 //! title: a value-like choice outside auto-hashable only through its declared equality is hashable
 //! rule: hashable ... every type except ... (b) a choice that is not
 //!   value-like, or is value-like and neither auto-hashable nor declares user
-//!   equality (§35.7 — ... a value-like choice outside auto-hashable **only**
-//!   because it carries a homogeneous `=`/`<>` overload is hashable on the
-//!   strength of the `Equals(T)`/`GetHashCode` §25.2's co-declaration rule
-//!   obliges beside it)
+//!   equality (§35.7 — ... a value-like choice outside auto-hashable through
+//!   its own declared equality — `Equals(other: C)` with `GetHashCode`, with
+//!   or without a homogeneous `=`/`<>` overload beside them — is hashable on
+//!   the strength of those members)
 //! cites: 3.6, 35.7, 14.2
 //! expect: accept
 module Conf;

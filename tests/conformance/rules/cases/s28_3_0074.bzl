@@ -2,8 +2,9 @@
 //! doc: spec
 //! section: 28.3
 //! title: a discard suppresses the must-use warning on an owned local
-//! rule: The warning is **suppressed** ... when it is explicitly disposed or
-//!   discarded — `_ := …` (§17.13).
+//! rule: dispose it explicitly with `.Dispose()` or discard it with `_ := …`
+//!   (§17.13) ... The warning is **suppressed** by exactly these conditions
+//!   ... it is explicitly disposed or discarded
 //! cites: 28.3, 17.13
 //! expect: quiet
 module Conf;

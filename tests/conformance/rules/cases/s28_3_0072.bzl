@@ -2,8 +2,8 @@
 //! doc: spec
 //! section: 28.3
 //! title: using var suppresses the must-use warning on an owned local
-//! rule: The warning is **suppressed** when the local is declared `using var`
-//!   (the scope-bound intent is then explicit).
+//! rule: The warning is **suppressed** by exactly these conditions ... the
+//!   local is declared `using var` (the scope-bound intent is then explicit)
 //! cites: 28.3, 28.10
 //! expect: quiet
 module Conf;

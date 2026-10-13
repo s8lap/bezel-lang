@@ -2,11 +2,11 @@
 //! doc: spec
 //! section: 28.3
 //! title: under the trust-admission report mode, abandoning a task minted over a borrowed receiver reports
-//! rule: In that mode, at every site where the compiler makes an admission that
-//!   rests on a K4.3-recorded trust clause — ... the frame-held clause (§30.1,
-//!   §30.5) ... — the compiler emits a warning naming the rule and its clause
-//!   ... The site is the admitting site — the store, the call, the abandon or
-//!   the `await` the clause admits
+//! rule: In that mode, at every site where the compiler makes an admission
+//!   that rests on a K4.3-recorded trust clause, it **emits a warning** ...
+//!   the **frame-held** clause (§30.1, §30.5) ... **The warning** names the
+//!   rule and its clause ... The site is the admitting site — the store, the
+//!   call, the abandon or the `await` the clause admits
 //! cites: 28.3, 30.1, 30.10
 //! expect: warn
 //! diagnostic: trust

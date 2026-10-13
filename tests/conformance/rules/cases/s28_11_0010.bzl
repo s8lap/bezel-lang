@@ -2,8 +2,12 @@
 //! doc: spec
 //! section: 28.11
 //! title: an element borrow re-taken after the mutation is clean
-//! rule: A borrow re-taken after the mutation is clean, and a use before the
-//!   mutation, or on a path the kill does not dominate, draws nothing.
+//! rule: A borrow so produced is valid until its slot is mutated — an
+//!   indexer-set, `Remove`/`RemoveAt`, `Clear()` or the collection's own
+//!   disposal disposes the referent — and is not statically tracked per slot
+//!   ... Re-take the borrow after the mutation, take the element out first
+//!   through `PopAt`/`Pop`/`PopValue`, which leave no borrow behind, or
+//!   mutate after the last use
 //! cites: 28.11, 28.2
 //! expect: quiet
 module Conf;

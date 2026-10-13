@@ -2,10 +2,11 @@
 //! doc: spec
 //! section: 28.11
 //! title: a RemoveAt at the borrow's index after an intervening Insert draws no warning
-//! rule: `RemoveAt(i)` where the borrow was taken as `coll[i]` with the same
-//!   index expression, and no structural operation of §29.12's list on the
-//!   same collection binding between the borrow and the kill: a reposition or
-//!   removal ahead of the slot would change which element the index names.
+//! rule: A borrow so produced is valid until its slot is mutated — an
+//!   indexer-set, `Remove`/`RemoveAt`, `Clear()` or the collection's own
+//!   disposal disposes the referent — and is not statically tracked per slot:
+//!   a use of it afterwards is a mid-scope kill under the checked-mode
+//!   backstop (K4.1, §28.2)
 //! cites: 28.11, 29.12, 28.2
 //! expect: quiet
 module Conf;

@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 28.11
 //! title: an element-level indexer write on the collection does not draw the element-borrow warning
-//! rule: An element-level write — an indexer-set — does not draw this
-//!   warning: it is not a §29.12 structural operation, and the two warnings
-//!   share one operation vocabulary.
+//! rule: A borrow so produced is valid until its slot is mutated — an
+//!   indexer-set, `Remove`/`RemoveAt`, `Clear()` or the collection's own
+//!   disposal disposes the referent — and is not statically tracked per slot
 //! cites: 28.11, 29.12
 //! expect: quiet
 module Conf;

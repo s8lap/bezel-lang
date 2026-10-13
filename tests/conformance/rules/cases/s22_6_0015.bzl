@@ -2,9 +2,11 @@
 //! doc: spec
 //! section: 22.6
 //! title: owned on an out parameter never distinguishes overloads
-//! rule: "`owned` on an **`out` parameter** stays outside the
-//!   distinguishability list: two methods differing only in the `owned`
-//!   qualifier on an `out` parameter are a compile error."
+//! rule: **`owned` never distinguishes overloads.** Two same-name members
+//!   that differ only by `owned` on a parameter — an ordinary parameter or an
+//!   `out` parameter — are indistinguishable and clash at the second
+//!   declaration (§11.3) ... as is `TryGet(name: string, out c: Conn?)`
+//!   beside `TryGet(name: string, out owned c: Conn?)`
 //! cites: 22.6
 //! expect: reject
 //! diagnostic: owned qualifier
