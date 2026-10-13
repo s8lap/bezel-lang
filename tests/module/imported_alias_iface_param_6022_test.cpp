@@ -205,4 +205,101 @@ BEZEL_TEST(imported_alias_iface_param_6022,
     BEZEL_EXPECT_TRUE(hasMismatch6022(r));
 }
 
+
+// ---------------------------------------------------------------------------
+// An exported alias of an IMPORT-ALIASED built-in (`import System.Diagnostics
+// as D; type SW := D.Stopwatch;`). The exporter's `@Home.` marker for an
+// alias-qualified built-in is keyed on the use-site node, so the alias head
+// must still travel as the plain target name and an importer's same-named
+// type must not capture it (§2.2, §27.8, §11.2, v0.338).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const char* kLibSw6022 =
+    "module LibA; import System.Diagnostics as D; type SW := D.Stopwatch; "
+    "public interface ISink "
+    "  method Show(w: SW): int; "
+    "end ISink;";
+
+std::string appSw6022(const std::string& prelude, const std::string& param) {
+    return "module AppB; import LibA; " + prelude +
+           " public class K: ISink "
+           "  public constructor() end constructor; "
+           "  public method Show(w: " + param + "): int "
+           "    Console.WriteLine(\"impl-sw\"); "
+           "    return 1; "
+           "  end Show; "
+           "end K; "
+           "public class C "
+           "  public static method Main(): int "
+           "    var s: ISink := new K(); "
+           "    var w := new D.Stopwatch(); "
+           "    var n := s.Show(w); "
+           "    return 0; "
+           "  end Main; "
+           "end C;";
+}
+
+}  // namespace
+
+BEZEL_TEST(imported_alias_iface_param_6022,
+           exported_alias_of_import_aliased_builtin_direct_spelling_runs) {
+    auto r = build6022(kLibSw6022,
+                       appSw6022("import System.Diagnostics as D;", "D.Stopwatch"));
+    BEZEL_EXPECT_TRUE(r.libBuilt);
+    BEZEL_EXPECT_TRUE(r.appCompiled);
+    BEZEL_EXPECT_EQ(r.out, std::string("impl-sw\n"));
+}
+
+BEZEL_TEST(imported_alias_iface_param_6022,
+           exported_alias_of_import_aliased_builtin_importer_alias_runs) {
+    auto r = build6022(
+        kLibSw6022,
+        appSw6022("import System.Diagnostics as D; type SW2 := D.Stopwatch;",
+                  "SW2"));
+    BEZEL_EXPECT_TRUE(r.libBuilt);
+    BEZEL_EXPECT_TRUE(r.appCompiled);
+    BEZEL_EXPECT_EQ(r.out, std::string("impl-sw\n"));
+}
+
+BEZEL_TEST(imported_alias_iface_param_6022,
+           exported_alias_of_import_aliased_builtin_not_hijacked_by_local_class) {
+    // The importer declares its OWN class `Stopwatch`; the exported alias
+    // still names the built-in, so `D.Stopwatch` is the witness and the
+    // importer's local type is not.
+    auto r = build6022(
+        kLibSw6022,
+        appSw6022("import System.Diagnostics as D; "
+                  "public class Stopwatch public constructor() end constructor; "
+                  "end Stopwatch;",
+                  "D.Stopwatch"));
+    BEZEL_EXPECT_TRUE(r.libBuilt);
+    BEZEL_EXPECT_TRUE(r.appCompiled);
+    BEZEL_EXPECT_EQ(r.out, std::string("impl-sw\n"));
+}
+
+BEZEL_TEST(imported_alias_iface_param_6022,
+           exported_alias_of_import_aliased_builtin_local_class_rejected) {
+    // An importer-local class named `Stopwatch` is a different type from the
+    // exported alias's target, so it is not a witness.
+    auto r = build6022(
+        kLibSw6022,
+        appSw6022("public class Stopwatch public constructor() end constructor; "
+                  "end Stopwatch;",
+                  "Stopwatch"));
+    BEZEL_EXPECT_TRUE(r.libBuilt);
+    BEZEL_EXPECT_FALSE(r.appCompiled);
+    BEZEL_EXPECT_TRUE(hasMismatch6022(r));
+}
+
+BEZEL_TEST(imported_alias_iface_param_6022,
+           exported_alias_of_import_aliased_builtin_other_builtin_rejected) {
+    auto r = build6022(kLibSw6022,
+                       appSw6022("", "StringBuilder"));
+    BEZEL_EXPECT_TRUE(r.libBuilt);
+    BEZEL_EXPECT_FALSE(r.appCompiled);
+    BEZEL_EXPECT_TRUE(hasMismatch6022(r));
+}
+
 }  // namespace bezel::module
