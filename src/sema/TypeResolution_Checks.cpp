@@ -2078,6 +2078,22 @@ void Resolver::checkGenericConstraintConsistency() {
                     if (!boundParam(item).empty()) continue;  // type-param bound
                     TypeRef* bound = ctx_.resolvedType(*item.typeArg);
                     if (!bound) bound = resolveType(*item.typeArg, &boundScope);
+                    // §14.2 (constraint table, `where T: SomeClass` row) and
+                    // Appendix C.4 v0.338: a bound naming `Object` (§8.1, the
+                    // root type, a primitive-kind TypeRef) is a compile error
+                    // at the declaration. Issue #5805.
+                    if (bound && bound->kind == TypeRef::Kind::Primitive &&
+                        bound->primitive == PrimitiveType::Object) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            "type parameter `" + std::string(gc.typeParam) +
+                            "` is constrained to `Object`, the root type — a "
+                            "where-clause type bound may name only a class or "
+                            "an interface (§14.2); write an unconstrained `" +
+                            std::string(gc.typeParam) + "`, or `where " +
+                            std::string(gc.typeParam) + ": notnull`");
+                        continue;
+                    }
                     if (!bound || bound->kind != TypeRef::Kind::Named ||
                         !bound->declaration)
                         continue;  // primitive/builtin/unresolved: defer
