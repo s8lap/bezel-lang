@@ -4406,6 +4406,7 @@ void Resolver::checkEqualsHashCodePairing() {
             return isClassOwnTypeEquals(t, ms, ctx_);
         };
         MethodSymbol* equalsOverride = nullptr;   // first `override Equals`
+        MethodSymbol* equalsOverrideNonOwn = nullptr;  // first `override Equals` not at the own type
         MethodSymbol* equalsOwnTyped = nullptr;   // first own-typed Equals, either spelling
         MethodSymbol* equalsPlainOwn = nullptr;   // first plain own-typed Equals
         bool overridesHashCode = false;           // `override GetHashCode`
@@ -4426,6 +4427,8 @@ void Resolver::checkEqualsHashCodePairing() {
             }
             if (ms->name != "Equals") continue;
             if (isOverride && !equalsOverride) equalsOverride = ms;
+            if (isOverride && !equalsOverrideNonOwn && !isOwnTypeEquals(ms))
+                equalsOverrideNonOwn = ms;
             if (!equalsOwnTyped && isOwnTypeEquals(ms)) equalsOwnTyped = ms;
             if (!isOverride && !equalsPlainOwn && isOwnTypeEquals(ms))
                 equalsPlainOwn = ms;
@@ -4437,59 +4440,69 @@ void Resolver::checkEqualsHashCodePairing() {
         const bool valueKind = t->kind == ast::TypeDeclKind::Record ||
                                t->kind == ast::TypeDeclKind::Enum ||
                                t->kind == ast::TypeDeclKind::Choice;
-        // §8.3 (v0.338, #5955; #6032): a choice owning at every instantiation
-        // has no `Object` slot to fill and carries no plain-spelling obligation
-        // (§35.4, §35.11). "Owning at every instantiation" is decided at the
-        // most relaxing instantiation: each type parameter is substituted by
-        // `int`, a value type that holds no borrow. A marked `owned T` payload
-        // is erased there (§35.11), so the choice is Owning at `int` only when
-        // some payload is owning independently of its parameters, which is
-        // owning at every instantiation. A parameter with a class, interface or
-        // other constraint `int` may not satisfy keeps the obligation (narrow
-        // #5955). The "no boxing reaches" conjunct of the spec wording is not
-        // checked (HYPOTHESIS).
+        // §8.3 (v0.338, #5955): the plain own-typed `Equals` obligation is imposed
+        // only where value-likeness is PROVEN (ruling d1). A choice with no type
+        // parameters, or whose every type parameter is unconstrained or
+        // `value`-constrained, is classified at T=int: it is owning there (a choice
+        // that no boxing reaches, §8.3 L1103, §35.4, §35.11) and exempt, otherwise
+        // it keeps the obligation. Any other constraint on a type parameter makes
+        // the verdict unproven, so the choice is ADMITTED (base behaviour, residual
+        // false accept). The "no boxing reaches" conjunct is not checked (HYPOTHESIS).
         bool owningChoice = false;
         if (t->kind == ast::TypeDeclKind::Choice) {
-            bool substitutable = true;
+            bool provable = true;
             for (Symbol* gp : t->genericParams) {
                 auto* gps = dynamic_cast<GenericParamSymbol*>(gp);
-                if (!gps) { substitutable = false; break; }
+                if (!gps) { provable = false; break; }
                 for (const auto& c : gps->constraints)
-                    if (c.kind != "value") substitutable = false;
+                    if (c.kind != "value") provable = false;
             }
-            if (substitutable) {
+            if (!provable) {
+                owningChoice = true;  // admitted: base behaviour
+            } else {
                 TypeRef self;
                 self.kind = TypeRef::Kind::Named;
                 self.declaration = t;
                 for (size_t i = 0; i < t->genericParams.size(); ++i)
-                    self.genericArgs.push_back(
-                        ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    self.genericArgs.push_back(ctx_.primitiveTypeRef(PrimitiveType::Int));
                 auto verdict = common::classifyChoiceType(&self, ctx_);
-                owningChoice =
-                    verdict && *verdict == common::ChoiceClassification::Owning;
+                owningChoice = verdict && *verdict == common::ChoiceClassification::Owning;
             }
         }
-        if (valueKind && equalsOwnTyped) {
-            // The owning-choice exemption is taken for the plain spelling
-            // only: an `override Equals` on a choice keeps its existing
-            // obligation (the "no boxing reaches" conjunct is unverified here).
-            const bool exempt = owningChoice && !hasMod(equalsOwnTyped, "override");
-            if (!declaresHashCode && !exempt) {
-                if (hasMod(equalsOwnTyped, "override")) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, equalsOwnTyped->declLoc,
-                        "a type that overrides `Equals` must also override "
-                        "`GetHashCode` (§8.3)");
-                } else {
-                    const char* kindPhrase =
-                        t->kind == ast::TypeDeclKind::Record ? "a record"
-                        : t->kind == ast::TypeDeclKind::Enum ? "an enum"
-                                                             : "a choice";
-                    ctx_.diagnostics().report(
-                        Severity::Error, equalsOwnTyped->declLoc,
-                        std::string(kindPhrase) + " declaring `Equals(" +
-                        std::string(t->name) + ")` must declare `GetHashCode` "
-                        "(§8.3)");
+        if (valueKind) {
+            // A value kind's `override Equals` at a parameter type other than
+            // its own (`Object?`, §9.2) is not discharged by a plain
+            // GetHashCode: base's trailing rule, reported at that declaration.
+            if (equalsOverrideNonOwn && !overridesHashCode) {
+                ctx_.diagnostics().report(
+                    Severity::Error, equalsOverrideNonOwn->declLoc,
+                    "a type that overrides `Equals` must also override "
+                    "`GetHashCode` (§8.3)");
+                return;
+            }
+            // §8.3 (v0.338, #5955): an own-typed `Equals`, either spelling, is
+            // discharged by any declared GetHashCode (both spellings read).
+            // The owning-choice exemption is taken for the plain spelling only.
+            if (equalsOwnTyped) {
+                const bool exempt =
+                    owningChoice && !hasMod(equalsOwnTyped, "override");
+                if (!declaresHashCode && !exempt) {
+                    if (hasMod(equalsOwnTyped, "override")) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, equalsOwnTyped->declLoc,
+                            "a type that overrides `Equals` must also override "
+                            "`GetHashCode` (§8.3)");
+                    } else {
+                        const char* kindPhrase =
+                            t->kind == ast::TypeDeclKind::Record ? "a record"
+                            : t->kind == ast::TypeDeclKind::Enum ? "an enum"
+                                                                 : "a choice";
+                        ctx_.diagnostics().report(
+                            Severity::Error, equalsOwnTyped->declLoc,
+                            std::string(kindPhrase) + " declaring `Equals(" +
+                            std::string(t->name) + ")` must declare `GetHashCode` "
+                            "(§8.3)");
+                    }
                 }
             }
             return;
