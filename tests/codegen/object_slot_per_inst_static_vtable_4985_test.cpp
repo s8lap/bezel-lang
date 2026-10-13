@@ -80,7 +80,7 @@ BEZEL_TEST(object_slot_per_inst_static_vtable_4985,
 module M;
 public class B<T>
   public static _c: int := 0;
-  public virtual method ToString(): string => $"<{B<T>._c}>";
+  public override method ToString(): string => $"<{B<T>._c}>";
 end B;
 public class D<T>: B<T>
   public override method ToString(): string => $"<D{B<T>._c}>";
@@ -113,7 +113,7 @@ BEZEL_TEST(object_slot_per_inst_static_vtable_4985,
 module M;
 public class B<T>
   public static _c: int := 0;
-  public virtual method ToString(): string => $"<D{B<T>._c}>";
+  public override method ToString(): string => $"<D{B<T>._c}>";
 end B;
 public class Program
   public static method Main(): int
@@ -162,7 +162,7 @@ BEZEL_TEST(object_slot_per_inst_static_vtable_4985,
 module M;
 public class B<T>
   public static _c: int := 0;
-  public virtual method Equals(other: Object?): bool
+  public override method Equals(other: Object?): bool
     if (other is null) then return false; end if;
     if (other is B<T>) then return true; end if;
     return false;
@@ -222,7 +222,7 @@ BEZEL_TEST(object_slot_per_inst_static_vtable_4985,
 module M;
 public class B<T>
   public static _c: int := 0;
-  public virtual method GetHashCode(): int => B<T>._c;
+  public override method GetHashCode(): int => B<T>._c;
 end B;
 public class D<T>: B<T>
   public override method GetHashCode(): int => B<T>._c + 1;

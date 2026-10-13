@@ -51,7 +51,7 @@ BEZEL_TEST(base_tostring_1106, no_base_override_typename_default) {
 BEZEL_TEST(base_tostring_1106, base_override_dispatched) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class B public virtual method ToString(): string => \"BASE\"; end B; "
+        "class B public override method ToString(): string => \"BASE\"; end B; "
         "class A: B public override method ToString(): string => base.ToString(); end A; "
         "class C public static method Main(): int "
         "  using var a := new A(); var s := a.ToString(); "
@@ -130,7 +130,7 @@ BEZEL_TEST(base_tostring_1110, concat_left_operand_object_base) {
 BEZEL_TEST(base_tostring_1110, concat_operand_explicit_base) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class B public virtual method ToString(): string => \"BASE\"; end B; "
+        "class B public override method ToString(): string => \"BASE\"; end B; "
         "class A: B public override method ToString(): string => \"x\" + base.ToString(); end A; "
         "class C public static method Main(): int "
         "  using var a := new A(); var s := a.ToString(); "

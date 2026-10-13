@@ -323,7 +323,7 @@ BEZEL_TEST(codegen_cg27d, record_alignment_padded_1283) {
 BEZEL_TEST(codegen_cg27d, class_override_alignment_padded_1283) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class W public method ToString(): string return \"WW\"; end ToString; end W; "
+        "class W public override method ToString(): string return \"WW\"; end ToString; end W; "
         "class C public static method Main(): int "
         "  using var w := new W(); "
         "  var s := $\"[{w,8}]\"; "          // "[      WW]" (6 spaces + "WW")

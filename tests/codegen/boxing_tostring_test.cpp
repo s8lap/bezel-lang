@@ -139,7 +139,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, class_override_virtual_dispatch_via_obje
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class Animal "
-        "  public virtual method ToString(): string => \"animal\"; "
+        "  public override method ToString(): string => \"animal\"; "
         "end Animal; "
         "class Dog : Animal "
         "  public override method ToString(): string => \"dog\"; "

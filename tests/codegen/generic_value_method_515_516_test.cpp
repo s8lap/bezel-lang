@@ -260,7 +260,7 @@ BEZEL_TEST(codegen_generic_value_method_515, asstring_class_ref_type_control_14_
         "class MyVal "
         "  public n: int; "
         "  public constructor(v: int) n := v; end constructor; "
-        "  public method ToString(): string => \"MyVal:\"; "
+        "  public override method ToString(): string => \"MyVal:\"; "
         "  destructor end destructor; "
         "end MyVal; "
         "class Helper "

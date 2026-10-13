@@ -1154,6 +1154,29 @@ static bool isObjectVirtualReplacementMember(
     return false;
 }
 
+// fix #5669 (§12.2, v0.338): the name of the `Object` virtual member that
+// `ms` declares at its OWN signature (§8.1: `Equals(other: Object?)` — also
+// `Equals(other: Object)`, nullability widened either way — `GetHashCode()`,
+// `ToString()`), or empty when it declares none. A class member at that
+// signature that is not `override` is hiding (§12.2); the `Equals(T)` at the
+// class's own type (`Equals(other: Point)`) is not this signature and is not
+// matched here. Keyed on the parameter's resolved type, not on its spelling.
+static std::string_view objectOwnSignatureMemberOf(
+    const MethodSymbol* ms, const SemaContext& sema) {
+    if (!ms || ms->isOperator) return {};
+    if (ms->name == "GetHashCode" || ms->name == "ToString")
+        return ms->params.empty() ? ms->name : std::string_view{};
+    if (ms->name == "Equals" && ms->params.size() == 1) {
+        auto* param = dynamic_cast<ParameterSymbol*>(ms->params.front());
+        if (!param || !param->declType) return {};
+        const TypeRef* paramTy = sema.resolvedType(*param->declType);
+        if (paramTy && paramTy->kind == TypeRef::Kind::Primitive &&
+            paramTy->primitive == PrimitiveType::Object)
+            return ms->name;
+    }
+    return {};
+}
+
 void Resolver::checkEnumRestrictions() {
     if (!ctx_.module()) return;
     // fix #3601 (§10.4 / §10.5 / §11.6, v0.286): the two module-children-only
@@ -6896,9 +6919,10 @@ void Resolver::checkHidingAndOverride() {
         // fix #2984: a class whose ONLY base is a built-in exception has both
         // maps empty, so this early-out used to skip its derived-member loop
         // entirely — the reject below would never have been reached.
-        if (baseMembers.empty() && baseOperators.empty() &&
-            builtinExcBase.empty())
-            continue;
+        // fix #5669 (§12.2 / §8.1, v0.338): `Object` is every class's root
+        // and its three virtual members block a non-override declaration at
+        // their own signature, so an empty user-base set no longer means
+        // there is nothing to check: the loop below always runs.
         for (Symbol* m : t->members) {
             if (dynamic_cast<ConstructorSymbol*>(m) ||
                 dynamic_cast<DestructorSymbol*>(m)) {
@@ -6965,6 +6989,29 @@ void Resolver::checkHidingAndOverride() {
                 // Checked only after `baseMembers` misses, so a user ancestor
                 // that (illegally) declares the same name reports once, on that
                 // ancestor's own declaration, rather than twice down the chain.
+                //
+                // fix #5669 (§12.2 / §8.1, v0.338): `Object` is not in
+                // `baseMembers` (the frontier never holds it), so a plain
+                // `Equals(other: Object?)`, `GetHashCode()` or `ToString()`
+                // declared without `override` at Object's own signature was
+                // accepted. §12.2 blocks exactly that declaration: `override`
+                // reaches the slot and nothing else does. Any other signature
+                // of the three names stays admitted as an overload (§12.2,
+                // resolved by §22.6), and `override` is checked by its own path.
+                if (!hasMod(ms, "override")) {
+                    if (auto objName = objectOwnSignatureMemberOf(
+                            dynamic_cast<const MethodSymbol*>(ms), ctx_);
+                        !objName.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string("member `") + std::string(ms->name) +
+                            "` hides the inherited `Object." +
+                            std::string(objName) +
+                            "`; hiding is forbidden — use `override` for a "
+                            "virtual base member, or choose a different name "
+                            "(\xC2\xA7""12.2)");
+                    }
+                }
                 std::string_view excOwner;
                 if (!builtinExcBase.empty() &&
                     builtinExceptionSurfaceMemberOf(builtinExcBase, ms->name,
