@@ -6252,6 +6252,17 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
             // base-typed parameter by the ordinary argument rules (an
             // implicit reference conversion, §5.1).
             if (at->kind != TypeRef::Kind::Named) return Quality::Inapplicable;
+            // fix #5862 (§22.6 / §31.4, v0.338): a built-in exception class
+            // has no declaration, so the pointer tests below call every pair
+            // of them Exact. Grade it by name, exactly as `classifyArg` does
+            // for a call argument.
+            if (isBuiltinExceptionRef(pt)) {
+                switch (classifyArg(at, pt)) {
+                    case ArgMatch::Exact: return Quality::Exact;
+                    case ArgMatch::Convert: return Quality::Converting;
+                    case ArgMatch::NotApplicable: return Quality::Inapplicable;
+                }
+            }
             if (pt->declaration == at->declaration)
                 return sameNullability ? Quality::Exact : Quality::Converting;
             if (pt->declaration && at->declaration &&

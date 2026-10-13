@@ -297,3 +297,174 @@ BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(
         r, "no overload of `Log` is applicable"));
 }
+
+// ===========================================================================
+// Follow-up rows (review of 20a8779a).
+// ===========================================================================
+
+namespace {
+// `L(e: Exception)` beside `L(s: string)`, the shape of the review's s01-s10
+// probes: a built-in exception read through a §7.4-narrowed `Exception?`.
+std::string narrowProg(const std::string& body) {
+    return "module M; static class C "
+           "  private static method L(e: Exception): int => 1; "
+           "  private static method L(s: string): int => 2; "
+           "  private static method F(): Exception? => new Exception(\"z\"); "
+           "  private static method G(n: Exception?): int "
+           "    if n <> null then return L(n); end if; return 0; "
+           "  end G; "
+           "  public static method Main(): int " + body + " end Main; "
+           "end C;";
+}
+}  // namespace
+
+// §7.4 / §22.6: a flow-narrowed nullable local is read as non-null, so it
+// converts to the non-nullable `Exception` parameter. 20a8779a rejected this.
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           narrowed_nullable_local_if_spec_7_4_22_6) {
+    expectRuns(narrowProg("using var n := F(); "
+                          "if n <> null then Console.WriteLine(L(n)); end if; "
+                          "return 0;"),
+               "1\n");
+}
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           narrowed_nullable_local_early_return_spec_7_4_22_6) {
+    expectRuns(narrowProg("using var n := F(); "
+                          "if n = null then return 1; end if; "
+                          "Console.WriteLine(L(n)); return 0;"),
+               "1\n");
+}
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           narrowed_nullable_local_and_condition_spec_7_4_22_6) {
+    expectRuns(narrowProg("using var n := F(); "
+                          "if n <> null and L(n) = 1 then "
+                          "  Console.WriteLine(7); end if; return 0;"),
+               "7\n");
+}
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           narrowed_nullable_parameter_spec_7_4_22_6) {
+    expectRuns(narrowProg("using var e := new Exception(\"x\"); "
+                          "Console.WriteLine(G(e)); return 0;"),
+               "1\n");
+}
+// Control: an UN-narrowed nullable local is still not applicable (§7).
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           unnarrowed_nullable_local_still_rejected_spec_7_22_6) {
+    auto r = runAot(narrowProg("var n := F(); Console.WriteLine(L(n)); "
+                               "return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "no overload of `L` is applicable"));
+}
+
+// §22.6 / §11.3: operator overloads differing only in the built-in exception
+// class are declarable AND usable -- the operator resolver grades by name too.
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           operator_overloads_pick_by_exception_class_spec_22_6) {
+    expectRuns(
+        "module M; record V(N: int) "
+        "  public static pure method operator +(a: V, e: Exception): V => "
+        "    new V(a.N + 1); "
+        "  public static pure method operator +(a: V, e: ArgumentException): V"
+        "    => new V(a.N + 2); "
+        "end V; "
+        "class P public static method Main(): int "
+        "  using var a := new ArgumentException(\"x\"); "
+        "  using var b := new Exception(\"x\"); "
+        "  var v := new V(0); "
+        "  Console.WriteLine((v + a).N); Console.WriteLine((v + b).N); "
+        "  return 0; "
+        "end Main; end P;",
+        "2\n1\n");
+}
+
+// -- Behavior flips pinned (all §22.6, v0.338).
+
+// a19, defaulted-arity tie-break: `L(a)` is exact on `L(ArgumentException)`
+// with no default filled, so it beats `L(Exception, n := 5)` (was 105).
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           default_param_overload_prefers_exact_no_default_spec_22_6) {
+    expectRuns(
+        "module M; static class C "
+        "  private static method L(e: Exception, n: int := 5): int => n + 100; "
+        "  private static method L(e: ArgumentException): int => 2; "
+        "  public static method Main(): int "
+        "    using var a := new ArgumentException(\"x\"); "
+        "    using var b := new Exception(\"x\"); "
+        "    Console.WriteLine(L(a)); Console.WriteLine(L(b)); "
+        "    Console.WriteLine(L(a, 7)); return 0; "
+        "  end Main; end C;",
+        "2\n105\n107\n");
+}
+
+// n09, constructors with a default: `new K(b)` for an Exception reaches the
+// Exception constructor (was the first-declared-by-luck 22).
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           constructor_default_param_exception_arg_spec_22_6) {
+    expectRuns(
+        "module M; class K "
+        "  public R: int; "
+        "  public constructor(e: Exception, n: int := 1) R := 100 + n; "
+        "  end constructor; "
+        "  public constructor(e: ArgumentException) R := 22; end constructor; "
+        "end K; "
+        "class P public static method Main(): int "
+        "  using var a := new ArgumentException(\"x\"); "
+        "  using var b := new Exception(\"x\"); "
+        "  using var k1 := new K(a); using var k2 := new K(b); "
+        "  Console.WriteLine(k1.R); Console.WriteLine(k2.R); return 0; "
+        "end Main; end P;",
+        "22\n101\n");
+}
+
+// a10b: `L(Exception?)` beside `L(ArgumentException)` called with an
+// `Exception` -- only the nullable overload applies (was 2, the first).
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           exception_arg_selects_nullable_overload_when_derived_inapplicable) {
+    expectRuns(
+        "module M; static class C "
+        "  private static method L(e: Exception?): int => 1; "
+        "  private static method L(e: ArgumentException): int => 2; "
+        "  public static method Main(): int "
+        "    using var a := new ArgumentException(\"x\"); "
+        "    using var b := new Exception(\"x\"); "
+        "    Console.WriteLine(L(a)); Console.WriteLine(L(b)); return 0; "
+        "  end Main; end C;",
+        "2\n1\n");
+}
+
+// k01, §22.6 L4564 (`Animal`/`Object`-on-`Dog` is ambiguous) and §12 L679:
+// a user subclass of MyEx converts to BOTH `MyEx` and `Exception`, so neither
+// candidate is exact -- ambiguous (was the MyEx overload by accident).
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           user_subclass_arg_two_conversions_ambiguous_spec_22_6) {
+    auto r = runAot(
+        "module M; "
+        "class MyEx: Exception public constructor() base(\"m\"); "
+        "  end constructor; end MyEx; "
+        "class A1: MyEx public constructor() base(); end constructor; end A1; "
+        "static class C "
+        "  private static method L(e: Exception): int => 1; "
+        "  private static method L(e: MyEx): int => 3; "
+        "  public static method Main(): int "
+        "    using var a := new A1(); Console.WriteLine(L(a)); return 0; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "ambiguous call to `L`"));
+}
+
+// a06: each candidate is exact at a different position (`ArgumentException`
+// at 1, `int` at 2) -- ambiguous per §22.6 (was the first-declared pick).
+BEZEL_TEST(sema_overload_builtin_class_distinct_5862,
+           two_params_exact_on_different_positions_ambiguous_spec_22_6) {
+    auto r = runAot(
+        "module M; static class C "
+        "  private static method L(e: Exception, n: int): int => 1; "
+        "  private static method L(e: ArgumentException, n: long): int => 2; "
+        "  public static method Main(): int "
+        "    using var a := new ArgumentException(\"x\"); "
+        "    Console.WriteLine(L(a, 1)); return 0; "
+        "  end Main; end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "ambiguous call to `L`"));
+}

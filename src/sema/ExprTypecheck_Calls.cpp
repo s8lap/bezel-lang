@@ -1122,8 +1122,11 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     // position is one `classifyArg` can grade (a primitive, a resolved
     // non-generic named type, or a built-in exception class). A candidate
     // naming some other declaration-less type there (a built-in interface, a
-    // generic instantiation) keeps the pre-existing Undecidable fallback, so no
-    // call that resolved before this change is newly judged inapplicable.
+    // generic instantiation) keeps the pre-existing Undecidable fallback. A
+    // call whose candidates are all gradable is ranked by name here (ambiguity
+    // per §22.6, never a silent first-declared pick), which can reject a call
+    // that previously compiled by picking the first-declared overload; the
+    // flips are listed in the #5862 commit bodies.
     for (std::size_t i = 0; i < nArg; ++i) {
         if (!isBuiltinExceptionRef(argTypes[i])) continue;
         for (const auto& pts : paramTypes) {
@@ -1205,6 +1208,19 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                     argExprs[i],
                     const_cast<TypeRef*>(argTypes[i]),
                     const_cast<TypeRef*>(paramTypes[c][i]));
+            }
+            // fix #5862 (§7.4 / §22.6, v0.338): grade a built-in exception
+            // argument at the type it is READ at. `classifyArg` sees only the
+            // declared type, which would call a §7.4-narrowed `Exception?`
+            // local nullable and reject it against `Exception`. The ONE
+            // narrowed-read predicate is `isNarrowedNonNullRead`.
+            if (argTy && argTy->nullable && isBuiltinExceptionRef(argTy) &&
+                i < argExprs.size() && argExprs[i] &&
+                isNarrowedNonNullRead(argExprs[i])) {
+                TypeRef* nn = ctx_.makeTypeRef();
+                *nn = *argTy;
+                nn->nullable = false;
+                argTy = nn;
             }
             ArgMatch m = classifyArg(argTy, paramTypes[c][i]);
             grid[c][i] = m;
