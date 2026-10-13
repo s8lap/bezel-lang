@@ -107,7 +107,7 @@ BEZEL_TEST(owned_bare_t_primitive_func_unit_erasure_1857,
         "end Factory; "
         "class P "
         "  public static method Main(): int "
-        "    using var f := new Factory<() -> int>(); "
+        "    using var f := new Factory<(() -> int)?>(); "
         "    var n := f.Make(); "
         "    return 0; "
         "  end Main; "
@@ -220,13 +220,12 @@ BEZEL_TEST(owned_bare_t_primitive_func_unit_erasure_1857,
         "end Factory; "
         "class P "
         "  public static method Main(): int "
-        "    using var f := new Factory<() -> int>(); "
+        "    using var f := new Factory<(() -> int)?>(); "
         "    var n := f.Make(); "
         "    Console.WriteLine(\"done\"); "
         "    return 0; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     const std::size_t done = r.stdoutText.find("done");

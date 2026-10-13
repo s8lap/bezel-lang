@@ -1182,6 +1182,10 @@ private:
                                    // ast::ExtensionDecl
         std::string param;        // the type-parameter name
         SourceLocation loc;       // the `default(T)` site (for the note)
+        // #5820 (§17.11 v0.338): true for an UNCONSTRAINED `T` (no `where`
+        // item of any kind names it); the join then judges the substitution
+        // by defaultIllFormed alone, with the unconstrained wording.
+        bool unconstrained = false;
     };
     struct GenericInstantiationSite {
         const void* owner;        // fix #3719: the ast::MethodDecl being
@@ -1203,7 +1207,8 @@ private:
     // `owner` (the method when `param` is method-level, else the enclosing
     // type).
     void recordDefaultTypeParamUse(const void* owner, std::string_view param,
-                                   SourceLocation loc);
+                                   SourceLocation loc,
+                                   bool unconstrained = false);
     // Record one type-argument binding of a generic instantiation — a
     // generic METHOD's own call site (ExprTypecheck_Calls.cpp), or, since
     // fix #3719, a generic CLASS/RECORD construction or the extension(s)

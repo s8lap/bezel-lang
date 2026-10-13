@@ -287,11 +287,13 @@ void ExprTC::run(const ast::SourceFile& src) {
 // ExprTypecheck_impl.hpp.
 void ExprTC::recordDefaultTypeParamUse(const void* owner,
                                        std::string_view param,
-                                       SourceLocation loc) {
+                                       SourceLocation loc,
+                                       bool unconstrained) {
     if (!owner || param.empty()) return;
     for (const auto& u : defaultTypeParamUses_)
         if (u.owner == owner && u.param == param) return;  // one is enough
-    defaultTypeParamUses_.push_back({owner, std::string(param), loc});
+    defaultTypeParamUses_.push_back(
+        {owner, std::string(param), loc, unconstrained});
 }
 
 // fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
@@ -398,10 +400,12 @@ void ExprTC::checkDeferredDefaultInstantiations() {
     };
     for (const auto& site : genericInstantiationSites_) {
         bool bodyTakesDefault = false;
+        bool useUnconstrained = false;
         SourceLocation useLoc{};
         for (const auto& u : defaultTypeParamUses_) {
             if (u.owner != site.owner || u.param != site.param) continue;
             bodyTakesDefault = true;
+            useUnconstrained = u.unconstrained;
             useLoc = u.loc;
             break;
         }
@@ -413,6 +417,19 @@ void ExprTC::checkDeferredDefaultInstantiations() {
         // cannot be judged here — its own instantiation sites will be.
         if (a->kind == TypeRef::Kind::Named && !a->declaration) continue;
         if (!defaultIllFormed(a)) continue;
+        // #5820 (§17.11 v0.338, generic-body list bullet 1): an unconstrained
+        // `default(T)` is rejected at every non-defaultable substitution; the
+        // `value` wording below would misstate that obligation.
+        if (useUnconstrained) {
+            ctx_.diagnostics().report(
+                Severity::Error, site.loc,
+                "type argument `" + site.argName +
+                "` is not defaultable (§17.11): the generic body takes "
+                "`default(" + site.param + ")` (line " +
+                std::to_string(useLoc.line) + "), which has no well-defined "
+                "zero value for this substitution, but " + structuralReason(a));
+            continue;
+        }
         ctx_.diagnostics().report(
             Severity::Error, site.loc,
             "type argument `" + site.argName +

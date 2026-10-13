@@ -5896,6 +5896,17 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                         return false;
                     };
+                    // #5820: the enclosing class/extension AST nodes, read once
+                    // here for both the value gate below and the unconstrained
+                    // gate at the end of this arm.
+                    const ast::TypeDecl* classDecl = nullptr;
+                    if (currentType_ && currentType_->decl)
+                        classDecl = dynamic_cast<const ast::TypeDecl*>(
+                            currentType_->decl);
+                    const ast::ExtensionDecl* extDecl = nullptr;
+                    if (currentExtension_ && currentExtension_->decl)
+                        extDecl = dynamic_cast<const ast::ExtensionDecl*>(
+                            currentExtension_->decl);
                     if (isMethodParam) {
                         if (paramHasValueConstraint(
                                 currentMethodDecl_->genericConstraints))
@@ -5934,11 +5945,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // obligations against two different owners — both
                         // SHOULD be recorded, each to be discharged against
                         // its own instantiation sites.
-                        if (currentType_ && currentType_->decl)
-                            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                                    currentType_->decl))
-                                if (paramHasValueConstraint(
-                                        td->genericConstraints))
+                        if (classDecl)
+                            if (paramHasValueConstraint(
+                                    classDecl->genericConstraints))
                                     recordDefaultTypeParamUse(
                                         currentType_->decl, paramName,
                                         de->span.begin);
@@ -5958,13 +5967,58 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // closing rule). `currentExtension_->decl` (the
                         // ExtensionDecl AST node) is the owner key, mirroring
                         // `currentType_->decl` above.
-                        if (currentExtension_ && currentExtension_->decl)
-                            if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
-                                    currentExtension_->decl))
-                                if (paramHasValueConstraint(ed->genericConstraints))
+                        if (extDecl)
+                            if (paramHasValueConstraint(extDecl->genericConstraints))
                                     recordDefaultTypeParamUse(
                                         currentExtension_->decl, paramName,
                                         de->span.begin);
+                    }
+                    // #5820 (§17.11 v0.338, generic-body list bullet 1, and
+                    // §3.6 rule 2): an UNCONSTRAINED `T` — no `where` item of
+                    // any kind names it in the method, class or extension
+                    // scope — is rejected at every non-defaultable
+                    // substitution, so the same deferred obligation is
+                    // recorded for it (flagged `unconstrained` for the
+                    // wording). A `where` item of any kind, value included,
+                    // keeps the existing gates above and does not reach here.
+                    {
+                        auto namedByAnyConstraint =
+                            [&](const std::vector<ast::GenericConstraint>& gcs) {
+                                for (const auto& gc : gcs)
+                                    if (gc.typeParam == paramName) return true;
+                                return false;
+                            };
+                        bool constrained = false;
+                        if (currentMethodDecl_)
+                            constrained |= namedByAnyConstraint(
+                                currentMethodDecl_->genericConstraints);
+                        if (classDecl)
+                            constrained |= namedByAnyConstraint(
+                                classDecl->genericConstraints);
+                        if (extDecl)
+                            constrained |= namedByAnyConstraint(
+                                extDecl->genericConstraints);
+                        if (!constrained) {
+                            if (isMethodParam) {
+                                recordDefaultTypeParamUse(
+                                    currentMethodDecl_, paramName,
+                                    de->span.begin, /*unconstrained=*/true);
+                            } else if (classDecl &&
+                                       std::any_of(
+                                           classDecl->genericParams.begin(),
+                                           classDecl->genericParams.end(),
+                                           [&](const ast::GenericParam& gp) {
+                                               return gp.name == paramName;
+                                           })) {
+                                recordDefaultTypeParamUse(
+                                    classDecl, paramName, de->span.begin,
+                                    /*unconstrained=*/true);
+                            } else if (extDecl) {
+                                recordDefaultTypeParamUse(
+                                    extDecl, paramName, de->span.begin,
+                                    /*unconstrained=*/true);
+                            }
+                        }
                     }
                 }
             }

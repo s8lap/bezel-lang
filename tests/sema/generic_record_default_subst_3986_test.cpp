@@ -455,3 +455,106 @@ BEZEL_TEST(generic_record_default_subst_3986, generic_class_control_rejected) {
            "type"));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "\xC2\xA7""17.11"));
 }
+
+// ── #5820 (§17.11 v0.338, generic-body list bullet 1; §3.6 rule 2): an
+// UNCONSTRAINED `default(T)` is rejected at every non-defaultable substitution,
+// reference types included. Spec text, docs/Bezel_Language_Spec.md v0.338:
+//   "For unconstrained `T`, `default(T)` is permitted and has type `T`: the
+//    rule below rejects at the instantiation site every substitution that is
+//    not **defaultable** — a non-nullable reference type (a class, an
+//    interface, `Object`, `string`, a function type, a task type), a choice,
+//    an enum with no zero-valued constant, a constructor-only record, a record
+//    or inline array with a non-defaultable component …"
+
+namespace {
+
+void expectUnconstrainedDefaultRejected(const std::string& program) {
+    auto r = runAot(program);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "is not defaultable (\xC2\xA7""17.11)"));
+}
+
+}  // namespace
+
+// Method-level unconstrained T, instantiated at `string` (the issue's repro).
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_string_substitution_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module U5820a; "
+        "static class Util5820a "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    return 7; "
+        "  end Z; "
+        "end Util5820a; "
+        "class P5820a "
+        "  public static method Main(): int "
+        "    return Util5820a.Z<string>(); "
+        "  end Main; "
+        "end P5820a;");
+}
+
+// Same shape at a class substitution: a non-nullable class is non-defaultable.
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_class_substitution_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module U5820b; "
+        "class Widget5820b "
+        "  public Count: int; "
+        "  public constructor(c: int) Count := c; end constructor; "
+        "end Widget5820b; "
+        "static class Util5820b "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    return 7; "
+        "  end Z; "
+        "end Util5820b; "
+        "class P5820b "
+        "  public static method Main(): int "
+        "    return Util5820b.Z<Widget5820b>(); "
+        "  end Main; "
+        "end P5820b;");
+}
+
+// Admitted substitution: a nullable reference type is defaultable (null).
+// Must RUN (§17.11: `null` exactly at a nullable substitution).
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_nullable_string_substitution_runs_spec_17_11) {
+    auto r = runAot(
+        "module U5820c; "
+        "static class Util5820c "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    if t = null then return 5; end if; "
+        "    return 6; "
+        "  end Z; "
+        "end Util5820c; "
+        "class P5820c "
+        "  public static method Main(): int "
+        "    return Util5820c.Z<string?>(); "
+        "  end Main; "
+        "end P5820c;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+// Admitted substitution: a value type (`int`) — the zero value, not null.
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_int_substitution_runs_zero_spec_17_11) {
+    auto r = runAot(
+        "module U5820d; "
+        "static class Util5820d "
+        "  public static method Z<T>(): owned T "
+        "    return default(T); "
+        "  end Z; "
+        "end Util5820d; "
+        "class P5820d "
+        "  public static method Main(): int "
+        "    return Util5820d.Z<int>() + 7; "
+        "  end Main; "
+        "end P5820d;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}

@@ -258,8 +258,8 @@ const char* kLib3161 =
     "public interface INoPin3161<T> end INoPin3161; "
     "public class C3161<T> : INoPin3161<T> end C3161; "
     "public interface IHasGet3161<T> method Get(): T; end IHasGet3161; "
-    "public class D3161<T> : IHasGet3161<T> "
-    "  public method Get(): T => default(T); "
+    "public abstract class D3161<T> : IHasGet3161<T> "
+    "  public abstract method Get(): T; "
     "end D3161;";
 
 // T1 — the IMPORTED, no-pin case.
