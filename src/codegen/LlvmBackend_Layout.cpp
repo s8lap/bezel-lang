@@ -254,16 +254,55 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
     // admitted here: the measured defect is the class chain, and widening to
     // interfaces would newly SELECT operators for shapes nothing has measured.)
     auto paramMatches = [&](sema::Symbol* paramSym,
-                            const sema::TypeRef* operandTy) -> bool {
+                            const sema::TypeRef* operandTy,
+                            bool exactOnly) -> bool {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(paramSym);
         if (!ps) return false;
         sema::TypeRef* pt = ps->declType ? ctx_.resolvedType(*ps->declType)
                                          : ps->resolvedDeclType;
         if (!pt || !operandTy) return false;
         if (pt->kind == sema::TypeRef::Kind::Named) {
-            if (operandTy->kind != sema::TypeRef::Kind::Named ||
-                !pt->declaration || !operandTy->declaration)
+            if (operandTy->kind != sema::TypeRef::Kind::Named) return false;
+            // fix #6004 (§31.4 / §25.2, v0.338): a BUILT-IN exception type
+            // (`Exception`, `ArgumentException`, …) has no TypeSymbol, so the
+            // declaration test below can never match it — `v += d` with
+            // `operator +(V, Exception)` found no overload here and fell into
+            // emitCompoundOp's integer tail, which IR-verifier-aborted on the
+            // record. Match by NAME, walking the operand's built-in base chain
+            // (`ArgumentException` -> `Exception`): §25.2's "a derived-typed
+            // operand satisfies a base-typed parameter", the same rule the
+            // class chain below applies. The explicit `v := v + d` never
+            // reached this search (lowerBinary reads sema's recorded operator).
+            // fix #6004 (narrow, v0.338 §22.6 exact-beats-convert): `exactOnly`
+            // admits only the operand's OWN type; the base-chain walk below is
+            // the second pass, run only when no exact overload exists.
+            if (!pt->declaration && !operandTy->declaration) {
+                if (!isBuiltinExceptionTypeRef(pt) ||
+                    !isBuiltinExceptionTypeRef(operandTy))
+                    return false;
+                // fix #6004 (narrow, v0.338 §22.6): nullability is part of the
+                // match. The exact pass needs `T?`/`T` to agree; the base pass
+                // also takes a `T?` parameter for a non-null operand as a
+                // CONVERT candidate (nullable-widening), never the reverse.
+                const bool nullMatch = pt->nullable == operandTy->nullable;
+                const bool nullConvert =
+                    !exactOnly && pt->nullable && !operandTy->nullable;
+                if (!nullMatch && !nullConvert) return false;
+                const std::string want(pt->astNode->name->parts.back());
+                std::string cur(operandTy->astNode->name->parts.back());
+                for (std::size_t guard = 0; !cur.empty() && guard < 64; ++guard) {
+                    if (cur == want) return true;
+                    if (exactOnly) return false;
+                    std::string next;
+                    for (const auto& [child, parent] : builtinExceptionHierarchy())
+                        if (cur == child) { next = parent; break; }
+                    cur = std::move(next);
+                }
                 return false;
+            }
+            if (!pt->declaration || !operandTy->declaration)
+                return false;
+            if (exactOnly) return pt->declaration == operandTy->declaration;
             std::unordered_set<const sema::TypeSymbol*> seen;
             for (const sema::TypeSymbol* t = operandTy->declaration;
                  t && seen.insert(t).second; t = classBaseOf(t))
@@ -316,7 +355,9 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
     // contributes no duplicate candidates" — so the FIRST match up the chain is
     // THE match and there is no ambiguity to resolve. The visited set guards a
     // malformed cyclic chain.
-    auto findOnType = [&](const sema::TypeSymbol* ts) -> sema::MethodSymbol* {
+    // Every candidate on the chain of `ts`, in declaration order.
+    auto hitsOnType = [&](const sema::TypeSymbol* ts, bool exactOnly) {
+        std::vector<sema::MethodSymbol*> hits;
         std::unordered_set<const sema::TypeSymbol*> seen;
         for (const sema::TypeSymbol* t = ts; t && seen.insert(t).second;
              t = classBaseOf(t)) {
@@ -324,12 +365,12 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
                 if (ms && ms->isOperator && ms->operatorToken == binOp &&
                     ms->params.size() == 2 &&
-                    paramMatches(ms->params[0], leftTy) &&
-                    paramMatches(ms->params[1], rightTy))
-                    return ms;
+                    paramMatches(ms->params[0], leftTy, exactOnly) &&
+                    paramMatches(ms->params[1], rightTy, exactOnly))
+                    hits.push_back(ms);
             }
         }
-        return nullptr;
+        return hits;
     };
     // fix #5205 (§22.6/§25.2, v0.313): sema ranked the overloads (exact beats
     // convert, ties rejected) and recorded the winner; honour it when it is an
@@ -338,15 +379,45 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
     // instantiations re-resolve) fall back to the search below.
     if (auto* rm = dynamic_cast<const sema::MethodSymbol*>(recorded))
         if (rm->isOperator && rm->operatorToken == binOp &&
-            rm->params.size() == 2 && paramMatches(rm->params[0], leftTy) &&
-            paramMatches(rm->params[1], rightTy))
+            rm->params.size() == 2 &&
+            paramMatches(rm->params[0], leftTy, /*exactOnly=*/false) &&
+            paramMatches(rm->params[1], rightTy, /*exactOnly=*/false))
             return const_cast<sema::MethodSymbol*>(rm);
-    if (leftTy && leftTy->kind == sema::TypeRef::Kind::Named &&
-        leftTy->declaration)
-        if (sema::MethodSymbol* m = findOnType(leftTy->declaration)) return m;
-    if (rightTy && rightTy->kind == sema::TypeRef::Kind::Named &&
-        rightTy->declaration)
-        return findOnType(rightTy->declaration);
+    // fix #6004 (§22.6 exact-beats-convert, §25.2): a derived-typed operand
+    // matches a base-typed parameter only when no overload takes the operand's
+    // OWN type. Pass 1 admits exact matches only (on both operand types);
+    // pass 2 admits the base-chain matches. Without the split, the first
+    // declared base-typed overload won: `operator +(V, Exception)` declared
+    // before `operator +(V, ArgumentException)` took an ArgumentException
+    // operand, where sema's exact overload is the answer.
+    const sema::TypeSymbol* lDecl =
+        (leftTy && leftTy->kind == sema::TypeRef::Kind::Named)
+            ? leftTy->declaration : nullptr;
+    const sema::TypeSymbol* rDecl =
+        (rightTy && rightTy->kind == sema::TypeRef::Kind::Named)
+            ? rightTy->declaration : nullptr;
+    //
+    // fix #6004 (narrow): two base-chain candidates for a BUILT-IN exception
+    // operand are ambiguous (`v := v + e` on the same overloads is sema-rejected
+    // as ambiguous, §22.6), and the compound path has no sema check for such an
+    // operand. Declining here (no overload) keeps the compile from picking by
+    // declaration order; the caller then fails the same way the base did.
+    // Two hits for a built-in operand are ambiguous in EITHER pass: sema's
+    // compound path skips built-in parameters (the #5205 check), so codegen
+    // must not pick one by declaration order. (Nullability-only overloads land
+    // here: an exact pass sees both.)
+    const bool builtinOperand =
+        (leftTy && isBuiltinExceptionTypeRef(leftTy)) ||
+        (rightTy && isBuiltinExceptionTypeRef(rightTy));
+    for (const bool exactOnly : {true, false}) {
+        for (const sema::TypeSymbol* d : {lDecl, rDecl}) {
+            if (!d) continue;
+            auto hits = hitsOnType(d, exactOnly);
+            if (hits.empty()) continue;
+            if (hits.size() > 1 && builtinOperand) return nullptr;
+            return hits.front();
+        }
+    }
     return nullptr;
 }
 
