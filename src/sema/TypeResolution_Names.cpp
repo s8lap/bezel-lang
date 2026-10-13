@@ -3176,6 +3176,46 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             }
         }
     }
+    // fix #6040 (§2.3, v0.338 L161; §2.7 rule 2): a built-in name reached by its
+    // HOME module's qualified name (`System.Exception`, `System.Text.StringBuilder`)
+    // resolves to the bare built-in when that module is in scope: either an
+    // auto-imported module (§2.3's "Auto-imported module" rows, needs no import),
+    // or a module this file imports (`import System.Threading;` then
+    // `System.Threading.CancellationToken`, §2.3 "`System.Threading.Task` under
+    // `import System.Threading;`"). Any other qualifier keeps falling through to
+    // the unresolved-name diagnostic: a wrong name (`Foo.Exception`), a module the
+    // file does not import (`System.Threading.CancellationToken` with no import),
+    // and a user declaration named `System` (lookupName, §2.7 rule 1).
+    if (t.name->parts.size() >= 2 && !t.aliasQualifiedBuiltin &&
+        importAliases_.find(std::string(first)) == importAliases_.end() &&
+        !lookupName(first, scope)) {
+        bool isGenericMarker = false;
+        for (Scope* s = scope; s; s = s->parent)
+            if (s->names.count(first)) { isGenericMarker = true; break; }
+        std::string prefix;
+        for (std::size_t k = 0; k + 1 < t.name->parts.size(); ++k) {
+            if (k > 0) prefix += '.';
+            prefix += std::string(t.name->parts[k]);
+        }
+        const std::string_view last = t.name->parts.back();
+        // §2.3 auto-imported module rows: `System` (its always-available rows),
+        // `System.Text`, `System.Collections.Generic`, `System.Collections.Linq`.
+        const bool autoImported =
+            (prefix == "System" || prefix == "System.Text" ||
+             prefix == "System.Collections.Generic" ||
+             prefix == "System.Collections.Linq") &&
+            isAlwaysAvailableBareName(last);
+        const bool explicitlyImported = sourceImports_.count(prefix) != 0 &&
+                                        isAlwaysAvailableBareName(last);
+        if (!isGenericMarker && (autoImported || explicitlyImported) &&
+            common::builtinTypeHomeModuleOf(last) == prefix) {
+            t.name->parts.erase(t.name->parts.begin(),
+                                t.name->parts.end() - 1);
+            first = t.name->parts.front();
+            // Same bookkeeping as #4698: the qualifier is gone from the AST.
+            const_cast<ast::Type&>(t).aliasQualifiedBuiltin = true;
+        }
+    }
     // fix #4698: an alias-qualified built-in names the built-in by qualifier;
     // a type parameter, module type or imported type of the same bare name
     // must not capture it (§2.2 "the import stays reachable by qualifier").
