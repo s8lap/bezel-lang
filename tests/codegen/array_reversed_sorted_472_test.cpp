@@ -41,7 +41,8 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
@@ -51,31 +52,29 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 namespace fs = std::filesystem;
 
-// Run the JIT pipeline; return the exit code, or -999 if the program did not
+// Run the AOT pipeline; return the exit code, or -999 if the program did not
 // run (compile error / JIT failure).
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
 
 // True iff sema rejected `src` with at least one error diagnostic.
 bool rejectedAtCompile(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return !r.ran && r.diagnostics.hasErrors();
 }
 
 // True iff at least one reported diagnostic message contains `needle`.
 bool diagContains(const std::string& src, const std::string& needle) {
-    auto r = runJit(src);
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(needle) != std::string::npos) return true;
-    return false;
+    auto r = runAot(src);
+    return bezel::test::diagnosticMessageContains(r, needle.c_str());
 }
 
 // ---- ASan leg (mirrors array_reverse_chain_466_test.cpp) -------------------
@@ -430,15 +429,19 @@ std::string boxMain1195(const std::string& body) {
 // primary-ctor `v` go through the explicit `public readonly property V: int := v;`
 // declared on the kBox1195 fixture (canonical §22.10 idiom, lines 2042-2057).
 // The sort intent (ascending by CompareTo) is preserved; the value-encoding
-// expected exit code (660) is unchanged.
+// expected value (660) is unchanged. 660 exceeds the 8-bit exit status, so it
+// is asserted on captured stdout (runAot stdoutText), not the exit code.
 BEZEL_TEST(array_reversed_sorted_472, sort_noarg_class_icomparable_inplace_1195) {
-    BEZEL_EXPECT_EQ(run(boxMain1195(
+    auto r = runAot(boxMain1195(
         "  using var b0 := new Box(30); using var b1 := new Box(10); "
         "  using var b2 := new Box(20); "
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  a.Sort(); "
-        "  return a.Get(0).V * 49 + a.Get(1).V * 7 + a.Get(2).V;")), 660);
+        "  Console.WriteLine(a.Get(0).V * 49 + a.Get(1).V * 7 + a.Get(2).V); "
+        "  return 0;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "660\n");
 }
 
 // §14.2 / #1195: Sort() orders in ascending order by CompareTo — largest last.
@@ -481,13 +484,16 @@ BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_original_un
 // §14.2 / #1195: Sorted() full order check — [Box(30),Box(10),Box(20)]
 // sorted → [Box(10),Box(20),Box(30)]: 10*49 + 20*7 + 30 = 660.
 BEZEL_TEST(array_reversed_sorted_472, sorted_noarg_class_icomparable_order_1195) {
-    BEZEL_EXPECT_EQ(run(boxMain1195(
+    auto r = runAot(boxMain1195(
         "  using var b0 := new Box(30); using var b1 := new Box(10); "
         "  using var b2 := new Box(20); "
         "  using var a := new Array<Box>(); "
         "  a.Add(b0); a.Add(b1); a.Add(b2); "
         "  using var s := a.Sorted(); "
-        "  return s.Get(0).V * 49 + s.Get(1).V * 7 + s.Get(2).V;")), 660);
+        "  Console.WriteLine(s.Get(0).V * 49 + s.Get(1).V * 7 + s.Get(2).V); "
+        "  return 0;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "660\n");
 }
 
 // §14.2 / #1195: Sorted() on non-IComparable class still emits a diagnostic.
