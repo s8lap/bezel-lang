@@ -7436,6 +7436,48 @@ void Resolver::checkAbstractImplementations() {
         }
         return typeRefEqual(a, b);
     };
+    // §11.2 (v0.338, #5985): the declaration-less positional shortcut applies
+    // to a pair of declaration-less Named refs. A bare method-level type
+    // parameter (no generic arguments) corresponds positionally to the
+    // candidate's bare type parameter, so only nullability is compared there.
+    // A generic built-in (`Array<V>`, `Dictionary<K, V>`) is NOT a bare
+    // parameter: its head spelling, nullability and generic arguments must
+    // all match under the substitution, and each argument pair is compared by
+    // this same rule (so `Array<U>` corresponds to `Array<T>` at the same
+    // position, while `Array<int>` and `Array<string>` never do).
+    // Function-typed arguments are not substituted by substTypeRef, so their
+    // pair keeps the pre-#5985 nullability-only comparison (the #5971 cells).
+    auto spellOf = [](const TypeRef* t) -> std::string_view {
+        if (t->astNode && t->astNode->name &&
+            !t->astNode->name->parts.empty())
+            return t->astNode->name->parts.back();
+        return t->importedName;
+    };
+    std::function<bool(const TypeRef*, const TypeRef*)> declLessNamedMatch =
+        [&](const TypeRef* a, const TypeRef* b) -> bool {
+        if (a->genericArgs.empty() && b->genericArgs.empty())
+            return a->nullable == b->nullable;
+        if (a->nullable != b->nullable) return false;
+        if (spellOf(a) != spellOf(b)) return false;
+        if (a->genericArgs.size() != b->genericArgs.size()) return false;
+        for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
+            const TypeRef* x = a->genericArgs[i];
+            const TypeRef* y = b->genericArgs[i];
+            if (!x || !y) return false;
+            if (x->kind == TypeRef::Kind::Function &&
+                y->kind == TypeRef::Kind::Function) {
+                if (x->nullable != y->nullable) return false;
+                continue;
+            }
+            if (x->kind == TypeRef::Kind::Named && y->kind == TypeRef::Kind::Named &&
+                !x->declaration && !y->declaration) {
+                if (!declLessNamedMatch(x, y)) return false;
+            } else if (!typesMatch(x, y)) {
+                return false;
+            }
+        }
+        return true;
+    };
     auto resolvedOf = [&](const ast::Type* node) -> TypeRef* {
         return node ? ctx_.resolvedType(*node) : nullptr;
     };
@@ -8146,7 +8188,9 @@ void Resolver::checkAbstractImplementations() {
                             ctSub->kind == TypeRef::Kind::Named) {
                             // Both are method-level type params: accept regardless of
                             // spelling (the renaming is intentional per §11.2).
-                            match = (itSub->nullable == ctSub->nullable);
+                            // Generic built-ins (`Array<V>`) compare their
+                            // arguments too (§11.2, v0.338, #5985).
+                            match = declLessNamedMatch(itSub, ctSub);
                         } else {
                             match = typesMatch(itSub, ctSub);
                             if (!match && itSub && ctSub &&
@@ -8647,7 +8691,7 @@ void Resolver::checkAbstractImplementations() {
                     if (!itSub->declaration && !ctSub->declaration &&
                         itSub->kind == TypeRef::Kind::Named &&
                         ctSub->kind == TypeRef::Kind::Named) {
-                        match = (itSub->nullable == ctSub->nullable);
+                        match = declLessNamedMatch(itSub, ctSub);
                     } else {
                         match = typesMatch(itSub, ctSub);
                         if (!match && itSub && ctSub &&
