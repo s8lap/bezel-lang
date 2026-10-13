@@ -978,6 +978,14 @@ struct MetaMember {
     // a `set(owned)` setter, which takes the value over.
     bool setterTakesOwned = false;
 
+    // fix #5868 (§23.4 / §1.6, v0.334): for an Indexer member, the optional
+    // identifier after the `end` keyword. Emitted only when non-empty, so a
+    // module whose indexers use no `end` label is byte-identical to before this
+    // fix. Needed because `checkIndexerEndLabel` reads `blockEndLabel` from the
+    // AST decl — null for an imported indexer — and would skip silently.
+    // With this field, the check runs for imported indexers too.
+    std::string blockEndLabel;
+
     // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
     // and named arguments" / §2.8.3 rule 4; spec v0.254) — the §22.10
     // primary-constructor parameter's DEFAULT-VALUE EXPRESSION TEXT, for a

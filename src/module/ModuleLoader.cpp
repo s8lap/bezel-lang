@@ -1404,6 +1404,11 @@ struct Loader {
                 // consults a single `ps->isAutoProperty` field regardless of
                 // `ps->isIndexer`.)
                 p->isAutoProperty = mm.isAutoProperty;
+                // fix #5868 (§23.4 / §1.6, v0.334): carry `blockEndLabel`
+                // from the wire so `checkIndexerEndLabel` can consult it
+                // without walking the AST decl — the AST decl is null for an
+                // imported indexer and the check would skip silently.
+                p->blockEndLabel = mm.blockEndLabel;
                 applyBehavior(p);
                 return p;
             }

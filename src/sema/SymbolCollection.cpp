@@ -291,6 +291,11 @@ Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
         if (pd->isIndexer) {
             sym->indexerParams =
                 collectParams(pd->indexerParams, ctx, scope);
+            // fix #5868 (§23.4 / §1.6, v0.334): carry `blockEndLabel` onto
+            // the symbol so `checkIndexerEndLabel` can consult it without
+            // walking the AST decl — the AST walk is null for an imported
+            // indexer and the check would skip silently.
+            sym->blockEndLabel = pd->blockEndLabel;
         }
         // fix #3618 (§22.15 "Purity attaches to the getter"): the
         // accessor-level `pure get` marker. Mirrors

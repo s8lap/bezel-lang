@@ -3865,6 +3865,10 @@ void Resolver::checkIndexerParamDefaults() {
 // §23.4 / §1.6 (v0.334): an indexer's `end` clause may not carry an identifier
 // label. An `end`-label that is supplied must match the construct it closes; an
 // indexer has no name to reference, so a supplied identifier is a mismatch.
+// Reads `PropertySymbol::blockEndLabel` (set on BOTH sides — SymbolCollection's
+// PropertyDecl arm fills it from `pd->blockEndLabel` for a local indexer,
+// and ModuleLoader's Indexer case fills it from `MetaMember::blockEndLabel`
+// for an imported one) so the check runs for both local and imported indexers.
 void Resolver::checkIndexerEndLabel() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
@@ -3873,13 +3877,9 @@ void Resolver::checkIndexerEndLabel() {
         for (Symbol* m : t->members) {
             auto* ps = dynamic_cast<PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
-        // SEAM-DEBT: #5868 `blockEndLabel` is carried ONLY by the AST decl —
-        // PropertySymbol has isIndexer/indexerParams but no blockEndLabel. So
-        // ps->decl is null for an IMPORTED symbol and the check skips silently.
-            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-            if (!pd || pd->blockEndLabel.empty()) continue;
+            if (ps->blockEndLabel.empty()) continue;
             ctx_.diagnostics().report(
-                Severity::Error, pd->span.begin,
+                Severity::Error, ps->declLoc,
                 "an indexer has no name to label `end` with — write `end;` "
                 "without an identifier (§23.4, §1.6)");
         }
@@ -3887,7 +3887,11 @@ void Resolver::checkIndexerEndLabel() {
 }
 
 // §23.5 (v0.334): `ref` and `out` parameters are not allowed in indexer
-// parameter lists.
+// parameter lists. Reads `ParameterSymbol::modifier` (set on BOTH sides —
+// SymbolCollection::collectParams for local, ModuleLoader::convertParams for
+// imported) so the check runs for both local and imported indexers. The
+// diagnostic uses `ps->declLoc` as the location since individual param
+// locations are not preserved on imported symbols.
 void Resolver::checkIndexerRefOutParams() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
@@ -3896,18 +3900,15 @@ void Resolver::checkIndexerRefOutParams() {
         for (Symbol* m : t->members) {
             auto* ps = dynamic_cast<PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
-        // SEAM-DEBT: #5868 the indexer parameter `ref`/`out` modifier is carried
-        // ONLY by the AST decl — ParamSymbol has no modifier field. Same silent
-        // skip for imported symbols; the local-only limit is not in the spec.
-            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-            if (!pd) continue;
-            for (const auto& p : pd->indexerParams) {
-                if (p.modifier == "ref" || p.modifier == "out" ||
-                    p.modifier == "out owned") {
+            for (auto* paramSym : ps->indexerParams) {
+                auto* p = dynamic_cast<ParameterSymbol*>(paramSym);
+                if (!p) continue;
+                if (p->modifier == "ref" || p->modifier == "out" ||
+                    p->modifier == "out owned") {
                     ctx_.diagnostics().report(
-                        Severity::Error, p.loc,
+                        Severity::Error, ps->declLoc,
                         "an indexer parameter may not be declared with `" +
-                        std::string(p.modifier) +
+                        std::string(p->modifier) +
                         "` — ref and out parameters are not allowed in "
                         "indexer parameter lists (§23.5)");
                 }

@@ -183,6 +183,16 @@ enum RecordCode : unsigned {
     // blob) reads as `false` = "participates in equality", which is exactly
     // what that dependency's own compiler produced.
     REC_EQ_CLAUSE = 17,
+    // fix #5868 (§23.4 / §1.6, v0.334): MEMBER_BLOCK — an Indexer member's
+    // `blockEndLabel` (the optional identifier after `end`). Emitted only when
+    // non-empty, so a module whose indexers use no `end` label is byte-identical
+    // to before this fix. A distinct code rather than a further trailing
+    // REC_STRING for the same reason REC_EQ_CLAUSE is coded: an indexer's
+    // `end` label is independent of any trailing string slot, and may be absent
+    // or present. Absent (an OLD artifact) reads as "" — the pre-fix behavior,
+    // which means the §23.4 check is skipped for imported indexers until
+    // recompiled.
+    REC_BLOCK_END_LABEL = 19,
     // §35.7 / §9.2 "The `equality skip` clause" (v0.307, additive within v7;
     // issue #4652, follow-up to fix #4643/#3152 family F9): CHOICE_PAYLOAD_BLOCK
     // — a choice payload field's `equality skip` clause as a single scalar
@@ -414,6 +424,9 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // #2884 commit message documents the silent wrong-value measurement
     // that would result if the importer cached a stale body).
     hashStr(h, m.propertyBodyText);
+    // fix #5868 (§23.4): the indexer's `end` label — part of the indexer's
+    // signature identity (an `end foo;` vs `end bar;` is a different indexer).
+    hashStr(h, m.blockEndLabel);
     // §11.3 (issue #502): hash nested type when present.
     hashBool(h, m.nestedType != nullptr);
     if (m.nestedType) hashTypeDecl(h, *m.nestedType);
@@ -688,6 +701,8 @@ MetaMember::MetaMember(const MetaMember& o)
       accessorIsPure(o.accessorIsPure),
       // fix #5209: same copy role as accessorIsPure.
       setterTakesOwned(o.setterTakesOwned),
+      // fix #5868 (§23.4): the indexer's `end` label.
+      blockEndLabel(o.blockEndLabel),
       contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
@@ -722,6 +737,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         // above.
         accessorIsPure = o.accessorIsPure;
         setterTakesOwned = o.setterTakesOwned;  // fix #5209
+        blockEndLabel = o.blockEndLabel;       // fix #5868
         contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
@@ -812,6 +828,9 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // mark dependents stale, since the importer monomorphizes
            // the body per instantiation).
            propertyBodyText == o.propertyBodyText &&
+           // fix #5868 (§23.4): the indexer's `end` label is part of the
+           // indexer's signature identity.
+           blockEndLabel == o.blockEndLabel &&
            nestedEq;
 }
 
@@ -1158,6 +1177,11 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
          m.kind == MetaMemberKind::Indexer) &&
         !m.propertyBodyText.empty())
         emitString(w, m.propertyBodyText);
+    // fix #5868 (§23.4 / §1.6, v0.334): for an Indexer member, the optional
+    // `end` label. Emitted only when non-empty, so a module whose indexers
+    // use no `end` label is byte-identical to before this fix.
+    if (m.kind == MetaMemberKind::Indexer && !m.blockEndLabel.empty())
+        emitStringAs(w, REC_BLOCK_END_LABEL, m.blockEndLabel);
     // fix #3140 (§9.8 / §10, schema v7 additive): for an EnumConstant member
     // carrying a `serialized "<name>"` rename, a second trailing REC_STRING
     // holds the wire name. Emitted ONLY when non-empty, exactly as
@@ -2265,6 +2289,19 @@ bool readMemberBody(Reader& r, MetaMember& m) {
                     m.fieldInitText.reserve(vals.size());
                     for (std::uint64_t v : vals)
                         m.fieldInitText.push_back(
+                            static_cast<char>(v & 0xFF));
+                }
+                // fix #5868 (§23.4 / §1.6, v0.334): the indexer's `end`
+                // label — coded rather than a trailing string slot for the
+                // same reason REC_AUTO_PROP_INIT is (self-describing, can
+                // appear anywhere in the trailing records). Absent on a
+                // pre-#5868 blob leaves `blockEndLabel` empty, which is the
+                // "no label" reading the §23.4 check treats as clean.
+                if (got.get() == REC_BLOCK_END_LABEL) {
+                    m.blockEndLabel.clear();
+                    m.blockEndLabel.reserve(vals.size());
+                    for (std::uint64_t v : vals)
+                        m.blockEndLabel.push_back(
                             static_cast<char>(v & 0xFF));
                 }
                 continue;

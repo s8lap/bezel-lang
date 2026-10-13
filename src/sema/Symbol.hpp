@@ -909,6 +909,14 @@ struct DestructorSymbol : MemberSymbol {};
 struct PropertySymbol : MemberSymbol {
     bool isIndexer = false;
     std::vector<Symbol*> indexerParams; // empty when !isIndexer
+    // fix #5868 (§23.4 / §1.6, v0.334): the optional identifier after the
+    // `end` keyword on an indexer block. Set on BOTH sides — SymbolCollection's
+    // PropertyDecl arm fills it from `pd->blockEndLabel` for a local indexer,
+    // and ModuleLoader's Indexer case fills it from `MetaMember::blockEndLabel`
+    // (the wire channel this fix adds). Consulted by `checkIndexerEndLabel`
+    // instead of walking the AST decl, so the check runs for imported indexers
+    // too. Empty string means `end;` with no label; non-empty means `end foo;`.
+    std::string blockEndLabel;
     // §22.15 "Where `pure` may appear" / "Purity attaches to the getter"
     // (#3618, v0.286): whether this property's GETTER ACCESSOR is declared
     // `pure get`. Set on BOTH sides — SymbolCollection's PropertyDecl arm

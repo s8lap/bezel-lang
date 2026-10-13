@@ -1648,6 +1648,11 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             if (prop->isIndexer) {
                 out.params = convertParams(prop->indexerParams, ctx);
                 fillParamDefaults(out.params, pd->indexerParams, &ctx);
+                // fix #5868 (§23.4 / §1.6, v0.334): carry `blockEndLabel`
+                // from the AST so `checkIndexerEndLabel` can consult it
+                // without walking the AST decl — the AST walk is null for an
+                // imported indexer and the check would skip silently.
+                out.blockEndLabel = pd->blockEndLabel;
             }
             // fix #2467 (§9.2/§2.5, v0.235): carry an instance AUTO-PROPERTY's
             // constant-foldable initializer (`property X: T := v;`) textually,
