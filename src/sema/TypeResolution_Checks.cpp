@@ -9187,8 +9187,17 @@ void Resolver::checkAbstractImplementations() {
                     if (imRetRef && crt &&
                         imRetRef->kind != TypeRef::Kind::Error &&
                         crt->kind != TypeRef::Kind::Error) {
-                        const TypeRef* irtSub = substTypeRef(imRetRef, obl.subst);
-                        const TypeRef* crtSub = substTypeRef(crt, implSubst);
+                        // #6092: a function type that is the WHOLE return is
+                        // substituted through its parameter and return types
+                        // (substTypeRef leaves a non-Named ref alone).
+                        const TypeRef* irtSub =
+                            imRetRef->kind == TypeRef::Kind::Function
+                                ? substGenericArg(imRetRef, obl.subst)
+                                : substTypeRef(imRetRef, obl.subst);
+                        const TypeRef* crtSub =
+                            crt->kind == TypeRef::Kind::Function
+                                ? substGenericArg(crt, implSubst)
+                                : substTypeRef(crt, implSubst);
                         // §11.2 (v0.338, #6013): the return type takes the same
                         // positional correspondence for a member's own type
                         // parameters as the parameter compare above:
@@ -9202,8 +9211,13 @@ void Resolver::checkAbstractImplementations() {
                         // #6062: a same-declaration user-generic return
                         // (`Box<T>`) compares its arguments by own-parameter
                         // position as well.
+                        // #6092: a bare function-typed return compares
+                        // structurally, own parameters by position.
                         const bool retMatch =
-                            (sameGenericDeclPair(irtSub, crtSub) ||
+                            (irtSub->kind == TypeRef::Kind::Function &&
+                             crtSub->kind == TypeRef::Kind::Function)
+                                ? declLessArgMatch(irtSub, crtSub, im, impl)
+                            : (sameGenericDeclPair(irtSub, crtSub) ||
                              (!irtSub->declaration && !crtSub->declaration &&
                               irtSub->kind == TypeRef::Kind::Named &&
                               crtSub->kind == TypeRef::Kind::Named))
