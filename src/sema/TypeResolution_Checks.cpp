@@ -7739,6 +7739,18 @@ void Resolver::checkAbstractImplementations() {
         }
         return true;
     };
+    // #6013: declLessNamedMatch compares a function-typed generic argument by
+    // nullability only, so a return pair that carries a function type anywhere
+    // in its generic-argument tree (`Array<(T) -> T>`) must not be routed
+    // through it. Such pairs keep the name-based typesMatch of the base compiler.
+    std::function<bool(const TypeRef*)> containsFunctionType =
+        [&](const TypeRef* t) -> bool {
+        if (!t) return false;
+        if (t->kind == TypeRef::Kind::Function) return true;
+        for (const TypeRef* g : t->genericArgs)
+            if (containsFunctionType(g)) return true;
+        return false;
+    };
     auto resolvedOf = [&](const ast::Type* node) -> TypeRef* {
         return node ? ctx_.resolvedType(*node) : nullptr;
     };
@@ -9018,7 +9030,27 @@ void Resolver::checkAbstractImplementations() {
                         crt->kind != TypeRef::Kind::Error) {
                         const TypeRef* irtSub = substTypeRef(imRetRef, obl.subst);
                         const TypeRef* crtSub = substTypeRef(crt, implSubst);
-                        if (!typesMatch(irtSub, crtSub)) {
+                        // §11.2 (v0.338, #6013): the return type takes the same
+                        // positional correspondence for a member's own type
+                        // parameters as the parameter compare above:
+                        // `P<T>(a: T): T` implemented as `P<X>(a: X): X` matches
+                        // at position 0 on both the parameter and the return.
+                        // Declaration-less Named pairs go through
+                        // declLessNamedMatch; everything else keeps typesMatch.
+                        // A pair with a function type anywhere in its generic
+                        // arguments also keeps typesMatch: declLessNamedMatch
+                        // compares a function-typed argument by nullability
+                        // only, which would accept `Array<(T) -> T>` against
+                        // `Array<(int) -> int>` (§11.2 L1849: "exactly equal").
+                        const bool retMatch =
+                            (!irtSub->declaration && !crtSub->declaration &&
+                             irtSub->kind == TypeRef::Kind::Named &&
+                             crtSub->kind == TypeRef::Kind::Named &&
+                             !containsFunctionType(irtSub) &&
+                             !containsFunctionType(crtSub))
+                                ? declLessNamedMatch(irtSub, crtSub, im, impl)
+                                : typesMatch(irtSub, crtSub);
+                        if (!retMatch) {
                             ctx_.diagnostics().report(
                                 Severity::Error, implLoc,
                                 std::string("method `") + std::string(name) +
