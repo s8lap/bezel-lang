@@ -4664,6 +4664,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             calleeSym = chosen;
         }
     }
+    // fix #5641 (§15.1 / §14.2): when calleeSym is null (TryPop, TryPeek, etc.
+    // on imported generic collections — the member is found by resolveMemberAccess
+    // but exprSymbol is not set on the callee MemberAccessExpr for these), the
+    // hasOutVar block inside the `if (ms)` block below is never entered, and
+    // the inline-array out-param check is silently bypassed. Detect the pattern
+    // here: an out var arg + a MemberAccessExpr callee whose receiver has an
+    // inline-array generic argument. Report inline array for the Try* family
+    // (which forms T? in the out param).
+    if (!calleeSym) {
+        bool hasOutVarArg = false;
+        for (const auto& a : ce.args)
+            if (a.modifier == "out var" && a.value) { hasOutVarArg = true; break; }
+        if (hasOutVarArg) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+                if (TypeRef* recvTy = ctx_.exprType(*ma->target)) {
+                    if (recvTy->kind == TypeRef::Kind::Named &&
+                        !recvTy->genericArgs.empty()) {
+                        for (TypeRef* ga : recvTy->genericArgs) {
+                            if (ga && ga->kind == TypeRef::Kind::InlineArray) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`" + std::string(ma->member) +
+                                    "()` with an inline-array type argument "
+                                    "is not admitted — the `out` parameter "
+                                    "type would be a nullable inline array, "
+                                    "which §15.1 does not admit (spec §15.1 "
+                                    "/ §14.2, v0.327; diagnostic: "
+                                    "`inline array`)");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
         // SEAM-ACCESSOR: the AST arm of this both-sources arity read (#4589
         // below) — ModuleLoader never assigns MethodSymbol::decl for an
@@ -4920,11 +4956,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // (SetIt<T> above has none). The static-interface `T.TryParse` shape
         // (#807) has an empty md->genericParams and is handled separately in
         // ExprTypecheck_Exprs.cpp, so it is untouched here.
-        if (md && !md->genericParams.empty()) {
-            bool hasOutVar = false;
-            for (const auto& a : ce.args)
-                if (a.modifier == "out var" && a.value) { hasOutVar = true; break; }
-            if (hasOutVar) {
+        //
+        // fix #5641 (§15.1 / §14.2): the gate was `!md->genericParams.empty()`,
+        // but `TryPop` on `Stack<T>` uses the class's type parameter `T` (not
+        // a method-level generic), so md->genericParams is empty and this block
+        // was skipped. Add a check for the receiver type's generic args.
+        bool hasOutVar = false;
+        for (const auto& a : ce.args)
+            if (a.modifier == "out var" && a.value) { hasOutVar = true; break; }
+        if (hasOutVar) {
+            // Helper: check if the receiver type has generic args that could
+            // provide type-parameter bindings for an out var.
+            auto receiverHasGenericArgs = [&](const ast::CallExpr& ce) -> bool {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+                    if (TypeRef* recvTy = ctx_.exprType(*ma->target)) {
+                        if (recvTy->kind == TypeRef::Kind::Named &&
+                            recvTy->declaration &&
+                            recvTy->declaration->kind == ast::TypeDeclKind::Class &&
+                            !recvTy->genericArgs.empty())
+                            return true;
+                    }
+                }
+                return false;
+            };
+            if (md && (!md->genericParams.empty() || receiverHasGenericArgs(ce))) {
                 // Build the method type-parameter substitution map: from
                 // explicit type args (`SetIt<int>`) when present, else infer it
                 // from the value arguments (`SetIt(88, …)` binds T=int).
@@ -4970,6 +5025,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         unifyArgSubst(md->params[pi].type.get(), argTy,
                                       paramNames, outSubst);
                     }
+                    // fix #5641 (§15.1 / §14.2): if outSubst is still empty
+                    // after inference from explicit args and non-out call args,
+                    // try to extract the substitution from the RECEIVER type's
+                    // generic arguments. For `s.TryPop(out var top)` where
+                    // `s: Stack<[3]int>`, `s` carries the class's instantiation
+                    // `T → [3]int`. Without this, outSubst stays empty (TryPop
+                    // has no non-out args), substituteReturnType is a no-op, and
+                    // the out var type is never checked against §15.1.
+                    if (outSubst.empty()) {
+                        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                                ce.callee.get())) {
+                            if (TypeRef* recvTy =
+                                    ctx_.exprType(*ma->target)) {
+                                if (recvTy->kind == TypeRef::Kind::Named &&
+                                    recvTy->declaration &&
+                                    !recvTy->genericArgs.empty()) {
+                                    TypeSymbol* recvTS = recvTy->declaration;
+                                    for (std::size_t i = 0;
+                                         i < recvTS->genericParams.size() &&
+                                         i < recvTy->genericArgs.size();
+                                         ++i) {
+                                        Symbol* gp = recvTS->genericParams[i];
+                                        TypeRef* ga = recvTy->genericArgs[i];
+                                        if (gp && ga)
+                                            outSubst[gp->name] = ga;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 if (!outSubst.empty()) {
                     // The method's own type-parameter names — a fully-resolved
@@ -4999,6 +5084,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     // substituteReturnType, so this neither
                                     // over-narrows (`T?`→`int?`) nor over-widens
                                     // (`T`→`int`).
+                                    // §15.1 / §14.2 (fix #5641): if the out parameter
+                                    // is `T?` and `T` was substituted by an inline
+                                    // array, the formed type `[N]T?` is not
+                                    // admitted. Report at the call site.
+                                    if (concrete && concrete->nullable &&
+                                        concrete->kind == TypeRef::Kind::InlineArray) {
+                                        ctx_.diagnostics().report(
+                                            Severity::Error, ce.span.begin,
+                                            "`" + std::string(ms->name) +
+                                            "()` with an inline-array type argument "
+                                            "is not admitted — the `out` parameter "
+                                            "type would be a nullable inline array, "
+                                            "which §15.1 does not admit (spec §15.1 "
+                                            "/ §14.2, v0.327; diagnostic: "
+                                            "`inline array`)");
+                                    }
                                     if (concrete && concrete != resolved &&
                                         !containsMethodTypeParam(concrete, gpNames))
                                         loc->declType = concrete;
@@ -8464,26 +8565,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                     // stdlib §5 *OrNull: return nullable T. Use a nullable copy
                     // of srcElem (set nullable flag on a fresh TypeRef copy).
+                    // §15.1 / §14.2 (fix #5641): reject if srcElem is an inline
+                    // array (the return type would be a nullable inline array).
                     if ((m == "FirstOrNull" || m == "LastOrNull" ||
                          m == "SingleOrNull") && ce.args.empty()) {
                         if (srcElem) {
-                            auto* nullTy = ctx_.makeTypeRef();
-                            *nullTy = *srcElem;
-                            nullTy->nullable = true;
-                            ctx_.setExprType(&ce, nullTy);
+                            if (srcElem->kind == TypeRef::Kind::InlineArray) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() is not admitted on a lazy sequence of an "
+                                    "inline array element type — the return type "
+                                    "would be a nullable inline array, which §15.1 "
+                                    "does not admit (spec §15.1 / §14.2, v0.327; "
+                                    "diagnostic: `inline array`)");
+                            } else {
+                                auto* nullTy = ctx_.makeTypeRef();
+                                *nullTy = *srcElem;
+                                nullTy->nullable = true;
+                                ctx_.setExprType(&ce, nullTy);
+                            }
                         }
                         return true;
                     }
                     // stdlib §5 (#650/#661/#789): FirstOrNull(pred) /
                     // LastOrNull(pred) / SingleOrNull(pred) on lazy receiver → T?.
+                    // §15.1 / §14.2 (fix #5641): same inline-array check.
                     if ((m == "FirstOrNull" || m == "LastOrNull" ||
                          m == "SingleOrNull") &&
                         ce.args.size() == 1) {
                         if (srcElem) {
-                            auto* nullTy = ctx_.makeTypeRef();
-                            *nullTy = *srcElem;
-                            nullTy->nullable = true;
-                            ctx_.setExprType(&ce, nullTy);
+                            if (srcElem->kind == TypeRef::Kind::InlineArray) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() is not admitted on a lazy sequence of an "
+                                    "inline array element type — the return type "
+                                    "would be a nullable inline array, which §15.1 "
+                                    "does not admit (spec §15.1 / §14.2, v0.327; "
+                                    "diagnostic: `inline array`)");
+                            } else {
+                                auto* nullTy = ctx_.makeTypeRef();
+                                *nullTy = *srcElem;
+                                nullTy->nullable = true;
+                                ctx_.setExprType(&ce, nullTy);
+                            }
                         }
                         return true;
                     }
@@ -10515,10 +10641,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                   m == "SingleOrNull") && ce.args.empty() &&
                                  !recvTy->genericArgs.empty() &&
                                  recvTy->genericArgs[0]) {
-                            auto* nullTy = ctx_.makeTypeRef();
-                            *nullTy = *recvTy->genericArgs[0];
-                            nullTy->nullable = true;
-                            ctx_.setExprType(&ce, nullTy);
+                            // §15.1 / §14.2 (fix #5641): a stdlib member whose
+                            // signature forms `T?` at a type argument substituted by
+                            // an inline array is a compile error at the use.
+                            if (recvTy->genericArgs[0]->kind == TypeRef::Kind::InlineArray) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() is not admitted on an `Array` of an "
+                                    "inline array — the return type would be a "
+                                    "nullable inline array, which §15.1 does not "
+                                    "admit (spec §15.1 / §14.2, v0.327; "
+                                    "diagnostic: `inline array`)");
+                            } else {
+                                auto* nullTy = ctx_.makeTypeRef();
+                                *nullTy = *recvTy->genericArgs[0];
+                                nullTy->nullable = true;
+                                ctx_.setExprType(&ce, nullTy);
+                            }
                         }
                         // fix #3784 (stdlib §5.1, v0.286): MinOrNull()/MaxOrNull()
                         // on a direct collection receiver return nullable T
@@ -10593,10 +10733,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  ce.args.size() == 1 &&
                                  !recvTy->genericArgs.empty() &&
                                  recvTy->genericArgs[0]) {
-                            auto* nullTy = ctx_.makeTypeRef();
-                            *nullTy = *recvTy->genericArgs[0];
-                            nullTy->nullable = true;
-                            ctx_.setExprType(&ce, nullTy);
+                            // §15.1 / §14.2 (fix #5641): same check as the
+                            // zero-arg form above.
+                            if (recvTy->genericArgs[0]->kind == TypeRef::Kind::InlineArray) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string(m) +
+                                    "() is not admitted on an `Array` of an "
+                                    "inline array — the return type would be a "
+                                    "nullable inline array, which §15.1 does not "
+                                    "admit (spec §15.1 / §14.2, v0.327; "
+                                    "diagnostic: `inline array`)");
+                            } else {
+                                auto* nullTy = ctx_.makeTypeRef();
+                                *nullTy = *recvTy->genericArgs[0];
+                                nullTy->nullable = true;
+                                ctx_.setExprType(&ce, nullTy);
+                            }
                         }
                         // stdlib §5 (#651): OfType<U>() — lazy IEnumerable<U>.
                         // U comes from the explicit type arg on the callee
