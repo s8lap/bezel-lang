@@ -7876,18 +7876,6 @@ void Resolver::checkAbstractImplementations() {
                 return false;
         return true;
     };
-    // #6013: declLessNamedMatch compares a function-typed generic argument by
-    // nullability only, so a return pair that carries a function type anywhere
-    // in its generic-argument tree (`Array<(T) -> T>`) must not be routed
-    // through it. Such pairs keep the name-based typesMatch of the base compiler.
-    std::function<bool(const TypeRef*)> containsFunctionType =
-        [&](const TypeRef* t) -> bool {
-        if (!t) return false;
-        if (t->kind == TypeRef::Kind::Function) return true;
-        for (const TypeRef* g : t->genericArgs)
-            if (containsFunctionType(g)) return true;
-        return false;
-    };
     // #6053 / §11.2 (v0.338): "parameter types must match exactly under the
     // substitution". A function-typed argument (`Array<(T)->T>`) is compared
     // structurally, as typeRefEqual's Function arm does (modifiers, the owned
@@ -9208,11 +9196,9 @@ void Resolver::checkAbstractImplementations() {
                         // at position 0 on both the parameter and the return.
                         // Declaration-less Named pairs go through
                         // declLessNamedMatch; everything else keeps typesMatch.
-                        // A pair with a function type anywhere in its generic
-                        // arguments also keeps typesMatch: declLessNamedMatch
-                        // compares a function-typed argument by nullability
-                        // only, which would accept `Array<(T) -> T>` against
-                        // `Array<(int) -> int>` (§11.2 L1849: "exactly equal").
+                        // A function-typed generic argument is compared
+                        // structurally by declLessArgMatch (#6053, #6076), so
+                        // `Array<(T) -> U>` against `Array<(B) -> A>` rejects.
                         // #6062: a same-declaration user-generic return
                         // (`Box<T>`) compares its arguments by own-parameter
                         // position as well.
@@ -9220,9 +9206,7 @@ void Resolver::checkAbstractImplementations() {
                             (sameGenericDeclPair(irtSub, crtSub) ||
                              (!irtSub->declaration && !crtSub->declaration &&
                               irtSub->kind == TypeRef::Kind::Named &&
-                              crtSub->kind == TypeRef::Kind::Named &&
-                              !containsFunctionType(irtSub) &&
-                              !containsFunctionType(crtSub)))
+                              crtSub->kind == TypeRef::Kind::Named))
                                 ? declLessNamedMatch(irtSub, crtSub, im, impl)
                                 : typesMatch(irtSub, crtSub);
                         if (!retMatch) {
