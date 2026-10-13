@@ -9977,7 +9977,8 @@ static bool isValueTypeArg(const TypeRef* t) {
 // both are Named user-declared with the same TypeSymbol pointer, or both are
 // Named builtins with the same importedName (arity not recursively checked;
 // deeper nesting is left to the recursive variance walk if ever implemented).
-// Nullability is intentionally ignored — variance operates on the base type.
+// Nullability is ignored here for Named/Primitive bases — variance operates on
+// the base type; typeArgIdentical adds the nullability comparison (#6109).
 //
 // #2007: the composite non-generic kinds InlineArray (`[N]T`) and Function
 // (`(T1,…)->T2`) have no separate "base + arguments" decomposition — the
@@ -10089,8 +10090,8 @@ static bool isFreeGenericTypeVarRef(
 // identical, component-wise. This is the only relation an INVARIANT position
 // (a concrete generic type — Array, records, classes) or a value-typed
 // argument admits (§12.9 "concrete generic types are always invariant"): it is
-// what makes `Array<Dog>` distinct from `Array<Animal>`. Nullability is ignored,
-// matching typeArgSameBase (variance operates on the base type).
+// what makes `Array<Dog>` distinct from `Array<Animal>`. Nullability is part of
+// identity (#6109, §7.1/§12.9), compared in this function after the base check.
 //
 // #2007: InlineArray and Function have no `genericArgs` (their identity lives
 // in `arrayElement` / `funcParams` + `funcReturn`), so the genericArgs loop
@@ -10118,12 +10119,23 @@ static bool isFreeGenericTypeVarRef(
 // `T` and skipped it — which is why one level worked and two did not.
 static bool typeArgIdentical(
     const TypeRef* a, const TypeRef* b,
-    const std::unordered_set<std::string_view>* freeNames) {
+    const std::unordered_set<std::string_view>* freeNames,
+    bool checkTopNullability = true) {
     if (!a || !b) return a == b;
     if (isFreeGenericTypeVarRef(a, freeNames) ||
         isFreeGenericTypeVarRef(b, freeNames))
         return true;
     if (!typeArgSameBase(a, b)) return false;
+    // fix #6109 (§12.9 "concrete generic types are always invariant", §7.1
+    // "`string` and `string?` are distinct types", v0.338): nullability is part
+    // of a type argument's identity, so `Array<string?>` is not `Array<string>`
+    // (a null element would flow into a non-null slot) and `Array<F?>` is not
+    // `Array<F>`. Every NESTED argument is compared strictly (an invariant base
+    // composes). Only a covariant caller (typeArgCovariantAssignable's identity
+    // short-circuit) passes checkTopNullability=false for ITS OWN top-level
+    // argument, preserving the pre-existing `out T` behaviour that spec
+    // §12.9 does not pin down (held out of #6109).
+    if (checkTopNullability && a->nullable != b->nullable) return false;
     if (a->kind == TypeRef::Kind::InlineArray)
         return typeArgIdentical(a->arrayElement, b->arrayElement, freeNames);
     if (a->kind == TypeRef::Kind::Function) {
@@ -10161,8 +10173,13 @@ static bool typeArgCovariantAssignable(
     bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*),
     const std::unordered_set<std::string_view>* freeNames) {
     if (!fromArg || !toArg) return fromArg == toArg;
-    // Identity (recursive) is always a legal conversion.
-    if (typeArgIdentical(fromArg, toArg, freeNames)) return true;
+    // Identity (recursive) is always a legal conversion. The top-level
+    // nullability of THIS (covariant-position) argument is not compared: #6109
+    // makes only invariant positions nullability-strict (§12.9); nested
+    // arguments are still compared strictly.
+    if (typeArgIdentical(fromArg, toArg, freeNames,
+                         /*checkTopNullability=*/false))
+        return true;
     // §12.9 L1592: a value-typed argument admits no variant conversion — only
     // identity (already ruled out). Checked before the Object root so
     // `IEnumerable<int>` is NOT covariantly assignable to `IEnumerable<Object>`.
