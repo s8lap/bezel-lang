@@ -1526,6 +1526,16 @@ std::string_view builtinTypeHomeModuleOf(std::string_view name) {
     return builtinClassModulePathOf(name);
 }
 
+// §2.3 (v0.338) auto-imported module rows; see the header for the list's role.
+constexpr std::array<std::string_view, 4> kAutoImportedModulePaths = {
+    "System", "System.Text", "System.Collections.Generic",
+    "System.Collections.Linq",
+};
+
+bool isAutoImportedModulePath(std::string_view modulePath) {
+    return contains(kAutoImportedModulePaths, modulePath);
+}
+
 // fix #3119: the 14 keyword-aliased built-in types (spec §3.4) — `string`
 // plus the 13 primitive value-type keywords. Per stdlib §2.13 rule 2, they
 // render as their lowercase keyword in BOTH `Name` and `FullName`; the

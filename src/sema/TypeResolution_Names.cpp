@@ -3198,12 +3198,9 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             prefix += std::string(t.name->parts[k]);
         }
         const std::string_view last = t.name->parts.back();
-        // §2.3 auto-imported module rows: `System` (its always-available rows),
-        // `System.Text`, `System.Collections.Generic`, `System.Collections.Linq`.
+        // §2.3 auto-imported module rows (common::isAutoImportedModulePath).
         const bool autoImported =
-            (prefix == "System" || prefix == "System.Text" ||
-             prefix == "System.Collections.Generic" ||
-             prefix == "System.Collections.Linq") &&
+            common::isAutoImportedModulePath(prefix) &&
             isAlwaysAvailableBareName(last);
         const bool explicitlyImported = sourceImports_.count(prefix) != 0;
         if (!isGenericMarker && (autoImported || explicitlyImported) &&

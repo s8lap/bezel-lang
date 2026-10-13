@@ -550,6 +550,13 @@ std::string_view builtinClassModulePathOf(std::string_view name);
 // that `Alias.Name` names the same entity as the bare `Name`.
 std::string_view builtinTypeHomeModuleOf(std::string_view name);
 
+// §2.3 (v0.338) auto-imported module rows: `System`, `System.Text`,
+// `System.Collections.Generic`, `System.Collections.Linq`. The single list of
+// those four module paths; sema's qualified-name resolution and the module
+// loader's implementation-provided set both read it, so the rows are spelled
+// once. `System.Threading` and the other explicit-import modules are NOT here.
+bool isAutoImportedModulePath(std::string_view modulePath);
+
 // fix #3119 (spec §3.4; stdlib §2.13 rule 2, v0.252): true when `name` is one
 // of the 14 keyword-aliased built-in types — `string` plus the 13 primitive
 // value-type keywords (`bool`, `byte`, `sbyte`, `short`, `ushort`, `int`,
