@@ -113,6 +113,24 @@ BEZEL_TEST(async_unbound_await_interface_result_5723,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kPatternAOwningLocation));
 }
 
+// §30.3 / §30.5: `.Result` is the Pattern A sibling of `await` and takes the
+// same owning-location rule. MEASURED pre-fix: `var r := Make().Result;` at
+// `Task<IShape>` was accepted and ASan reported heap-use-after-free.
+BEZEL_TEST(async_unbound_await_interface_result_5723,
+          reject_unbound_result_read_task_iface_30_5) {
+    auto r = runAot(std::string(kShapes) +
+        "public class Program "
+        "  public static async method Make(): Task<IShape> return new Sq(); "
+        "  end Make; "
+        "  public static method Main(): int "
+        "    var r := Make().Result; return r.Area(); end Main; "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r,
+        "reading `.Result` on a class-typed `Task<T>` (Pattern A) requires the "
+        "task expression to occupy a syntactically-visible owning location"));
+}
+
 // Pattern B: the unbound `var` must discharge an owned local, as for a class.
 BEZEL_TEST(async_unbound_await_interface_result_5723,
           reject_unbound_var_await_owningtask_iface_30_5) {
