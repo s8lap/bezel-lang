@@ -12900,6 +12900,13 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
 // virtual dispatch during construction resolves to the most-derived class.
 void Emitter::emitInstanceInit(const sema::TypeSymbol* t, llvm::Value* obj,
                                llvm::StructType* st) {
+    // fix s22_7_0011 (§22.7, v0.334): a `static constructor` runs before the
+    // type's first USE — and a `new T()` is a use of T. Without this call,
+    // the vtable store below runs without triggering lazy static init, so a type
+    // with a static constructor would never init on instance creation. Static init
+    // runs first, then the vtable install, then the constructor body.
+    emitEnsureStaticInit(t);
+
     // CG17: install the vtable pointer (instance slot 0) before field
     // initializers / the constructor, so virtual dispatch on the new object
     // resolves to its own class.
