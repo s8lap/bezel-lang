@@ -7750,11 +7750,31 @@ void Resolver::checkAbstractImplementations() {
     std::function<bool(const TypeRef*, const TypeRef*, const MethodSymbol*,
                        const MethodSymbol*)>
         declLessArgMatch;
+    // #6062: both refs name the same declaration (a user generic) and carry
+    // generic arguments of equal count.
+    auto sameGenericDeclPair = [](const TypeRef* a, const TypeRef* b) -> bool {
+        return a && b && a->kind == TypeRef::Kind::Named &&
+               b->kind == TypeRef::Kind::Named && a->declaration &&
+               a->declaration == b->declaration && !a->genericArgs.empty() &&
+               a->genericArgs.size() == b->genericArgs.size();
+    };
     std::function<bool(const TypeRef*, const TypeRef*, const MethodSymbol*,
                        const MethodSymbol*)>
         declLessNamedMatch =
             [&](const TypeRef* a, const TypeRef* b, const MethodSymbol* aM,
                 const MethodSymbol* bM) -> bool {
+        // #6062 / §11.2 (v0.338): a user-generic reference (`Box<T>`) names a
+        // declaration; the SAME declaration with the same arity compares its
+        // arguments under the own-parameter-by-position rule, so `Box<T>`
+        // against `Box<B>` is decided by the position of `T` and `B`, not by
+        // typeRefEqual (which sees two declaration-less refs as equal).
+        if (sameGenericDeclPair(a, b)) {
+            if (a->nullable != b->nullable) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+                if (!declLessArgMatch(a->genericArgs[i], b->genericArgs[i], aM, bM))
+                    return false;
+            return true;
+        }
         int ai = ownParamIndex(a, aM);
         int bi = ownParamIndex(b, bM);
         if (ai >= 0 || bi >= 0)
@@ -7810,6 +7830,7 @@ void Resolver::checkAbstractImplementations() {
         if (x->kind == TypeRef::Kind::Named && y->kind == TypeRef::Kind::Named &&
             !x->declaration && !y->declaration)
             return declLessNamedMatch(x, y, aM, bM);
+        if (sameGenericDeclPair(x, y)) return declLessNamedMatch(x, y, aM, bM);
         return typesMatch(x, y);
     };
     auto resolvedOf = [&](const ast::Type* node) -> TypeRef* {
@@ -8517,9 +8538,10 @@ void Resolver::checkAbstractImplementations() {
                         // — `Show(x: T)` on `class C<T>` does not implement
                         // `Show<U>(x: U)` (§11.2, v0.314).
                         bool match;
-                        if (!itSub->declaration && !ctSub->declaration &&
-                            itSub->kind == TypeRef::Kind::Named &&
-                            ctSub->kind == TypeRef::Kind::Named) {
+                        if ((!itSub->declaration && !ctSub->declaration &&
+                             itSub->kind == TypeRef::Kind::Named &&
+                             ctSub->kind == TypeRef::Kind::Named) ||
+                            sameGenericDeclPair(itSub, ctSub)) {
                             // Both are method-level type params: accept regardless of
                             // spelling (the renaming is intentional per §11.2).
                             // Generic built-ins (`Array<V>`) compare their
@@ -9028,9 +9050,10 @@ void Resolver::checkAbstractImplementations() {
                     // corresponding.  See also the same check in
                     // `paramsMatchObligation` (the candidate-filter loop above).
                     bool match;
-                    if (!itSub->declaration && !ctSub->declaration &&
-                        itSub->kind == TypeRef::Kind::Named &&
-                        ctSub->kind == TypeRef::Kind::Named) {
+                    if ((!itSub->declaration && !ctSub->declaration &&
+                         itSub->kind == TypeRef::Kind::Named &&
+                         ctSub->kind == TypeRef::Kind::Named) ||
+                        sameGenericDeclPair(itSub, ctSub)) {
                         match = declLessNamedMatch(itSub, ctSub, im, impl);
                         // §11.2 rule 1: the T -> T? parameter widening applies here too.
                         if (!match && !itSub->nullable && ctSub->nullable) {
@@ -9103,12 +9126,16 @@ void Resolver::checkAbstractImplementations() {
                         // compares a function-typed argument by nullability
                         // only, which would accept `Array<(T) -> T>` against
                         // `Array<(int) -> int>` (§11.2 L1849: "exactly equal").
+                        // #6062: a same-declaration user-generic return
+                        // (`Box<T>`) compares its arguments by own-parameter
+                        // position as well.
                         const bool retMatch =
-                            (!irtSub->declaration && !crtSub->declaration &&
-                             irtSub->kind == TypeRef::Kind::Named &&
-                             crtSub->kind == TypeRef::Kind::Named &&
-                             !containsFunctionType(irtSub) &&
-                             !containsFunctionType(crtSub))
+                            (sameGenericDeclPair(irtSub, crtSub) ||
+                             (!irtSub->declaration && !crtSub->declaration &&
+                              irtSub->kind == TypeRef::Kind::Named &&
+                              crtSub->kind == TypeRef::Kind::Named &&
+                              !containsFunctionType(irtSub) &&
+                              !containsFunctionType(crtSub)))
                                 ? declLessNamedMatch(irtSub, crtSub, im, impl)
                                 : typesMatch(irtSub, crtSub);
                         if (!retMatch) {
