@@ -722,6 +722,23 @@ public:
     // for the asymmetry rationale and #4330's
     // `positional_field_conforming_accepted_control` test pin.
     void checkRecordWithFromTemporary(const ast::WithExpr& we);
+    // §35.3 (v0.334): the CHOICE-CASE sibling of `checkRecordFromTemporary`.
+    // The rule (from §35.3): "An argument to a plain class- or interface-typed
+    // payload slot is a borrow, and §9.7's no-temporary-source rule applies
+    // verbatim: constructing a choice that holds borrows (§35.4's holds-borrows
+    // property — borrow-bearing or owning alike) from a temporary bound to a
+    // borrow-carrying payload is rejected (bind the source to a named local
+    // first)." Structural twin of `checkRecordFromTemporary` with
+    // `caseDecl->payload` standing in for `recordPositionalFieldSymbols`. The
+    // holds-borrows gate is §35.4's property; the per-slot test, temporary
+    // predicate, null carve-out, and remedy are verbatim §9.7's own wording.
+    // §9.7 supplies the carrier difference: "Choices that hold borrows are
+    // subject to this section's borrow-lifetime rules — with 'record' read as
+    // 'record or choice' throughout" (§9.7, v0.220, #2180).
+    // per §35.3, §9.7
+    void checkChoiceCaseFromTemporary(const sema::ChoiceCaseSymbol& ccs,
+                                     const std::vector<ast::CallArgument>& args,
+                                     const sema::TypeRef* ownedInst);
     // fix #5626 (§9.7, v0.315): `handleReturn` calls checkRecordFromTemporary
     // only when the return expression IS a NewExpr/WithExpr directly. When
     // one is nested inside an ArrayLiteralExpr (e.g. `return [new Str2(new
@@ -1555,7 +1572,8 @@ private:
                                 BlockState&& baseline, SourceLocation joinLoc);
 
     void recordMovesInArgs(const std::vector<ast::CallArgument>& args,
-                           const ast::Expr* callee = nullptr);
+                           const ast::Expr* callee = nullptr,
+                           const sema::TypeRef* choiceInstTy = nullptr);
 
     // fix #4095 (§9.7 / §22.7 / §22.8, v0.295): a record constructor's leading
     // `this(...)` chain argument that is a fresh owned producer (`new T(...)`)

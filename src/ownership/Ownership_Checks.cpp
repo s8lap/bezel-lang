@@ -1321,11 +1321,11 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         return;
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
-        recordMovesInArgs(call->args, call->callee.get());
+        recordMovesInArgs(call->args, call->callee.get(), ctx_.exprType(e));
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
-        recordMovesInArgs(nc->args, nc->callee.get());
+        recordMovesInArgs(nc->args, nc->callee.get(), ctx_.exprType(e));
         return;
     }
     // A constructor call `new T(owned x)` / `new T(move x)` consumes its
@@ -1696,7 +1696,8 @@ void MethodOwnership::joinMarkerFreeArmEnds(std::vector<BlockState>&& ends,
 }
 
 void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& args,
-                       const ast::Expr* callee) {
+                       const ast::Expr* callee,
+                       const sema::TypeRef* choiceInstTy) {
     // Resolve callee parameter list for implicit ownership transfer check.
     //
     // fix #3176 (§22.3 / §2.5, v0.254): through `resolveCalleeParams`, so an
@@ -1722,6 +1723,33 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
     const sema::ChoiceCaseSymbol* calleeChoiceCase =
         callee ? dynamic_cast<sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*callee))
                : nullptr;
+    // §35.3 (v0.334): "An argument to a plain class- or interface-typed
+    // payload slot is a borrow, and §9.7's no-temporary-source rule applies
+    // verbatim: constructing a choice that holds borrows (§35.4's holds-borrows
+    // property — borrow-bearing or owning alike) from a temporary bound to a
+    // borrow-carrying payload is rejected (bind the source to a named local
+    // first)."
+    //
+    // The holds-borrows gate is §35.4's property read "whatever the
+    // classification" (§3.6's holds-borrows row). A choice that does NOT hold
+    // borrows (value-like, or every payload an owned marker / a value type)
+    // takes no such borrow, so §9.7's rule has nothing to say and a temporary
+    // bound to it is an ordinary unbound owned temporary — ADMITTED; that
+    // boundary is pinned by the ADMIT CONTROL rows.
+    //
+    // The instantiation is read from the CONSTRUCTION CallExpr's own stamped
+    // type rather than the `C.N` MemberAccess target: ExprTypecheck_Calls.cpp
+    // stamps that target only after the callee resolves, so in this pass
+    // `ctx_.exprType(*ma->target)` reads back NULL for every choice construction
+    // reaching here. The §28.1 erasure oracle gets away with the MemberAccess
+    // spelling only because it is gated on `userOwned`, so a plain slot never
+    // asks the question. This call's own type carries the concrete
+    // instantiation with its type arguments (§28.1 / §3.6 rule 2).
+    // // per §35.3, §35.4
+    if (calleeChoiceCase && choiceInstTy) {
+        if (isBorrowBearingChoice(choiceInstTy))
+            checkChoiceCaseFromTemporary(*calleeChoiceCase, args, choiceInstTy);
+    }
     std::size_t pos = 0;
     for (const auto& a : args) {
         if (!a.value) { ++pos; continue; }
@@ -17146,6 +17174,69 @@ void MethodOwnership::checkRecordWithFromTemporary(const ast::WithExpr& we) {
             "named local whose scope outlives the record and pass that "
             "(§9.7 / §28.3 borrow-lifetime rule, #4344)");
         return;  // one diagnostic per `with(...)` is enough
+    }
+}
+
+// §35.3 (v0.334): the CHOICE-CASE sibling of `checkRecordFromTemporary`. The
+// rule, quoted from §35.3:
+//
+//   "An argument to a plain class- or interface-typed payload slot is a
+//    borrow, and §9.7's no-temporary-source rule applies verbatim:
+//    constructing a choice that holds borrows (§35.4's holds-borrows property
+//    — borrow-bearing or owning alike) from a temporary bound to a
+//    borrow-carrying payload is rejected (bind the source to a named local
+//    first)."
+//
+// "Verbatim" is the operative word and it is literal: the per-slot test, the
+// temporary predicate, the null carve-out and the remedy are exactly
+// `checkRecordFromTemporary`'s, with `caseDecl->payload[i]` standing in for
+// `recordPositionalFieldSymbols(ts)[i]`. Only the CARRIER differs — a choice
+// instead of a record — and §9.7 itself supplies that difference: "Choices
+// that hold borrows … are subject to this section's borrow-lifetime rules —
+// the bullet list below, its null-source forms included — with 'record' read
+// as 'record or choice' throughout" (§9.7, v0.220, #2180).
+//
+// The caller has already gated on `isBorrowBearingChoice(choiceInst)`, so this
+// only has to answer the per-slot question. `ownedInst` carries the choice's
+// instantiation so a GENERIC payload's borrow-carrying-ness is read AFTER
+// substitution (§3.6 rule 2 / §35.4), matching what the slot will actually
+// hold at this construction. // per §35.3, §9.7
+void MethodOwnership::checkChoiceCaseFromTemporary(
+    const sema::ChoiceCaseSymbol& ccs,
+    const std::vector<ast::CallArgument>& args,
+    const sema::TypeRef* ownedInst) {
+    if (!ccs.caseDecl) return;
+    const std::vector<ast::Param>& payload = ccs.caseDecl->payload;
+    const sema::TypeSymbol* chDecl = ccs.parent;
+    for (std::size_t i = 0; i < args.size() && i < payload.size(); ++i) {
+        // A payload marked `owned` is an OWNED-CONSUMING position (§35.3's
+        // first bullet), not a borrow: a fresh producer transfers with no
+        // marker there and §9.7's rule has nothing to say. §35.3's second
+        // bullet keys on a "PLAIN class- or interface-typed payload slot".
+        if (payload[i].modifier == "owned") continue;
+        const sema::TypeRef* ft =
+            common::substitutedChoicePayloadType(payload[i], chDecl, ownedInst,
+                                                ctx_);
+        if (!fieldTypeIsBorrowCarrying(ft)) continue;
+        const ast::Expr* arg = args[i].value.get();
+        if (!arg || !exprIsTemporary(*arg)) continue;
+        // §9.7's null-source form, carried over verbatim: a `null` argument
+        // stores no borrow, so it is never a dangling one.
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arg)) continue;
+        report(
+            Severity::Error, arg->span.begin,
+            std::string("a choice that holds borrows may not be constructed "
+                        "from a temporary bound to its borrow-carrying payload "
+                        "`") +
+                std::string(payload[i].name) +
+                "` of case `" + std::string(ccs.caseDecl->name) +
+                "` — the argument to a plain class- or interface-typed payload "
+                "slot is a borrow, and the temporary's lifetime ends at this "
+                "construction expression, so the choice would immediately "
+                "outlive that borrow's source (a dangling borrow); bind the "
+                "source to a named local whose scope outlives the choice and "
+                "pass that (§35.3 / §9.7 no-temporary-source rule)");
+        return;  // one diagnostic per construction is enough
     }
 }
 
