@@ -3014,6 +3014,24 @@ private:
     // is not flagged. The `owned`-field case is handled by targetIsOwnedField.
     bool targetIsNonOwnedField(const ast::Expr& target) const;
 
+    // fix-forward #3575 (§28.5 / §35.4 / §15.3, v0.334): true when `target`
+    // resolves to a field whose DECLARED type is a MOVE-ONLY VALUE TYPE — an
+    // owning-classified choice, or an owning inline array
+    // (common::isMoveOnlyValueType). Such a field is an OWNED-BEARING field
+    // even without the `owned` modifier: §28.5 names them in so many words
+    // ("A class with only owned-bearing fields (`owned` class/interface fields,
+    // owning-inline-array fields and/or owning-choice fields — the fields of
+    // move-only value type, §15.3) … needs no destructor"), and §35.4 states
+    // the rule directly ("a move-only value carrying no borrows may be a class
+    // field (the class's destructor disposes it)"). §28.5 admits `owned` ONLY
+    // on class- and interface-typed fields, so the modifier is not merely
+    // redundant here — it is not available. Exempting these from
+    // targetIsNonOwnedField's freshly-produced-owned rejection is what keeps
+    // `h._o := Bundle.Ready(r);` admitted; codegen's
+    // disposeDisplacedOwningChoiceLocal (LlvmBackend_Disposal.cpp) already
+    // disposes the displaced value there.
+    bool targetIsMoveOnlyValueField(const ast::Expr& target) const;
+
     // §28.3 / §28.5 / §28.8 (issue #402): handle an assignment whose LHS is an
     // `owned` field. An owned field may only receive an OWNED value (§28.3
     // producers: `new`, `move`, an owned-returning call, a consumed `owned`

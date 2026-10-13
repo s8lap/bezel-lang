@@ -1,5 +1,5 @@
 // RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=CHECK --allow-empty %s
 //
 // Issue #4587 (§15.3 / §28.7, spec v0.306) accept control: a read AFTER
 // reassignment must still be admitted. §15.3's first Rules bullet states the
@@ -35,5 +35,27 @@ class C
   end Main;
 end C;
 
-// NODIAG-NOT: error
-// NODIAG-NOT: §
+// fix-forward #3575 (§35.4, v0.334): `Bundle.Ready(...)` is a CASE
+// CONSTRUCTION, and §35.3 makes an owning construction an "owned move-only
+// value"; §35.4 then requires the K3.14 must-use warning on a local it binds
+// that is never discharged. `b` and `c` are read only, through a BORROWING
+// `case` (§35.5 — an unmarked read of a move-only scrutinee stays a borrowing
+// match), so neither transfers the obligation and both warn. That warning is
+// the CORRECT §35.4 behaviour and it is not a rejection: the control this file
+// exists for — "a read AFTER reassignment is admitted" — is unchanged.
+//
+// The blanket "no diagnostic may cite a section" directive this replaces
+// forbade the two must-use warnings above, which are required to cite §28.3.
+// Pinning the exact warnings restores strictly MORE coverage than it drops:
+// a NOT-for-`error` line brackets each warning, so a rejection anywhere in the
+// output still fails the file, and the `already moved out` guards keep the
+// sibling #4587 reject rows' needle out of an accept row that shares their
+// declarations.
+
+// CHECK-NOT: error
+// CHECK: warning: owned value in `b` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop)
+// CHECK-NOT: error
+// CHECK-NOT: already moved out
+// CHECK: warning: owned value in `c` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop)
+// CHECK-NOT: error
+// CHECK-NOT: already moved out

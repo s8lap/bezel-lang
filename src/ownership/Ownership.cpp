@@ -1115,8 +1115,60 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // // per §28.3 K7.4/K1.4, §28.8 K3.1, v0.313, #5427
             const bool ownedParamPerPathAutoDrop =
                 ownedParamTransfersNullSlot(sym);
+            // fix-forward #3575 (§28.3 rule 4 / K7.4 / §35.8 / §28.8.1 /
+            // §15.3, v0.334): the LOCAL-side twin of `ownedParamTransfersNullSlot`
+            // for a MOVE-ONLY VALUE TYPE binding, which is the other case whose
+            // per-path disposal is exactly-once by construction.
+            //
+            // §28.3 rule 4 (Ownership state of locals) states the rule the
+            // `!st.maybeConsumed` gate was reading as a reject: "maybe-consumed
+            // — the K7 join of owned with moved-from or explicitly-disposed;
+            // unreadable until reassigned …; **scope-end disposal is
+            // per-path**". So a maybe-consumed local is not undischarged; it is
+            // per-path, and the gate above must admit it whenever the
+            // per-path disposal is exactly-once — which is the same question
+            // `ownedParamTransfersNullSlot` answers for a parameter, by
+            // requiring every recorded discharge shape to be slot-NULLING and
+            // denying by default.
+            //
+            // For a move-only value type the deny-by-default question has a
+            // decidable answer, because §35.8 REJECTS `Dispose()` on a choice
+            // value outright: the only discharge shapes such a binding admits
+            // are transfers (a binding, a store, an `owned` sink, a return),
+            // and §28.7/§28.8.1 make every one of them a value-move that leaves
+            // the source's slot moved-from — the null-guarded owning-choice
+            // scope-end pass then skips the moved path and disposes the
+            // un-moved one, once. There is no non-nulling shape available to
+            // record, so the condition `ownedParamTransfersNullSlot` insists on
+            // holds a fortiori.
+            //
+            // Narrow on purpose: keyed on the binding's DECLARED (or, for an
+            // inferred `var`, initializer) type being a move-only value type
+            // (common::isMoveOnlyValueType), so a plain class local keeps the
+            // §28.3 reject — `.Dispose()` is admitted there and is exactly the
+            // non-nulling shape the parameter side has to record.
+            bool moveOnlyValuePerPathAutoDrop = false;
+            if (st.maybeConsumed) {
+                const auto* ls =
+                    dynamic_cast<const sema::LocalSymbol*>(sym);
+                const auto* ld =
+                    ls ? dynamic_cast<const ast::LocalDecl*>(ls->decl)
+                       : nullptr;
+                if (ld) {
+                    const sema::TypeRef* dt =
+                        ld->type ? ctx_.resolvedType(*ld->type)
+                                 : (ld->initializer
+                                        ? ctx_.exprType(*ld->initializer)
+                                        : nullptr);
+                    const char* moveOnlyKind = nullptr;
+                    moveOnlyValuePerPathAutoDrop =
+                        common::isMoveOnlyValueType(dt, ctx_, moveOnlyKind);
+                }
+            }
+            const bool perPathAutoDrop =
+                ownedParamPerPathAutoDrop || moveOnlyValuePerPathAutoDrop;
             if (!isAsync_ && !sawYield_ && !isDestructor_ &&
-                (!st.maybeConsumed || ownedParamPerPathAutoDrop) &&
+                (!st.maybeConsumed || perPathAutoDrop) &&
                 (reassignedLocals.count(sym) == 0 ||
                  reassignedDropCovered_.count(sym) != 0)) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
@@ -5798,6 +5850,48 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // a call on a value with no symbol) falls through to the builtin
     // name-head check below. // per §28.3 / §30.14
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // fix-forward #3575 (§35.4 / §35.3, v0.334): an OWNING-choice CASE
+        // CONSTRUCTION (`Bundle.Ready(new Resource(42))`) produces an owned
+        // move-only value — §35.3: "an owning construction is an `owned`
+        // move-only value … the caller takes ownership and discharges it by
+        // binding, storing, returning, or consuming it" — so §35.4's K3.14
+        // must-use warning and §28.3's scope-end auto-drop must apply to the
+        // local it binds.
+        //
+        // The test is POSITIVE: the callee must be a genuine case member.
+        // Sema resolves a payload-carrying case construction's callee to a
+        // `ChoiceCaseSymbol` whose parent is a Choice TypeSymbol (the same
+        // resolution `ExprTypecheck_Calls.cpp` ~4438 stamps the call's result
+        // type from). NOTE: a `ConstructorSymbol` is the WRONG test — it is a
+        // SIBLING of `ChoiceCaseSymbol` under `MemberSymbol`, not a supertype,
+        // and no case construction ever resolves to one, so that cast is
+        // unconditionally null and silently retires the whole rule.
+        //
+        // Everything else that reaches this block is NOT a fresh producer and
+        // must stay Borrowed. Specifically the three spellings that merely READ
+        // an owning choice out of storage: a method call returning it
+        // (`b.Get()` — a `MethodSymbol`), a call through a function-typed FIELD
+        // (`b.fetch()` — a `FieldSymbol`), and a call through a function-typed
+        // LOCAL (`g()` — a `LocalSymbol`). Classifying any of those Owned
+        // discharges the produced local independently (scope-end auto-drop, or
+        // an `owned` sink), disposing a payload the receiver still owns —
+        // Box's destructor then disposes it a second time. MEASURED on the
+        // negated form of this test: `heap-use-after-free` in
+        // `Box$DisposeCore` under ASan, and the two function-typed spellings
+        // silently un-reject §28.8's "a borrow cannot be passed where an
+        // `owned` value is required". Those spellings are pinned by
+        // `owning_choice_case_ctor_only_is_a_fresh_producer_3575_test.cpp`.
+        if (sema::Symbol* calleeSym =
+                ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr) {
+            if (auto* ccs = dynamic_cast<sema::ChoiceCaseSymbol*>(calleeSym)) {
+                if (auto* cts = dynamic_cast<sema::TypeSymbol*>(ccs->parent);
+                    cts && cts->kind == ast::TypeDeclKind::Choice)
+                    if (auto cv = common::classifyChoiceType(
+                            ctx_.exprType(e), ctx_))
+                        if (*cv == common::ChoiceClassification::Owning)
+                            return OwnershipState::Owned;
+            }
+        }
         // #1414 stage 4 phase A: the sema-side consumer of the shared ownership-
         // facts core. The callee → user-MethodDecl navigation that reaches the
         // `returnOwned` authority is the one copy shared with codegen
@@ -6753,10 +6847,34 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
                 head != "Task" && head != "OwningTask")
                 return true;
         }
+        // §35.4, v0.334: owning-choice locals are covered by codegen's
+        // disposeDisplacedOwningChoiceLocal (LlvmBackend_Disposal.cpp).
+        if (auto cv = common::classifyChoiceType(dt, ctx_))
+            if (*cv == common::ChoiceClassification::Owning) return true;
     }
     if (!ld->initializer) return false;
-    if (producerState(*ld->initializer) != OwnershipState::Owned) return false;
     const sema::TypeRef* t = ctx_.exprType(*ld->initializer);
+    // fix-forward #3575 (§35.4 / §15.3 / §28.7, v0.334): a MOVE-ONLY VALUE TYPE
+    // initializer — an owning-classified choice or an owning inline array
+    // (common::isMoveOnlyValueType) — is covered by codegen's
+    // disposeDisplacedOwningChoiceLocal (LlvmBackend_Disposal.cpp) whatever
+    // spelling produced the BINDING. `var t := move h.C;` is the shape that
+    // needs this: its initializer is a `move` of a field, and producerState
+    // reads that Borrowed (the `move` arm keys on owning COLLECTIONS by
+    // name-head), so the producer test below would decline and the §28.3
+    // discharge error would reject a program codegen disposes correctly — the
+    // move-only property rides on the VALUE TYPE, not on the spelling.
+    //
+    // Placed BEFORE the producer test deliberately: the owning-choice arm that
+    // used to sit below it was unreachable for exactly these bindings, being
+    // below `producerState(...) != Owned → return false`. That later, narrower
+    // arm is removed here — this one subsumes it, running earlier and admitting
+    // the owning-inline-array case alongside.
+    {
+        const char* moveOnlyKind = nullptr;
+        if (common::isMoveOnlyValueType(t, ctx_, moveOnlyKind)) return true;
+    }
+    if (producerState(*ld->initializer) != OwnershipState::Owned) return false;
     // #5421 (§28.7 / §28.9): the collection arm, mirroring codegen's
     // disposeDisplacedCollectionLocal (collectionTypeOfLocal /
     // dictTypeOfLocal / linkedListTypeOfLocal, LlvmBackend_Setup.cpp). Those
@@ -8628,6 +8746,7 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         handleOwnedFieldAssignment(as, flagged386,
                                    /*intoOwningArraySlot=*/true);
     } else if (!flagged386 && targetIsNonOwnedField(*as.target) &&
+               !targetIsMoveOnlyValueField(*as.target) &&
                producerState(*as.value) == OwnershipState::Owned) {
         // #1020 / §28.6 (v0.153): a freshly-produced owned value — a `new`, an
         // owned-returning call, a `move`, or an owned operator result

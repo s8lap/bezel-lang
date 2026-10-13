@@ -238,6 +238,17 @@ BEZEL_TEST(owning_match_expr_arm_transfer_4633,
     // way it stays rejected, and the new §35.5 admission (which requires the
     // marked name to be a PAYLOAD BINDING of that arm's pattern, which `o` is
     // not) does not launder it.
+    //
+    // fix-forward #3575 (§35.4 / §35.3, v0.334): the REJECT is unchanged but
+    // its GROUND moves. §35.3 makes `Outer.W(...)` "an `owned` move-only
+    // value", so `o` is now a genuine owned binding — the not-an-owned-binding
+    // gate no longer applies to it, and the arm is rejected one clause later,
+    // on §28.3's own type restriction: the marker is supported only on a plain
+    // `var` owned local of CLASS or INTERFACE type. That is the correct
+    // rejection and a stricter one — §15.3 lists a move-only value (an owning
+    // choice among them) among the positions where `move` is an error, and the
+    // old needle was firing only because the compiler had not yet recognised
+    // `o` as owned at all.
     auto r = runAot(prog(kDecls,
         "var o := Outer.W(new Widget(\"a\"), new Widget(\"b\")); "
         "var r := (case move o of "
@@ -245,7 +256,8 @@ BEZEL_TEST(owning_match_expr_arm_transfer_4633,
         "  X       => Outer.X); "
         "_ := r; "
         "return 0;"));
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kNotOwnedNeedle));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "supported only on a plain `var` owned local"));
 }
 
 BEZEL_TEST(owning_match_expr_arm_transfer_4633,

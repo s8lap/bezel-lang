@@ -16578,6 +16578,29 @@ bool MethodOwnership::targetIsNonOwnedField(const ast::Expr& target) const {
     return true;
 }
 
+// fix-forward #3575 (§28.5 / §35.4 / §15.3, v0.334): see the header. The
+// move-only-value-type FIELD carve-out that pairs with targetIsNonOwnedField.
+// Reads the field's DECLARED type (the FieldSymbol's own declaration), not the
+// stored value's — the exemption is a property of the STORAGE LOCATION, and it
+// mirrors targetIsOwnedField / targetIsOwningInlineArraySlot, which likewise
+// ask what the target is rather than what is being written into it.
+bool MethodOwnership::targetIsMoveOnlyValueField(
+        const ast::Expr& target) const {
+    if (!dynamic_cast<const ast::MemberAccessExpr*>(&target) &&
+        !dynamic_cast<const ast::IdentifierExpr*>(&target))
+        return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(target));
+    if (!fs) return false;
+    // The field's own type, read off the field ACCESS — sema types a field
+    // read with the field's declared type. Going through `fs->decl` instead
+    // would need a kind-dependent downcast: for a body field `decl` is an
+    // `ast::FieldDecl`, but for a record's positional field it is the owning
+    // `ast::TypeDecl` and the type lives on `FieldSymbol::posParam` — and a
+    // positional record field is never a move-only type anyway.
+    const char* kind = nullptr;
+    return common::isMoveOnlyValueType(ctx_.exprType(target), ctx_, kind);
+}
+
 // #926 / §28.6 (v0.153): a getter may not return a fresh owned value. See header.
 void MethodOwnership::checkGetterFreshOwnedReturn(const ast::Expr& e) {
     if (producerState(e) == OwnershipState::Owned) {
@@ -16714,6 +16737,21 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
     // the value, so a fresh owned initializer is exactly what it wants. Not here.
     for (std::string_view m : fd.modifiers)
         if (m == "owned") return;
+    // fix-forward #3575 (§28.5 / §35.4 / §15.3, v0.334): a field whose DECLARED
+    // type is a MOVE-ONLY VALUE TYPE is owned-bearing WITHOUT the `owned`
+    // modifier — §28.5 lists "owning-inline-array fields and/or owning-choice
+    // fields" among the fields whose generated cleanup the class destructor
+    // performs, and admits `owned` only on class- and interface-typed fields, so
+    // the modifier is not available to write. The declaration-form counterpart
+    // of targetIsMoveOnlyValueField; without it `private _o: Bundle :=
+    // Bundle.Ready(r);` is rejected while the same store spelled as an
+    // assignment is admitted.
+    {
+        const char* moveOnlyKind = nullptr;
+        if (fd.type && common::isMoveOnlyValueType(
+                           ctx_.resolvedType(*fd.type), ctx_, moveOnlyKind))
+            return;
+    }
     if (producerState(*fd.initializer) == OwnershipState::Owned) {
         report(Severity::Error, fd.initializer->span.begin,
                std::string("a freshly-produced owned value cannot be stored "
