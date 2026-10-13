@@ -271,9 +271,11 @@ BEZEL_TEST(generic_interface_type_arg_conversion_4892,
 module M;
 public record R(X: int): IEquatable<R>
   public method Equals(other: R): bool => X = other.X;
+  public method GetHashCode(): int => X;
 end R;
 public record S(Y: int): IEquatable<S>
   public method Equals(other: S): bool => true;
+  public method GetHashCode(): int => Y;
 end S;
 public class Program
   public static method Main(): int
@@ -418,6 +420,7 @@ BEZEL_TEST(generic_interface_type_arg_conversion_4892,
 module M;
 public record R(X: int): IEquatable<R>
   public method Equals(other: R): bool => X = other.X;
+  public override method GetHashCode(): int => X;
 end R;
 public class A: IEnumerable<int>
   private owned _xs: Array<int>;

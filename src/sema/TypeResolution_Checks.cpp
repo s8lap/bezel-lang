@@ -4405,27 +4405,83 @@ void Resolver::checkEqualsHashCodePairing() {
         auto isOwnTypeEquals = [&](const MethodSymbol* ms) {
             return isClassOwnTypeEquals(t, ms, ctx_);
         };
-        MethodSymbol* equalsOverride = nullptr;
-        MethodSymbol* equalsOwnTyped = nullptr;
-        bool overridesHashCode = false;
+        MethodSymbol* equalsOverride = nullptr;   // first `override Equals`
+        MethodSymbol* equalsOwnTyped = nullptr;   // first own-typed Equals, either spelling
+        MethodSymbol* equalsPlainOwn = nullptr;   // first plain own-typed Equals
+        bool overridesHashCode = false;           // `override GetHashCode`
+        bool declaresHashCode = false;            // `GetHashCode()`, either spelling
         for (Symbol* m : t->members) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (!ms || ms->isOperator) continue;
-            if (hasMod(ms, "override")) {
-                if (ms->name == "Equals" && !equalsOverride) equalsOverride = ms;
+            const bool isOverride = hasMod(ms, "override");
+            if (ms->name == "GetHashCode") {
                 // fix #5956 (§8.3, v0.338): the slot's `GetHashCode` is the
                 // zero-parameter one; a wrong-signature override does not
                 // discharge the obligation.
-                else if (ms->name == "GetHashCode" && ms->params.empty())
-                    overridesHashCode = true;
-            } else if (ms->name == "Equals" && t->kind == ast::TypeDeclKind::Class &&
-                       !equalsOwnTyped && isOwnTypeEquals(ms)) {
-                equalsOwnTyped = ms;
+                if (ms->params.empty()) {
+                    declaresHashCode = true;
+                    if (isOverride) overridesHashCode = true;
+                }
+                continue;
             }
+            if (ms->name != "Equals") continue;
+            if (isOverride && !equalsOverride) equalsOverride = ms;
+            if (!equalsOwnTyped && isOwnTypeEquals(ms)) equalsOwnTyped = ms;
+            if (!isOverride && !equalsPlainOwn && isOwnTypeEquals(ms))
+                equalsPlainOwn = ms;
         }
-        if (equalsOwnTyped && !equalsOverride && !overridesHashCode) {
+        // §8.3 (v0.338, #5955): on a value kind (record, enum, choice) an
+        // own-typed `Equals`, declared override or plain, obliges
+        // `GetHashCode`, and a plain `GetHashCode` discharges it: the rule
+        // reads both spellings of both members.
+        const bool valueKind = t->kind == ast::TypeDeclKind::Record ||
+                               t->kind == ast::TypeDeclKind::Enum ||
+                               t->kind == ast::TypeDeclKind::Choice;
+        // §8.3 (v0.338, #5955): a choice owning at every instantiation has no
+        // `Object` slot to fill and carries no plain-spelling obligation
+        // (§35.4, §35.11). Only a non-generic choice is classified here; a
+        // generic owning choice keeps the obligation (narrow #5955: a false
+        // reject, since the instantiation is not classified). The "no boxing
+        // reaches" conjunct of the spec wording is not checked (HYPOTHESIS).
+        bool owningChoice = false;
+        if (t->kind == ast::TypeDeclKind::Choice && t->genericParams.empty()) {
+            TypeRef self;
+            self.kind = TypeRef::Kind::Named;
+            self.declaration = t;
+            auto verdict = common::classifyChoiceType(&self, ctx_);
+            owningChoice = verdict && *verdict == common::ChoiceClassification::Owning;
+        }
+        if (valueKind && equalsOwnTyped) {
+            // The owning-choice exemption is taken for the plain spelling
+            // only: an `override Equals` on a choice keeps its existing
+            // obligation (the "no boxing reaches" conjunct is unverified here).
+            const bool exempt = owningChoice && !hasMod(equalsOwnTyped, "override");
+            if (!declaresHashCode && !exempt) {
+                if (hasMod(equalsOwnTyped, "override")) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, equalsOwnTyped->declLoc,
+                        "a type that overrides `Equals` must also override "
+                        "`GetHashCode` (§8.3)");
+                } else {
+                    const char* kindPhrase =
+                        t->kind == ast::TypeDeclKind::Record ? "a record"
+                        : t->kind == ast::TypeDeclKind::Enum ? "an enum"
+                                                             : "a choice";
+                    ctx_.diagnostics().report(
+                        Severity::Error, equalsOwnTyped->declLoc,
+                        std::string(kindPhrase) + " declaring `Equals(" +
+                        std::string(t->name) + ")` must declare `GetHashCode` "
+                        "(§8.3)");
+                }
+            }
+            return;
+        }
+        // §8.3 (v0.338, #5724): on a class, a plain own-typed `Equals` fills
+        // the `Object` slot and obliges the class's own `override GetHashCode`.
+        if (t->kind == ast::TypeDeclKind::Class && equalsPlainOwn &&
+            !equalsOverride && !overridesHashCode) {
             ctx_.diagnostics().report(
-                Severity::Error, equalsOwnTyped->declLoc,
+                Severity::Error, equalsPlainOwn->declLoc,
                 "a class declaring `Equals(" + std::string(t->name) +
                 ")` must override `GetHashCode` (§8.3)");
             return;

@@ -607,10 +607,12 @@ BEZEL_TEST(imported_iequatable_bound_5035, record_type_argument_still_rejected) 
                     "  public method Equals(other: Rec5035): bool "
                     "    return X = other.X; "
                     "  end Equals; "
+                    "  public method GetHashCode(): int return X; end GetHashCode; "
                     "end Rec5035; ",
         app5035("T11", "using var g := new RO5035(); "
                        "var p := new Rec5035(5); var q := new Rec5035(5); "
                        "return g.EqC5035(p, q);"));
+    BEZEL_EXPECT_TRUE(r.depOk);
     if (!r.depOk) return;
     BEZEL_EXPECT_FALSE(r.success);
     BEZEL_EXPECT_TRUE(r.err.find(kArgWidthReject5035) != std::string::npos);
