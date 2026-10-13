@@ -19,6 +19,7 @@ public class Point: IEquatable<Point>
   end constructor;
 
   public method Equals(other: Point): bool => X = other.X and Y = other.Y;
+  public override method GetHashCode(): int => X;
 end Point;
 
 public static class Helpers

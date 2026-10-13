@@ -4155,18 +4155,62 @@ void Resolver::checkOperatorGroups() {
 // would satisfy `=` while leaving the hash inconsistent — the classic
 // dictionary-lookup footgun the rule prevents (rationale §7.3). Records using
 // the same `override` form (§9.2) are covered uniformly. Was accepted silently.
+//
+// §8.3 (v0.338, proposal 0155, #5724): on a CLASS, an `Equals` whose one
+// parameter is the class's own type (`C`, `C?`, or `C<T…>` spelled with its
+// own type parameters) fills the `Object` slot whether or not it carries
+// `override`, and obliges `override GetHashCode()` exactly as an `Equals`
+// override does. Only the class's own `GetHashCode` override discharges it.
+// An `Equals` at any other parameter type obliges nothing.
 void Resolver::checkEqualsHashCodePairing() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
+        // §8.3 (v0.338): `C` or `C?`, with `C`'s own type parameters when
+        // generic. A type-parameter reference is a Named TypeRef with no
+        // declaration whose name is the parameter's own.
+        auto isOwnTypeParamRef = [](const TypeRef* a, const Symbol* gp) {
+            return a && a->kind == TypeRef::Kind::Named && !a->declaration &&
+                   a->genericArgs.empty() && !a->nullable &&
+                   a->headName() == gp->name;
+        };
+        auto isOwnTypeEquals = [&](const MethodSymbol* ms) {
+            if (ms->params.size() != 1) return false;
+            auto* param = dynamic_cast<ParameterSymbol*>(ms->params[0]);
+            if (!param) return false;
+            TypeRef* pt = param->declType ? ctx_.resolvedType(*param->declType)
+                                          : param->resolvedDeclType;
+            if (!pt || pt->kind != TypeRef::Kind::Named || pt->declaration != t)
+                return false;
+            if (t->genericParams.empty()) return pt->genericArgs.empty();
+            if (pt->genericArgs.size() != t->genericParams.size()) return false;
+            for (size_t i = 0; i < t->genericParams.size(); ++i) {
+                if (!isOwnTypeParamRef(pt->genericArgs[i], t->genericParams[i]))
+                    return false;
+            }
+            return true;
+        };
         MethodSymbol* equalsOverride = nullptr;
+        MethodSymbol* equalsOwnTyped = nullptr;
         bool overridesHashCode = false;
         for (Symbol* m : t->members) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
-            if (!ms || ms->isOperator || !hasMod(ms, "override")) continue;
-            if (ms->name == "Equals" && !equalsOverride) equalsOverride = ms;
-            else if (ms->name == "GetHashCode") overridesHashCode = true;
+            if (!ms || ms->isOperator) continue;
+            if (hasMod(ms, "override")) {
+                if (ms->name == "Equals" && !equalsOverride) equalsOverride = ms;
+                else if (ms->name == "GetHashCode") overridesHashCode = true;
+            } else if (ms->name == "Equals" && t->kind == ast::TypeDeclKind::Class &&
+                       !equalsOwnTyped && isOwnTypeEquals(ms)) {
+                equalsOwnTyped = ms;
+            }
+        }
+        if (equalsOwnTyped && !equalsOverride && !overridesHashCode) {
+            ctx_.diagnostics().report(
+                Severity::Error, equalsOwnTyped->declLoc,
+                "a class declaring `Equals(" + std::string(t->name) +
+                ")` must override `GetHashCode` (§8.3)");
+            continue;
         }
         if (equalsOverride && !overridesHashCode) {
             ctx_.diagnostics().report(

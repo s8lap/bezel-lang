@@ -81,6 +81,7 @@ const std::string kPrelude =
     "public class C: IEquatable<C> "
     "  public constructor() end constructor; "
     "  public method Equals(other: C): bool => true; "
+    "  public override method GetHashCode(): int => 0; "
     "end C; "
     "public class C2: IEquatable<Other> "
     "  public constructor() end constructor; "

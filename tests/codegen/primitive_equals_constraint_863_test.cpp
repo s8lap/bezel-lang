@@ -94,6 +94,7 @@ BEZEL_TEST(primitive_equals_constraint_863, user_class_equals_via_constraint) {
         "  public x: int; "
         "  public constructor(v: int) x := v; end constructor; "
         "  public method Equals(other: Pt): bool => x = other.x; "
+        "  public override method GetHashCode(): int => x; "
         "end Pt; "
         "static class U "
         "  public static method Eq<T>(a: T, b: T): int where T: IEquatable<T> "

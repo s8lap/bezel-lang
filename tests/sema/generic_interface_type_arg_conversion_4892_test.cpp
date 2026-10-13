@@ -321,6 +321,7 @@ public class C: IEquatable<C>
   private _n: int;
   public constructor(n: int) _n := n; end constructor;
   public method Equals(other: C): bool => _n = other.N();
+  public override method GetHashCode(): int => _n;
   public method N(): int => _n;
 end C;
 public class Program

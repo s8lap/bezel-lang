@@ -315,6 +315,7 @@ BEZEL_TEST(constraint_receiver_sigsub_5469,
         "public class CS: IEquatable<CS> "
         "  public constructor() end constructor; "
         "  public method Equals(other: CS): bool => true; "
+        "  public override method GetHashCode(): int => 0; "
         "end CS; "
         "public static class H "
         "  public static method F<T>(a: T, o: T): bool "
