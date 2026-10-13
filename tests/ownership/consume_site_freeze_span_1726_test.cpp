@@ -29,12 +29,12 @@
 #include <string>
 #include <string_view>
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"       // runAotCheckedDisposal — AOT oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::parseAndCheckOwnership;
-using bezel::test::runJitChecked;
+using bezel::test::runAotCheckedDisposal;
 
 namespace {
 
@@ -171,12 +171,12 @@ BEZEL_TEST(consume_site_freeze_span,
 
 // The accepted program runs to completion under checked disposal — the buffer's
 // storage is discharged exactly once (through the sink), with no double-free,
-// leak, or use-after-dispose fault. (runJit omits the ownership check, so this
-// exercises the accepted runtime behavior; the compile-time acceptance is
-// asserted by the ownership test above.)
+// leak, or use-after-dispose fault. (The ported-from JIT harness omitted the
+// ownership check, so this exercises the accepted runtime behavior; the
+// compile-time acceptance is asserted by the ownership test above.)
 BEZEL_TEST(consume_site_freeze_span,
            span_dead_before_consume_runs_clean_spec_28_3) {
-    auto r = runJitChecked(mod(
+    auto r = runAotCheckedDisposal(mod(
         "    var buf := new OwningBuffer<double>(4); "
         "    var s := buf.AsSpan(); "
         "    var n := s.Length; "
