@@ -662,6 +662,16 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
     return false;
 }
 
+// fix #6125 (stdlib §4.1, v0.338): the built-in borrowing collection heads
+// whose stdlib declaration names `Count` and no `Length` (`ICollection<T>`
+// and its inherited-only siblings `IList<T>`, `IReadOnlyList<T>` and
+// `IReadOnlyCollection<T>`). A user-declared type of the same name is not
+// matched by the caller (`!declaration` gate).
+static bool isCountOnlyCollection(std::string_view cn) {
+    return cn == "ICollection" || cn == "IList" || cn == "IReadOnlyList" ||
+           cn == "IReadOnlyCollection";
+}
+
 // Simple (last-component) name of a Named TypeRef, or empty for non-Named.
 // (A file-local copy of ExprTypecheck.cpp's `namedTypeSimpleName`, which is
 // static to its own translation unit.)
@@ -25506,14 +25516,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 std::string_view cn = isBuiltin
                     ? std::string_view(tt->headName())
                     : std::string_view();
-                const char* msg = nullptr;
+                std::string msg;
                 if (ma.member == "Count" && cn == "StringBuilder")
                     msg = "no member `Count` on `StringBuilder`: use `Length` "
                           "(stdlib §3.1)";
-                else if (ma.member == "Length" && cn == "ICollection")
-                    msg = "no member `Length` on `ICollection<T>`: use `Count` "
-                          "(stdlib §4.1)";
-                if (msg) {
+                else if (ma.member == "Length" && isCountOnlyCollection(cn))
+                    // fix #6125 (stdlib §4.1, v0.338): the same convention as
+                    // ICollection<T> above, for the list and read-only interfaces
+                    // that §4.1 also declares with `Count` only.
+                    msg = "no member `Length` on `" + std::string(cn) +
+                          "<T>`: use `Count` (stdlib §4.1)";
+                if (!msg.empty()) {
                     auto loc = ma.span.begin;
                     if (loc.line == 0 && ma.target)
                         loc = ma.target->span.begin;
@@ -30763,17 +30776,18 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty()) {
             std::string_view cn = recvTy->headName();
-            const char* msg = nullptr;
+            std::string msg;
             if (nm.member == "Count" && cn == "StringBuilder")
                 msg = "no member `Count` on `StringBuilder`: use `Length` "
                       "(stdlib §3.1)";
             else if (nm.member == "Count" && cn == "OwningBuffer")
                 msg = "no member `Count` on `OwningBuffer<T>`: use `Length` "
                       "(stdlib §4.14)";
-            else if (nm.member == "Length" && cn == "ICollection")
-                msg = "no member `Length` on `ICollection<T>`: use `Count` "
-                      "(stdlib §4.1)";
-            if (msg) {
+            else if (nm.member == "Length" && isCountOnlyCollection(cn))
+                // fix #6125 (stdlib §4.1, v0.338): `?.` twin of the bare arm.
+                msg = "no member `Length` on `" + std::string(cn) +
+                      "<T>`: use `Count` (stdlib §4.1)";
+            if (!msg.empty()) {
                 SourceLocation loc = nm.span.begin;
                 if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
                 ctx_.diagnostics().report(Severity::Error, loc, msg);
