@@ -179,7 +179,17 @@ MetaType convertType(const sema::TypeRef* ref) {
                 // first part of the syntactic name so the loader can identify
                 // the type and lowerTypeRef can route it to ptrTy() (or the
                 // appropriate value-type for DateTime/Guid/etc.).
-                t.namedName = std::string(ref->astNode->name->parts[0]);
+                // §27.8 (v0.338, #6022): an alias is a pure synonym. A ref
+                // reached through `type A := Array<int>` keeps the USE-SITE
+                // name `A` on astNode, and an importer has no `A` to look up
+                // (the alias is not an exported type), so the signature
+                // crossed the boundary naming a type that does not exist.
+                // Carry the alias TARGET's head, recorded at alias resolution
+                // (TypeRef::aliasResolvedHead), exactly as a direct spelling
+                // would have been carried.
+                t.namedName = ref->aliasResolvedHead.empty()
+                                  ? std::string(ref->astNode->name->parts[0])
+                                  : std::string(ref->aliasResolvedHead);
                 // per §2.2 (v0.313), fix #5241: an alias-qualified built-in
                 // (`D.Stopwatch`, alias segment dropped by sema) must not be
                 // carried as the BARE name, which an importer would rebind to
