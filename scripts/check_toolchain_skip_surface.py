@@ -29,7 +29,7 @@ THREE COUNTS, LIVE + CONTROL PAIR.
                      for which already exists at
                      check_ambiguous_ran_false.py:347 _text_checking_helpers,
                      and which this script REUSES by import — see Q7 in
-                     docs/proposals/oracle-ratchets-2026-09.md §8), and
+                     docs/proposals/papers/oracle-ratchets-2026-09.md §8), and
                      (b) an inline `if (<var>.diagnostics ... .find("SKIP")
                      != npos) return;`. absorbing_sites may ONLY fall.
   support_calls    - the control: the same tokens counted WITHOUT the

@@ -567,7 +567,7 @@ def write_baseline(uncovered_cur, incomplete_cur):
         '#',
         '# Two ints per row: uncovered_emitters first, incomplete_field_saves second.',
         '# See check_nested_body_scope_coverage.py\'s module docstring and',
-        '# docs/proposals/defect-campaign-2026-09.md §2.8 (Family L) for the six',
+        '# docs/proposals/papers/defect-campaign-2026-09.md §2.8 (Family L) for the six',
         '# open members.',
         '',
     ]
@@ -1035,7 +1035,7 @@ def main():
         print('`std::unordered_map<sema::MethodSymbol*, llvm::Function*>')
         print('methodFns_` POINTER-HASH order, not declaration order. See')
         print('LlvmBackend_Assign.cpp:4932 for the canonical-find shape and')
-        print('docs/proposals/defect-campaign-2026-09.md §2.8 (Family L)')
+        print('docs/proposals/papers/defect-campaign-2026-09.md §2.8 (Family L)')
         print('for the six open members (#3936, #2723, #2628, #4150,')
         print('#4151, #2748). Mark a site `// NESTED-BODY-SCOPE-ONLY:')
         print('<reason>` if a caller\'s body provably cannot reach the')

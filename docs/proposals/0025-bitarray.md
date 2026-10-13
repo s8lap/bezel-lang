@@ -7,7 +7,7 @@
 | **Target module(s)** | `System.Collections.Generic` (stdlib §4) — new §4.20 |
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |
 | **Currency note** | Refreshed 2026-09-17 to v0.306: the two "`System.Collections.Generic` is not auto-imported" claims (§D1, §6 item 2) corrected — §4 has been auto-imported since **v0.289** (0122 L3), and the quoted stdlib §4 sentence no longer exists. §D2/§D3/§D4's citations re-verified (`OwningBuffer<T>.Length`, `Array<T>.Sort`/`Reverse` — restored on `Array<T>` itself at v0.275 — and the `Span<T>` indexer bounds-check all stand). No tier-2 flags. Written-against pin unchanged. |
-| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #28 (P1), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
+| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #28 (P1), wave D3 of the [stdlib gap DESIGN plan](papers/stdlib-gap-design-plan-2026-07.md) |
 | **Depends on** | [Proposal 0008](0008-integer-toolkit.md) / [#1437](https://github.com/s8lap/bezel-lang/issues/1437) — `BitOperations.PopCount` is used internally for `PopCount`. `BitArray` without `PopCount` is independent; `PopCount` requires 0008 to land first. |
 
 ---

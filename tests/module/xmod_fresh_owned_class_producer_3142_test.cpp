@@ -3,7 +3,7 @@
 //
 // §2.8.3 rule 4 (imported artifacts) / §28.3 (Local variables, ownership, and
 // borrows) / §15.3, v0.252. Audit:
-// docs/proposals/imported-symbol-audit-2026-08-13.md, family F5.
+// docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F5.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

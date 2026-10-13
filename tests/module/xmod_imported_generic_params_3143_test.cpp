@@ -3,7 +3,7 @@
 //
 // §14.1 (Generic declarations) / §12.9 (Variance) / §9.4 (Records are value
 // types) / §2.5 (Dependency resolution) / §2.8.3 rule 4, v0.254. Audit:
-// docs/proposals/imported-symbol-audit-2026-08-13.md, family F6.
+// docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F6.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

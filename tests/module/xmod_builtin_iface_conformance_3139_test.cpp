@@ -3,7 +3,7 @@
 //
 // spec §18.5 (format specs) / §14.2 (generic constraints) / §2.5 (imported
 // declarations) / §2.8.2–§2.8.3 (module artifacts), v0.254. Audit:
-// docs/proposals/imported-symbol-audit-2026-08-13.md, family F1.
+// docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F1.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

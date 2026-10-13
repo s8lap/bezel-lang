@@ -2,7 +2,7 @@
 // resolution at a use site") of the imported-symbol classification seam
 // (umbrella #3152). §22.12 (static members / class-level `const`) / §2.7 rule 1
 // (unqualified name resolution) / §2.5 + §2.8.3 rule 4 / §4.6 (string `+`),
-// v0.254. Audit: docs/proposals/member-symbol-audit-2026-08-13.md, Appendix A.4
+// v0.254. Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md, Appendix A.4
 // row `Exprs.cpp:1215` — "the two adjacent arms both got the fallback; this one
 // did not".
 //

@@ -20950,7 +20950,7 @@ static bool typeRefReferencesAnyNameIn(
 // #3177 types the `?.` node the same access would instead reach codegen and
 // fail with an `undefined reference` at link time — so the two spellings must
 // consult ONE decline, not two copies of it. Audit drift-pair #13
-// (docs/proposals/member-symbol-audit-2026-08-13.md §6).
+// (docs/proposals/papers/member-symbol-audit-2026-08-13.md §6).
 //
 // `loc` is resolved by the caller (both spellings fall back to the receiver's
 // span when the access node's own span is degenerate, the #1307 pattern).

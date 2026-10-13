@@ -1,6 +1,6 @@
 // fix #3174 (§22.15 "Pure members", v0.254) — a `pure` constructor whose
 // `base(…)` chain target lives in an IMPORTED class. Family M8 of umbrella
-// #3149/#3152; see docs/proposals/member-symbol-audit-2026-08-13.md.
+// #3149/#3152; see docs/proposals/papers/member-symbol-audit-2026-08-13.md.
 //
 // §22.15 (v0.254), verbatim: "A pure constructor's `base(…)`/`this(…)` chain
 // target must itself be pure."

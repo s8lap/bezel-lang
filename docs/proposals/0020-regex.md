@@ -415,7 +415,7 @@ Kept explicitly out of v1 so the door is labelled:
 
 ## 12. Relationship to existing issues and proposals
 
-- **Gap-review item #19**, wave D3 ([stdlib gap review](stdlib-gap-review-2026-07.md); [design plan](stdlib-gap-design-plan-2026-07.md)). The review notes it as "deferred in stdlib §11" — this proposal is that deferral coming due.
+- **Gap-review item #19**, wave D3 ([stdlib gap review](papers/stdlib-gap-review-2026-07.md); [design plan](papers/stdlib-gap-design-plan-2026-07.md)). The review notes it as "deferred in stdlib §11" — this proposal is that deferral coming due.
 - **[#1438](https://github.com/s8lap/bezel-lang/issues/1438) / [#1448](https://github.com/s8lap/bezel-lang/issues/1448)** — borrow-bearing values (params / locals) in async contexts. The borrow-free Match design (§5) is chosen *specifically* to stay clear of these; span-input/span-Match forms are deferred (§10) until they settle.
 - **[#1363](https://github.com/s8lap/bezel-lang/issues/1363)** — static-mutable-state side door: the reason there is no hidden pattern cache (§Q2).
 - **spec §9.7** (borrow-bearing records), **§16.3** (`Range<int>`), **§29.11** (lazy single-consumption), **§28.14** (call-bounded callbacks, v0.177), **§4.6** (string = code points), **§31.4** (exception hierarchy / import-with-producer principle); **stdlib §9.6** (String), **§3.3** (ReadOnlyStringSpan), **§2.18** (defined-fault format model), **§1** (Try convention — `Find` returns a nullable, the (b) nullable-return Try shape).

@@ -5,7 +5,7 @@
 // conversions) / §22.10 (primary constructors) / §22.8 (construction sequence)
 // / §14.2 (`where T: new()`) / §9.7 (borrow-bearing records) / §2.8.3 rule 4
 // (imported artifacts), v0.254. Audit:
-// docs/proposals/imported-symbol-audit-2026-08-13.md, family F3.
+// docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F3.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

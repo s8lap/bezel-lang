@@ -1,5 +1,5 @@
 // fix #3671 (§9.1 / §9.2 / §22.8 / §2.8.2, v0.286) — census row 7 residual
-// (docs/proposals/duplication-census-2026-08-30.md §2 row 7 / §6 point 6):
+// (docs/proposals/papers/duplication-census-2026-08-30.md §2 row 7 / §6 point 6):
 // `buildRecordValue` (LlvmBackend_Exprs2.cpp) initialized an imported record's
 // body-declared field/auto-property with ONLY the constant-foldable-text
 // replay (`ctx_.importedConstValue` / `foldImportedConstText`, #2467/#328),

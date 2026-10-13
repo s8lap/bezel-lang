@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_imported_symbol_reads.py - ratchet the imported-symbol classification seam.
 
-WHY (umbrella #3152, audit docs/proposals/imported-symbol-audit-2026-08-13.md).
+WHY (umbrella #3152, audit docs/proposals/papers/imported-symbol-audit-2026-08-13.md).
 `ModuleLoader` never assigns `Symbol::decl` for an imported type - there is no
 `ast::TypeDecl` to assign, because the importing compilation has no AST for a
 dependency's types at all (`reconstructTypeSymbol` at ModuleLoader.cpp:325,
@@ -604,7 +604,7 @@ def write_baseline(c1, c2, c3):
         '# scripts/imported_symbol_reads.grandfather (which only ever falls - see',
         '# that file\'s header) - the excess needs a `// SEAM-DEBT: #NNNN <reason>`',
         '# marker at each new site. See',
-        '# docs/proposals/imported-symbol-audit-2026-08-13.md for the per-site triage.',
+        '# docs/proposals/papers/imported-symbol-audit-2026-08-13.md for the per-site triage.',
         '',
         '# class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet',
         '#         for an imported symbol.',
@@ -1115,7 +1115,7 @@ def main():
             print('  ' + v)
         print('\nA new AST-gated classification read answers WRONG for every imported')
         print('symbol, silently. Read the fact off the sema::TypeSymbol instead - see')
-        print('docs/proposals/imported-symbol-audit-2026-08-13.md §4 for the four')
+        print('docs/proposals/papers/imported-symbol-audit-2026-08-13.md §4 for the four')
         print('accessors that already do this correctly.')
         return 1 if a.strict else 0
     for l in sanc_lines:

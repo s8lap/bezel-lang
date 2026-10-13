@@ -9,7 +9,7 @@
 # scripts/imported_symbol_reads.grandfather (which only ever falls - see
 # that file's header) - the excess needs a `// SEAM-DEBT: #NNNN <reason>`
 # marker at each new site. See
-# docs/proposals/imported-symbol-audit-2026-08-13.md for the per-site triage.
+# docs/proposals/papers/imported-symbol-audit-2026-08-13.md for the per-site triage.
 
 # class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet
 #         for an imported symbol.

@@ -172,7 +172,7 @@ that proves the rule, "is this Exception-derived?", **1 copy, by design (#3046)*
 
 ### 0.2 The duplication census: this is a known, measured hotspot class
 
-`docs/proposals/duplication-census-2026-08-30.md` §4, measured 2026-08-30:
+`docs/proposals/papers/duplication-census-2026-08-30.md` §4, measured 2026-08-30:
 
 - **Hotspot 3 — LINQ operator name list (#3589, extends open #3444).** *"10 hand-spellings,
   6 of them 37–44 names. Behaviour DISAGREES: measured the 44-name set
@@ -232,7 +232,7 @@ Two more found during this refresh, same root cause, not previously linked to 00
 
 ### 0.4 The defect-campaign families self-hosting would shrink
 
-`docs/proposals/defect-campaign-2026-09.md` (on `main`). Which members, and why:
+`docs/proposals/papers/defect-campaign-2026-09.md` (on `main`). Which members, and why:
 
 | Family | Members self-hosting reaches | Why |
 |---|---|---|

@@ -3,7 +3,7 @@
 //
 // §31.2.4 / §31.4 (F11), §14.4 / §28.5 (F12), §19.3 / §5.1 / §12.9 (F14), all
 // against §2.8.3 rule 4 (imported artifacts), v0.252.
-// Audit: docs/proposals/imported-symbol-audit-2026-08-13.md, §5.
+// Audit: docs/proposals/papers/imported-symbol-audit-2026-08-13.md, §5.
 //
 // ── THE SHARED SEAM ────────────────────────────────────────────────────────
 //

@@ -5,7 +5,7 @@
 // / §35.4 (the classification) / §35.5 (matching) / §35.7 (equality) /
 // §35.12 (sendability) / §2.5 (imported declarations) / §2.8.2–§2.8.3 (module
 // artifacts), v0.254. Audit:
-// docs/proposals/imported-symbol-audit-2026-08-13.md, family F9.
+// docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F9.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

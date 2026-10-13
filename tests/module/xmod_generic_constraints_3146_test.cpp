@@ -3,7 +3,7 @@
 //
 // §14.2 (generic constraints) / Appendix C.4 / §2.8.3 rule 4 (imported
 // artifacts), v0.252.
-// Audit: docs/proposals/imported-symbol-audit-2026-08-13.md, family F13.
+// Audit: docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F13.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

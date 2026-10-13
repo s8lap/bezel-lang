@@ -1,7 +1,7 @@
 // fix #3211 (§24.3 "Events" anchor / §2.5 "Dependency resolution"; v0.254) —
 // the handler lambda parameter of a `Subscribe` on an IMPORTED event was left
 // UNTYPED, so any use of it in the handler body failed to resolve. Family M4
-// of umbrella #3152; see docs/proposals/member-symbol-audit-2026-08-13.md
+// of umbrella #3152; see docs/proposals/papers/member-symbol-audit-2026-08-13.md
 // Appendix A.3 row `Calls.cpp:11288` ("UNIFY" with importedMemberType).
 //
 // SPEC STATUS OF THE SURFACE UNDER TEST. §24 is RETIRED at v0.254 ("the `event`

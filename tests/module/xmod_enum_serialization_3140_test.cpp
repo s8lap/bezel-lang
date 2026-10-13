@@ -4,7 +4,7 @@
 //
 // §9.8 (an enum "writes the member name as a string") / §10.2 / §2.8.3 rule 4
 // (imported artifacts), v0.252.
-// Audit: docs/proposals/imported-symbol-audit-2026-08-13.md, family F4.
+// Audit: docs/proposals/papers/imported-symbol-audit-2026-08-13.md, family F4.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
 //

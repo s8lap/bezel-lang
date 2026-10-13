@@ -6,7 +6,7 @@
 | **Tracking issue** | [#1450](https://github.com/s8lap/bezel-lang/issues/1450) |
 | **Target module(s)** | `System.Threading` (stdlib §6) — added as new members on the `Task` static class (§6.7) |
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |
-| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #15 (2×P1), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
+| **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #15 (2×P1), wave D3 of the [stdlib gap DESIGN plan](papers/stdlib-gap-design-plan-2026-07.md) |
 | **Dependency** | None blocking; sits downstream of `TaskScope` §6.10 (v0.175) but is independent of it |
 
 ---

@@ -16,7 +16,7 @@
 //     interface; §11.2's "matches" rule cannot answer differently for the
 //     two. Spec revision v0.254.
 //
-// Audit: docs/proposals/member-symbol-audit-2026-08-13.md, family M13
+// Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md, family M13
 // (rank 2). The audit's own §A.6 wording names exactly the three axes
 // pinned below.
 //

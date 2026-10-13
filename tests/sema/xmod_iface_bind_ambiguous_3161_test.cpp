@@ -1,7 +1,7 @@
 // Spec-derived regression test for issue #3161 — residue of #3143.
 //
 // §19.3/§19.5/§5.1/§12.9 (§2.8.3 rule 4 for the cross-module side),
-// v0.254. Audit: docs/proposals/imported-symbol-audit-2026-08-13.md,
+// v0.254. Audit: docs/proposals/papers/imported-symbol-audit-2026-08-13.md,
 // family F6 + the §19.3 admit-residue of #3161.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────

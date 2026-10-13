@@ -1,6 +1,6 @@
 # Family J — measurement table (HEAD b57a712e, 2026-09-18)
 
-Family J per `docs/proposals/defect-campaign-2026-09.md` §2.6. Seven open
+Family J per `docs/proposals/papers/defect-campaign-2026-09.md` §2.6. Seven open
 members. All measurements on the `worktree-family-J-anchor` worktree at
 HEAD `b57a712e9a2cee447328343fe4a64062cfdff3e9`, bezelc built from a
 fresh ccache config (no PCH stale), machine: the lane box (NVMe build,

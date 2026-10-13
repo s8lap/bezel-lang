@@ -2,7 +2,7 @@
 
 **Status:** audit, read-only. No `src/` change was made.
 **Base:** `main` @ `137f58f`, spec v0.252. **Umbrella:** #3152. **This half:** #3149.
-**Companion:** `docs/proposals/imported-symbol-audit-2026-08-13.md` (the `ast::TypeDecl` half).
+**Companion:** `docs/proposals/papers/imported-symbol-audit-2026-08-13.md` (the `ast::TypeDecl` half).
 
 ⚠ **Provenance is marked per row.** The `ast::TypeDecl` audit's §5 table was later found **wrong
 in six rows** (#3168) — sites it recorded as broken were already both-sources, and two of those

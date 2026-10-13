@@ -7,7 +7,7 @@
 
 ## 0. Summary
 
-This proposal expands item **P11** of [future-directions-2026-07-18.md](future-directions-2026-07-18.md). It contains two deliberately separated moves:
+This proposal expands item **P11** of [future-directions-2026-07-18.md](papers/future-directions-2026-07-18.md). It contains two deliberately separated moves:
 
 - **Part A — the guidance flip (§2), docs-only, no semantics change.** Rationale §12.2 currently ends its producer decision tree with *"When in doubt, choose Pattern A."* The evidence (§1) says the language has outgrown that default: the affine model (v0.150, rationale §5.23) removed the leak-risk argument that motivated it, the v0.190 calls-mint ruling (rationale §12.10) removed the fewer-obligations argument, the standard library itself has resolved the doubt toward Pattern B in **every** resource-bearing case (§1.2: 21 `OwningTask<T>` API methods, zero resource-bearing Pattern A APIs), and both recent API proposals (0001, 0018) chose B citing stdlib precedent (§1.3). The flip makes the recorded guidance match the recorded practice: **when in doubt over a fresh, single-consumer class result, choose Pattern B (`OwningTask<T>`); Pattern A (`Task<T>` for class T) becomes the marked, justified case** — fan-out and chained republication, stated in a doc comment. Not one signature, not one program, and not one compiler rule changes.
 

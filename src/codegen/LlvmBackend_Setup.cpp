@@ -28846,7 +28846,7 @@ struct StringEscapeWalker {
                 if (ps && ps->modifier == "out") {
                     const sema::TypeRef* fty = ps->resolvedDeclType;
                     if (!fty && chosen->decl) {
-                        // SEAM-ACCESSOR: AST-fallback — `chosen->decl` is null for every imported constructor (docs/proposals/imported-symbol-audit-2026-08-13.md §2), so this fires only for LOCAL constructors with unresolved `resolvedDeclType`. Mirrors #3304's parallel `walkCallArgs` site (same shape; same marker).
+                        // SEAM-ACCESSOR: AST-fallback — `chosen->decl` is null for every imported constructor (docs/proposals/papers/imported-symbol-audit-2026-08-13.md §2), so this fires only for LOCAL constructors with unresolved `resolvedDeclType`. Mirrors #3304's parallel `walkCallArgs` site (same shape; same marker).
                         if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(
                                 chosen->decl))
                             if (i < cd->params.size() && cd->params[i].type)

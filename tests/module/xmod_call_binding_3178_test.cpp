@@ -4,7 +4,7 @@
 // §22.5 named arguments across a module boundary.
 //
 // Family M5 of umbrella #3152; see
-// docs/proposals/member-symbol-audit-2026-08-13.md.
+// docs/proposals/papers/member-symbol-audit-2026-08-13.md.
 //
 // WHAT THE DEFECT WAS. `checkImportedCallArity` was the ENTIRE call-checking
 // path for an imported callee, and `resolveMethodOverload`'s candidate

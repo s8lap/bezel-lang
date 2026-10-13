@@ -2,7 +2,7 @@
 // UNWRAPPED by `wrapUserClassAsIEnumerable`, driving the §29.11 enumerator
 // vtable through a raw class pointer (SIGSEGV 139 on the standard
 // `for-in` shape). Per the in-repo handoff
-// (docs/proposals/imported-symbol-programme-status-2026-08-14.md §6b):
+// (docs/proposals/papers/imported-symbol-programme-status-2026-08-14.md §6b):
 //
 //   "The accessor-slot half is #3190; this is the enumerator half, which
 //    is a different resolution mechanism and is filed separately for that

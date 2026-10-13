@@ -80,7 +80,7 @@ struct StorageMember {
 // `Channel<T>` and from `where T: sendable` while the byte-identical local
 // declaration was accepted, and the §14.2 component path named the computed
 // property as a "field"). The audit's rule
-// (docs/proposals/imported-symbol-audit-2026-08-13.md §4) is that an accessor
+// (docs/proposals/papers/imported-symbol-audit-2026-08-13.md §4) is that an accessor
 // must consult both sources rather than switch on which one exists, so this
 // walk enumerates the members SYMBOL-side — the one enumeration both a local
 // and an imported type have — and asks the shared both-sources accessors for

@@ -249,7 +249,7 @@ With these, this proposal carries no open design question; the remaining path is
 
 ## 8. Relationship to existing issues and proposals
 
-- Gap-review item #25; wave D2 per the [stdlib gap design plan](stdlib-gap-design-plan-2026-07.md).
+- Gap-review item #25; wave D2 per the [stdlib gap design plan](papers/stdlib-gap-design-plan-2026-07.md).
 - The gap review note: "discharge-by-move ruling" — settled by `Persist()` in §2.3 above.
 - `Path.GetTempPath()` is the entry point for `TempFile.Create()` — the two additions are co-designed.
 - `Directory.CreateTempSubdirectory` is the directory analogue; a `TempDirectory` RAII type is explicitly deferred.

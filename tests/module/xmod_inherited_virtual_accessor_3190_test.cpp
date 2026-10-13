@@ -3,7 +3,7 @@
 //
 // §12.1 / §12.5 (inheritance and dispatch) / §23 (properties) / §23.4
 // (indexers) / §2.8.2 clause 1 / §2.8.3 rule 4, v0.254.
-// Audit: docs/proposals/member-symbol-audit-2026-08-13.md, family M6 (rank 3).
+// Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md, family M6 (rank 3).
 //
 // ── WHAT THE AUDIT SAID, AND WHAT MEASUREMENT FOUND ────────────────────────
 //

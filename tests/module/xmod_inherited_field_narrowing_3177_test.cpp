@@ -1,7 +1,7 @@
 // Spec-derived regression test for issue #3177 — family M4 ("member TYPE
 // resolution at a use site") of the imported-symbol classification seam
 // (umbrella #3152). §7.4 (flow narrowing) / §2.5 + §2.8.3 rule 4 (imported
-// artifacts), v0.254. Audit: docs/proposals/member-symbol-audit-2026-08-13.md,
+// artifacts), v0.254. Audit: docs/proposals/papers/member-symbol-audit-2026-08-13.md,
 // Appendix A.3 rows `Calls.cpp:12429` / `:12435`, and the ⚠ coupling note in
 // §8 step 4.
 //
