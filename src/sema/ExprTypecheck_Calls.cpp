@@ -14396,6 +14396,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     //   Dispose(): unit (handled by using-var machinery)
                     if ((rcn == "TaskCompletionSource" ||
                          rcn == "OwningTaskCompletionSource") && recvTy) {
+                        // fix #6064 (§30.11, stdlib §6.6): the non-generic
+                        // `TaskCompletionSource` (void completion) declares
+                        // `SetResult()` / `TrySetResult(): bool` with NO result
+                        // parameter. The arm below sets only the result type
+                        // and never checks the argument list, so
+                        // `SetResult(1)` was silently accepted. Reject any
+                        // argument on the non-generic receiver; the generic
+                        // arity is unchanged.
+                        if (rcn == "TaskCompletionSource" &&
+                            recvTy->genericArgs.empty() &&
+                            (m == "SetResult" || m == "TrySetResult") &&
+                            !ce.args.empty()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`") + std::string(m) +
+                                "` has no overload that accepts " +
+                                std::to_string(ce.args.size()) +
+                                " argument(s): the non-generic "
+                                "`TaskCompletionSource` has no result "
+                                "parameter, so the call is `" +
+                                std::string(m) + "()` (\xC2\xA7""30.11, "
+                                "stdlib \xC2\xA7""6.6)");
+                        }
                         if (m == "TrySetResult" || m == "TrySetException" ||
                             m == "TrySetCancelled") {
                             // TrySet* → bool return.

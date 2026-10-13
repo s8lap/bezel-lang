@@ -78,7 +78,7 @@ BEZEL_TEST(tcs_974, non_generic_tcs_trysetresult_void_completes_task) {
         "class C "
         "  public static async method Run(): Task<int> "
         "    using var tcs := new TaskCompletionSource(); "
-        "    _ := tcs.TrySetResult(0); "
+        "    _ := tcs.TrySetResult(); "
         "    await tcs.Task; "
         "    return 42; "
         "  end Run; "
