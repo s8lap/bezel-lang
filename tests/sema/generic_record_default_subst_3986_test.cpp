@@ -518,6 +518,130 @@ BEZEL_TEST(generic_default_unconstrained_5820,
         "end P5820b;");
 }
 
+// #5962 residual (a): a TASK type is a non-defaultable reference type
+// (§17.11 v0.338, L3519 "a task type"). The direct `default(Task<int>)` is
+// rejected already; the generic-instantiation form must agree, not skip the
+// null-declaration builtin Named arg (ExprTypecheck.cpp, deferred join).
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_task_substitution_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module U5962a; "
+        "static class Util5962a "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    return 7; "
+        "  end Z; "
+        "end Util5962a; "
+        "class P5962a "
+        "  public static method Main(): int "
+        "    return Util5962a.Z<Task<int>>(); "
+        "  end Main; "
+        "end P5962a;");
+}
+
+// #5962 residual (a), collection-family representative: the same removed skip
+// now also judges Array<T> (a builtin collection, null-declaration Named arg).
+// §17.11 v0.338, L3519 "every substitution that is not defaultable -- a
+// non-nullable reference type"; direct `default(Array<int>)` rejects too.
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_array_substitution_rejected_spec_17_11) {
+    expectUnconstrainedDefaultRejected(
+        "module U5962b; "
+        "static class Util5962b "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    return 7; "
+        "  end Z; "
+        "end Util5962b; "
+        "class P5962b "
+        "  public static method Main(): int "
+        "    return Util5962b.Z<Array<int>>(); "
+        "  end Main; "
+        "end P5962b;");
+}
+
+// #5962 residual (a), ACCEPT controls (§17.11 v0.338, L3519): a NULLABLE
+// builtin substitution is defaultable (`null` exactly at a nullable
+// substitution) and must still RUN; a value builtin is defaultable at its zero.
+// Each row asserts r.ran and the exit code; no skip guard.
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_task_nullable_substitution_runs_spec_17_11) {
+    auto r = runAot(
+        "module CX5962a; "
+        "static class Util5962a2 "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    if t = null then return 5; end if; "
+        "    return 6; "
+        "  end Z; "
+        "end Util5962a2; "
+        "class P5962a2 "
+        "  public static method Main(): int "
+        "    return Util5962a2.Z<Task<int>?>(); "
+        "  end Main; "
+        "end P5962a2;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_array_nullable_substitution_runs_spec_17_11) {
+    auto r = runAot(
+        "module CX5962b; "
+        "static class Util5962b2 "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    if t = null then return 7; end if; "
+        "    return 8; "
+        "  end Z; "
+        "end Util5962b2; "
+        "class P5962b2 "
+        "  public static method Main(): int "
+        "    return Util5962b2.Z<Array<int>?>(); "
+        "  end Main; "
+        "end P5962b2;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_datetime_substitution_runs_spec_17_11) {
+    auto r = runAot(
+        "module CX5962c; "
+        "static class Util5962c "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    return 5; "
+        "  end Z; "
+        "end Util5962c; "
+        "class P5962c "
+        "  public static method Main(): int "
+        "    return Util5962c.Z<DateTime>(); "
+        "  end Main; "
+        "end P5962c;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
+BEZEL_TEST(generic_default_unconstrained_5820,
+           method_guid_substitution_runs_spec_17_11) {
+    auto r = runAot(
+        "module CX5962d; "
+        "static class Util5962d "
+        "  public static method Z<T>(): int "
+        "    var t := default(T); "
+        "    return 6; "
+        "  end Z; "
+        "end Util5962d; "
+        "class P5962d "
+        "  public static method Main(): int "
+        "    return Util5962d.Z<Guid>(); "
+        "  end Main; "
+        "end P5962d;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 6);
+}
+
 // Admitted substitution: a nullable reference type is defaultable (null).
 // Must RUN (§17.11: `null` exactly at a nullable substitution).
 BEZEL_TEST(generic_default_unconstrained_5820,

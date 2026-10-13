@@ -412,10 +412,13 @@ void ExprTC::checkDeferredDefaultInstantiations() {
         if (!bodyTakesDefault) continue;
         TypeRef* a = site.arg;
         if (!a || a->kind == TypeRef::Kind::Error) continue;
-        // A substitution that is itself an unresolved bare type parameter
-        // (a generic body instantiating another generic with its own `T`)
-        // cannot be judged here — its own instantiation sites will be.
-        if (a->kind == TypeRef::Kind::Named && !a->declaration) continue;
+        // #5962 (§17.11 v0.338, L3519: "a task type" is non-defaultable): a
+        // null-declaration Named arg is NOT skipped here. The shared walker
+        // (typeHasNoDefaultWalk, Named null-declaration arm) judges the
+        // builtin collection/Task family by name (`Task<int>`,
+        // `OwningTask<int>`), and DEFERS (returns false) for an unresolved
+        // bare type parameter (a generic body instantiating another generic
+        // with its own `T`), which its own instantiation sites judge.
         if (!defaultIllFormed(a)) continue;
         // #5820 (§17.11 v0.338, generic-body list bullet 1): an unconstrained
         // `default(T)` is rejected at every non-defaultable substitution; the
