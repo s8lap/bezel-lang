@@ -2883,7 +2883,20 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
             declareC("bz_wait_for_borrows",
                      llvm::Type::getVoidTy(llvm_), {ptrTy()}),
             {obj});
+        llvm::Value* isRO = builder_.CreateCall(
+            declareC("bz_exc_is_runtime_owned", llvm::Type::getInt8Ty(llvm_),
+                     {ptrTy()}), {obj});
+        llvm::Value* notRO = builder_.CreateICmpEQ(
+            isRO, builder_.getInt8(0), "obj.notro");
+        llvm::BasicBlock* freeBB = llvm::BasicBlock::Create(
+            llvm_, "obj.free", currentFn_);
+        llvm::BasicBlock* skipBB = llvm::BasicBlock::Create(
+            llvm_, "obj.keeplive", currentFn_);
+        builder_.CreateCondBr(notRO, freeBB, skipBB);
+        builder_.SetInsertPoint(freeBB);
         builder_.CreateCall(freeFn(), {obj});
+        builder_.CreateBr(skipBB);
+        builder_.SetInsertPoint(skipBB);
     }
 }
 

@@ -2191,14 +2191,17 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
     builder_.CreateBr(retB);
 
     // setfail: bz_exc holds the TypeInitializationException genericInstSfinitFn's
-    // own propagate block already wrapped. Save the INNER (original) exception —
-    // not the TIE itself, whose heap block a catch-arm disposer may reclaim —
-    // mirroring emitEnsureInitFns's failB exactly.
+    // own propagate block already wrapped. #5872: cache the TIE itself and mark
+    // it BORROWED — §22.7 requires this exact instance to be rethrown on every
+    // later access, and the borrow mark is what keeps a catch-arm disposer from
+    // reclaiming it out from under the next access.
     builder_.SetInsertPoint(failB);
     llvm::Value* tie0 = builder_.CreateLoad(ptrTy(), emitExcSlot());
-    llvm::Value* inner0 = builder_.CreateLoad(
-        ptrTy(), builder_.CreateGEP(i8Ty, tie0, builder_.getInt64(kExcInnerOffset)));
-    builder_.CreateStore(inner0, excGV);
+    builder_.CreateStore(tie0, excGV);
+    builder_.CreateCall(
+        declareC("bz_exc_mark_runtime_owned", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy()}),
+        {tie0});
     // #1391: RELEASE store, same rationale as doneB — publishes the excGV
     // write just above (and the failed state itself) to any domain that
     // later observes state==3 via an Acquire load or bz_static_init_wait.
@@ -2214,27 +2217,13 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
     builder_.CreateCall(notifyFn, {stateGV});
     builder_.CreateBr(retB);
 
-    // reraise: failed state — wrap a FRESH TypeInitializationException around
-    // the saved original each time (a reclaimed prior TIE must never be
-    // re-raised), mirroring emitEnsureInitFns's failedB exactly. Reached both
-    // from the fast chkfail path (state was already 3) and from crosswait
+    // reraise: failed state — raise the CACHED TypeInitializationException
+    // (§22.7 identity, #5872), mirroring emitEnsureInitFns's failedB. Reached
+    // both from the fast chkfail path (state was already 3) and from crosswait
     // (bz_static_init_wait returned 3) — both leave excGV already populated
-    // (by whichever domain's failB ran first), so both wrap the SAME saved
-    // inner exception.
+    // (by whichever domain's failB ran first), so both raise the SAME instance.
     builder_.SetInsertPoint(reraiseB);
-    llvm::Value* savedInner = builder_.CreateLoad(ptrTy(), excGV);
-    auto tieVit = builtinVtable_.find("TypeInitializationException");
-    if (tieVit != builtinVtable_.end()) {
-        llvm::Value* tie = builder_.CreateCall(
-            callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
-        builder_.CreateStore(tieVit->second, tie);
-        builder_.CreateStore(
-            savedInner,
-            builder_.CreateGEP(i8Ty, tie, builder_.getInt64(kExcInnerOffset)));
-        builder_.CreateStore(tie, emitExcSlot());
-    } else {
-        builder_.CreateStore(savedInner, emitExcSlot());
-    }
+    builder_.CreateStore(builder_.CreateLoad(ptrTy(), excGV), emitExcSlot());
     builder_.CreateBr(retB);
 
     builder_.SetInsertPoint(retB);
@@ -12192,20 +12181,25 @@ void Emitter::emitEnsureInitFns() {
         builder_.CreateBr(retB);
 
         // setfail: bz_exc holds the TypeInitializationException (inner=original;
-        // sfinit/cctor self-wrap in emitStaticConstructorBody). Save the INNER
-        // (the ORIGINAL) — NOT the TIE — because once the first raised TIE is
-        // caught its heap block is reclaimed by the handler, so re-storing that
-        // pointer on a later access would be a use-after-free. The TIE's disposer
-        // (bz$exDisposeMsg, #1033) releases only the owned Message@8 / ParamName@32
-        // (both null for a TIE → no-op) and intentionally does NOT touch
-        // InnerException@16, so the inner survives the first TIE's catch-arm
-        // disposal and stays valid for the reraise block to re-wrap. Mark failed;
-        // leave bz_exc = the TIE for this first raise.
+        // sfinit/cctor self-wrap in emitStaticConstructorBody). §22.7 requires the
+        // FIRST instance to be the one cached and rethrown for the life of the
+        // failed state, so cache the TIE itself, not a re-wrap of its inner.
+        //
+        // #5872: the cached TIE must NOT be reclaimed by any handler that catches
+        // it, or the next access re-reads a freed block (heap-use-after-free,
+        // measured). It is marked BORROWED — the same mechanism §30.4/§30.9 already
+        // uses for an exception that is in flight but not handler-owned — so every
+        // disposal site that consults bz_is_exc_borrowed skips it. The mark is
+        // permanent by design: the instance is process-lifetime by §31.4 (the
+        // runtime-owned exemption from §31.1's dispose-after-arm rule), so it is
+        // never unmarked and never becomes reclaimable.
         builder_.SetInsertPoint(failB);
         llvm::Value* tie0 = builder_.CreateLoad(ptrTy(), emitExcSlot());
-        llvm::Value* inner0 = builder_.CreateLoad(
-            ptrTy(), builder_.CreateGEP(i8Ty, tie0, builder_.getInt64(16)));
-        builder_.CreateStore(inner0, excGV);
+        builder_.CreateStore(tie0, excGV);
+        builder_.CreateCall(
+            declareC("bz_exc_mark_runtime_owned", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {tie0});
         // #1391 / §22.12 rule 1: RELEASE store, same rationale as doneB — this
         // publishes the excGV write just above (and the failed-state itself)
         // to any domain that later observes state==3 via an Acquire load.
@@ -12223,36 +12217,16 @@ void Emitter::emitEnsureInitFns() {
         builder_.CreateCall(notifyFn, {stateGV});
         builder_.CreateBr(retB);
 
-        // reraise: failed state — wrap a FRESH TypeInitializationException around
-        // the saved original (§22.7) and raise it. A fresh TIE each time avoids
-        // re-raising a reclaimed block.
-        //
-        // #1033 / §31.4: the block MUST be the uniform kExcObjSize (40), NOT the
-        // 24 bytes this once hard-coded. The TIE vtable's slot 2 is the built-in
-        // exception disposer bz$exDisposeMsg (it shares the disposer of every
-        // built-in exception), which reads ParamName@32 (and Message@8) on
-        // catch-arm-exit disposal. A 24-byte block put offset 32 OUT OF BOUNDS —
-        // the disposer read/wrote past the allocation, corrupting the heap and
-        // crashing the static-init failed-state-reraise paths (#720 / #796 /
-        // #1553). Message@8 stays null (calloc) so its release is a no-op;
-        // kExcObjSize keeps the ParamName@32 read in-bounds (also null → no-op),
-        // matching emitStaticConstructorBody's propagate-block TIE (which already
-        // uses kExcObjSize) and the §31.4 layout note in LlvmBackend_Iterators /
-        // LlvmBackend_Async ("a smaller alloc would make CauseChain@24 /
-        // ParamName@32 reads read out of bounds").
+        // reraise: failed state — raise the CACHED TypeInitializationException
+        // (§22.7: "the instance constructed on first failure is the one cached and
+        // rethrown; the triggering access and every subsequent access see the same
+        // cached TypeInitializationException instance"). #5872: the cached TIE is
+        // the block built by emitStaticConstructorBody's self-wrap, already a
+        // uniform kExcObjSize (40) allocation carrying the TIE vtable and its
+        // inner at offset 16, and marked borrowed above so no handler reclaims it
+        // — so it is safe to raise the same pointer on every later access.
         builder_.SetInsertPoint(failedB);
-        llvm::Value* savedInner = builder_.CreateLoad(ptrTy(), excGV);
-        auto tieVit = builtinVtable_.find("TypeInitializationException");
-        if (tieVit != builtinVtable_.end()) {
-            llvm::Value* tie = builder_.CreateCall(
-                callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
-            builder_.CreateStore(tieVit->second, tie);  // vtable at offset 0
-            builder_.CreateStore(savedInner,
-                builder_.CreateGEP(i8Ty, tie, builder_.getInt64(16)));  // inner@16
-            builder_.CreateStore(tie, emitExcSlot());
-        } else {
-            builder_.CreateStore(savedInner, emitExcSlot());  // fallback: raw
-        }
+        builder_.CreateStore(builder_.CreateLoad(ptrTy(), excGV), emitExcSlot());
         builder_.CreateBr(retB);
 
         builder_.SetInsertPoint(retB);

@@ -890,6 +890,7 @@ int8_t bz_task_fault_borrowed(void* tp) {
 // in/absent from the set is a no-op.
 static thread_local std::unordered_set<void*> g_borrowed_exc;
 
+
 extern "C" void bz_mark_exc_borrowed(void* obj) {
     if (obj) g_borrowed_exc.insert(obj);
 }
@@ -1571,7 +1572,7 @@ void* bz_task_when_all_results(void* task_arr, int64_t elem_size) {
 // no type-specific support: it works for a WhenAllOwned<T> result (an
 // arbitrary class T) or a fault Exception alike. Mirrors the existing
 // bz_domain_spawn fault-wrap pattern (this file, DomainFaultedException path).
-static void bz_dispose_class_obj(void* obj) {
+static void bz_dispose_class_obj_impl(void* obj) {
     if (!obj) return;
     void** vtbl = nullptr;
     memcpy(&vtbl, obj, sizeof(void*));
@@ -1592,6 +1593,42 @@ static void bz_dispose_class_obj(void* obj) {
     // never happens for a class without the §31.4 header.
     bz_exc_reclaim_causechain_registered(obj);
     free(obj);
+}
+
+// EXPERIMENT (#5872): process-wide registry of RUNTIME-OWNED exceptions —
+// objects the spec declares live for the life of the process and that no
+// handler may ever reclaim. The §22.7 cached TypeInitializationException is
+// the motivating case. Unlike g_borrowed_exc this must NOT be thread-local:
+// the cached instance is process-global, so a mark made on the domain that
+// ran the failing initializer has to be visible to every other domain that
+// later catches it. Mutex-guarded (a cross-domain insert/read).
+static std::mutex g_runtime_owned_exc_mtx;
+static std::unordered_set<void*> g_runtime_owned_exc;
+// Non-zero once any runtime-owned instance exists. Every reclaim in the
+// program reads this first, so the overwhelming common case (no failed
+// static initializer anywhere) costs ONE relaxed atomic load and takes no
+// lock — the reclaim path must not serialize every object free in the
+// process behind this.
+static std::atomic<int> g_runtime_owned_exc_any{0};
+
+extern "C" void bz_exc_mark_runtime_owned(void* obj) {
+    if (!obj) return;
+    {
+        std::lock_guard<std::mutex> lk(g_runtime_owned_exc_mtx);
+        g_runtime_owned_exc.insert(obj);
+    }
+    g_runtime_owned_exc_any.store(1, std::memory_order_release);
+}
+extern "C" int8_t bz_exc_is_runtime_owned(void* obj) {
+    if (!obj) return 0;
+    if (!g_runtime_owned_exc_any.load(std::memory_order_acquire)) return 0;
+    std::lock_guard<std::mutex> lk(g_runtime_owned_exc_mtx);
+    return g_runtime_owned_exc.count(obj) ? 1 : 0;
+}
+extern "C" void bz_dispose_class_obj(void* obj) {
+    // EXPERIMENT (#5872): never reclaim a runtime-owned instance.
+    if (obj && bz_exc_is_runtime_owned(obj)) return;
+    return bz_dispose_class_obj_impl(obj);
 }
 
 // stdlib §6.7 / §30.10: Task.WhenAllOwned<T>(owned tasks: OwningArray<OwningTask<T>>):
