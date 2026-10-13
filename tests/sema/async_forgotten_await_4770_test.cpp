@@ -34,9 +34,12 @@ const char* kAsyncReturnNoAwait() {
 const char* kAsyncReturnOwningTaskNoAwait() {
     return
         "module M; "
+        "public sealed class Box "
+        "  public method V(): int return 7; end V; "
+        "end Box; "
         "class C "
-        "  public static method GetSeven(): OwningTask<int> "
-        "    return Task.FromResult<int>(7); end GetSeven; "
+        "  public static method GetSeven(): OwningTask<Box> "
+        "    return Task.FromOwnedResult(new Box()); end GetSeven; "
         "  public static async method Relay(): Task<int> "
         "    return GetSeven(); "
         "  end Relay; "
