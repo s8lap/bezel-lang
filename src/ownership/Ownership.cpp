@@ -15278,6 +15278,18 @@ bool isAsyncPatternAClassResultType(const sema::TypeRef* rt,
     const sema::TypeRef* arg = rt->genericArgs.front();
     // User class with a disposal obligation — the primary arm.
     if (common::isNonTrivialDisposeClass(arg, ctx)) return true;
+    // narrow #5723 / #5949 (§30.5 *No fourth kind*, v0.338): the rule reads
+    // "`Task<T>` for class or interface T" and the Pattern A row names `Object`.
+    // An interface T has no destructor of its own to classify, and the kinds
+    // are read off the operand's ownership state, not the disposal ceremony
+    // (K1.6), so an interface or Object result is gated unconditionally. The
+    // trivial-dispose CLASS gap is #5704's scope and is left as is.
+    if (arg->kind == sema::TypeRef::Kind::Primitive &&
+        arg->primitive == sema::PrimitiveType::Object)
+        return true;
+    if (arg->kind == sema::TypeRef::Kind::Named && arg->declaration &&
+        arg->declaration->kind == ast::TypeDeclKind::Interface)
+        return true;
     // fix #4338 / #3638: builtin owning/borrowing collections (Array, Dictionary,
     // OwningArray, etc.) carry disposal obligations but have null declarations.
     // `isNonTrivialDisposeClass` returns false for them; close the gap with the
