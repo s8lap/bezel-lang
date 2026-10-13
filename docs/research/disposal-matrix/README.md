@@ -10,6 +10,7 @@ This matrix asks whether every disposal obligation the spec creates is discharge
 |---|---|---|---|---|
 | 1 | v0.333 | 51 of 140 | 6 of 16 | 21 root causes, each filed as an issue (listed in the run file's `groups`); all decided in v0.334 (proposals 0159–0169) |
 | 2 | v0.334 | 12 of 140 | 6 of 22 | 8 issues: explicitly-disposed reassignment vs 0162 (#5832), the collection window (#5833), borrowed/static `OwningTask` await (#5834), return-slot timing (#5840), `Environment.Exit` in the exit pass (#5841), in-flight async advance (#5842), and existing #5796, #5800 |
+| 3 | v0.336 | 0 of 140 | 2 of 26 | targeted re-run (66 cells re-derived, 74 carried): the abandoned drop-on-overwrite's location (#5925, new, soundness) and a derived destructor's bare take of an inherited field read by the base destructor (#5913, second face); editorial residues of 0174 filed in #5926 |
 
 ## Files
 

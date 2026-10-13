@@ -31,7 +31,7 @@
   [
    "R6",
    "Span",
-   "Span<T>, ReadOnlySpan<T>, IReadOnlySpan<T>"
+   "Span<T>, ReadOnlySpan<T>, ArraySpan<T>, ReadOnlyArraySpan<T>, ReadOnlyStringSpan"
   ],
   [
    "R7",
