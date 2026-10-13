@@ -1177,6 +1177,36 @@ static std::string_view objectOwnSignatureMemberOf(
     return {};
 }
 
+// fix #5956 (§8.3, v0.338): an `Equals` whose one parameter is the class's own
+// type, `C` or `C?` (`C<T>` with its own type parameters when generic). Such
+// a member is the `Object` slot's second spelling ([§8.3]), so it is an
+// admitted override target with no base-side entry in `baseMembers`.
+static bool isClassOwnTypeEquals(const TypeSymbol* t, const MethodSymbol* ms,
+                                 const SemaContext& sema) {
+    // §8.3 (v0.338): `C` or `C?`, with `C`'s own type parameters when
+    // generic. A type-parameter reference is a Named TypeRef with no
+    // declaration whose name is the parameter's own.
+    auto isOwnTypeParamRef = [](const TypeRef* a, const Symbol* gp) {
+        return a && a->kind == TypeRef::Kind::Named && !a->declaration &&
+               a->genericArgs.empty() && !a->nullable &&
+               a->headName() == gp->name;
+    };
+    if (!t || !ms || ms->params.size() != 1) return false;
+    auto* param = dynamic_cast<ParameterSymbol*>(ms->params[0]);
+    if (!param) return false;
+    TypeRef* pt = param->declType ? sema.resolvedType(*param->declType)
+                                  : param->resolvedDeclType;
+    if (!pt || pt->kind != TypeRef::Kind::Named || pt->declaration != t)
+        return false;
+    if (t->genericParams.empty()) return pt->genericArgs.empty();
+    if (pt->genericArgs.size() != t->genericParams.size()) return false;
+    for (size_t i = 0; i < t->genericParams.size(); ++i) {
+        if (!isOwnTypeParamRef(pt->genericArgs[i], t->genericParams[i]))
+            return false;
+    }
+    return true;
+}
+
 void Resolver::checkEnumRestrictions() {
     if (!ctx_.module()) return;
     // fix #3601 (§10.4 / §10.5 / §11.6, v0.286): the two module-children-only
@@ -4278,29 +4308,8 @@ void Resolver::checkEqualsHashCodePairing() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
-        // §8.3 (v0.338): `C` or `C?`, with `C`'s own type parameters when
-        // generic. A type-parameter reference is a Named TypeRef with no
-        // declaration whose name is the parameter's own.
-        auto isOwnTypeParamRef = [](const TypeRef* a, const Symbol* gp) {
-            return a && a->kind == TypeRef::Kind::Named && !a->declaration &&
-                   a->genericArgs.empty() && !a->nullable &&
-                   a->headName() == gp->name;
-        };
         auto isOwnTypeEquals = [&](const MethodSymbol* ms) {
-            if (ms->params.size() != 1) return false;
-            auto* param = dynamic_cast<ParameterSymbol*>(ms->params[0]);
-            if (!param) return false;
-            TypeRef* pt = param->declType ? ctx_.resolvedType(*param->declType)
-                                          : param->resolvedDeclType;
-            if (!pt || pt->kind != TypeRef::Kind::Named || pt->declaration != t)
-                return false;
-            if (t->genericParams.empty()) return pt->genericArgs.empty();
-            if (pt->genericArgs.size() != t->genericParams.size()) return false;
-            for (size_t i = 0; i < t->genericParams.size(); ++i) {
-                if (!isOwnTypeParamRef(pt->genericArgs[i], t->genericParams[i]))
-                    return false;
-            }
-            return true;
+            return isClassOwnTypeEquals(t, ms, ctx_);
         };
         MethodSymbol* equalsOverride = nullptr;
         MethodSymbol* equalsOwnTyped = nullptr;
@@ -4310,7 +4319,11 @@ void Resolver::checkEqualsHashCodePairing() {
             if (!ms || ms->isOperator) continue;
             if (hasMod(ms, "override")) {
                 if (ms->name == "Equals" && !equalsOverride) equalsOverride = ms;
-                else if (ms->name == "GetHashCode") overridesHashCode = true;
+                // fix #5956 (§8.3, v0.338): the slot's `GetHashCode` is the
+                // zero-parameter one; a wrong-signature override does not
+                // discharge the obligation.
+                else if (ms->name == "GetHashCode" && ms->params.empty())
+                    overridesHashCode = true;
             } else if (ms->name == "Equals" && t->kind == ast::TypeDeclKind::Class &&
                        !equalsOwnTyped && isOwnTypeEquals(ms)) {
                 equalsOwnTyped = ms;
@@ -7084,23 +7097,35 @@ void Resolver::checkHidingAndOverride() {
                 // reaches the slot and nothing else does. Any other signature
                 // of the three names stays admitted as an overload (§12.2,
                 // resolved by §22.6), and `override` is checked by its own path.
+                //
                 // fix #5961 (§12.2, v0.338): "a static member of the three
                 // names stays blocked" — the admission covers instance
                 // members only, so a static `Equals`/`GetHashCode`/`ToString`
                 // is blocked at every parameter list (Object's own signature
-                // keeps the hiding message below). A `static class` is left
-                // as it was: the normative stdlib declares
-                // `public static class Convert` with static `ToString`
-                // overloads (spec question, see the commit body).
+                // keeps the hiding message below).
+                //
+                // fix #5956 (§12.2 / §12.1, v0.338): an `override` of one of
+                // the three names reaches the slot only at Object's own
+                // signature (or the class's own-typed `Equals`); the §12.2
+                // admission is for a NON-override declaration, so an override
+                // at any other parameter list overrides no virtual member.
                 if (auto* tm = dynamic_cast<const MethodSymbol*>(ms);
-                    tm && !tm->isOperator && hasMod(ms, "static") &&
+                    tm && !tm->isOperator &&
                     (tm->name == "Equals" || tm->name == "GetHashCode" ||
-                     tm->name == "ToString") &&
-                    objectOwnSignatureMemberOf(tm, ctx_).empty()) {
+                     tm->name == "ToString")) {
+                    bool objectSig =
+                        !objectOwnSignatureMemberOf(tm, ctx_).empty() ||
+                        isClassOwnTypeEquals(t, tm, ctx_);
+                    // A `static class` is not exempted by the spec text; the
+                    // normative stdlib declares `public static class Convert`
+                    // with static `ToString(value: int)` overloads, so this
+                    // path leaves static classes as they were (spec question,
+                    // see the #5961 commit body).
                     bool staticClass = false;
                     for (std::string_view mod : t->modifiers)
                         if (mod == "static") staticClass = true;
-                    if (!staticClass) {
+                    if (hasMod(ms, "static") && !staticClass &&
+                        objectOwnSignatureMemberOf(tm, ctx_).empty()) {
                         ctx_.diagnostics().report(
                             Severity::Error, ms->declLoc,
                             std::string("static member `") +
@@ -7111,6 +7136,17 @@ void Resolver::checkHidingAndOverride() {
                             "`ToString` is blocked at any parameter list "
                             "(\xC2\xA7""12.2)");
                         continue;
+                    }
+                    if (hasMod(ms, "override") && !objectSig) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string("`override ") +
+                            std::string(ms->name) +
+                            "` matches no virtual member: `Object." +
+                            std::string(ms->name) +
+                            "` is declared at a different signature, and "
+                            "`override` requires the matching one "
+                            "(\xC2\xA7""12.1, \xC2\xA7""12.2)");
                     }
                 }
                 if (!hasMod(ms, "override")) {

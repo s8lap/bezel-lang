@@ -36,8 +36,9 @@
 //       `ReferenceEquals`) gates suppression of the universal-surface
 //       check on whether the receiver is a type-name. An alias-qualified
 //       static receiver (`AliasCls.Equals()` for a class with a
-//       user-declared static `Equals` 0-arg, or any alias-qualified
-//       type-name receiver sharing a universal-member name) was treated
+//       user-declared static `Equals` 0-arg; such a declaration is now
+//       rejected, §12.2 L2027, #5956, so only a receiver sharing a
+//       universal-member name without that declaration is reachable) was treated
 //       as an INSTANCE receiver and the arity check fired rejecting a
 //       legitimate 0-arg call with "the universal `Object.Equals` member
 //       takes 1 argument(s) but the call supplies 0 (§8.1)" — a false
@@ -240,7 +241,8 @@ BEZEL_TEST(type_alias_family_4052,
 // A3: §8.1 universal-member arity check through a `type` alias. An alias-
 // qualified type-name receiver sharing a universal-member name must
 // suppress the §8.1 arity check exactly like the direct name. Hits: alias
-// of class with static `Equals()` (0-arg), alias of class calling the
+// of class with a user static `AliasProbe4052()` (renamed from a static
+// `Equals()` 0-arg, which §12.2 L2027 / #5956 now rejects), alias of class calling the
 // universal `Equals` directly, anti-regression for the direct-name
 // spelling, chained-outer-first known-open #4047.
 // ============================================================================
@@ -302,9 +304,11 @@ BEZEL_TEST(type_alias_family_4052,
     // FIXED (#4047): was a §8.1 universal-member arity rejection
     // (targetIsStaticReceiver stayed false because the outer alias
     // didn't resolve through to ClsChained4052), now 1 — the user-
-    // declared static `Equals() => true` resolves through the chained
-    // alias and the `if` takes the truthy branch. The fixed-point re-
-    // resolution sweep in `Resolver::resolveAliasForwardReferences`
+    // declared static `AliasProbe4052() => true` resolves through the
+    // chained alias and the `if` takes the truthy branch. A user-declared
+    // static `Equals()` is now rejected (§12.2 L2027, #5956), so the
+    // arity-suppression shape this comment once described is unwritable.
+    // The fixed-point re-resolution sweep in `Resolver::resolveAliasForwardReferences`
     // closes the upstream ordering gap; the alias-qualified type-name
     // receiver then sees through to ClsChained4052 and the §8.1 arity
     // check is suppressed exactly like the direct-name spelling.

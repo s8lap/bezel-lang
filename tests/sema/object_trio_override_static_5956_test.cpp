@@ -33,9 +33,86 @@ bool hasAnyObjectTrioDiag(const JitResult& r) {
 }  // namespace
 
 // §12.1 / §12.2 (v0.338, #5956): the issue's repro. The `override GetHashCode(x:
+// int)` matches no virtual member and is rejected at the declaration.
+BEZEL_TEST(object_trio_override_static_5956,
+           override_wrong_signature_getHashCode_spec_12_2) {
+    auto r = runAot(R"(
+module Conf;
+public class Point
+  public readonly property X: int;
+  public constructor() end constructor;
+  public override method Equals(other: Object?): bool => true;
+  public override method GetHashCode(x: int): int => x;
+end Point;
+public class Program
+  public static method Main(): int return 0; end Main;
+end Program;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "`override GetHashCode` matches no virtual member"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
 // §8.3 (v0.338, #5956): a wrong-signature `GetHashCode` override does not
+// discharge the pairing obligation of an `Equals` override.
+BEZEL_TEST(object_trio_override_static_5956,
+           wrong_signature_gethashcode_does_not_discharge_pairing_spec_8_3) {
+    auto r = runAot(R"(
+module M;
+public class Point
+  public constructor() end constructor;
+  public override method Equals(other: Object?): bool => true;
+  public override method GetHashCode(x: int): int => x;
+end Point;
+public class Program
+  public static method Main(): int return 0; end Main;
+end Program;
+)");
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "a type that overrides `Equals` must also override `GetHashCode` (§8.3)"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
 // §12.1 / §12.2 (v0.338, #5956): `override Equals` at a parameter list other
+// than Object's own (`Equals(a: int, b: int)`) overrides no virtual member.
+BEZEL_TEST(object_trio_override_static_5956,
+           override_wrong_signature_equals_spec_12_2) {
+    auto r = runAot(R"(
+module M;
+public class Point
+  public constructor() end constructor;
+  public override method Equals(a: int, b: int): bool => true;
+  public override method GetHashCode(): int => 0;
+end Point;
+public class Program
+  public static method Main(): int return 0; end Main;
+end Program;
+)");
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "`override Equals` matches no virtual member"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
 // §12.1 / §12.2 (v0.338, #5956): `override ToString` at `ToString(fmt: string)`
+// overrides no virtual member.
+BEZEL_TEST(object_trio_override_static_5956,
+           override_wrong_signature_toString_spec_12_2) {
+    auto r = runAot(R"(
+module M;
+public class Point
+  public constructor() end constructor;
+  public override method ToString(fmt: string): string => fmt;
+end Point;
+public class Program
+  public static method Main(): int return 0; end Main;
+end Program;
+)");
+    BEZEL_EXPECT_TRUE(hasErrorContaining(
+        r, "`override ToString` matches no virtual member"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
 // §12.2 (v0.338, #5961): a static `GetHashCode` at another parameter list is
 // blocked: "a static member of the three names stays blocked".
 BEZEL_TEST(object_trio_override_static_5956,
