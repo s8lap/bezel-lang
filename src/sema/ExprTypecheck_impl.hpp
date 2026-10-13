@@ -4129,6 +4129,13 @@ private:
     TypeSymbol* memberTargetType(const ast::Expr* target);
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
+    // per §27.6 (v0.338; #5814): a method reference's explicit type-argument
+    // list substituted into the formed function type.
+    TypeRef* applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
+                                    const MethodSymbol& ms, TypeRef* ft);
+    TypeRef* substituteMethodRefTypeArgs(
+        const std::vector<std::unique_ptr<ast::Type>>& targs,
+        const MethodSymbol& ms, TypeRef* ft);
 
     // §2.7 (v0.307) / fix #5012, #5013: does `headExpr` denote the builtin
     // `System.Threading.<clsName>` class through a QUALIFIED

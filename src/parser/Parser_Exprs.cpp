@@ -993,6 +993,17 @@ bool Parser::checkRetiredParenLambda() {
 // keywords cannot appear as expression operands, so admitting them cannot
 // turn a relational `<` into a false type-arg reading; an ill-formed
 // combination still reaches parseType, the authority.
+// per §27.6 (v0.338; proposal 0164) / §22.12: a generic method's type-argument
+// list is followed by `(` at a call, and by `)`, `]`, `,` or `;` where the
+// name is a method REFERENCE (`xs.Select(Util.Id<int>)`, `var f := Util.Id<int>;`).
+// None of the four can follow a `>` that closes a relational chain (the chain
+// would lack its right operand), so the scan stays unambiguous.
+static bool methodTypeArgsCloserFollows(const Token& after) {
+    if (after.kind != TokenKind::Punctuator) return false;
+    return after.text == "(" || after.text == ")" || after.text == "]" ||
+           after.text == "," || after.text == ";";
+}
+
 bool Parser::tokensLookLikeMethodTypeArgs() {
     // peekAt(0) must be `<`.
     std::size_t k = 1;                // start scanning after the opening `<`
@@ -1013,9 +1024,9 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
                     if (parenDepth != 0) return false; // `>>` inside function `(…)`
                     const Token& after = peekAt(k + 1);
                     if (depth == 2) {
-                        // both `>` consumed here; we need `(` next.
-                        return after.kind == TokenKind::Punctuator &&
-                               after.text == "(";
+                        // both `>` consumed here; we need `(` next, or a
+                        // reference's list terminator (§27.6, v0.338).
+                        return methodTypeArgsCloserFollows(after);
                     }
                     // depth == 1: `>>` closes this list twice (malformed),
                     // bail out.
@@ -1027,10 +1038,10 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
                 if (parenDepth != 0) return false; // `>` inside function-type `(…)`
                 --depth;
                 if (depth == 0) {
-                    // The closing `>` of the arg list.  Confirm `(` follows.
+                    // The closing `>` of the arg list.  Confirm `(` follows,
+                    // or a method reference's list terminator (§27.6).
                     const Token& after = peekAt(k + 1);
-                    return after.kind == TokenKind::Punctuator &&
-                           after.text == "(";
+                    return methodTypeArgsCloserFollows(after);
                 }
                 continue;
             }

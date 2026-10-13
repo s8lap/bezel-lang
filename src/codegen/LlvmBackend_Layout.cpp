@@ -5501,10 +5501,179 @@ llvm::Value* Emitter::applyMethodRefSlotAdapt(MrSlotAdapt k, llvm::Value* v,
     return v;
 }
 
+llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
+                                             llvm::Value* receiverVal,
+                                             const ast::Expr* refExpr) {
+    // per §27.6 (v0.338; #5814). Sema admitted this reference only with its
+    // full type-argument list on the member name (applyMethodRefTypeArgs).
+    const std::vector<std::unique_ptr<ast::Type>>* typeArgs = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(refExpr))
+        typeArgs = &ma->typeArgs;
+    const sema::TypeRef* fnTy = refExpr ? ctx_.exprType(*refExpr) : nullptr;
+    auto unsupported = [&](const char* why) -> llvm::Value* {
+        ctx_.diagnostics().report(
+            Severity::Error, refExpr ? refExpr->span.begin : SourceLocation{},
+            std::string("the reference to the generic method `") +
+                std::string(ms->name) + "` cannot be formed: " + why +
+                " (\xC2\xA7""27.6, v0.338; #5814 \xE2\x80\x94 write a lambda "
+                "that calls the method)");
+        return nullptr;
+    };
+    if (!typeArgs || typeArgs->size() != ms->genericParams.size() || !fnTy ||
+        fnTy->kind != sema::TypeRef::Kind::Function)
+        return unsupported("it names no type-argument list");
+    if (isExtensionMethod(ms) || ms->extensionDecl)
+        return unsupported("a generic extension member reference has no "
+                           "generic thunk yet");
+    if (ms->parent && !ms->parent->genericParams.empty())
+        return unsupported("a member of a generic type has no generic thunk "
+                           "yet");
+    if (ifaceMethodIndex_.count(ms) || vtableSlot_.count(ms))
+        return unsupported("a virtual or interface generic method has no "
+                           "generic thunk yet");
+    CallableInfo ci;
+    if (!callableInfo(ms, ci) ||
+        (ci.bodyKind != ast::MethodBodyKind::Expression &&
+         ci.bodyKind != ast::MethodBodyKind::Block))
+        return unsupported("its body is not available to specialize");
+    if (ms->genericParams.size() != typeArgs->size())
+        return unsupported("its declaration is not available to specialize");
+
+    // The substitution the reference names, resolved in the caller's scope.
+    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+    std::vector<std::string> idKeys;
+    for (std::size_t i = 0; i < typeArgs->size(); ++i) {
+        sema::TypeRef* arg = (*typeArgs)[i] ? ctx_.resolvedType(*(*typeArgs)[i])
+                                            : nullptr;
+        if (!arg) return unsupported("a type argument did not resolve");
+        const sema::TypeRef* inCaller =
+            substituteTypeRefLocal(arg, genericSubstSemaTy_);
+        const std::string_view gpName = ms->genericParams[i]->name;
+        newSubst[gpName] = lowerTypeRef(arg);
+        newSema[gpName] = inCaller;
+        idKeys.push_back(typeRefIdentityKey(inCaller));
+    }
+
+    const bool instMethod = !isStaticMethod(ms);
+    // The formed function type's slots, lowered in the caller's scope.
+    std::vector<llvm::Type*> thunkParamTys{ptrTy()};  // env
+    for (const auto& fp : fnTy->funcParams) {
+        if (!fp.modifier.empty()) thunkParamTys.push_back(ptrTy());
+        else thunkParamTys.push_back(lowerTypeRef(fp.type));
+    }
+    llvm::Type* retTy = (!fnTy->funcReturn ||
+                         fnTy->funcReturn->kind == sema::TypeRef::Kind::Unit)
+                            ? llvm::Type::getVoidTy(llvm_)
+                            : lowerTypeRef(fnTy->funcReturn);
+    // A formation that converts representation at the target has no adapter on
+    // this path (#5208's adapters are keyed on the callee's own ABI).
+    if (const auto* mf = ctx_.methodRefFormation(*refExpr)) {
+        const sema::TypeRef* tgt = mf->target;
+        if (tgt && tgt->kind == sema::TypeRef::Kind::Function &&
+            tgt->funcParams.size() == fnTy->funcParams.size()) {
+            for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i)
+                if (fnTy->funcParams[i].modifier.empty() &&
+                    lowerTypeRef(tgt->funcParams[i].type) !=
+                        thunkParamTys[i + 1])
+                    return unsupported("the target function type changes a "
+                                       "parameter's representation");
+            if (tgt->funcReturn && retTy->isVoidTy() == false &&
+                lowerTypeRef(tgt->funcReturn) != retTy)
+                return unsupported("the target function type changes the "
+                                   "return representation");
+        }
+    }
+    const FnValKind kind = closureKindForMethod(ms, false);
+
+    auto cit = genericMethodThunks_.find({ms, idKeys});
+    if (cit != genericMethodThunks_.end())
+        return buildMethodClosureCell(cit->second, instMethod, receiverVal,
+                                      kind);
+
+    auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
+    static std::atomic<unsigned> gThunkCtr{0};
+    auto* thunk = llvm::Function::Create(
+        thunkFnTy, llvm::Function::InternalLinkage,
+        "gthunk$" + std::to_string(gThunkCtr.fetch_add(1)), module_.get());
+
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+
+    currentFn_ = thunk;
+    currentThis_ = nullptr;
+    locals_.clear(); paramSlots_.clear(); refParams_.clear();
+    disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    finallyBodyStack_.clear();
+    unwindTarget_ = nullptr; propagateBB_ = nullptr;
+    currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
+
+    auto argIt = thunk->args().begin();
+    llvm::Value* envPtrArg = &*argIt++;
+    std::vector<llvm::Value*> callArgs;
+    if (instMethod) callArgs.push_back(builder_.CreateLoad(ptrTy(), envPtrArg));
+    for (; argIt != thunk->args().end(); ++argIt) callArgs.push_back(&*argIt);
+
+    // The body lowers under the reference's substitution only.
+    genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
+    bool emitted = false;
+    llvm::Value* result = emitInlineGenericMethod(ms, callArgs, &emitted);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSema);
+
+    if (retTy->isVoidTy()) {
+        builder_.CreateRetVoid();
+    } else if (result && result->getType() == retTy) {
+        builder_.CreateRet(result);
+    } else {
+        builder_.CreateUnreachable();
+        emitted = false;
+    }
+
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    finallyBodyStack_ = std::move(savedFinallyBodies);
+    unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+    currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
+    diverged_ = savedDiverged;
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+
+    if (!emitted && !retTy->isVoidTy())
+        return unsupported("its body did not lower at the named arguments");
+    genericMethodThunks_[{ms, idKeys}] = thunk;
+    return buildMethodClosureCell(thunk, instMethod, receiverVal, kind);
+}
+
 llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                              llvm::Value* receiverVal,
                              const sema::TypeRef* recvStaticTy,
                              const ast::Expr* refExpr) {
+    // per §27.6 (v0.338; #5814): a reference over a generic method forms the
+    // method at the type arguments it names, never the erased template.
+    if (!ms->genericParams.empty() && refExpr)
+        return makeGenericMethodThunk(ms, receiverVal, refExpr);
     llvm::Function* origFn = nullptr;
     auto it = methodFns_.find(ms);
     if (it != methodFns_.end()) origFn = it->second;

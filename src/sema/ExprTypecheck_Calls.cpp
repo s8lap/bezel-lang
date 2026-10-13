@@ -22840,6 +22840,112 @@ bool ExprTC::isQualifiedBuiltinThreadingHead(const ast::Expr* headExpr,
     return false;
 }
 
+// per §27.6 *References to generic methods* (v0.338; proposal 0164, #5814): a
+// method reference over a generic method names its type arguments on the
+// member name (`Util.Keep<Pair>`), under §14.5's all-or-nothing rule for
+// explicit lists. The formed function type is the method's signature at
+// that substitution. Returns null when `targs` is not exactly the method's own
+// parameter count (or a type argument does not resolve).
+TypeRef* ExprTC::substituteMethodRefTypeArgs(
+    const std::vector<std::unique_ptr<ast::Type>>& targs,
+    const MethodSymbol& ms, TypeRef* ft) {
+    if (!ft || targs.empty() || ms.genericParams.size() != targs.size())
+        return nullptr;
+    std::unordered_map<std::string_view, TypeRef*> subst;
+    for (std::size_t i = 0; i < ms.genericParams.size(); ++i) {
+        auto* gps = dynamic_cast<GenericParamSymbol*>(ms.genericParams[i]);
+        if (!gps || !targs[i]) return nullptr;
+        TypeRef* tr = ctx_.resolvedType(*targs[i]);
+        if (!tr) return nullptr;
+        subst[gps->name] = tr;
+    }
+    TypeRef* out = substituteReturnType(ft, subst);
+    if (!out) return nullptr;
+    if (out != ft) out->funcReturnOwned = ft->funcReturnOwned;
+    return out;
+}
+
+// The formed type of a method reference `ma` over `ms` (§27.6, v0.338; null
+// after an error, leaving the access untyped so no cascade follows): a
+// reference to a generic method must name its type arguments, exactly the
+// declared count, and never reads them from the target ("no inference binds
+// them from the target"). A callee position (`Util.Keep<Pair>(x)`) is typed by
+// typeCall, not here. Overload selection follows §14.5's list rule: without a
+// list only candidates declaring no type parameters take part, so the error is
+// reported only where every candidate in the group is generic.
+TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
+                                        const MethodSymbol& ms, TypeRef* ft) {
+    if (!ft || &ma == calleeOfCallCtx_) return ft;
+    if (ma.typeArgs.empty()) {
+        if (ms.genericParams.empty()) return ft;
+        if (ms.parent) {
+            std::vector<MethodSymbol*> group;
+            collectHierarchyOverloads(ms.parent, ms.name, group);
+            for (MethodSymbol* ov : group)
+                if (ov->genericParams.empty()) return ft;
+        }
+        std::string names;
+        for (auto* g : ms.genericParams) {
+            if (!names.empty()) names += ", ";
+            names += std::string(g->name);
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, ma.span.begin,
+            "the method reference `" + std::string(ms.name) +
+                "` is a reference to a generic method and names no type "
+                "arguments: write `" + std::string(ms.name) + "<" + names +
+                ">` with each type parameter supplied \xE2\x80\x94 no inference "
+                "binds them from the target (\xC2\xA7""27.6, \xC2\xA7""14.5, v0.338)");
+        return nullptr;
+    }
+    if (ms.genericParams.size() != ma.typeArgs.size()) {
+        ctx_.diagnostics().report(
+            Severity::Error, ma.span.begin,
+            "the method reference `" + std::string(ms.name) + "` names " +
+                std::to_string(ma.typeArgs.size()) +
+                " type argument(s), but the method declares " +
+                std::to_string(ms.genericParams.size()) +
+                " type parameter(s) of its own \xE2\x80\x94 a reference to a "
+                "generic method names exactly its declared type parameters, "
+                "all or none (\xC2\xA7""27.6, \xC2\xA7""14.5, v0.338)");
+        return nullptr;
+    }
+    TypeRef* out = substituteMethodRefTypeArgs(ma.typeArgs, ms, ft);
+    if (!out) return ft;
+    // per §28.14 (v0.338): a formation whose slot, bound to a callee parameter
+    // other than `out` declared at a bare type parameter, is substituted with
+    // a function type is a set-erasing position
+    // (`b.Put<() -> int>` over `Put<T>(ref x: T)`).
+    if (ft->kind == TypeRef::Kind::Function && out->kind == TypeRef::Kind::Function &&
+        ft->funcParams.size() == out->funcParams.size()) {
+        for (std::size_t i = 0; i < ft->funcParams.size(); ++i) {
+            const auto& fp = ft->funcParams[i];
+            if (fp.modifier == "out" || fp.modifier == "out owned" || !fp.type ||
+                !out->funcParams[i].type ||
+                out->funcParams[i].type->kind != TypeRef::Kind::Function)
+                continue;
+            bool bare = false;
+            for (auto* g : ms.genericParams)
+                if (fp.type->kind != TypeRef::Kind::Function &&
+                    fp.type->headName() == g->name)
+                    bare = true;
+            if (!bare) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, ma.span.begin,
+                "the method reference `" + std::string(ms.name) +
+                    "` binds a function-typed argument to the parameter "
+                    "declared at the type parameter `" +
+                    std::string(fp.type->headName()) +
+                    "`, a set-erasing position: a call through the formed value "
+                    "would pass its argument where the callee's position "
+                    "announces no capture set \xE2\x80\x94 call the method "
+                    "directly (\xC2\xA7""28.14, \xC2\xA7""28.3, v0.338)");
+            return nullptr;
+        }
+    }
+    return out;
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // fix #4961 (spec §28.14, v0.307): "forming a method reference over
     // a capture-free-register position is a compile error". The capture-free
@@ -29982,7 +30088,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 unit->kind = TypeRef::Kind::Unit;
                 ft->funcReturn = unit;
             }
-            ctx_.setExprType(&ma, ft);
+            if (TypeRef* rt = applyMethodRefTypeArgs(ma, *ims, ft))
+                ctx_.setExprType(&ma, rt);
         }
         return;
     }
@@ -30137,7 +30244,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             ft->funcReturn = unit;
         }
         ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
-        ctx_.setExprType(&ma, ft);
+        if (TypeRef* rt = applyMethodRefTypeArgs(ma, *ms, ft))
+            ctx_.setExprType(&ma, rt);
     }
 }
 

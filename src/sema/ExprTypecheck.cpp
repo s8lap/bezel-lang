@@ -5191,10 +5191,24 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
     // unique winner.
     MethodSymbol* exactWinnerMs = nullptr;
     std::vector<MethodSymbol*> convertingWinnerMs;
+    // §27.6 / §14.5 (v0.338, #5814): the list rule — with a type-argument list
+    // only candidates declaring that many type parameters of their own take
+    // part (formed at that substitution); without one, only candidates
+    // declaring none.
+    const std::vector<std::unique_ptr<ast::Type>>* refTypeArgs = nullptr;
+    static const std::vector<std::unique_ptr<ast::Type>> kNoTypeArgs;
+    if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(fromExpr))
+        refTypeArgs = &rma->typeArgs;
+    else if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(fromExpr))
+        refTypeArgs = &rid->typeArgs;
+    if (!refTypeArgs) refTypeArgs = &kNoTypeArgs;
     for (MethodSymbol* ov : overloads) {
         if (sema::formalParamCount(*ov) != arity) continue;
+        if (ov->genericParams.size() != refTypeArgs->size()) continue;
 
         TypeRef* ft = buildMethodRefType(ov);
+        if (ft && !refTypeArgs->empty())
+            ft = substituteMethodRefTypeArgs(*refTypeArgs, *ov, ft);
         if (!ft) continue;
 
         bool modMatch = true;

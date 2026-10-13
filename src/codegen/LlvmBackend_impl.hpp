@@ -20212,6 +20212,18 @@ private:
                                  const sema::TypeRef* recvStaticTy = nullptr,
                                  const ast::Expr* refExpr = nullptr);
 
+    // per §27.6 *References to generic methods* (v0.338; proposal 0164, #5814):
+    // the thunk for a reference over a generic method at the type arguments the
+    // reference names. The generic method's compiled function is the erased
+    // template, so the thunk instead inlines / specializes the body under the
+    // reference's substitution (the path a call at those arguments takes).
+    // Cached per (method, type-argument identity keys).
+    llvm::Value* makeGenericMethodThunk(sema::MethodSymbol* ms,
+                                        llvm::Value* receiverVal,
+                                        const ast::Expr* refExpr);
+    std::map<std::pair<sema::MethodSymbol*, std::vector<std::string>>,
+             llvm::Function*> genericMethodThunks_;
+
     // fix #5208 (§27.6 / §5.1, v0.313): how one function-type slot of a
     // method-reference formation is bridged. `from` is the type the value
     // arrives as, `to` the type the other side expects (parameter slots:
