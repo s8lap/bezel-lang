@@ -7528,15 +7528,21 @@ void Resolver::checkAbstractImplementations() {
         }
         return typeRefEqual(a, b);
     };
-    // §11.2 (v0.338, #5985): the declaration-less positional shortcut applies
-    // to a pair of declaration-less Named refs. A bare method-level type
-    // parameter (no generic arguments) corresponds positionally to the
-    // candidate's bare type parameter, so only nullability is compared there.
-    // A generic built-in (`Array<V>`, `Dictionary<K, V>`) is NOT a bare
-    // parameter: its head spelling, nullability and generic arguments must
-    // all match under the substitution, and each argument pair is compared by
-    // this same rule (so `Array<U>` corresponds to `Array<T>` at the same
-    // position, while `Array<int>` and `Array<string>` never do).
+    // §11.2 (v0.338, #5985, #5996, #5995): "A member's own type parameters take
+    // part in the match by number and position, not by name." A
+    // declaration-less Named ref is a member's OWN type parameter only when
+    // its spelling is one of that member's declared generic parameters (read
+    // from the MethodSymbol, never inferred from the spelling's shape: a
+    // built-in class such as `Mutex` is also declaration-less). Name lookup
+    // resolves a method-level parameter before any built-in, so a parameter
+    // that shares a built-in's name still denotes the parameter.
+    //   * own vs own   -> match (nullability agrees);
+    //   * own vs other -> no match;
+    //   * neither      -> an ordinary type: head spelling, nullability and
+    //                     generic arguments must all be equal, each argument
+    //                     compared by this same rule (`Array<U>` against
+    //                     `Array<T>` at the same position, `Array<int>` never
+    //                     against `Array<string>`, `Mutex` never `Random`).
     // Function-typed arguments are not substituted by substTypeRef, so their
     // pair keeps the pre-#5985 nullability-only comparison (the #5971 cells).
     auto spellOf = [](const TypeRef* t) -> std::string_view {
@@ -7545,10 +7551,28 @@ void Resolver::checkAbstractImplementations() {
             return t->astNode->name->parts.back();
         return t->importedName;
     };
-    std::function<bool(const TypeRef*, const TypeRef*)> declLessNamedMatch =
-        [&](const TypeRef* a, const TypeRef* b) -> bool {
+    auto ownParamIndex = [&](const TypeRef* t,
+                             const MethodSymbol* m) -> int {
+        if (!m || t->kind != TypeRef::Kind::Named || t->declaration ||
+            !t->genericArgs.empty())
+            return -1;
+        std::string_view sp = spellOf(t);
+        for (std::size_t i = 0; i < m->genericParams.size(); ++i)
+            if (m->genericParams[i] && m->genericParams[i]->name == sp)
+                return static_cast<int>(i);
+        return -1;
+    };
+    std::function<bool(const TypeRef*, const TypeRef*, const MethodSymbol*,
+                       const MethodSymbol*)>
+        declLessNamedMatch =
+            [&](const TypeRef* a, const TypeRef* b, const MethodSymbol* aM,
+                const MethodSymbol* bM) -> bool {
+        int ai = ownParamIndex(a, aM);
+        int bi = ownParamIndex(b, bM);
+        if (ai >= 0 || bi >= 0)
+            return (ai >= 0) == (bi >= 0) && a->nullable == b->nullable;
         if (a->genericArgs.empty() && b->genericArgs.empty())
-            return a->nullable == b->nullable;
+            return typesMatch(a, b);
         if (a->nullable != b->nullable) return false;
         if (spellOf(a) != spellOf(b)) return false;
         if (a->genericArgs.size() != b->genericArgs.size()) return false;
@@ -7563,7 +7587,7 @@ void Resolver::checkAbstractImplementations() {
             }
             if (x->kind == TypeRef::Kind::Named && y->kind == TypeRef::Kind::Named &&
                 !x->declaration && !y->declaration) {
-                if (!declLessNamedMatch(x, y)) return false;
+                if (!declLessNamedMatch(x, y, aM, bM)) return false;
             } else if (!typesMatch(x, y)) {
                 return false;
             }
@@ -8282,7 +8306,7 @@ void Resolver::checkAbstractImplementations() {
                             // spelling (the renaming is intentional per §11.2).
                             // Generic built-ins (`Array<V>`) compare their
                             // arguments too (§11.2, v0.338, #5985).
-                            match = declLessNamedMatch(itSub, ctSub);
+                            match = declLessNamedMatch(itSub, ctSub, im, candidate);
                         } else {
                             match = typesMatch(itSub, ctSub);
                             if (!match && itSub && ctSub &&
@@ -8783,7 +8807,7 @@ void Resolver::checkAbstractImplementations() {
                     if (!itSub->declaration && !ctSub->declaration &&
                         itSub->kind == TypeRef::Kind::Named &&
                         ctSub->kind == TypeRef::Kind::Named) {
-                        match = declLessNamedMatch(itSub, ctSub);
+                        match = declLessNamedMatch(itSub, ctSub, im, impl);
                     } else {
                         match = typesMatch(itSub, ctSub);
                         if (!match && itSub && ctSub &&
