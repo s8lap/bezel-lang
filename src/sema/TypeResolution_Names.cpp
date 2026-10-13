@@ -2306,6 +2306,15 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                     checkOwnedDeclType(ref->funcReturn, t.span.begin,
                                        "a function-type return slot");
             }
+            // §22.3 (v0.338, #5986): record a function type that carries a
+            // `ref` slot; checkRefSlotFunctionTypes() decides it once every
+            // choice is classified.
+            for (const auto& fp : ref->funcParams) {
+                if (fp.modifier == "ref") {
+                    refSlotFunctionSites_.push_back({&t, ref});
+                    break;
+                }
+            }
             break;
         case ast::TypeKind::Named:
             resolveNamed(t, scope, *ref);

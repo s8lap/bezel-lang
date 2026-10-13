@@ -660,6 +660,10 @@ private:
     // member, or function-type slot) may not be declared at a move-only value
     // type. Runs after every member type and choice classification resolves.
     void checkRefParamMoveOnlyDeclarations();
+    // §22.3 (v0.338, #5986): a function type's `ref` slot at a move-only value
+    // type, at every position the function type is written (see
+    // refSlotFunctionSites_). Runs right after checkRefParamMoveOnlyDeclarations.
+    void checkRefSlotFunctionTypes();
     // fix #4494 (§22.5 "Defaults and modifiers", v0.306): "Every parameter
     // after the first defaulted parameter must itself have a default." Runs
     // over every LOCAL formal list that admits a default, reading the rule's
@@ -1847,6 +1851,19 @@ private:
         TypeSymbol* enclosingType = nullptr;  // for the bare-param Pass 2 recheck
     };
     std::vector<MoveOnlyElementSite> moveOnlyElementSites_;
+
+    // §22.3 (v0.338, #5986): every function TypeRef written with a `ref` slot,
+    // recorded at its resolution point (resolveType's Function case) and
+    // checked once, after classification, by checkRefSlotFunctionTypes().
+    // One recording site covers every position a function type is written:
+    // parameter, local, field, property, method return, generic argument and
+    // alias. The check cannot run at resolution time: a choice's classification
+    // is not yet known there.
+    struct RefSlotFunctionSite {
+        const ast::Type* site = nullptr;  // the function-type annotation node
+        TypeRef* fnRef = nullptr;         // its resolved Function TypeRef
+    };
+    std::vector<RefSlotFunctionSite> refSlotFunctionSites_;
 
     // stdlib §4.14 / spec §14.4 (#3794): one OwningBuffer<T>/Span<T>/
     // ReadOnlySpan<T> element slot whose T is a bare generic parameter of the

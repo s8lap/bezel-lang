@@ -3884,28 +3884,10 @@ void Resolver::checkIndexerRefOutParams() {
 // each instantiation that substitutes a move-only type.
 //
 // Walks every method and constructor parameter of every module-level type,
-// then recurses into function-typed parameter types so a `ref` slot of a
-// function type is checked too. Mirrors checkIndexerRefOutParams' walk.
-static void checkRefSlotsOfType(SemaContext& ctx, const TypeRef* t,
-                                SourceLocation loc) {
-    if (!t) return;
-    for (const auto& fp : t->funcParams) {
-        if (fp.modifier == "ref" && fp.type) {
-            const char* moveOnlyKind = nullptr;
-            if (common::isMoveOnlyValueType(fp.type, ctx, moveOnlyKind)) {
-                ctx.diagnostics().report(
-                    Severity::Error, loc,
-                    std::string("a function type's `ref` slot may not be "
-                                "declared at ") + moveOnlyKind +
-                    ", a move-only value type — no argument can bind a "
-                    "`ref` slot of move-only type; take the value as a plain "
-                    "parameter and return it, or use `out` (\xC2\xA7""22.3)");
-            }
-        }
-        checkRefSlotsOfType(ctx, fp.type, loc);
-    }
-}
-
+// then every nested type at any depth. A function type's `ref` slot is NOT
+// checked here: it is checked at its resolution point by
+// checkRefSlotFunctionTypes (#5986), which also covers a parameter's function
+// type, so a function-typed parameter is never reported twice.
 void Resolver::checkRefParamMoveOnlyDeclarations() {
     if (!ctx_.module()) return;
     auto checkParams = [&](const std::vector<Symbol*>& params,
@@ -3932,7 +3914,6 @@ void Resolver::checkRefParamMoveOnlyDeclarations() {
                         "(\xC2\xA7""22.3)");
                 }
             }
-            checkRefSlotsOfType(ctx_, paramType, ps->declLoc);
         }
     };
     for (Symbol* child : ctx_.module()->children) {
@@ -3959,6 +3940,33 @@ void Resolver::checkRefParamMoveOnlyDeclarations() {
                 }
             }
         });
+    }
+}
+
+// §22.3 (v0.338, #5986): "a function type's `ref` slot included" at every
+// position a function type is WRITTEN: a parameter type (#5566), a local, a
+// field, a property, a method return type, a generic argument and an alias.
+// Decided once per written function type (resolveType's Function case records
+// it in refSlotFunctionSites_), after every choice is classified, so a choice
+// slot is judged by its final classification. One annotation node is reported
+// once even when it is resolved more than once.
+void Resolver::checkRefSlotFunctionTypes() {
+    std::unordered_set<const ast::Type*> reported;
+    for (const RefSlotFunctionSite& s : refSlotFunctionSites_) {
+        if (!s.site || !s.fnRef || !reported.insert(s.site).second) continue;
+        for (const auto& fp : s.fnRef->funcParams) {
+            if (fp.modifier != "ref" || !fp.type) continue;
+            const char* moveOnlyKind = nullptr;
+            if (common::isMoveOnlyValueType(fp.type, ctx_, moveOnlyKind)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, s.site->span.begin,
+                    std::string("a function type's `ref` slot may not be "
+                                "declared at ") + moveOnlyKind +
+                    ", a move-only value type — no argument can bind a "
+                    "`ref` slot of move-only type; take the value as a plain "
+                    "parameter and return it, or use `out` (\xC2\xA7""22.3)");
+            }
+        }
     }
 }
 

@@ -198,6 +198,7 @@ void Resolver::run(const ast::SourceFile& src) {
     // §2.2 v0.164 / #1365: also collect import aliases for qualified-name
     // resolution in resolveNamed (§2.7).
     sourceImports_.clear();
+    refSlotFunctionSites_.clear();  // §22.3 (#5986), see checkRefSlotFunctionTypes
     importAliases_.clear();
     ambiguousImportNames_.clear();
     // fix #5140 (§2.3, v0.309): per-file §2.3 imported-public-vs-always-
@@ -598,6 +599,9 @@ void Resolver::run(const ast::SourceFile& src) {
     // §22.3 (v0.338, #5566): no `ref` parameter at a move-only value type
     // (declaration side; the call-site and ownership rules are separate).
     checkRefParamMoveOnlyDeclarations();
+    // §22.3 (v0.338, #5986): the same rule for a function type's `ref` slot
+    // wherever that function type is written (not only as a parameter type).
+    checkRefSlotFunctionTypes();
     // §14.4 / §15.3 (#3794): OwningBuffer<T>/Span<T>/ReadOnlySpan<T> reject
     // the §15.3 move-only kinds (owning inline arrays, owning-classified
     // choices) per the §14.4 exception's own clause. Pass 1 (concrete slot)

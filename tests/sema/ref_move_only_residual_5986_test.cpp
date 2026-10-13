@@ -7,9 +7,10 @@
 //
 // #5566 covered the parameter positions (methods, constructors, interface
 // members) and a function type that is itself a parameter type. This file
-// covers the residual lambda position (a): a lambda's written `ref` parameter.
-// The function-type `ref` slot at the other written positions (b) is in the
-// next commit of this lane.
+// covers the two residual positions: (a) a lambda's written `ref` parameter,
+// and (b) a function type's `ref` slot at every other position where the
+// function type is written: a local, a field, a property, a method return
+// type, a generic argument and an alias.
 //
 // The reject rows assert the §22.3 needle, the `(§22.3)` citation and the
 // `file:line:col: ` position, never `hasErrors()` alone. The control rows
@@ -48,6 +49,8 @@ const std::string kPrelude =
     "choice Bundle Ready(owned first: Res), Empty; end Bundle; "
     "choice Color Red, Green; end Color; ";
 
+const char* const kFnSlotNeedle =
+    "a function type's `ref` slot may not be declared at an owning-classified choice";
 const char* const kLambdaNeedle =
     "a `ref` parameter `b` of `lambda` may not be declared at an owning-classified choice";
 
@@ -83,6 +86,88 @@ BEZEL_TEST(sema_ref_move_only_residual_5986,
 // --- (b) function type's `ref` slot at a position other than a parameter -----
 
 BEZEL_TEST(sema_ref_move_only_residual_5986,
+           local_function_type_ref_slot_nullable_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: "a function type's `ref` slot included", as a LOCAL's
+    // declared type (a nullable function type, §27.2).
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var f: ((ref Bundle) -> ())? := null; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           field_function_type_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a FIELD's declared function type.
+    auto r = runAot(kPrelude +
+                    "class C private _f: ((ref Bundle) -> ())? := null; "
+                    "public static method Main() end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           property_function_type_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a PROPERTY's declared function type (block property,
+    // §23.3), backed by a field of the same type.
+    auto r = runAot(kPrelude +
+                    "class C private _f: ((ref Bundle) -> ())? := null; "
+                    "public property F: ((ref Bundle) -> ())? "
+                    "get => _f; end F; "
+                    "public static method Main() end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           method_return_function_type_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a method RETURN type that is a function type with a
+    // move-only `ref` slot.
+    auto r = runAot(kPrelude +
+                    "class C public static method G(): ((ref Bundle) -> ())? "
+                    "return null; end G; "
+                    "public static method Main() end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           generic_argument_function_type_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type as a generic ARGUMENT (`Array<F>`).
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var a: Array<(ref Bundle) -> ()> := []; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           alias_function_type_ref_slot_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: a function type written through a type alias
+    // (`type FB := (ref Bundle) -> ();`), at the alias declaration.
+    auto r = runAot(kPrelude +
+                    "type FB := (ref Bundle) -> (); "
+                    "class C public static method Main() var f: FB? := null; "
+                    "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(r, kFnSlotNeedle));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           local_function_type_ref_slot_owning_inline_array_rejected_sec_22_3) {
+    // §22.3 `ref` bullet: "an owning inline array" is a move-only value type
+    // (§15.3), so a function type's `ref` slot of that type is rejected too.
+    auto r = runAot(kPrelude +
+                    "class C public static method Main() "
+                    "var f: ((ref [2 owned]Res) -> ())? := null; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnosticWithLocation(
+        r, "a function type's `ref` slot may not be declared at an owning inline array"));
+}
+
+// --- controls: must still accept (run) ---------------------------------------
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
            lambda_ref_int_and_copyable_choice_still_accepted_sec_22_3) {
     // §22.3 `ref` bullet, control: a lambda `ref` parameter of a copyable type
     // (`int`, and the copyable choice `Color`) is not move-only and runs.
@@ -97,3 +182,46 @@ BEZEL_TEST(sema_ref_move_only_residual_5986,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
 }
 
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           function_type_ref_slot_class_and_int_still_accepted_sec_22_3) {
+    // §22.3 `ref` bullet, control: a function type's `ref` slot at an OWNING
+    // CLASS (`Res`, a reference type, not move-only) and at `int` is accepted
+    // in a local and a field.
+    auto r = runAot(kPrelude +
+                    "class C private _f: (ref Res) -> () := lambda(ref r: Res) => do end; "
+                    "public static method Main() "
+                    "var g: (ref int) -> () := lambda(ref n: int) => do end; "
+                    "var o: (ref Res) -> () := lambda(ref r: Res) => do end; "
+                    "Console.WriteLine(\"ran\"); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           function_type_ref_slot_type_parameter_still_accepted_sec_22_3) {
+    // §22.3 `ref` bullet: "a `ref` parameter whose declared type is or contains
+    // a type parameter is not rejected at its declaration". A function type
+    // `(ref T) -> ()` at a type parameter is accepted as written.
+    auto r = runAot(kPrelude +
+                    "class Box<T> private _f: ((ref T) -> ())? := null; end Box; "
+                    "class C public static method M<T>(f: (ref T) -> ()) end M; "
+                    "public static method Main() Console.WriteLine(\"ran\"); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
+}
+
+BEZEL_TEST(sema_ref_move_only_residual_5986,
+           function_type_plain_owned_out_slots_at_bundle_still_accepted_sec_22_3) {
+    // §22.3 `ref` bullet, control: plain, `owned` and `out` slots of a
+    // function type at the owning choice are not `ref` slots and stay legal,
+    // at a local and a field.
+    auto r = runAot(kPrelude +
+                    "class C private _f: ((Bundle) -> ())? := null; "
+                    "public static method Main() "
+                    "var p: (Bundle) -> () := lambda(b: Bundle) => do end; "
+                    "var o: (owned Bundle) -> () := lambda(owned b: Bundle) => do end; "
+                    "var u: (out Bundle) -> () := lambda(out b: Bundle) => do b := Bundle.Empty; end; "
+                    "Console.WriteLine(\"ran\"); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
+}
