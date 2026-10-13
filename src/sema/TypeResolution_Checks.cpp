@@ -1922,9 +1922,24 @@ void Resolver::checkGenericConstraintConsistency() {
     // type's). A bound whose head names one of these is a type-parameter bound
     // (§14.2's `where T: U`), as opposed to a bound naming a real class or
     // interface — the distinction the self/cycle checks below turn on.
+    // Which declaration-level §14.2 rules a `where` clause set is checked
+    // against. Type and method declarations run every rule. An extension
+    // block's where clauses (and its methods') are routed through the same
+    // pass one rule at a time, so each newly-reached rule is a separate,
+    // individually-tested change (issue #5805 follow-up).
+    enum : unsigned {
+        kRuleClassValue = 1u << 0,        // `class` with `value` (§14.2)
+        kRuleSelfCycle = 1u << 1,         // `where T: T` and bound cycles (§14.2)
+        kRuleObjectBound = 1u << 2,       // a bound naming `Object` (§14.2, C.4)
+        kRuleRecordEnumChoice = 1u << 3,  // a record/enum/choice bound (§14.2)
+        kRulesAll = 0xFu,
+    };
+    // The rules an extension block's `where` clauses currently run under.
+    constexpr unsigned kRulesExtension = kRuleObjectBound;
     auto checkList =
         [&](const std::vector<ast::GenericConstraint>& gcs,
-            const std::vector<std::string_view>& paramOrder, SourceLocation loc) {
+            const std::vector<std::string_view>& paramOrder, SourceLocation loc,
+            unsigned rules) {
             // Per type-parameter: does it require both `class` and `value`?
             std::unordered_map<std::string_view, std::pair<bool, bool>> kinds;
             for (const auto& gc : gcs)
@@ -1933,7 +1948,8 @@ void Resolver::checkGenericConstraintConsistency() {
                     else if (item.kind == "value") kinds[gc.typeParam].second = true;
                 }
             for (const auto& kv : kinds)
-                if (kv.second.first && kv.second.second)
+                if ((rules & kRuleClassValue) && kv.second.first &&
+                    kv.second.second)
                     ctx_.diagnostics().report(
                         Severity::Error, loc,
                         "contradictory constraints on type parameter `" +
@@ -1986,7 +2002,8 @@ void Resolver::checkGenericConstraintConsistency() {
                     std::string_view u = boundParam(item);
                     if (u.empty()) continue;
                     if (u == gc.typeParam) {
-                        if (selfReported.insert(gc.typeParam).second)
+                        if ((rules & kRuleSelfCycle) &&
+                            selfReported.insert(gc.typeParam).second)
                             ctx_.diagnostics().report(
                                 Severity::Error, loc,
                                 "self-referential constraint on type parameter `" +
@@ -2022,7 +2039,8 @@ void Resolver::checkGenericConstraintConsistency() {
                             std::sort(key.begin(), key.end());
                             std::string canon;
                             for (const auto& c : key) canon += c + ",";
-                            if (reported.insert(canon).second) {
+                            if ((rules & kRuleSelfCycle) &&
+                                reported.insert(canon).second) {
                                 std::string chain;
                                 for (std::string_view c : cyc)
                                     chain += "`" + std::string(c) + "` -> ";
@@ -2076,13 +2094,19 @@ void Resolver::checkGenericConstraintConsistency() {
                 for (const auto& item : gc.items) {
                     if (item.kind != "type" || !item.typeArg) continue;
                     if (!boundParam(item).empty()) continue;  // type-param bound
+                    // Only the bound-resolving rules need the bound resolved;
+                    // skipping the resolution keeps a rule that is not routed
+                    // here from re-reporting a name another pass owns.
+                    if (!(rules & (kRuleObjectBound | kRuleRecordEnumChoice)))
+                        continue;
                     TypeRef* bound = ctx_.resolvedType(*item.typeArg);
                     if (!bound) bound = resolveType(*item.typeArg, &boundScope);
                     // §14.2 (constraint table, `where T: SomeClass` row) and
                     // Appendix C.4 v0.338: a bound naming `Object` (§8.1, the
                     // root type, a primitive-kind TypeRef) is a compile error
                     // at the declaration. Issue #5805.
-                    if (bound && bound->kind == TypeRef::Kind::Primitive &&
+                    if ((rules & kRuleObjectBound) && bound &&
+                        bound->kind == TypeRef::Kind::Primitive &&
                         bound->primitive == PrimitiveType::Object) {
                         ctx_.diagnostics().report(
                             Severity::Error, loc,
@@ -2094,6 +2118,7 @@ void Resolver::checkGenericConstraintConsistency() {
                             std::string(gc.typeParam) + ": notnull`");
                         continue;
                     }
+                    if (!(rules & kRuleRecordEnumChoice)) continue;
                     if (!bound || bound->kind != TypeRef::Kind::Named ||
                         !bound->declaration)
                         continue;  // primitive/builtin/unresolved: defer
@@ -2131,7 +2156,7 @@ void Resolver::checkGenericConstraintConsistency() {
         if (!td) continue;
         std::vector<std::string_view> typeParams;
         for (const auto& gp : td->genericParams) typeParams.push_back(gp.name);
-        checkList(td->genericConstraints, typeParams, td->span.begin);
+        checkList(td->genericConstraints, typeParams, td->span.begin, kRulesAll);
         for (const auto& m : td->members)
             if (auto* mdl = dynamic_cast<const ast::MethodDecl*>(m.get())) {
                 // A method's `where` clause may bound a method parameter by an
@@ -2177,7 +2202,41 @@ void Resolver::checkGenericConstraintConsistency() {
                         "enclosing type parameter on a member is meaningless "
                         "and not a user-extensible mechanism)");
                 }
-                checkList(mdl->genericConstraints, methodParams, mdl->span.begin);
+                checkList(mdl->genericConstraints, methodParams, mdl->span.begin,
+                          kRulesAll);
+            }
+    }
+    // §14.2 (v0.338) with §26.4/§28.3 (`extension IEnumerable<T> where T: U`):
+    // an extension block's `where` clause is read under §14.2 (spec :5672), and
+    // its members are generic methods that declare the block's parameters
+    // before their own. Route both through the same pass. Only local blocks:
+    // imported extension symbols live outside `module->children`.
+    for (Symbol* child : ctx_.module()->children) {
+        auto* ex = dynamic_cast<ExtensionSymbol*>(child);
+        if (!ex || !ex->decl) continue;
+        auto* ed = dynamic_cast<const ast::ExtensionDecl*>(ex->decl);
+        if (!ed) continue;
+        // The block-level parameters ride the target type's generic-argument
+        // list (`T` in `extension IEnumerable<T>`), as in extensionTypeParams.
+        std::vector<std::string_view> extParams;
+        if (ed->targetType)
+            for (const auto& ga : ed->targetType->genericArgs) {
+                if (!ga) continue;
+                if (ga->kind == ast::TypeKind::Named && ga->name &&
+                    ga->name->parts.size() == 1 && !ga->nullable &&
+                    ga->genericArgs.empty())
+                    extParams.push_back(ga->name->parts.front());
+            }
+        checkList(ed->genericConstraints, extParams, ed->span.begin,
+                  kRulesExtension);
+        for (const auto& m : ed->members)
+            if (auto* mdl = dynamic_cast<const ast::MethodDecl*>(m.get())) {
+                std::vector<std::string_view> methodParams;
+                for (const auto& gp : mdl->genericParams)
+                    methodParams.push_back(gp.name);
+                for (std::string_view p : extParams) methodParams.push_back(p);
+                checkList(mdl->genericConstraints, methodParams, mdl->span.begin,
+                          kRulesExtension);
             }
     }
 }
