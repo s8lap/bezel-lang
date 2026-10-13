@@ -11202,6 +11202,60 @@ void Resolver::checkOneConstraint(SourceLocation useSite,
     // Unknown constraint kind: ignore (parser would not produce it).
 }
 
+// Primitive-type keyword spelling, defined below with the other diagnostic
+// spellers.
+static const char* primitiveKeyword(PrimitiveType p);
+
+// §14.2 *Type-parameter bounds* (v0.338, #5906): decides a `where T: U` whose
+// substitution for `U` (`uSubst`) is NOT a user declaration. A substitution S
+// satisfies the bound only when S is non-nullable and is identical to `U`'s
+// substitution, a class derived from a class substitution, or a type
+// conforming to an interface substitution; at `U := Object` the admitted set
+// is `Object` and every class type (string, interfaces, function types and
+// value types are not classes, §8.1); a nullable `U` admits nothing.
+// Precondition: `arg` is non-nullable and `uSubst` is non-nullable-or-nullable
+// but not a user declaration paired with a user `arg` (the caller routes that
+// pair through argSatisfiesTypeBound). Returns true only where the bound is
+// decidably unsatisfied; interface conformance of a non-user substitution is
+// left to the conformance tables (returns false, the historical defer).
+static bool typeBoundSubstitutionRejects(const TypeRef* arg,
+                                         const TypeRef* uSubst) {
+    if (uSubst->nullable) return true;
+    if (uSubst->kind == TypeRef::Kind::Primitive) {
+        if (uSubst->primitive != PrimitiveType::Object)
+            return !typeRefEqual(arg, uSubst);
+        // U := Object: Object itself and class types only.
+        if (arg->kind == TypeRef::Kind::Primitive)
+            return arg->primitive != PrimitiveType::Object;
+        if (arg->kind == TypeRef::Kind::Named)
+            // A builtin Named arg without a declaration is undecided here.
+            return arg->declaration != nullptr &&
+                   arg->declaration->kind != ast::TypeDeclKind::Class;
+        // Function types, inline arrays and unit are not classes.
+        return true;
+    }
+    if (uSubst->kind == TypeRef::Kind::Named && uSubst->declaration &&
+        uSubst->declaration->kind != ast::TypeDeclKind::Interface) {
+        // A user class/record/enum/choice: only an identical or derived
+        // user type satisfies it, and a non-user arg is neither.
+        return true;
+    }
+    return false;
+}
+
+// Spelling of `U`'s substitution for the §14.2 diagnostic (`where T: Object`).
+static std::string typeBoundSubstSpelling(const TypeRef* uSubst) {
+    std::string s;
+    if (uSubst->kind == TypeRef::Kind::Primitive)
+        s = primitiveKeyword(uSubst->primitive);
+    else if (uSubst->kind == TypeRef::Kind::Named && uSubst->declaration)
+        s = std::string(uSubst->declaration->name);
+    else
+        s = "<type>";
+    if (uSubst->nullable) s += "?";
+    return s;
+}
+
 void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                                        const std::vector<TypeRef*>& argRefs,
                                        Scope* scope) {
@@ -11333,7 +11387,8 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                             "` does not satisfy the constraint `where " +
                             std::string(gp->name) + ": " +
                             std::string(boundParam) + "` (§14.2)");
-                    } else if (uSubst->kind == TypeRef::Kind::Named &&
+                    } else if (!uSubst->nullable &&
+                               uSubst->kind == TypeRef::Kind::Named &&
                                uSubst->declaration &&
                                arg->kind == TypeRef::Kind::Named &&
                                arg->declaration) {
@@ -11346,9 +11401,20 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                                     t.span.begin, std::string(gp->name),
                                     std::string(uSubst->declaration->name),
                                     argSpelling(argAst), arg, uSubst});
+                    } else if (typeBoundSubstitutionRejects(arg, uSubst)) {
+                        // §14.2 (v0.338, #5906): a non-user substitution for
+                        // `U` admits only the identical type (or, at Object,
+                        // a class type); the rest is a compile error.
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("type argument `") +
+                            argSpelling(argAst) +
+                            "` does not satisfy the constraint `where " +
+                            std::string(gp->name) + ": " +
+                            typeBoundSubstSpelling(uSubst) + "` (§14.2)");
                     }
-                    // else: a substitution that is not a user declaration
-                    // (primitive/builtin/param) → defer (no diagnostic),
+                    // else: undecided here (interface conformance of a
+                    // non-user substitution) → defer (no diagnostic),
                     // matching checkOneConstraint's conservatism.
                     continue;
                 }
