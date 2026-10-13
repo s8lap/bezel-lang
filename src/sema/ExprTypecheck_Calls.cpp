@@ -30624,6 +30624,53 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 return;
             }
         }
+        // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
+        // collection/string head. The `.` form types these `int` in
+        // resolveMemberAccess; the `?.` form left them untyped (every
+        // type-driven check skipped, #2434 degrade). §7.5: "The result type is
+        // always nullable", so the result is `int?`. Reuse the SAME head
+        // predicates as the `.` path, and keep its Count-vs-Length rejections
+        // (§4.4 / §4.5 / §4.11) for the heads that declare only `Count`.
+        if (!member && recvTy && currentCallArity_ <= 0 &&
+            (nm.member == "Length" || nm.member == "Count") &&
+            recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty()) {
+            std::string_view cn = recvTy->headName();
+            // `Count`: the `.` form's two sources — the collection-family list
+            // of its issue #421/#420 block (ICollection<T>.Count, stdlib §4.3;
+            // OwningBuffer §4.14) and the registry predicate.
+            bool isIntProperty =
+                nm.member == "Length"
+                    ? common::isBuiltinIntLengthPropertyHead(cn)
+                    : (common::isBuiltinIntCountPropertyHead(cn) ||
+                       common::isPlainBuiltinCollectionHead(cn) ||
+                       common::isOwningCollectionHead(cn) ||
+                       cn == "OwningBuffer");
+            if (isIntProperty) {
+                ctx_.setExprType(
+                    &nm, ctx_.primitiveTypeRef(PrimitiveType::Int,
+                                              /*nullable=*/true));
+                return;
+            }
+            if (nm.member == "Length") {
+                const char* sec = nullptr;
+                if (cn == "Array") sec = "Array<T>`: use `Count` (stdlib \\S4.4)";
+                else if (cn == "OwningArray") sec = "OwningArray<T>`: use `Count` (stdlib \\S4.5)";
+                else if (cn == "Stack") sec = "Stack<T>`: use `Count` (stdlib \\S4.11)";
+                else if (cn == "OwningStack") sec = "OwningStack<T>`: use `Count` (stdlib \\S4.11)";
+                else if (cn == "Queue") sec = "Queue<T>`: use `Count` (stdlib \\S4.11)";
+                else if (cn == "OwningQueue") sec = "OwningQueue<T>`: use `Count` (stdlib \\S4.11)";
+                if (sec) {
+                    SourceLocation loc = nm.span.begin;
+                    if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("no member `Length` on `") + sec);
+                    return;
+                }
+            }
+        }
     }
     if (!member) {
         // #3019 (§9.2/§9.3/§35.7): the `?.` form of a direct Equals/GetHashCode
