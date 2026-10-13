@@ -18552,6 +18552,48 @@ private:
         return rt && (isBoxableValueType(rt) || isNullableValueTy(rt));
     }
 
+    // fix #6057 (§27.6 / §8.6 / §28.9, v0.338): does the method reference
+    // `ma` (`face.Method`, no call) take its OWN reference on the §8.6 box
+    // its receiver holds? Yes exactly when the receiver is a local whose slot
+    // provably holds the box its initializer minted (`pureBoxBindings_`) at
+    // an Object/interface type and the member is an instance method declared
+    // by an interface — the shape whose function object stores the box
+    // pointer itself as its captured receiver. The formation site then
+    // `bz_box_retain`s the box and gives the function object an env disposer
+    // that releases it, so the function object and the local each own one
+    // reference: the local keeps its ordinary scope-end release and the box
+    // lives as long as the longer-lived of the two.
+    //
+    // ONE predicate, two readers that must agree: the escape walker (a `true`
+    // here is a safe read of the local, not an escape) and the formation site
+    // in `lowerExpr` (which emits the retain). A walker `true` without the
+    // retain would be a use-after-free through the function object, so
+    // neither side re-spells the test. Anything else answers false and keeps
+    // the old treatment: the reference is an escape and the box is leaked,
+    // never freed early.
+    bool methodRefRetainsBoxReceiver(const ast::MemberAccessExpr& ma,
+                                     bool allowPureBinding) {
+        if (!allowPureBinding || !ma.target) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+        if (!id) return false;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        if (!loc || !loc->decl ||
+            !pureBoxBindings_.count(static_cast<const void*>(loc->decl)))
+            return false;
+        if (!isObjectOrInterfaceTarget(ctx_.exprType(*ma.target))) return false;
+        return isInterfaceInstanceMethod(
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(ma)));
+    }
+    static bool isInterfaceInstanceMethod(sema::MethodSymbol* ms) {
+        return ms && !isStaticMethod(ms) && !isExtensionMethod(ms) &&
+               ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface;
+    }
+    // fix #6057: the env disposer of such a function object —
+    // `void (ptr env)`: releases the box whose pointer is the env's one word.
+    // Run by `bz_closure_release` at the function object's last drop.
+    llvm::Function* boxReceiverEnvdtor();
+    llvm::Function* boxReceiverEnvdtorFn_ = nullptr;
+
     // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): every LocalDecl
     // that is REASSIGNED by a statement-level `AssignmentStmt` in the current
     // function body. `tryOpaqueSlotBuiltinRender` narrows an `Object`-typed

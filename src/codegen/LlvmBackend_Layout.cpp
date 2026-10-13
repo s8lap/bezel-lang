@@ -6902,6 +6902,21 @@ Emitter::FnValKind Emitter::closureKindForMethod(sema::MethodSymbol* ms,
     return FVK_REF_IDENTITY;
 }
 
+// fix #6057 (§27.6 / §28.9, v0.338): see `methodRefRetainsBoxReceiver`.
+llvm::Function* Emitter::boxReceiverEnvdtor() {
+    if (boxReceiverEnvdtorFn_) return boxReceiverEnvdtorFn_;
+    auto* voidTy = llvm::Type::getVoidTy(llvm_);
+    auto* fnTy = llvm::FunctionType::get(voidTy, {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$mref$boxrecv$envdtor", module_.get());
+    llvm::IRBuilder<> b(llvm::BasicBlock::Create(llvm_, "entry", fn));
+    llvm::Value* box = b.CreateLoad(ptrTy(), fn->getArg(0), "box");
+    b.CreateCall(declareC("bz_box_release", voidTy, {ptrTy()}), {box});
+    b.CreateRetVoid();
+    boxReceiverEnvdtorFn_ = fn;
+    return fn;
+}
+
 llvm::Value* Emitter::buildMethodClosureCell(llvm::Function* thunk,
                                              bool instMethod,
                                              llvm::Value* receiverVal,

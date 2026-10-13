@@ -7838,7 +7838,28 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             const sema::TypeRef* recvTy =
                 (!isStaticMethod(emitMs) && ma->target) ? ctx_.exprType(*ma->target)
                                                     : nullptr;
-            return makeMethodThunk(emitMs, recv, recvTy, &e);
+            llvm::Value* cell = makeMethodThunk(emitMs, recv, recvTy, &e);
+            // fix #6057 (§27.6 / §8.6 / §28.9, v0.338): a reference over a
+            // local that holds a §8.6 box captures the BOX pointer. The
+            // escape walker no longer counts that as an escape (same
+            // predicate), so the local releases its reference at scope end;
+            // the function object must therefore own one of its own. The
+            // retain is emitted whenever the predicate holds — it is what
+            // keeps the walker's answer sound. The matching release is the
+            // env disposer; it is installed only when the cell's env provably
+            // holds that pointer (the selected overload is itself an
+            // interface instance method), and a mismatch leaves a bounded
+            // leak, never an early free.
+            if (cell && recv && recv->getType()->isPointerTy() &&
+                methodRefRetainsBoxReceiver(
+                    *ma, currentFn_ == boxReleaseEligibleFn_)) {
+                emitBoxRetain(recv);
+                if (isInterfaceInstanceMethod(emitMs))
+                    builder_.CreateStore(
+                        boxReceiverEnvdtor(),
+                        builder_.CreateStructGEP(closureCellType(), cell, 3));
+            }
+            return cell;
         }
         // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
         // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics

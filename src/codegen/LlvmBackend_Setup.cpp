@@ -38245,6 +38245,10 @@ struct BoxEscapeWalker {
     // Left empty in phase 1, like `isKnownBoxReceiver`.
     std::function<bool(const sema::MethodSymbol*, const ast::Expr*)>
         isSynthesizedEqualsCallee;
+    // fix #6057 (§27.6 / §28.9, v0.338): "does this method reference take
+    // its own reference on its receiver's box?" — the Emitter's
+    // `methodRefRetainsBoxReceiver`. Left empty in phase 1.
+    std::function<bool(const ast::MemberAccessExpr*)> methodRefRetainsBox;
     // fix #3447 (§8.6 / §28.9, v0.306): PHASE-1 mode. The question phase 1
     // asks is NOT "does the box escape" but the strictly weaker "can anything
     // overwrite this slot" — a local passed as a call argument still HOLDS the
@@ -38535,10 +38539,21 @@ struct BoxEscapeWalker {
         //     method reference's `()` form captures the receiver, so the
         //     resulting function value can outlive the producing scope and
         //     the box escapes with it). Still an escape.
+        //     fix #6057 (§27.6 / §8.6 / §28.9, v0.338): ... unless the
+        //     formation site gives the function value its OWN reference on
+        //     the box (`Emitter::methodRefRetainsBoxReceiver`, the one
+        //     predicate both sides read). Then the local's reference is
+        //     untouched by the capture and the read is safe: without this
+        //     the local was barred from its scope-end release and nothing
+        //     else ever released the box (24 B per evaluation).
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
             sema::Symbol* sym = ctx.exprSymbol(*m);
             bool isMethodGroupRef = dynamic_cast<sema::MethodSymbol*>(sym) != nullptr;
-            expr(m->target.get(), /*safeRead=*/!isMethodGroupRef);
+            bool refOwnsItsBox =
+                isMethodGroupRef && !inLambda && methodRefRetainsBox &&
+                isTargetIdent(m->target.get()) && methodRefRetainsBox(m);
+            expr(m->target.get(),
+                 /*safeRead=*/!isMethodGroupRef || refOwnsItsBox);
             return;
         }
         // fix #3229 / §28.9 / §7.5 (v0.254): the null-conditional twin of the
@@ -39056,6 +39071,11 @@ void Emitter::collectBoxReleaseEligible(
             [this](const ast::Expr* r) {       // fix #3447
                 return knownBoxReceiverShape(r, /*allowPureBinding=*/true);
             }};
+        w.methodRefRetainsBox =                  // fix #6057
+            [this](const ast::MemberAccessExpr* m) {
+                return methodRefRetainsBoxReceiver(*m,
+                                                   /*allowPureBinding=*/true);
+            };
         w.isSynthesizedEqualsCallee =            // fix #5068
             [this](const sema::MethodSymbol* ms, const ast::Expr* r) {
                 const sema::TypeRef* rt = r ? ctx_.exprType(*r) : nullptr;
