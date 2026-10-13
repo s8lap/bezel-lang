@@ -30647,6 +30647,20 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 return;
             }
         }
+        // fix #6071 (stdlib §9.6): `string` declares `Length`, not `Count`; a
+        // bare `s?.Count` reference (the call spelling is the §5 LINQ operator)
+        // has no member to resolve. Mirrors the `.` form's "no member" reject.
+        if (!member && recvTy && nm.member == "Count" &&
+            &nm != calleeOfCallCtx_ &&
+            recvTy->kind == TypeRef::Kind::Primitive &&
+            recvTy->primitive == PrimitiveType::String) {
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "no member `Count` on `string`: use `Length` (stdlib §9.6)");
+            return;
+        }
         // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
         // collection/string head. The `.` form types these `int` in
         // resolveMemberAccess; the `?.` form left them untyped (every
@@ -30684,6 +30698,17 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 else if (cn == "OwningStack") sec = "OwningStack<T>`: use `Count` (stdlib \\S4.11)";
                 else if (cn == "Queue") sec = "Queue<T>`: use `Count` (stdlib \\S4.11)";
                 else if (cn == "OwningQueue") sec = "OwningQueue<T>`: use `Count` (stdlib \\S4.11)";
+                // fix #6071 (§4.7-§4.10, §4.17, §4.18): every other built-in
+                // collection head (Set, Dictionary, LinkedList, SortedSet, ...)
+                // declares `Count`, never `Length` — the `.` form rejects it
+                // through the collection-surface catch-all. None of these heads
+                // is a registry Length head (those are handled above).
+                std::string generic;
+                if (!sec && (common::isPlainBuiltinCollectionHead(cn) ||
+                             common::isOwningCollectionHead(cn))) {
+                    generic = std::string(cn) + "<T>`: use `Count` (stdlib §4)";
+                    sec = generic.c_str();
+                }
                 if (sec) {
                     SourceLocation loc = nm.span.begin;
                     if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
