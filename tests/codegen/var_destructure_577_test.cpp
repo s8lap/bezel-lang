@@ -10,16 +10,17 @@
 // similarly lacked a slot for them. Now both are handled identically to
 // the bare naked-binding form.
 
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -155,16 +156,22 @@ BEZEL_TEST(codegen_577_var_destructure, const_then_var_binding_spec_19_3) {
 
 // Constant + var-binding: arm must NOT fire when the constant sub-pattern
 // does not match. Expected: -1 (fallthrough to _ arm).
+// The value is printed (not returned) so the assertion sees all of it: the
+// exit status is 8-bit, and -1 would read as 255.
 BEZEL_TEST(codegen_577_var_destructure, const_then_var_binding_no_match_spec_19_3) {
-    BEZEL_EXPECT_EQ(runFull(
+    auto r = runAot(
         "module M; "
         "record Pair(A: int, B: int); "
         "class C public static method Main(): int "
         "  var p := new Pair(5, 7); "
-        "  return (case p of "
+        "  var n := (case p of "
         "    Pair(0, var b) => b, "
         "    _ => -1); "
-        "end Main; end C;"), -1);
+        "  Console.WriteLine(n); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "-1\n");
 }
 
 // #726 / §19.3: NESTED record destructuring in a case arm binds the inner name.
