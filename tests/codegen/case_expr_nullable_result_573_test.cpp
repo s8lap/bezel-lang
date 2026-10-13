@@ -19,13 +19,12 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
-using bezel::test::runJit;
 
 namespace {
 
 // Helper: run a complete program; return the Main exit code.
 int runFull(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
