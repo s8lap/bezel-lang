@@ -365,27 +365,28 @@ BEZEL_TEST(sema_move_only_payload_binding_write_point_5870,
         "return 0; "));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    // NOTE — the VALUE this program prints is NOT asserted, deliberately, and
-    // the reason is a SEPARATE, UNFIXED CODEGEN DEFECT found while writing
-    // this row. MEASURED on this tree: the program compiles, runs, exits 0,
-    // and prints a garbage pointer for `b[0].V` where the post-write value 9
-    // is expected. That is §19.3's OWN rule again — a borrowing-match binding
-    // of a move-only payload is a snapshot copy (`lowerCaseStmt`'s
-    // `CreateStore(scrut, slot)`, src/codegen/LlvmBackend_Stmts.cpp:11203),
-    // and the copy this program makes is evidently taken from a location the
-    // field store already invalidated.
+    // §19.3 :4046 (v0.336) is a rule about the VALUE, not only about
+    // admission: "Each arm's case test reads the source as it stands when
+    // that arm is tried (§19.4)". Arm 2's case test runs after arm 1's guard
+    // has already assigned `h.Slots`, so the source it reads is the NEW
+    // `[new Cell(9), new Cell(9)]` and `b[0].V` is 9.
     //
-    // §19.3 says nothing about the runtime VALUE here: its whitelist admits
-    // this program, so the fix must NOT reject it, and a rejection would be a
-    // silent denial of a valid program. Asserting `9` would instead turn this
-    // row into a codegen gate, which is outside this change's scope (the
-    // TAKER-vacancy work in LlvmBackend_Setup.cpp is a sibling lane's) and
-    // would make this suite red for a reason no part of it can fix. The
-    // finding is reported to the coordinator instead.
+    // This assertion is STRENGTHENED, not added: the row previously asserted
+    // only `ran` and `exitCode`, with a NOTE recording that the printed value
+    // was a garbage pointer because `lowerCaseStmt` stored the hoisted
+    // scrutinee into the binding slot — a read of storage §28.3 had already
+    // disposed inside `Holder$Decline`. The plain oracle passed that row; the
+    // ASan oracle is the one that saw it (heap-use-after-free, READ of size 4
+    // in `main`, freed by `bz$M.Holder$Decline`, allocated by `calloc` in
+    // `main`). `lowerCaseStmt` now re-reads the source at each arm's test
+    // point (`caseScrutRereadable` + the per-arm `lowerExpr`), which is the
+    // spec's own sentence implemented in codegen.
     //
-    // What IS asserted is what §4046 decides: the program is ADMITTED. Change
-    // `caseBindingSource_`/arm scoping back to a whole-construct event log and
-    // this row goes red, which is the point of having it.
+    // The two lines are the whole differential:
+    //   "9" — arm 2's binding observes the POST-write source (§19.3/§19.4).
+    //   "0" — arm 1 was DECLINED, so its body never ran; the guard's write
+    //         point is real and n is untouched.
+    BEZEL_EXPECT_EQ(r.stdoutText, "9\n0\n");
 }
 
 // ── A8 — §7.4's stable local covers "a local variable **or parameter** of

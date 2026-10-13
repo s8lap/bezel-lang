@@ -11021,6 +11021,82 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
 }
 
 
+// §19.3 *Move-only payload bindings across a write point* (v0.336), QUOTED at
+// :4046: "Each arm's case test reads the source as it stands when that arm is
+// tried (§19.4), so a write point in a declined arm's guard is not a write
+// point for a later arm's bindings."
+//
+// That sentence is a RULE about generated code, not only about the static
+// check: sema admits a construct whose write point sits in a DECLINED arm's
+// guard precisely because the later arm re-reads the source, and codegen is
+// where "re-reads" has to happen. Before this predicate `lowerCaseStmt`
+// lowered the scrutinee ONCE, before the arms, and every binding arm stored
+// that single hoisted `scrut` value — so a later arm's binding aliased
+// whatever the earlier guard had already replaced, and an owning-collection
+// field read as a freed buffer.
+//
+// MEASURED on base 485f46cf (the shape is #5870's A7 row): arm 1's guard
+// assigns `h.Slots`, §28.3 disposes the old `[new Cell(1), new Cell(3)]`
+// inside `bz$M.Holder$Decline`, and arm 2's binding read that freed storage —
+// `AddressSanitizer: heap-use-after-free ... READ of size 4 in main`, freed by
+// `bz$M.Holder$Decline`, allocated by `calloc` in `main`. The program printed
+// a garbage pointer where `b[0].V` was expected to read 9.
+//
+// The whitelist answers "may `lowerExpr(e)` be emitted a second time at a
+// later arm's test point without duplicating an effect or reading stale
+// storage?".
+//
+//   - a LOCAL identifier (or a parameter, which is a local too) — `lowerExpr`
+//     is a load of that local's own slot, so the second evaluation reads the
+//     slot's CURRENT value. That is the whole point: a guard that reassigned
+//     the receiver or the local is observed.
+//   - a plain FIELD read over a re-readable receiver — `fieldAddr` GEPs the
+//     receiver, so the chain is re-walked from the (freshly loaded) receiver
+//     and the second read sees the field's current bytes.
+//
+// Everything else DECLINES, and a declined scrutinee keeps the pre-existing
+// single hoisted value — the no-change direction:
+//
+//   - a CALL or any other effectful expression root. Re-evaluating would run
+//     the call once per arm, duplicating its effects. This is also what
+//     keeps `case h.Slots of` after `case Make().Slots of` honest: only the
+//     local-rooted chain is re-read.
+//   - an auto-property (§23.1), a computed getter (§23.2), a virtual or
+//     interface property, or an event. `lowerExpr` dispatches all of those
+//     through accessor machinery ABOVE its `fieldAddr` path, and an accessor
+//     body is a call — re-evaluating it duplicates that call's effects. Only
+//     `sema::FieldSymbol` reaches the plain GEP-and-load path.
+//   - an index read. `lvalueAddr`'s inline-array arm re-emits a §15.1 bounds
+//     `IndexOutOfRangeException` guard, and an indexer read is a call.
+//   - anything deeper than the bound: a re-read is only as safe as its root.
+//
+// §19.3's own list of non-sources ("`this` in a value-kind member body …
+// neither is any other field, an element, a static, or a property or indexer
+// read") is the STATIC half of this rule — it decides which bindings sema
+// admits. This predicate is the DYNAMIC half, and it is deliberately wider in
+// one direction: a field read over a class-typed local is never a statically
+// provably-unwritten source, so sema may reject a program that writes it
+// between two uses of one binding (R1), while a write that lands in a
+// DECLINED arm's guard is admitted (A7) and lands here.
+bool Emitter::caseScrutRereadable(const ast::Expr* e, int depth) {
+    // Bounded so a pathological receiver chain cannot walk the AST forever;
+    // a chain this long is not one the two arms above describe.
+    if (!e || depth > 8) return false;
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+        return dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)) != nullptr;
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+        // §14.1 field storage only. `storageMemberOf` also accepts an
+        // auto-property's backing slot, and `lowerExpr` would reach it through
+        // the accessor dispatch above `fieldAddr` — a call, not a load — so
+        // the plain `FieldSymbol` test is the one that matches what a second
+        // `lowerExpr` actually emits.
+        if (!dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ma)))
+            return false;
+        return caseScrutRereadable(ma->target.get(), depth + 1);
+    }
+    return false;
+}
+
 bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     // §19 / §A (#727): a scrutinee-less `case cond => ... end` statement is an
     // ordered boolean-condition chain (like if/elif); each arm's pattern is a
@@ -11046,6 +11122,11 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     // its payloads leaked outright. See `unboundOwningChoiceTemp`.
     llvm::AllocaInst* scrutChoiceSlot = nullptr;
     const sema::TypeRef* scrutChoiceRef = nullptr;
+    // §19.3 (:4046, v0.336) — "Each arm's case test reads the source as it
+    // stands when that arm is tried (§19.4)". Set at the end of the scrutinee
+    // block below; when true, arms after the first RE-READ the source instead
+    // of reusing the value hoisted before the arms. See caseScrutRereadable.
+    bool scrutRereadable = false;
     if (cs.scrutinee) {
         scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
@@ -11166,10 +11247,55 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                         markedSrcSlot->getAllocatedType()),
                     markedSrcSlot);
         }
+        // §19.3 (:4046, v0.336) — the per-arm re-read gate. Every scrutinee
+        // shape whose SECOND evaluation would not be "read the source as it
+        // stands" is excluded here, each for its own reason:
+        //
+        //  - `disposeOwnedScrutinee` (§K8 / #1795): the construct OWNS a fresh
+        //    temporary it captured in `scrutOwnedSlot` and disposes it at
+        //    `endBB`. Re-evaluating would mint a second temporary that no
+        //    disposal reaches, and the §28.3 "unbound owned temporary" leak.
+        //  - `scrutChoiceSlot` / `markedSrcSlot` (§35.5 *The owning match*):
+        //    the value was CAPTURED — `scrutChoiceSlot` holds the only copy,
+        //    and `markedSrcSlot` was just ZEROED above (#4609's moved-from
+        //    encoding). Re-reading either source yields null, and #4609's own
+        //    note states the invariant this breaks: "the bindings were filled
+        //    from the scrutinee VALUE above, not re-read from this slot, so
+        //    nothing in the arm observes the zeros."
+        //
+        // Both are `case` scrutinees whose value is a MOVE, so §19.3's
+        // borrowing-match rule — the rule the re-read implements — does not
+        // govern them; §35.5's transfer does.
+        scrutRereadable = !cs.disposeOwnedScrutinee && !scrutChoiceSlot &&
+                          !markedSrcSlot && scrut &&
+                          caseScrutRereadable(cs.scrutinee.get());
     }
     auto* endBB =
         llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);
-    for (const auto& arm : cs.arms) {
+    for (std::size_t armIdx = 0; armIdx < cs.arms.size(); ++armIdx) {
+        const auto& arm = cs.arms[armIdx];
+        // §19.3 (:4046, v0.336) — "Each arm's case test reads the source as
+        // it stands when that arm is tried (§19.4)". Arm 0 IS the entry read,
+        // so `scrut` is exactly its case test. Every LATER arm re-reads,
+        // because a DECLINED arm runs only its pattern test and its guard —
+        // and either may have written the source (a destructuring pattern's
+        // named-slot getter is a call, and a guard is arbitrary code), so the
+        // hoisted value is no longer the source's current value.
+        //
+        // The re-read is what makes #5870's A7 program a snapshot of the
+        // POST-write value instead of a borrow of freed storage: arm 1's
+        // guard assigns `h.Slots`, §28.3 disposes the old array inside
+        // `Holder$Decline`, and arm 2's test — and therefore its binding —
+        // reads `h.Slots` as it stands after that write.
+        //
+        // A re-read that fails to lower falls back to the hoisted value; that
+        // is the pre-existing behaviour, so a shape this gate declines never
+        // becomes a new failure mode.
+        llvm::Value* armScrut = scrut;
+        if (armIdx > 0 && scrutRereadable) {
+            if (llvm::Value* reread = lowerExpr(*cs.scrutinee))
+                armScrut = reread;
+        }
         llvm::Value* pm = nullptr;
         if (!cs.scrutinee) {
             // #727: scrutinee-less arm — `_` always matches; otherwise the arm's
@@ -11189,7 +11315,8 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                 }
             }
         } else {
-            pm = patternMatches(arm.pattern.get(), scrut, enumTy, isStr, scrutTy);
+            pm = patternMatches(arm.pattern.get(), armScrut, enumTy, isStr,
+                                scrutTy);
         }
         if (!pm) {  // deferred pattern kind — degrade to no-op
             builder_.CreateBr(endBB);
@@ -11207,10 +11334,18 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         // bound name) and before the arm body. The alloca goes in the
         // function entry block; the store is emitted in the current
         // (pattern-test) block, before we branch to the guard or body.
+        //
+        // §19.3 (:4046, v0.336) — the stored value is THIS arm's case-test
+        // value (`armScrut`), not the hoisted one: §19.3 makes the bound name
+        // "a borrow whose source is the scrutinee's source", and this arm's
+        // source is the source as it stands when this arm is tried. Storing
+        // the hoisted value here is the use-after-free: the source's storage
+        // was disposed by an earlier declined arm's guard, and the binding
+        // would address the freed bytes.
         if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
                            arm.pattern.get())) {
-            llvm::AllocaInst* slot = entryAlloca(scrut->getType());
-            builder_.CreateStore(scrut, slot);
+            llvm::AllocaInst* slot = entryAlloca(armScrut->getType());
+            builder_.CreateStore(armScrut, slot);
             if (!disposeStack_.empty())
                 recordDeclScopeDepth(bp);  // fix #4523
             locals_[bp] = slot;

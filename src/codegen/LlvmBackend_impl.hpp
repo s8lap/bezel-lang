@@ -22873,6 +22873,13 @@ private:
 
     bool lowerCaseStmt(const ast::CaseStmt& cs);
 
+    // §19.3 *Move-only payload bindings across a write point* (v0.336): is `e`
+    // a re-readable PLACE — a chain of plain field reads rooted at a local —
+    // so that `lowerExpr(e)` a second time, at a later arm's test point, reads
+    // the SOURCE as it stands then and duplicates no effect? The whitelist is
+    // deliberately narrow; see the definition for why each arm is here.
+    bool caseScrutRereadable(const ast::Expr* e, int depth = 0);
+
     llvm::Value* lowerCaseExpr(const ast::CaseExpr& ce);
 
     // §17.15 / K8.5 (v0.216, #2098): the binding atom `(var x := E; body)`.
