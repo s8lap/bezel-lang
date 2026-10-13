@@ -1806,6 +1806,55 @@ std::string spellTypeRefForDiag(const TypeRef* a) {
     }
     return "?";
 }
+
+// fix-forward #5641 (§15.1, v0.334): the receiver type-argument INDEX at
+// which a builtin member's SIGNATURE forms `T?`, or -1 when it forms none.
+//
+// §15.1 scopes the conditionally-admitted register to "a type parameter of
+// its receiver type — the element type, or a dictionary's value type". The
+// clause is POSITIONAL: `Dictionary<K,V>.TryGetValue(key: K, out value: V?)`
+// forms its `T?` at V (index 1) and not at K (index 0), so a receiver whose
+// KEY is an inline array is not over the register — only its value type is.
+// Reading "any inline-array argument" instead over-rejects, which is what
+// #5641's rejected `05e2661b` did.
+//
+// ONE predicate, so the question cannot drift between the two sites that ask
+// it: `narrowFromBuiltinShapeA` (ExprTypecheck.cpp) reads the same stdlib
+// §1 shape-(a) table for the out-argument POSITION, and the `posElem` /
+// `valElem` / `popValElem` / `ownSetElem` arms in
+// `ExprTypecheck_Exprs.cpp` read it for the recipient's type — the same
+// per-member split, keyed the same way.
+//
+// The members and their signatures are stdlib §1 (shape (a)) as listed per
+// type: element type — `Stack`/`OwningStack` `TryPop`/`TryPeek`,
+// `Queue`/`OwningQueue` `TryDequeue`/`TryPeek`,
+// `OwningArray`/`OwningLinkedList` `TryPopFirst`/`TryPopLast`, `Channel`
+// `TryReceive`, `OwningSet` `TryPop`; value type — `Dictionary`/
+// `SortedDictionary`/`OwningDictionary` `TryGetValue`, `OwningDictionary`
+// `TryPopValue`. A member not named here forms no `T?` at a receiver type
+// argument and is not in the register.
+int builtinNullableOutTypeArgIndex(std::string_view head,
+                                   std::string_view member) {
+    auto isOneOf = [](std::initializer_list<std::string_view> names,
+                      std::string_view x) {
+        for (std::string_view n : names)
+            if (n == x) return true;
+        return false;
+    };
+    // Element type — genericArgs[0].
+    if (isOneOf({"Stack", "OwningStack", "Queue", "OwningQueue",
+                 "OwningArray", "OwningLinkedList", "Channel", "OwningSet"},
+                head) &&
+        isOneOf({"TryPop", "TryPeek", "TryDequeue", "TryPopFirst",
+                 "TryPopLast", "TryReceive"}, member))
+        return 0;
+    // A dictionary's VALUE type — genericArgs[1]. The key type (index 0)
+    // participates in no `T?` this signature forms: `key: K` is K, not K?.
+    if (isOneOf({"Dictionary", "SortedDictionary", "OwningDictionary"}, head) &&
+        isOneOf({"TryGetValue", "TryPopValue"}, member))
+        return 1;
+    return -1;
+}
 }  // namespace
 
 // fix #4806 (§12.7 / §22.3, v0.307): a bare `ref`/`out` operand names its
@@ -4670,19 +4719,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // hasOutVar block inside the `if (ms)` block below is never entered, and
     // the inline-array out-param check is silently bypassed. Detect the pattern
     // here: an out var arg + a MemberAccessExpr callee whose receiver has an
-    // inline-array generic argument. Report inline array for the Try* family
-    // (which forms T? in the out param).
+    // inline-array generic argument.
+    //
+    // fix-forward #5641 (spec §15.1, v0.334): the check is on the ONE
+    // receiver type argument this member forms `T?` at, read from
+    // `builtinNullableOutTypeArgIndex` above — not on "any inline-array
+    // argument". `05e2661b` scanned the whole argument list, so
+    // `Dictionary<[3]int, string>.TryGetValue(k, out var v)` was rejected:
+    // §15.1 registers "a dictionary's VALUE type", and the key type
+    // participates in no `T?` the signature forms (`key: K` is K, not `K?`).
     if (!calleeSym) {
         bool hasOutVarArg = false;
         for (const auto& a : ce.args)
             if (a.modifier == "out var" && a.value) { hasOutVarArg = true; break; }
         if (hasOutVarArg) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
-                if (TypeRef* recvTy = ctx_.exprType(*ma->target)) {
+                if (TypeRef* recvTy = ma->target
+                                          ? ctx_.exprType(*ma->target)
+                                          : nullptr) {
                     if (recvTy->kind == TypeRef::Kind::Named &&
-                        !recvTy->genericArgs.empty()) {
-                        for (TypeRef* ga : recvTy->genericArgs) {
-                            if (ga && ga->kind == TypeRef::Kind::InlineArray) {
+                        !recvTy->declaration && recvTy->astNode) {
+                        const int idx = builtinNullableOutTypeArgIndex(
+                            recvTy->headName(), ma->member);
+                        TypeRef* formed =
+                            idx >= 0 &&
+                                    static_cast<std::size_t>(idx) <
+                                        recvTy->genericArgs.size()
+                                ? recvTy->genericArgs[idx]
+                                : nullptr;
+                        if (formed) {
+                            if (formed->kind == TypeRef::Kind::InlineArray) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
                                     "`" + std::string(ma->member) +
@@ -4690,9 +4756,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "is not admitted — the `out` parameter "
                                     "type would be a nullable inline array, "
                                     "which §15.1 does not admit (spec §15.1 "
-                                    "/ §14.2, v0.327; diagnostic: "
+                                    "/ §14.2, v0.334; diagnostic: "
                                     "`inline array`)");
-                                break;
                             }
                         }
                     }
