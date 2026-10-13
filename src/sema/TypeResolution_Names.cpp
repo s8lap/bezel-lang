@@ -3205,8 +3205,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
              prefix == "System.Collections.Generic" ||
              prefix == "System.Collections.Linq") &&
             isAlwaysAvailableBareName(last);
-        const bool explicitlyImported = sourceImports_.count(prefix) != 0 &&
-                                        isAlwaysAvailableBareName(last);
+        const bool explicitlyImported = sourceImports_.count(prefix) != 0;
         if (!isGenericMarker && (autoImported || explicitlyImported) &&
             common::builtinTypeHomeModuleOf(last) == prefix) {
             t.name->parts.erase(t.name->parts.begin(),
