@@ -508,7 +508,17 @@ void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
     // an IMPORTED one `astNode` is null (there is no AST for a dependency) while
     // `MetaMember::type`'s `namedName` carries the type-parameter name into
     // `importedName`. `headName()` is the ONE read both spellings agree on.
+    //
+    // fix-forward #5641 (spec §15.1, v0.334): report ONCE per instantiation
+    // site and name the field. The rejection is at the `new Box<[3]int>()`
+    // site, so N offending fields used to emit N byte-identical diagnostics
+    // at that one location (MEASURED: `Box2<T> { _v: T?; _w: T?; }` at
+    // `Box2<[3]int>` emitted 2). `reported` closes the field loop after the
+    // first report, and the message names the field so the reader knows
+    // which declaration to change.
+    bool reported = false;
     for (Symbol* m : t->members) {
+        if (reported) break;
         auto* fs = dynamic_cast<const FieldSymbol*>(m);
         if (!fs) continue;
         const TypeRef* ft = storageComponentType(fs, ctx_);
@@ -523,17 +533,18 @@ void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
                 TypeRef* arg = rt->genericArgs[i];
                 if (arg &&
                     arg->kind == TypeRef::Kind::InlineArray) {
+                    reported = true;
                     ctx_.diagnostics().report(
                         Severity::Error, ne.span.begin,
-                        "type `" + argNameOf(arg) +
-                        "` may not be nullable (`" +
+                        "field `" + std::string(fs->name) +
+                        "` may not have a nullable type (`" +
                         std::string(fpn) +
                         "?`) when `" + std::string(fpn) +
                         "` is substituted by an inline array — "
                         "§15.1 admits no nullable inline-array "
                         "form, and §3.6 rule 2 rejects `T?` at `T` "
                         "substituted by an inline array "
-                        "(spec §15.1 / §3.6 rule 2, v0.327; "
+                        "(spec §15.1 / §3.6 rule 2, v0.334; "
                         "diagnostic: `nullable inline-array`)");
                 }
                 break;
