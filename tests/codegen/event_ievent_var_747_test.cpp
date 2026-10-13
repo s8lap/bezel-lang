@@ -12,14 +12,14 @@
 // Subscription, so the `using var` never disposed it. The fix routes by static
 // type (IEvent<T>) directly to bz_event_subscribe (no itable is fabricated).
 
-#include "support/codegen_support.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
 
 namespace {
 int run(const std::string& program) {
-    auto r = runJit(program);
+    auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
 }
 
