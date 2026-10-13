@@ -40,6 +40,21 @@ MEMBER_RE = re.compile(
     r'\b(?:method|property|const)\s+(?:operator\s+\S+|([A-Za-z_]\w*))')
 ENUM_CONST_RE = re.compile(r'^\s*([A-Z]\w*)\s*(?:,|;|:=|\()')
 GENERIC_PARAM_RE = re.compile(r'<([^<>()]*)>')
+# A type-parameter LIST, anchored on the declaration it belongs to:
+# `class Pair<TFirst, TSecond>` / `method Describe<T>`. GENERIC_PARAM_RE
+# alone cannot tell that apart from a generic INSTANTIATION like
+# `Array<Widget>`, which is a USE of a type and must still be reported when
+# the type is invented. Anchoring on the declaration keyword keeps the two
+# apart, so widening the spelling test below cannot silence a real finding.
+TYPE_PARAM_DECL_RE = re.compile(
+    r'\b(?:class|interface|record|enum|choice|method)\s+[A-Za-z_]\w*\s*'
+    r'<([^<>()]*)>')
+# A type parameter is any PascalCase name in a declaration list — `T`, `TKey`
+# and `TFirst` are all conventional. The old 1-to-3-character test was a
+# proxy for "looks like a type parameter" that happened to be both too tight
+# for real names and too loose to mean anything (`Foo` passed it), so it is
+# replaced by anchoring, which is what actually distinguishes the two.
+TYPE_PARAM_RE = re.compile(r'^[A-Z]\w*$')
 
 PRIMITIVES = {
     "bool", "byte", "sbyte", "short", "ushort", "int", "uint", "long", "ulong",
@@ -248,7 +263,12 @@ def declared_in(source):
     for group in GENERIC_PARAM_RE.findall(source):
         for part in group.split(","):
             part = part.strip().replace("in ", "").replace("out ", "").strip()
-            if re.match(r'^[A-Z]\w{0,2}$', part):
+            if TYPE_PARAM_RE.match(part):
+                names.add(part)
+    for group in TYPE_PARAM_DECL_RE.findall(source):
+        for part in group.split(","):
+            part = part.strip().replace("in ", "").replace("out ", "").strip()
+            if TYPE_PARAM_RE.match(part):
                 names.add(part)
     return names
 

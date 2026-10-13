@@ -728,6 +728,39 @@ class TestNamesIndexGaps(unittest.TestCase):
                       | self.index.get("SeekOrigin", set())
                       | set(self.index.get("FileAccess", set())))
 
+    def test_a_multi_character_type_parameter_is_not_an_invented_type(self):
+        # `class Pair<TFirst, TSecond>` — the declaration list was filtered
+        # to 1-to-3-character names, so a real parameter name like `TFirst`
+        # read as an invented API. s34_0005 (spec §34, v0.334) is the case
+        # that tripped it.
+        body = ("module Conf;\n\n"
+                "public class Pair<TFirst, TSecond>\n"
+                "  public property First: TFirst;\n"
+                "  public property Second: TSecond;\n"
+                "end Pair;\n")
+        self.assertEqual(self.types(body), ([], []))
+
+    def test_a_generic_use_site_is_still_reported(self):
+        # The anchor is what keeps the fix honest. A type parameter in a
+        # DECLARATION list is the case's own and does not need indexing; an
+        # invented type used anywhere else is still an invented type. This
+        # case declares `TFirst` and uses `TWidget`, so only the second may
+        # be reported — which is what stops the widened spelling test from
+        # becoming a blanket suppression of PascalCase type names.
+        body = ("module Conf;\n\n"
+                "public class Box<TFirst>\n"
+                "  public property Item: TFirst;\n"
+                "  public property Other: TWidget;\n"
+                "end Box;\n")
+        self.assertEqual(self.types(body), (["TWidget"], []))
+
+    def types(self, body):
+        import names
+        return names.check_source(body, names.build_index(
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))))), "docs")))
+
     def test_the_committed_corpus_reports_nothing(self):
         base = os.path.dirname(os.path.abspath(__file__))
         rc = names.main(["--strict"], base_dir=base)
