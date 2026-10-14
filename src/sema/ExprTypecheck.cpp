@@ -23693,6 +23693,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         std::vector<std::unordered_set<Symbol*>> fallThroughExits;
         std::vector<std::set<std::pair<std::uint32_t, std::uint32_t>>>
             fieldExits;
+        // fix #6113 (§12.7 "Reassignment within the controlled block
+        // invalidates the type narrowing", §7.4 "How narrowing is
+        // invalidated", v0.338): a §12.7 type narrowing in effect at the `if`
+        // survives it only when no path that reaches the following statement
+        // invalidated it. Each fall-through branch contributes the narrowings
+        // it STARTED with (its guards' facts seeded) and the ones it ENDED
+        // with; an entry narrowing the branch did not carry unchanged from
+        // start to end was invalidated on that path. Comparing against the
+        // branch's own start, not the statement's entry, is what keeps a
+        // branch that re-narrows the same variable (`if q is C then … end if;`
+        // under an outer `q is B`) from dropping the outer fact. Restoring the
+        // entry map by assignment resurrected it: `if q is B then if k = 0
+        // then q := alt; end if; return q.y; end if;` read `y` off an `A`.
+        std::vector<std::pair<std::unordered_map<Symbol*, TypeRef*>,
+                              std::unordered_map<Symbol*, TypeRef*>>>
+            typeExits;
         if (ifs->ifBranch.condition) {
             visitExpr(*ifs->ifBranch.condition);
             checkConditionIsBool(*ifs->ifBranch.condition, "if");
@@ -23705,6 +23721,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         nullNarrowed_ = entryNullNarrowed;
         fieldNarrowed_ = fieldCondState;
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
+        auto branchEntryTypes = narrowings_;   // #6113
         {
             // per §21.6 / §21.1 (#5314): the branch body is a block; a local
             // declared in it is not visible after the matching `end`.
@@ -23720,6 +23737,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (!bodyAlwaysExits(ifs->ifBranch.body)) {
             fallThroughExits.push_back(nullNarrowed_);
             fieldExits.push_back(fieldNarrowed_);
+            typeExits.emplace_back(branchEntryTypes, narrowings_);
         }
         narrowings_ = savedNarrowings;
         initNarrowed_ = savedInitNarrowed;
@@ -23768,6 +23786,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 collectNarrowings(ifs->elifBranches[j].condition.get(),
                                   /*forTrueBranch=*/false);
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/true);
+            branchEntryTypes = narrowings_;   // #6113
             {
                 Scope bodyScope;  // per §21.6 / §21.1 (#5314): block scope
                 bodyScope.parent = currentScope_;
@@ -23779,6 +23798,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (!bodyAlwaysExits(el.body)) {
                 fallThroughExits.push_back(nullNarrowed_);
                 fieldExits.push_back(fieldNarrowed_);
+                typeExits.emplace_back(branchEntryTypes, narrowings_);
             }
             narrowings_ = savedNarrowings;
             initNarrowed_ = savedInitNarrowed;
@@ -23790,6 +23810,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/false);
         for (const auto& el : ifs->elifBranches)
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/false);
+        branchEntryTypes = narrowings_;   // #6113
         {
             Scope bodyScope;  // per §21.6 / §21.1 (#5314): block scope
             bodyScope.parent = currentScope_;
@@ -23802,8 +23823,23 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (!ifs->hasElse || !bodyAlwaysExits(ifs->elseBody)) {
             fallThroughExits.push_back(nullNarrowed_);
             fieldExits.push_back(fieldNarrowed_);
+            typeExits.emplace_back(branchEntryTypes, narrowings_);
         }
+        // After-if type narrowings: the entry facts no fall-through path
+        // invalidated (#6113). With no fall-through path the after-if point
+        // is unreachable and the entry map stands.
         narrowings_ = savedNarrowings;
+        for (const auto& [branchStart, branchEnd] : typeExits) {
+            for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+                auto st = branchStart.find(it->first);
+                auto en = branchEnd.find(it->first);
+                if (st != branchStart.end() && en != branchEnd.end() &&
+                    st->second == en->second)
+                    ++it;
+                else
+                    it = narrowings_.erase(it);
+            }
+        }
         initNarrowed_ = savedInitNarrowed;
         // After-if nullability = intersection of all fall-through exit sets.
         if (fallThroughExits.empty()) {
