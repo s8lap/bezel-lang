@@ -7702,6 +7702,18 @@ void Resolver::checkAbstractImplementations() {
     // class parameter `T`). Own-parameter classification is by spelling, so
     // the substituted refs are recorded here and ownParamIndex skips them.
     std::unordered_set<const TypeRef*> substOrigin;
+    // #6121: a substituted-in composite (`K<T>: I<Box<T>>`: `Box<T>`) carries
+    // class parameters inside it; every ref reachable from it is a substituted-in
+    // ref, not just its root.
+    std::function<void(const TypeRef*)> markSubstOrigin =
+        [&](const TypeRef* t) {
+            if (!t || !substOrigin.insert(t).second) return;
+            for (const TypeRef* ga : t->genericArgs) markSubstOrigin(ga);
+            markSubstOrigin(t->arrayElement);
+            for (const TypeRef::FuncParam& fp : t->funcParams)
+                markSubstOrigin(fp.type);
+            markSubstOrigin(t->funcReturn);
+        };
     std::function<TypeRef*(TypeRef*, const SubstMap&)> substGenericArg;
     std::function<TypeRef*(TypeRef*,
                            const std::unordered_map<std::string_view, const TypeRef*>&)>
@@ -7730,7 +7742,7 @@ void Resolver::checkAbstractImplementations() {
             auto it = map.find(d->headName());
             if (it != map.end() && it->second) {
                 const TypeRef* s = it->second;
-                substOrigin.insert(s);
+                markSubstOrigin(s);
                 if (d->nullable && !s->nullable) {
                     TypeRef* nn = ctx_.makeTypeRef(*s);
                     nn->nullable = true;
