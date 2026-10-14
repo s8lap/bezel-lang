@@ -116,3 +116,57 @@ BEZEL_TEST(interface_overload_witness_5999, generic_interface_instantiation_unch
         " return 0; end Main; end P;\n"),
         "4 4\n");
 }
+
+// Two interfaces declaring a same-named member with different parameter types,
+// both implemented by one class that declares both overloads. Each interface
+// receiver must bind its own slot's witness (§11.2 v0.338: a member matches an
+// interface member only on "parameter types that are exactly equal under the
+// interface's substitution"); the direct call on C then resolves over all of
+// C's overloads (§22.6 v0.338, "Exact-match ranking over the applicable
+// candidates"). `a.F(g)` with `g: Dog` binds IA's F(Animal) (only applicable
+// member of IA), so it prints 1. Expected `112 | 12`.
+BEZEL_TEST(interface_overload_witness_5999, two_interfaces_same_member_name_each_receiver_spec_11_2) {
+    BEZEL_EXPECT_EQ(out(
+        "module M; class Animal end Animal; class Dog: Animal end Dog;\n"
+        "interface IA method F(x: Animal): int; end IA;\n"
+        "interface ID method F(x: Dog): int; end ID;\n"
+        "class C: IA, ID\n"
+        " public method F(x: Dog): int => 2;\n"
+        " public method F(x: Animal): int => 1;\n"
+        "end C;\n"
+        "class P public static method Main(): int\n"
+        " using var c := new C(); var a: IA := c; var d: ID := c; using var an := new Animal(); using var g := new Dog();\n"
+        " Console.WriteLine(a.F(an).ToString() + a.F(g).ToString() + d.F(g).ToString() + \" | \" + c.F(an).ToString() + c.F(g).ToString());\n"
+        " return 0; end Main; end P;\n"),
+        "112 | 12\n");
+}
+
+// Interface member F(Dog) implemented by a class whose base declares virtual
+// overloads F(Animal) and F(Dog), with a derived override of both. The witness
+// for IF(Dog) must be the member whose parameter types match (§11.2 v0.338,
+// "parameter types that are exactly equal under the interface's substitution"),
+// so an interface receiver over a plain B prints B's F(Dog) = 20, not its
+// F(Animal) = 10; over D it prints D's F(Dog) override = 200. The direct call
+// on D resolves to the exact-match Dog overload (§22.6 v0.338, "Exact-match
+// ranking over the applicable candidates"): 200. Expected `200 20 | 200`.
+BEZEL_TEST(interface_overload_witness_5999, inherited_virtual_overloads_derived_override_spec_11_2) {
+    BEZEL_EXPECT_EQ(out(
+        "module M; class Animal end Animal; class Dog: Animal end Dog;\n"
+        "interface I\n"
+        " method F(x: Dog): int;\n"
+        "end I;\n"
+        "class B: I\n"
+        " public virtual method F(x: Animal): int => 10;\n"
+        " public virtual method F(x: Dog): int => 20;\n"
+        "end B;\n"
+        "class D: B\n"
+        " public override method F(x: Dog): int => 200;\n"
+        " public override method F(x: Animal): int => 100;\n"
+        "end D;\n"
+        "class P public static method Main(): int\n"
+        " using var d := new D(); var j: I := d; using var b := new B(); var k: I := b;\n"
+        " using var g := new Dog();\n"
+        " Console.WriteLine(j.F(g).ToString() + \" \" + k.F(g).ToString() + \" | \" + d.F(g).ToString());\n"
+        " return 0; end Main; end P;\n"),
+        "200 20 | 200\n");
+}
