@@ -629,3 +629,79 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// ===========================================================================
+// #6170 review follow-ups (§19.3 / §35.5 / §28.9 / §22.9, v0.338). The
+// reviewer's probe programs, verbatim, each looping 200 times.
+// ===========================================================================
+namespace {
+std::string choiceReviewProgram6170(const std::string& classes,
+                                    const std::string& stepBody) {
+    return "module M;\n"
+           "choice P Ok(v: string), Two(a: string, b: string), No; end P;\n" +
+           classes +
+           "\nclass Program\n"
+           "  static method Len(p: P): int\n"
+           "    var n := 0;\n"
+           "    case p of Ok(var s) => do n := s.Length; end, "
+           "Two(var x, var y) => do n := x.Length + y.Length; end, "
+           "No => do n := 0; end end case;\n"
+           "    return n;\n"
+           "  end Len;\n"
+           "  static method Step(k: int, q: string): int\n"
+           "    var n := 0;\n" +
+           stepBody +
+           "\n    return n;\n"
+           "  end Step;\n"
+           "  public static method Main(): int\n"
+           "    var total := 0;\n"
+           "    for var k in 0..<200 do total := total + "
+           "Program.Step(k, \"q\" + k.ToString()); end;\n"
+           "    Console.WriteLine(total.ToString());\n"
+           "    return 0;\n"
+           "  end Main;\n"
+           "end Program;\n";
+}
+}  // namespace
+
+// THE PIN (review of step 2): `a` is reassigned inside an arm of `case a of`
+// while the arm's binding `s` still borrows a's payload (§35.5). The step-2
+// reassignment released the old payload, so `s.Length` read freed memory:
+// MEASURED ASan heap-use-after-free on e491dc8a (plain run: an
+// OverflowException from the freed length). A reassignment of the scrutinee
+// inside its own arm is now an escape, so `a` is not an owner there (the
+// pre-step-2 behaviour: its payload leaks, so this oracle runs with LSan off).
+// Expected total: 200 iterations of len("q<k>p") = 30 + 360 + 500 = 890.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_19_3_35_5_reassign_scrutinee_inside_its_arm_6170) {
+    JitResult r = runAotAsanNoLeak(choiceReviewProgram6170(
+        "",
+        "    var a := P.Ok(q + \"p\"); case a of Ok(var s) => do a := P.No; "
+        "n := s.Length; end, Two(var x, var y) => do n := 0; end, "
+        "No => do n := 0; end end case;"));
+    BEZEL_EXPECT_TRUE(r.ran);  // pre-fix: ASan heap-use-after-free
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("890") != std::string::npos);
+}
+
+// The same hazard through a construction reassignment, and through a copy
+// whose own arm reassigns it and then the source.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_19_3_35_5_reassign_scrutinee_inside_its_arm_variants_6170) {
+    JitResult r1 = runAotAsanNoLeak(choiceReviewProgram6170(
+        "",
+        "    var a := P.Ok(q + \"p\"); case a of Ok(var s) => do "
+        "a := P.Ok(q + \"r\"); n := s.Length; end, Two(var x, var y) => do "
+        "n := 0; end, No => do n := 0; end end case;"));
+    BEZEL_EXPECT_TRUE(r1.ran);  // pre-fix: ASan heap-use-after-free
+    BEZEL_EXPECT_EQ(r1.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r1.stdoutText.find("890") != std::string::npos);
+    JitResult r2 = runAotAsanNoLeak(choiceReviewProgram6170(
+        "",
+        "    var a := P.Ok(q + \"p\"); var b := a; case b of Ok(var s) => do "
+        "b := P.No; a := P.No; n := s.Length; end, Two(var x, var y) => do "
+        "n := 0; end, No => do n := 0; end end case;"));
+    BEZEL_EXPECT_TRUE(r2.ran);  // pre-fix: ASan heap-use-after-free
+    BEZEL_EXPECT_EQ(r2.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r2.stdoutText.find("890") != std::string::npos);
+}

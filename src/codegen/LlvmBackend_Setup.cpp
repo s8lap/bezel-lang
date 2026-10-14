@@ -28593,6 +28593,14 @@ struct StringEscapeWalker {
     // reassignment that releases the old value, not an escape. Null in every
     // other walk.
     const std::unordered_set<const void*>* choiceOwnerAliases = nullptr;
+    // fix #6170 step 2 (§19.3 / §35.5 / §28.9, v0.338): how many `case` arms
+    // whose scrutinee is the tracked local itself enclose the current walk
+    // position. An arm's payload bindings BORROW the scrutinee's strings
+    // (§35.5), so a reassignment of the tracked local inside such an arm
+    // would release the very strings a live binding still reads (heap-use-
+    // after-free). There the `choiceOwnerAliases` reassignment relaxation
+    // does not apply and the reassignment stays an escape.
+    int targetScrutineeArmDepth = 0;
     // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): path-sensitive branch
     // analysis. The default walk is PATH-INSENSITIVE — when the walker hits
     // an `if`/`while`/`for` it walks every reachable branch in sequence and
@@ -30363,11 +30371,15 @@ struct StringEscapeWalker {
                                  isTargetIdent(ce->scrutinee.get()) &&
                                  armsBindingsSafe(ce->arms);
             expr(ce->scrutinee.get(), /*safeRead=*/scrutineeSafe);
+            // fix #6170 step 2: see targetScrutineeArmDepth.
+            bool onTarget = isTargetIdent(ce->scrutinee.get());
+            if (onTarget) ++targetScrutineeArmDepth;
             for (auto& arm : ce->arms) {
                 expr(arm.guard.get(), /*safeRead=*/false);
                 expr(arm.exprBody.get(), /*safeRead=*/armSafe);
                 for (auto& s : arm.stmts) stmt(s.get());
             }
+            if (onTarget) --targetScrutineeArmDepth;
             return;
         }
         // Leaf literals (int/float/char/string/bool/null/unit/typeof/nameof/
@@ -30771,7 +30783,11 @@ struct StringEscapeWalker {
                 // lowered by lowerValueLikeChoiceLocalReassign (retain the new
                 // value, release the old). Outside a lambda only: a captured
                 // local is a cell the reassign lowering does not handle.
-                if (choiceOwnerAliases && !inLambda && as->op == ":=") {
+                // Never inside an arm of a `case` on the tracked local itself
+                // (targetScrutineeArmDepth): a live binding borrows the value
+                // the reassignment would release.
+                if (choiceOwnerAliases && !inLambda && as->op == ":=" &&
+                    targetScrutineeArmDepth == 0) {
                     expr(as->value.get(), /*safeRead=*/true);
                     return;
                 }
@@ -31221,11 +31237,15 @@ struct StringEscapeWalker {
                                  isTargetIdent(cs->scrutinee.get()) &&
                                  armsBindingsSafe(cs->arms);
             expr(cs->scrutinee.get(), /*safeRead=*/scrutineeSafe);
+            // fix #6170 step 2: see targetScrutineeArmDepth.
+            bool onTarget = isTargetIdent(cs->scrutinee.get());
+            if (onTarget) ++targetScrutineeArmDepth;
             for (auto& arm : cs->arms) {
                 expr(arm.guard.get(), /*safeRead=*/false);
                 expr(arm.exprBody.get(), /*safeRead=*/false);
                 for (auto& a : arm.stmts) stmt(a.get());
             }
+            if (onTarget) --targetScrutineeArmDepth;
             return;
         }
         // BreakStmt / ContinueStmt: no sub-expressions. Any other statement type
