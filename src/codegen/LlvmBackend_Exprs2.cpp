@@ -12008,6 +12008,21 @@ llvm::Value* Emitter::buildRecordValue(
                 const std::string* text = ctx_.importedConstValue(m);
                 if (text && !text->empty()) continue;
             }
+            // fix #4097 (§7.9 "Default initialization", §9.3, v0.338): a
+            // member of NULLABLE type with no initializer is DEFAULTABLE —
+            // "every nullable type, whose default is `null`" satisfies the
+            // must-initialize rule vacuously and "is implicitly initialized to
+            // that default"; §9.3: "a defaultable one may be left to its
+            // default" and a body constructor "does not assign [a non-
+            // defaultable body field] for the primary" (so only a
+            // NON-defaultable one needs an initializer). The preamble
+            // zero-fill above (`ConstantAggregateZero`) IS that default for a
+            // nullable slot (null pointer / `{hasValue: false}`), so the fast
+            // path leaves it correct. Deliberately scoped to nullable types
+            // (the issue's shape); other defaultable kinds stay declined.
+            if (const sema::TypeRef* mt = recordMemberTypeResolved(m);
+                mt && mt->nullable && mt->kind != sema::TypeRef::Kind::InlineArray)
+                continue;
             return false;  // no initializer (and no imported replay available)
         }
         return true;
