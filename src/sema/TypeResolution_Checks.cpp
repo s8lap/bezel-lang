@@ -7584,6 +7584,34 @@ void Resolver::checkHidingAndOverride() {
                 // signature (or the class's own-typed `Equals`); the §12.2
                 // admission is for a NON-override declaration, so an override
                 // at any other parameter list overrides no virtual member.
+                // fix #5961 (§12.2, v0.338): a FIELD or PROPERTY named
+                // `Equals`, `GetHashCode` or `ToString` has no parameter
+                // list, so it is not the admitted overload (the admission
+                // covers "a non-override instance member ... at any other
+                // parameter list", a method notion) and no `override` can
+                // reach the slot: §12.2's "any inherited member" rule blocks
+                // it, instance or static. A `static class` is left as it was
+                // (spec question, see the #5961 commit body).
+                if (!dynamic_cast<const MethodSymbol*>(ms) &&
+                    (ms->name == "Equals" || ms->name == "GetHashCode" ||
+                     ms->name == "ToString")) {
+                    bool staticClassF = false;
+                    for (std::string_view mod : t->modifiers)
+                        if (mod == "static") staticClassF = true;
+                    if (!staticClassF || !hasMod(ms, "static")) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string(dynamic_cast<const PropertySymbol*>(ms)
+                                            ? "property `"
+                                            : "field `") +
+                            std::string(ms->name) +
+                            "` hides the inherited `Object." +
+                            std::string(ms->name) +
+                            "`; hiding is forbidden — choose a different name "
+                            "(\xC2\xA7""12.2)");
+                        continue;
+                    }
+                }
                 if (auto* tm = dynamic_cast<const MethodSymbol*>(ms);
                     tm && !tm->isOperator &&
                     (tm->name == "Equals" || tm->name == "GetHashCode" ||
