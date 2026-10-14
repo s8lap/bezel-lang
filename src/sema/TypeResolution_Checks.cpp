@@ -10088,6 +10088,13 @@ void Resolver::checkAbstractImplementations() {
                 if (cit != concreteProps.end()) {
                     const TypeRef* ctype = propType(cit->second);
                     if (!itype || !ctype) continue;
+                    // #6179 / §11.2 (v0.338): an implementing property
+                    // inherited from a generic base class (`class K: B<int>,
+                    // N`) is read through its declaring class's substitution
+                    // (`X -> int`) before the exact compare, as the generic
+                    // arm below does.
+                    ctype = propTypeUnder(ctype, classSubstOf(cit->second));
+                    if (!ctype) continue;
                     if (itype->kind == TypeRef::Kind::Error ||
                         ctype->kind == TypeRef::Kind::Error) continue;
                     if (!typeRefEqual(itype, ctype)) {
