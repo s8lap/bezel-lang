@@ -475,8 +475,8 @@ s10_5_0005	pass
 s10_5_0006	pass	
 s10_5_0007	pass	
 s10_5_0008	pass	
-s10_5_0009	fail	compiled but spec rejects this (override Equals Object? on enum)
-s10_5_0010	fail	compiled but spec rejects this (plain Equals Object? on enum)
+s10_5_0009	pass	
+s10_5_0010	pass	
 s10_5_0011	pass	
 s10_6_0001	pass	
 s11_1_0001	pass	
@@ -2061,8 +2061,8 @@ s35_2_0005	pass
 s35_2_0006	pass	
 s35_2_0007	pass	
 s35_2_0008	pass	
-s35_2_0009	fail	compiled but spec rejects this (override Equals Object? on choice)
-s35_2_0010	fail	compiled but spec rejects this (plain Equals Object? on choice)
+s35_2_0009	pass	
+s35_2_0010	pass	
 s35_2_0011	pass	
 s35_2_0042	pass	
 s35_3_0001	pass	
