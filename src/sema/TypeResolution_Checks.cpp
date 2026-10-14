@@ -6179,6 +6179,17 @@ static bool baseTypePathTo(const TypeSymbol* from, const TypeSymbol* target,
 void Resolver::buildBaseGenericSubst(
         MethodSymbol* derived, MethodSymbol* base,
         std::unordered_map<std::string_view, TypeRef*>& out) {
+    TypeSymbol* derivedClass = derived ? derived->parent : nullptr;
+    TypeSymbol* baseClass = base ? base->parent : nullptr;
+    buildBaseClassGenericSubst(derivedClass, baseClass, out);
+}
+
+// Shared by the method check (buildBaseGenericSubst) and the property /
+// indexer check (checkPropertyOverrideSignatureMatch), so both compose the
+// base's type arguments through the same chain (#6303, §12.1 / §11.2).
+void Resolver::buildBaseClassGenericSubst(
+        const TypeSymbol* derivedClass, const TypeSymbol* baseClass,
+        std::unordered_map<std::string_view, TypeRef*>& out) {
     // Example: Container<T> base, IntBox : Container<int> derived → {T → int}.
     // Look up the base type's TypeRef from the derived class's baseTypeRefs
     // (which store the resolved generic args).
@@ -6189,8 +6200,6 @@ void Resolver::buildBaseGenericSubst(
     // they are substituted by the bindings composed so far (the derived
     // class's own parameters stay as written: the identity). A chain that
     // records no argument at some level leaves the map empty, as before.
-    TypeSymbol* derivedClass = derived ? derived->parent : nullptr;
-    TypeSymbol* baseClass = base ? base->parent : nullptr;
     if (!derivedClass || !baseClass) return;
     std::vector<std::size_t> path;
     if (!baseTypePathTo(derivedClass, baseClass, path, 0)) return;
@@ -7116,28 +7125,10 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
     // the method check's buildBaseGenericSubst. A property/indexer carries
     // no own generic parameters, so only the enclosing-class substitution
     // applies.
+    // §12.1 / §11.2 (#6303): the same chain-composing substitution as the
+    // method check, through the shared buildBaseClassGenericSubst.
     std::unordered_map<std::string_view, TypeRef*> genericSubst;
-    if (derived->parent && base->parent) {
-        for (std::size_t bi = 0; bi < derived->parent->baseTypes.size();
-             ++bi) {
-            if (derived->parent->baseTypes[bi] != base->parent) continue;
-            TypeRef* baseRef =
-                (bi < derived->parent->baseTypeRefs.size())
-                    ? derived->parent->baseTypeRefs[bi]
-                    : nullptr;
-            if (!baseRef) break;
-            for (std::size_t gi = 0;
-                 gi < base->parent->genericParams.size() &&
-                 gi < baseRef->genericArgs.size();
-                 ++gi) {
-                if (auto* gp = dynamic_cast<GenericParamSymbol*>(
-                        base->parent->genericParams[gi])) {
-                    genericSubst[gp->name] = baseRef->genericArgs[gi];
-                }
-            }
-            break;
-        }
-    }
+    buildBaseClassGenericSubst(derived->parent, base->parent, genericSubst);
 
     // Visibility must match exactly (per §12.1, same as methods).
     if (derived->visibility != base->visibility) {

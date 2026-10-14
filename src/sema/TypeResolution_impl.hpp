@@ -1088,6 +1088,13 @@ private:
         MethodSymbol* derived, MethodSymbol* base,
         std::unordered_map<std::string_view, TypeRef*>& out);
 
+    // The class-level core of buildBaseGenericSubst: the substitution for
+    // `baseClass`'s generic parameters as bound through the base-type chain
+    // from `derivedClass` (#6303). Property/indexer overrides use it directly.
+    void buildBaseClassGenericSubst(
+        const TypeSymbol* derivedClass, const TypeSymbol* baseClass,
+        std::unordered_map<std::string_view, TypeRef*>& out);
+
     // §12.1/§22.5 (#1090): does the derived method's parameter list match the
     // base method's (same arity, same parameter types after generic subst)?
     // Used to pick the correct overload among several same-name base members
