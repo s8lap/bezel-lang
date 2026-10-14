@@ -6393,7 +6393,27 @@ static OverrideTParamScope makeOverrideTParamScope(
 static bool overrideSpellingDiffers(const TypeRef* d, const TypeRef* b,
                                     const OverrideTParamScope& s,
                                     bool bDerivedScope) {
-    if (!d || !b || d->kind != b->kind) return false;
+    if (!d || !b) return false;
+    // A base class parameter: compare with its substituted argument (already
+    // in the derived scope). An unsubstituted one (an indirect base) is a
+    // wildcard. #6315 / #6316 (b), §12.1 + §11.2 (v0.338): the argument is
+    // compared WHOLE, at every depth and whatever its kind, in the derived
+    // scope, so `Array<V>` (or `(V) -> int`) against `T` bound to `Array<U>`
+    // (or `(U) -> int`) differs: V is not U. Only a declaration-less head was
+    // compared before, and `typeRefEqual` equated the rest blindly, since a
+    // class type parameter has no declaration to tell two of them apart.
+    if (!bDerivedScope && b->kind == TypeRef::Kind::Named &&
+        !b->declaration && b->genericArgs.empty()) {
+        std::string_view bn = declLessNamedSpelling(b);
+        if (!s.baseOwn.count(bn) && s.baseClassParams.count(bn)) {
+            if (!s.classSubst) return false;
+            auto sub = s.classSubst->find(bn);
+            if (sub == s.classSubst->end() || !sub->second) return false;
+            return overrideSpellingDiffers(d, sub->second, s,
+                                           /*bDerivedScope=*/true);
+        }
+    }
+    if (d->kind != b->kind) return false;
     switch (d->kind) {
         case TypeRef::Kind::Named: {
             if (!d->declaration && !b->declaration) {
@@ -6407,16 +6427,8 @@ static bool overrideSpellingDiffers(const TypeRef* d, const TypeRef* b,
                     if (di == s.derivedOwn.end() || di->second != bi->second)
                         return true;
                 } else if (s.baseClassParams.count(bn)) {
-                    // A base class parameter: compare with its substituted
-                    // argument (already in the derived scope). An
-                    // unsubstituted one (an indirect base) is a wildcard.
-                    if (s.classSubst) {
-                        auto sub = s.classSubst->find(bn);
-                        if (sub != s.classSubst->end() && sub->second &&
-                            !sub->second->declaration &&
-                            dn != declLessNamedSpelling(sub->second))
-                            return true;
-                    }
+                    // A base class parameter spelled with type arguments is
+                    // not a well-formed type; a wildcard, as before.
                 } else {
                     // A base built-in or unresolved name: a derived type
                     // parameter of that name shadows it, so they never match.
@@ -6876,6 +6888,8 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         if (r && r->kind != TypeRef::Kind::Unit) bRet = r;
         bDeclaresReturn = (bRet != nullptr);
     }
+    const auto tparamScope =
+        makeOverrideTParamScope(derived, base, genericSubst);
     if (dDecl) {
         // Return type (null == unit) and owned-return modifier.
         TypeRef* dRet = dDecl->returnType
@@ -6883,15 +6897,20 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         // Apply substitution to base return type (T → int, etc.).
         TypeRef* bRetSubst = applyGenericSubst(bRet, genericSubst);
         bool bothNullReturn = !dDecl->returnType && !bDeclaresReturn;
-        if (!bothNullReturn && !typeRefEqual(dRet, bRetSubst)) {
+        // #6315 / #6316 (b), §12.1 (v0.338): `typeRefEqual` cannot tell two
+        // type parameters apart, so the return type also takes the
+        // positional/spelling walk the parameters do (`Array<V>` does not
+        // match `T` bound to `Array<U>`; a method's own `U` matches the
+        // overridden member's `T` at the same position).
+        if (!bothNullReturn &&
+            (!typeRefEqual(dRet, bRetSubst) ||
+             overrideSpellingDiffers(dRet, bRet, tparamScope, false))) {
             err("return type");
         }
         if (dDecl->returnOwned != bRetOwned) {
             err("`owned` return modifier");
         }
     }
-    const auto tparamScope =
-        makeOverrideTParamScope(derived, base, genericSubst);
     // Parameters: count, exact modifier, exact type.
     if (derived->params.size() != base->params.size()) {
         err("parameter count");
