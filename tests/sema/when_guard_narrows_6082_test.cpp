@@ -493,3 +493,38 @@ BEZEL_TEST(sema_when_guard_narrows_6082,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("1 -1\n"));
 }
+
+// A guard test of a MUTABLY CAPTURED local, read in the arm with no call
+// between the test and the read (the review's rv4 cell B/n12b_cap_nocall).
+// §7.4 (v0.338): "Straight-line check-then-use of a captured local (`if x <>
+// null then x.M(); end;` — no call *between* the test and the use) remains
+// accepted", and a `when` guard narrows its arm's body like an `if`
+// condition, so the guard narrows `q` and the program compiles.
+//
+// PENDING #6141. The lambda's `q := new A()` (a fresh object assigned to a
+// borrow-initialised captured local) is accepted and leaks 16 B per call, on
+// staging and in the `if` spelling of this program alike. That is #6141's
+// defect, not the narrowing's, so this row runs the plain leg only and pins
+// the values; it gains the ASan leg (`runAotChecked`) when #6141 lands.
+BEZEL_TEST(sema_when_guard_narrows_6082,
+           guard_narrows_mutably_captured_local_without_call_spec_7_4_pending_6141) {
+    auto r = runAot(std::string(kPrelude) + R"bzl(public class P
+  public static method T(k: int, o: A): int
+    var q: A := o;
+    var mut := lambda() => do q := new A(); end;
+    case k of
+      _ when q is B => do return q.y; end,
+      _ => do mut(); return -9; end
+    end case;
+    return -7;
+  end T;
+  public static method Main(): int
+    Console.WriteLine($"{T(0, new B())} {T(0, new A())} {T(1, new B())} {T(1, new A())}");
+    return 0;
+  end Main;
+end P;
+)bzl");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("9 -9 9 -9\n"));
+}
