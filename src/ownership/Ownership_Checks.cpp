@@ -7106,6 +7106,11 @@ void MethodOwnership::checkRefOutLambdaCaptureOnStore(
     }
 }
 
+// Defined further down, beside the §30.5 indirect-escape check that first
+// needed them; the await-borrow alias arm of `borrowSourceForExpr` reads both.
+static bool isPatternATaskType(const sema::TypeRef* rt);
+static const sema::TypeRef* symbolTypeRef(const sema::Symbol* sym);
+
 sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
     // §31.1 (issue #392) — a re-borrow of a catch-bound exception variable.
     // `var b := ex;` binds `b` to the in-flight exception's borrow; the source
@@ -7295,6 +7300,32 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                         isEscapeBoundLocal(it->second.source->sym))
                         return it->second.source->sym;
                 }
+            }
+        } else if (dynamic_cast<const ast::IdentifierExpr*>(shape1Core)) {
+            // fix #6101 (§30.5 *Consumer-side rules*, Pattern A, v0.338): "`var
+            // r := await task;` — `r` is a non-owned local with the same source
+            // as `task`", and the producer row counts `Object` as a class
+            // ("`Object`, a class (§3.1), included"). The await arm above
+            // records that source on `r` whatever the result type is, but a
+            // plain-`Object` holder is a Primitive-kind TypeRef that
+            // `returnedExprMayBorrow` reads as a value copy, so the multi-hop
+            // leg just above never ran for it: `keep := r;`, `h.f := r;`,
+            // `a[0] := r;` and `var b := r; keep := b;` were all accepted at
+            // `Task<Object>` where the class twin is rejected, and each read
+            // the result after the task had disposed it. Follow the recorded
+            // source for a bare `Object` / `Object?` holder when - and only
+            // when - that source is a Pattern A task: the one way such a
+            // holder comes to carry one is the await arm (or a re-borrow of a
+            // holder that did, through this leg). // per §30.5, §28.3
+            const sema::TypeRef* ht = ctx_.exprType(*shape1Core);
+            if (ht && ht->kind == sema::TypeRef::Kind::Primitive &&
+                ht->primitive == sema::PrimitiveType::Object) {
+                auto it = states_.find(ctx_.exprSymbol(*shape1Core));
+                if (it != states_.end() && it->second.source &&
+                    isEscapeBoundLocal(it->second.source->sym) &&
+                    isPatternATaskType(
+                        symbolTypeRef(it->second.source->sym)))
+                    return it->second.source->sym;
             }
         }
     }
