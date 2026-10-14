@@ -9081,6 +9081,7 @@ private:
             // (`Gen<U>: IL<U>`) has no concrete instantiation; match under
             // the arguments as written on the one class that lists it.
             std::vector<const sema::TypeRef*> written;
+            const sema::TypeSymbol* lister = cls;
             if (n == 0) {
                 for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t))
                     for (std::size_t bi = 0; bi < t->baseTypes.size() &&
@@ -9089,13 +9090,21 @@ private:
                         if (t->baseTypes[bi] == iface->parent &&
                             t->baseTypeRefs[bi]) {
                             ++n;
+                            lister = t;
                             written.assign(
                                 t->baseTypeRefs[bi]->genericArgs.begin(),
                                 t->baseTypeRefs[bi]->genericArgs.end());
                             only = &written;
                         }
             }
-            if (n == 1)
+            // fix #6075 (§12.1 / §14.1, v0.338): arguments written on an
+            // ANCESTOR (`G<T>: IG<T>` reached from `D<U>: G<U>`) name that
+            // ancestor's parameters, which findInterfaceImplAt compares
+            // against each candidate unsubstituted: `D.Foo(x: Array<U>)`
+            // failed against `Array<T>` and the base's `Foo(x: Array<T>)`
+            // became the witness. That case goes to the chain-substituted
+            // match below, which reads both sides into `cls`'s scope.
+            if (n == 1 && lister == cls)
                 if (sema::MethodSymbol* at =
                         findInterfaceImplAt(cls, iface, *only))
                     return at;
