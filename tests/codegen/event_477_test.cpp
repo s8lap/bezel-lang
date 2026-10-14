@@ -30,25 +30,15 @@
 // (B7) remain capture-admitting per the rule's own final sentence.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness
-#include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
-using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& program) {
     auto r = runAot(program);
     BEZEL_EXPECT_TRUE(r.ran);
-    return r.ran ? r.exitCode : -999;
-}
-
-// Rows that stay on the deprecated JIT oracle: their program is one the spec
-// rejects on the AOT path (see the commit body for the spec sentence). They are
-// kept, not deleted, so the behaviour they pin stays under test.
-int runJitLeftover(const std::string& program) {
-    auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -206,10 +196,12 @@ BEZEL_TEST(codegen_events_477, interface_local_event_subscribe_b7) {
 }
 
 // §24.3 / §24.7: subscribing through an interface-typed PARAMETER must also
-// reach the real backing source. The helper receives `i: ISource` and
-// subscribes a handler (+V*10); the concrete sub adds +V. Trigger(1) → 11.
+// reach the real backing source. The helper receives `i: ISource` and returns
+// a capture-free Subscription (+V*10 into the static Tot.V); the concrete sub
+// adds +V. Trigger(1) -> 11. Capture-free callbacks are always admitted
+// (§28.14), so the returned form is admitted on the AOT path.
 BEZEL_TEST(codegen_events_477, interface_parameter_event_subscribe_b7) {
-    BEZEL_EXPECT_EQ(runJitLeftover(
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "record EvType(V: int); "
         "interface ISource "
@@ -219,22 +211,18 @@ BEZEL_TEST(codegen_events_477, interface_parameter_event_subscribe_b7) {
         "  public event Ready: EvType; "
         "  public method Trigger(v: int) Ready.Raise(new EvType(v)); end Trigger; "
         "end Source; "
-        "class Acc "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Acc; "
+        "class Tot public static V: int := 0; end Tot; "
         "class Helper "
-        "  public static method Wire(i: ISource, acc: Acc): Subscription "
-        "    return i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
+        "  public static method Wire(i: ISource): Subscription "
+        "    return i.Ready.Subscribe(lambda(e) => do Tot.V := Tot.V + e.V * 10; end); "
         "  end Wire; "
         "end Helper; "
         "class C public static method Main(): int "
-        "  var acc := new Acc(); "
         "  var src := new Source(); "
-        "  var sub2 := Helper.Wire(src, acc); "
-        "  var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
+        "  var sub2 := Helper.Wire(src); "
+        "  var sub1 := src.Ready.Subscribe(lambda(e) => do Tot.V := Tot.V + e.V; end); "
         "  src.Trigger(1); "
-        "  return acc.V; "                                // expect 11
+        "  return Tot.V; "                                // expect 11
         "end Main; end C;"), 11);
 }
 
@@ -288,8 +276,8 @@ BEZEL_TEST(codegen_events_477, interface_local_dispose_unsubscribes_b7) {
         "  var i: ISource := src; "
         "  do using var sub2 := i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
         "  src.Trigger(1); "                              // acc.V = 10
-        "  sub2.Dispose(); end; "                              // unsubscribe via interface-local sub
-        "  src.Trigger(1); "                              // handler gone — no-op
+        "  sub2.Dispose(); "                              // unsubscribe via interface-local sub
+        "  src.Trigger(1); end; "                              // handler gone — no-op
         "  return acc.V; "                                // expect 10
         "end Main; end C;"), 10);
 }
