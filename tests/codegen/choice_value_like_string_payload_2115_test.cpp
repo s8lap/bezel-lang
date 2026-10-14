@@ -284,7 +284,6 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
            spec_28_9_35_4_borrow_payload_arg_retained_6170) {
     JitResult r = runAotChecked(choiceBorrowProgram6170(
         "var s := \"s\" + k.ToString(); var a := P.Ok(s); n := 1; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan leak (400 allocs) → ran=false
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -298,7 +297,6 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "case a of Ok(var t) => do n := t.Length; end, "
         "  Two(var x, var y) => do n := 0; end, No => do n := 0; end end case; "
         "n := n + s.Length; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -312,7 +310,6 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "var s := \"s\" + k.ToString(); "
         "do var a := P.Ok(s); n := 1; end; "
         "n := n + s.Length; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -325,7 +322,6 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
     JitResult r = runAotChecked(choiceBorrowProgram6170(
         "var s := \"s\" + k.ToString(); var a := P.Two(s, s); "
         "s := \"z\" + k.ToString(); n := s.Length; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -340,7 +336,6 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "for var i in 0..<3 do var a := P.Ok(s); "
         "  if i = 1 then break; end; n := n + 1; end; "
         "n := n + s.Length; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -357,7 +352,6 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "  n := 1; end; "
         "catch InvalidOperationException => do n := 2; end end try; "
         "n := n + s.Length; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
