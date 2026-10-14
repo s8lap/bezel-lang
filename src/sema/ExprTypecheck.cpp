@@ -18115,6 +18115,12 @@ void MutablyCapturedScan::expr(const ast::Expr* e) {
             if (arm.exprBody) expr(arm.exprBody.get());
             body(arm.stmts);
         }
+    } else if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+        // §17.15 binding atom `(var x := E; body)`: its clauses and its body
+        // are ordinary sub-expressions — a lambda written inside one, or a
+        // mutation inside one that is itself a lambda's body, counts.
+        for (const auto& c : bx->clauses) stmt(c.get());
+        expr(bx->body.get());
     }
     // Leaf / type-only exprs (identifiers, literals, typeof/nameof/default,
     // unit) hold no sub-expression that can contain a lambda; nothing to do.
