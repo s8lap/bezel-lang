@@ -9966,6 +9966,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  (colName == "Array" || colName == "OwningArray" ||
                                   colName == "Set" || colName == "OwningSet"))
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // fix #6163 / stdlib §4.11: Stack<T>, OwningStack<T>,
+                        // Queue<T> and OwningQueue<T> declare no `Remove` (they
+                        // are IReadOnlyCollection<T>, #1354; Push/Pop/Peek/
+                        // Enqueue/Dequeue/Contains/TryPop/TryPeek/TryDequeue/
+                        // Clear/Drain only). The generous member-surface union
+                        // above admits the name because a sibling family has
+                        // it, so the call was accepted and dropped at lowering
+                        // (#3079). Same diagnostic shape as the surface check.
+                        else if (m == "Remove" &&
+                                 (colName == "Stack" || colName == "Queue" ||
+                                  colName == "OwningStack" ||
+                                  colName == "OwningQueue")) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `Remove` on `") +
+                                std::string(colName) +
+                                "<T>` (§22.5 / §4.11) — it is not part of this "
+                                "collection's method surface");
+                        }
                         // per §3: Contains → bool, IndexOf → int
                         // per §4.10 stdlib: TryAdd(item: T): bool
                         // §4.11/§4.12 (#725): Stack.TryPop/TryPeek,
