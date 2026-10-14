@@ -370,3 +370,71 @@ BEZEL_TEST(sema_generic_method_reference_list_5814,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "explicit type argument(s)"));
 }
+
+// s27_6_0014 second half — `var f: (int) -> int := Math.Abs;` selects among
+// `Abs`'s non-generic overloads by the target (§27.6 "Method references to
+// overloaded methods", v0.338): exact match wins; the formed value is invoked.
+// Before the fix the reference was typed as the scalar `int` and rejected as
+// "not implicitly convertible". (The decimal overload's invocation is #6297,
+// a pre-existing codegen fault of `Math.Abs(decimal)` itself, so not run here.)
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           math_abs_reference_selected_by_target_27_6) {
+    auto r = runAotChecked(
+        "module Conf; "
+        "public class Program "
+        "  public static method Apply(f: (int) -> int, a: int): int => f(a); "
+        "  public static method Main() "
+        "    var a: (int) -> int := Math.Abs; "
+        "    Console.WriteLine(a(-4)); "
+        "    var l: (long) -> long := Math.Abs; "
+        "    Console.WriteLine(l(-5000000000L)); "
+        "    var d: (double) -> double := Math.Abs; "
+        "    Console.WriteLine(d(-2.5)); "
+        "    var t := 0; var i := 0; "
+        "    while i < 200 do "
+        "      var f: (int) -> int := Math.Abs; "
+        "      t := t + f(-i) + Apply(Math.Abs, -i); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(t); "
+        "    Console.WriteLine(Math.Abs(-7)); "
+        "  end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+                    std::string("4\n5000000000\n2.5\n39800\n7\n"));
+}
+
+// §27.6: no target -> ambiguous, reported (`var f := Math.Abs;`); a target
+// matching no overload exactly (string; converting-only int -> long) is
+// reported, never guessed.
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           math_abs_reference_without_target_or_match_rejected_27_6) {
+    auto r = runAot(
+        "module Conf; public class Program public static method Main() "
+        "  var f := Math.Abs; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "is ambiguous: it is overloaded and has no target type"));
+    for (const char* tgt : {"(string) -> string", "(int) -> long", "(int, int) -> int"}) {
+        auto q = runAot(std::string("module Conf; public class Program "
+            "public static method Main() var f: ") + tgt + " := Math.Abs; "
+            "end Main; end Program;");
+        BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(q));
+        BEZEL_EXPECT_TRUE(diagnosticMessageContains(q, "`Math.Abs`"));
+    }
+}
+
+// #6297: `Math.Abs(decimal)` codegen is malformed IR, so the decimal overload
+// is not formed as a reference (§27.6, stdlib §2.2, v0.338): a sema error, not
+// a verifier crash.
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           math_abs_decimal_reference_rejected_until_6297_27_6) {
+    auto r = runAot(
+        "module Conf; public class Program public static method Main() "
+        "  var f: (decimal) -> decimal := Math.Abs; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`Math.Abs(decimal)` overload cannot yet be formed as a method reference"));
+}

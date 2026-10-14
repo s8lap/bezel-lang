@@ -29876,7 +29876,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             "declares type parameters; there are no partial "
                             "lists (\xC2\xA7""14.5, \xC2\xA7""27.6, v0.338)");
                 }
-                if (m=="Abs"||m=="Sign") setInt();
+                // per §27.6 "Method references to overloaded methods" (v0.338,
+                // #5814): `Math.Abs` NOT in callee position is a reference to
+                // the overloaded method group (stdlib §2.2: int/long/double/
+                // decimal). It is typed as the first overload's function type
+                // - the convention every other method group follows - and
+                // checkAssignable's selectMathAbsOverload re-types it against
+                // the target; a call's own overload is chosen in typeCall.
+                if (m=="Abs" && &ma != calleeOfCallCtx_ && ma.typeArgs.empty()) {
+                    auto* ft = ctx_.makeTypeRef();
+                    ft->kind = TypeRef::Kind::Function;
+                    TypeRef::FuncParam fp;
+                    fp.type = ctx_.primitiveTypeRef(PrimitiveType::Int);
+                    ft->funcParams.push_back(fp);
+                    ft->funcReturn = fp.type;
+                    ctx_.setExprType(&ma, ft);
+                }
+                else if (m=="Abs"||m=="Sign") setInt();
                 else if (m=="Sqrt"||m=="Pow"||
                          m=="Ceiling"||m=="Floor"||m=="Round"||m=="Truncate"||
                          // §2.2 (v0.285): the surviving constants are `Pi`

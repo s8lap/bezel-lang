@@ -7217,7 +7217,7 @@ bool Emitter::isPrimIntrinsicMethodRef(const ast::Expr* e) const {
     // function value — is backed by the same thunk (no MethodSymbol).
     if (id->name == "Math")
         return ma->member == "Min" || ma->member == "Max" ||
-               ma->member == "Clamp";
+               ma->member == "Clamp" || ma->member == "Abs";
     return sema::primitiveFromName(id->name) != sema::PrimitiveType::None;
 }
 

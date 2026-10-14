@@ -3724,6 +3724,11 @@ private:
     MethodRefOverloadResult selectMethodRefOverload(const ast::Expr* fromExpr,
                                                     const TypeRef* target,
                                                     const TypeRef*& winnerOut);
+    // §27.6 (v0.338, #5814): built-in `Math.Abs` method-group selection.
+    bool isMathAbsReference(const ast::Expr* e) const;
+    TypeRef* selectMathAbsOverload(
+        const ast::Expr* fromExpr, TypeRef* to, SourceLocation loc,
+        const std::unordered_set<std::string_view>* freeTypeParamNames);
 
     // §27.6 (issue #4978, v0.307): build a Function TypeRef from a
     // MethodSymbol — mirror of the bare-method-access TypeRef construction

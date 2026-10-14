@@ -5372,6 +5372,79 @@ TypeRef* ExprTC::buildMethodRefType(const MethodSymbol* ms) {
     return ft;
 }
 
+// §27.6 (v0.338, #5814): a bare, built-in `Math.Abs` (no list, no user symbol)
+// typed by resolveMemberAccess as a function value.
+bool ExprTC::isMathAbsReference(const ast::Expr* e) const {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || ma->member != "Abs" || !ma->typeArgs.empty()) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id || id->name != "Math") return false;
+    if (ctx_.exprSymbol(*e)) return false;       // a user `Math` type
+    const TypeRef* t = ctx_.exprType(*e);
+    return t && t->kind == TypeRef::Kind::Function;
+}
+
+// §27.6 "Method references to overloaded methods" (v0.338): select among
+// `Abs`'s int/long/double/decimal overloads (stdlib §2.2) by the target; an
+// exact (parameter and, where closed, return) match wins. Absent an exact
+// candidate the reference is ambiguous (candidates that unify only through
+// conversion are co-equal) - reported, never guessed. The winner is published
+// as the expression's type so codegen's primitive-intrinsic thunk is keyed by
+// it. Returns null after reporting.
+TypeRef* ExprTC::selectMathAbsOverload(
+    const ast::Expr* fromExpr, TypeRef* to, SourceLocation loc,
+    const std::unordered_set<std::string_view>* freeTypeParamNames) {
+    static const PrimitiveType kAbs[] = {PrimitiveType::Int, PrimitiveType::Long,
+                                         PrimitiveType::Double,
+                                         PrimitiveType::Decimal};
+    const char* kSigs = "`(int) -> int`, `(long) -> long`, "
+                        "`(double) -> double`, `(decimal) -> decimal`";
+    if (to->funcParams.size() == 1 && to->funcParams[0].modifier.empty()) {
+        const TypeRef* tp = to->funcParams[0].type;
+        const TypeRef* tr = to->funcReturn;
+        const bool openRet = !tr || isFreeGenericTypeVarRef(tr, freeTypeParamNames);
+        for (PrimitiveType pt : kAbs) {
+            TypeRef* p = ctx_.primitiveTypeRef(pt);
+            if (!tp || !functionSlotTypeRefEqual(tp, p)) continue;
+            if (!openRet && !functionSlotTypeRefEqual(tr, p)) continue;
+            if (pt == PrimitiveType::Decimal) {
+                // stdlib §2.2 declares `Abs(decimal)`, but its codegen is
+                // malformed IR (#6297): keep the reference rejected here.
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "the `Math.Abs(decimal)` overload cannot yet be formed as "
+                    "a method reference (\xC2\xA7""27.6, stdlib \xC2\xA7""2.2, "
+                    "v0.338; #6297) \xE2\x80\x94 call it directly or write a "
+                    "lambda");
+                return nullptr;
+            }
+            auto* ft = ctx_.makeTypeRef();
+            ft->kind = TypeRef::Kind::Function;
+            TypeRef::FuncParam fp;
+            fp.type = p;
+            ft->funcParams.push_back(fp);
+            ft->funcReturn = p;
+            ctx_.setExprType(fromExpr, ft);
+            return ft;
+        }
+        // Converting-only candidates are co-equal: ambiguous when more than
+        // one unifies, and (decision recorded, #5814) not formed when one does.
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "the method reference `Math.Abs` is ambiguous against the target "
+            "type, or matches no overload exactly (\xC2\xA7""27.6, v0.338) "
+            "\xE2\x80\x94 select by an exact function type (candidates: " +
+                std::string(kSigs) + ")");
+        return nullptr;
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        "the method reference `Math.Abs` matches no overload of the target "
+        "function type (\xC2\xA7""27.6, v0.338) \xE2\x80\x94 candidates: " +
+            std::string(kSigs));
+    return nullptr;
+}
+
 ExprTC::MethodRefOverloadResult
 ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
                                 const TypeRef* target,
@@ -5530,6 +5603,17 @@ ExprTC::selectMethodRefOverload(const ast::Expr* fromExpr,
 bool ExprTC::reportUncalledOverloadedMethodRef(const ast::Expr* initExpr,
                                                SourceLocation loc) {
     if (!initExpr) return false;
+    // §27.6 (v0.338, #5814): the built-in `Math.Abs` group has no target here.
+    if (isMathAbsReference(initExpr)) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "the method reference `Math.Abs` is ambiguous: it is overloaded and has "
+            "no target type to select by (\xC2\xA7""27.6, v0.338) \xE2\x80\x94 add an "
+            "explicit type annotation (e.g. `var f: (int) -> int := "
+            "Math.Abs;`) to disambiguate (candidates: `(int) -> int`, "
+            "`(long) -> long`, `(double) -> double`, `(decimal) -> decimal`)");
+        return true;
+    }
     // fix #5063/#852 regression (§27.6, v0.307): restrict to a BARE method-
     // group reference shape (Identifier/MemberAccess — mirrors
     // `freshReferenceFormation`'s own shape test above), never any other
@@ -5702,6 +5786,14 @@ void ExprTC::checkAssignable(
         }
     }
     if (!from || !to) return;
+    // §27.6 "Method references to overloaded methods" (v0.338, #5814): the
+    // built-in `Math.Abs` group is selected by the target function type.
+    if (to->kind == TypeRef::Kind::Function && isMathAbsReference(fromExpr)) {
+        TypeRef* chosen = selectMathAbsOverload(fromExpr, to, loc,
+                                                freeTypeParamNames);
+        if (!chosen) return;          // diagnosed
+        from = chosen;
+    }
     // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
     // conversion site — see narrowIntConstantToTarget above.
     from = narrowIntConstantToTarget(fromExpr, from, to);
