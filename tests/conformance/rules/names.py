@@ -325,8 +325,18 @@ def reserved_declarations(source):
     return sorted(found)
 
 
-def check_source(source, index):
+def check_source(source, index, modules=()):
     own_types = declared_in(source)
+    # A module qualifier (`System.Exception`, `System.Threading.Task`) is not a
+    # type name: §2.3 v0.338 reaches an always-available type "by its module's
+    # qualified name". Strip the qualifier, longest module first, and check the
+    # type it qualifies.
+    # The auto-imported modules are §2.3's table rows; the rest come from the
+    # module index.
+    qualifiers = sorted(set(modules) | {"System", "System.Text",
+                                        "System.Collections.Generic",
+                                        "System.Collections.Linq"},
+                        key=len, reverse=True)
     known_types = own_types | PRIMITIVES | LANGUAGE | set(index)
     known_members = UNIVERSAL_MEMBERS | members_declared_in(source)
     unknown_types = set()
@@ -338,6 +348,8 @@ def check_source(source, index):
         code = STRING_RE.sub('""', code)
         if re.match(r'\s*(module|import)\b', code):
             continue
+        for mod in qualifiers:
+            code = re.sub(r'\b' + re.escape(mod) + r'\.(?=[A-Z])', '', code)
         for rx in TYPE_POSITION_RES:
             for m in rx.finditer(code):
                 name = m.group(1)
@@ -393,7 +405,8 @@ def main(argv, base_dir=None):
             continue
         with open(os.path.join(cases_dir, name), encoding="utf-8") as f:
             source = corpus.strip_header(f.read())
-        types, members = check_source(source, index)
+        types, members = check_source(source, index,
+                                      set(module_of_type.values()))
         imports = [] if sections.get(case_id) in IMPORT_RULE_SECTIONS \
             else missing_imports(source, module_of_type)
         # A reject case may be ABOUT declaring a reserved name; only a case that
@@ -406,7 +419,9 @@ def main(argv, base_dir=None):
         # contract requires to be the rule's own wording — names that identifier.
         if expects.get(case_id) == "reject":
             frag = diagnostics.get(case_id, "")
-            types = [t for t in types if t not in frag.split()]
+            # The diagnostic quotes the name in backticks (`Foo`).
+            named = set(re.findall(r'[A-Za-z_]\w*', frag))
+            types = [t for t in types if t not in named]
         if types or members or reserved or imports:
             findings += 1
             print(case_id)
