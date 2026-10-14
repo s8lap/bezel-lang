@@ -17,8 +17,7 @@ public record Money
     Amount := amount;
   end constructor;
 
-  public override method Equals(other: Object?): bool =>
-    (if other is Money then true else false);
+  public override method Equals(other: Money): bool => true;
   public override method GetHashCode(): int => 0;
 end Money;
 

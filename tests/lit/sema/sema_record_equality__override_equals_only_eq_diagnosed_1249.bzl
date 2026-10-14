@@ -8,7 +8,7 @@
 // (The §8.3 eq+hash pairing error is also expected, but the §9.2 `=` reject
 // is the load-bearing assertion here.)
 
-module M; record R public property V: int; public constructor(v: int) V := v; end constructor; public override method Equals(other: Object?): bool => true; end R; class C public method M() var a := new R(1); var b := new R(9); _ := a = b; end M; end C;
+module M; record R public property V: int; public constructor(v: int) V := v; end constructor; public override method Equals(other: R): bool => true; end R; class C public method M() var a := new R(1); var b := new R(9); _ := a = b; end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: a type that overrides `Equals` must also override `GetHashCode`
 // CHECK-SAME: (§8.3)

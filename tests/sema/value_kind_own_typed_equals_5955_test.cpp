@@ -177,10 +177,13 @@ class Program public static method Main(): int return 0; end Main; end Program;
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
-// §8.3 (v0.338, #5955) control: a record's `Equals(other: Object?)` takes no
-// own type, so it does not oblige `GetHashCode` under the own-typed rule.
+// §9.2 (v0.338, #5924 item 1; was a #5955 control that accepted it): "An
+// `Equals` taking `Object?` or `Object` is rejected on every value kind at the
+// declaration, `override` or plain, the diagnostic naming the own-typed
+// spelling." A record's plain `Equals(other: Object?)` is therefore rejected
+// (it was accepted, obliging nothing), naming `Equals(other: R)`.
 BEZEL_TEST(value_kind_own_typed_equals_5955,
-           record_plain_object_equals_obliges_nothing_accepted_spec_8_3) {
+           record_plain_object_equals_rejected_spec_9_2) {
     auto r = runAot(R"(
 module M;
 record R public property V: int; public constructor(v: int) V := v; end constructor;
@@ -188,8 +191,14 @@ record R public property V: int; public constructor(v: int) V := v; end construc
 end R;
 class Program public static method Main(): int return 0; end Main; end Program;
 )");
-    BEZEL_EXPECT_FALSE(hasAnyHashDiag(r));
-    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("may not take `Object?`") != std::string::npos &&
+            d.message.find("Equals(other: R)") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
 }
 
 // §8.3 (v0.338, #5955) control: an owning-classified choice (an `owned` class

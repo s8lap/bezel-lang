@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; record R public property V: int; public constructor(v: int) V := v; end constructor; public override method Equals(other: Object?): bool => true; public override method GetHashCode(): int => 0; public static method operator =(a: R, b: R): bool => a.V = b.V; public static method operator <>(a: R, b: R): bool => a.V <> b.V; end R; class C public method M() var a := new R(1); var b := new R(9); _ := a = b; end M; end C;
+module M; record R public property V: int; public constructor(v: int) V := v; end constructor; public override method Equals(other: R): bool => true; public override method GetHashCode(): int => 0; public static method operator =(a: R, b: R): bool => a.V = b.V; public static method operator <>(a: R, b: R): bool => a.V <> b.V; end R; class C public method M() var a := new R(1); var b := new R(9); _ := a = b; end M; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

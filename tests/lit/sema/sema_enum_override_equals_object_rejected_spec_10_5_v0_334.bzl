@@ -17,4 +17,4 @@
 
 module M; enum Color Red, Green, Blue; public override method Equals(x: Object): bool => x <> null; public override method GetHashCode(): int => 1; end Color; class C public static method Main(): int return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: enum method `Equals` may not be virtual, abstract, or override — enums dispatch statically (§10.5)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: enum method `Equals` may not take `Object` — an enum's `Object` slot is filled by its own-typed `Equals(other: Color)`, spelled `override` or plain (§10.5)

@@ -323,7 +323,7 @@ BEZEL_TEST(operator_groups_746, record_equals_without_gethashcode_diagnosed_1193
     auto r = parseSemaAll(
         "module M; record R "
         "  public X: int; "
-        "  public override method Equals(o: Object?): bool => false; "
+        "  public override method Equals(other: R): bool => false; "
         "end R; class F public static method Main(): int return 0; end Main; "
         "end F;");
     BEZEL_EXPECT_TRUE(hasEqHashPairingError(r));

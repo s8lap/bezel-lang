@@ -4,7 +4,7 @@
 //! title: declaring the operator overloads beside an Equals or GetHashCode override restores equality use
 //! rule: = and <> on a record outside the auto-hashable set are a compile error
 //!   unless the author also declares the operator =/<> overloads, along with
-//!   Equals(Object?), Equals(T), and GetHashCode overrides as needed.
+//!   Equals(T) and GetHashCode overrides as needed.
 //! cites: 25.2
 //! expect: run
 //! stdout: True
@@ -20,8 +20,6 @@ public record Money
   public static method operator =(a: Money, b: Money): bool => true;
   public static method operator <>(a: Money, b: Money): bool => false;
   public method Equals(other: Money): bool => true;
-  public override method Equals(other: Object?): bool =>
-    (if other is Money then true else false);
   public override method GetHashCode(): int => 0;
 end Money;
 

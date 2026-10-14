@@ -203,7 +203,7 @@ BEZEL_TEST(equality_v0158, equals_override_still_disqualifies_spec_9_2) {
         "record R "
         "  public property V: int; "
         "  public constructor(v: int) V := v; end constructor; "
-        "  public override method Equals(o: Object?): bool => true; "
+        "  public override method Equals(other: R): bool => true; "
         "  public override method GetHashCode(): int => 0; "
         "end R; "
         "class C public method M(a: R, b: R) _ := a = b; end M; end C;");

@@ -714,6 +714,30 @@ void Resolver::checkTypeMemberModifierOrder(TypeSymbol* t) {
 static bool isObjectVirtualReplacementMember(
     const MethodSymbol* ms, const SemaContext& sema, TypeSymbol* owner);
 
+// §9.2 / §10.5 / §35.2 (v0.338): the spelling (`Object?` or `Object`) of an
+// `Equals` whose one parameter is `Object`, nullable or not, or empty when `ms`
+// is not one. On every value kind such a declaration is rejected at the
+// declaration, `override` or plain: the kind's own-typed `Equals(other: T)` is
+// the one member that fills its `Object` slot ([§8.3], [§8.6]). Keyed on the
+// resolved parameter type, not on its spelling.
+static std::string_view objectSlotEqualsSpelling(const MethodSymbol* ms,
+                                                 const SemaContext& sema) {
+    if (!ms || ms->isOperator || ms->name != "Equals" || ms->params.size() != 1)
+        return {};
+    // A `static` Equals fills no instance slot; whether §9.2 rejects it is
+    // open (#6191), so it keeps its pre-#5924 behaviour (not rejected here).
+    for (auto mod : ms->modifiers)
+        if (mod == "static") return {};
+    auto* param = dynamic_cast<ParameterSymbol*>(ms->params.front());
+    if (!param || !param->declType) return {};
+    const TypeRef* paramTy = sema.resolvedType(*param->declType);
+    if (!paramTy || paramTy->kind != TypeRef::Kind::Primitive ||
+        paramTy->primitive != PrimitiveType::Object)
+        return {};
+    return paramTy->nullable ? std::string_view("Object?")
+                             : std::string_view("Object");
+}
+
 // §9.2 (v0.297): reject `virtual`, `abstract`, and `sealed override` on
 // record members, and `override` on any record member other than the three
 // Object-slot names `Equals` / `GetHashCode` / `ToString`. Records are
@@ -734,6 +758,22 @@ void Resolver::checkRecordMemberModifiers() {
             // line 1376: "what its kind: method, property, or indexer".
             if (!dynamic_cast<MethodSymbol*>(m) &&
                 !dynamic_cast<PropertySymbol*>(m)) {
+                continue;
+            }
+            // fix #5924 item 1 (§9.2, v0.338): an `Equals` taking `Object?` or
+            // `Object` is rejected on a record at the declaration, `override`
+            // or plain, naming the own-typed spelling (`Equals(other: R)`),
+            // which is the member that fills the record's `Object` slot.
+            if (auto spelling = objectSlotEqualsSpelling(
+                    dynamic_cast<MethodSymbol*>(m), ctx_);
+                !spelling.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("record member `Equals` may not take `") +
+                    std::string(spelling) + "` — a record's `Object` slot is "
+                    "filled by its own-typed `Equals(other: " +
+                    std::string(t->name) + ")`, spelled `override` or plain "
+                    "(§9.2)");
                 continue;
             }
             const bool hasVirtual = hasMod(mem, "virtual");
@@ -1196,14 +1236,11 @@ static bool isObjectVirtualReplacementMember(
         if (!param || !param->declType) return false;
         const TypeRef* paramTy = sema.resolvedType(*param->declType);
         if (!paramTy) return false;
-        // Valid: Equals(E) where E is the owner type
+        // Valid: Equals(E) where E is the owner type. `Equals(Object?)` is
+        // not admitted: §9.2 / §10.5 / §35.2 (v0.338) reject it on every
+        // value kind, so objectSlotEqualsSpelling reports it instead.
         if (paramTy->kind == TypeRef::Kind::Named &&
             paramTy->declaration == owner)
-            return true;
-        // Valid: Equals(Object?) — nullable Object
-        if (paramTy->kind == TypeRef::Kind::Primitive &&
-            paramTy->primitive == PrimitiveType::Object &&
-            paramTy->nullable)
             return true;
         return false;
     }
@@ -1466,6 +1503,21 @@ void Resolver::checkEnumRestrictions() {
                 // (checkTypeStaticNotVirtual's "may not be `sealed` on its
                 // own" check, ~line 583) and gating it here too would
                 // double-report that case.
+                // fix #5924 item 1 (§10.5, v0.338): an `Equals` taking
+                // `Object?` or `Object` is rejected at the declaration,
+                // `override` or plain, naming the own-typed spelling; it is
+                // reported here instead of the dispatch-modifier message.
+                if (auto spelling = objectSlotEqualsSpelling(ms, ctx_);
+                    !spelling.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("enum method `Equals` may not take `") +
+                        std::string(spelling) + "` — an enum's `Object` slot "
+                        "is filled by its own-typed `Equals(other: " +
+                        std::string(t->name) + ")`, spelled `override` or "
+                        "plain (§10.5)");
+                    continue;
+                }
                 bool overrideAdmitted = hasMod(ms, "override") &&
                     !hasMod(ms, "sealed") &&
                     isObjectVirtualReplacementMember(ms, ctx_, t);
@@ -1734,6 +1786,19 @@ void Resolver::checkChoiceDispatchModifiers() {
             // this disqualifies admission rather than adding an
             // unconditional top-level reject (avoids double-reporting bare
             // `sealed`, already caught by checkTypeStaticNotVirtual).
+            // fix #5924 item 1 (§35.2, v0.338): an `Equals` taking `Object?`
+            // or `Object` is rejected in either spelling, as on an enum.
+            if (auto spelling = objectSlotEqualsSpelling(ms, ctx_);
+                !spelling.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("choice method `Equals` may not take `") +
+                    std::string(spelling) + "` — a choice's `Object` slot is "
+                    "filled by its own-typed `Equals(other: " +
+                    std::string(t->name) + ")`, spelled `override` or plain "
+                    "(§35.2)");
+                continue;
+            }
             bool overrideAdmitted = hasMod(ms, "override") &&
                 !hasMod(ms, "sealed") &&
                 isObjectVirtualReplacementMember(ms, ctx_, t);

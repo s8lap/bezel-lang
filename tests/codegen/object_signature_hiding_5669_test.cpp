@@ -207,13 +207,14 @@ BEZEL_TEST(object_signature_hiding_5669,
 }
 
 // §12.2 line 2027: records keep their own value-kind rule (§8.3 / §10.5); the
-// class-only hiding check does not reach a record's `Equals(other: Object?)`.
+// class-only hiding check does not reach a record's own-typed `Equals(other: R)`.
 BEZEL_TEST(object_signature_hiding_5669,
            record_equals_at_object_signature_unchanged_spec_12_2) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M5669k; "
         "record R(X: int) "
-        "  public method Equals(other: Object?): bool => other is R; "
+        "  public method Equals(other: R): bool => true; "
+        "  public method GetHashCode(): int => 1; "
         "end R; "
         "class Program public static method Main(): int "
         "  var r := new R(1); "

@@ -15,4 +15,4 @@
 
 module M; choice Color Red(payload: int), Green, Blue(msg: string); public override method Equals(x: Object): bool => true; public override method GetHashCode(): int => 1; end Color; class C public static method Main(): int return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: choice method `Equals` may not be virtual, abstract, or override — choices dispatch statically (§35.2)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: choice method `Equals` may not take `Object` — a choice's `Object` slot is filled by its own-typed `Equals(other: Color)`, spelled `override` or plain (§35.2)
