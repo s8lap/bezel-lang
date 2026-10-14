@@ -6199,6 +6199,8 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     // point of NestedBodyScope is that the next per-body field is handled in one
     // place. Today it is a no-op here.
     NestedBodyScope nestedScope(*this);
+    // #4602: a record/enum/choice accessor's `this` is a value receiver.
+    if (!isStaticProp) noteCdNonClassThisFn(cls, fn);
 
     currentFn_          = fn;
     builder_.SetInsertPoint(entryBB);

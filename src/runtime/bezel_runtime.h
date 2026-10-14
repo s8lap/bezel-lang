@@ -1014,6 +1014,25 @@ void  bz_register_borrow(void* obj);
 void  bz_release_borrow(void* obj);
 void  bz_wait_for_borrows(void* obj);
 
+// #4602 (§28.2, v0.338): bounded retention for checked disposal (layer 1).
+// Checked disposal quarantines a disposed block so a surviving borrow's
+// member-entry guard can read its disposed flag. A block NO surviving borrow
+// can reach need not be quarantined. Codegen (checked builds only) calls
+// bz_cd_mark_escaped(v) wherever a class-typed value may be retained beyond
+// the evaluating frame (a store, an argument, a capture, a yield, a return),
+// and asks bz_cd_may_free(obj) at the release point of a provably fresh,
+// never-reassigned local: 1 = no escape was recorded, the block may be freed;
+// 0 = keep the quarantine. The escaped set is a process-global side table;
+// an entry is never removed (a marked block is quarantined, so its address
+// is never reused by the allocator through this path). The environment
+// variable BEZEL_CHECKED_DISPOSAL_QUARANTINE_ALL=1 (test-only) makes
+// bz_cd_may_free always return 0, restoring the full quarantine. Null-safe.
+void  bz_cd_mark_escaped(void* obj);
+// Marks the pointer held in `slot` (a capture cell or caller storage);
+// null-safe in both the slot and its contents.
+void  bz_cd_mark_escaped_slot(void* slot);
+int8_t bz_cd_may_free(void* obj);
+
 // stdlib §6.7 / §30.10: Task.FromResult<T>(value). Allocate a task and
 // immediately complete it with the `result_size` bytes at `result`. The
 // returned task is already-done; `await` on it takes the fast path. For

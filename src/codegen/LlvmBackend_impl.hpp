@@ -13114,7 +13114,11 @@ private:
     // unwind, caught-exception normal-exit free), and (since #415) for an
     // explicit `obj.Dispose()` whose receiver is a slot/field this scope owns and
     // can null to block a second reclaim. free(null) is a no-op.
-    void emitDisposeAndReclaim(llvm::Value* obj);
+    // #4602 (§28.2, v0.338): `cdMayFree` is true only at the scope-end release
+    // of a provably fresh, never-reassigned local (cdFreeEligibleSlots_); in
+    // checked mode the block is then freed when bz_cd_may_free says no escape
+    // was recorded, and quarantined otherwise. Ignored in unchecked mode.
+    void emitDisposeAndReclaim(llvm::Value* obj, bool cdMayFree = false);
 
     // fix #3470 / §28.12 step 2 ("...and the heap block is released"): the
     // BLOCK-RELEASE tail of emitDisposeAndReclaim — identity-hash side-table
@@ -13125,7 +13129,50 @@ private:
     // of a bare `free(obj)` that skipped the first two and the quarantine.
     // `obj` must be non-null (free(null) would be a no-op, but the side-table
     // and CauseChain helpers are called unconditionally).
-    void emitReclaimBlock(llvm::Value* obj);
+    void emitReclaimBlock(llvm::Value* obj, bool cdMayFree = false);
+
+    // #4602 (§28.2, v0.338) — checked-disposal bounded retention, layer 1.
+    // A checked build quarantines a disposed block so a surviving borrow's
+    // member-entry guard can read its disposed flag; a block no surviving
+    // borrow can reach may be freed. Two halves:
+    //  * ESCAPE MARKS. lowerExpr calls bz_cd_mark_escaped on every value of a
+    //    class-like type (cdMarkableType) unless its parent position is known
+    //    not to retain it (cdBenign_, filled by noteCdBenignChildren and by
+    //    lowerLocalDecl for an initializer). The default is to mark, so a
+    //    position this code does not recognise costs retention, never safety.
+    //    Implicit retentions are marked at their creation points: a lambda
+    //    env's captures, a bound method reference's receiver, and an
+    //    iterator/async frame's `this`.
+    //  * FREE-ELIGIBLE RELEASE. Only the scope-end disposal of a local bound
+    //    to a fresh `new` (no slot-derived value, so no K5.6 slot borrow can
+    //    reach it), never reassigned, never captured, never used outside a
+    //    borrow position (cdFreeEligibleDecls_) asks bz_cd_may_free. Every
+    //    other release site keeps the quarantine.
+    std::unordered_set<const ast::Expr*> cdBenign_;
+    std::unordered_set<const void*> cdFreeEligibleDecls_;
+    std::unordered_set<const llvm::Value*> cdFreeEligibleSlots_;
+    // #4602: sema leaves a bare `this`/`base` untyped (exprType null), so the
+    // escape mark cannot classify it by type. FAIL CLOSED: an untyped value
+    // is marked unless it is a bare `this`/`base` inside a function known to
+    // be a record/enum/choice instance body (a value receiver, never a heap
+    // block). Those functions are recorded here by emitFunctionBody,
+    // emitConstructorBody and ensurePropertyAccessorFn via
+    // noteCdNonClassThisFn; every other body kind (indexers, destructors,
+    // extensions, lambdas, thunks, anything added later) marks.
+    std::unordered_set<const llvm::Function*> cdNonClassThisFns_;
+    void noteCdNonClassThisFn(const sema::TypeSymbol* t, llvm::Function* fn) {
+        if (t && fn && (t->kind == ast::TypeDeclKind::Record ||
+                        t->kind == ast::TypeDeclKind::Enum ||
+                        t->kind == ast::TypeDeclKind::Choice))
+            cdNonClassThisFns_.insert(fn);
+    }
+    bool cdExprMarkable(const ast::Expr& e);
+    void noteCdBenignChildren(const ast::Expr& e);
+    bool cdMarkableType(const sema::TypeRef* t);
+    bool cdCallResultKeepsNoReceiver(const sema::TypeRef* t);
+    void emitCdMarkEscaped(llvm::Value* v);
+    void collectCdFreeEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
     // §6.6 / §30.11 (#974): release a NON-NULL `bz_tcs_t*` — fault a pending
     // inner task, clean up its error object, fire-and-forget the task, free the
@@ -23453,6 +23500,15 @@ private:
             --ip;
             const llvm::Instruction* i = &*ip;
             if (i == since.prev) return false;  // reached the snapshot
+            // #4602 (§28.2, v0.338): a checked-disposal escape mark is
+            // bookkeeping lowerExpr appends to the RECEIVER's value, not
+            // member dispatch, so it must not read as "an arm handled it".
+            // Measured: without this skip, checked builds lost the #4193
+            // bogus-getter-receiver rejection.
+            if (auto* ci = llvm::dyn_cast<llvm::CallInst>(i))
+                if (const llvm::Function* cf = ci->getCalledFunction())
+                    if (cf->getName().starts_with("bz_cd_mark_escaped"))
+                        continue;
             if (i->mayHaveSideEffects()) return true;
             if (--budget == 0) return true;  // give up conservatively
         }

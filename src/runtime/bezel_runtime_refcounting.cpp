@@ -2,6 +2,8 @@
 // Split from bezel_runtime.cpp per #1414 stage 2 (behavior-preserving motion).
 #include "bezel_runtime_internal.hpp"
 
+#include <unordered_set>
+
 // ---------------------------------------------------------------------------
 // §22.13 / #1212: static owned class/interface fields are disposed at program
 // exit in REVERSE initialization order (last-init first-disposed).
@@ -690,6 +692,44 @@ static void bz_drain_borrow_table(void) {
     // frees its BzBorrowEntry (which destructs the std::condition_variable;
     // the libstdc++ cv destructor is lock-free).
     (void)drained.size();
+}
+
+// ---------------------------------------------------------------------------
+// #4602 (§28.2, v0.338): checked-disposal escaped set — see the declarations
+// in bezel_runtime.h. §28.2 lets checked builds defer reclamation of a
+// disposed block ("the implementation may quarantine it"); it does not
+// require retaining a block no borrow can reach. The set records every
+// pointer codegen saw leave a frame; a release site that is otherwise
+// eligible frees the block only when its pointer is absent.
+// ---------------------------------------------------------------------------
+namespace {
+std::mutex g_cd_escaped_mu;
+std::unordered_set<void*>* g_cd_escaped = nullptr;  // reachable via a global
+int g_cd_quarantine_all = -1;  // -1 = not yet read from the environment
+}  // namespace
+
+extern "C" void bz_cd_mark_escaped(void* obj) {
+    if (!obj) return;
+    std::lock_guard<std::mutex> lk(g_cd_escaped_mu);
+    if (!g_cd_escaped) g_cd_escaped = new std::unordered_set<void*>();
+    g_cd_escaped->insert(obj);
+}
+
+extern "C" void bz_cd_mark_escaped_slot(void* slot) {
+    if (!slot) return;
+    bz_cd_mark_escaped(*static_cast<void**>(slot));
+}
+
+extern "C" int8_t bz_cd_may_free(void* obj) {
+    if (!obj) return 0;
+    std::lock_guard<std::mutex> lk(g_cd_escaped_mu);
+    if (g_cd_quarantine_all < 0) {
+        const char* v = getenv("BEZEL_CHECKED_DISPOSAL_QUARANTINE_ALL");
+        g_cd_quarantine_all = (v && v[0] && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    if (g_cd_quarantine_all) return 0;
+    if (g_cd_escaped && g_cd_escaped->count(obj)) return 0;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

@@ -10876,6 +10876,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         ~CurrentMethodGuard() { slot = prev; }
     };
     CurrentMethodGuard methodGuard{currentMethod_, ms};
+    // #4602: a record/enum/choice method's `this` is a value receiver.
+    if (ms && !isStaticMethod(ms)) noteCdNonClassThisFn(ms->parent, fn);
     // §2.5 / §14.1 / #783: an IMPORTED method's `methodFns_` entry is an EXTERNAL
     // declaration (the exporter holds the compiled body); never emit a body for
     // it here — doing so would multiply-define `bz$<Class>$<M>` at link time.
@@ -11202,6 +11204,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
         collectMoveOnlyArrayTransferred(*ci.stmts);
+        collectCdFreeEligible(*ci.stmts);  // #4602
         // fix #2900: must run BEFORE collectStringReleaseEligible so the
         // source `s`'s producer/borrow walks see the populated
         // `objectStringBorrowAll_` set and admit `var o: Object := s;` as
@@ -12919,6 +12922,8 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                                 // shape — so the empty list is sound).
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) { currentMethod_ = savedCurrentMethod; return; }
+    // #4602: a record/enum/choice constructor's `this` is a value receiver.
+    noteCdNonClassThisFn(cs->parent, fn);
     // fix #4056 / §9.4 / CG29 / §22.3 (v0.294): a record CONSTRUCTOR's `this`
     // is the receiver POINTER (CG29), but callees expecting the record STRUCT
     // (e.g. a static method's record parameter or a non-`this` instance-method
@@ -18115,6 +18120,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             }
         }
     }
+    // #4602: a local's initializer is a binding, not a retention — the
+    // local's own later uses are marked where they retain the value.
+    if (checkedDisposal_ && init) cdBenign_.insert(init);
     llvm::Value* v = init ? lowerExpr(*init) : nullptr;
     expectedFunctionType_ = savedExpectedForLambdaDecl;
     // fix #4342: restore the flags (saved above) so a subsequent LocalDecl
@@ -18897,6 +18905,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     }
     if (!slot) slot = entryAlloca(slotTy);
     locals_[declNode] = slot;
+    // #4602 (§28.2, v0.338): this local's checked-mode scope-end release may
+    // free its block (see collectCdFreeEligible). A state-machine local lives
+    // in a frame with its own teardown, so it never qualifies.
+    if (checkedDisposal_ && !(smStateStruct_ && smSelf_) &&
+        cdFreeEligibleDecls_.count(static_cast<const void*>(declNode)))
+        cdFreeEligibleSlots_.insert(slot);
     // CG-generic: record the concrete substitution for this local so that
     // method calls on it (e.g. sp2.GetFirst()) can recover the concrete type
     // args even when the sema type is still generic. Prefer the active
@@ -25158,6 +25172,13 @@ struct MoveOnlyArrayTransferWalker {
     // the slot-disposal GEP would read out of bounds and crash. Marking captured
     // arrays ineligible (a safe leak) avoids that entirely.
     bool inLambda = false;
+    // #4602 (§28.2, v0.338): optional outputs for the checked-disposal
+    // free-eligibility walk (collectCdFreeEligible). Null for the #747 walk,
+    // whose behavior they do not change. `cdReassigned` receives every local
+    // that is the target of an assignment; `cdCandidates` every non-lambda
+    // LocalDecl whose initializer is a fresh `new`.
+    std::unordered_set<const void*>* cdReassigned = nullptr;
+    std::vector<const ast::LocalDecl*>* cdCandidates = nullptr;
 
     // #747 verify (LENS 2): a store into an owned slot `a[i] := rhs` whose rhs is
     // NOT a fresh-owned value (`new`), a `move`, or `null` may ALIAS another owner
@@ -25304,6 +25325,9 @@ struct MoveOnlyArrayTransferWalker {
     void stmt(const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (cdCandidates && !inLambda &&
+                dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                cdCandidates->push_back(ld);   // #4602
             expr(ld->initializer.get(), /*borrow=*/false);   // `var b := a` xfers a
             return;
         }
@@ -25333,6 +25357,15 @@ struct MoveOnlyArrayTransferWalker {
                 if (!isSafeOwnedSlotRhs(as->value.get()))
                     markIdent(ixt->target.get());
             }
+            // #4602: a reassigned local may hold a slot-derived value.
+            if (cdReassigned)
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get()))
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                            ctx.exprSymbol(*id)))
+                        if (loc->decl)
+                            cdReassigned->insert(
+                                static_cast<const void*>(loc->decl));
             expr(as->target.get(), /*borrow=*/true);
             expr(as->value.get(), /*borrow=*/false);
             return;
@@ -25406,6 +25439,43 @@ void Emitter::collectMoveOnlyArrayTransferred(
     moveOnlyArrayTransferred_.clear();
     MoveOnlyArrayTransferWalker w{ctx_, moveOnlyArrayTransferred_};
     for (auto& s : body) w.stmt(s.get());
+}
+
+
+// #4602 (§28.2, v0.338): which locals of this method body may have their
+// block FREED (not quarantined) at their checked-mode scope-end release,
+// subject to the runtime escaped-set test. A local qualifies only if all of:
+//  * its initializer is a fresh `new` — the block was never in a field,
+//    element or other slot, so no K5.6 slot borrow of it can exist;
+//  * it is a `using var` or an ownership-pass auto-drop owner
+//    (autoDropAtScopeEnd: never moved, never discharged on any path), so its
+//    scope-end disposal is the object's one and only release;
+//  * it is never reassigned, so the block released is the one bound;
+//  * every use of it is a borrow position (receiver of a member access,
+//    method call or index, an `is`/`as` operand, a `case` scrutinee, a
+//    for-in iterable) — the same default-transfer walk #747 uses, so an
+//    argument, an initializer, a return, a capture or any unrecognised use
+//    makes it ineligible.
+// Locals of a lambda body are never candidates. What can still reach the
+// block is `this` inside its own members (and their callees); those
+// positions carry the runtime escape mark (lowerExpr, see cdBenign_).
+void Emitter::collectCdFreeEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (!checkedDisposal_) return;
+    std::unordered_set<const void*> transferred;
+    std::unordered_set<const void*> reassigned;
+    std::vector<const ast::LocalDecl*> candidates;
+    MoveOnlyArrayTransferWalker w{ctx_, transferred};
+    w.cdReassigned = &reassigned;
+    w.cdCandidates = &candidates;
+    for (auto& s : body) w.stmt(s.get());
+    for (const ast::LocalDecl* ld : candidates) {
+        const void* key = static_cast<const void*>(ld);
+        if (transferred.count(key) || reassigned.count(key)) continue;
+        if (ld->isAwaitUsing || ld->usingVarSourceIsBorrow) continue;
+        if (!ld->isUsing && !ld->autoDropAtScopeEnd) continue;
+        cdFreeEligibleDecls_.insert(key);
+    }
 }
 
 

@@ -7,6 +7,11 @@
 // (stopwatch_getter_receiver_accept_4193.bzl) for the full derivation.
 //
 // RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+// RUN: %not %bezelc --checked-disposal -c %s 2>&1 | FileCheck %s
+// RUN: %not %bezelc --unchecked-disposal -c %s 2>&1 | FileCheck %s
+// #4602 (§28.2, v0.338): both disposal modes pin the rejection. A checked
+// build appends an escape mark to the getter result, which once read as
+// "an arm handled it" and dropped the diagnostic.
 
 module M;
 

@@ -6080,6 +6080,9 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                              llvm::Value* receiverVal,
                              const sema::TypeRef* recvStaticTy,
                              const ast::Expr* refExpr) {
+    // #4602 (§28.2, v0.338): a bound method reference retains its receiver
+    // in the closure env past this frame.
+    if (receiverVal) emitCdMarkEscaped(receiverVal);
     // per §27.6 (v0.338; #5814): a reference over a generic method forms the
     // method at the type arguments it names, never the erased template.
     if (!ms->genericParams.empty() && refExpr)

@@ -4166,6 +4166,23 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             llvm::Value* dst = builder_.CreateStructGEP(
                 envTy, envAlloc, static_cast<unsigned>(i));
             builder_.CreateStore(ce.envValue, dst);
+            // #4602 (§28.2, v0.338): the env retains what it captured past
+            // this frame. `this` is stored by value; every other capture
+            // stores the address of its storage (a shared cell, or a ref/out
+            // param's caller storage), so mark the value currently held
+            // there. A later store into that storage is an assignment and is
+            // marked where it is lowered.
+            if (checkedDisposal_) {
+                if (ce.isThis) {
+                    emitCdMarkEscaped(ce.envValue);
+                } else if (ce.valTy && ce.valTy->isPointerTy() &&
+                           (!ce.semaTy || cdMarkableType(ce.semaTy))) {
+                    builder_.CreateCall(
+                        declareC("bz_cd_mark_escaped_slot",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                        {ce.envValue});
+                }
+            }
             // fix #4509 (§27.5 / §28.9, v0.306): announce this env as a holder
             // of a REFCOUNTED capture cell. Emitted HERE, at the one site that
             // stores the cell pointer into an env, so the retain and the store

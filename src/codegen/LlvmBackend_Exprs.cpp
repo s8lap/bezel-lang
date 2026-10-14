@@ -107,6 +107,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     fullExprFn_ = thisFn;
     ++fullExprDepth_;
     noteFnAtObjectChildren(e);   // #5978: see `fnAtObject_`
+    if (checkedDisposal_) noteCdBenignChildren(e);   // #4602
     llvm::Value* v = lowerExprInner(e);
     // fix #5978 (§12.7 *Function-typed targets*, v0.338): `e` formed the
     // freshest closure cell — record the function type it was formed at.
@@ -121,6 +122,12 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (v && !fnAtObject_.empty())
         if (auto it = fnAtObject_.find(&e); it != fnAtObject_.end())
             v = fnValForObjectTarget(v, it->second, &e);
+    // #4602 (§28.2, v0.338): checked-disposal escape mark — a class-like
+    // value at a position not known to leave it in this frame may be retained
+    // past the frame, so its block must stay quarantined after disposal.
+    if (checkedDisposal_ && v) {
+        if (!cdBenign_.count(&e) && cdExprMarkable(e)) emitCdMarkEscaped(v);
+    }
     --fullExprDepth_;
     fullExprFn_ = parentFn;
     const bool atBoundary = (fullExprDepth_ == 0 || parentFn != thisFn);

@@ -2796,7 +2796,7 @@ void Emitter::emitDynamicDispose(llvm::Value* obj) {
 }
 
 
-void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
+void Emitter::emitDisposeAndReclaim(llvm::Value* obj, bool cdMayFree) {
     // #380 / §28: an auto-dispose site that OWNS the slot/field holding `obj`
     // (using-var scope-end, owned-field auto-dispose, exception unwind, the
     // caught-exception normal-exit free). It is the LAST dispose of this object
@@ -2842,7 +2842,7 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
                  {ptrTy()}),
         {obj});
     emitDynamicDispose(obj);
-    emitReclaimBlock(obj);
+    emitReclaimBlock(obj, cdMayFree);
 }
 
 
@@ -2856,7 +2856,7 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
 // reap, the §31.4 CauseChain reclaim, and §28.2 checked-disposal's quarantine
 // (it freed a block whose disposed flag a surviving borrow's member-entry
 // guard is entitled to read).
-void Emitter::emitReclaimBlock(llvm::Value* obj) {
+void Emitter::emitReclaimBlock(llvm::Value* obj, bool cdMayFree) {
     // §8.3 / #2058: reap the side-table entry BEFORE the heap free (the object
     // is still live here, so the erase cannot read freed memory). Bounds the
     // identity-hash side-table for long-running services; the per-domain
@@ -2929,7 +2929,26 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
     // branch, matching checked disposal's own deliberate-leak posture for
     // everything else the block owns — only the block header itself is kept
     // readable for the disposed-flag guard.)
-    if (!checkedDisposal_) {
+    // #4602 (§28.2, v0.338): a checked build may still free a block no
+    // surviving borrow can reach. `cdMayFree` is set only by the scope-end
+    // release of a fresh, never-reassigned local; there the runtime's escaped
+    // set decides (bz_cd_may_free: 1 = no escape recorded). A marked block,
+    // and every block released anywhere else, keeps the quarantine.
+    llvm::BasicBlock* cdKeepBB = nullptr;
+    if (checkedDisposal_ && cdMayFree) {
+        llvm::Value* mayFree = builder_.CreateCall(
+            declareC("bz_cd_may_free", llvm::Type::getInt8Ty(llvm_),
+                     {ptrTy()}), {obj});
+        llvm::Value* doFree = builder_.CreateICmpNE(
+            mayFree, builder_.getInt8(0), "cd.mayfree");
+        llvm::BasicBlock* cdFreeBB = llvm::BasicBlock::Create(
+            llvm_, "cd.free", currentFn_);
+        cdKeepBB = llvm::BasicBlock::Create(llvm_, "cd.quarantine",
+                                            currentFn_);
+        builder_.CreateCondBr(doFree, cdFreeBB, cdKeepBB);
+        builder_.SetInsertPoint(cdFreeBB);
+    }
+    if (!checkedDisposal_ || cdKeepBB) {
         // fix #3460 (§28.3 / §30.1): before freeing the heap block, wait for
         // any cross-task BORROWS on this object to be released. A borrow is
         // registered by an async frame whose `this = c` capture points at c
@@ -2960,7 +2979,182 @@ void Emitter::emitReclaimBlock(llvm::Value* obj) {
         builder_.CreateCall(freeFn(), {obj});
         builder_.CreateBr(skipBB);
         builder_.SetInsertPoint(skipBB);
+        if (cdKeepBB) {
+            builder_.CreateBr(cdKeepBB);
+            builder_.SetInsertPoint(cdKeepBB);
+        }
     }
+}
+
+
+// #4602 (§28.2, v0.338): record that `v` may outlive the evaluating frame
+// (see the cdBenign_ declaration). Null-safe at runtime; a closed block (the
+// value's producer terminated it) has nowhere to emit and nothing to mark.
+void Emitter::emitCdMarkEscaped(llvm::Value* v) {
+    if (!checkedDisposal_ || !v || !v->getType()->isPointerTy() ||
+        llvm::isa<llvm::ConstantPointerNull>(v))
+        return;
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    if (!bb || bb->getTerminator()) return;
+    builder_.CreateCall(
+        declareC("bz_cd_mark_escaped", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy()}), {v});
+}
+
+
+// #4602: can a value of static type `t` be (an alias of) a user class
+// instance — the only blocks a free-eligible release ever frees? A class or
+// interface type, `Object` (§5.1: the universal reference type), a built-in
+// exception, and a type parameter that does not resolve to something else.
+// Built-in collection / task / span types are runtime-managed blocks with
+// their own release rules and are not marked (marking them would only grow
+// the escaped set).
+bool Emitter::cdMarkableType(const sema::TypeRef* t) {
+    if (!t) return false;
+    if (isBareTypeParamRef(t)) {
+        const sema::TypeRef* r = resolveTypeParamRef(t);
+        if (!r || r == t || isBareTypeParamRef(r)) return true;
+        t = r;
+    }
+    using K = sema::TypeRef::Kind;
+    if (t->kind == K::Primitive)
+        return t->primitive == sema::PrimitiveType::Object;
+    if (t->kind != K::Named) return false;
+    const sema::TypeSymbol* ts = t->declaration;
+    if (!ts) return true;  // an imported name codegen cannot classify
+    if (ts->kind == ast::TypeDeclKind::Interface) return true;
+    if (ts->kind != ast::TypeDeclKind::Class) return false;
+    if (ts->decl) return true;  // a user-declared (or imported) class
+    return isBuiltinExceptionTypeRef(t);
+}
+
+
+// #4602: does a call whose result has static type `t` leave no reference to
+// its RECEIVER behind once it returns, other than through a value the result
+// position itself is marked for? A plain value result, a string, or a
+// user-declared type qualifies (a user type that holds the receiver got it
+// through a store, an argument or a capture, each marked where it happens).
+// A function value (a bound method), a built-in generic carrier (an
+// iterator's IEnumerable, a Task, a collection) or an unknown type does not:
+// such a result can hold the receiver without any marked position.
+bool Emitter::cdCallResultKeepsNoReceiver(const sema::TypeRef* t) {
+    if (!t) return false;
+    using K = sema::TypeRef::Kind;
+    switch (t->kind) {
+    case K::Unit:
+    case K::Primitive:
+        return true;
+    case K::Named:
+        return t->declaration && t->declaration->decl;
+    default:
+        return false;
+    }
+}
+
+
+// #4602: the children of `e` whose value `e` itself does not retain. A
+// receiver of a member access or a method call (the callee's own stores are
+// marked inside it), an operand whose value flows on into `e`'s own result
+// (marked at `e`'s position if that position retains it), or a value only
+// compared or tested. Everything else — call and constructor arguments,
+// collection and `with` elements, a lambda's expression body, a thrown
+// operand — stays unmarked here and is therefore marked.
+void Emitter::noteCdBenignChildren(const ast::Expr& e) {
+    // Two kinds of parent. A CONSUMER uses the child's value without handing
+    // it on (a member-access target, a comparison operand, an `is` test), so
+    // the child is benign whatever the parent is. A PASS-THROUGH parent's value
+    // IS the child's value (`x!`, `(if c then x else y)`, `x ?? y`, `x as T`),
+    // so the child is benign only when the parent position itself is benign
+    // or is marked. FAIL CLOSED: an untyped pass-through parent that is not
+    // itself benign leaves its children marked. The child's entry is erased
+    // first, because the same AST node is re-lowered per generic
+    // instantiation and an earlier verdict must not carry over.
+    auto benign = [this](const ast::Expr* c) {
+        if (c) cdBenign_.insert(c);
+    };
+    auto passThrough = [this, &e](const ast::Expr* c) {
+        if (!c) return;
+        cdBenign_.erase(c);
+        if (cdBenign_.count(&e) || cdExprMarkable(e)) cdBenign_.insert(c);
+    };
+    auto isFn = [this](const ast::Expr& x) {
+        const sema::TypeRef* t = ctx_.exprType(x);
+        return !t || t->kind == sema::TypeRef::Kind::Function;
+    };
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (!isFn(e)) benign(ma->target.get());
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        if (!isFn(e)) benign(nm->target.get());
+        return;
+    }
+    const ast::Expr* callee = nullptr;
+    if (auto* c = dynamic_cast<const ast::CallExpr*>(&e)) callee = c->callee.get();
+    else if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(&e))
+        callee = c->callee.get();
+    if (callee) {
+        if (!cdCallResultKeepsNoReceiver(ctx_.exprType(e))) return;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+            benign(ma->target.get());
+        else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+            benign(nm->target.get());
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        benign(ix->target.get());
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->op == "as") passThrough(tt->operand.get());
+        else benign(tt->operand.get());
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        passThrough(pb->operand.get());
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        passThrough(ce->thenValue.get());
+        passThrough(ce->elseValue.get());
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->op == "??") {
+            passThrough(be->left.get());
+            passThrough(be->right.get());
+        } else {
+            benign(be->left.get());
+            benign(be->right.get());
+        }
+        return;
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        benign(ue->operand.get());
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        benign(cx->scrutinee.get());
+        return;
+    }
+}
+
+
+// #4602: will lowerExpr mark the value of `e` (absent a benign parent)?
+// Typed: by cdMarkableType. UNTYPED: yes (fail closed), except a bare
+// `this`/`base` inside a record/enum/choice instance body, whose receiver is
+// a value pointer (cdNonClassThisFns_). emitCdMarkEscaped itself skips a
+// non-pointer value, so an untyped scalar costs nothing.
+bool Emitter::cdExprMarkable(const ast::Expr& e) {
+    if (const sema::TypeRef* t = ctx_.exprType(e)) return cdMarkableType(t);
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        if (id->name == "this" || id->name == "base") {
+            llvm::BasicBlock* bb = builder_.GetInsertBlock();
+            const llvm::Function* fn = bb ? bb->getParent() : nullptr;
+            return !(fn && cdNonClassThisFns_.count(fn));
+        }
+    }
+    return true;
 }
 
 
@@ -9739,7 +9933,9 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                                 currentFn_);
         builder_.CreateCondBr(isNull, contBB, dispBB);
         builder_.SetInsertPoint(dispBB);
-        emitDisposeAndReclaim(obj);
+        // #4602 (§28.2, v0.338): a fresh, never-reassigned local's own
+        // release may free its block in checked mode (collectCdFreeEligible).
+        emitDisposeAndReclaim(obj, cdFreeEligibleSlots_.count(it->slot) != 0);
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);

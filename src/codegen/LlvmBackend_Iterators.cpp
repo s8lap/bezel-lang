@@ -884,6 +884,10 @@ void Emitter::emitFrameCaptureStores(const StateMachineFrame& frame,
                 val = builder_.CreateLoad(ty, it->second);
         }
         if (val) builder_.CreateStore(val, capField);
+        // #4602 (§28.2, v0.338): an iterator/async frame retains `this` past
+        // the call that created it (the iterator object can outlive any
+        // marked position), so the receiver's block must stay quarantined.
+        if (val && !sym) emitCdMarkEscaped(val);
     }
 }
 
