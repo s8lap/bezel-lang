@@ -29,14 +29,25 @@
 // capture) — read back as the exit code identically. Instance-event handlers
 // (B7) remain capture-admitting per the rule's own final sentence.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& program) {
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(r.ran);
+    return r.ran ? r.exitCode : -999;
+}
+
+// Rows that stay on the deprecated JIT oracle: their program is one the spec
+// rejects on the AOT path (see the commit body for the spec sentence). They are
+// kept, not deleted, so the behaviour they pin stays under test.
+int runJitLeftover(const std::string& program) {
     auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
@@ -186,9 +197,9 @@ BEZEL_TEST(codegen_events_477, interface_local_event_subscribe_b7) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var src := new Source(); "
-        "  var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
+        "  using var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
         "  var i: ISource := src; "
-        "  var sub2 := i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
+        "  using var sub2 := i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
         "  src.Trigger(1); "
         "  return acc.V; "                                // expect 11
         "end Main; end C;"), 11);
@@ -198,7 +209,7 @@ BEZEL_TEST(codegen_events_477, interface_local_event_subscribe_b7) {
 // reach the real backing source. The helper receives `i: ISource` and
 // subscribes a handler (+V*10); the concrete sub adds +V. Trigger(1) → 11.
 BEZEL_TEST(codegen_events_477, interface_parameter_event_subscribe_b7) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runJitLeftover(
         "module M; "
         "record EvType(V: int); "
         "interface ISource "
@@ -247,7 +258,7 @@ BEZEL_TEST(codegen_events_477, concrete_event_subscribe_regression_b7) {
         "class C public static method Main(): int "
         "  var acc := new Acc(); "
         "  var src := new Source(); "
-        "  var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
+        "  using var sub1 := src.Ready.Subscribe(lambda(e) => do acc.Add(e.V); end); "
         "  src.Trigger(5); "
         "  return acc.V; "                                // expect 5
         "end Main; end C;"), 5);
@@ -275,9 +286,9 @@ BEZEL_TEST(codegen_events_477, interface_local_dispose_unsubscribes_b7) {
         "  var acc := new Acc(); "
         "  var src := new Source(); "
         "  var i: ISource := src; "
-        "  var sub2 := i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
+        "  do using var sub2 := i.Ready.Subscribe(lambda(e) => do acc.Add(e.V * 10); end); "
         "  src.Trigger(1); "                              // acc.V = 10
-        "  sub2.Dispose(); "                              // unsubscribe via interface-local sub
+        "  sub2.Dispose(); end; "                              // unsubscribe via interface-local sub
         "  src.Trigger(1); "                              // handler gone — no-op
         "  return acc.V; "                                // expect 10
         "end Main; end C;"), 10);
