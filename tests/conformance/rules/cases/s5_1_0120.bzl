@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 5.1
 //! title: a class implementing IEnumerable<int> converts to IEnumerable<V> under an explicit list
-//! rule: a type to an interface it implements or conforms to: classes by declaration or inheritance
+//! rule: **a type to an interface it implements or conforms to**: classes by declaration or inheritance
 //! cites: 5.1, 11.2, 14.5
 //! expect: accept
 module Conf;

@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 22.6
 //! title: a string argument is not applicable to IEnumerable<int> under an explicit list
-//! rule: Applicability over the (substituted) signatures: parameter types under the implicit conversions (§5.1) and the `ref`/`out` modifiers.
+//! rule: Applicability over the (substituted) signatures: parameter types under the implicit conversions (§5.1) and the `ref`/`out` modifiers — this section.
 //! cites: 22.6, 4.6, 5.1
 //! expect: reject
 //! diagnostic: implicit

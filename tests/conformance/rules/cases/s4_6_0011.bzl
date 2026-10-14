@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 4.6
 //! title: a string is accepted where IEnumerable<char> is expected
-//! rule: `string` implements `IEnumerable<char>`, so strings may be iterated with `for`.
+//! rule: `string` implements `IEnumerable<char>`, so strings may be iterated with `for`:
 //! cites: 4.6, 5.1
 //! expect: accept
 module Conf;
