@@ -4579,7 +4579,8 @@ private:
     // CaptureScope::ownLocalExclusion). Only the plain extern callback caller
     // passes false.
     bool isCaptureFreeEntry(const ast::Expr* entryExpr,
-                            bool ownLocalExclusion = true);
+                            bool ownLocalExclusion = true,
+                            bool receiverIsCapture = false);
 
     // §30.14 (#6284): the capture walk's scope. `params` holds the symbols
     // the walk treats as declared inside the entry lambda (its own params,
@@ -4606,6 +4607,13 @@ private:
         // if, do…end), so base's verdict there is unchanged; in the newly
         // walked statements the own-local exclusion applies.
         bool inNewWalk = false;
+        // per §30.14 (#6286): true at a caller whose admission is the
+        // Domain.Spawn one (Spawn, SharedEventSource Subscribe, `static event
+        // +=`). There the receiver is a borrow of the origin domain, so the
+        // receiver keywords `this`/`base` and an instance member read by its
+        // bare name are captures. False at the plain extern caller (§32.8),
+        // whose receiver rule is not changed by #6286.
+        bool receiverIsCapture = false;
     };
 
     // Helper: does the lambda body (recursively) reference any identifier

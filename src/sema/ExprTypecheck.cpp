@@ -21858,9 +21858,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // subscriber list transports the handler to whichever domain
             // raises, and a capture-bearing closure carries borrows of its
             // origin domain's scopes.
+            // per §28.14 / §30.14 (#6286): the same admission as a Domain.Spawn
+            // entry, so the receiver is a capture here.
             if (as->op == "+=" &&
                 (assignTargetIsStaticEvent || assignTargetIsSharedEventSource) &&
-                !isCaptureFreeEntry(as->value.get())) {
+                !isCaptureFreeEntry(as->value.get(), /*ownLocalExclusion=*/true,
+                                    /*receiverIsCapture=*/true)) {
                 if (assignTargetIsSharedEventSource) {
                     // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14
                     // (v0.307): SharedEventSource<T> `+=` (which desugars

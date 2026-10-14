@@ -15336,7 +15336,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     const ast::Expr* entryExpr = ce.args[0].value.get();
 
                     // Check 1: capture-free entry.
-                    bool entryOk = isCaptureFreeEntry(entryExpr);
+                    // per §30.14 (#6286): the receiver is a capture here.
+                    bool entryOk = isCaptureFreeEntry(
+                        entryExpr, /*ownLocalExclusion=*/true,
+                        /*receiverIsCapture=*/true);
                     if (!entryOk) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
@@ -31762,8 +31765,24 @@ bool ExprTC::isSendable(const TypeRef* rt,
 //       any local or parameter from the enclosing scope).
 // ===========================================================================
 
+// per §30.14 (#6286): a symbol that names an instance member, which a bare
+// identifier reads through the implicit receiver. A static member is not one;
+// enum and choice constants are not in the member kinds listed here.
+static bool isInstanceMemberSymbol(const Symbol* sym) {
+    if (!sym) return false;
+    if (!(dynamic_cast<const FieldSymbol*>(sym) ||
+          dynamic_cast<const MethodSymbol*>(sym) ||
+          dynamic_cast<const PropertySymbol*>(sym) ||
+          dynamic_cast<const EventSymbol*>(sym)))
+        return false;
+    const auto* ms = static_cast<const MemberSymbol*>(sym);
+    return std::find(ms->modifiers.begin(), ms->modifiers.end(),
+                     std::string_view("static")) == ms->modifiers.end();
+}
+
 bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr,
-                                bool ownLocalExclusion) {
+                                bool ownLocalExclusion,
+                                bool receiverIsCapture) {
     if (!entryExpr) return false;
 
     // (a) Static method reference, qualified: MemberAccessExpr whose target
@@ -31813,6 +31832,7 @@ bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr,
         scope.entryBegin = lam->span.begin.offset;
         scope.entryEnd = lam->span.end.offset;
         scope.ownLocalExclusion = ownLocalExclusion;
+        scope.receiverIsCapture = receiverIsCapture;
         return !lambdaBodyCaptures(lam, scope);
     }
 
@@ -31835,6 +31855,13 @@ bool ExprTC::lambdaBodyCaptures(
 bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
     // Check this node.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        // per §30.14 (#6286): the receiver is a borrow of the origin domain.
+        // `this`/`base` name it, and a bare instance-member name reads it
+        // implicitly; either is a capture where the caller says so.
+        if (scope.receiverIsCapture) {
+            if (id->name == "this" || id->name == "base") return true;
+            if (isInstanceMemberSymbol(ctx_.exprSymbol(*id))) return true;
+        }
         Symbol* sym = ctx_.exprSymbol(*id);
         if (!sym) return false;
         // Captured if it resolves to a local or parameter NOT in our own params.

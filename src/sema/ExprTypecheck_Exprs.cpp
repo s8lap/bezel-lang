@@ -10948,8 +10948,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // Domain.Spawn entry (§30.14, #600). Checked here, after
                 // visiting the argument, so isCaptureFreeEntry can see a
                 // lambda's captures.
+                // per §28.14 / §30.14 (#6286): the same admission as a
+                // Domain.Spawn entry, so the receiver is a capture here.
                 if (pos2 == 0 && subscribeArgNeedsCaptureFree &&
-                    !isCaptureFreeEntry(a.value.get())) {
+                    !isCaptureFreeEntry(a.value.get(), /*ownLocalExclusion=*/true,
+                                        /*receiverIsCapture=*/true)) {
                     if (subscribeArgIsSharedEvent) {
                         // fix #4920 / stdlib §6.5 (v0.307) / spec §28.14
                         // (v0.307): the ISharedEvent<T>/SharedEventSource<T>
