@@ -22694,11 +22694,47 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         // as Exact. Outside the built-in exception hierarchy,
                         // which classifyArg grades by name, such a pair is
                         // never convertible (§5.1: no stdlib subtyping).
+                        // fix #6091 (v0.338; stdlib Array/LinkedList/Set/Stack/
+                        // Queue declarations in Bezel_Standard_Library.md): a
+                        // declaration-less standard collection class converts
+                        // to a standard collection interface it implements,
+                        // with the same element type (Array<int> into
+                        // IEnumerable<int>, ICollection<int>, IReadOnlyList<int>).
+                        // The binary operator path accepts these by declaration
+                        // pointer equality, so the compound path must too. The
+                        // table lists only borrowing collections; owning ones
+                        // carry ownership obligations and are not admitted here.
+                        auto stdlibCollectionConverts = [](const TypeRef* from,
+                                                           const TypeRef* to) {
+                            if (from->declaration || to->declaration) return false;
+                            if (from->genericArgs.size() != to->genericArgs.size())
+                                return false;
+                            if (from->genericArgs.size() == 1 &&
+                                !typeRefEqual(from->genericArgs[0], to->genericArgs[0]))
+                                return false;
+                            std::string_view c = namedRefSimpleName(from);
+                            std::string_view i = namedRefSimpleName(to);
+                            if (c == "Array")
+                                return i == "IList" || i == "ICollection" ||
+                                       i == "IReadOnlyList" ||
+                                       i == "IReadOnlyCollection" || i == "IEnumerable";
+                            if (c == "LinkedList" || c == "Set")
+                                return i == "ICollection" ||
+                                       i == "IReadOnlyCollection" || i == "IEnumerable";
+                            if (c == "Stack" || c == "Queue")
+                                return i == "IReadOnlyCollection" || i == "IEnumerable";
+                            return false;
+                        };
+                        // fix #6091 (§6.6/§25.2, v0.338): differing stdlib names
+                        // are never convertible except through the table above
+                        // or the built-in exception hierarchy (classifyArg).
                         if (!pt->declaration && !operandTy->declaration &&
                             !isBuiltinExceptionRef(pt) &&
                             namedRefSimpleName(pt) !=
                                 namedRefSimpleName(operandTy))
-                            return Q::Inapplicable;
+                            return stdlibCollectionConverts(operandTy, pt)
+                                       ? Q::Converting
+                                       : Q::Inapplicable;
                         switch (classifyArg(operandTy, pt)) {
                             case ArgMatch::Exact:
                                 return sameNull ? Q::Exact : Q::Converting;

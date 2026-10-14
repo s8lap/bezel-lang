@@ -30,6 +30,12 @@ std::string prog(const std::string& opDecls, const std::string& body) {
 }
 const char* kExcOp =
     "public static method operator +(v: V, e: Exception): V => new V(v.X + 1000); ";
+// `operator +(v: V, s: <param>)` returning V with X + 1000 (used by the
+// stdlib-collection-interface rows below).
+std::string opOver(const std::string& param) {
+    return "public static method operator +(v: V, s: " + param +
+           "): V => new V(v.X + 1000); ";
+}
 }  // namespace
 
 // ---- reject rows (§6.6 / §25.2) -------------------------------------------
@@ -103,4 +109,70 @@ BEZEL_TEST(sema_compound_assign_no_applicable_operator_6091,
         "var v := new V(1); var ae := new ArgumentException(\"a\"); v += ae; "));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "1001\n");
+}
+
+// ---- stdlib collection operands into collection-interface parameters ------
+// §5.1 / stdlib: Array<T> implements IList<T>, so it converts to IEnumerable<T>,
+// ICollection<T> and IReadOnlyList<T> (same element type). The compound form is
+// sema-accepted; codegen does not yet lower the record's compound call with a
+// collection-interface argument (IR verification, #6004 family), so these rows
+// assert only the sema outcome, through the sema-only gated typecheck
+// (parseAndTypecheckGated). That oracle is not vacuous: the same gate rejects
+// r1 with the "no valid result" diagnostic, so a program that sema rejects
+// fails the hasErrors check here.
+
+BEZEL_TEST(sema_compound_assign_no_applicable_operator_6091,
+           a3_array_operand_into_ienumerable_param_sema_accepts_spec_25_2) {
+    auto r = bezel::test::parseAndTypecheckGated(prog(opOver("IEnumerable<int>"),
+        "var v := new V(1); var s := new Array<int>(2); v += s; "));
+    BEZEL_EXPECT_TRUE(static_cast<bool>(r.sourceFile));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_compound_assign_no_applicable_operator_6091,
+           a4_array_operand_into_icollection_param_sema_accepts_spec_25_2) {
+    auto r = bezel::test::parseAndTypecheckGated(prog(opOver("ICollection<int>"),
+        "var v := new V(1); var s := new Array<int>(2); v += s; "));
+    BEZEL_EXPECT_TRUE(static_cast<bool>(r.sourceFile));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_compound_assign_no_applicable_operator_6091,
+           a5_array_operand_into_ireadonlylist_param_sema_accepts_spec_25_2) {
+    auto r = bezel::test::parseAndTypecheckGated(prog(opOver("IReadOnlyList<int>"),
+        "var v := new V(1); var s := new Array<int>(2); v += s; "));
+    BEZEL_EXPECT_TRUE(static_cast<bool>(r.sourceFile));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_compound_assign_no_applicable_operator_6091,
+           a6_array_operand_binary_form_into_ienumerable_param_prints_1001) {
+    // Binary-form twin of a3: the binary operator path accepts this and the
+    // program runs, so the compound rows above test the same overload.
+    auto r = runAot(prog(opOver("IEnumerable<int>"),
+        "var v := new V(1); var s := new Array<int>(2); v := v + s; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "1001\n");
+}
+
+BEZEL_TEST(sema_compound_assign_no_applicable_operator_6091,
+           r6_stringbuilder_operand_into_ienumerable_param_spec_25_2) {
+    // StringBuilder is not a collection and does not implement IEnumerable<int>
+    // (§5.1: no conversion between unrelated stdlib classes). The binary form is
+    // accepted by declaration-pointer equality; the compound form is rejected.
+    auto r = runAot(prog(opOver("IEnumerable<int>"),
+        "var v := new V(1); var sb := new StringBuilder(); v += sb; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "compound assignment `+=` has no valid result on record type `V`"));
+}
+
+BEZEL_TEST(sema_compound_assign_no_applicable_operator_6091,
+           r7_array_element_type_mismatch_into_ienumerable_param_spec_25_2) {
+    // Array<string> implements IEnumerable<string>, not IEnumerable<int>.
+    auto r = runAot(prog(opOver("IEnumerable<int>"),
+        "var v := new V(1); var s := new Array<string>(2); v += s; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "compound assignment `+=` has no valid result on record type `V`"));
 }
