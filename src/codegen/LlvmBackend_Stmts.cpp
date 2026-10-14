@@ -3216,6 +3216,73 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // fix #6052 (§30.5 kind 1, v0.338): "a named owned binding of the
+            // body, a plain owned local ..., consumed marker-free at the
+            // return ...: the task owns the result and its destructor disposes
+            // it directly". A class/interface local that the ownership pass
+            // flagged for the scope-end auto-drop (it is still owned on SOME
+            // other exit of a body with more than one `return`) is registered
+            // on disposeStack_, so the disposals below freed the very object
+            // this return hands to the task and the result slot dangled. The
+            // sync return further down erases the entry at compile time; that
+            // is per-FUNCTION, and this must be per-EDGE (the same local is
+            // still scope-disposed on every exit that does not return it), so
+            // this is the #776 technique instead: null the slot on this edge
+            // and let the null-guarded scope-end disposal skip it.
+            llvm::AllocaInst* asyncKind1LocalSlot = nullptr;
+            if (v && rs->value && v->getType()->isPointerTy()) {
+                const ast::Expr* core = rs->value.get();
+                while (auto* pb =
+                           dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+                    if (!pb->operand) break;
+                    core = pb->operand.get();
+                }
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(core)) {
+                    const sema::TypeRef* lt = ctx_.exprType(*id);
+                    auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                        ctx_.exprSymbol(*id));
+                    auto lit = loc ? locals_.find(loc->decl) : locals_.end();
+                    // Not a `string` or a function value (their returns
+                    // mint or keep a +1 of their own, further down), not a
+                    // task (#776 above), and not an `Object` local: that
+                    // slot may hold a §8.6 box, which is released rather
+                    // than consumed, and no `Task<Object>` teardown takes
+                    // an `Object` result over.
+                    const bool consumedHere =
+                        lt &&
+                        lt->kind != sema::TypeRef::Kind::Primitive &&
+                        lt->kind != sema::TypeRef::Kind::Function &&
+                        !isTaskTypeName(lt);
+                    if (consumedHere &&
+                        lit != locals_.end() && lit->second &&
+                        lit->second->getAllocatedType()->isPointerTy()) {
+                        llvm::AllocaInst* slot = lit->second;
+                        // A captured local's slot holds its capture cell
+                        // (§27.5); only a cell whose content is the object
+                        // pointer qualifies.
+                        auto cv = cellVars_.find(slot);
+                        const bool storageOk =
+                            cv == cellVars_.end() ||
+                            (cv->second && cv->second->isPointerTy());
+                        if (storageOk)
+                            for (const auto& scope : disposeStack_)
+                                for (const auto& e : scope)
+                                    if (e.slot == slot && !e.boxedCellFree &&
+                                        !e.boxedCellFreeDeferred &&
+                                        !e.cellRelease)
+                                        asyncKind1LocalSlot = slot;
+                    }
+                }
+            }
+            auto moveAsyncKind1LocalToReturnSlot = [&]() {
+                llvm::AllocaInst* rslot = asyncReturnSlotHere();
+                builder_.CreateStore(v, rslot);
+                llvm::Type* ety = nullptr;
+                llvm::Value* addr = boxedStorage(asyncKind1LocalSlot, ety);
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     addr);
+                asyncReturnEdgeSlot_ = rslot;
+            };
             // #721 C1 / §30.9: a `return` exiting a try-with-finally must run the
             // finally first. Stash the unwrapped result and route through the
             // active finally (exit mode 5); the post-finally dispatch (lowerTry)
@@ -3254,7 +3321,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // deferChainedAsyncReturnSource (LlvmBackend_Async.cpp).
                 if (chainedReturn && rs->value)
                     deferChainedAsyncReturnSource(rs->value.get());
+                // fix #6052 (§28.3 *The return slot*, v0.338): the returned
+                // local moves into the return slot before any cleanup of the
+                // edge runs. Nothing the frame registered disposes it from
+                // here on; a cleanup that raises does (a disposer below, or
+                // the body of a finally on the route — lowerTry), and the
+                // terminal dispatch hands it to the task.
+                llvm::AllocaInst* savedEdgeSlot = asyncReturnEdgeSlot_;
+                if (asyncKind1LocalSlot) {
+                    moveAsyncKind1LocalToReturnSlot();
+                    for (auto& f : finallyStack_)
+                        f.asyncReturnSlotRouted = true;
+                }
                 emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
+                asyncReturnEdgeSlot_ = savedEdgeSlot;
                 if (v && fr.asyncRetSlot)
                     builder_.CreateStore(v, fr.asyncRetSlot);
                 // fix #3129 / §30.5 Pattern A: record on the FinallyFrame that
@@ -3304,8 +3384,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // above and by emitAsyncLambda's expression-body completion.
             if (chainedReturn && rs->value)
                 deferChainedAsyncReturnSource(rs->value.get());
+            // fix #6052: `v` already holds the result; see asyncKind1LocalSlot.
             // No enclosing finally: dispose all live scopes, then complete.
-            emitAllDisposals();
+            if (asyncKind1LocalSlot) {
+                llvm::AllocaInst* savedEdgeSlot = asyncReturnEdgeSlot_;
+                moveAsyncKind1LocalToReturnSlot();
+                emitAllDisposals();
+                // Every cleanup completed normally: the value is the task's.
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     asyncReturnEdgeSlot_);
+                asyncReturnEdgeSlot_ = savedEdgeSlot;
+            } else {
+                emitAllDisposals();
+            }
             // fix #3129 / §30.5 Pattern A: hoist the §30.5 kind 1 / kind 2 decision
             // out of the *no enclosing finally* branch into a helper called from
             // BOTH the direct branch and lowerTry's mode-5 dispatch, so a Pattern A
@@ -5721,6 +5812,30 @@ void Emitter::emitAsyncPatternAResultDecision(bool chainedReturn,
 }
 
 
+llvm::AllocaInst* Emitter::asyncReturnSlotHere() {
+    // fix #6052 (§28.3 *The return slot*, v0.338). Frame-backed like every
+    // slot read after a suspension (a finally body may await), which also
+    // zero-initialises it (entryAllocaNullPtr).
+    llvm::AllocaInst*& slot = asyncReturnSlots_[currentFn_];
+    if (!slot) {
+        slot = entryAllocaNullPtr();
+        if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
+    }
+    return slot;
+}
+
+
+void Emitter::emitAsyncReturnSlotUnwind(llvm::AllocaInst* slot) {
+    // fix #6052: the `dynamicDispose` arm — load, skip a null, dispose and
+    // reclaim through the object's own vtable, null the slot.
+    Disposal rd{slot, nullptr};
+    rd.unwindOnly = true;
+    rd.dynamicDispose = true;
+    emitDisposals(std::vector<Disposal>{rd}, /*isUnwind=*/true);
+}
+
+
+
 bool Emitter::lowerTry(const ast::TryStmt& trys) {
     bool hasFin = trys.hasFinally;
     // §30.9 / §31.2 (#438): in an async state machine, an `await` inside a catch
@@ -6213,6 +6328,10 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // same routed edge). The terminal mode-5 dispatch reads it to ask
         // emitAsyncPatternAResultDecision to skip the kind-1 disposer attach.
         bool myBorrowedAsyncRet = finallyStack_.back().borrowedAsyncReturn;
+        // fix #6052: read before the pop, like the two flags above.
+        llvm::AllocaInst* myAsyncReturnSlot =
+            finallyStack_.back().asyncReturnSlotRouted
+                ? asyncReturnSlotHere() : nullptr;
         // Pop the frame — outer frames (if any) are now at back().
         finallyStack_.pop_back();
         if (!finallyBodyStack_.empty()) finallyBodyStack_.pop_back();
@@ -6221,7 +6340,26 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
 
         // finNormalBB: run finally body, then dispatch based on exit mode.
         builder_.SetInsertPoint(finNormalBB);
+        // fix #6052 (§28.3 *The return slot*, v0.338): "if one raises — a
+        // `finally` that throws ... — the return is abandoned ... and the
+        // slot's value is disposed by the unwind as an owned local
+        // established at that point would be: at the raise, before every
+        // cleanup still pending on the edge that was established before the
+        // `return` statement ... only a cleanup established inside the
+        // raising cleanup itself ... unwinds before it". So the slot is an
+        // unwind-only entry in a scope of its own around this copy of the
+        // finally body — the only copy an async `return` reaches. The entry
+        // skips a null slot (every other exit mode) and nulls it after
+        // disposing, and a raise a handler inside the finally body catches
+        // never unwinds this far.
+        if (myAsyncReturnSlot) {
+            Disposal rd{myAsyncReturnSlot, nullptr};
+            rd.unwindOnly = true;
+            rd.dynamicDispose = true;
+            disposeStack_.push_back({rd});
+        }
         bool finTerm = lowerScopedBlock(trys.finallyBody);
+        if (myAsyncReturnSlot) disposeStack_.pop_back();
         auto* resumeBB = llvm::BasicBlock::Create(llvm_, "finally.resume",
                                                   currentFn_);
         if (!finTerm) builder_.CreateBr(resumeBB);
@@ -6406,12 +6544,18 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 llvm::BasicBlock::Create(llvm_, "finally.asyncret", currentFn_);
             sw->addCase(builder_.getInt32(5), arDispBB);
             builder_.SetInsertPoint(arDispBB);
+            // fix #6052 (§28.3 *The return slot*, v0.338): this finally
+            // completed normally; the slot still owns the value across the
+            // disposals below, and the next-outer finally's body in turn.
+            llvm::AllocaInst* savedEdgeSlot = asyncReturnEdgeSlot_;
+            asyncReturnEdgeSlot_ = myAsyncReturnSlot;
             if (outerFr) {
                 // fix #1567 / §29.7/§28.10 (v0.182): dispose the scopes between
                 // this finally and the next-outer finally (reverse establishment)
                 // after this finally body, before routing the async return onward
                 // — the mode-5 twin of mode 1.
                 emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
+                asyncReturnEdgeSlot_ = savedEdgeSlot;
                 builder_.CreateStore(builder_.getInt32(5), outerFr->exitModSlot);
                 if (asyncRetSlot && outerFr->asyncRetSlot && asyncResultTy_) {
                     llvm::Value* rv =
@@ -6442,6 +6586,14 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // dispose every remaining scope established before this try
                 // AFTER the finally body, then complete the outer task.
                 emitDisposalsInRange(0, bodyScopeIdx);
+                asyncReturnEdgeSlot_ = savedEdgeSlot;
+                // fix #6052: "The slot's value transfers to the caller only
+                // when every cleanup on the return edge has completed
+                // normally" — here.
+                if (myAsyncReturnSlot)
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()),
+                        myAsyncReturnSlot);
                 llvm::Value* rv = (asyncRetSlot && asyncResultTy_)
                     ? builder_.CreateLoad(asyncResultTy_, asyncRetSlot)
                     : nullptr;

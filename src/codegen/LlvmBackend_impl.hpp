@@ -2925,6 +2925,11 @@ private:
         // the two predicates ask different questions (owned vs. borrowed),
         // so they cannot share a bit. See emitAsyncPatternAResultDecision.
         bool borrowedAsyncReturn = false;
+        // fix #6052 (§28.3 *The return slot*, v0.338): some async `return`
+        // routed through this finally moved an owned local into the body's
+        // return slot (asyncReturnSlotHere), so a raise from this finally's
+        // body on that edge must dispose the slot's value. See lowerTry.
+        bool asyncReturnSlotRouted = false;
         // §21.5 (v0.201, #2051): labeled `break`/`continue` that CROSS this
         // finally to reach an OUTER loop. The fixed modes 0-6 name only the
         // innermost-loop break/continue (mode 2/3), so a labeled jump to an
@@ -12132,6 +12137,22 @@ private:
     // and the unwind edge disposes only the scopes OUTSIDE it — re-running the
     // pass that just threw would double-release the entries that do not null
     // their own slot.
+    // fix #6052 (§28.3 *The return slot*, v0.338): "A value transferred into
+    // a `return` ... leaves the named-value regime above for a callee-local
+    // owned slot, established on the cleanup stack at the `return` statement
+    // ... In an `async` body the slot is the frame's". One frame-backed slot
+    // per async body (keyed by its Resume function; at most one `return` is
+    // in flight), holding the owned local a `return x;` consumed while the
+    // edge's cleanups run and null otherwise.
+    std::unordered_map<llvm::Function*, llvm::AllocaInst*> asyncReturnSlots_;
+    llvm::AllocaInst* asyncReturnSlotHere();
+    // The slot while the cleanups of a return edge are being emitted: a
+    // disposer that raises there disposes the slot's value at the raise
+    // (emitPendingCheckIf). Null everywhere else.
+    llvm::AllocaInst* asyncReturnEdgeSlot_ = nullptr;
+    // Dispose-and-null the slot's value if it holds one.
+    void emitAsyncReturnSlotUnwind(llvm::AllocaInst* slot);
+
     static constexpr std::size_t kAllLiveScopes =
         static_cast<std::size_t>(-1);
 

@@ -2554,6 +2554,16 @@ void Emitter::emitPendingCheckIf(llvm::Value* cond,
     // still on disposeStack_ (its owner pops it after the pass returns), so
     // re-disposing it here would double-release every entry that does not null
     // its own slot (a plain `stringRelease` is exactly such an entry).
+    // fix #6052 (§28.3 *The return slot*, v0.338): a cleanup of a return
+    // edge raised — "a `using var`'s or an auto-dropped local's disposer that
+    // throws" — so "the return is abandoned ... and the slot's value is
+    // disposed by the unwind ... at the raise, before every cleanup still
+    // pending on the edge". Set only while such an edge's disposals are
+    // being emitted, and only for the body that owns the slot (a disposer
+    // body built lazily meanwhile is another function).
+    if (asyncReturnEdgeSlot_ &&
+        asyncReturnEdgeSlot_->getFunction() == currentFn_)
+        emitAsyncReturnSlotUnwind(asyncReturnEdgeSlot_);
     if (unwindDisposeHi == kAllLiveScopes)
         emitUnwindDisposals();
     else
