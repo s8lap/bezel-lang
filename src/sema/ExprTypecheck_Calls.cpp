@@ -32045,6 +32045,16 @@ bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
             for (const auto& sub : arm.stmts)
                 if (sub && stmtCaptures(*sub, arms)) return true;
         }
+    } else if (auto* be2 = dynamic_cast<const ast::BindExpr*>(&e)) {
+        // per §30.14 (fix #6291): the binding atom `(var x := E; body)` was not
+        // walked, so an outer name in a clause initializer or in the body was
+        // missed. Its clauses are embedded LocalDecls whose declarations sit
+        // inside the entry lambda, so their own names stay non-captures under
+        // inNewWalk (the entry's source range decides, as in #6284/#6285).
+        for (const auto& clause : be2->clauses)
+            if (clause && clause->initializer &&
+                exprCaptures(*clause->initializer, nw)) return true;
+        if (be2->body && exprCaptures(*be2->body, nw)) return true;
     } else if (auto* innerLam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         // A nested lambda: it has its OWN params; captures from its perspective
         // may or may not propagate. For Domain.Spawn capture check, a nested
