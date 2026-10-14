@@ -9565,8 +9565,23 @@ private:
                                               const sema::MethodSymbol* ms)
                                               const {
         if (!cls || !ms) return nullptr;
+        // fix #6298 (§12.1, v0.338): a generic-method override of a GENERIC
+        // base's virtual (`C: B<int>` overriding `Q<U>(e: U, t: T)` as
+        // `Q<V>(e: V, t: int)`) differs from the base only by the base's
+        // type argument, so the unsubstituted comparison never matched it and
+        // the walk reached the base's own method, an exact self-match: the
+        // base body ran for a derived receiver. Both sides are read through
+        // the chain substitution into `cls`'s scope (the one #6075 builds for
+        // findInterfaceImpl), and an own type parameter matches by position.
+        const std::vector<SlotChainLevel> levels = slotChainLevels(cls);
+        const SlotSubst* msSubst = nullptr;
+        for (const SlotChainLevel& lv : levels)
+            if (lv.type == ms->parent) { msSubst = &lv.subst; break; }
         sema::MethodSymbol* nameOnly = nullptr;
         for (const sema::TypeSymbol* t = cls; t;) {
+            const SlotSubst* candSubst = nullptr;
+            for (const SlotChainLevel& lv : levels)
+                if (lv.type == t) { candSubst = &lv.subst; break; }
             for (sema::Symbol* m : t->members) {
                 auto* cand = dynamic_cast<sema::MethodSymbol*>(m);
                 if (!cand || isStaticMethod(cand) || cand->name != ms->name)
@@ -9575,11 +9590,77 @@ private:
                     continue;
                 if (!methodFns_.count(cand)) continue;
                 if (methodSigParamsMatch(cand, ms)) return cand;
+                if (msSubst && candSubst && cand != ms &&
+                    methodSigParamsMatchUnder(cand, candSubst, ms, msSubst))
+                    return cand;
                 if (!nameOnly) nameOnly = cand;
             }
             t = baseClassOf(t);
         }
         return nameOnly;
+    }
+
+    // fix #6298 (§12.1, v0.338): `methodSigParamsMatch` read through the
+    // chain substitutions (see findMethodBySignature). A bare reference to the
+    // method's OWN type parameter (checked before any substitution, so a
+    // class parameter of the same name does not shadow it) matches the other
+    // side's own parameter at the same position; everything else is followed
+    // through its frames and compared structurally.
+    bool methodSigParamsMatchUnder(const sema::MethodSymbol* a,
+                                   const SlotSubst* as,
+                                   const sema::MethodSymbol* b,
+                                   const SlotSubst* bs) const {
+        if (a->params.size() != b->params.size()) return false;
+        auto ownIndex = [](const sema::MethodSymbol* m,
+                           const sema::TypeRef* tr) -> int {
+            std::string_view nm = slotBareParamName(tr);
+            if (nm.empty()) return -1;
+            for (std::size_t i = 0; i < m->genericParams.size(); ++i)
+                if (m->genericParams[i] && m->genericParams[i]->name == nm)
+                    return static_cast<int>(i);
+            return -1;
+        };
+        auto paramTy = [&](const sema::Symbol* p) -> const sema::TypeRef* {
+            auto* ps = dynamic_cast<const sema::ParameterSymbol*>(p);
+            if (!ps) return nullptr;
+            const sema::TypeRef* t = ps->resolvedDeclType;
+            if (!t && ps->declType) t = ctx_.resolvedType(*ps->declType);
+            return t;
+        };
+        auto eq = [&](auto& self, const sema::TypeRef* x, std::size_t xf,
+                      const sema::TypeRef* y, std::size_t yf) -> bool {
+            if (!x || !y) return false;
+            int xo = xf == 0 ? ownIndex(a, x) : -1;
+            int yo = yf == 0 ? ownIndex(b, y) : -1;
+            if (xo >= 0 || yo >= 0)
+                return xo == yo && x->nullable == y->nullable;
+            SlotResolved xr = resolveSlotParam(x, as, xf);
+            SlotResolved yr = resolveSlotParam(y, bs, yf);
+            const sema::TypeRef* rx = xr.type;
+            const sema::TypeRef* ry = yr.type;
+            if (!rx || !ry || rx->kind != ry->kind ||
+                (x->nullable || rx->nullable) != (y->nullable || ry->nullable))
+                return false;
+            if (rx->kind == sema::TypeRef::Kind::Named) {
+                if (rx->declaration != ry->declaration) return false;
+                if (!rx->declaration && rx->headName() != ry->headName())
+                    return false;
+                if (rx->genericArgs.size() != ry->genericArgs.size())
+                    return false;
+                for (std::size_t k = 0; k < rx->genericArgs.size(); ++k)
+                    if (!self(self, rx->genericArgs[k], xr.frame,
+                              ry->genericArgs[k], yr.frame))
+                        return false;
+                return true;
+            }
+            sema::TypeRef nx = *rx, ny = *ry;
+            nx.nullable = ny.nullable = false;
+            return methodSigTypeRefEqual(&nx, &ny, true);
+        };
+        for (std::size_t i = 0; i < a->params.size(); ++i)
+            if (!eq(eq, paramTy(a->params[i]), 0, paramTy(b->params[i]), 0))
+                return false;
+        return true;
     }
 
     // fix #2768 (stdlib §4.4 / §2.8, spec §14.2, v0.240): the `CompareTo` that
