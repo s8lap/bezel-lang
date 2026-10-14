@@ -32810,6 +32810,30 @@ struct ClosureEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
+    // fix #6176 (§7.7 / §27.5 / §28.9, v0.338): true when the body being
+    // walked returns into a type that is NOT a function type (`Object`, a
+    // type parameter). §7.7: "`a ?? b` returns `a` if non-null, else `b`" —
+    // the operand's own value is the result, so `return nn ?? e;` hands the
+    // caller the very cell the local `nn` holds. At a function-typed return
+    // the `return` arm mints the caller's reference (lowerStmt's closure
+    // RETURN arms) and the local's scope-end release balances its own; at any
+    // other return type nothing is minted, so the local's reference is the
+    // one the caller receives and a scope-end release frees it under the
+    // caller (heap-use-after-free). Set by `collectClosureReleaseEligible`.
+    bool coalesceReturnTransfers = false;
+    // Is `e` the target itself, or a `??` (chain) one of whose operands is
+    // the target — an expression whose value can BE the target's cell?
+    // Postfix `!` neither moves nor copies (§17.8), so it is looked through.
+    bool coalesceYieldsTarget(const ast::Expr* e) const {
+        while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e))
+            e = pb->operand.get();
+        if (!e) return false;
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e))
+            return b->op == "??" && (coalesceYieldsTarget(b->left.get()) ||
+                                     coalesceYieldsTarget(b->right.get()));
+        return isTargetIdent(e);
+    }
+
     // fix #4473 (§27.5 / §28.9, v0.301): true when `target_expr` is the LHS
     // of an AssignmentStmt and is a same-scope closure-typed local or
     // parameter slot — the `lambdaRef := y` shape where `lambdaRef` is a
@@ -33369,6 +33393,18 @@ struct ClosureEscapeWalker {
             // only the bare-ident case marks isReturned_.
             if (r->value && isTargetIdent(r->value.get()))
                 isReturned_ = true;
+            // fix #6176 (§7.7, v0.338): `return nn ?? e;` where nothing mints
+            // the caller's reference is the same transfer as `return nn;` —
+            // see `coalesceReturnTransfers`. (The BinaryExpr arm of expr()
+            // reads both operands as non-consuming, which holds for `=` /
+            // `<>` only.)
+            if (coalesceReturnTransfers && r->value &&
+                dynamic_cast<const ast::BinaryExpr*>(r->value.get()) &&
+                coalesceYieldsTarget(r->value.get())) {
+                isReturned_ = true;
+                escaped = true;
+                return;
+            }
             expr(r->value.get(), /*safeRead=*/false); return;
         }
         if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
@@ -33659,6 +33695,21 @@ void Emitter::collectClosureReleaseEligible(
     // `returnedClosureLocalOwnsPlusOne`) sees the right state during the walk.
     closureBorrowAll_.clear();
     closureBorrowRetainEligible_.clear();
+    // fix #6176 (§7.7 / §27.5 / §28.9, v0.338): does a `return` in this body
+    // mint the caller's reference for a returned function value? Exactly the
+    // three venues lowerStmt's `return` arms key their closure mint on: a
+    // method's declared return type, a block lambda's return type, an async
+    // body's result type. Anywhere else a returned `nn ?? e` carries the
+    // local's own reference out — see ClosureEscapeWalker::
+    // coalesceReturnTransfers.
+    auto isFnTy = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Function;
+    };
+    const bool coalesceReturnTransfers =
+        !isFnTy(currentReturnTypeNode_
+                    ? ctx_.resolvedType(*currentReturnTypeNode_)
+                    : currentLambdaReturnSemaTy_) &&
+        !isFnTy(asyncResultSemaType_);
     // Find every `var` (non-using) closure LocalDecl whose initializer is a
     // +1 closure producer: either a codegen-internal producer (a lambda /
     // method reference — isPlusOneClosureProducer) or a call to a
@@ -33859,6 +33910,7 @@ void Emitter::collectClosureReleaseEligible(
 
     for (const ast::Node* ld : candidates) {
         ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
         // fix #2481 (consumer 3/3): OPT-IN the case-scrutinee relaxation —
         // see the scrutineeBorrowMode flag comment (struct ClosureEscapeWalker,
         // above) for the full soundness argument. A closure-typed producer
@@ -33987,6 +34039,7 @@ void Emitter::collectClosureReleaseEligible(
     // under the same escape discipline.
     for (const ast::Node* ld : borrowCandidates) {
         ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.coalesceReturnTransfers = coalesceReturnTransfers;  // #6176
         // Mirrors the producer loop above — same scrutineeBorrowMode opt-in,
         // same soundness argument (independent of whether the slot's +1 came
         // from a producer or a retained borrow; either way the slot owns
