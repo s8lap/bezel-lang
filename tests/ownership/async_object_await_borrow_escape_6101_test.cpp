@@ -29,6 +29,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -157,17 +158,18 @@ BEZEL_TEST(async_object_await_borrow_escape_6101,
         kHeldByKeep);
 }
 
-// Accepted: the borrow is read, and re-borrowed, inside the task's scope.
+// Accepted: the borrow is read, and re-borrowed, inside the task's scope. On
+// runAotChecked since the task disposes its `Object` result (narrow #5949).
 BEZEL_TEST(async_object_await_borrow_escape_6101,
           accept_object_result_read_inside_task_scope_30_5) {
-    expectRuns30(runAot(program("Object", "new Object()", "",
+    expectRuns30(runAotChecked(program("Object", "new Object()", "",
                                 "n := n + r.GetHashCode() * 0 + 1;", "")));
 }
 
 BEZEL_TEST(async_object_await_borrow_escape_6101,
           accept_object_result_alias_read_inside_task_scope_28_3) {
     expectRuns30(
-        runAot(program("Object", "new Object()", "",
+        runAotChecked(program("Object", "new Object()", "",
                        "var b := r; n := n + b.ToString().Length * 0 + 1;",
                        "")));
 }
@@ -176,7 +178,7 @@ BEZEL_TEST(async_object_await_borrow_escape_6101,
 BEZEL_TEST(async_object_await_borrow_escape_6101,
           accept_object_result_stored_into_inner_local_28_3) {
     expectRuns30(
-        runAot(program("Object", "new Object()", "",
+        runAotChecked(program("Object", "new Object()", "",
                        "var keep: Object? := null; keep := r; "
                        "n := n + keep!.GetHashCode() * 0 + 1;",
                        "")));

@@ -2777,6 +2777,10 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> initFns_;
     // #362 / stdlib §4.5: the cached per-element dispose thunk (built lazily).
     llvm::Function* elementDisposerThunk_ = nullptr;
+    // fix #5949 (§30.5 / §28.9, v0.338): the cached `void(void*)` reclaim thunk
+    // for an `Object`-typed task result slot (built lazily; see
+    // objectReclaimThunk()).
+    llvm::Function* objectReclaimThunk_ = nullptr;
     // §28.13 / stdlib §2.16 (#603): void(void*) thunks that call
     // bz_shared_release / bz_weak_release, used as per-element disposal
     // callbacks for OwningArray<Shared<T>> / OwningArray<Weak<T>>.
@@ -12510,6 +12514,23 @@ private:
     // callback for bz_array_free / bz_array_clear_disposing /
     // bz_array_remove_at_disposing. Built once per module and cached.
     llvm::Function* elementDisposerThunk();
+    // fix #5949 (§30.5 / §28.9, v0.338): per-T result disposer for a
+    // `Task<Object>` / `Task<Object?>` / `OwningTask<Object>` result slot.
+    // Reclaims the slot iff it holds an `Object` INSTANCE (word 0 == the
+    // module's `Object` vtable); a §8.6 box, a string, or any other value an
+    // `Object` slot can hold is left alone. Null when the module built no
+    // `Object` vtable. See the definition for the safety argument.
+    llvm::Function* objectReclaimThunk();
+    // True for the builtin `Object` type (nullable or not).
+    static bool isPlainObjectRef(const sema::TypeRef* t);
+    // fix #5949 follow-up (§30.5 kind 1, v0.338): true when the current async
+    // body's result disposer is the `Object` reclaim thunk and this non-`await`
+    // return's operand is NOT provably owned by the task — neither proven
+    // Owned by the ownership pass (`ownershipProvedOwned`, from
+    // `ReturnStmt::asyncResultIsOwnedObject`) nor a literal `new Object()`.
+    // The disposer must not be attached for such a return.
+    bool asyncObjectResultNotProvablyOwned(const ast::Expr* valueExpr,
+                                           bool ownershipProvedOwned);
     llvm::Function* sharedReleaseThunk();
     llvm::Function* weakReleaseThunk();
     llvm::Function* groupingFreeThunk(); // stdlib §5 (#651): IGrouping disposal

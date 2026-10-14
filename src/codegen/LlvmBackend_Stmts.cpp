@@ -3036,6 +3036,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // to emitAsyncPatternAResultDecision, then is reset.
         bool borrowedReturn = asyncBorrowedReturn_;
         asyncBorrowedReturn_ = false;
+        // fix #5949 follow-up (§30.5 kind 1, v0.338): under `Task<Object>`
+        // the result disposer is attached only for an operand the ownership
+        // pass proved OWNED at this return (or a literal `new Object()`); a
+        // box, a `string`, an upcast or any unproven operand attaches none.
+        if (asyncObjectResultNotProvablyOwned(rs->value.get(),
+                                              rs->asyncResultIsOwnedObject))
+            borrowedReturn = true;
         if (diverged_) return true;  // CG40: the value expression threw
         // #2491 (return-path twin of #2434): a return statement's value
         // expression was present but failed to lower — either lowerExpr
@@ -3244,15 +3251,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     auto lit = loc ? locals_.find(loc->decl) : locals_.end();
                     // Not a `string` or a function value (their returns
                     // mint or keep a +1 of their own, further down), not a
-                    // task (#776 above), and not an `Object` local: that
-                    // slot may hold a §8.6 box, which is released rather
-                    // than consumed, and no `Task<Object>` teardown takes
-                    // an `Object` result over.
+                    // task (#776 above), and an `Object` local only when the
+                    // ownership pass proved it holds an owned instance at
+                    // this return (narrow #5949): otherwise the slot may
+                    // hold a §8.6 box, which is released rather than
+                    // consumed, and the task gets no disposer for it.
                     const bool consumedHere =
                         lt &&
-                        lt->kind != sema::TypeRef::Kind::Primitive &&
+                        !(lt->kind == sema::TypeRef::Kind::Primitive &&
+                          !isPlainObjectRef(lt)) &&
                         lt->kind != sema::TypeRef::Kind::Function &&
-                        !isTaskTypeName(lt);
+                        !isTaskTypeName(lt) &&
+                        (!isPlainObjectRef(lt) ||
+                         rs->asyncResultIsOwnedObject);
                     if (consumedHere &&
                         lit != locals_.end() && lit->second &&
                         lit->second->getAllocatedType()->isPointerTy()) {
@@ -3264,13 +3275,33 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         const bool storageOk =
                             cv == cellVars_.end() ||
                             (cv->second && cv->second->isPointerTy());
+                        // An `Object` local qualifies only through the entry
+                        // that reclaims an `Object` INSTANCE (`objectReclaim`),
+                        // the one value the task's own disposer
+                        // (objectReclaimThunk) takes over. An `Object` local
+                        // registered for a user-class instance (`var o: Object
+                        // := new C();`) stays the frame's, as it was before
+                        // #5949: that thunk leaves such an instance alone, so
+                        // moving it to the task would only leak it. The task
+                        // then gets no disposer for this return either - the
+                        // frame has disposed what its slot points at.
+                        const bool objLocal = isPlainObjectRef(lt);
+                        bool objOtherEntry = false;
                         if (storageOk)
                             for (const auto& scope : disposeStack_)
                                 for (const auto& e : scope)
                                     if (e.slot == slot && !e.boxedCellFree &&
                                         !e.boxedCellFreeDeferred &&
-                                        !e.cellRelease)
-                                        asyncKind1LocalSlot = slot;
+                                        !e.cellRelease) {
+                                        if (objLocal && !e.objectReclaim)
+                                            objOtherEntry = true;
+                                        else
+                                            asyncKind1LocalSlot = slot;
+                                    }
+                        if (objOtherEntry) {
+                            asyncKind1LocalSlot = nullptr;
+                            borrowedReturn = true;
+                        }
                     }
                 }
             }

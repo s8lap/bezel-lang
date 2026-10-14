@@ -797,9 +797,53 @@ llvm::Function* Emitter::patternAResultDisposerFor(
     // Exclude nested Task-family results explicitly so the two policies stay
     // disjoint. // per §30.5 (Task<T> doesn't own its T)
     if (isTaskTypeName(tElem)) return nullptr;
+    // fix #5949 (§30.5, v0.338): `Task<Object>` is Pattern A and the task owns
+    // an `Object` instance result; elementPolicyFor has no `Object` row.
+    if (isPlainObjectRef(tElem)) return objectReclaimThunk();
     ElementPolicy pol = elementPolicyFor(tElem, /*owningFamily=*/true);
     return pol.cat == ElementPolicy::Category::ClassOwned ? pol.disposerThunk
                                                            : nullptr;
+}
+
+
+// fix #5949 follow-up (§30.5 kind 1 / §28.3, v0.338). `Task<Object>`'s per-T
+// disposer (objectReclaimThunk) may be attached ONLY for a result the task
+// provably owns. §30.5 kind 1: "a fresh owned value (a `return` of an owned
+// expression — a fresh producer, or a named owned binding of the body, a plain
+// owned local or an `owned` parameter, consumed marker-free at the return ...):
+// the task owns the result and its destructor disposes it directly". Under
+// `Task<Object>` the operand's static type says nothing about that — the slot
+// can equally hold a borrow of the caller's object (`return p;`), an upcast of
+// a binding the frame disposes itself (`return p as Object;`), or a
+// runtime-managed box / `string` ("kind 1 below with nothing for the teardown
+// to dispose"). Attaching the disposer to any of those reads or frees memory
+// the task does not own: the heap-use-after-free the first #5949 cut shipped.
+//
+// The proof comes from the ownership pass, which alone knows the operand's
+// flow state: `ownershipProvedOwned` is `ReturnStmt::asyncResultIsOwnedObject`.
+// The one shape decided here is the literal `new Object()`, which needs no flow
+// state and also occurs where that pass does not dataflow (a lambda body, an
+// expression body). A `return await ...` is not this function's business: its
+// kind (2 chained / 3 borrowed) is detectAsyncPatternAKind's.
+//
+// Returns true when the current body's disposer is the `Object` thunk and this
+// non-`await` return must NOT attach it — the "teardown disposes nothing"
+// outcome, i.e. exactly what a `Task<Object>` return did before #5949.
+bool Emitter::asyncObjectResultNotProvablyOwned(const ast::Expr* valueExpr,
+                                                bool ownershipProvedOwned) {
+    if (!valueExpr || !asyncPatternAResultDisposer_ || !objectReclaimThunk_ ||
+        asyncPatternAResultDisposer_ != objectReclaimThunk_)
+        return false;
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(valueExpr))
+        if (un->op == "await") return false;
+    if (ownershipProvedOwned) return false;
+    const ast::Expr* x = valueExpr;
+    while (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(x))
+        x = p->operand.get();
+    if (x && dynamic_cast<const ast::NewExpr*>(x) &&
+        isPlainObjectRef(resolveTypeParamRef(ctx_.exprType(*x))))
+        return false;
+    return true;
 }
 
 
@@ -1077,7 +1121,18 @@ void Emitter::detectAsyncPatternAKind(const ast::Expr* valueExpr) {
         // NOT a Task<Widget>) continue to compile, matching the
         // narrow-to-known-shape discipline #4285's own set follows.
         // // per §30.5, §30.6, v0.306
-        if (asyncPatternAResultDisposer_ &&
+        // narrow #5949 (§30.5, v0.338): under `Task<Object>` the member /
+        // indexer shapes below are not rejected here. A value-typed or
+        // `string` read (`return h.count;`, `return names[0];`) is boxed or
+        // runtime-managed at the return - "no borrow and is not reached" -
+        // and whether an `Object`-typed one is reached is #6050. Either way
+        // the return attaches no disposer (asyncObjectResultNotProvablyOwned),
+        // as before `Task<Object>` had one.
+        const bool objectResultRuntimeManagedOperand =
+            objectReclaimThunk_ &&
+            asyncPatternAResultDisposer_ == objectReclaimThunk_ &&
+            !isTaskFactoryCallExpr(valueExpr);
+        if (asyncPatternAResultDisposer_ && !objectResultRuntimeManagedOperand &&
             (dynamic_cast<const ast::MemberAccessExpr*>(valueExpr) ||
              dynamic_cast<const ast::NullCondMemberExpr*>(valueExpr) ||
              dynamic_cast<const ast::IndexExpr*>(valueExpr) ||
@@ -2751,6 +2806,12 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             asyncChainedReturn_ = false;
             bool borrowedReturn = asyncBorrowedReturn_;
             asyncBorrowedReturn_ = false;
+            // fix #5949 follow-up: not provably owned by the task (see the
+            // helper) — same "teardown disposes nothing" outcome as a
+            // borrowed source. An expression body has no ReturnStmt, so only
+            // the literal `new Object()` qualifies. // per §30.5
+            if (asyncObjectResultNotProvablyOwned(lam.exprBody.get(), false))
+                borrowedReturn = true;
             // fix #3773 (§27.3 / §27.5 / §28.9 / §30.6, v0.286): mint the
             // return-site +1 for the value that completes the outer task,
             // mirroring `lowerLambda`'s OWN expression-body mint

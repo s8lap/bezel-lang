@@ -31,6 +31,25 @@ namespace bezel::ownership {
 // checkOwnership entry point and its supporting free functions.
 
 namespace {
+// narrow #5704 / fix #5949 follow-up (§30.5, v0.338): the builtin `Object`
+// type, nullable or not — a Primitive-kind TypeRef with no declaration.
+bool isPlainObjectType(const sema::TypeRef* t) {
+    return t && t->kind == sema::TypeRef::Kind::Primitive &&
+           t->primitive == sema::PrimitiveType::Object;
+}
+// A Pattern A `Task<Object>` / `Task<Object?>` (§30.5: "`Task<T>` for class or
+// interface T (`Object`, a class (§3.1), included"). Plain `Task` head only,
+// like every sibling gate here — never `OwningTask` (Pattern B).
+bool isAsyncObjectResultTaskType(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable)
+        return false;
+    if (rt->headName() != "Task") return false;
+    if (rt->genericArgs.empty()) return false;
+    return isPlainObjectType(rt->genericArgs.front());
+}
+}  // namespace
+
+namespace {
 // §29.3 (#945): does this statement list use `yield` (making the method an
 // iterator)?
 //
@@ -4623,6 +4642,13 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // fix #5949 follow-up (§30.5 kind 1, v0.338): publish to codegen
+            // whether a `Task<Object>` body's operand is OWNED here. Read
+            // BEFORE handleReturn discharges the binding; assigned (not OR-ed)
+            // so the last dataflow visit — the fixpoint state — is what
+            // codegen sees. // per §30.5
+            const_cast<ast::ReturnStmt*>(rs)->asyncResultIsOwnedObject =
+                asyncObjectResultOperandIsOwned(*rs->value);
             handleReturn(*rs->value);
         }
         return;
@@ -15302,6 +15328,32 @@ bool isAsyncPatternAClassResultType(const sema::TypeRef* rt,
     return false;
 }
 }  // namespace
+
+// fix #5949 follow-up (§30.5 kind 1, v0.338): "a fresh owned value (a `return`
+// of an owned expression — a fresh producer, or a named owned binding of the
+// body, a plain owned local or an `owned` parameter, consumed marker-free at
+// the return ...): the task owns the result and its destructor disposes it
+// directly". True only for a LOCAL of static type `Object` that is Owned in
+// the CURRENT dataflow state (`owned` is not admissible on an `Object`
+// parameter or return type, so a local is the only named owned `Object`
+// binding there is). The literal `new Object()` is recognized by codegen
+// itself (it needs no flow state and also occurs in lambda and expression
+// bodies, which this pass does not dataflow). Everything else answers false
+// and gets no disposer. // per §30.5, §28.3
+bool MethodOwnership::asyncObjectResultOperandIsOwned(const ast::Expr& e) {
+    if (!isAsync_ || !returnType_) return false;
+    if (!isAsyncObjectResultTaskType(ctx_.resolvedType(*returnType_)))
+        return false;
+    const ast::Expr* x = &e;
+    while (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(x))
+        x = p->operand.get();
+    if (!x || !isPlainObjectType(ctx_.exprType(*x))) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(x);
+    if (!id) return false;
+    if (!dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id))) return false;
+    LocalOwnership* st = lookupStateFor(*id);
+    return st && st->state == OwnershipState::Owned && !st->implicitDischarge;
+}
 
 void MethodOwnership::checkAsyncPatternABorrowedIdentifierReturn(
         const ast::Expr& e) {

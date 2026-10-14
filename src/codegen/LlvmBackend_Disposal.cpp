@@ -4768,6 +4768,67 @@ llvm::Function* Emitter::elementDisposerThunk() {
 }
 
 
+bool Emitter::isPlainObjectRef(const sema::TypeRef* t) {
+    return t && t->kind == sema::TypeRef::Kind::Primitive &&
+           t->primitive == sema::PrimitiveType::Object;
+}
+
+
+// fix #5949 (§30.5 / §28.9 / §8.1, v0.338): the result disposer of a
+// `Task<Object>` (Pattern A: "the task owns any class-typed result it
+// produces", `Object` included), attached by the producing async body at each
+// return whose operand can be an `Object` instance. `elementPolicyFor` has no `Object` row — `Object` is a Primitive-kind
+// TypeRef with no declaration — so the task teardown attached NO disposer and a
+// `new Object()` result leaked on every consumption form.
+//
+// The slot may hold more than an `Object` instance (§5.1: `Object` is the
+// universal reference type): a §8.6 box, a string, or a user-class instance
+// upcast to `Object`. §30.5 kind 1 ("a box under `Task<Object>` ... with
+// nothing for the teardown to dispose") and §28.9 put boxes on their own
+// release rules, so — exactly as the `using var` local arm of fix #5437 does
+// (emitDisposals' `objectReclaim`) — the thunk reclaims iff word 0 is the
+// module's `Object` vtable BY ADDRESS and otherwise leaves the value alone.
+// That fails safe: an unrecognized value is a bounded leak, never a free of
+// memory another owner still holds (no double free of an upcast class
+// instance, no free of a box). Reclaim is the free alone: §8.1 gives `Object`
+// no destructor and no fields, so there is no logical-disposal step. Mirrors
+// emitReclaimBlock: the identity-hash side-table entry is reaped first and the
+// block is quarantined (not freed) in §28.2 checked-disposal mode.
+llvm::Function* Emitter::objectReclaimThunk() {
+    if (objectReclaimThunk_) return objectReclaimThunk_;
+    auto objVtable = builtinVtable_.find("Object");
+    if (objVtable == builtinVtable_.end()) return nullptr;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$objReclaim", module_.get());
+    llvm::Argument* obj = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* tstBB = llvm::BasicBlock::Create(llvm_, "obj.test", fn);
+    auto* relBB = llvm::BasicBlock::Create(llvm_, "obj.reclaim", fn);
+    auto* retBB = llvm::BasicBlock::Create(llvm_, "obj.ret", fn);
+    llvm::IRBuilder<> b(entry);
+    b.CreateCondBr(
+        b.CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, tstBB);
+    b.SetInsertPoint(tstBB);
+    llvm::Value* word0 = b.CreateLoad(ptrTy(), obj);
+    b.CreateCondBr(
+        b.CreateICmpEQ(word0, llvm::cast<llvm::Constant>(objVtable->second)),
+        relBB, retBB);
+    b.SetInsertPoint(relBB);
+    b.CreateCall(declareC("bz_obj_identity_hash_forget",
+                          llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                 {obj});
+    if (!checkedDisposal_) b.CreateCall(freeFn(), {obj});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    objectReclaimThunk_ = fn;
+    return fn;
+}
+
+
 // §28.13 / stdlib §2.16 (#603): void(void*) thunk that calls
 // bz_shared_release(ptr), used as the per-element disposal callback for an
 // OwningArray<Shared<T>> (or similar owning collection of shared handles).

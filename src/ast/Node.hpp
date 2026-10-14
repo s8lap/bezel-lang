@@ -292,6 +292,19 @@ struct LocalTypeDecl : Stmt {
 // A.6: `ReturnStmt ::= "return" Expression? ";"`.
 struct ReturnStmt : Stmt {
     std::unique_ptr<Expr> value;       // null for `return;`
+    // fix #5949 follow-up (§30.5 kind 1, §28.3, v0.338): set by the ownership
+    // pass (its single setter, at the ReturnStmt arm that calls handleReturn)
+    // when this `return` sits in an `async` METHOD body declared
+    // `Task<Object>` / `Task<Object?>` and its operand is a LOCAL of static
+    // type `Object` that is, at THIS program point per the `states_` dataflow,
+    // in the Owned state. §30.5 kind 1: "a named owned binding of the body, a
+    // plain owned local ..., consumed marker-free at the return ... the task
+    // owns the result". Codegen attaches the `Object` result disposer only for
+    // such a return (and for a literal `new Object()`, which it recognizes
+    // itself); every other operand under `Task<Object>` gets no disposer,
+    // because the task cannot be shown to own it. Never set for a lambda
+    // body's return (lambda bodies are not dataflowed).
+    bool asyncResultIsOwnedObject = false;
 };
 
 // A.6: `ExpressionStmt ::= Expression ";"`. Statement-position expression

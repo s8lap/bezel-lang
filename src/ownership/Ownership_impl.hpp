@@ -2195,6 +2195,12 @@ private:
     // expression bodies). // per §30.5, §28.3, §28.6
     void checkAsyncPatternABorrowedIdentifierReturn(const ast::Expr& e);
 
+    // fix #5949 follow-up (§30.5 kind 1, v0.338): true when the current body
+    // is an async `Task<Object>` producer and `e` is a local of static type
+    // `Object` in the Owned state right now. Published to codegen as
+    // `ast::ReturnStmt::asyncResultIsOwnedObject`. // per §30.5
+    bool asyncObjectResultOperandIsOwned(const ast::Expr& e);
+
     // fix #4311: shared diagnostic for
     // `checkAsyncPatternABorrowedIdentifierReturn`, worded identically to
     // `fix #4285`'s codegen diagnostic (LlvmBackend_Async.cpp) so the two AST
