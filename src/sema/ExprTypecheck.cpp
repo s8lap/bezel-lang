@@ -21108,6 +21108,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     dynamic_cast<const ast::CallExpr*>(es->expr.get()))
                 reportNoTargetInferenceIfNeeded(*exCall);
         }
+        // fix #6310 (§27.6, v0.338): an expression statement has no target
+        // function type, so an overloaded method group named as the statement
+        // (`Math.Abs;`, an overloaded `c.Inst;`) is the no-target case the
+        // section calls ambiguous. Reuse the var-initializer rule (#4978, #5814).
+        if (es->expr)
+            reportUncalledOverloadedMethodRef(es->expr.get(),
+                                              es->expr->span.begin);
         // §21.9 (#743): a bare expression statement that DISCARDS a freshly
         // OWNED value requiring disposal silently abandons the disposal
         // obligation — a leak. For a non-trivial-dispose class (a destructor
