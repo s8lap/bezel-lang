@@ -468,3 +468,32 @@ end P;
 )bzl");
     expectExceptionDowncastRejected(r, "Exception", "IOException");
 }
+
+// ACCEPT (#6023 review F2, the exception spelling). §12.7 (v0.338) narrows a
+// `readonly` field by `is`; this compiler does not yet (#5550), so the read of
+// `this._e` is left on the permissive path it had before #6023
+// (isReadonlyFieldRead). Looped.
+BEZEL_TEST(sema_builtin_exception_downcast_not_implicit_6023,
+           readonly_exception_field_tested_then_read_as_the_tested_type_spec_12_7) {
+    auto r = runAot(R"bzl(module M6023E;
+public class Hr
+  public constructor(e: Exception) _e := e; end constructor;
+  public readonly _e: Exception;
+  public method G(): int
+    if this._e is IOException then var io: IOException := this._e; return io.Message.Length; end if;
+    return -1;
+  end G;
+end Hr;
+public class P
+  public static method Main(): int
+    var t := 0;
+    for var i in 0..200 do t := t + new Hr(new IOException("abc")).G() + new Hr(new Exception("b")).G(); end for;
+    Console.WriteLine($"{new Hr(new IOException("abc")).G()} {new Hr(new Exception("b")).G()} {t}");
+    return 0;
+  end Main;
+end P;
+)bzl");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3 -1 402\n"));
+}

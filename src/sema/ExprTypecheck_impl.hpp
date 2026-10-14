@@ -3255,6 +3255,14 @@ private:
     // §7.4 (v0.214, #2085/#2116): true iff `fs` carries the `readonly` modifier.
     static bool isReadonlyField(const FieldSymbol* fs);
 
+    // #6023 review (F2): true iff `e` is a bare read of a `readonly` field —
+    // `_f`, `this._f`, `base._f` or `X._f`. checkAssignable's two #6023
+    // downcast rejections leave such a source on the permissive path it had
+    // before #6023: §12.7 (v0.338) narrows a `readonly` field by `is`, but
+    // this compiler does not yet (#5550), so a rejection would turn the
+    // spec's own spelling into a false reject.
+    bool isReadonlyFieldRead(const ast::Expr* e);
+
     // §7.4 (v0.214, #2085/#2116): drop every readonly-field fact rooted at
     // `root` (a local that was reassigned, passed `ref`/`out`, or mutably
     // captured — the path's facts ride the root). A no-op for a symbol that was

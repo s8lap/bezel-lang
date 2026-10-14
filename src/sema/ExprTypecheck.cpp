@@ -6265,6 +6265,8 @@ void ExprTC::checkAssignable(
                 return;
             // pending #6083: see ExprTypecheck_impl.hpp.
             if (pendingTypeFactAdmits(fromExpr, to)) return;
+            // #5550: a `readonly` field source — see isReadonlyFieldRead.
+            if (isReadonlyFieldRead(fromExpr)) return;
             if (fromExpr &&
                 (dynamic_cast<const ast::CaseExpr*>(fromExpr) ||
                  dynamic_cast<const ast::ConditionalExpr*>(fromExpr) ||
@@ -7580,8 +7582,10 @@ void ExprTC::checkAssignable(
                      cur = common::builtinExceptionParentOf(cur), ++guard) {
                     if (cur == toH) { widens = true; break; }
                 }
-                // pending #6083: see ExprTypecheck_impl.hpp.
-                if (!widens && !pendingTypeFactAdmits(fromExpr, to)) {
+                // pending #6083: see ExprTypecheck_impl.hpp. #5550: a
+                // `readonly` field source — see isReadonlyFieldRead.
+                if (!widens && !pendingTypeFactAdmits(fromExpr, to) &&
+                    !isReadonlyFieldRead(fromExpr)) {
                     bool downcast = false;
                     guard = 0;
                     for (std::string_view cur = toH;
@@ -14788,6 +14792,16 @@ void ExprTC::erasePendingTypeFact(Symbol* carrier) {
     auto it = pendingTypeFactKeys_.find(carrier);
     if (it == pendingTypeFactKeys_.end()) return;
     for (const PendingTypeFactKey& k : it->second) narrowings_.erase(k.key);
+}
+
+bool ExprTC::isReadonlyFieldRead(const ast::Expr* e) {
+    if (!e) return false;
+    Symbol* sym = nullptr;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+        sym = ctx_.exprSymbol(*id);
+    else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        sym = ctx_.exprSymbol(*ma);
+    return isReadonlyField(dynamic_cast<FieldSymbol*>(sym));
 }
 
 bool ExprTC::pendingTypeFactAdmits(const ast::Expr* fromExpr, TypeRef* to) {

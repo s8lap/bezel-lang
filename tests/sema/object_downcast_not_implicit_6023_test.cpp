@@ -1352,3 +1352,34 @@ BEZEL_TEST(sema_object_downcast_not_implicit_6023,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("18 -1\n"));
 }
+
+// ACCEPT (#6023 review F2). §12.7 (v0.338): "`if this._f is Dog then
+// this._f.Bark(); end;` over `readonly _f: Animal` narrows `this._f`". This
+// compiler does not narrow a `readonly` field by `is` yet (#5550), so the
+// downcast read of `this._f` is left on the permissive path it had before
+// #6023 (isReadonlyFieldRead) instead of turning the spec's spelling into a
+// false reject. The A-typed analog stays rejected, as before #6023 (#5550).
+// Looped.
+BEZEL_TEST(sema_object_downcast_not_implicit_6023,
+           readonly_object_field_tested_then_read_as_the_tested_type_spec_12_7) {
+    auto r = runAot(std::string(kPrelude) + R"bzl(public class Hr
+  public constructor(o: Object) _f := o; end constructor;
+  public readonly _f: Object;
+  public method G(): int
+    if this._f is B then var b: B := this._f; return b.y; end if;
+    return -1;
+  end G;
+end Hr;
+public class P
+  public static method Main(): int
+    var t := 0;
+    for var i in 0..200 do t := t + new Hr(new B()).G() + new Hr(new A()).G(); end for;
+    Console.WriteLine($"{new Hr(new B()).G()} {new Hr(new A()).G()} {t}");
+    return 0;
+  end Main;
+end P;
+)bzl");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("9 -1 1608\n"));
+}
