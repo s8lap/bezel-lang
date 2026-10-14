@@ -9,7 +9,9 @@
 // silently-empty — wrong value, no signal to the programmer.
 //
 // These tests verify:
-//   1. RUNTIME: second for-loop over consumed bound lazy → InvalidOperationException
+//   1. STATIC: second for-loop over a consumed bound lazy is a compile error;
+//      RUNTIME: in a callee's plain IEnumerable<T> parameter (statically
+//      untracked) it raises InvalidOperationException (§29.11 v0.338)
 //   2. RUNTIME: first enumeration still yields the correct result (s1 = 6)
 //   3. RUNTIME: fresh inline lazy (`for x in a.Where(…)`) still works once
 //   4. RUNTIME: `var ys := a.Where(…).ToArray()` materialises → re-enumerable
@@ -29,23 +31,39 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::runAotOut;
 
 namespace {
 
-// Run via JIT; return the int return value, or -999 on compile/JIT failure.
+// Run via AOT; return the int return value, or -999 on compile/link/run failure.
 int run(const std::string& src) {
-    auto r = runJit(src);
+    auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
+}
+
+// True iff the program is REJECTED at compile time and some diagnostic message
+// contains every needle (a specific diagnostic, not merely "failed").
+bool rejectedWith(const std::string& src, std::initializer_list<const char*> needles) {
+    auto r = runAot(src);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        bool all = true;
+        for (const char* n : needles)
+            if (d.message.find(n) == std::string::npos) all = false;
+        if (all) return true;
+    }
+    return false;
 }
 
 // Run the FULL sema pipeline (including checkDefiniteAssignment) and return
 // true iff at least one error diagnostic was reported.
-// The standard `runJit` helper skips DA; this function exercises the full
-// pipeline that the `bezelc` driver runs, so DA-based static errors are visible.
+// This function drives the sema pipeline that the `bezelc` driver runs, so
+// DA-based static errors are visible.
 bool rejectedByDA(const std::string& src) {
     bezel::DiagnosticEngine diags;
     bezel::Lexer lexer(src, diags);
@@ -82,13 +100,15 @@ bool daErrorContains(const std::string& src, const std::string& needle) {
 
 // ── RUNTIME: second for-loop raises InvalidOperationException ──────────────
 
-// §29.11 / #1226: first loop consumes `filtered` (s1=6); second loop must
-// raise InvalidOperationException, not silently yield 0.
-// Verify via try/catch: caught=1 means the exception was thrown.
-// rc = s1*100 + caught = 601.
+// §29.11 v0.338: a lazy query "is single-consumption. It may be enumerated at
+// most once ... an affine discipline"; a second enumeration "is a compile error
+// where the flow analysis can see it statically".  The bound `filtered` is
+// enumerated twice in straight-line code, so the AOT driver REJECTS it.
+// FLIP (#1226): this row used to assert a RUNTIME InvalidOperationException
+// (rc 601), reachable only because the JIT skipped the ownership pass.
 BEZEL_TEST(linq_single_consumption_1226,
-           second_forin_raises_ioe_not_silent_empty_spec_29_11) {
-    BEZEL_EXPECT_EQ(run(
+           second_forin_rejected_at_compile_time_spec_29_11) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
@@ -101,7 +121,35 @@ BEZEL_TEST(linq_single_consumption_1226,
         "    caught := 1; "
         "  end; "
         "  return s1 * 100 + caught; "
-        "end Main; end C;"), 601);
+        "end Main; end C;",
+        {"bound lazy query `filtered` was already consumed", "§29.11"}));
+}
+
+// §29.11 v0.338: "Inside a callee, a plain IEnumerable<T> parameter is
+// statically untracked ... so a violation there is enforced only by the runtime
+// InvalidOperationException guard."  The callee's second loop over `xs` raises
+// IOE: s1=6, caught=1 -> 601 (printed: outside 0..255).
+BEZEL_TEST(linq_single_consumption_1226,
+           callee_param_second_forin_raises_ioe_spec_29_11) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C "
+        "public static method Twice(xs: IEnumerable<int>): int "
+        "  var s1 := 0; for var x in xs do s1 := s1 + x; end; "
+        "  var caught := 0; "
+        "  try "
+        "    for var x in xs do caught := caught + x; end; "
+        "  catch InvalidOperationException => "
+        "    caught := 1; "
+        "  end; "
+        "  return s1 * 100 + caught; "
+        "end Twice; "
+        "public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var filtered := a.Where(lambda(x) => x mod 2 = 0); "
+        "  Console.WriteLine(C.Twice(filtered)); "
+        "  return 0; "
+        "end Main; end C;"), "601");
 }
 
 // §29.11: the first enumeration must still yield the correct value (s=6).
@@ -137,17 +185,19 @@ BEZEL_TEST(linq_single_consumption_1226,
 
 // §29.11: `var ys := a.Where(…).ToArray()` produces an owned Array<int> that
 // is re-enumerable any number of times.  Both for-loops must yield s=6.
+// 606 is outside 0..255, so it is asserted on stdout (runAotOut).
 BEZEL_TEST(linq_single_consumption_1226,
            toarray_materializes_reenumerable_spec_29_11) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
         "  using var ys: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
         "  var s1 := 0; for var x in ys do s1 := s1 + x; end; "
         "  var s2 := 0; for var x in ys do s2 := s2 + x; end; "
-        "  return s1 * 100 + s2; "
-        "end Main; end C;"), 606);
+        "  Console.WriteLine(s1 * 100 + s2); "
+        "  return 0; "
+        "end Main; end C;"), "606");
 }
 
 // ── RUNTIME: two independent bound lazies, each enumerated once → OK ───────
