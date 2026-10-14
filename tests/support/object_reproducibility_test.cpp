@@ -220,3 +220,94 @@ BEZEL_TEST(object_reproducibility,
     // above can see a stale entry.
     BEZEL_EXPECT_TRUE(slurpBytes(dir / "used.o") != refBytes);
 }
+
+// CAUSE 3 — emission order driven by POINTER-keyed hash containers. The async
+// iterator's Dispose restored its suspend-locals by iterating
+// `StateMachineFrame::localFields` (an unordered_map keyed on AST-node
+// pointers), and emitEnsureInitFns visited types by iterating `sfinitFnOf_` /
+// `cctorFnOf_` (keyed on TypeSymbol pointers). In a fresh process the relative
+// addresses — and so the bucket collisions that decide the order — repeat; in
+// a fork of a parent with a fragmented heap they do not, so the emitted
+// instruction / definition order changed with the parent's history.
+//
+// The pin fragments the parent's heap differently before each forked compile
+// (an in-process emission of an unrelated program, then blocks of assorted
+// sizes, every other one freed, the rest kept alive for the child to inherit)
+// and requires every object to equal the first. A
+// pointer-ordered emission shows up as a differing object for some layouts;
+// the iteration count is chosen so the pre-fix build failed on every run
+// measured (see the commit message for the measurement).
+namespace {
+
+const char* kProgramAsyncIter =
+    "module M; class C "
+    "  public static _hits: int := 0; "
+    "  private static async method Seq(n: int): IAsyncEnumerable<int> "
+    "    for var i in 1..n do "
+    "      var built := $\"it-{i}\"; "
+    "      var churn := $\"churn-churn-churn-{i}-{i}-{i}\"; "
+    "      var third := $\"third-{i}\"; "
+    "      if churn.Length < 0 then yield return 99; end; "
+    "      if third.Length < 0 then yield return 98; end; "
+    "      yield return built.Length; "
+    "    end; "
+    "  end Seq; "
+    "  public static async method Main(): Task<int> "
+    "    var total := 0; "
+    "    await for var v in C.Seq(20) do "
+    "      total := total + v; "
+    "    end; "
+    "    C._hits := C._hits + 1; "
+    "    return total + D._seen + E._seen + F._seen + G._seen + H._seen; "
+    "  end Main; "
+    "end C; "
+    "class D public static _seen: int := 2; end D; "
+    "class E public static _seen: int := 3; end E; "
+    "class F public static _seen: int := 4; end F; "
+    "class G public static _seen: int := 5; end G; "
+    "class H public static _seen: int := 6; end H;";
+
+}  // namespace
+
+BEZEL_TEST(object_reproducibility,
+           same_program_same_object_under_varied_parent_heap_layouts) {
+    const fs::path dir = bezel_test::wtScratchDir("objrepro_heap");
+    const fs::path src = dir / "p.bzl";
+    {
+        std::ofstream out(src, std::ios::binary);
+        out << kProgramAsyncIter;
+    }
+    const bezel::codegen::CodegenOptions opts;
+
+    std::string first;
+    std::vector<std::unique_ptr<char[]>> keep;
+    constexpr int kRounds = 32;
+    int differing = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        // Perturb the heap the child inherits the way the harness's parent
+        // does — an in-process emission of an unrelated program, whose AST /
+        // symbols / IR are freed again — plus a round-specific mix of block
+        // sizes, every other one released back to the allocator's free lists.
+        BEZEL_EXPECT_TRUE(emitInProcess(kProgramB));
+        std::vector<std::unique_ptr<char[]>> blocks;
+        for (int j = 0; j < 256; ++j)
+            blocks.emplace_back(
+                new char[16 + static_cast<std::size_t>((round * 37 + j * 53) % 480)]);
+        for (std::size_t j = 0; j < blocks.size(); ++j)
+            if (j % 2 == 0) keep.push_back(std::move(blocks[j]));
+        blocks.clear();
+
+        const fs::path obj = dir / ("p" + std::to_string(round) + ".o");
+        const auto st = aot::forkedCompileObject(
+            src.string(), obj.string(), opts,
+            (dir / ("p" + std::to_string(round) + ".err")).string());
+        BEZEL_EXPECT_TRUE(st.outcome == aot::CompileOutcome::Ok);
+        const std::string bytes = slurpBytes(obj);
+        BEZEL_EXPECT_FALSE(bytes.empty());
+        if (round == 0)
+            first = bytes;
+        else if (bytes != first)
+            ++differing;
+    }
+    BEZEL_EXPECT_EQ(differing, 0);
+}

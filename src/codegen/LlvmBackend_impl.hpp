@@ -15783,6 +15783,18 @@ private:
     // This is a determinism fix, not a correctness one.
     std::vector<std::pair<llvm::AllocaInst*, unsigned>> smSpillsInFrameOrder() const;
 
+    // The same determinism rule for the Dispose bodies' restore of a frame's
+    // suspend-locals (restoreFrameLocalIntoSlot's two call sites): `localFields`
+    // is keyed on AST-node pointers, so iterating it directly emitted the
+    // restore allocas/loads in an order that depended on where the nodes landed
+    // in memory — the same program produced different objects after a different
+    // allocation history (object reproducibility). Field indices are unique per
+    // entry (buildStateMachineFrame assigns `localStart + li`), so this order is
+    // total. Order within the group is semantically free: each entry restores
+    // its own field into its own fresh slot.
+    static std::vector<std::pair<const ast::Node*, unsigned>>
+    localFieldsInFieldOrder(const StateMachineFrame& frame);
+
     // fix #3505 (§29.3 "Iterator methods" / §30.1 "`async` methods" /
     // §30.6 "Async lambdas" / §30.7 "Async iterators", v0.283): THE
     // suspend/resume frame member list, and the single authority both halves of

@@ -1070,6 +1070,19 @@ Emitter::smSpillsInFrameOrder() const {
 }
 
 
+// Object reproducibility: see the declaration in LlvmBackend_impl.hpp.
+std::vector<std::pair<const ast::Node*, unsigned>>
+Emitter::localFieldsInFieldOrder(const StateMachineFrame& frame) {
+    std::vector<std::pair<const ast::Node*, unsigned>> out(
+        frame.localFields.begin(), frame.localFields.end());
+    std::sort(out.begin(), out.end(),
+              [](const std::pair<const ast::Node*, unsigned>& a,
+                 const std::pair<const ast::Node*, unsigned>& b) {
+                  return a.second < b.second;
+              });
+    return out;
+}
+
 void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
                            std::vector<const ast::YieldStmt*>& out) {
     for (const auto& s : stmts) {
@@ -2683,7 +2696,12 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         // Restore suspend-locals from the frame so finally bodies that
         // reference iterator-body locals round-trip correctly.
-        for (auto& [node, fieldIdx] : frame.localFields)
+        // In FIELD order, not `localFields`' hash order: that map is keyed on
+        // AST-node pointers, so its iteration order (and with it the order of
+        // the allocas and loads emitted here) varied with the allocation
+        // history of the process (object reproducibility). Field indices are
+        // unique per local (buildStateMachineFrame), so the order is total.
+        for (const auto& [node, fieldIdx] : localFieldsInFieldOrder(frame))
             restoreFrameLocalIntoSlot(frame, node, fieldIdx, self);
 
         auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});

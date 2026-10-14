@@ -12196,8 +12196,27 @@ void Emitter::emitEnsureInitFns() {
         if (!t) return;
         if (seen.insert(t).second) types.push_back(t);
     };
-    for (auto& [t, fn] : sfinitFnOf_) consider(t);
-    for (auto& [t, fn] : cctorFnOf_) consider(t);
+    // Object reproducibility: both maps are keyed on TypeSymbol POINTERS, so
+    // their iteration order — and with it the order the per-type globals and
+    // ensureinit functions below are emitted in — depended on where the symbols
+    // landed in memory. Visit them in mangled-name order instead (the name the
+    // emitted `bz$<T>$ensureinit` symbol carries, so unique per type). Each
+    // type's block below is independent of every other's, so only the order of
+    // the emitted definitions changes.
+    {
+        std::vector<const sema::TypeSymbol*> withInit;
+        for (auto& [t, fn] : sfinitFnOf_) withInit.push_back(t);
+        for (auto& [t, fn] : cctorFnOf_) withInit.push_back(t);
+        std::vector<std::pair<std::string, const sema::TypeSymbol*>> keyed;
+        keyed.reserve(withInit.size());
+        for (const sema::TypeSymbol* t : withInit)
+            if (t) keyed.emplace_back(mangledTypeName(t), t);
+        std::stable_sort(keyed.begin(), keyed.end(),
+                         [](const auto& a, const auto& b) {
+                             return a.first < b.first;
+                         });
+        for (const auto& [name, t] : keyed) consider(t);
+    }
     // #798: also emit an (exported) ensureinit for every LOCAL public non-generic
     // type that has a static MEMBER but no static STATE (const-only static fields
     // / static methods). The importer calls bz$<T>$ensureinit at each cross-module

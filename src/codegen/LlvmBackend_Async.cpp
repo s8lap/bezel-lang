@@ -4397,7 +4397,12 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // the same restore. This block was a byte-identical copy of the sync
         // iterator's, including its §27.5 capture-cell defect; both now call
         // the one `restoreFrameLocalIntoSlot`.
-        for (auto& [node, fieldIdx] : frame.localFields)
+        // In FIELD order, not `localFields`' hash order: that map is keyed on
+        // AST-node pointers, so its iteration order (and with it the order of
+        // the allocas and loads emitted here) varied with the allocation
+        // history of the process (object reproducibility). Field indices are
+        // unique per local (buildStateMachineFrame), so the order is total.
+        for (const auto& [node, fieldIdx] : localFieldsInFieldOrder(frame))
             restoreFrameLocalIntoSlot(frame, node, fieldIdx, self);
 
         // §29.7 (#2574): load the suspension state ONCE, before any branch
