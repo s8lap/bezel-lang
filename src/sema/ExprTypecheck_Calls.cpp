@@ -24568,6 +24568,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (tkid && tkid->name == "Task") {
             auto* tkSym = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tkid));
             isBuiltinTask = tkSym && tkSym == ctx_.builtinClassSym("Task");
+            // fix-forward #6079 (§2.2 Aliases, §2.7 rule 1, v0.338): with
+            // `Task` homed in `System.Threading`, an alias-qualified head
+            // `T.Task` reaches this gate already rewritten to the bare
+            // built-in (normalizeAliasQualifiedBuiltinHead), so the alias arm
+            // below no longer sees it. The rewrite recorded the alias it
+            // dropped; name the qualifier exactly as that arm does.
+            if (isBuiltinTask && tkid->aliasQualifiedBuiltin) {
+                auto writtenIt = aliasQualifiedBuiltinAlias_.find(tkid);
+                if (writtenIt != aliasQualifiedBuiltinAlias_.end()) {
+                    qualifierNote =
+                        std::string("; note: `Task` here is the "
+                        "always-available builtin type, referenced "
+                        "through `") +
+                        writtenIt->second + ".Task`, where `" +
+                        writtenIt->second +
+                        "` is an import alias for module "
+                        "`System.Threading` (\xC2\xA7""2.7 rule 1)";
+                }
+            }
         } else if (tkma && tkma->member == "Task" && tkma->target) {
             if (auto* innerMa = dynamic_cast<const ast::MemberAccessExpr*>(
                     tkma->target.get())) {
@@ -24637,7 +24656,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // module/alias explicitly, so there is no collision to
                 // explain.
                 std::string taskAliasNote;
-                if (tkid) {
+                if (tkid && qualifierNote.empty()) {
                     auto aliasIt = importAliases_.find("Task");
                     if (aliasIt != importAliases_.end()) {
                         taskAliasNote =

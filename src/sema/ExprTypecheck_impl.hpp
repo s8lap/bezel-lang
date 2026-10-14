@@ -328,6 +328,12 @@ private:
     // position (e.g. `BankingApp.Transactions` in `BankingApp.Transactions.Calc`).
     // Lets the next MemberAccess level detect the complete module name.
     std::unordered_map<const ast::MemberAccessExpr*, std::string> partialModulePaths_;
+    // fix-forward #6079 (§2.2 Aliases, §2.7 rule 1, v0.338): the alias a
+    // normalizeAliasQualifiedBuiltinHead rewrite dropped (`T` of `T.Task`),
+    // keyed by the bare IdentifierExpr that replaced the qualified head, so a
+    // diagnostic about that head can still name the qualifier as written.
+    std::unordered_map<const ast::IdentifierExpr*, std::string>
+        aliasQualifiedBuiltinAlias_;
 
     // §12.7 flow narrowing. When `if x is T` (or the else branch of
     // `if x is not T`) narrows a simple variable `x` to `T`, an entry maps the

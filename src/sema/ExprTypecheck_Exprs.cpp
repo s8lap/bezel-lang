@@ -1688,6 +1688,8 @@ void ExprTC::normalizeAliasQualifiedBuiltinHead(
     // The qualifier is gone from the AST, so remember it: the head must keep
     // naming the built-in, never a same-named local / type / import.
     bare->aliasQualifiedBuiltin = true;
+    // Copied before the move below destroys `inner` (and `aid` with it).
+    aliasQualifiedBuiltinAlias_[bare.get()] = std::string(aid->name);
     const_cast<ast::MemberAccessExpr&>(ma).target = std::move(bare);
 }
 

@@ -369,3 +369,163 @@ BEZEL_TEST(task_qualified_member_5006,
     BEZEL_EXPECT_TRUE(r.ran);
     if (r.ran) BEZEL_EXPECT_EQ(99, r.exitCode);
 }
+
+// ── Parts 9-13: fix-forward #6079 (spec §2.3, §2.2 Aliases, §2.7 rules 1-2,
+//    v0.338) ──
+//
+// #6079 homed `Task` in `System.Threading` (spec §2.3: "the always-available
+// one by its module's qualified name (`System.Exception`;
+// `System.Threading.Task` under `import System.Threading;`; §2.7 rule 2)").
+// With that row the #4698 normalization rewrites an alias-qualified head
+// `T.Task` to the bare built-in BEFORE the #5006 gate runs, so the gate saw a
+// bare `Task` and dropped the note naming the qualifier the user wrote (Part
+// 2 went red). The note's wording is still accurate under v0.338: `T` is
+// resolved as an import alias by §2.7 rule 1's last source, and §2.2 makes the
+// alias "an additional *qualifier*" for the module's names. These rows pin
+// the EXACT note text per spelling, and its absence where no qualifier was
+// written.
+namespace {
+
+// The single Error naming the missing `Task` member, or "" if there is none.
+std::string unknownTaskMemberError6079(const std::string& program,
+                                       const std::string& missingMember) {
+    auto r = runAot(program);
+    if (r.ran) return "";
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("no member `" + missingMember + "` on `Task`") ==
+                std::string::npos)
+            continue;
+        // The AOT harness carries each diagnostic as its rendered stderr
+        // line; drop only trailing whitespace so the callers can pin how the
+        // message ENDS.
+        std::string msg = d.message;
+        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' ||
+                                msg.back() == ' '))
+            msg.pop_back();
+        return msg;
+    }
+    return "";
+}
+
+bool endsWith6079(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+const char* const kLastSurfaceClause6079 =
+    "use `Task.FromResult(...)` for an already-completed task";
+
+}  // namespace
+
+// ── Part 9: the Part 2 program, exact trailing note (alias spelling) ──
+BEZEL_TEST(task_qualified_member_5006,
+           alias_qualified_completed_task_exact_qualifier_note_6079) {
+    const std::string msg = unknownTaskMemberError6079(
+        "module M;\n"
+        "import System.Threading as T;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var t := T.Task.CompletedTask;\n"
+        "    _ := t;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "CompletedTask");
+    BEZEL_EXPECT_TRUE(endsWith6079(
+        msg,
+        std::string(kLastSurfaceClause6079) +
+            "; note: `Task` here is the always-available builtin type, "
+            "referenced through `T.Task`, where `T` is an import alias for "
+            "module `System.Threading` (\xC2\xA7" "2.7 rule 1)"));
+}
+
+// ── Part 10: another alias name and another missing member — the note names
+//    the alias AS WRITTEN (`Th`), not a fixed spelling ──
+BEZEL_TEST(task_qualified_member_5006,
+           alias_qualified_other_unknown_member_names_written_alias_6079) {
+    const std::string msg = unknownTaskMemberError6079(
+        "module M;\n"
+        "import System.Threading as Th;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var t := Th.Task.Nope;\n"
+        "    _ := t;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "Nope");
+    BEZEL_EXPECT_TRUE(endsWith6079(
+        msg,
+        std::string(kLastSurfaceClause6079) +
+            "; note: `Task` here is the always-available builtin type, "
+            "referenced through `Th.Task`, where `Th` is an import alias for "
+            "module `System.Threading` (\xC2\xA7" "2.7 rule 1)"));
+}
+
+// ── Part 11: fully qualified head under `import System.Threading;` — exact
+//    trailing note (module spelling, §2.7 rule 2), and no alias note ──
+BEZEL_TEST(task_qualified_member_5006,
+           module_qualified_completed_task_exact_qualifier_note_6079) {
+    const std::string msg = unknownTaskMemberError6079(
+        "module M;\n"
+        "import System.Threading;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var t := System.Threading.Task.CompletedTask;\n"
+        "    _ := t;\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n",
+        "CompletedTask");
+    BEZEL_EXPECT_TRUE(endsWith6079(
+        msg,
+        std::string(kLastSurfaceClause6079) +
+            "; note: `Task` here is the always-available builtin type, "
+            "referenced through the module-qualified head "
+            "`System.Threading.Task` (\xC2\xA7" "2.7 rule 2)"));
+    BEZEL_EXPECT_TRUE(msg.find("import alias") == std::string::npos);
+}
+
+// ── Part 12: bare head — rejected, and NO qualifier note: the message ends
+//    at the documented-surface text, with or without an (unused) alias for
+//    the module in the file ──
+BEZEL_TEST(task_qualified_member_5006,
+           bare_completed_task_has_no_qualifier_note_6079) {
+    for (const char* importLine :
+         {"", "import System.Threading;\n", "import System.Threading as T;\n"}) {
+        const std::string msg = unknownTaskMemberError6079(
+            std::string("module M;\n") + importLine +
+                "class C\n"
+                "  public static method Main(): int\n"
+                "    var t := Task.CompletedTask;\n"
+                "    _ := t;\n"
+                "    return 0;\n"
+                "  end Main;\n"
+                "end C;\n",
+            "CompletedTask");
+        BEZEL_EXPECT_TRUE(endsWith6079(msg, kLastSurfaceClause6079));
+        BEZEL_EXPECT_TRUE(msg.find("note:") == std::string::npos);
+    }
+}
+
+// ── Part 13: a USER class named `Task` in a user module, reached through an
+//    alias — not the built-in, so the closed-surface gate (and its note) must
+//    not capture it: the member the user class declares is read (42) ──
+BEZEL_TEST(task_qualified_member_5006,
+           alias_qualified_user_task_is_unaffected_6079) {
+    const std::string libSrc =
+        "module Outer.Inner;\n"
+        "public static class Task\n"
+        "  public static readonly property Answer: int := 42;\n"
+        "end Task;\n";
+    const std::string mainSrc =
+        "module M;\n"
+        "import Outer.Inner as U;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    return U.Task.Answer;\n"
+        "  end Main;\n"
+        "end C;\n";
+    BEZEL_EXPECT_EQ(42, buildAndRunWithLib5006(libSrc, mainSrc));
+}
