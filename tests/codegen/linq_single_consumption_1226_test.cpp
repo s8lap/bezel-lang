@@ -311,46 +311,66 @@ BEZEL_TEST(linq_single_consumption_1226,
 
 // ── #1252: a TERMINAL op consumes a bound lazy too (UAF → IOE) ─────────────
 
-// §29.11 / #1252: a terminal op (Count) consumes the bound lazy; a subsequent
-// for-loop must raise InvalidOperationException (the affine null-guard), not a
-// use-after-free of the exhausted bz_lazy.  n=Count=2, caught=1 → rc=201.
+// §29.11 v0.338 consumption point 1 ("Enumeration or a terminal operator"): a
+// terminal op (Count) spends the bound query's enumeration right; a subsequent
+// for-loop is a second enumeration, a compile error where visible (#6197).
+// FLIP (#6197): was a runtime IOE (rc 201); callee twin below keeps the runtime.
 BEZEL_TEST(linq_single_consumption_1226,
            terminal_then_forin_raises_ioe_1252_spec_29_11) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_TRUE(rejectedWith(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  var q := a.Where(lambda(x) => x > 1); "
         "  var n := q.Count(); "
         "  var caught := 0; "
-        "  try "
-        "    for var x in q do caught := caught + x; end; "
-        "  catch InvalidOperationException => "
-        "    caught := 1; "
-        "  end; "
+        "  for var x in q do caught := caught + x; end; "
         "  return n * 100 + caught; "
-        "end Main; end C;"), 201);
+
+        "end Main; end C;",
+        {"bound lazy query `q` was already consumed", "§29.11"}));
 }
 
-// §29.11 / #1252: a SECOND terminal op on a consumed bound lazy also raises
-// InvalidOperationException (the terminal-materialize null-guard), not a
-// bz_lazy_to_array(null) crash.  n=2, r=1 → rc=201.
+// §29.11 v0.338 consumption point 1: second terminal op on a spent query.
+// FLIP (#6197): was a runtime IOE (rc 201).
 BEZEL_TEST(linq_single_consumption_1226,
            second_terminal_raises_ioe_1252_spec_29_11) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_TRUE(rejectedWith(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); "
         "  var q := a.Where(lambda(x) => x > 1); "
         "  var n := q.Count(); "
-        "  var r := 0; "
-        "  try "
-        "    r := q.Sum(); "
-        "  catch InvalidOperationException => "
-        "    r := 1; "
-        "  end; "
+        "  var r := q.Sum(); "
         "  return n * 100 + r; "
-        "end Main; end C;"), 201);
+
+        "end Main; end C;",
+        {"bound lazy query `q` was already consumed", "§29.11", "terminal operator"}));
+}
+
+// §29.11 v0.338: inside a callee a plain IEnumerable<T> parameter is statically
+// untracked; the runtime IOE guard still fires (n=2, caught=1 -> 201).
+BEZEL_TEST(linq_single_consumption_1226,
+           callee_param_terminal_then_forin_raises_ioe_spec_29_11) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C "
+        "public static method Run(xs: IEnumerable<int>): int "
+        "  var n := xs.Count(); "
+        "  var caught := 0; "
+        "  try "
+        "    for var x in xs do caught := caught + x; end; "
+        "  catch InvalidOperationException => "
+        "    caught := 1; "
+        "  end; "
+        "  return n * 100 + caught; "
+        "end Run; "
+        "public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  Console.WriteLine(C.Run(q)); "
+        "  return 0; "
+        "end Main; end C;"), "201");
 }
 
 // §29.11 / #1252: a single terminal op on a bound lazy is correct (no spurious
@@ -466,5 +486,95 @@ BEZEL_TEST(linq_single_consumption_1226,
         "  var s := 0; "
         "  for var x in merged do s := s + x; end; "  // merged is a fresh lazy, OK
         "  return s; "
+        "end Main; end C;"), false);
+}
+
+// §29.11 v0.338 consumption point 1: each terminal operator as the FIRST
+// consumption spends the right; any later use is a compile error (#6197).
+BEZEL_TEST(linq_single_consumption_1226,
+           terminal_count_then_second_use_rejected_6197_spec_29_11) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var n := q.Count(); "
+        "  var m := q.Count(); "
+        "  return 0; "
+
+        "end Main; end C;",
+        {"bound lazy query `q` was already consumed", "§29.11", "terminal operator"}));
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           terminal_first_then_second_use_rejected_6197_spec_29_11) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var n := q.First(); "
+        "  var m := q.Count(); "
+        "  return 0; "
+
+        "end Main; end C;",
+        {"bound lazy query `q` was already consumed", "§29.11", "terminal operator"}));
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           terminal_toarray_then_second_use_rejected_6197_spec_29_11) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var n := q.ToArray(); "
+        "  var m := q.Count(); "
+        "  return 0; "
+
+        "end Main; end C;",
+        {"bound lazy query `q` was already consumed", "§29.11", "terminal operator"}));
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           terminal_sum_then_second_use_rejected_6197_spec_29_11) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var n := q.Sum(); "
+        "  var m := q.Count(); "
+        "  return 0; "
+
+        "end Main; end C;",
+        {"bound lazy query `q` was already consumed", "§29.11", "terminal operator"}));
+}
+
+// §29.11: a terminal op in one branch then a use after: mirrors the for-in
+// rule (branch consumption is intersected); the conservative cases compile.
+BEZEL_TEST(linq_single_consumption_1226,
+           terminal_in_one_branch_then_use_after_mirrors_forin_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var n := 0; "
+        "  if a.Count > 2 then n := q.Count(); else n := q.Count(); end; "
+        "  return n + q.Count(); "
+        "end Main; end C;"), true);
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           terminal_in_one_arm_only_then_use_after_conservative_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(rejectedByDA(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var n := 0; "
+        "  if a.Count > 2 then n := q.Count(); end; "
+        "  return n + q.Count(); "
         "end Main; end C;"), false);
 }

@@ -2026,6 +2026,27 @@ private:
                     }
                 }
             }
+            // §29.11 point 1 (#6197): a terminal operator (`Count`, `First`,
+            // `ToArray`, `Sum`, …) applied to a bound lazy local spends its
+            // enumeration right. Detect: call result is NOT lazy-enumerable
+            // (a deferred operator is handled above) AND the callee is a member
+            // access whose receiver is a lazy-enumerable identifier.
+            // per §29.11 v0.338
+            if (ctx_.exprType(e) && !isLazyEnumerableExprType(e)) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce->callee.get())) {
+                    if (const auto* rid =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get())) {
+                        if (isLazyEnumerableExprType(*ma->target)) {
+                            checkRead(*rid);
+                            markLazyConsumed(*rid, "terminal operator");
+                            for (const auto& a : ce->args) visitCallArg(a);
+                            return;
+                        }
+                    }
+                }
+            }
             // §7.5 / §22.4 (v0.235, #2345): `recv?.M(args)` — the callee is a
             // NullCondMemberExpr. Give this the same per-path short-circuit
             // treatment evalCond already gives and/or (see
