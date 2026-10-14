@@ -8668,6 +8668,60 @@ private:
                                           const sema::MethodSymbol* iface) {
         if (!iface) return nullptr;
         sema::MethodSymbol* nameOnly = nullptr;
+        // fix #5999 (§22.6 / §11.2, v0.338): among same-name same-arity
+        // overloads the witness is the one whose parameter types equal the
+        // interface method's (an implementation may widen `T` to `T?`), so a
+        // call through the interface reaches the overload sema resolved.
+        // Types that cannot be compared (a generic interface's unsubstituted
+        // `T`) never match here and keep the arity pick below.
+        auto paramTy = [&](const sema::Symbol* p) -> const sema::TypeRef* {
+            auto* ps = dynamic_cast<const sema::ParameterSymbol*>(p);
+            if (!ps) return nullptr;
+            const sema::TypeRef* t = ps->resolvedDeclType;
+            if (!t && ps->declType) t = ctx_.resolvedType(*ps->declType);
+            return t;
+        };
+        auto sigMatches = [&](const sema::MethodSymbol* ms, bool widen) {
+            for (std::size_t i = 0; i < ms->params.size(); ++i) {
+                const sema::TypeRef* ct = paramTy(ms->params[i]);
+                const sema::TypeRef* it = paramTy(iface->params[i]);
+                if (!ct || !it) return false;
+                // A Named type without a declaration is a type parameter or
+                // a built-in (e.g. ArgumentException): compare by head name
+                // (a generic interface's unsubstituted `T` then never matches
+                // a concrete parameter and keeps the arity pick below).
+                if (ct->kind == sema::TypeRef::Kind::Named &&
+                    it->kind == sema::TypeRef::Kind::Named &&
+                    (!ct->declaration || !it->declaration)) {
+                    if (ct->declaration || it->declaration ||
+                        ct->headName() != it->headName() ||
+                        ct->nullable != it->nullable ||
+                        ct->genericArgs.size() != it->genericArgs.size())
+                        return false;
+                    continue;
+                }
+                if (methodSigTypeRefEqual(ct, it)) continue;
+                if (widen && ct->nullable && !it->nullable) {
+                    sema::TypeRef stripped = *ct;
+                    stripped.nullable = false;
+                    if (methodSigTypeRefEqual(&stripped, it)) continue;
+                }
+                return false;
+            }
+            return true;
+        };
+        for (int widen = 0; widen < 2; ++widen) {
+            for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t)) {
+                for (sema::Symbol* m : t->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                    if (!ms || isStaticMethod(ms) || ms->name != iface->name ||
+                        !methodFns_.count(ms) ||
+                        ms->params.size() != iface->params.size())
+                        continue;
+                    if (sigMatches(ms, widen != 0)) return ms;
+                }
+            }
+        }
         for (const sema::TypeSymbol* t = cls; t;) {
             for (sema::Symbol* m : t->members) {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
