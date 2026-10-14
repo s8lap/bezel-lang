@@ -30379,6 +30379,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 TypeRef* ct = ctx_.makeTypeRef();
                 ct->kind = TypeRef::Kind::Named;
                 ct->declaration = cc->parent;
+                // fix #6146 (§35.11, §28.3, v0.338): carry the instantiation's
+                // type arguments from the target (`Opt<int>.No` → [int]), as
+                // the payload CALL path does in typeCall. Without them the
+                // bare-case type is the unsubstituted generic choice, whose
+                // `owned T` payload reads as an owning class-assumption
+                // marker, so `var a := Opt<int>.No; var b := a;` falsely
+                // reports "already moved out".
+                if (const TypeRef* tgt = ma.target ? ctx_.exprType(*ma.target) : nullptr;
+                    tgt && tgt->declaration == cc->parent && !tgt->genericArgs.empty())
+                    ct->genericArgs = tgt->genericArgs;
                 ctx_.setExprType(&ma, ct);
             }
         } else if (auto* ims = dynamic_cast<MethodSymbol*>(member)) {
@@ -30536,6 +30546,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         TypeRef* ct = ctx_.makeTypeRef();
         ct->kind = TypeRef::Kind::Named;
         ct->declaration = targetType;
+        // fix #6146 (§35.11, §28.3, v0.338): the instantiation's type
+        // arguments travel with the bare case too (see the imported arm).
+        if (const TypeRef* tgt = ma.target ? ctx_.exprType(*ma.target) : nullptr;
+            tgt && tgt->declaration == targetType && !tgt->genericArgs.empty())
+            ct->genericArgs = tgt->genericArgs;
         ctx_.setExprType(&ma, ct);
     } else if (auto* ms = dynamic_cast<MethodSymbol*>(member)) {
         // §27.6 (issue #436): a bare `obj.Method` in value position (not the
