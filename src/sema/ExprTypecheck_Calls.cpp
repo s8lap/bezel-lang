@@ -9955,6 +9955,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
                                 ctx_.setExprType(&ce, recvTy->genericArgs[0]);
                         }
+                        // fix #6144 / stdlib §4.1 (Remove(item: T): bool,
+                        // inherited by Set/OwningSet via ICollection<T>),
+                        // §4.4 (Array), §4.5 (OwningArray): the call's result
+                        // type was never set, so `var r := s.Remove(x)` left
+                        // `r` untyped and `r.ToString()` failed to lower
+                        // (#3079). The other families type Remove at their
+                        // own arms (LinkedList L11392, Dictionary, SortedSet).
+                        else if (m == "Remove" && ce.args.size() == 1 &&
+                                 (colName == "Array" || colName == "OwningArray" ||
+                                  colName == "Set" || colName == "OwningSet"))
+                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         // per §3: Contains → bool, IndexOf → int
                         // per §4.10 stdlib: TryAdd(item: T): bool
                         // §4.11/§4.12 (#725): Stack.TryPop/TryPeek,
