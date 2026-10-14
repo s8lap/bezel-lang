@@ -9097,7 +9097,9 @@ private:
                 it->kind == sema::TypeRef::Kind::Named && !ct->declaration &&
                 !it->declaration && ct->headName() != it->headName())
                 return false;
-            return methodSigTypeRefEqual(ct, it);
+            // fix #6228 (§11.2, v0.338): exact, as #6171's witness test —
+            // `Array<string>` is not `Array<int>`'s witness.
+            return methodSigTypeRefEqual(ct, it, true);
         };
         for (int widen = 0; widen < 2; ++widen) {
             for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t)) {
