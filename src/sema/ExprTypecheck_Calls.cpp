@@ -29824,7 +29824,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // Min/Max/Clamp are overloaded (int or double) — valid, but left
                 // untyped here; their result type is refined from the argument in
                 // typeCall (§2.2 polymorphic-return handling).
-                else if (m=="Min"||m=="Max"||m=="Clamp") { /* valid, untyped */ }
+                else if (m=="Min"||m=="Max"||m=="Clamp") {
+                    // per §27.6 / §14.5 (v0.338): `Min`/`Max`/`Clamp` declare
+                    // only generic overloads (stdlib §2.2), so a reference
+                    // with no type-argument list has no candidate: it is
+                    // written `Math.Max<int>`. A callee position is typed by
+                    // typeCall; a list is left to the formation site.
+                    if (&ma != calleeOfCallCtx_ && ma.typeArgs.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            "the method reference `Math." + std::string(m) +
+                                "` is a reference to a generic method and "
+                                "names no type arguments: write `Math." +
+                                std::string(m) + "<T>` with the type argument "
+                                "supplied \xE2\x80\x94 no inference binds it "
+                                "from the target (\xC2\xA7""27.6, \xC2\xA7""14.5, "
+                                "v0.338)");
+                    }
+                    /* otherwise valid, untyped */
+                }
                 else rejectBuiltinStatic();
             }
             // fix #3572 / §2.1 / v0.286: per-class accept-list for Console.

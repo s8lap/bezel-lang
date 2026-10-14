@@ -267,3 +267,19 @@ BEZEL_TEST(sema_generic_method_reference_list_5814,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "a set-erasing position"));
 }
+
+// s27_6_0013 — `Math.Max` has only generic overloads, so a reference without
+// its type-argument list is rejected (it compiled and the binary crashed,
+// rc 139, before the fix).
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           bare_math_max_reference_rejected_not_crashing_27_6) {
+    auto r = runAot(
+        "module Conf; "
+        "public class Program public static method Main() "
+        "  var m: (int, int) -> int := Math.Max; "
+        "  Console.WriteLine(m(3, 5)); "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "`Math.Max` is a reference to a generic method and names no type arguments"));
+}
