@@ -4514,6 +4514,20 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // unqualified (§8.5's recorded asymmetry).
         return lowerStringLiteral(
             std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
+    // fix #5924 (§9.2 / §14.2, v0.338): a record whose own-typed `Equals` is
+    // user-declared is not auto-bearing, yet a `T`-typed receiver bound to it
+    // still reaches the slot for an argument that is not `S` itself (the
+    // second kind, read at `Object?`): "an argument that is a boxed S compares
+    // by it on the box's payload, and any other argument, `null` included,
+    // compares unequal". Reach that through the box's `Equals`, the same
+    // run-time route an auto-bearing record takes for such an argument. The
+    // own-typed (first-kind) argument still declines here, as before.
+    if (isEquals && isRecord && !autoBearing && call.args[0].value) {
+        const sema::TypeRef* at =
+            resolveTypeParamRef(ctx_.exprType(*call.args[0].value));
+        if (!equalsArgIsOwnTypeOrUnresolved(at, ts))
+            return lowerValueSemUniversalEquals(recvTy, recv, call);
+    }
     if ((isGetHashCode || isEquals) && !autoBearing)
         // §9.2: an ineligible body record has no auto equality. Do not
         // synthesize; fall through to ordinary dispatch (which finds the
