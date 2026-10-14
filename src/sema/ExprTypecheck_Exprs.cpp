@@ -13553,17 +13553,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) {
-                    // §28.3 A7 (v0.209, #2080): an expression-`case`/
-                    // `when` ARM RESULT is a marked-transfer admission
-                    // position — announce the exact child node.
-                    const ast::Expr* savedMtSlot = markedArmSlot_;
-                    markedArmSlot_ = arm.exprBody.get();
-                    visitExpr(*arm.exprBody);
-                    markedArmSlot_ = savedMtSlot;
+                {
+                    ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                    if (arm.guard) {
+                        visitExpr(*arm.guard);
+                        guardFacts.seed(*arm.guard);
+                    }
+                    if (arm.exprBody) {
+                        // §28.3 A7 (v0.209, #2080): an expression-`case`/
+                        // `when` ARM RESULT is a marked-transfer admission
+                        // position — announce the exact child node.
+                        const ast::Expr* savedMtSlot = markedArmSlot_;
+                        markedArmSlot_ = arm.exprBody.get();
+                        visitExpr(*arm.exprBody);
+                        markedArmSlot_ = savedMtSlot;
+                    }
+                    for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 }
-                for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 currentScope_ = saveScope;
             } else if (dp && currentScope_ && dp->typeName) {
                 // §19: DestructuringPattern — same logic as in CaseStmt.
@@ -13732,17 +13738,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         bindNestedDestructuringNames(armScope, std::move(nestedWork));
                         Scope* saveScope = currentScope_;
                         currentScope_ = &armScope;
-                        if (arm.guard) visitExpr(*arm.guard);
-                        if (arm.exprBody) {
-                            // §28.3 A7 (v0.209, #2080): arm-result
-                            // marked-transfer admission position.
-                            const ast::Expr* savedMtSlot = markedArmSlot_;
-                            markedArmSlot_ = arm.exprBody.get();
-                            visitExpr(*arm.exprBody);
-                            markedArmSlot_ = savedMtSlot;
+                        {
+                            ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                            if (arm.guard) {
+                                visitExpr(*arm.guard);
+                                guardFacts.seed(*arm.guard);
+                            }
+                            if (arm.exprBody) {
+                                // §28.3 A7 (v0.209, #2080): arm-result
+                                // marked-transfer admission position.
+                                const ast::Expr* savedMtSlot = markedArmSlot_;
+                                markedArmSlot_ = arm.exprBody.get();
+                                visitExpr(*arm.exprBody);
+                                markedArmSlot_ = savedMtSlot;
+                            }
+                            for (const auto& bs : arm.stmts)
+                                if (bs) visitStmt(*bs);
                         }
-                        for (const auto& bs : arm.stmts)
-                            if (bs) visitStmt(*bs);
                         currentScope_ = saveScope;
                         // §7.4 (#2258): this path leaves the arm loop early,
                         // so fold the arm's exit HERE — the loop-tail fold
@@ -14163,17 +14175,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 bindNestedDestructuringNames(armScope, std::move(nestedWork));
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) {
-                    // §28.3 A7 (v0.209, #2080): an expression-`case`/
-                    // `when` ARM RESULT is a marked-transfer admission
-                    // position — announce the exact child node.
-                    const ast::Expr* savedMtSlot = markedArmSlot_;
-                    markedArmSlot_ = arm.exprBody.get();
-                    visitExpr(*arm.exprBody);
-                    markedArmSlot_ = savedMtSlot;
+                {
+                    ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                    if (arm.guard) {
+                        visitExpr(*arm.guard);
+                        guardFacts.seed(*arm.guard);
+                    }
+                    if (arm.exprBody) {
+                        // §28.3 A7 (v0.209, #2080): an expression-`case`/
+                        // `when` ARM RESULT is a marked-transfer admission
+                        // position — announce the exact child node.
+                        const ast::Expr* savedMtSlot = markedArmSlot_;
+                        markedArmSlot_ = arm.exprBody.get();
+                        visitExpr(*arm.exprBody);
+                        markedArmSlot_ = savedMtSlot;
+                    }
+                    for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 }
-                for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 currentScope_ = saveScope;
             } else {
                 // §7.4 (v0.210, #2105): a scrutinee-less `when` arm's
@@ -14215,17 +14233,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                           /*forTrueBranch=*/true);
                     }
                 }
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) {
-                    // §28.3 A7 (v0.209, #2080): an expression-`case`/
-                    // `when` ARM RESULT is a marked-transfer admission
-                    // position — announce the exact child node.
-                    const ast::Expr* savedMtSlot = markedArmSlot_;
-                    markedArmSlot_ = arm.exprBody.get();
-                    visitExpr(*arm.exprBody);
-                    markedArmSlot_ = savedMtSlot;
+                {
+                    ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                    if (arm.guard) {
+                        visitExpr(*arm.guard);
+                        guardFacts.seed(*arm.guard);
+                    }
+                    if (arm.exprBody) {
+                        // §28.3 A7 (v0.209, #2080): an expression-`case`/
+                        // `when` ARM RESULT is a marked-transfer admission
+                        // position — announce the exact child node.
+                        const ast::Expr* savedMtSlot = markedArmSlot_;
+                        markedArmSlot_ = arm.exprBody.get();
+                        visitExpr(*arm.exprBody);
+                        markedArmSlot_ = savedMtSlot;
+                    }
+                    for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 }
-                for (const auto& s : arm.stmts) if (s) visitStmt(*s);
                 intersectNarrowingSetsWith(armEntryNull, armEntryInit,
                                            armEntryNarrow, armEntryField);  // §7.4 #2258
             }

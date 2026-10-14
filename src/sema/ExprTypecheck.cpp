@@ -25787,9 +25787,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
-                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                {
+                    ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                    if (arm.guard) {
+                        visitExpr(*arm.guard);
+                        guardFacts.seed(*arm.guard);
+                    }
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                }
                 currentScope_ = saveScope;
             } else if (dp && currentScope_ && dp->typeName) {
                 // §19: a DestructuringPattern arm introduces a scope with
@@ -25975,10 +25981,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         bindNestedDestructuringNames(armScope, std::move(nestedWork));
                         Scope* saveScope = currentScope_;
                         currentScope_ = &armScope;
-                        if (arm.guard) visitExpr(*arm.guard);
-                        if (arm.exprBody) visitExpr(*arm.exprBody);
-                        for (const auto& bs : arm.stmts)
-                            if (bs) visitStmt(*bs);
+                        {
+                            ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                            if (arm.guard) {
+                                visitExpr(*arm.guard);
+                                guardFacts.seed(*arm.guard);
+                            }
+                            if (arm.exprBody) visitExpr(*arm.exprBody);
+                            for (const auto& bs : arm.stmts)
+                                if (bs) visitStmt(*bs);
+                        }
                         currentScope_ = saveScope;
                         // §7.4 (#2258): this path leaves the arm loop early, so
                         // fold the arm's exit HERE — the loop-tail fold never
@@ -26359,9 +26371,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 bindNestedDestructuringNames(armScope, std::move(nestedWork));
                 Scope* saveScope = currentScope_;
                 currentScope_ = &armScope;
-                if (arm.guard) visitExpr(*arm.guard);
-                if (arm.exprBody) visitExpr(*arm.exprBody);
-                for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                {
+                    ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                    if (arm.guard) {
+                        visitExpr(*arm.guard);
+                        guardFacts.seed(*arm.guard);
+                    }
+                    if (arm.exprBody) visitExpr(*arm.exprBody);
+                    for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                }
                 currentScope_ = saveScope;
             } else {
                 // §7.4 (v0.210, #2105): a scrutinee-less `when` arm's
@@ -26419,9 +26437,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     bodyScope.parent = currentScope_;
                     Scope* const saveScope = currentScope_;
                     currentScope_ = &bodyScope;
-                    if (arm.guard) visitExpr(*arm.guard);
-                    if (arm.exprBody) visitExpr(*arm.exprBody);
-                    for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                    {
+                        ArmGuardFacts guardFacts(*this);  // fix #6082 (§7.4)
+                        if (arm.guard) {
+                            visitExpr(*arm.guard);
+                            guardFacts.seed(*arm.guard);
+                        }
+                        if (arm.exprBody) visitExpr(*arm.exprBody);
+                        for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
+                    }
                     currentScope_ = saveScope;
                 }
                 intersectNarrowingSetsWith(armEntryNull, armEntryInit,

@@ -3047,6 +3047,56 @@ private:
     // symbol. Returns true iff a narrowing was applied.
     bool narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch);
 
+    // fix #6082 (§7.4 *How narrowing is established*, §19.4, v0.338): "a
+    // `when` guard (§19.4, narrowing that arm's body)". One instance per
+    // `case` arm, declared in the block that visits the arm's guard and body:
+    // `seed` runs collectNarrowings over the already-visited guard for its
+    // TRUE branch, and the destructor — at the end of that block, i.e. after
+    // the body — takes the guard's facts back out, so they never reach a later
+    // arm or the code after the construct. The un-seeding is the same
+    // INTERSECTION with the arm-entry snapshot the scrutinee-less `when` arms
+    // use (#2258: a fact the body invalidated stays dropped). One refinement:
+    // a type fact the guard REPLACED (`if o is A then … when o is B`) is put
+    // back to its entry value first, provided the guard's own fact is still in
+    // force, so the enclosing narrowing survives the arm as it did before
+    // guards narrowed anything.
+    struct ArmGuardFacts {
+        ExprTC& tc;
+        bool seeded = false;
+        std::unordered_map<Symbol*, TypeRef*> entryTypes;
+        std::unordered_set<Symbol*> entryNull;
+        std::unordered_set<Symbol*> entryInit;
+        std::set<std::pair<std::uint32_t, std::uint32_t>> entryField;
+        std::vector<std::pair<Symbol*, TypeRef*>> seededTypes;
+        explicit ArmGuardFacts(ExprTC& t) : tc(t) {}
+        ArmGuardFacts(const ArmGuardFacts&) = delete;
+        ArmGuardFacts& operator=(const ArmGuardFacts&) = delete;
+        void seed(const ast::Expr& guard) {
+            entryTypes = tc.narrowings_;
+            entryNull = tc.nullNarrowed_;
+            entryInit = tc.initNarrowed_;
+            entryField = tc.fieldNarrowed_;
+            seeded = true;
+            tc.collectNarrowings(&guard, /*forTrueBranch=*/true);
+            for (const auto& [sym, ty] : tc.narrowings_) {
+                auto e = entryTypes.find(sym);
+                if (e == entryTypes.end() || e->second != ty)
+                    seededTypes.emplace_back(sym, ty);
+            }
+        }
+        ~ArmGuardFacts() {
+            if (!seeded) return;
+            for (const auto& [sym, ty] : seededTypes) {
+                auto cur = tc.narrowings_.find(sym);
+                if (cur == tc.narrowings_.end() || cur->second != ty) continue;
+                auto e = entryTypes.find(sym);
+                if (e != entryTypes.end()) cur->second = e->second;
+            }
+            tc.intersectNarrowingSetsWith(entryNull, entryInit, entryTypes,
+                                          entryField);
+        }
+    };
+
     // §7.4 / §8.4 helper: if `cond` is a `<simple var> <> null` / `= null`
     // test that narrows in the requested branch (`<> null` narrows the true
     // branch, `= null` narrows the else branch — and `is not null` / `is null`
