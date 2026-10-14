@@ -3216,6 +3216,22 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
 }
 
 bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
+    return typeRefEqualImpl(a, b, /*sameScope=*/false);
+}
+
+// #6315 / §11.2, §12.1 (v0.338): `typeRefEqual` with the scope of a CLASS type
+// parameter made visible. A type parameter is a declaration-less Named ref whose
+// only identity is its spelling, so the declaration compare below equates any
+// two of them (`Array<U>` with `Array<V>`). When BOTH refs are read in ONE
+// class's scope, a declaration-less Named pair is the same type exactly when its
+// head spellings agree. Callers must have substituted both sides into that one
+// scope; every other caller keeps the blind `typeRefEqual`.
+bool Resolver::typeRefEqualSameScope(const TypeRef* a, const TypeRef* b) {
+    return typeRefEqualImpl(a, b, /*sameScope=*/true);
+}
+
+bool Resolver::typeRefEqualImpl(const TypeRef* a, const TypeRef* b,
+                                bool sameScope) {
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
     if (a->nullable != b->nullable) return false;
@@ -3228,10 +3244,13 @@ bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
             return a->primitive == b->primitive;
         case TypeRef::Kind::Named: {
             if (a->declaration != b->declaration) return false;
+            if (sameScope && !a->declaration &&
+                a->headName() != b->headName())
+                return false;
             if (a->genericArgs.size() != b->genericArgs.size())
                 return false;
             for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
-                if (!typeRefEqual(a->genericArgs[i], b->genericArgs[i]))
+                if (!typeRefEqualImpl(a->genericArgs[i], b->genericArgs[i], sameScope))
                     return false;
             }
             return true;
@@ -3251,19 +3270,19 @@ bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
             if (a->arraySizeValue >= 0 && b->arraySizeValue >= 0 &&
                 a->arraySizeValue != b->arraySizeValue)
                 return false;
-            return typeRefEqual(a->arrayElement, b->arrayElement);
+            return typeRefEqualImpl(a->arrayElement, b->arrayElement, sameScope);
         case TypeRef::Kind::Function: {
             if (a->funcParams.size() != b->funcParams.size())
                 return false;
             for (std::size_t i = 0; i < a->funcParams.size(); ++i) {
                 if (a->funcParams[i].modifier != b->funcParams[i].modifier)
                     return false;
-                if (!typeRefEqual(a->funcParams[i].type,
-                                  b->funcParams[i].type))
+                if (!typeRefEqualImpl(a->funcParams[i].type,
+                                      b->funcParams[i].type, sameScope))
                     return false;
             }
             return a->funcReturnOwned == b->funcReturnOwned &&
-                   typeRefEqual(a->funcReturn, b->funcReturn);
+                   typeRefEqualImpl(a->funcReturn, b->funcReturn, sameScope);
         }
     }
     return false;
@@ -9908,7 +9927,10 @@ void Resolver::checkAbstractImplementations() {
             if (isub->kind == TypeRef::Kind::Function &&
                 csub->kind == TypeRef::Kind::Function)
                 return declLessArgMatch(isub, csub, nullptr, nullptr);
-            return typesMatch(isub, csub);
+            // #6315 / §11.2: `isub` and `csub` are both in the implementing
+            // class's scope after substitution, so a class type parameter
+            // compares by spelling at any depth (`Box<U>` is not `Box<V>`).
+            return typeRefEqualSameScope(isub, csub);
         };
         // The declared type of `ps` read through `subst` (the impl-side
         // substitution of the class that declares it, or the interface
@@ -10096,7 +10118,10 @@ void Resolver::checkAbstractImplementations() {
                                           classSubstOf(cps));
                         const TypeRef* ity =
                             propTypeUnder(ifaceParamTy(k), obl.subst);
-                        if (!pty || !ity || !typeRefEqual(pty, ity)) {
+                        // #6315 / §11.2: both keys are now in the derived
+                        // class's scope, so a class type parameter is
+                        // compared by spelling, not blindly.
+                        if (!pty || !ity || !typeRefEqualSameScope(pty, ity)) {
                             all = false;
                             break;
                         }

@@ -47,6 +47,11 @@ public:
     // (§22.6 overload resolution) can reuse it via the free-function
     // wrapper `bezel::sema::typeRefEqual` in TypeResolution.hpp.
     static bool typeRefEqual(const TypeRef* a, const TypeRef* b);
+    // #6315: `typeRefEqual` for two refs read in ONE class scope (declaration-
+    // less Named, i.e. a class type parameter, compared by spelling).
+    static bool typeRefEqualSameScope(const TypeRef* a, const TypeRef* b);
+    static bool typeRefEqualImpl(const TypeRef* a, const TypeRef* b,
+                                 bool sameScope);
 
     // §12.1 (v0.181, #1560): does a derived (override) parameter type MATCH
     // a base parameter type — exactly, or via the one admitted widening
