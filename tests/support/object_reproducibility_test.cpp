@@ -145,3 +145,78 @@ BEZEL_TEST(object_reproducibility,
     BEZEL_EXPECT_EQ(b1.size(), b2.size());
     BEZEL_EXPECT_TRUE(b1 == b2);
 }
+
+// CAUSE 2 — the object-emission TargetMachine carried state across emissions.
+// LLVM's ELF object-file lowering records every `llvm.used` global of each
+// module it emits in a set of GlobalObject POINTERS on the TargetMachine that is
+// never cleared. emitObjectFile used to emit through ONE process-wide machine,
+// so a later global that sat at a recorded address was emitted as if it were in
+// `llvm.used` (SHF_GNU_RETAIN, its own section). In the harness that address
+// was a freed global of an earlier, unrelated in-process emission, so which
+// global caught it depended on allocation history.
+//
+// The pin makes the stale pointer DETERMINISTIC instead of allocation-dependent:
+// emit a module whose global `g` is in `llvm.used`, then delete `llvm.used` (the
+// global `g` itself stays alive at the same address) and emit the module again.
+// That second object must equal the object of the same module built without
+// `llvm.used` from the start. Fail-without: the reused machine still lists `g`,
+// so the second object gives `g` a retained unique section and the bytes differ.
+namespace {
+
+std::unique_ptr<llvm::Module> makeRetainProbeModule(llvm::LLVMContext& ctx,
+                                                    bool withUsed) {
+    auto m = std::make_unique<llvm::Module>("retain_probe", ctx);
+    auto* i32 = llvm::Type::getInt32Ty(ctx);
+    auto* g = new llvm::GlobalVariable(
+        *m, i32, /*isConstant=*/true, llvm::GlobalValue::ExternalLinkage,
+        llvm::ConstantInt::get(i32, 7), "repro_probe_global");
+    if (withUsed) {
+        auto* ptrTy = llvm::PointerType::getUnqual(ctx);
+        auto* arrTy = llvm::ArrayType::get(ptrTy, 1);
+        auto* used = new llvm::GlobalVariable(
+            *m, arrTy, /*isConstant=*/false,
+            llvm::GlobalValue::AppendingLinkage,
+            llvm::ConstantArray::get(arrTy, {g}), "llvm.used");
+        used->setSection("llvm.metadata");
+    }
+    return m;
+}
+
+// Emits WITHOUT ASan instrumentation, deliberately and regardless of
+// BEZEL_AOT_FORCE_SANITIZE (#3917): nothing here is ever executed — the claim
+// is about the emitted BYTES — and the AddressSanitizer pass rewrites the
+// module IN PLACE (new globals, its own used-lists), so instrumenting the
+// first emission of `m` below would change the module the second emission
+// sees and the comparison would no longer isolate the machine's state.
+bool emitUninstrumented(llvm::Module& m, const fs::path& path) {
+    std::string err;
+    return bezel::codegen::emitObjectFile(m, path.string(), err,
+                                          /*sanitizeAddress=*/false);
+}
+
+}  // namespace
+
+BEZEL_TEST(object_reproducibility,
+           object_emission_does_not_inherit_a_previous_modules_used_set) {
+    bezel::test::ensureNativeTargetInitialized();
+    const fs::path dir = bezel_test::wtScratchDir("objrepro_tm");
+
+    // Reference: the module never had `llvm.used`.
+    llvm::LLVMContext refCtx;
+    auto ref = makeRetainProbeModule(refCtx, /*withUsed=*/false);
+    BEZEL_EXPECT_TRUE(emitUninstrumented(*ref, dir / "ref.o"));
+
+    // Same module, first emitted WITH `llvm.used`, then without it.
+    llvm::LLVMContext ctx;
+    auto m = makeRetainProbeModule(ctx, /*withUsed=*/true);
+    BEZEL_EXPECT_TRUE(emitUninstrumented(*m, dir / "used.o"));
+    m->getGlobalVariable("llvm.used")->eraseFromParent();
+    BEZEL_EXPECT_TRUE(emitUninstrumented(*m, dir / "after.o"));
+
+    const std::string refBytes = slurpBytes(dir / "ref.o");
+    BEZEL_EXPECT_FALSE(refBytes.empty());
+    BEZEL_EXPECT_TRUE(slurpBytes(dir / "after.o") == refBytes);
+    // Control: `llvm.used` really does change the object, so the comparison
+    // above can see a stale entry.
+    BEZEL_EXPECT_TRUE(slurpBytes(dir / "used.o") != refBytes);
+}

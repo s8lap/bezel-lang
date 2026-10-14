@@ -26,20 +26,26 @@ namespace bezel::codegen {
 // use; null when the host target is unavailable (in which case the module keeps
 // the empty DataLayout and emitObjectFile reports the lookup failure, exactly
 // as before this fix).
+//
+// The CONFIGURATION is the single source of truth (createHostTargetMachine);
+// the shared instance answers layout queries only. Object emission builds a
+// FRESH machine from the same configuration on every call — see emitObjectFile
+// for why a machine must not be reused across emissions.
+static std::unique_ptr<llvm::TargetMachine> createHostTargetMachine() {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
+    std::string err;
+    const llvm::Target* target =
+        llvm::TargetRegistry::lookupTarget(triple.str(), err);
+    if (!target) return std::unique_ptr<llvm::TargetMachine>{};
+    llvm::TargetOptions opts;
+    return std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(
+        triple, "generic", "", opts, llvm::Reloc::PIC_));
+}
+
 static llvm::TargetMachine* hostTargetMachine() {
-    static std::unique_ptr<llvm::TargetMachine> tm = [] {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-        llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
-        std::string err;
-        const llvm::Target* target =
-            llvm::TargetRegistry::lookupTarget(triple.str(), err);
-        if (!target) return std::unique_ptr<llvm::TargetMachine>{};
-        llvm::TargetOptions opts;
-        return std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(triple, "generic", "", opts,
-                                        llvm::Reloc::PIC_));
-    }();
+    static std::unique_ptr<llvm::TargetMachine> tm = createHostTargetMachine();
     return tm.get();
 }
 
@@ -82,13 +88,34 @@ bool emitObjectFile(llvm::Module& module, const std::string& objectPath,
     // lowers `alloca`/GEP with. Re-stamping is idempotent for an Emitter-built
     // module (which stamps itself at construction) and is still required for a
     // module that came from anywhere else.
-    llvm::TargetMachine* tm = hostTargetMachine();
-    if (!tm) {
+    //
+    // OBJECT REPRODUCIBILITY: the machine that EMITS is a fresh one per call,
+    // built from the same configuration as the shared layout machine (so its
+    // DataLayout is the one the emitter measured against; checked below). A
+    // TargetMachine is not stateless across emissions: its ELF object-file
+    // lowering (TargetLoweringObjectFileELF) records every `llvm.used` global
+    // of each module it emits in a set of GlobalObject POINTERS that is never
+    // cleared. Reusing one machine therefore let a later module's global that
+    // happened to be allocated at a freed earlier global's address inherit
+    // SHF_GNU_RETAIN and a unique section — so the same program's object
+    // depended on the process's allocation history (the AOT test harness forks
+    // every compile from a parent that has emitted other objects in-process).
+    // A fresh machine starts with an empty set: the object is a function of
+    // the module alone.
+    if (!hostTargetMachine()) {
         error = "could not create a target machine for the host triple '" +
                 llvm::sys::getDefaultTargetTriple() + "'";
         return false;
     }
     setHostTargetLayout(module);
+    std::unique_ptr<llvm::TargetMachine> tmOwner = createHostTargetMachine();
+    llvm::TargetMachine* tm = tmOwner.get();
+    if (!tm || tm->createDataLayout() != module.getDataLayout()) {
+        error = "could not create an object-emission target machine matching "
+                "the host layout for '" +
+                llvm::sys::getDefaultTargetTriple() + "'";
+        return false;
+    }
 
     // JIT→AOT test-harness migration §2 (memory net): when requested, run LLVM's
     // AddressSanitizerPass over the generated module so the emitted machine code
