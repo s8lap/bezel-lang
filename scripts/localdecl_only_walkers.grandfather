@@ -24,5 +24,4 @@
 1    src/driver/ScopedAwaitBind.cpp
 1    src/ownership/Ownership.cpp
 1    src/ownership/Ownership_Checks.cpp
-1    src/sema/ExprTypecheck_Calls.cpp
 1    src/sema/TypeResolution_Checks.cpp

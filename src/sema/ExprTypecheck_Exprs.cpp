@@ -1592,6 +1592,7 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
                 for (const auto& gp : currentMethodDecl_->genericParams)
                     if (gp.name == pn) owner = currentMethodDecl_;
             if (!owner && currentType_ && currentType_->decl)
+                // SEAM-DEBT: #5821 class-1 read of the enclosing type's own decl; the type whose body is being checked is never imported, and the owner must match genericInstantiationSites_'s TypeDecl identity
                 if (auto* td = dynamic_cast<const ast::TypeDecl*>(
                         currentType_->decl))
                     for (const auto& gp : td->genericParams)
