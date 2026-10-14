@@ -638,8 +638,77 @@ private:
         std::vector<std::unordered_map<Symbol*, TypeRef*>> typeEdges;
         std::vector<std::set<std::pair<std::uint32_t, std::uint32_t>>>
             fieldEdges;
+        // #6114: true for a `continue` edge (a BACK-edge: it reaches the loop
+        // head again), false for a `break`. Parallel to the vectors above.
+        std::vector<bool> isContinue;
     };
     std::vector<LoopEdgeNarrowing> loopEdgeNarrowing_;
+
+    // fix #6114 (§7.4 "Narrowing is flow-sensitive: at each program point the
+    // compiler tracks, per local variable … whether its value is known
+    // non-null"; "How narrowing is invalidated"; §12.7 "Reassignment within
+    // the controlled block invalidates the type narrowing", v0.338): a point
+    // inside a loop is reached from the loop's entry AND from its back-edges,
+    // so a fact carried in from before the loop holds there only if the loop
+    // body does not invalidate it before control comes round again.
+    //
+    // The body is walked once, with the entry facts in force. A frame per
+    // open loop records, for each local, the first place that RELIED on a
+    // fact carried in from before that loop (`…Uses`); when the walk reaches
+    // the loop's end, a relied-on fact that is missing at any back-edge (the
+    // body's end, each `continue`) is reported at the place that relied on
+    // it. A loop that never relies on the fact, or never loses it, is
+    // unaffected — in particular a body that reassigns the local to a
+    // non-nullable value (`best := it`), or re-tests it, keeps compiling.
+    //
+    // "Carried in" versus "established on this iteration" is tracked in the
+    // flow state itself, so every existing save / restore / all-paths join
+    // carries it for free: establishing a fact inside a loop also inserts a
+    // private MARKER symbol (one per frame, local and fact kind; never
+    // returned by any lookup) into `nullNarrowed_`. Fact present + marker
+    // present = established on this iteration on every path here; fact
+    // present + marker absent = (at least on one path) carried in. An
+    // intersection join yields exactly that reading.
+    struct LoopFactUse {
+        SourceLocation loc;
+        TypeRef* type = nullptr;   // the narrowed type relied on (type uses)
+    };
+    struct LoopFactFrame {
+        std::unordered_map<Symbol*, Symbol*> nullMarkers;
+        std::unordered_map<Symbol*, Symbol*> typeMarkers;
+        // First reliance on a carried-in non-null fact that the null-test set
+        // alone must supply / that either set may supply (§7.4 vs the
+        // declaration-initializer knowledge, see `initNarrowed_`).
+        std::unordered_map<Symbol*, LoopFactUse> nullSetUses;
+        std::unordered_map<Symbol*, LoopFactUse> anySetUses;
+        std::unordered_map<Symbol*, LoopFactUse> typeUses;
+    };
+    std::vector<LoopFactFrame> loopFactFrames_;
+    std::vector<std::unique_ptr<LocalSymbol>> loopFactMarkers_;
+    // The expression / statement being visited: where a reliance is reported.
+    SourceLocation factUseLoc_;
+    // The operand of the `is` / `is not` test being visited (not a reliance).
+    const ast::Expr* typeTestOperandNode_ = nullptr;
+    // Does control never reach the end of this loop body? Counts `break` /
+    // `continue` (which `bodyAlwaysExits`, a §21.7 return-on-every-path
+    // predicate, does not).
+    bool loopBodyEndUnreachable(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // A fact for `sym` was just established at this point (null test,
+    // non-nullable assignment or initializer, type test): mark it as
+    // established-on-this-iteration in every open loop.
+    void confirmNullFact(Symbol* sym);
+    void confirmTypeFact(Symbol* sym);
+    // The checker just relied on `sym`'s fact. `nullSetOnly`: only the
+    // null-test set could have supplied it.
+    void noteNullFactUse(Symbol* sym, bool nullSetOnly);
+    void noteTypeFactUse(Symbol* sym, TypeRef* narrowed);
+    void pushLoopFactFrame();
+    // Report every relied-on carried-in fact missing at a back-edge of the
+    // innermost loop, then close its frame. `bodyEndIsBackEdge` is false when
+    // the body always leaves before its end.
+    void popLoopFactFrame(bool bodyEndIsBackEdge,
+                          const LoopEdgeNarrowing& edges);
     // Slice S27: enclosing catch-arm-body depth, for the §31.5 rule
     // that a bare `throw;` / `throw` re-raise is valid only in a catch
     // arm body.
@@ -3331,7 +3400,7 @@ private:
     // checked so an erroneous jump (unknown label, jump outside any loop)
     // snapshots nothing — `loopEdgeNarrowing_` runs parallel to
     // `loopLabelStack_`, whose size equals `loopDepth_`.
-    void recordLoopEdgeNarrowing(int targetOffset);
+    void recordLoopEdgeNarrowing(int targetOffset, bool isContinue = false);
 
     void visitTopDecl(const ast::TopDecl& d);
 

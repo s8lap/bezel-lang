@@ -1774,6 +1774,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // branch's many early returns on a bare-name identifier that is itself
     // a clause expression (e.g. `static requires(myConst)`).
     ClauseStaticGuard clauseStaticGuard(this, e);
+    // #6114: where a reliance on a flow fact is reported (restored on every
+    // return path so a parent's later reliance is reported at the parent).
+    struct FactUseLocGuard {
+        SourceLocation& slot;
+        SourceLocation saved;
+        FactUseLocGuard(SourceLocation& s, SourceLocation now)
+            : slot(s), saved(s) { slot = now; }
+        ~FactUseLocGuard() { slot = saved; }
+    } factUseLocGuard(factUseLoc_, e.span.begin);
     // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`. Handled
     // before visitChildren — the clauses are §21.1 declaration statements
     // typed verbatim by visitStmt's LocalDecl arm inside a child Scope, so
@@ -2517,9 +2526,13 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // `var p: Object := o` observed the callee's store. A chain operand
             // is a different node, so its root still narrows.
             if (auto nt = narrowings_.find(sym); nt != narrowings_.end()) {
-                if (&e != refOutArgTargetNode_)
+                if (&e != refOutArgTargetNode_) {
+                    // #6114: a narrowed READ relies on the fact (a `ref` /
+                    // `out` operand, below, passes the declared location).
+                    if (&e != typeTestOperandNode_)
+                        noteTypeFactUse(sym, nt->second);
                     ctx_.setExprType(&e, nt->second);
-                else
+                } else
                     // narrow #4806: capture the narrowed type NOW — the
                     // call-argument visit erases narrowings_[sym] for this
                     // ref/out operand right after this visit returns (§7.4
@@ -11937,7 +11950,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             intersectNarrowingSetsWith(thenExitNull, thenExitInit,
                                        thenExitNarrowings, thenExitField);
     } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        // #6114: the operand of `is` / `is not` is tested at run time
+        // whatever type it is read at, so reading it does not rely on a
+        // narrowing in force (`while … do if q is B then … end if; q := alt;`).
+        const ast::Expr* const saveTested = typeTestOperandNode_;
+        if (te->op != "as") typeTestOperandNode_ = te->operand.get();
         if (te->operand) visitExpr(*te->operand);
+        typeTestOperandNode_ = saveTested;
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
         if (th->operand) {
             visitExpr(*th->operand);
@@ -12184,6 +12203,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // the `loopLabelStack_` reset).
         auto saveLoopEdges = std::move(loopEdgeNarrowing_);
         loopEdgeNarrowing_.clear();
+        // #6114: likewise the loop fact frames — the body is its own
+        // callable, entered with every non-`const` local fact dropped.
+        auto saveLoopFactFrames = std::move(loopFactFrames_);
+        loopFactFrames_.clear();
         int saveCatch = catchDepth_;
         // per §21.5/§31.2 (v0.182, #1578): a lambda is its own callable, so a
         // `break`/`continue` inside it can only ever target a loop declared
@@ -12682,6 +12705,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         loopDepth_ = saveLoop;
         loopLabelStack_ = std::move(saveLoopLabels);  // §21.5 (v0.201)
         loopEdgeNarrowing_ = std::move(saveLoopEdges);  // §7.4 (#2152)
+        loopFactFrames_ = std::move(saveLoopFactFrames);   // #6114
         catchDepth_ = saveCatch;
         finallyLoopBoundary_ = saveFinallyLoopBoundary;
         finallyDepth_ = saveFinallyDepth;  // per §21.7 (#1589)

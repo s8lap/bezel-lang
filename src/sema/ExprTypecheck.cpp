@@ -5907,6 +5907,7 @@ void ExprTC::checkAssignable(
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(narrowExpr)) {
             if (Symbol* s = ctx_.exprSymbol(*id))
                 if (nullNarrowed_.count(s)) {
+                    noteNullFactUse(s, /*nullSetOnly=*/true);   // #6114
                     if (from->kind == TypeRef::Kind::Primitive) {
                         from = ctx_.primitiveTypeRef(from->primitive,
                                                      /*nullable=*/false);
@@ -8573,6 +8574,7 @@ bool ExprTC::narrowedToBoxedValue(Symbol* sym) {
     if (!sym) return false;
     auto it = narrowings_.find(sym);
     if (it == narrowings_.end() || !it->second) return false;
+    noteTypeFactUse(sym, it->second);   // #6114
     TypeRef* d = declaredTypeOf(sym);
     const bool boxHolding =
         d && ((d->kind == TypeRef::Kind::Primitive &&
@@ -14419,6 +14421,7 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
         narrowed->nullable = false;
     }
     narrowings_[sym] = narrowed;
+    confirmTypeFact(sym);   // #6114
     return true;
 }
 
@@ -14485,10 +14488,23 @@ TypeRef* ExprTC::declaredTypeOf(Symbol* sym) {
 // false to exclude it.
 bool ExprTC::isKnownNonNull(Symbol* sym, bool initNarrow) {
     if (!sym) return false;
-    if (nullNarrowed_.count(sym)) return true;
-    if (initNarrow && initNarrowed_.count(sym)) return true;
-    if (auto it = narrowings_.find(sym); it != narrowings_.end())
-        return it->second && !it->second->nullable;
+    // #6114: each `true` below is a reliance on a flow fact.
+    if (nullNarrowed_.count(sym)) {
+        noteNullFactUse(sym, /*nullSetOnly=*/!initNarrow ||
+                                 !initNarrowed_.count(sym));
+        return true;
+    }
+    if (initNarrow && initNarrowed_.count(sym)) {
+        noteNullFactUse(sym, /*nullSetOnly=*/false);
+        return true;
+    }
+    if (auto it = narrowings_.find(sym); it != narrowings_.end()) {
+        if (it->second && !it->second->nullable) {
+            noteTypeFactUse(sym, it->second);
+            return true;
+        }
+        return false;
+    }
     TypeRef* dt = declaredTypeOf(sym);
     return dt && !dt->nullable;
 }
@@ -15247,6 +15263,7 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType,
     if (valueProvesNonNull(value, valueType)) {
         nullNarrowed_.insert(sym);
         initNarrowed_.insert(sym);
+        confirmNullFact(sym);   // #6114
     } else {
         nullNarrowed_.erase(sym);
         initNarrowed_.erase(sym);
@@ -15334,7 +15351,7 @@ void ExprTC::intersectNarrowingSetsWith(
 // is already in error and the snapshot is harmless either way — and a
 // still-valid enclosing loop's join only ever DROPS facts (intersection), so a
 // stray snapshot cannot manufacture an unsound acceptance.
-void ExprTC::recordLoopEdgeNarrowing(int targetOffset) {
+void ExprTC::recordLoopEdgeNarrowing(int targetOffset, bool isContinue) {
     if (loopEdgeNarrowing_.empty()) return;
     auto idx = static_cast<std::ptrdiff_t>(loopEdgeNarrowing_.size()) - 1
              - static_cast<std::ptrdiff_t>(targetOffset);
@@ -15345,6 +15362,165 @@ void ExprTC::recordLoopEdgeNarrowing(int targetOffset) {
     col.initEdges.push_back(initNarrowed_);
     col.typeEdges.push_back(narrowings_);
     col.fieldEdges.push_back(fieldNarrowed_);
+    col.isContinue.push_back(isContinue);
+}
+
+// fix #6114: see LoopFactFrame in ExprTypecheck_impl.hpp.
+void ExprTC::confirmNullFact(Symbol* sym) {
+    for (auto& f : loopFactFrames_) {
+        Symbol*& m = f.nullMarkers[sym];
+        if (!m) {
+            loopFactMarkers_.push_back(std::make_unique<LocalSymbol>());
+            m = loopFactMarkers_.back().get();
+        }
+        nullNarrowed_.insert(m);
+    }
+}
+
+void ExprTC::confirmTypeFact(Symbol* sym) {
+    for (auto& f : loopFactFrames_) {
+        Symbol*& m = f.typeMarkers[sym];
+        if (!m) {
+            loopFactMarkers_.push_back(std::make_unique<LocalSymbol>());
+            m = loopFactMarkers_.back().get();
+        }
+        nullNarrowed_.insert(m);
+    }
+}
+
+void ExprTC::noteNullFactUse(Symbol* sym, bool nullSetOnly) {
+    for (auto& f : loopFactFrames_) {
+        auto m = f.nullMarkers.find(sym);
+        if (m != f.nullMarkers.end() && nullNarrowed_.count(m->second))
+            continue;   // established on this iteration of that loop
+        auto& uses = nullSetOnly ? f.nullSetUses : f.anySetUses;
+        uses.emplace(sym, LoopFactUse{factUseLoc_, nullptr});
+    }
+}
+
+void ExprTC::noteTypeFactUse(Symbol* sym, TypeRef* narrowed) {
+    for (auto& f : loopFactFrames_) {
+        auto m = f.typeMarkers.find(sym);
+        if (m != f.typeMarkers.end() && nullNarrowed_.count(m->second))
+            continue;
+        f.typeUses.emplace(sym, LoopFactUse{factUseLoc_, narrowed});
+    }
+}
+
+void ExprTC::pushLoopFactFrame() { loopFactFrames_.emplace_back(); }
+
+bool ExprTC::loopBodyEndUnreachable(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& sp : body) {
+        if (!sp) continue;
+        const ast::Stmt& s = *sp;
+        // A jump leaves this statement list whichever loop it targets.
+        if (dynamic_cast<const ast::BreakStmt*>(&s) ||
+            dynamic_cast<const ast::ContinueStmt*>(&s))
+            return true;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            if (!ifs->hasElse) continue;
+            bool all = loopBodyEndUnreachable(ifs->ifBranch.body) &&
+                       loopBodyEndUnreachable(ifs->elseBody);
+            for (const auto& el : ifs->elifBranches)
+                all = all && loopBodyEndUnreachable(el.body);
+            if (all) return true;
+            continue;
+        }
+        if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+            if (loopBodyEndUnreachable(dob->body)) return true;
+            continue;
+        }
+        if (stmtAlwaysExits(s)) return true;
+    }
+    return false;
+}
+
+void ExprTC::popLoopFactFrame(bool bodyEndIsBackEdge,
+                              const LoopEdgeNarrowing& edges) {
+    if (loopFactFrames_.empty()) return;
+    LoopFactFrame frame = std::move(loopFactFrames_.back());
+    loopFactFrames_.pop_back();
+    // Does the fact hold at every back-edge? `inNull` / `inInit` / `inTypes`
+    // answer for one back-edge state.
+    auto everyBackEdge = [&](auto&& holds) {
+        if (bodyEndIsBackEdge &&
+            !holds(nullNarrowed_, initNarrowed_, narrowings_))
+            return false;
+        for (std::size_t i = 0; i < edges.nullEdges.size(); ++i) {
+            if (!edges.isContinue[i]) continue;
+            if (!holds(edges.nullEdges[i], edges.initEdges[i],
+                       edges.typeEdges[i]))
+                return false;
+        }
+        return true;
+    };
+    // Diagnostics are emitted in source order of the reliance so the output
+    // does not depend on the pointer-keyed containers' iteration order
+    // (#2116).
+    std::vector<std::pair<SourceLocation, std::string>> reports;
+    auto nullMessage = [](const Symbol* sym) {
+        return "`" + std::string(sym->name) +
+               "` is nullable here: the knowledge that it is non-null was "
+               "established before the loop, and the loop body invalidates "
+               "it (a reassignment from a nullable value, a `ref`/`out` "
+               "argument, or a call that can reach a closure assigning it) "
+               "before control returns to this point on the next iteration "
+               "\xE2\x80\x94 test `" + std::string(sym->name) +
+               "` inside the loop (\xC2\xA7" "7.4)";
+    };
+    std::unordered_set<Symbol*> reportedNull;
+    for (const auto& [sym, use] : frame.nullSetUses) {
+        Symbol* s = sym;
+        if (everyBackEdge([&](const auto& n, const auto&, const auto&) {
+                return n.count(s) > 0;
+            }))
+            continue;
+        reportedNull.insert(s);
+        reports.emplace_back(use.loc, nullMessage(s));
+    }
+    for (const auto& [sym, use] : frame.anySetUses) {
+        Symbol* s = sym;
+        if (reportedNull.count(s)) continue;
+        if (everyBackEdge([&](const auto& n, const auto& in, const auto&) {
+                return n.count(s) > 0 || in.count(s) > 0;
+            }))
+            continue;
+        reports.emplace_back(use.loc, nullMessage(s));
+    }
+    for (const auto& [sym, use] : frame.typeUses) {
+        Symbol* s = sym;
+        TypeRef* ty = use.type;
+        if (everyBackEdge([&](const auto&, const auto&, const auto& t) {
+                auto it = t.find(s);
+                return it != t.end() &&
+                       (it->second == ty ||
+                        typeArgIdentical(it->second, ty, nullptr));
+            }))
+            continue;
+        reports.emplace_back(
+            use.loc,
+            "`" + std::string(s->name) +
+                "` does not have its narrowed type here: the type narrowing "
+                "was established before the loop, and the loop body "
+                "invalidates it (a reassignment, a `ref`/`out` argument, or a "
+                "call that can reach a closure assigning it) before control "
+                "returns to this point on the next iteration \xE2\x80\x94 "
+                "test `" + std::string(s->name) +
+                "` inside the loop (\xC2\xA7" "12.7, \xC2\xA7" "7.4)");
+    }
+    std::sort(reports.begin(), reports.end(),
+              [](const auto& a, const auto& b) {
+                  if (a.first.line != b.first.line)
+                      return a.first.line < b.first.line;
+                  if (a.first.column != b.first.column)
+                      return a.first.column < b.first.column;
+                  return a.second < b.second;
+              });
+    for (auto& [loc, msg] : reports)
+        ctx_.diagnostics().report(Severity::Error, loc, std::move(msg));
+    for (const auto& [sym, m] : frame.nullMarkers) nullNarrowed_.erase(m);
+    for (const auto& [sym, m] : frame.typeMarkers) nullNarrowed_.erase(m);
 }
 
 // §7.4 / §8.4 (issue #418): a `<simple var> <> null` / `= null` test proves a
@@ -15381,6 +15557,7 @@ bool ExprTC::narrowFromNullTest(const ast::Expr* cond, bool forTrueBranch) {
         !dynamic_cast<ParameterSymbol*>(sym))
         return false;
     nullNarrowed_.insert(sym);
+    confirmNullFact(sym);   // #6114
     return true;
 }
 
@@ -15653,6 +15830,7 @@ bool ExprTC::narrowFromOutPostcond(const ast::Expr* cond, bool forTrueBranch) {
             !dynamic_cast<ParameterSymbol*>(recip))
             continue;
         nullNarrowed_.insert(recip);
+        confirmNullFact(recip);   // #6114
         any = true;
     }
     return any;
@@ -15728,6 +15906,7 @@ bool ExprTC::narrowFromBuiltinShapeA(const ast::CallExpr* ce,
         !dynamic_cast<ParameterSymbol*>(recip))
         return false;
     nullNarrowed_.insert(recip);
+    confirmNullFact(recip);   // #6114
     return true;
 }
 
@@ -20215,6 +20394,7 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
 }
 
 void ExprTC::visitStmt(const ast::Stmt& s) {
+    factUseLoc_ = s.span.begin;   // #6114
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // Initializer evaluates BEFORE the local comes into scope.
         // §5 / issue #184: if the variable has an explicit wider integer
@@ -20786,7 +20966,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // `var a: int? := 3;` narrowed.
                 if (valueProvesNonNull(ld->initializer.get(),
                                        ctx_.exprType(*ld->initializer)))
+                {
                     initNarrowed_.insert(lsym);
+                    confirmNullFact(lsym);   // #6114
+                }
             }
         }
     } else if (auto* localType =
@@ -20975,7 +21158,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // §7.4 / #3298: same predicate as the `var` site above.
                 if (valueProvesNonNull(lc->value.get(),
                                        ctx_.exprType(*lc->value)))
+                {
                     nullNarrowed_.insert(lsym);
+                    confirmNullFact(lsym);   // #6114
+                }
             }
         }
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
@@ -23937,6 +24123,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 intersectFieldFactsWith(fieldExits[i]);
         }
     } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        // #6114: the condition is re-evaluated on every iteration, so the
+        // frame opens before it.
+        pushLoopFactFrame();
         if (ws->condition) {
             visitExpr(*ws->condition);
             checkConditionIsBool(*ws->condition, "while");
@@ -23980,6 +24169,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             for (const auto& bs : ws->body) if (bs) visitStmt(*bs);
             currentScope_ = saveScope;
         }
+        popLoopFactFrame(!loopBodyEndUnreachable(ws->body),
+                         loopEdgeNarrowing_.back());   // #6114
         intersectNarrowingSetsAfterLoop(whileEntryNull, whileEntryInit,
                                         whileEntryNarrowings,
                                         whileEntryField,
@@ -24226,7 +24417,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto forEntryNarrowings = narrowings_;
         auto forEntryField = fieldNarrowed_;  // §7.4 #2116
         loopEdgeNarrowing_.emplace_back();
+        pushLoopFactFrame();   // #6114
         for (const auto& bs : fs->body) if (bs) visitStmt(*bs);
+        popLoopFactFrame(!loopBodyEndUnreachable(fs->body),
+                         loopEdgeNarrowing_.back());   // #6114
         intersectNarrowingSetsAfterLoop(forEntryNull, forEntryInit,
                                         forEntryNarrowings,
                                         forEntryField,
@@ -24262,7 +24456,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // §7.4 (#2152): a `continue` jumps to the cond re-check, which on
             // cond-false exits the loop, so its state is also a possible
             // after-loop state — snapshot it into the target loop's collector.
-            recordLoopEdgeNarrowing(cont->targetLoopOffset);
+            recordLoopEdgeNarrowing(cont->targetLoopOffset,
+                                    /*isContinue=*/true);
         }
     } else if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         // per §21.6 (#1242): a do…end block introduces a lexical scope;

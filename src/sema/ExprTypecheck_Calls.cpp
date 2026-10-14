@@ -15703,7 +15703,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (auto* id =
                                     dynamic_cast<const ast::IdentifierExpr*>(e))
                                 if (Symbol* s = ctx_.exprSymbol(*id))
-                                    return nullNarrowed_.count(s) > 0;
+                                    if (nullNarrowed_.count(s) > 0) {
+                                        noteNullFactUse(   // #6114
+                                            s, /*nullSetOnly=*/true);
+                                        return true;
+                                    }
                             return false;
                         };
                         if (auto* sTy = ctx_.exprType(*ce.args[0].value))
