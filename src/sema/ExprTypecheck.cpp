@@ -7606,7 +7606,41 @@ void ExprTC::checkAssignable(
                 return;
             }
         }
+        // fix #6118 (§5.1 "Reference conversions", §31.4, v0.338): USER class
+        // → built-in exception. Only the target lacks a TypeSymbol here, so
+        // neither the declaration-keyed check far above nor the built-in pair
+        // just above saw it, and `var a: ArgumentException := my` with
+        // `MyEx: IOException` reached the catch-all accept. §5.1 converts a
+        // class only "to base class, transitively": the target must be on the
+        // source's ancestor chain (`namedAncestorChain` continues a user
+        // class's chain into the built-in hierarchy through
+        // `builtinExceptionBaseOf`). A class with no exception base at all
+        // converts to none of them.
+        if (from->kind == TypeRef::Kind::Named && from->declaration &&
+            from->declaration->kind == ast::TypeDeclKind::Class &&
+            !fromIsTypeVar &&
+            to->kind == TypeRef::Kind::Named && !to->declaration &&
+            to->genericArgs.empty() && !toIsTypeVar &&
+            common::isBuiltinExceptionName(to->headName()) &&
+            !hasNamedAncestor(from, to->headName())) {
+            const std::string f(from->declaration->name), t(to->headName());
+            reportNotConvertible(
+                "the built-in exception type `" + t + "` is not a base of `" +
+                f + "` (§31.4), and a class converts implicitly only "
+                "to a base class, an interface it implements, or `Object`");
+            return;
+        }
         // Repro A: built-in class → user class.
+        // pending #6083 (#6118): …unless a test of the carrier against the
+        // target or a class derived from it is on record — the same two
+        // shapes, on the same terms, as for a built-in exception target
+        // (see ExprTypecheck_impl.hpp).
+        if (fromBuiltinClass && toUserClass &&
+            !hasNamedAncestor(from, to->declaration->name) &&
+            pendingTypeFactAdmits(fromExpr, to)) {
+            if (from->nullable && !to->nullable) reportNullable();
+            return;
+        }
         if (fromBuiltinClass && toUserClass &&
             !hasNamedAncestor(from, to->declaration->name)) {
             const std::string toN(to->declaration->name);
