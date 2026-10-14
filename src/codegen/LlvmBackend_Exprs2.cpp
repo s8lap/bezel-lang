@@ -11731,6 +11731,75 @@ llvm::Value* Emitter::buildRecordValue(
         auto idxIt = fieldIndex_.find(m);
         if (idxIt == fieldIndex_.end()) continue;
         if (init) {
+            // fix #4096/#4507 (§15.4 "a field declaration's initializer", §9.2,
+            // v0.338): an INLINE-ARRAY body field / auto-property whose
+            // initializer is a collection literal `[e1, e2, …]` is built IN
+            // PLACE (GEP into the field slot, store each element) — a
+            // CollectionLiteralExpr is not a general expression value, so the
+            // `lowerExpr` below returns null for it and the #1386 backstop
+            // fired on a legal program. Same shape as the positional-argument
+            // arm further down (#1129) and the class-side `emitOwnFieldInit`
+            // inline-array arm. The slot is already zero (§7.9), so an empty
+            // literal needs no store; a literal shorter than the array leaves
+            // the tail at its zero default.
+            if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(init);
+                cl && !cl->isDict) {
+                llvm::Type* fty0 = st->getElementType(idxIt->second);
+                auto* aty = llvm::dyn_cast<llvm::ArrayType>(fty0);
+                const sema::TypeRef* fRt =
+                    aty ? recordMemberTypeResolved(m) : nullptr;
+                const sema::TypeRef* elemSemaTy =
+                    (fRt && fRt->kind == sema::TypeRef::Kind::InlineArray)
+                        ? fRt->arrayElement
+                        : nullptr;
+                // DECLINE (fall through to the pre-fix behaviour, the #1386
+                // backstop) rather than risk UB: (a) a literal whose length is
+                // not EXACTLY the array's — sema has no length check for a
+                // field initializer (a local gets §15.4's "has N element(s) but
+                // the type requires exactly M" error), so an over-long literal
+                // would write past the slot; (b) a NULLABLE-VALUE element type
+                // (`[2]int?`, `[2]Pt?`), whose slot is `{hasValue, T}` and
+                // needs wrapping this arm does not do (the class-side field
+                // path has the same pre-existing wrong values, filed
+                // separately). Nothing is stored before these checks.
+                if (aty && elemSemaTy && !isNullableValueTy(elemSemaTy) &&
+                    cl->elements.size() == aty->getNumElements()) {
+                    llvm::Type* elemTy = aty->getElementType();
+                    llvm::Value* fieldGep =
+                        builder_.CreateStructGEP(st, slot, idxIt->second);
+                    for (std::size_t k = 0; k < cl->elements.size(); ++k) {
+                        if (!cl->elements[k]) continue;
+                        llvm::Value* ev = lowerExpr(*cl->elements[k]);
+                        if (!ev)
+                            ev = lowerCollectionLiteralElementOrUnitNull(
+                                *cl->elements[k], elemTy);
+                        if (!ev) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, cl->elements[k]->span.begin,
+                                "internal: lowerExpr returned null for record "
+                                "field/property inline-array initializer "
+                                "element — #1386");
+                            continue;
+                        }
+                        ev = boxForTarget(ev, elemSemaTy, cl->elements[k].get());
+                        if (ev->getType() != elemTy &&
+                            ev->getType()->isIntegerTy() &&
+                            elemTy->isIntegerTy()) {
+                            unsigned eb = ev->getType()->getIntegerBitWidth();
+                            unsigned db = elemTy->getIntegerBitWidth();
+                            ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                                         : builder_.CreateTrunc(ev, elemTy);
+                        }
+                        builder_.CreateStore(
+                            ev, builder_.CreateGEP(
+                                    fty0, fieldGep,
+                                    {builder_.getInt32(0),
+                                     builder_.getInt32(
+                                         static_cast<unsigned>(k))}));
+                    }
+                    continue;
+                }
+            }
             llvm::Value* v = lowerExpr(*init);
             if (!v) {
                 // #1386: ICE — lowerExpr returned null for a record field/
