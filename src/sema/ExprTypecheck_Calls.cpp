@@ -1274,6 +1274,26 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
         bool regraded = false;
         std::vector<std::vector<ArgMatch>> g2 = grid;
         for (std::size_t i = 0; i < nArg && i < argExprs.size(); ++i) {
+            // fix #6002 (§22.6 / §7.4, v0.338): a §7.4-narrowed read of a
+            // nullable binding is non-null where it is read, so it reaches a
+            // non-nullable parameter its declared type does not (`L(n)` at
+            // `n: Animal?` beside `L(Animal)` / `L(string)`). It is graded
+            // as a CONVERSION even to its own non-null type: whether such a
+            // read is that parameter's exact match is the open question
+            // filed with this fix, and a conversion is the grade that can
+            // only reject (ambiguity), never silently prefer.
+            if (argTypes[i] && argTypes[i]->nullable &&
+                isNarrowedNonNullRead(argExprs[i])) {
+                TypeRef* nn = ctx_.makeTypeRef();
+                *nn = *argTypes[i];
+                nn->nullable = false;
+                regraded = true;
+                for (std::size_t c = 0; c < nCand; ++c)
+                    if (classifyArg(nn, paramTypes[c][i]) !=
+                        ArgMatch::NotApplicable)
+                        g2[c][i] = ArgMatch::Convert;
+                continue;
+            }
             if (!dynamic_cast<const ast::NullLiteralExpr*>(argExprs[i]))
                 continue;
             regraded = true;
