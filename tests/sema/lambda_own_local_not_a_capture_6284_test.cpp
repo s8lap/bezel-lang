@@ -249,7 +249,10 @@ BEZEL_TEST(lambda_own_local_not_a_capture_6284,
 // ---- extern callback (§32.8 / #4671) -----------------------------------------
 
 BEZEL_TEST(lambda_own_local_not_a_capture_6284,
-           extern_callback_own_local_plain_accepted_spec_32_8) {
+           extern_callback_own_local_plain_unchanged_pending_6287_spec_32_8) {
+    // Base (7f79b510) REJECTS this with the extern capture-free text. Kept
+    // until #6287 (extern callback invocation segfaults): the own-local
+    // exclusion is not applied to a plain extern callback.
     auto r = runAot(
         "module Conf; "
         "extern \"libc\" method qsort(basePtr: IntPtr, nmemb: UIntPtr, "
@@ -261,12 +264,15 @@ BEZEL_TEST(lambda_own_local_not_a_capture_6284,
         "  end S; "
         "  public static method Main(): int return 0; end Main; "
         "end IntSorter;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_FALSE(rejectedBy(r, kExternNeedle));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedBy(r, kExternNeedle));
+    BEZEL_EXPECT_TRUE(rejectedBy(r, "(§32.8)"));
 }
 
 BEZEL_TEST(lambda_own_local_not_a_capture_6284,
-           extern_callback_own_local_interpolated_accepted_spec_32_8) {
+           extern_callback_own_local_interpolated_unchanged_pending_6287_spec_32_8) {
+    // Base ACCEPTED this (interpolations were not walked). Kept so the
+    // extern interpolation does not start rejecting own locals.
     auto r = runAot(
         "module Conf; "
         "extern \"libc\" method qsort(basePtr: IntPtr, nmemb: UIntPtr, "

@@ -7633,7 +7633,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // argument's symbol / lambda captures — guaranteed
                 // populated because `visitChildren` runs before
                 // `typeCall`.
-                if (isCaptureFreeEntry(a.value.get())) continue;
+                // per §32.8 / #6284: own-local exclusion deliberately not
+                // applied at plain extern callbacks until #6287 (extern
+                // callback invocation segfaults); keeps base behaviour.
+                if (isCaptureFreeEntry(a.value.get(),
+                                       /*ownLocalExclusion=*/false)) continue;
                 ctx_.diagnostics().report(
                     Severity::Error, a.value->span.begin,
                     "callback argument at a plain (un-`env`-paired) "
@@ -31740,7 +31744,8 @@ bool ExprTC::isSendable(const TypeRef* rt,
 //       any local or parameter from the enclosing scope).
 // ===========================================================================
 
-bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) {
+bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr,
+                                bool ownLocalExclusion) {
     if (!entryExpr) return false;
 
     // (a) Static method reference, qualified: MemberAccessExpr whose target
@@ -31789,6 +31794,7 @@ bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) {
         // body is not a capture; the entry's source range decides that.
         scope.entryBegin = lam->span.begin.offset;
         scope.entryEnd = lam->span.end.offset;
+        scope.ownLocalExclusion = ownLocalExclusion;
         return !lambdaBodyCaptures(lam, scope);
     }
 
@@ -31821,8 +31827,9 @@ bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
         // per §30.14 (#6284): declared inside the entry lambda's body (a
         // LocalDecl, a loop or catch variable, a pattern binding): not a
         // capture. The declaring node's file offset decides it.
-        if (const ast::Node* d = sym->decl) {
-            if (d->span.begin.line != 0 &&
+        if (scope.ownLocalExclusion) {
+            const ast::Node* d = sym->decl;
+            if (d && d->span.begin.line != 0 &&
                 d->span.begin.offset >= scope.entryBegin &&
                 d->span.begin.offset < scope.entryEnd)
                 return false;
@@ -31857,8 +31864,13 @@ bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
     } else if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
         // per §30.14: a capture written only inside `$"..."` (e.g. `$"c={n}"`)
         // is a capture of the Spawn entry lambda, exactly like a bare `n`.
+        // per §32.8 / #6284: at the plain extern caller the exclusion is off
+        // for plain uses, but inside an interpolation it stays on, matching
+        // base, which accepted an own local there.
+        CaptureScope inner = scope;
+        inner.ownLocalExclusion = true;
         for (const auto& part : is->parts)
-            if (part.expr && exprCaptures(*part.expr, scope)) return true;
+            if (part.expr && exprCaptures(*part.expr, inner)) return true;
     } else if (auto* innerLam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         // A nested lambda: it has its OWN params; captures from its perspective
         // may or may not propagate. For Domain.Spawn capture check, a nested

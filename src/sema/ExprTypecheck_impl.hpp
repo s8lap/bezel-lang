@@ -4574,7 +4574,12 @@ private:
     // capture-free: a static-method-reference (MemberAccessExpr whose
     // target is a TypeSymbol) or a non-capturing lambda (a LambdaExpr
     // whose body references no locals from the enclosing scope).
-    bool isCaptureFreeEntry(const ast::Expr* entryExpr);
+    // `ownLocalExclusion` (#6284): when false, a local declared inside the
+    // lambda body is still a capture outside an interpolation (see
+    // CaptureScope::ownLocalExclusion). Only the plain extern callback caller
+    // passes false.
+    bool isCaptureFreeEntry(const ast::Expr* entryExpr,
+                            bool ownLocalExclusion = true);
 
     // §30.14 (#6284): the capture walk's scope. `params` holds the symbols
     // the walk treats as declared inside the entry lambda (its own params,
@@ -4587,6 +4592,12 @@ private:
         std::unordered_set<const Symbol*> params;
         std::uint32_t entryBegin = 0;
         std::uint32_t entryEnd = 0;
+        // per §32.8 / #6284: false at the plain extern callback caller, where
+        // a plain own-local use stays a capture as on base until #6287 (extern
+        // callback invocation segfaults). Interpolated expressions always
+        // apply the exclusion there (base never walked them, so an own local
+        // inside `$"..."` was accepted); see the InterpolatedStringExpr arm.
+        bool ownLocalExclusion = true;
     };
 
     // Helper: does the lambda body (recursively) reference any identifier
