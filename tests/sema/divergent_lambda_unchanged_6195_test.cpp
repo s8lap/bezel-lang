@@ -193,3 +193,49 @@ BEZEL_TEST(divergent_lambda_unchanged_6195,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(
         r, ":7:51: no member `Length` on primitive type `int`"));
 }
+
+// REJECT (origin/main: rejected at compile time; staging wrongly accepted.) A
+// throws-only block lambda bound to a variable and assigned to a `() -> ()`
+// target is rejected on origin/main; the open #6195 question is its
+// classification, so this row pins origin's rejection, not a settled §27.3 reading.
+BEZEL_TEST(divergent_lambda_unchanged_6195,
+           throws_only_lambda_var_to_unit_fn_type_rejected_pending_6195) {
+    auto r = runAot(
+        "module T;\n"
+        "public static class Program\n"
+        "  public static method Main(args: Array<string>): int\n"
+        "    var h := lambda() => do throw new Exception(\"x\"); end;\n"
+        "    var g: () -> () := h;\n"
+        "    return 0;\n"
+        "  end;\n"
+        "end;\n");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, ":5:24: the initializer for `g` has a type that is not implicitly "
+           "convertible to the target type"));
+}
+
+// ACCEPT + RUN (origin/main: overload resolution picks the `() -> int` overload
+// for a throws-only lambda; staging printed `unit`.) The callback is never
+// invoked, so the throw does not run.
+BEZEL_TEST(divergent_lambda_unchanged_6195,
+           throws_only_lambda_overload_picks_value_fn_param_unchanged_pending_6195) {
+    auto r = runAot(
+        "module T;\n"
+        "public static class Program\n"
+        "  public static method Over(f: () -> int): int\n"
+        "    Console.WriteLine(\"int\");\n"
+        "    return 0;\n"
+        "  end;\n"
+        "  public static method Over(f: () -> ())\n"
+        "    Console.WriteLine(\"unit\");\n"
+        "  end;\n"
+        "  public static method Main(args: Array<string>): int\n"
+        "    Over(lambda() => do throw new Exception(\"x\"); end);\n"
+        "    return 0;\n"
+        "  end;\n"
+        "end;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "int\n");
+}
