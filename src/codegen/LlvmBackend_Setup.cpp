@@ -42196,6 +42196,11 @@ void Emitter::collectCellFreeEligible(
 // is lowered, so all isUserMethodBoxReturnCall queries during per-body
 // collectBoxReleaseEligible see a fully-populated set.
 void Emitter::collectBoxReturnMethods() {
+    // fix #6320 (§8.6 / §9.4, v0.338): the bare `this` keyword expression.
+    static auto isThisIdent = [](const ast::Expr& e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+        return id && id->name == "this";
+    };
     // Recursive statement scanner: sets `allBox` to false if any ReturnStmt
     // returns a non-boxable value, and sets `hasReturn` to true when any
     // ReturnStmt with a value is found.
@@ -42204,6 +42209,9 @@ void Emitter::collectBoxReturnMethods() {
         Emitter& em;
         bool allBox = true;
         bool hasReturn = false;
+        // fix #6320 (§8.6 / §9.4, v0.338): a record/choice `this` is boxed
+        // at the return (boxForTarget), though sema leaves it untyped.
+        bool valueThis = false;
 
         void scanStmts(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
             for (auto& s : stmts) scanStmt(s.get());
@@ -42214,6 +42222,8 @@ void Emitter::collectBoxReturnMethods() {
                 if (rs->value) {
                     hasReturn = true;
                     const sema::TypeRef* srcTy = ctx.exprType(*rs->value);
+                    if (!srcTy && valueThis && isThisIdent(*rs->value))
+                        return;
                     if (!srcTy ||
                         (!em.isBoxableValueType(srcTy) &&
                          !em.isNullableValueTy(srcTy))) {
@@ -42252,14 +42262,23 @@ void Emitter::collectBoxReturnMethods() {
         if (!md || !md->returnType) continue;
         const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
         if (!rt || !isObjectOrInterfaceTarget(rt)) continue;
+        // fix #6320: an instance method of a record or choice, whose `this`
+        // is a value boxed at the return.
+        const bool valueThis =
+            !isStaticMethod(sym) && sym->parent &&
+            (sym->parent->kind == ast::TypeDeclKind::Record ||
+             sym->parent->kind == ast::TypeDeclKind::Choice);
 
         if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
             // Arrow body: the body expression itself is the returned value.
             const sema::TypeRef* srcTy = ctx_.exprType(*md->exprBody);
             if (srcTy && (isBoxableValueType(srcTy) || isNullableValueTy(srcTy)))
                 boxReturnMethods_.insert(sym);
+            else if (!srcTy && valueThis && isThisIdent(*md->exprBody))
+                boxReturnMethods_.insert(sym);
         } else if (md->bodyKind == ast::MethodBodyKind::Block && !md->stmts.empty()) {
             Scanner sc{ctx_, *this};
+            sc.valueThis = valueThis;
             sc.scanStmts(md->stmts);
             if (sc.allBox && sc.hasReturn)
                 boxReturnMethods_.insert(sym);

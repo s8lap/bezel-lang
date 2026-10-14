@@ -4523,7 +4523,7 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     // field retain/release on a class-instance store) is unreachable and
     // retired with it (#1735).
     if (!we.source) return nullptr;
-    llvm::Value* src = lowerExpr(*we.source);
+    llvm::Value* src = lowerThisAddrOr(*we.source);
     if (!src) return nullptr;
     auto* rt = ctx_.exprType(*we.source);
     const sema::TypeSymbol* t = nullptr;

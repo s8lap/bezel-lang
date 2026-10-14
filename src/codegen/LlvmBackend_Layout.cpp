@@ -2649,7 +2649,30 @@ const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
     if (currentCtorParentRecord_ &&
         currentCtorParentRecord_->kind == ast::TypeDeclKind::Record)
         return currentCtorParentRecord_;
+    // fix #6320 (§9.4 / §35.1, v0.338): inside a LAMBDA body `currentFn_` is
+    // the lambda's own function, and a captured `this` is restored from the
+    // env as the receiver pointer. Recover its lexical enclosing type (#5226).
+    // Non-generic only: the receiver's substitution is not active in the
+    // lambda body, so a generic layout could not be recomputed here.
+    if (currentFn_) {
+        auto lit = lambdaFnEnclosingType_.find(currentFn_);
+        if (lit != lambdaFnEnclosingType_.end() && lit->second &&
+            lit->second->genericParams.empty() &&
+            (lit->second->kind == ast::TypeDeclKind::Record ||
+             lit->second->kind == ast::TypeDeclKind::Choice))
+            return lit->second;
+    }
     return nullptr;
+}
+
+
+// fix #6320 (§9.4, v0.338): an address position over `this` (a member-access
+// target, a method-call receiver, a `with` source) keeps the receiver ADDRESS
+// (CG29); every other expression lowers as a value.
+llvm::Value* Emitter::lowerThisAddrOr(const ast::Expr& e) {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        if (id->name == "this" || id->name == "base") return currentThis_;
+    return lowerExpr(e);
 }
 
 
@@ -4348,6 +4371,37 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
         declTy = concreteTarget;
     }
     const sema::TypeRef* srcTy = ctx_.exprType(*init);
+    // fix #6320 (§8.6 / §9.4 / §35.1, v0.338): sema leaves a record/choice
+    // `this` untyped (see lowerWith), so its source type is the receiver's
+    // own. `v` is the loaded receiver value (lowerExpr), boxed like any other
+    // record or choice value. A generic receiver takes its type arguments from
+    // the active substitution; with any one unbound, nothing is boxed.
+    sema::TypeRef thisSrcTy;
+    if (!srcTy) {
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(init);
+        const sema::TypeSymbol* rec =
+            tid && (tid->name == "this" || tid->name == "base")
+                ? currentReceiverRecordType()
+                : nullptr;
+        bool bound = rec && v && !v->getType()->isPointerTy();
+        if (bound) {
+            for (const sema::Symbol* gp : rec->genericParams) {
+                auto it = gp ? genericSubstSemaTy_.find(gp->name)
+                             : genericSubstSemaTy_.end();
+                if (it == genericSubstSemaTy_.end() || !it->second) {
+                    bound = false;
+                    break;
+                }
+                thisSrcTy.genericArgs.push_back(
+                    const_cast<sema::TypeRef*>(it->second));
+            }
+        }
+        if (bound) {
+            thisSrcTy.kind = sema::TypeRef::Kind::Named;
+            thisSrcTy.declaration = const_cast<sema::TypeSymbol*>(rec);
+            srcTy = &thisSrcTy;
+        }
+    }
     if (!srcTy) return v;
     // fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): the unit
     // source is the one boxable kind with NO lowered value — `()` lowers to
@@ -9128,7 +9182,7 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         } else {
             base = lvalueAddr(*ma.target, baseTy);
             if (!base) {
-                llvm::Value* obj = lowerExpr(*ma.target);
+                llvm::Value* obj = lowerThisAddrOr(*ma.target);
                 if (!obj) return nullptr;
                 if (obj->getType()->isPointerTy()) {
                     base = obj;
@@ -9147,7 +9201,7 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         elemTy = st->getElementType(idxIt->second);
         return builder_.CreateStructGEP(st, base, idxIt->second);
     }
-    llvm::Value* obj = lowerExpr(*ma.target);
+    llvm::Value* obj = lowerThisAddrOr(*ma.target);
     if (!obj) return nullptr;
     // issue #486 / §14.2: guard against emitting a StructGEP from a
     // non-pointer receiver.  This arises when the unspecialized body of a

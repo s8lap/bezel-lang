@@ -7579,7 +7579,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
         }
         // CG9: `this` (and `base`, same instance) is the receiver ptr.
-        if (id->name == "this" || id->name == "base") return currentThis_;
+        // fix #6320 (§9.4 / §35.1, v0.338): a record or choice `this` is a
+        // VALUE, but CG29 keeps it as the ADDRESS of the receiver. Reading it
+        // as an expression yields the value, exactly as a record local does;
+        // the address-needing positions (member access, a method call on
+        // `this`, `this with`) reach `currentThis_` via `lowerThisAddrOr`.
+        if (id->name == "this" || id->name == "base")
+            return loadThisValueIfRecv(currentThis_);
         // CG33b: a bare computed-property read evaluates its getter
         // against the current `this`.
         if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e))) {

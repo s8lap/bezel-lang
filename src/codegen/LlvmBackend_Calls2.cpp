@@ -12665,7 +12665,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (tid->name == "this" || tid->name == "base")
                     thisReceiver = currentThis_ != nullptr;
             }
-            recv = ma->target ? lowerExpr(*ma->target) : nullptr;
+            recv = ma->target ? lowerThisAddrOr(*ma->target) : nullptr;
         } else {
             recv = currentThis_;
             thisReceiver = currentThis_ != nullptr;

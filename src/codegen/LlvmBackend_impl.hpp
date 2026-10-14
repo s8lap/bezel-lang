@@ -8027,6 +8027,7 @@ private:
     // receivers, and any nullable-tagged / unrelated struct destination).
     llvm::Value* coerceThisRecordValue(llvm::Value* v, llvm::Type* expectedTy);
     llvm::Value* loadThisValueIfRecv(llvm::Value* v);
+    llvm::Value* lowerThisAddrOr(const ast::Expr& e);
 
     // §9.1 / §9.2: a record's instance storage members in declaration order —
     // non-static FieldSymbols (positional + explicit body fields) and
