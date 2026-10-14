@@ -105,6 +105,11 @@ public:
     // neither includes a runtime header nor reads the archive.
     static std::string runtimeLibraryPath();
 
+    // The linker the link recipe selects with `-fuse-ld=` ("" = clang's
+    // default), fixed at configure time. Part of linkRecipeSignature, so a
+    // cache keyed on the recipe separates products of different linkers.
+    static std::string programLinker();
+
     // Every auto-imported stdlib prelude source, concatenated (NUL-separated) —
     // the text injected into every compilation unit. A codegen INPUT, so a cache
     // over emitted objects must key on it; see Driver.cpp for why this is

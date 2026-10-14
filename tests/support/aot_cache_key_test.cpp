@@ -473,6 +473,32 @@ BEZEL_TEST(aot_cache_key, link_recipe_signature_is_path_independent_but_flag_exa
                              rt.empty() ? std::string() : std::string("<RUNTIME>")));
 }
 
+// The configured program linker (CMake BEZEL_PROGRAM_LINKER) changes the linked
+// bytes, so it must reach the K2 key through the recipe: both the plain and the
+// ASan signature spell `-fuse-ld=<linker>` when one is configured, and spell no
+// `-fuse-ld` at all when the compiler's default linker is used. Either way a
+// product linked by one linker can never be served for a recipe naming another.
+BEZEL_TEST(aot_cache_key, link_recipe_names_the_configured_program_linker) {
+    const std::string linker = Driver::programLinker();
+    for (bool asan : {false, true}) {
+        const std::string sig = Driver::linkRecipeSignature(asan);
+        if (linker.empty()) {
+            BEZEL_EXPECT_TRUE(sig.find("-fuse-ld=") == std::string::npos);
+        } else {
+            BEZEL_EXPECT_TRUE(sig.find("-fuse-ld=" + linker + " ") != std::string::npos);
+        }
+    }
+    // A recipe differing only in the linker yields a different link key.
+    const std::string sig = Driver::linkRecipeSignature(false);
+    std::string other = sig;
+    const auto at = other.find(" -lm");
+    BEZEL_EXPECT_TRUE(at != std::string::npos);
+    if (at == std::string::npos) return;
+    other.insert(at, " -fuse-ld=some-other-linker");
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), sig, kToolchain) !=
+                      composeLinkKey(ident(9), ident(1), other, kToolchain));
+}
+
 // ---------------------------------------------------------------------------
 // CROSS-LEVEL: an object key and a link key can never name the same entry.
 // ---------------------------------------------------------------------------

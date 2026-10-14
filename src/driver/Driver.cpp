@@ -291,6 +291,16 @@ std::string Driver::runtimeLibraryPath() {
 #endif
 }
 
+// The linker `linkCommandLine` passes as `-fuse-ld=`, or "" for clang's
+// default. Configured by CMake (BEZEL_PROGRAM_LINKER), scoped to this TU.
+std::string Driver::programLinker() {
+#ifdef BEZEL_PROGRAM_LINKER
+    return BEZEL_PROGRAM_LINKER;
+#else
+    return {};
+#endif
+}
+
 // The EXACT clang command `linkExecutableObject` runs. Factored out (rather than
 // built inline in the link) so the recipe has exactly ONE definition: a caller
 // that needs to know what the link depends on — the AOT test harness, which
@@ -306,6 +316,18 @@ std::string Driver::linkCommandLine(const std::string& objectPath,
     std::string cmd = "clang " + objectPath;
     for (const std::string& obj : extraObjects) cmd += " " + obj;
     cmd += " -o " + exePath + " -lm -lpthread";
+    const std::string linker = programLinker();
+    if (!linker.empty()) {
+        // The linker chosen at configure time (CMakeLists.txt,
+        // BEZEL_PROGRAM_LINKER). Single-threaded: a generated program is a
+        // tiny link, and the test gate runs ~a dozen of them at once on a
+        // saturated box, where a linker's thread pool costs CPU and buys no
+        // wall. mold additionally gets --no-fork so its work is done (and
+        // accounted) in the process clang waits for. No fallback: a linker
+        // missing at run time fails the link loudly.
+        cmd += " -fuse-ld=" + linker + " -Wl,--threads=1";
+        if (linker == "mold") cmd += " -Wl,--no-fork";
+    }
     if (sanitizeAddress) {
         // JIT→AOT test-harness migration §2 (memory net): link the ASan runtime
         // (defines __asan_report_* / asan.module_ctor referenced by the

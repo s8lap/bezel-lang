@@ -481,21 +481,67 @@ target_compile_definitions(bezelc PRIVATE
 set_source_files_properties(src/driver/Driver.cpp PROPERTIES
     COMPILE_DEFINITIONS "BEZEL_RUNTIME_LIB_PATH=\"$<TARGET_FILE:bezel_runtime>\"")
 # APPENDED after the #5010 SET above (a SET after it would drop this).
+# The linker the DRIVER uses for the programs it links (`clang -fuse-ld=<name>`
+# in Driver::linkCommandLine). This is the one link recipe both a shipped
+# bezelc and the AOT test harness (which forks Driver::compileFile) run, so
+# the two never diverge. It is a separate choice from the build's own linker
+# above: the build links a few huge C++ binaries, where mold's threads pay; the
+# driver links ~12k tiny programs per gate on a CPU-saturated box, where
+# per-link CPU is what counts. MEASURED 2026-10-14 (user+sys of the clang
+# tree, same objects, 20-60 interleaved reps on a loaded box): ld.bfd 122 ms
+# plain / 281 ms ASan, lld --threads=1 49 / 73 ms, mold --no-fork --threads=1
+# 57 / 94 ms; mold with its default threads costs MORE than bfd (191 / 345 ms)
+# and, without --no-fork, hides that CPU in a detached child that rusage never
+# sees (it then reads as 19 / 28 ms). Hence: lld, else the
+# compiler's default linker. `-DBEZEL_PROGRAM_LINKER=default` keeps clang's
+# default (no -fuse-ld); `=mold` or `=lld` forces one. A configured linker that
+# is missing at run time makes the link fail ("invalid linker name"); there is
+# no silent fallback. The choice is part of Driver::linkRecipeSignature, so the
+# AOT bincache's link key (K2) moves with it and products never mix.
+set(BEZEL_PROGRAM_LINKER "auto" CACHE STRING
+    "Linker bezelc passes as -fuse-ld for generated programs: auto|lld|mold|default")
+set(BEZEL_PROGRAM_LINKER_RESOLVED "")
+if(BEZEL_PROGRAM_LINKER STREQUAL "auto")
+    if(BEZEL_LLD)
+        set(BEZEL_PROGRAM_LINKER_RESOLVED lld)
+    endif()
+elseif(BEZEL_PROGRAM_LINKER STREQUAL "lld" OR BEZEL_PROGRAM_LINKER STREQUAL "mold")
+    set(BEZEL_PROGRAM_LINKER_RESOLVED ${BEZEL_PROGRAM_LINKER})
+elseif(NOT BEZEL_PROGRAM_LINKER STREQUAL "default")
+    message(FATAL_ERROR "BEZEL_PROGRAM_LINKER must be auto, lld, mold or default "
+        "(got '${BEZEL_PROGRAM_LINKER}')")
+endif()
+set(BEZEL_PROGRAM_FUSE_LD "")
+if(BEZEL_PROGRAM_LINKER_RESOLVED)
+    set(BEZEL_PROGRAM_FUSE_LD -fuse-ld=${BEZEL_PROGRAM_LINKER_RESOLVED})
+    set_property(SOURCE src/driver/Driver.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS
+        BEZEL_PROGRAM_LINKER="${BEZEL_PROGRAM_LINKER_RESOLVED}")
+    message(STATUS "Bezel: generated programs link with ${BEZEL_PROGRAM_LINKER_RESOLVED}")
+else()
+    message(STATUS "Bezel: generated programs link with the compiler's default linker")
+endif()
 # #5062: every program the driver links statically pulls in the runtime
 # archive's debug sections (the Bezel objects themselves carry no DWARF). The
-# runtime is compiled with -gz (above), but the DEFAULT linker the driver
-# invokes (plain `clang`, no -fuse-ld) inflates compressed input sections
-# unless told otherwise. So when that linker accepts
+# runtime is compiled with -gz (above), but the linker the driver invokes
+# inflates compressed input sections unless told otherwise. So when THAT
+# linker (BEZEL_PROGRAM_FUSE_LD, above) accepts
 # --compress-debug-sections, hand the flag to the driver's link recipe.
 # Nothing is lost: ASan/llvm-symbolizer and gdb still resolve runtime frames to
 # file:line. The flag is part of Driver::linkRecipeSignature, so the AOT
 # bincache link key moves exactly once. Scoped to Driver.cpp, the one TU
 # that reads it.
 if(BEZEL_DEBUG_COMPRESSION)
+    set(CMAKE_REQUIRED_LINK_OPTIONS ${BEZEL_PROGRAM_FUSE_LD})
+    set(_bezel_prog_ld_tag "${BEZEL_PROGRAM_LINKER_RESOLVED}")
+    if(NOT _bezel_prog_ld_tag)
+        set(_bezel_prog_ld_tag default)
+    endif()
     check_linker_flag(C
         "-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}"
-        BEZEL_DEFAULT_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
-    if(BEZEL_DEFAULT_LD_COMPRESS_DEBUG_${BEZEL_DEBUG_COMPRESSION})
+        BEZEL_PROGRAM_LD_COMPRESS_DEBUG_${_bezel_prog_ld_tag}_${BEZEL_DEBUG_COMPRESSION})
+    unset(CMAKE_REQUIRED_LINK_OPTIONS)
+    if(BEZEL_PROGRAM_LD_COMPRESS_DEBUG_${_bezel_prog_ld_tag}_${BEZEL_DEBUG_COMPRESSION})
         set_property(SOURCE src/driver/Driver.cpp APPEND PROPERTY
             COMPILE_DEFINITIONS
             BEZEL_LINK_COMPRESS_DEBUG="-Wl,--compress-debug-sections=${BEZEL_DEBUG_COMPRESSION}")
