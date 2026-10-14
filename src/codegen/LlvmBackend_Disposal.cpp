@@ -3673,8 +3673,8 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
 
 
 void Emitter::emitValueLikeChoiceActiveCaseStrRelease(
-        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,
-        const sema::TypeRef* choiceRef) {
+        llvm::Value* slot, const sema::TypeSymbol* choiceTy,
+        const sema::TypeRef* choiceRef, bool retain) {
     // fix #2115 / §28.9 / §35.4: release the ACTIVE case's runtime-managed
     // (`string`) payload(s) of a VALUE-LIKE choice struct at scope end. The
     // choice struct is { i32 tag, case0_payload, case1_payload, … } (see
@@ -3785,7 +3785,10 @@ void Emitter::emitValueLikeChoiceActiveCaseStrRelease(
                 casePayload, {j}, "vlcsr.str.field");
             // bz_string_release is null-safe (a never-bound string? slot) and a
             // no-op on a sentinel/literal payload — release unconditionally.
-            emitStringRelease(strPtr);
+            if (retain)
+                emitStringRetain(strPtr);  // fix #6170 step 2
+            else
+                emitStringRelease(strPtr);
         }
         builder_.CreateBr(joinBB);
     }

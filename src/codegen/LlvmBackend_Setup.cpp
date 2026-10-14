@@ -23667,6 +23667,20 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
 }
 
 
+// fix #6170 step 2 (§28.9 / §35.4, v0.338): is `ldNode` a value-like choice
+// local initialized by a plain COPY of a named local or parameter
+// (`var b := a;`)? Such a local, when armed, retains the whole value at bind.
+bool Emitter::valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const {
+    LocalDeclInitView v = localDeclInitView(ldNode);
+    if (!v.init || v.isUsing) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(v.init);
+    if (!id || id->name == "this" || id->name == "base") return false;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    return dynamic_cast<sema::LocalSymbol*>(sym) ||
+           dynamic_cast<sema::ParameterSymbol*>(sym);
+}
+
+
 const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
         const ast::Node* ldNode,
         std::vector<const ast::Expr*>* retainedArgs) const {
@@ -23704,6 +23718,10 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
         return nullptr;
     }
     if (rt->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+    // fix #6170 step 2 (§6.6 / §35.4, v0.338): a `P?` local's slot is the
+    // nullable wrapper `{ i8, P }`, not the choice struct the active-case
+    // walk reads, so it is never an owner here.
+    if (rt->nullable) return nullptr;
     auto verdict = common::classifyChoiceType(rt, ctx_);
     if (!verdict || *verdict != common::ChoiceClassification::ValueLike) {
         return nullptr;  // owning (handled by registerOwningChoiceDisposal) /
@@ -23736,6 +23754,18 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // any other source (a call returning a choice, a field/param read) is
     // conservatively rejected: the payload's ownership cannot be proved at this
     // analysis level, so release is unsafe (the value may be a borrow).
+    // fix #6170 step 2 (§28.9 / §35.4, v0.338): two more initializer shapes
+    // make the slot an owner. A COPY from a named local or parameter
+    // (`var b := a;`) is retained whole at bind (armValueLikeChoiceStrRelease)
+    // when the local is armed, and a payload-free case (`P.No`) holds no
+    // string; either may later be reassigned, which retains the new value and
+    // releases the old (lowerValueLikeChoiceLocalReassign).
+    if (valueLikeChoiceLocalIsCopy(ldNode)) return rt;
+    if (auto* cc0 = dynamic_cast<sema::ChoiceCaseSymbol*>(
+            ctx_.exprSymbol(*v.init));
+        cc0 && cc0->caseDecl && cc0->caseDecl->payload.empty() &&
+        !dynamic_cast<const ast::CallExpr*>(v.init))
+        return rt;
     auto* call = dynamic_cast<const ast::CallExpr*>(v.init);
     if (!call || !call->callee) return nullptr;
     auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(
@@ -23799,8 +23829,10 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
         }
         if (isProducer) anyProducer = true;
     }
-    if (!anyProducer && borrowArgs.empty())
-        return nullptr;  // no +1 to reclaim (literal-only payload)
+    // fix #6170 step 2: a literal-only payload is armed too (its release is a
+    // no-op on the sentinel), because the local may be reassigned or copied
+    // into, and only an armed local owns what it is given.
+    (void)anyProducer;
     if (retainedArgs) *retainedArgs = std::move(borrowArgs);
     return rt;  // eligible — the slot owns +1 on the active case's strings.
 }
@@ -27990,7 +28022,22 @@ void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
     // the string set): a body no pin names is not walked, so its choice locals
     // just leak (never double-freed — the safe direction). fix #2817 widened the
     // set of pinned bodies; see stringReleaseEligibleFn_'s declaration.
-    if (!slot || !ld || disposeStack_.empty()) return;
+    if (!slot || !ld) return;
+    // fix #6170 step 2 (§28.9 / §35.4, v0.338): an armed COPY (`var b := a;`)
+    // retains the whole value at bind, so it owns its own reference and the
+    // source's escape walk treats the copy as a read (`choiceOwnerAliases`).
+    // Emitted BEFORE every arming gate below and keyed on set membership
+    // alone: if a gate then declines to register the release, the retain is a
+    // leak, never a release without a retain.
+    if (valueLikeChoiceStrReleaseEligible_.count(declNode) &&
+        valueLikeChoiceLocalIsCopy(ld)) {
+        if (const sema::TypeRef* crt =
+                valueLikeChoiceLocalMintsStringPayload(ld);
+            crt && crt->declaration)
+            emitValueLikeChoiceActiveCaseStrRelease(slot, crt->declaration,
+                                                    crt, /*retain=*/true);
+    }
+    if (disposeStack_.empty()) return;
     if (emittingDisposerBody_) return;  // a disposer walks fields directly
     if (currentFn_ != stringReleaseEligibleFn_) return;
     if (!valueLikeChoiceStrReleaseEligible_.count(declNode)) return;
@@ -28002,6 +28049,87 @@ void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
     d.valueLikeChoiceStrReleaseRef = rt;  // instantiated (genericArgs) — for the
                                           // specialized-struct substitution
     disposeStack_.back().push_back(d);
+}
+
+// fix #6170 step 2 (§28.9 / §35.4, v0.338): make a freshly lowered §35.3
+// case construction `nv` (of `e`) an owner of its strings with the fewest
+// retains: a +1 producer or a literal argument already is one, so only the
+// remaining (borrowed) string payload arguments are retained, read straight
+// out of the constructed value. Returns false (nothing emitted) when `e` is
+// not a positional construction of `rt`'s choice, so the caller retains the
+// whole value instead. Mirrors valueLikeChoiceLocalMintsStringPayload's
+// classification of the same arguments.
+bool Emitter::retainValueLikeChoiceConstructionBorrows(
+        const ast::Expr* e, llvm::Value* nv, const sema::TypeRef* rt) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee || !nv || !rt || !rt->declaration) return false;
+    auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(
+        ctx_.exprSymbol(*call->callee));
+    if (!cc || !cc->caseDecl || cc->parent != rt->declaration) return false;
+    for (const auto& a : call->args)
+        if (!a.name.empty()) return false;
+    std::size_t tag = 0;
+    if (!choiceCaseByName(rt->declaration, cc->name, &tag)) return false;
+    for (std::size_t i = 0; i < cc->caseDecl->payload.size(); ++i) {
+        const ast::Param& pf = cc->caseDecl->payload[i];
+        if (!pf.type) continue;
+        const sema::TypeRef* ft = common::substitutedChoicePayloadType(
+            pf, rt->declaration, rt, ctx_);
+        if (!ft || ft->kind != sema::TypeRef::Kind::Primitive ||
+            ft->primitive != sema::PrimitiveType::String)
+            continue;
+        const ast::Expr* arg = i < call->args.size() && call->args[i].value
+                                   ? call->args[i].value.get()
+                                   : nullptr;
+        if (arg && (isPlusOneStringProducer(arg) ||
+                    dynamic_cast<const ast::StringLiteralExpr*>(arg) ||
+                    dynamic_cast<const ast::VerbatimStringExpr*>(arg)))
+            continue;
+        emitStringRetain(builder_.CreateExtractValue(
+            nv, {1 + (unsigned)tag, (unsigned)i}, "vlcrb.str"));
+    }
+    return true;
+}
+
+// fix #6170 step 2 (§28.9 / §35.4, v0.338): `x := e;` where x is an ARMED
+// value-like choice local (an owner, valueLikeChoiceStrReleaseEligible_). The
+// slot owns +1 on its active case's strings, so a reassignment must give the
+// new value its own references and drop the old ones: lower e, retain the new
+// value's active-case strings, release the old value's, then store. The order
+// keeps `x := x;` and `x := P.Ok(<payload of x>)` sound (the retain lands
+// before the release). The escape walk admits exactly these assignments
+// (`choiceOwnerAliases`: plain `:=`, outside a lambda), so this must fire for
+// every one of them — a membership hit with no usable slot is reported as an
+// internal error instead of falling back to a store without the retain.
+bool Emitter::lowerValueLikeChoiceLocalReassign(const ast::AssignmentStmt& as) {
+    if (as.op != ":=" || !as.target || !as.value) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(as.target.get());
+    if (!id) return false;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc || !loc->decl) return false;
+    const void* declNode = static_cast<const void*>(loc->decl);
+    if (!valueLikeChoiceStrReleaseEligible_.count(declNode)) return false;
+    const sema::TypeRef* rt = valueLikeChoiceLocalMintsStringPayload(loc->decl);
+    if (!rt || !rt->declaration) return false;  // not a choice owner local
+    llvm::AllocaInst* slot = localSlot(*as.target);
+    if (!slot) {
+        ctx_.diagnostics().report(
+            Severity::Error, as.span.begin,
+            "internal: value-like choice owner local has no slot (#6170)");
+        return true;
+    }
+    llvm::Value* nv = lowerExpr(*as.value);
+    if (!nv) return true;  // lowering already reported
+    if (!retainValueLikeChoiceConstructionBorrows(as.value.get(), nv, rt)) {
+        llvm::AllocaInst* tmp = entryAlloca(nv->getType());
+        builder_.CreateStore(nv, tmp);
+        emitValueLikeChoiceActiveCaseStrRelease(tmp, rt->declaration, rt,
+                                                /*retain=*/true);
+    }
+    emitValueLikeChoiceActiveCaseStrRelease(slot, rt->declaration, rt,
+                                            /*retain=*/false);
+    builder_.CreateStore(nv, slot);
+    return true;
 }
 
 namespace {
@@ -28364,6 +28492,16 @@ struct StringEscapeWalker {
     // the source local keeps (and may release) its own. Null => every
     // construction argument stays a conservative escape.
     const std::unordered_set<const void*>* retainedCtorArgs = nullptr;
+    // fix #6170 step 2 (§28.9 / §35.4, v0.338): the value-like choice OWNER
+    // locals of this body (the #2115 walk's current armed set). Each such
+    // local retains its whole value when it is bound from a copy and when it
+    // is reassigned, and releases the value it holds before a reassignment
+    // (`lowerValueLikeChoiceLocalReassign`). So, in the choice walk only,
+    // `var x := <tracked>;` and `x := <tracked>;` with x in the set are
+    // non-consuming reads of the tracked local, and `<tracked> := e;` is a
+    // reassignment that releases the old value, not an escape. Null in every
+    // other walk.
+    const std::unordered_set<const void*>* choiceOwnerAliases = nullptr;
     // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): path-sensitive branch
     // analysis. The default walk is PATH-INSENSITIVE — when the walker hits
     // an `if`/`while`/`for` it walks every reachable branch in sequence and
@@ -30241,6 +30379,14 @@ struct StringEscapeWalker {
                 expr(ld->initializer.get(), /*safeRead=*/true);
                 return;
             }
+            // fix #6170 step 2: a copy into a value-like choice owner local
+            // (which retains at bind) is a read of the tracked local.
+            if (choiceOwnerAliases && !inLambda &&
+                choiceOwnerAliases->count(static_cast<const void*>(ld)) &&
+                isTargetIdent(ld->initializer.get())) {
+                expr(ld->initializer.get(), /*safeRead=*/true);
+                return;
+            }
             // fix #2900 / §28.9 / §28.3 (v0.240): the `var o: Object := s;`
             // shape (and the same over an interface-typed alias) is a BORROW
             // of `s`, not an escape — the Object slot is admitted to
@@ -30392,6 +30538,14 @@ struct StringEscapeWalker {
                 expr(lc->value.get(), /*safeRead=*/true);
                 return;
             }
+            // fix #6170 step 2: `const b := <tracked>;` — the LocalConstDecl
+            // twin of the value-like choice owner copy relaxation.
+            if (choiceOwnerAliases && !inLambda &&
+                choiceOwnerAliases->count(static_cast<const void*>(lc)) &&
+                isTargetIdent(lc->value.get())) {
+                expr(lc->value.get(), /*safeRead=*/true);
+                return;
+            }
             // fix #3417 (§21.1 / §28.9 / §8.6, v0.283): #2900's OBJECT-ALIAS
             // relaxation, the second of the pair the sibling `LocalDecl` arm
             // carries, now that this fix admits an Object/interface-headed
@@ -30522,6 +30676,14 @@ struct StringEscapeWalker {
                     expr(as->value.get(), /*safeRead=*/true);
                     return;
                 }
+                // fix #6170 step 2: a plain `:=` to the tracked owner local is
+                // lowered by lowerValueLikeChoiceLocalReassign (retain the new
+                // value, release the old). Outside a lambda only: a captured
+                // local is a cell the reassign lowering does not handle.
+                if (choiceOwnerAliases && !inLambda && as->op == ":=") {
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
+                }
                 // fix #4266 (§9.7 / §28.9): the "declare, then assign"
                 // twin of the stringReleaseMode relaxation just above —
                 // narrower by SET membership, not by mode. Every
@@ -30549,6 +30711,22 @@ struct StringEscapeWalker {
                 }
                 escaped = true;
                 return;
+            }
+            // fix #6170 step 2: `x := <tracked>;` into a value-like
+            // choice owner local x, whose reassignment retains the value.
+            if (choiceOwnerAliases && !inLambda && as->op == ":=" &&
+                isTargetIdent(as->value.get())) {
+                auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get());
+                auto* tls = tid ? dynamic_cast<sema::LocalSymbol*>(
+                                      ctx.exprSymbol(*tid))
+                                : nullptr;
+                if (tls && tls->decl &&
+                    choiceOwnerAliases->count(
+                        static_cast<const void*>(tls->decl))) {
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
+                }
             }
             // fix #2505 / fix #2535 (§23.3/§28.9/§11, v0.236): a bare-
             // identifier (or safe-sub-positioned) RHS of a property-SET on a
@@ -34551,12 +34729,10 @@ void Emitter::collectStringReleaseEligible(
     // eligible local's +1 string payload(s) at scope end is provably free of
     // UAF (no escaping alias — the value was not copied / returned / captured /
     // case-matched / arg-passed) and of double-free (once per exit; the slot is
-    // the sole owner). REASSIGNMENT is left as a conservative ESCAPE
-    // (stringReleaseMode stays FALSE here, mirroring the dict-materializer /
-    // grouping / borrowing-Array walks): a value-like choice reassign has NO
-    // release-old-on-reassign machinery, so a reassigned local's previous +1
-    // payload would leak through the very release armed here — exclude it. An
-    // escaping local is simply not armed — its payload leaks (the pre-existing,
+    // the sole owner). stringReleaseMode stays FALSE here (its string-specific
+    // relaxations do not apply to a choice); REASSIGNMENT is instead admitted
+    // by fix #6170 step 2's `choiceOwnerAliases` below, whose reassign
+    // lowering releases the old value. An escaping local is simply not armed — its payload leaks (the pre-existing,
     // safe behavior). // per §28.9, §35.4 v0.226.
     //
     // fix #2450 / §35.5: scrutineeBorrowMode is ON (unlike stringReleaseMode,
@@ -34566,15 +34742,36 @@ void Emitter::collectStringReleaseEligible(
     // #2428 residual where the local's ONLY use is as a case scrutinee. See
     // the scrutineeBorrowMode flag comment (struct StringEscapeWalker, above)
     // for the full soundness argument.
-    for (const ast::Node* ld : valueLikeChoiceCandidates) {
-        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
-        // stringReleaseMode stays false — see the rationale above.
-        w.scrutineeBorrowMode = true;  // fix #2450
-        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
-        if (!w.escaped)
-            valueLikeChoiceStrReleaseEligible_.insert(
-                static_cast<const void*>(ld));
+    //
+    // fix #6170 step 2 (§28.9 / §35.4, v0.338): every armed local is an OWNER
+    // (it retains what it is bound from by copy and what it is reassigned,
+    // and releases the old value on reassignment), so a copy into another
+    // armed local, an assignment from one, and a reassignment of the local
+    // itself are not escapes (`choiceOwnerAliases`). Whether a copy is safe
+    // depends on whether its TARGET is armed, so the armed set is the
+    // greatest fixpoint: start from every candidate and drop escaping ones
+    // until nothing changes. On the final set every relaxation a walk used
+    // names a local that is still armed, i.e. one that really retains.
+    std::unordered_set<const void*> choiceOwners;
+    for (const ast::Node* ld : valueLikeChoiceCandidates)
+        choiceOwners.insert(static_cast<const void*>(ld));
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const ast::Node* ld : valueLikeChoiceCandidates) {
+            if (!choiceOwners.count(static_cast<const void*>(ld))) continue;
+            StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+            // stringReleaseMode stays false — see the rationale above.
+            w.scrutineeBorrowMode = true;  // fix #2450
+            w.choiceOwnerAliases = &choiceOwners;  // fix #6170 step 2
+            for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+            if (w.escaped) {
+                choiceOwners.erase(static_cast<const void*>(ld));
+                changed = true;
+            }
+        }
     }
+    for (const void* ld : choiceOwners)
+        valueLikeChoiceStrReleaseEligible_.insert(ld);
     // fix #6170 (§28.9 / §35.3 / §35.4, v0.338): the choice walk above now runs
     // BEFORE the string walks, because its verdict feeds them. For every armed
     // choice local, each BORROW string payload argument of its construction is

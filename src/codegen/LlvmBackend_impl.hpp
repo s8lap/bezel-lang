@@ -19133,6 +19133,7 @@ private:
     // arguments that are neither +1 producers nor literals (borrows); the
     // construction lowering retains each of them for an eligible local, so the
     // slot owns +1 on every active-case string either way.
+    bool valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const;
     const sema::TypeRef* valueLikeChoiceLocalMintsStringPayload(
         const ast::Node* ldNode,
         std::vector<const ast::Expr*>* retainedArgs = nullptr) const;
@@ -19151,9 +19152,17 @@ private:
     // case's string-typed payload fields of a value-like choice struct. Mirrors
     // emitOwningChoiceActiveCaseDisposal's switch/join shape but calls
     // emitStringRelease (null- and sentinel-safe) on each string payload slot.
+    // fix #6170 step 2: `retain` = true walks the SAME string fields and
+    // retains them instead (the symmetric owner-acquire of the release).
     void emitValueLikeChoiceActiveCaseStrRelease(
-        llvm::AllocaInst* slot, const sema::TypeSymbol* choiceTy,
-        const sema::TypeRef* choiceRef);
+        llvm::Value* slot, const sema::TypeSymbol* choiceTy,
+        const sema::TypeRef* choiceRef, bool retain = false);
+    // fix #6170 step 2: `target := value` on an armed value-like choice owner
+    // local: retain the new value, release the old, store. False = not one.
+    bool lowerValueLikeChoiceLocalReassign(const ast::AssignmentStmt& as);
+    bool retainValueLikeChoiceConstructionBorrows(const ast::Expr* e,
+                                                  llvm::Value* nv,
+                                                  const sema::TypeRef* rt);
 
     // #429 (closure RETURN category) / §28.9 / §28.3: true when `init` is a
     // call to a user-defined, locally-compiled method whose declared return type

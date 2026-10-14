@@ -517,6 +517,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // Atomic<T>.Value directly above: FileStream has no user
             // PropertyDecl, so the fallthrough would silently drop the write.
             if (tryLowerFileStreamPositionSet(*as)) return false;
+            // fix #6170 step 2: reassignment of a value-like choice owner.
+            if (lowerValueLikeChoiceLocalReassign(*as)) return false;
             // §22.9: `obj.P := v` / `obj.P OP= v` where P is a block-form
             // property runs its setter body (with `value` = v); compound
             // assignment is a read-modify-write through getter + setter.

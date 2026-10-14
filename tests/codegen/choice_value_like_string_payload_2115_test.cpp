@@ -355,3 +355,71 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// ===========================================================================
+// #6170 step 2: a value-like choice local is an OWNER under copy and
+// reassignment (§28.9 v0.338: every owner holds its own reference; §35.4: a
+// value-like choice is an ordinary copyable value). `var b := a;` retains the
+// whole value at bind, and `a := e;` retains the new value and releases the
+// old one. Before this, a copy or a reassignment counted as an escape, so the
+// payload leaked: 400 allocations per 200 iterations, or more with a
+// reassignment. Same 200-iteration runAotChecked oracle as above. Measured on
+// ae7f8f3b: every arm below leaks (LSan), rc=1.
+// ===========================================================================
+
+// THE PIN: the issue's copy shape.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_35_4_copy_is_an_owner_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var a := P.Ok(\"s\" + k.ToString()); var b := a; n := 1; "));
+    BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan leak → ran=false
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// The copy is assigned into an OUTER owner and read after the source's block
+// has released the source: the outer owner must hold its own reference (a
+// use-after-free on the read otherwise). A const copy inside a block, read
+// against the source afterwards, is the LocalConstDecl twin.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_copy_into_outer_owner_outlives_source_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var b := P.No; "
+        "do var a := P.Ok(\"s\" + k.ToString()); b := a; end; "
+        "do const c := b; n := 1; end; "
+        "n := n + (case b of Ok(var t) => t.Length, _ => 0); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// Reassignment releases the old value: a plain reassign, a self-assign, a
+// swap through a third owner, and a copy that is then reassigned while the
+// source is read afterwards.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_35_4_reassign_releases_old_value_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var a := P.Ok(\"s\" + k.ToString()); "
+        "a := P.Ok(\"z\" + k.ToString()); a := a; "
+        "var b := P.Ok(\"w\" + k.ToString()); var t := a; a := b; b := t; "
+        "var c := a; c := P.Two(\"x\" + k.ToString(), \"y\"); "
+        "n := (case a of Ok(var u) => u.Length, _ => 0); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// Reassignment in a loop with `break`, under an unwinding exception, and on a
+// generic choice at T = string (copy then reassign).
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_3_reassign_loop_unwind_and_generic_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var a := P.No; "
+        "for var i in 0..<5 do a := P.Ok(\"s\" + i.ToString()); "
+        "  if i = 2 then break; end; end; "
+        "try do a := P.Ok(\"u\" + k.ToString()); "
+        "  if k > 100 then throw new InvalidOperationException(\"x\"); end; end; "
+        "catch InvalidOperationException => do n := 2; end end try; "
+        "var g := G<string>.Val(\"g\" + k.ToString()); var h := g; "
+        "g := G<string>.Val(\"x\" + k.ToString()); "
+        "n := n + (case a of Ok(var u) => u.Length, _ => 0); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
