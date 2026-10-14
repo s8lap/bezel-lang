@@ -56,7 +56,7 @@ static bool hasError(const OwnershipResult& r, const std::string& sub) {
 }
 
 // `Res` is a disposable resource class; `Opt` is the canonical §35.4.2
-// borrow-bearing choice (`Some(r: Res)` carries an unmarked class payload).
+// borrow-bearing choice (`Some(r: Res?)` carries an unmarked class payload).
 // `VOpt` is a value-like choice (every payload is value-typed or runtime-
 // managed, §35.4.3) — the "no over-rejection" control for the new predicate.
 namespace {
@@ -64,7 +64,7 @@ const char* kCommon =
     "module M; "
     "class Res public constructor() end constructor; "
     "  destructor end destructor; end Res; "
-    "choice Opt Some(r: Res), None; end Opt; "
+    "choice Opt Some(r: Res?), None; end Opt; "
     "choice VOpt Some(n: int), Named(s: string), None; end VOpt; ";
 std::string mod(const std::string& decls) {
     return std::string(kCommon) + decls;

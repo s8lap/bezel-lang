@@ -18,4 +18,4 @@
 //      `v: Opt := Opt.Some(null);` — an explicit `null` for the borrow-
 //      carrying payload at the initializer site.
 
-module M; class Res public method Val(): int return 5; end Val; end Res; choice Opt Some(r: Res), None; end Opt; class Box public v: Opt; public constructor() v := Opt.None; end constructor; end Box; class BoxInit public v: Opt := Opt.None; end BoxInit; class BoxNull public v: Opt := Opt.Some(null); end BoxNull; class C public static method Main(): int return 0; end Main; end C;
+module M; class Res public method Val(): int return 5; end Val; end Res; choice Opt Some(r: Res?), None; end Opt; class Box public v: Opt; public constructor() v := Opt.None; end constructor; end Box; class BoxInit public v: Opt := Opt.None; end BoxInit; class BoxNull public v: Opt := Opt.Some(null); end BoxNull; class C public static method Main(): int return 0; end Main; end C;

@@ -3371,6 +3371,11 @@ private:
     // resolved MethodSymbol.
     void typeCall(const ast::CallExpr& ce);
 
+    // §35.3 (v0.338, #6119): the §22.5 binding + §5.1 argument conversion
+    // check of a payload-carrying case construction. See the definition in
+    // ExprTypecheck_Exprs.cpp.
+    void checkChoiceCaseConstruction(const ast::CallExpr& ce);
+
     // fix #4325 (§5.1 / §11.2, v0.298): `explicitSubst` is the METHOD's own
     // type-parameter → concrete-TypeRef binding for the EXPLICITLY
     // specified type arguments (`<TypeArg, …>`) at the call site, built by

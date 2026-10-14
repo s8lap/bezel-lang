@@ -6053,7 +6053,37 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // slice.
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         typeCall(*ce);
+        checkChoiceCaseConstruction(*ce);
     }
+}
+
+// §35.3 (v0.338, #6119): "Payload arguments bind to the case's payload fields
+// as to a parameter list" — a payload-carrying case construction
+// `Type.Case(args)` takes the §22.5 binding (arity, names) and the §5.1
+// per-argument conversion check of an ordinary call. `typeCall` types the
+// construction's result (the callee is a ChoiceCaseSymbol) but never checked
+// the arguments, so `CB.One(o)` with `o: Object` for `One(v: B)` compiled and
+// the payload was later read as a `B` (heap-buffer-overflow). The check is
+// the shared `checkArgsAgainstParams` over the case's own payload list, with
+// the callee's target as the substitution receiver so a generic choice's
+// payload type `T` is checked at the written instantiation.
+void ExprTC::checkChoiceCaseConstruction(const ast::CallExpr& ce) {
+    auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(ctx_.exprSymbol(*ce.callee));
+    if (!ccs || !ccs->caseDecl) return;
+    auto* cts = dynamic_cast<TypeSymbol*>(ccs->parent);
+    if (!cts || cts->kind != ast::TypeDeclKind::Choice) return;
+    // The substitution receiver is the written `Type<Args>` of the qualified
+    // form. A bare declared-result case name (§35.3) has no written target,
+    // and for a generic choice its payload types mention unbound parameters:
+    // leave that spelling to its existing handling.
+    const ast::Expr* target = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        target = ma->target.get();
+    if (!target && !cts->genericParams.empty()) return;
+    checkArgsAgainstParams(ccs->caseDecl->payload, ce.args, ce.span.begin,
+                           "case `" + std::string(cts->name) + "." +
+                               std::string(ccs->name) + "`",
+                           target, cts);
 }
 
 // §17.1 result-type table for binary operators. Slice 3c covers the
