@@ -5375,6 +5375,33 @@ static std::string spellPrimitiveName(PrimitiveType p) {
     return "?";
 }
 
+// fix #6023: the spelling of a downcast target in the §5.1 diagnostic — head
+// name, type arguments, and (when asked) the `?`. Covers the shapes the
+// rejection can name: a primitive, or a Named type with or without a
+// declaration.
+static std::string spellDowncastDiagType(const TypeRef* t, bool withNullable) {
+    if (!t) return "?";
+    std::string out;
+    if (t->kind == TypeRef::Kind::Primitive) {
+        out = spellPrimitiveName(t->primitive);
+    } else if (t->kind == TypeRef::Kind::Named) {
+        out = std::string(t->declaration ? namedTypeSimpleName(t)
+                                         : t->headName());
+        if (!t->genericArgs.empty()) {
+            out += "<";
+            for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                if (i) out += ", ";
+                out += spellDowncastDiagType(t->genericArgs[i], true);
+            }
+            out += ">";
+        }
+    } else {
+        out = "the target type";
+    }
+    if (withNullable && t->nullable) out += "?";
+    return out;
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -6154,8 +6181,140 @@ void ExprTC::checkAssignable(
                 "(§8.3)");
             return;
         }
+        // fix #6023 (§5.1 "Reference conversions", v0.338). The implicit
+        // reference conversions are a closed list — identity, class to base
+        // class "transitively, up to `Object`", "any type to `Object`", a type
+        // to an interface it implements, interface to extended interface, a
+        // type parameter to what its constraints guarantee, and §12.9's
+        // variance-induced ones — and every row WIDENS ("the same reference
+        // viewed at a wider static type"). None has `Object` as its source
+        // other than identity, so `Object` converts implicitly to no class,
+        // interface, `string` (§4.6: "The compiler does not implicitly
+        // convert other types to `string`") or type parameter. This arm used
+        // to return here — accepting the conversion — for every such target,
+        // which is an unchecked downcast: `var b: B := o; b.Y()` read a field
+        // the `A` behind `o` does not have (#6023 printed `y=0`), and
+        // `Take(o)` did the same through a parameter.
+        //
+        // What stays accepted, each for its own §5.1 reason:
+        //   * the `null` literal (typed `Object?` as a placeholder) into a
+        //     nullable target — "Nullable conversions";
+        //   * a carrier §12.7 has narrowed (`if o is B then var b: B := o;`):
+        //     its read is typed `B` before it gets here, so `from` is not
+        //     `Object` at all;
+        //   * an expression that is recorded `Object?` only because every
+        //     value it can produce is the bare `null`: a `case` whose arms
+        //     are all `null` (typeCase records the placeholder), and a
+        //     §17.15 binding atom whose body is `null`
+        //     (`var n: B? := (var t := 1; null);`). The §5.1 question is put
+        //     to each value-producing leaf of an `if`/`case`/binding atom
+        //     instead — a `null` leaf is the literal reaching a nullable
+        //     target; a leaf that is itself `Object`-typed is rejected by
+        //     this same arm. (A `case` with class, interface or built-in
+        //     exception arms beside a `null` arm is typed `B?` — #6086 — and
+        //     never gets here.)
+        // Function-typed targets keep falling through (the §27.6 re-typing
+        // block below must run), as does `Object?` into a non-nullable target
+        // (the §7 diagnostic below is the right rule to name).
+        //
+        // WHICH targets are rejected: exactly those for which the checked
+        // spelling the diagnostic recommends exists — `string`, every Named
+        // type with a declaration (user classes and interfaces, and the
+        // built-ins that carry a synthesized TypeSymbol), and the built-in
+        // exception classes. For each of them §12.7's `is` records a
+        // narrowing (narrowFromTypeTest), so `if o is T then var v: T := o;`
+        // is accepted (the read of `o` is typed `T` there and never reaches
+        // this arm). Two declaration-less target shapes are LEFT on the
+        // prior permissive path, because narrowFromTypeTest records nothing
+        // for them and rejecting here would turn §12.7's own spelling into a
+        // false reject with no replacement:
+        //   * a bare type parameter (`o is T` narrows nothing), and
+        //   * a built-in class that is not an exception (`StringBuilder`,
+        //     `Array<T>`, …), for which codegen resolves no runtime type
+        //     descriptor either — `is` reads false and `as` yields null.
+        // Both stay the unchecked downcast they were; they are not made
+        // worse here and are tracked on #6073 as the remaining cells. An
+        // Error-kind target has already been diagnosed, and `()` keeps the
+        // behaviour #5023 left it with.
         if (to->kind != TypeRef::Kind::Function &&
-            (!from->nullable || to->nullable)) return;
+            (!from->nullable || to->nullable)) {
+            if (fromIsNullLiteral) return;
+            bool toIsBuiltinException =
+                to->kind == TypeRef::Kind::Named && !to->declaration &&
+                to->genericArgs.empty() &&
+                common::isBuiltinExceptionName(to->headName()) &&
+                !refMentionsTypeVariable(to) &&
+                !(freeTypeParamNames &&
+                  freeTypeParamNames->count(to->headName()));
+            bool toIsRejectable =
+                (to->kind == TypeRef::Kind::Named &&
+                 (to->declaration || toIsBuiltinException)) ||
+                (to->kind == TypeRef::Kind::Primitive &&
+                 to->primitive == PrimitiveType::String);
+            if (!toIsRejectable) return;
+            // A built-in interface the compiler synthesizes
+            // (`IEquatable<T>`, `IComparable<T>`, …) stays on the permissive
+            // path too, for the second reason above: the conformance of a
+            // boxed primitive or `string` to one is not recorded in any
+            // runtime descriptor, so `o is IEquatable<string>` reads false
+            // and `o as IComparable<int>` yields null over a value that does
+            // conform (#6073) — the checked spelling this diagnostic would
+            // recommend does not work yet.
+            if (to->kind == TypeRef::Kind::Named && to->declaration &&
+                to->declaration->isSynthesizedBuiltinInterface)
+                return;
+            // pending #6083: see ExprTypecheck_impl.hpp.
+            if (pendingTypeFactAdmits(fromExpr, to)) return;
+            if (fromExpr &&
+                (dynamic_cast<const ast::CaseExpr*>(fromExpr) ||
+                 dynamic_cast<const ast::ConditionalExpr*>(fromExpr) ||
+                 dynamic_cast<const ast::BindExpr*>(fromExpr))) {
+                std::vector<const ast::Expr*> leaves;
+                std::vector<const ast::Expr*> work{fromExpr};
+                while (!work.empty()) {
+                    const ast::Expr* cur = work.back();
+                    work.pop_back();
+                    if (!cur) continue;
+                    if (auto* ce = dynamic_cast<const ast::CaseExpr*>(cur)) {
+                        for (const auto& arm : ce->arms)
+                            if (arm.exprBody) work.push_back(arm.exprBody.get());
+                    } else if (auto* cnd =
+                                   dynamic_cast<const ast::ConditionalExpr*>(cur)) {
+                        work.push_back(cnd->thenValue.get());
+                        work.push_back(cnd->elseValue.get());
+                    } else if (auto* bind =
+                                   dynamic_cast<const ast::BindExpr*>(cur)) {
+                        // §17.15: the atom's body supplies its value.
+                        work.push_back(bind->body.get());
+                    } else {
+                        leaves.push_back(cur);
+                    }
+                }
+                for (const ast::Expr* leaf : leaves) {
+                    if (dynamic_cast<const ast::NullLiteralExpr*>(leaf)) continue;
+                    TypeRef* lt = ctx_.exprType(*leaf);
+                    if (!lt) continue;  // bottom-typed (`throw`) — no constraint
+                    checkAssignable(lt, to, leaf->span.begin, what, leaf,
+                                    freeTypeParamNames);
+                }
+                return;
+            }
+            // Both types are spelled in full — type arguments and `?`
+            // included — so the message names the conversion the program
+            // wrote; the `is`/`as` hint names the non-nullable test type.
+            const std::string src = from->nullable ? "Object?" : "Object";
+            const std::string tgt = spellDowncastDiagType(to, true);
+            const std::string test = spellDowncastDiagType(to, false);
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " has a type that is not "
+                "implicitly convertible to the target type (§5.1): `Object` "
+                "converts implicitly to no other type — `" + src + "` to `" +
+                tgt + "` is a downcast, which is never implicit; test the "
+                "runtime type with `is " + test + "` (§12.7) or convert with "
+                "`as " + test + "` (§17.4), which yields `" + test + "?`");
+            return;
+        }
         // Function-typed target, OR Object? → non-nullable reference:
         // fall through to the downstream blocks.
     }
@@ -14437,8 +14596,26 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
             // / imported spelling whose head names one of the five boxable
             // value-builtins. A bare type parameter (`T` whose `headName()` is
             // anything else) stays excluded — #3092's distinct defect.
+            //
+            // fix #6023 (§12.7, §31.4, v0.338): …or a BUILT-IN EXCEPTION class.
+            // §12.7 states the rule over `T` without qualification, and the
+            // built-in exception types are ordinary classes user code derives
+            // from and tests at run time (every `catch` arm does), but they
+            // carry no TypeSymbol, so `if e is IOException then …` narrowed
+            // nothing: `e` kept its declared `Exception` inside the block.
+            // That was invisible only while `Exception` → `IOException` was
+            // (wrongly) accepted as an implicit conversion; with that
+            // conversion rejected, the unnarrowed read would make §12.7's own
+            // spelling a false reject. The reference is the same pointer at
+            // either static type, so no representation question arises. A
+            // type PARAMETER that shadows an exception name is not the
+            // built-in and stays excluded with every other bare `T`.
             narrowable = tt->declaration != nullptr ||
-                         isBoxableValueBuiltin(tt->headName());
+                         isBoxableValueBuiltin(tt->headName()) ||
+                         (tt->genericArgs.empty() &&
+                          common::isBuiltinExceptionName(tt->headName()) &&
+                          currentScopeGenericParamNames().count(
+                              tt->headName()) == 0);
             break;
         case TypeRef::Kind::Primitive:
             // `x is Object` narrows nothing (every value is an Object), and
@@ -14479,6 +14656,174 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
     narrowings_[sym] = narrowed;
     confirmTypeFact(sym);   // #6114
     return true;
+}
+
+// pending #6083 — see the declarations in ExprTypecheck_impl.hpp.
+bool ExprTC::isPendingTypeFactCarrier(Symbol* sym) {
+    if (!sym) return false;
+    if (!dynamic_cast<LocalSymbol*>(sym) &&
+        !dynamic_cast<ParameterSymbol*>(sym))
+        return false;
+    TypeRef* d = declaredTypeOf(sym);
+    if (!d) return false;
+    if (d->kind == TypeRef::Kind::Primitive)
+        return d->primitive == PrimitiveType::Object;
+    return d->kind == TypeRef::Kind::Named && !d->declaration &&
+           d->genericArgs.empty() &&
+           common::isBuiltinExceptionName(d->headName()) &&
+           currentScopeGenericParamNames().count(d->headName()) == 0;
+}
+
+Symbol* ExprTC::recordPendingTypeFact(Symbol* carrier, TypeRef* fact) {
+    if (!carrier || !fact) return nullptr;
+    auto& keys = pendingTypeFactKeys_[carrier];
+    for (const PendingTypeFactKey& k : keys) {
+        if (typeArgIdentical(k.tested, fact, nullptr)) {
+            narrowings_[k.key] = k.tested;
+            confirmTypeFact(k.key);   // #6114
+            return k.key;
+        }
+    }
+    PendingTypeFactKey k;
+    k.key = ctx_.makeSymbol<Symbol>();
+    // The carrier's own name, so the mutable-capture invalidation (which
+    // matches by name) drops the record together with the carrier's facts.
+    k.key->name = carrier->name;
+    k.tested = fact;
+    keys.push_back(k);
+    pendingTypeFactKeySet_.insert(k.key);
+    narrowings_[k.key] = fact;
+    confirmTypeFact(k.key);   // #6114
+    return k.key;
+}
+
+void ExprTC::erasePendingTypeFact(Symbol* carrier) {
+    auto it = pendingTypeFactKeys_.find(carrier);
+    if (it == pendingTypeFactKeys_.end()) return;
+    for (const PendingTypeFactKey& k : it->second) narrowings_.erase(k.key);
+}
+
+bool ExprTC::pendingTypeFactAdmits(const ast::Expr* fromExpr, TypeRef* to) {
+    if (!fromExpr || !to || pendingTypeFactKeys_.empty()) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(fromExpr);
+    if (!id) return false;
+    auto keys = pendingTypeFactKeys_.find(lookupName(id->name));
+    if (keys == pendingTypeFactKeys_.end()) return false;
+    for (const PendingTypeFactKey& k : keys->second) {
+        auto rec = narrowings_.find(k.key);
+        if (rec == narrowings_.end() || !rec->second) continue;
+        TypeRef* fact = rec->second;
+        if (to->kind == TypeRef::Kind::Primitive) {
+            if (fact->kind == TypeRef::Kind::Primitive &&
+                fact->primitive == to->primitive) {
+                noteTypeFactUse(k.key, fact);   // #6114
+                return true;
+            }
+            continue;
+        }
+        if (to->kind != TypeRef::Kind::Named ||
+            fact->kind != TypeRef::Kind::Named)
+            continue;
+        if (fact->declaration && to->declaration) {
+            if (fact->declaration == to->declaration ||
+                isSubtype(fact->declaration, to->declaration)) {
+                noteTypeFactUse(k.key, fact);   // #6114
+                return true;
+            }
+            continue;
+        }
+        if (hasNamedAncestor(fact, namedRefSimpleName(to))) {
+            noteTypeFactUse(k.key, fact);   // #6114
+            return true;
+        }
+    }
+    return false;
+}
+
+void ExprTC::recordPendingCondTypeFacts(const ast::Expr* cond,
+                                        bool forTrueBranch) {
+    if (!cond) return;
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(cond)) {
+        if (be->op == (forTrueBranch ? "and" : "or")) {
+            recordPendingCondTypeFacts(be->left.get(), forTrueBranch);
+            // #6115: a record the right operand's evaluation ended (a
+            // `ref`/`out` argument, a call reaching a closure that assigns
+            // the carrier) is not in force on this path; the right operand's
+            // own tests are recorded after the drop.
+            if (auto sp = condSpoiled_.find(be); sp != condSpoiled_.end())
+                for (Symbol* k : sp->second)
+                    if (pendingTypeFactKeySet_.count(k)) narrowings_.erase(k);
+            recordPendingCondTypeFacts(be->right.get(), forTrueBranch);
+        }
+        return;
+    }
+    auto* te = dynamic_cast<const ast::TypeTestExpr*>(cond);
+    if (!te || te->op != (forTrueBranch ? "is" : "is not") || !te->testType)
+        return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(te->operand.get());
+    if (!id || id->name == "this" || id->name == "base") return;
+    Symbol* sym = lookupName(id->name);
+    if (!isPendingTypeFactCarrier(sym)) return;
+    TypeRef* tt = ctx_.resolvedType(*te->testType);
+    if (!tt || tt->kind == TypeRef::Kind::Error) return;
+    recordPendingTypeFact(sym, tt);
+}
+
+std::unordered_map<Symbol*, TypeRef*> ExprTC::pendingTypeFactsInForce() const {
+    std::unordered_map<Symbol*, TypeRef*> out;
+    if (pendingTypeFactKeySet_.empty()) return out;
+    for (const auto& [sym, ty] : narrowings_)
+        if (pendingTypeFactKeySet_.count(sym)) out.emplace(sym, ty);
+    return out;
+}
+
+ExprTC::PendingArmTypeFact::PendingArmTypeFact(ExprTC& t,
+                                               const ast::Expr* scrutinee,
+                                               const ast::Pattern* pattern)
+    : tc(t) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(scrutinee);
+    if (!id || !pattern || id->name == "this" || id->name == "base") return;
+    Symbol* sym = tc.lookupName(id->name);
+    if (!tc.isPendingTypeFactCarrier(sym)) return;
+    TypeRef* tt = nullptr;
+    if (auto* np = dynamic_cast<const ast::NamedPattern*>(pattern)) {
+        if (!np->name || np->name->parts.empty()) return;
+        if (TypeSymbol* ts = tc.resolveCasePatternTypeSymbol(np->name->parts)) {
+            tt = tc.ctx_.makeTypeRef();
+            tt->kind = TypeRef::Kind::Named;
+            tt->declaration = ts;
+        } else if (np->name->parts.size() == 1 &&
+                   common::isBuiltinExceptionName(np->name->parts[0]) &&
+                   tc.currentScopeGenericParamNames().count(
+                       np->name->parts[0]) == 0) {
+            tt = tc.builtinAncestorTypeRef(np->name->parts[0]);
+        }
+    } else if (auto* tp = dynamic_cast<const ast::TypePattern*>(pattern)) {
+        if (tp->type) tt = tc.ctx_.resolvedType(*tp->type);
+    } else if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pattern)) {
+        if (bp->type) tt = tc.ctx_.resolvedType(*bp->type);
+    }
+    if (!tt || tt->kind == TypeRef::Kind::Error) return;
+    const auto before = tc.pendingTypeFactsInForce();
+    // #6114: the arm's test confirms the record for THIS iteration of every
+    // open loop, and only inside the arm — the marks this arm adds end with
+    // it, whether or not the record itself was already in force on entry.
+    const auto marksBefore = tc.nullNarrowed_;
+    Symbol* k = tc.recordPendingTypeFact(sym, tt);
+    if (k)
+        for (const auto& f : tc.loopFactFrames_)
+            if (auto m = f.typeMarkers.find(k);
+                m != f.typeMarkers.end() && marksBefore.count(m->second) == 0)
+                addedMarks.push_back(m->second);
+    // Already in force on entry (an enclosing exit test of the same type):
+    // not this arm's to end.
+    if (k && before.count(k) == 0) key = k;
+}
+
+ExprTC::PendingArmTypeFact::~PendingArmTypeFact() {
+    // A no-op when the body already dropped it (it assigned the carrier).
+    if (key) tc.narrowings_.erase(key);
+    for (Symbol* m : addedMarks) tc.nullNarrowed_.erase(m);
 }
 
 // §19.3 (v0.313, #5188): see the declaration in ExprTypecheck_impl.hpp.
@@ -15554,6 +15899,21 @@ void ExprTC::popLoopFactFrame(bool bodyEndIsBackEdge,
                         typeArgIdentical(it->second, ty, nullptr));
             }))
             continue;
+        if (pendingTypeFactKeySet_.count(s)) {
+            // pending #6083: the record that admits an `Object` / built-in
+            // exception carrier to a narrower type after a type test.
+            reports.emplace_back(
+                use.loc,
+                "`" + std::string(s->name) +
+                    "` is not known to hold the tested type here: the type "
+                    "test was made before the loop, and the loop body "
+                    "invalidates it (a reassignment, a `ref`/`out` argument, "
+                    "or a call that can reach a closure assigning it) before "
+                    "control returns to this point on the next iteration "
+                    "\xE2\x80\x94 test `" + std::string(s->name) +
+                    "` inside the loop (\xC2\xA7" "12.7, \xC2\xA7" "7.4)");
+            continue;
+        }
         reports.emplace_back(
             use.loc,
             "`" + std::string(s->name) +
@@ -21987,6 +22347,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             narrowedTargetTy = nit->second;
                         }
                         narrowings_.erase(tsym);
+                        erasePendingTypeFact(tsym);  // pending #6083
                     }
                 }
             }
@@ -22390,6 +22751,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 narrowings_[narrowedTargetSym] = narrowedTargetTy;
             visitExpr(*as->value);
             if (narrowedTargetSym) narrowings_.erase(narrowedTargetSym);
+            if (narrowedTargetSym)
+                erasePendingTypeFact(narrowedTargetSym);  // pending #6083
             if (eventHandlerSite)
                 checkEventSubscriptionHandler(*as, eventPayload,
                                               eventHandlerAsync,
@@ -24001,6 +24364,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // not added here; the null set's own all-paths join already carries
         // it.)
         std::vector<std::unordered_set<Symbol*>> initExits;
+        // pending #6083, shape (1) (see ExprTypecheck_impl.hpp): the records
+        // in force where each branch that reaches the statement after the
+        // `if` ends. `break`/`continue` count as not reaching it here
+        // (bodyAlwaysExits is about leaving the METHOD): a record lives in the
+        // loop body's block and ends with it.
+        std::vector<std::unordered_map<Symbol*, TypeRef*>> pendingExits;
+        // #6114: the loop-iteration marks in force at each of those ends.
+        std::vector<std::unordered_set<Symbol*>> pendingExitMarks;
+        auto notePendingExit = [&](const auto& body, bool isImplicitElse) {
+            bool leaves = !isImplicitElse && bodyAlwaysExits(body);
+            if (!leaves && !isImplicitElse && !body.empty() && body.back())
+                leaves =
+                    dynamic_cast<const ast::BreakStmt*>(body.back().get()) ||
+                    dynamic_cast<const ast::ContinueStmt*>(body.back().get());
+            if (!leaves) {
+                pendingExits.push_back(pendingTypeFactsInForce());
+                pendingExitMarks.push_back(nullNarrowed_);
+            }
+        };
         if (ifs->ifBranch.condition) {
             visitExpr(*ifs->ifBranch.condition);
             checkConditionIsBool(*ifs->ifBranch.condition, "if");
@@ -24040,6 +24422,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             collectNarrowings(falseCond, /*forTrueBranch=*/false);
         };
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
+        recordPendingCondTypeFacts(ifs->ifBranch.condition.get(),
+                                   /*forTrueBranch=*/true);  // pending #6083
         auto branchEntryTypes = narrowings_;   // #6113
         {
             // per §21.6 / §21.1 (#5314): the branch body is a block; a local
@@ -24059,6 +24443,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             typeExits.emplace_back(branchEntryTypes, narrowings_);
             initExits.push_back(initNarrowed_);
         }
+        notePendingExit(ifs->ifBranch.body, /*isImplicitElse=*/false);
         for (std::size_t i = 0; i < ifs->elifBranches.size(); ++i) {
             const auto& el = ifs->elifBranches[i];
             // §7.4 (v0.214, #2116): this elif CONDITION executes only when
@@ -24094,6 +24479,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // false (their else-narrowings are in the chain) and this
             // condition is true.
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/true);
+            // pending #6083: the same path, for the records.
+            recordPendingCondTypeFacts(ifs->ifBranch.condition.get(),
+                                       /*forTrueBranch=*/false);
+            for (std::size_t j = 0; j < i; ++j)
+                recordPendingCondTypeFacts(
+                    ifs->elifBranches[j].condition.get(),
+                    /*forTrueBranch=*/false);
+            recordPendingCondTypeFacts(el.condition.get(),
+                                       /*forTrueBranch=*/true);
             branchEntryTypes = narrowings_;   // #6113
             {
                 Scope bodyScope;  // per §21.6 / §21.1 (#5314): block scope
@@ -24109,6 +24503,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 typeExits.emplace_back(branchEntryTypes, narrowings_);
                 initExits.push_back(initNarrowed_);
             }
+            notePendingExit(el.body, /*isImplicitElse=*/false);
         }
         // The else body (explicit or implicit fall-through): all preceding
         // guards were false, so each contributes its else-branch narrowing
@@ -24116,6 +24511,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         advanceChain(ifs->elifBranches.empty()
                          ? ifs->ifBranch.condition.get()
                          : ifs->elifBranches.back().condition.get());
+        // pending #6083: the same path, for the records.
+        recordPendingCondTypeFacts(ifs->ifBranch.condition.get(),
+                                   /*forTrueBranch=*/false);
+        for (const auto& el : ifs->elifBranches)
+            recordPendingCondTypeFacts(el.condition.get(),
+                                       /*forTrueBranch=*/false);
         branchEntryTypes = narrowings_;   // #6113
         {
             Scope bodyScope;  // per §21.6 / §21.1 (#5314): block scope
@@ -24125,6 +24526,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             for (const auto& bs : ifs->elseBody) if (bs) visitStmt(*bs);
             currentScope_ = saveScope;
         }
+        notePendingExit(ifs->elseBody, /*isImplicitElse=*/!ifs->hasElse);
         // The else path falls through unless an explicit else body always exits.
         if (!ifs->hasElse || !bodyAlwaysExits(ifs->elseBody)) {
             fallThroughExits.push_back(nullNarrowed_);
@@ -24177,6 +24579,40 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             fieldNarrowed_ = std::move(fieldExits.front());
             for (std::size_t i = 1; i < fieldExits.size(); ++i)
                 intersectFieldFactsWith(fieldExits[i]);
+        }
+        // pending #6083, shape (1): the records after the `if` are those in
+        // force at the end of EVERY branch that reaches this point — so a test
+        // that held on each surviving path is recorded (the other branches
+        // left), and a record a surviving branch dropped by assigning the
+        // carrier is gone. (The #6113 join above only ever REMOVES an entry
+        // fact; a record can also be ESTABLISHED by the `if`, which is why it
+        // is joined here.) The surviving path is NOT narrowed: only the
+        // record the #6023 rejections read is written.
+        if (!pendingTypeFactKeySet_.empty() && !pendingExits.empty()) {
+            for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+                if (pendingTypeFactKeySet_.count(it->first))
+                    it = narrowings_.erase(it);
+                else
+                    ++it;
+            }
+            for (const auto& [key, fact] : pendingExits.front()) {
+                bool everywhere = true;
+                for (std::size_t i = 1; i < pendingExits.size(); ++i)
+                    if (pendingExits[i].count(key) == 0) everywhere = false;
+                if (!everywhere) continue;
+                narrowings_[key] = fact;
+                // #6114: the record was (re-)established on this iteration of
+                // an open loop only if it was on every one of those paths.
+                for (const auto& f : loopFactFrames_) {
+                    auto m = f.typeMarkers.find(key);
+                    if (m == f.typeMarkers.end()) continue;
+                    bool marked = true;
+                    for (const auto& marks : pendingExitMarks)
+                        if (marks.count(m->second) == 0) marked = false;
+                    if (marked) nullNarrowed_.insert(m->second);
+                    else nullNarrowed_.erase(m->second);
+                }
+            }
         }
     } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         // #6114: the condition is re-evaluated on every iteration, so the
@@ -25423,6 +25859,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         };
         for (const auto& arm : cs->arms) {
+            // pending #6083, shape (2) — see ExprTypecheck_impl.hpp.
+            PendingArmTypeFact pendingArmFact(*this, cs->scrutinee.get(),
+                                              arm.pattern.get());
             fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
             nullNarrowed_ = caseRunningNull;    // §7.4 #2164: per-arm base
             // §19 / §A (#727): scrutinee-less arm — typecheck the bool CONDITION

@@ -388,7 +388,13 @@ BEZEL_TEST(sema_init_value_from_object_3115,
 }
 
 BEZEL_TEST(sema_init_value_from_object_3115,
-           out_of_scope_object_to_interface_target_local_accepted_spec_3_5_1) {
+           object_to_interface_target_local_rejected_as_downcast_spec_5_1) {
+    // fix #6023 (§5.1 "Reference conversions", v0.338) FLIPPED this row. It
+    // pinned `var f: IFoo := o` (`o: Object`) as ACCEPTED, the reference-
+    // target half #3115 declared out of scope. §5.1's list of implicit
+    // reference conversions has no row with `Object` as its source, so it is
+    // now rejected — by the general downcast rule, NOT by #3115's
+    // value-type wording, which is the half this row still guards.
     // fix #3985: the original fixture used C#-shaped syntax throughout —
     // `interface IFoo: M(): void; end interface;` (no such `:`-member /
     // `void` / `end interface` forms; Appendix A's IfaceMethod is `"method"
@@ -422,7 +428,8 @@ BEZEL_TEST(sema_init_value_from_object_3115,
     // -> `parseAndTypecheckGated`). `!r.diagnostics.hasErrors()` is a real
     // discriminator: the gate makes "parsed+typechecked clean" and "gated
     // off by a parse error" mutually exclusive.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        hasError(r, "`Object` to `IFoo` is a downcast, which is never implicit"));
     BEZEL_EXPECT_TRUE(!hasError(r, kIssue3115Diag));
 }
 

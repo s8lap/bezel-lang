@@ -9419,6 +9419,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
+            // pending #6083: the left operand's test records too, so the
+            // spoil record below sees a record the right operand ends.
+            recordPendingCondTypeFacts(be->left.get(), /*forTrueBranch=*/true);
             // #6115: what the left operand established, before the right
             // operand's evaluation can invalidate it.
             auto seededNull = nullNarrowed_;
@@ -9452,6 +9455,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/false);
+            // pending #6083: the left operand's test records too, so the
+            // spoil record below sees a record the right operand ends.
+            recordPendingCondTypeFacts(be->left.get(), /*forTrueBranch=*/false);
             // #6115: what the left operand established, before the right
             // operand's evaluation can invalidate it.
             auto seededNull = nullNarrowed_;
@@ -11076,6 +11082,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             if (dynamic_cast<LocalSymbol*>(asym) ||
                                 dynamic_cast<ParameterSymbol*>(asym)) {
                                 narrowings_.erase(asym);
+                                erasePendingTypeFact(asym);  // pending #6083
                                 nullNarrowed_.erase(asym);
                                 initNarrowed_.erase(asym);  // init-narrowing (§6.6) also invalidated by out/ref
                                 // §7.4 v0.214 (#2085/#2116): the callee may
@@ -13126,6 +13133,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             }
         };
         for (const auto& arm : ce->arms) {
+            // pending #6083, shape (2) — see ExprTypecheck_impl.hpp.
+            PendingArmTypeFact pendingArmFact(*this, ce->scrutinee.get(),
+                                              arm.pattern.get());
             fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
             // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
             // boolean CONDITION expression (a ConstantPattern) — typecheck its

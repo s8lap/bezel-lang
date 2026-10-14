@@ -442,10 +442,14 @@ BEZEL_TEST(sema_primitive_boxes_into_builtin_iface_2765,
     BEZEL_EXPECT_TRUE(!hasError(r, kNotConvertible));
 }
 
-// #2765 control: `Object` → a USER interface, and `Object` → `string`. The
-// broadest false-reject guard on the early-return.
+// fix #6023 (§5.1 "Reference conversions", §4.6, v0.338) FLIPPED this row. It
+// pinned `Object` → a USER interface and `Object` → `string` as ACCEPTED;
+// both are downcasts §5.1 does not list and both are now rejected, once per
+// site, with the general downcast wording — never #2765's. (`Object` →
+// `IEquatable<string>`, the row above, stays accepted: the checked `is`/`as`
+// spelling does not work for a synthesized built-in interface yet, #6073.)
 BEZEL_TEST(sema_primitive_boxes_into_builtin_iface_2765,
-           object_into_user_interface_and_string_accepted) {
+           object_into_user_interface_and_string_rejected_as_downcast_spec_5_1) {
     auto r = parseSemaAll(
         "module M; "
         "public interface IThing method Ping(): int; end IThing; "
@@ -462,7 +466,9 @@ BEZEL_TEST(sema_primitive_boxes_into_builtin_iface_2765,
         "  var s2: string := o2; "
         "  return i.Ping() - 5 + s2.Length - 2; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(!hasError(r, kNotConvertible));
+    BEZEL_EXPECT_TRUE(hasError(r, "`Object` to `IThing` is a downcast"));
+    BEZEL_EXPECT_TRUE(hasError(r, "`Object` to `string` is a downcast"));
+    BEZEL_EXPECT_TRUE(!hasError(r, kObjectView));
 }
 
 // #2765 control / #3022: a USER interface named `IEquatable`, instantiated at

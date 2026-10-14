@@ -3097,6 +3097,72 @@ private:
         }
     };
 
+    // pending #6083 (§7.4 / §12.7 / §19.1, v0.338) — two shapes whose type
+    // narrowing the spec text does not settle:
+    //   (1) the code after an `if` statement on whose every surviving path a
+    //       type test of `x` held — `if x is not T then return; end;`, the
+    //       same with `throw`/`break`/`continue`, with `elif`/`else` branches
+    //       that leave too, and the positive spelling
+    //       `if x is T then … else return; end;` — and
+    //   (2) the scrutinee carrier inside a type-pattern arm
+    //       (`case x of T => …`, `case x of var q: T => …`).
+    // Neither is a §12.7 narrowing in this compiler: `x` keeps its declared
+    // type there, exactly as before. What IS recorded, for a carrier whose
+    // DECLARED type is `Object` or a built-in exception class, is that the
+    // test happened — and the only reader is checkAssignable's two #6023
+    // downcast rejections, which decline to fire for `x` → `T` (or a base of
+    // `T`) while the record is in force. Those two conversions compiled and
+    // ran correctly before #6023 (through the unchecked downcast it removes),
+    // so rejecting them now would decide #6083 by side effect; a user-class
+    // carrier, which was already rejected here, records nothing and stays
+    // rejected. To be deleted in whichever direction #6083 is ruled.
+    //
+    // A record lives in `narrowings_` under a private KEY symbol — one per
+    // (carrier, tested type), never returned by any name lookup — so it is
+    // block-scoped, loop-joined and lambda-dropped by the machinery that
+    // already does that for a real narrowing, without a second set of
+    // snapshots at every site. No read consults a key, so it changes no
+    // expression's type. Two successive tests of one carrier
+    // (`if x is not B then return; end; if x is not A then return; end;`)
+    // hold two records, and either admits. The one site that machinery gets
+    // wrong for a real narrowing is the `if` statement's own join (#6113: it
+    // restores the entry map, so a fact a branch dropped comes back); the
+    // records are joined there separately (see the IfStmt handler), as the
+    // intersection of the surviving paths.
+    struct PendingTypeFactKey {
+        Symbol* key = nullptr;
+        TypeRef* tested = nullptr;
+    };
+    std::unordered_map<Symbol*, std::vector<PendingTypeFactKey>>
+        pendingTypeFactKeys_;
+    std::unordered_set<Symbol*> pendingTypeFactKeySet_;
+    bool isPendingTypeFactCarrier(Symbol* sym);
+    // Puts the record in force; returns its key (null when nothing recorded).
+    Symbol* recordPendingTypeFact(Symbol* carrier, TypeRef* fact);
+    void erasePendingTypeFact(Symbol* carrier);
+    // True iff `fromExpr` is a bare read of a carrier with a record in force
+    // whose tested type is `to` or converts to it by §5.1 (ignoring `?`).
+    bool pendingTypeFactAdmits(const ast::Expr* fromExpr, TypeRef* to);
+    // Shape (1): record the type tests `cond` establishes on its true path
+    // (`x is T`, and `and`-joined such tests) or on its false path
+    // (`x is not T`, and `or`-joined such tests — false only when every
+    // operand is false). `not (…)` records nothing either way (§7.4: a type
+    // fact is "never" established "by `not`-composition").
+    void recordPendingCondTypeFacts(const ast::Expr* cond, bool forTrueBranch);
+    // The records in force (the key entries of `narrowings_`).
+    std::unordered_map<Symbol*, TypeRef*> pendingTypeFactsInForce() const;
+    // Shape (2): RAII over one arm of a `case` with a scrutinee.
+    struct PendingArmTypeFact {
+        ExprTC& tc;
+        Symbol* key = nullptr;  // set only when this arm put the record in force
+        std::vector<Symbol*> addedMarks;  // #6114 loop-iteration marks it added
+        PendingArmTypeFact(ExprTC& t, const ast::Expr* scrutinee,
+                           const ast::Pattern* pattern);
+        PendingArmTypeFact(const PendingArmTypeFact&) = delete;
+        PendingArmTypeFact& operator=(const PendingArmTypeFact&) = delete;
+        ~PendingArmTypeFact();
+    };
+
     // §7.4 / §8.4 helper: if `cond` is a `<simple var> <> null` / `= null`
     // test that narrows in the requested branch (`<> null` narrows the true
     // branch, `= null` narrows the else branch — and `is not null` / `is null`
