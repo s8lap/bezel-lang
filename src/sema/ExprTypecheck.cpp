@@ -2458,6 +2458,43 @@ static bool sameInstantiationArg(const TypeRef* arm, const TypeRef* det) {
     return typeRefEqual(arm, det);
 }
 
+// §27.8 / §19.6 (#6193): does the alias's resolved target `pat` describe the
+// scrutinee type `act`? Structural over Named generic arguments; an alias type
+// parameter (a Named TypeRef with no declaration spelled as one of `params`)
+// is a wildcard bound on first use and must then agree with every other use.
+// Top-level nullability is ignored (the nullable rule is applied separately).
+static bool aliasTargetMatchesScrutinee(
+    const TypeRef* pat, const TypeRef* act,
+    const std::vector<ast::GenericParam>& params,
+    std::unordered_map<std::string_view, const TypeRef*>& bound, bool top) {
+    if (!pat || !act) return false;
+    if (pat->kind == TypeRef::Kind::Named && !pat->declaration &&
+        pat->genericArgs.empty() && pat->astNode && pat->astNode->name &&
+        pat->astNode->name->parts.size() == 1) {
+        std::string_view nm = pat->astNode->name->parts[0];
+        for (const auto& gp : params) {
+            if (gp.name != nm) continue;
+            auto it = bound.find(nm);
+            if (it == bound.end()) { bound.emplace(nm, act); return true; }
+            return typeRefEqual(it->second, act);
+        }
+    }
+    if (pat->kind != act->kind) return false;
+    if (!top && pat->nullable != act->nullable) return false;
+    if (pat->kind == TypeRef::Kind::Named) {
+        if (!pat->declaration) return typeRefEqual(pat, act);  // builtin
+        if (pat->declaration != act->declaration) return false;
+        if (pat->genericArgs.size() != act->genericArgs.size()) return false;
+        for (std::size_t i = 0; i < pat->genericArgs.size(); ++i)
+            if (!aliasTargetMatchesScrutinee(pat->genericArgs[i],
+                                             act->genericArgs[i], params,
+                                             bound, false))
+                return false;
+        return true;
+    }
+    return typeRefEqual(pat, act);
+}
+
 // §19.6 v0.196 (#1862): does the case arm whose resolved typed-binding type is
 // `armTy` COVER the DETERMINED generic leaf `leaf`, whose sole inhabiting
 // instantiation is `leaf<solution…>`? Arg-SENSITIVE: the arm must name `leaf`
@@ -3611,15 +3648,62 @@ bool ExprTC::caseArmsExhaustive(
         for (const auto& arm : arms) {
             // §19.6 / §19.4: a guarded arm contributes nothing.
             if (arm.guard) continue;
-            auto* dp = dynamic_cast<const ast::DestructuringPattern*>(
-                arm.pattern.get());
-            if (!dp || !dp->typeName || dp->typeName->parts.empty()) continue;
+            // §19.6 + §27.8 (#6193): a bare `type` alias head (`type PA := Pt;`
+            // then `PA(a, b)`, or a bare `PA` type pattern) names the record
+            // it aliases — an alias is a pure synonym. Resolve it with the
+            // shared head resolver, falling back to the spelled name when the
+            // head does not resolve to a single type in scope.
+            const ast::QualifiedName* headName = nullptr;
+            const ast::DestructuringPattern* dp = nullptr;
+            if (auto* d = dynamic_cast<const ast::DestructuringPattern*>(
+                    arm.pattern.get())) {
+                dp = d;
+                headName = d->typeName.get();
+            } else if (auto* np = dynamic_cast<const ast::NamedPattern*>(
+                           arm.pattern.get())) {
+                headName = np->name.get();
+            }
+            if (!headName || headName->parts.empty()) continue;
             // The pattern's head must name the scrutinee's own record type —
-            // a record has no subtypes, so this is a name match against the
-            // scrutinee's declaration, exactly as the Choice branch above
+            // a record has no subtypes, so this is an identity check against
+            // the scrutinee's declaration, exactly as the Choice branch above
             // matches a destructure's head against `sub->members` by name.
-            if (dp->typeName->parts.back() != sub->name) continue;
-            if (!slotsIrrefutable(*dp)) continue;  // refutable slot: no coverage
+            TypeSymbol* headTs = resolvePatternHeadTypeInScope(headName);
+            if (headTs ? headTs != sub : headName->parts.back() != sub->name)
+                continue;
+            // §27.8: an alias is a synonym for the WHOLE aliased type, type
+            // arguments included. The alias's resolved target is matched
+            // structurally against the scrutinee, the alias's own type
+            // parameters acting as consistently-bound wildcards
+            // (`type D<T> := Pair<T,T>;` does not cover `Pair<int,string>`).
+            // A mismatch keeps the base warning (the missing rejection of
+            // such an arm is #6216). A head that is not a resolvable alias is
+            // not compared here (#6193).
+            if (headTs) {
+                TypeAliasSymbol* al = nullptr;
+                if (headName->parts.size() == 1) {
+                    al = dynamic_cast<TypeAliasSymbol*>(
+                        lookupName(headName->parts.front()));
+                } else {
+                    for (const auto& sym : ctx_.symbols())
+                        if (auto* a = dynamic_cast<TypeAliasSymbol*>(sym.get()))
+                            if (a->name == headName->parts.back()) al = a;
+                }
+                const auto* ad =
+                    al ? dynamic_cast<const ast::TypeAlias*>(al->decl) : nullptr;
+                if (ad && ad->aliasedType) {
+                    const TypeRef* ar = ctx_.resolvedType(*ad->aliasedType);
+                    std::unordered_map<std::string_view, const TypeRef*> bound;
+                    if (!scrutTy || !aliasTargetMatchesScrutinee(
+                                        ar, scrutTy, ad->genericParams, bound,
+                                        /*top=*/true))
+                        continue;
+                }
+            }
+            // A bare type pattern naming the exact type always matches a
+            // non-nullable record value (§19.3); a destructure needs every
+            // slot irrefutable.
+            if (dp && !slotsIrrefutable(*dp)) continue;
             if (!scrutTy->nullable || armsCoverNull(arms)) return true;
             // Non-null fully covered by the destructure, but null is not
             // (§19.6 nullable rule: "the rules above plus an explicit

@@ -2194,3 +2194,489 @@ BEZEL_TEST(sema_case_exhaust,
         "end C;");
     BEZEL_EXPECT_TRUE(hasReturnEveryPathError(r));
 }
+
+// --- §19.6 record exhaustiveness through a type alias (#6193) ---------------
+// §19.6 "Record scrutinee": an unguarded destructure "whose head names that
+// type" with every slot irrefutable, or "a type pattern naming that exact
+// type", needs no `_`. §27.8: "A type alias is a pure synonym" / aliases "see
+// through to the aliased type for identity". The head is compared by
+// alias-resolved type, not spelling. Warning ABSENCE is asserted via sema's
+// own diagnostics (parseSemaAll), which carries warnings for accepted programs.
+
+BEZEL_TEST(sema_case_exhaust, record_alias_head_destructure_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      PA(a, b) => a * 10 + b); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_alias_bare_type_pattern_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      PA => 5); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_unaliased_bare_type_pattern_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      Pt => 5); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_chained_alias_head_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        "type PB := PA; "
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      PB(a, _) => a); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_alias_head_discard_slots_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      PA(_, _) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_alias_head_refutable_slot_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      PA(1, b) => b); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_alias_head_guarded_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      PA(a, b) when a > 0 => a); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_alias_head_nullable_without_null_arm_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt?): int "
+        "    return (case p of "
+        "      PA(a, b) => a); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_alias_head_nullable_with_null_arm_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        ""
+        "class C "
+        "  public static method F(p: Pt?): int "
+        "    return (case p of "
+        "      PA(a, b) => a, null => 0); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// Control: an alias to a DIFFERENT record does not cover the scrutinee.
+BEZEL_TEST(sema_case_exhaust, record_alias_to_other_record_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "record Qt(X: int, Y: int); "
+        "type QA := Qt; "
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      QA(a, b) => a); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+}
+
+// Control: choice exhaustiveness through an alias head (already correct).
+BEZEL_TEST(sema_case_exhaust, choice_alias_head_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "choice Sh { Circle(R: int), Sq(S: int) } "
+        "type SA := Sh; "
+        "class C "
+        "  public static method F(s: Sh): int "
+        "    return (case s of "
+        "      SA.Circle(r) => r, SA.Sq(q) => q); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+}
+
+// Module-qualified alias head (`M.PA(...)`, alias declared in this module M).
+BEZEL_TEST(sema_case_exhaust, record_module_qualified_alias_head_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pt(X: int, Y: int); "
+        "type PA := Pt; "
+        "class C "
+        "  public static method F(p: Pt): int "
+        "    return (case p of "
+        "      M.PA(a, b) => a + b); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+}
+
+// --- #6193 N1: the alias head is compared by FULL type identity, type
+// arguments included (§27.8 "pure synonym" of the whole aliased type). A
+// mismatching instantiation keeps the base warning; no new error is added
+// (the missing rejection of such an arm is tracked separately, #6216).
+// The pattern head grammar carries no type arguments, so `B<int>(v)` is not
+// a pattern; a generic alias is used as `B(v)`.
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_matching_args_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type BI := Box<int>; "
+        "class C "
+        "  public static method F(p: Box<int>): int "
+        "    return (case p of "
+        "      BI(v) => v); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_mismatched_args_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type BS := Box<string>; "
+        "class C "
+        "  public static method F(p: Box<int>): int "
+        "    return (case p of "
+        "      BS(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_bare_mismatched_args_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type BS := Box<string>; "
+        "class C "
+        "  public static method F(p: Box<int>): int "
+        "    return (case p of "
+        "      BS => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_open_generic_alias_head_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type B<T> := Box<T>; "
+        "class C "
+        "  public static method F(p: Box<int>): int "
+        "    return (case p of "
+        "      B(v) => v); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_open_generic_alias_head_string_scrutinee_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type B<T> := Box<T>; "
+        "class C "
+        "  public static method F(p: Box<string>): int "
+        "    return (case p of "
+        "      B(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_unaliased_generic_head_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); "
+        "class C "
+        "  public static method F(p: Box<int>): int "
+        "    return (case p of "
+        "      Box(v) => v); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_nested_generic_alias_matching_args_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); record Wrap<T>(B: Box<T>); type WI := Wrap<int>; "
+        "class C "
+        "  public static method F(p: Wrap<int>): int "
+        "    return (case p of "
+        "      WI(b) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_nested_generic_alias_mismatched_args_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); record Wrap<T>(B: Box<T>); type WS := Wrap<string>; "
+        "class C "
+        "  public static method F(p: Wrap<int>): int "
+        "    return (case p of "
+        "      WS(b) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+
+// --- #6193 N1 (round 2): the alias's WHOLE resolved target is matched
+// structurally against the scrutinee, the alias's own type parameters being
+// consistently-bound wildcards; fixed or partial args inside a GENERIC alias
+// and 3-part heads are compared too. Mismatches keep the base warning.
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_fixed_arg_mismatch_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type BI<T> := Box<int>; "
+        "class C "
+        "  public static method F(p: Box<string>): int "
+        "    return (case p of "
+        "      BI(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_fixed_arg_match_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type BI<T> := Box<int>; "
+        "class C "
+        "  public static method F(p: Box<int>): int "
+        "    return (case p of "
+        "      BI(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_nested_fixed_mismatch_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type W<T> := Box<Box<int>>; "
+        "class C "
+        "  public static method F(p: Box<Box<string>>): int "
+        "    return (case p of "
+        "      W(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_nested_fixed_match_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type W<T> := Box<Box<int>>; "
+        "class C "
+        "  public static method F(p: Box<Box<int>>): int "
+        "    return (case p of "
+        "      W(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_nested_open_param_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Box<T>(V: T); type W<T> := Box<Box<T>>; "
+        "class C "
+        "  public static method F(p: Box<Box<string>>): int "
+        "    return (case p of "
+        "      W(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_partial_mismatch_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pair<A, B>(L: A, R: B); type PI<T> := Pair<int, T>; "
+        "class C "
+        "  public static method F(p: Pair<string, int>): int "
+        "    return (case p of "
+        "      PI(a, b) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_partial_match_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pair<A, B>(L: A, R: B); type PI<T> := Pair<int, T>; "
+        "class C "
+        "  public static method F(p: Pair<int, string>): int "
+        "    return (case p of "
+        "      PI(a, b) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_repeated_param_mismatch_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pair<A, B>(L: A, R: B); type D<T> := Pair<T, T>; "
+        "class C "
+        "  public static method F(p: Pair<int, string>): int "
+        "    return (case p of "
+        "      D(a, b) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_generic_alias_repeated_param_match_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Pair<A, B>(L: A, R: B); type D<T> := Pair<T, T>; "
+        "class C "
+        "  public static method F(p: Pair<int, int>): int "
+        "    return (case p of "
+        "      D(a, b) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_three_part_head_mismatch_still_warns_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M.Sub; "
+        "record Box<T>(V: T); type BS := Box<string>; "
+        "class C "
+        "  public static method F(p: Box<int>): int "
+        "    return (case p of "
+        "      M.Sub.BS(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_TRUE(nonExhaustiveWarningMentions(r, "has no all-slots-irrefutable destructure or exact-type arm"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+BEZEL_TEST(sema_case_exhaust, record_three_part_head_match_ok_spec_19_6_alias_head_6193) {
+    auto r = parseSemaAll(
+        "module M.Sub; "
+        "record Box<T>(V: T); type BS := Box<string>; "
+        "class C "
+        "  public static method F(p: Box<string>): int "
+        "    return (case p of "
+        "      M.Sub.BS(v) => 1); "
+        "  end F; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(hasNonExhaustiveWarning(r));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
