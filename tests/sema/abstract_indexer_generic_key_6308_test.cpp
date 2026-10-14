@@ -296,6 +296,8 @@ public class Program
 end Program;
 )");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "does not implement interface `I`'s indexer"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
@@ -321,5 +323,7 @@ public class Program
 end Program;
 )");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "does not implement inherited abstract member `indexer`"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_FALSE(r.ran);
 }
