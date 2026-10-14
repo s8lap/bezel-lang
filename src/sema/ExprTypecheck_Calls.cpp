@@ -1108,7 +1108,8 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<std::string>& candNames, SourceLocation loc,
     const std::string& calleeDesc, const std::string& extraNote,
     const std::vector<const ast::Expr*>& argExprs,
-    const std::vector<bool>& isGeneric) {
+    const std::vector<bool>& isGeneric,
+    const std::vector<bool>& inferenceFailed) {
     OverloadResult res;
     const std::size_t nCand = paramTypes.size();
     const std::size_t nArg = argTypes.size();
@@ -1260,6 +1261,48 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     std::vector<std::size_t> appl;
     for (std::size_t c = 0; c < nCand; ++c)
         if (res.applicable[c]) appl.push_back(c);
+
+    // fix #6157 (§22.6 / §7, v0.338): a bare `null` argument is typed as the
+    // nullable-`Object` sentinel, which `classifyArg` relates to no nullable
+    // parameter other than `Object?` itself, so `G(null)` beside `G(T)` /
+    // `G(T?)` had no applicable candidate. Reached only when ordinary grading
+    // found none: `null` is then applicable to every nullable parameter, as a
+    // conversion (it is no parameter type's exact match), and to no
+    // non-nullable one. A call ordinary grading already resolves is never
+    // regraded, so no selection that compiled before changes.
+    if (appl.empty() && !argExprs.empty()) {
+        bool regraded = false;
+        std::vector<std::vector<ArgMatch>> g2 = grid;
+        for (std::size_t i = 0; i < nArg && i < argExprs.size(); ++i) {
+            if (!dynamic_cast<const ast::NullLiteralExpr*>(argExprs[i]))
+                continue;
+            regraded = true;
+            for (std::size_t c = 0; c < nCand; ++c) {
+                const TypeRef* pt = paramTypes[c][i];
+                g2[c][i] = !pt || pt->nullable ? ArgMatch::Convert
+                                               : ArgMatch::NotApplicable;
+            }
+        }
+        if (regraded) {
+            for (std::size_t c = 0; c < nCand; ++c) {
+                // §14.5: "a candidate whose inference fails is inapplicable
+                // and drops out" — a `T?` whose `T` nothing bound is not a
+                // nullable parameter the `null` can be graded against.
+                if (c < inferenceFailed.size() && inferenceFailed[c])
+                    continue;
+                bool ok = true;
+                for (std::size_t i = 0; i < nArg; ++i)
+                    if (g2[c][i] == ArgMatch::NotApplicable) ok = false;
+                if (ok) appl.push_back(c);
+            }
+            if (!appl.empty()) {
+                grid = std::move(g2);
+                for (std::size_t c = 0; c < nCand; ++c)
+                    res.applicable[c] = false;
+                for (std::size_t c : appl) res.applicable[c] = true;
+            }
+        }
+    }
 
     // §22.6 step 4: no applicable candidate → unreachable, no candidates
     // cited.
@@ -2106,6 +2149,15 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
             // candidate set before ranking runs.
             if (isBuiltinExceptionRef(dt) && isBuiltinExceptionRef(bt) &&
                 namedRefSimpleName(dt) != namedRefSimpleName(bt))
+                return false;
+            // fix #6157 (§22.6 / §12.1, v0.338): the nullability widening is
+            // an OVERRIDE allowance, so it relates a derived declaration to
+            // its base one. Two members of ONE type that differ by it
+            // (`G(x: string?)` declared before `G(x: string)`) are two
+            // overloads: §22.6 ranks them, and dropping the second left the
+            // `T?` body to run for a `T` argument.
+            if (d->parent == b->parent && dt && bt &&
+                dt->nullable != bt->nullable)
                 return false;
             // fix #6001 R1 (§12.2 / §12.1, v0.338): a base member declared
             // on a GENERIC base is compared at the instantiation the derived
@@ -2974,14 +3026,30 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         // sees null and bypasses the re-type for the discard column
         // (consistency with the existing `narrowIntConstantToTarget`
         // pre-pass above, which already skips !carg->value).
+        // Column order (`argIdxRows[0]`), so `argExprs[i]` is the argument
+        // behind `argTypes[i]` for a named or defaulted binding too.
         [&]() {
             std::vector<const ast::Expr*> es;
-            es.reserve(ce.args.size());
-            for (const auto& a : ce.args)
-                es.push_back(a.value.get());
+            es.reserve(argIdxRows[0].size());
+            for (int ai : argIdxRows[0])
+                es.push_back(ce.args[static_cast<std::size_t>(ai)].value.get());
             return es;
         }(),
-        isGenericCand);
+        isGenericCand,
+        // A generic candidate whose ranked row still names one of its own
+        // type parameters: phase-1 inference bound nothing for it (§14.5).
+        [&]() {
+            std::vector<bool> failed(cands.size(), false);
+            for (std::size_t c = 0; c < cands.size(); ++c) {
+                if (cands[c]->genericParams.empty()) continue;
+                std::unordered_set<std::string_view> gp;
+                for (Symbol* g : cands[c]->genericParams)
+                    if (g) gp.insert(g->name);
+                for (const TypeRef* pt : paramTypes[c])
+                    if (containsMethodTypeParam(pt, gp)) failed[c] = true;
+            }
+            return failed;
+        }());
     // fix #5859 (§22.6 / §5.1 / §31.4, v0.334): §22.6's ranking is
     // `Undecidable` — and so decides NOTHING — whenever an ARGUMENT's type is
     // a BUILT-IN CLASS REFERENCE. Such a type is a `TypeRef::Kind::Named`

@@ -3640,7 +3640,8 @@ private:
         const std::string& extraNote = std::string(),
         const std::vector<const ast::Expr*>& argExprs =
             std::vector<const ast::Expr*>(),
-        const std::vector<bool>& isGeneric = std::vector<bool>());
+        const std::vector<bool>& isGeneric = std::vector<bool>(),
+        const std::vector<bool>& inferenceFailed = std::vector<bool>());
 
     // §22.6 method-overload resolution. Given the initially-resolved
     // MethodSymbol for a call and the call site, returns the MethodSymbol
