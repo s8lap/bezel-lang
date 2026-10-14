@@ -31841,6 +31841,11 @@ bool ExprTC::exprCaptures(const ast::Expr& e,
         if (co->condition && exprCaptures(*co->condition, ownParamSyms)) return true;
         if (co->thenValue && exprCaptures(*co->thenValue, ownParamSyms)) return true;
         if (co->elseValue && exprCaptures(*co->elseValue, ownParamSyms)) return true;
+    } else if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        // per §30.14: a capture written only inside `$"..."` (e.g. `$"c={n}"`)
+        // is a capture of the Spawn entry lambda, exactly like a bare `n`.
+        for (const auto& part : is->parts)
+            if (part.expr && exprCaptures(*part.expr, ownParamSyms)) return true;
     } else if (auto* innerLam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         // A nested lambda: it has its OWN params; captures from its perspective
         // may or may not propagate. For Domain.Spawn capture check, a nested
