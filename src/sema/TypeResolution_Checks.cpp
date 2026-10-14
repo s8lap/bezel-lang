@@ -8114,6 +8114,9 @@ void Resolver::checkAbstractImplementations() {
         struct IfaceIndexerObligation {
             PropertySymbol* ips;
             TypeSymbol* iface;
+            // #6129: the substitution this visit's instantiation induces
+            // (`: I<int>` -> {T -> int}), applied to the ELEMENT type compare.
+            SubstMap subst;
         };
         std::vector<IfaceIndexerObligation> ifaceIndexerObligations;
         // #2186: BFS over the inheritance chain tracking the per-node
@@ -8375,7 +8378,7 @@ void Resolver::checkAbstractImplementations() {
                         for (auto mod : ps->modifiers)
                             if (mod == "static") { isStaticIdx = true; break; }
                         if (curIsIface && !isStaticIdx) {
-                            ifaceIndexerObligations.push_back({ps, cur});
+                            ifaceIndexerObligations.push_back({ps, cur, curSubst});
                         } else if (!curIsIface && !isStaticIdx &&
                                    hasMod(ps, "abstract")) {
                             // fix #3641 / §12.5: "`abstract` on a member ...
@@ -8398,7 +8401,7 @@ void Resolver::checkAbstractImplementations() {
                             // #2449 machinery) is exactly the same search a
                             // §12.5 obligation needs; only the reported
                             // diagnostic differs by `obl.iface->kind` below.
-                            ifaceIndexerObligations.push_back({ps, cur});
+                            ifaceIndexerObligations.push_back({ps, cur, curSubst});
                         }
                         continue;  // indexers have no name; concrete side is
                                    // matched directly off `t->members` below,
@@ -9671,6 +9674,53 @@ void Resolver::checkAbstractImplementations() {
         // Indexer case from `MetaMember::hasSetter`) otherwise. No new
         // metadata bit is needed — every imported indexer obligation is
         // fully reconstructable from what #2414 + #2400 already publish.
+        // #6129 / #6130, §11.2 (v0.338): a property's type is its member's
+        // return, and "Return types must match exactly (no covariance in this
+        // version)". `isub`/`csub` are the interface's and the implementation's
+        // declared types, each already substituted through its own
+        // instantiation. Same exactness rule the method return compare uses
+        // (function types structurally, everything else by typesMatch).
+        auto propTypeMatches = [&](const TypeRef* isub,
+                                   const TypeRef* csub) -> bool {
+            if (!isub || !csub) return true;  // unresolved: never a new reject
+            if (isub->kind == TypeRef::Kind::Error ||
+                csub->kind == TypeRef::Kind::Error)
+                return true;
+            if (isub->kind == TypeRef::Kind::Function &&
+                csub->kind == TypeRef::Kind::Function)
+                return declLessArgMatch(isub, csub, nullptr, nullptr);
+            return typesMatch(isub, csub);
+        };
+        // The declared type of `ps` read through `subst` (the impl-side
+        // substitution of the class that declares it, or the interface
+        // visit's).
+        auto propTypeUnder = [&](const TypeRef* ty,
+                                 const SubstMap& subst) -> const TypeRef* {
+            if (!ty) return nullptr;
+            return substGenericArg(const_cast<TypeRef*>(ty), subst);
+        };
+        auto classSubstOf = [&](const PropertySymbol* ps) -> SubstMap {
+            SubstMap m;
+            if (ps && ps->parent) {
+                auto it = classSubst.find(ps->parent);
+                if (it != classSubst.end()) m = it->second;
+            }
+            return m;
+        };
+        // #6129: the declared type of a property or indexer, local or imported.
+        auto propType = [&](PropertySymbol* ps) -> const TypeRef* {
+            // SEAM-ACCESSOR: the `propType` lambda already falls back to
+            // ctx_.importedMemberType(ps) when `pd` is null — see the comment 15
+            // lines above and the `return ctx_.importedMemberType(ps);` line just
+            // below (fix #3152's audit family for the §11.2 property-type check).
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (pd) {
+                if (!pd->type) return nullptr;
+                return ctx_.resolvedType(*pd->type);
+            }
+            return ctx_.importedMemberType(ps);
+        };
+
         for (auto& obl : ifaceIndexerObligations) {
             PropertySymbol* ips = obl.ips;
             // SEAM-ACCESSOR: fix #2414/#2529 (family of #3152): `ifaceParamCount`/`ifaceParamTy`
@@ -9905,6 +9955,35 @@ void Resolver::checkAbstractImplementations() {
             // so nothing else checks it.
             if (!obligationIsInterface) continue;
 
+            // #6129 / §11.2 (v0.338): "A read-write member satisfies a read-only
+            // interface member of the same name and type" and "Return types must
+            // match exactly (no covariance in this version)": an indexer's
+            // ELEMENT type is its return. The parameter list picked the
+            // candidate above; the element type was never compared, so
+            // `readonly property [i: int]: int` was satisfied by
+            // `property [i: int]: string`. The indexer PARAMETER compare is
+            // untouched (#6131).
+            {
+                const TypeRef* ielem = propType(ips);
+                const TypeRef* celem = propType(candidate);
+                if (ielem && celem &&
+                    !propTypeMatches(propTypeUnder(ielem, obl.subst),
+                                     propTypeUnder(celem,
+                                                   classSubstOf(candidate)))) {
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        ctx_.isImported(candidate) ? t->declLoc
+                                                   : candidate->declLoc,
+                        std::string("indexer implements interface `") +
+                        std::string(obl.iface->name) +
+                        "` with a different element type than the interface "
+                        "declares \xE2\x80\x94 the element type does not match "
+                        "exactly (no covariance) under the interface's "
+                        "substitution (\xC2\xA7""11.2 / \xC2\xA7""23.4)");
+                    continue;
+                }
+            }
+
             if (!ifaceHasSetter())
                 continue;  // read-only obligation, candidate found: satisfied
 
@@ -9975,18 +10054,7 @@ void Resolver::checkAbstractImplementations() {
             // imported `Name: int` interface property compiled clean and,
             // read through the interface reference, produced a garbage `int`
             // off the string's representation).
-            auto propType = [&](PropertySymbol* ps) -> const TypeRef* {
-                // SEAM-ACCESSOR: the `propType` lambda already falls back to
-                // ctx_.importedMemberType(ps) when `pd` is null — see the comment 15
-                // lines above and the `return ctx_.importedMemberType(ps);` line just
-                // below (fix #3152's audit family for the §11.2 property-type check).
-                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                if (pd) {
-                    if (!pd->type) return nullptr;
-                    return ctx_.resolvedType(*pd->type);
-                }
-                return ctx_.importedMemberType(ps);
-            };
+            // (`propType` is defined above the indexer loop, #6129.)
             for (auto& [name, info] : ifaceProps) {
                 PropertySymbol* ips = info.first;
                 TypeSymbol* iface = info.second;
