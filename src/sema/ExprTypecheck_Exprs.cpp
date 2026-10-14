@@ -779,6 +779,10 @@ void ExprTC::collectLambdaReturnTypeFromStmt(const ast::Stmt* s,
                                              std::vector<TypeRef*>& out) {
     if (!s) return;
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+        // per §27.3: count the return forms syntactically, independent of
+        // whether the operand's type resolved (an unresolved operand is
+        // already diagnosed, and still makes this a value-carrying return).
+        if (rs->value) ++lamScanValueReturns_; else ++lamScanBareReturns_;
         if (rs->value)
             if (auto* t = ctx_.exprType(*rs->value)) out.push_back(t);
         return;
@@ -12625,7 +12629,26 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // divergent value-return types is a compile error — the
                 // compiler does not unify them to a common supertype.
                 std::vector<TypeRef*> returnTypes;
+                lamScanValueReturns_ = 0;
+                lamScanBareReturns_ = 0;
                 collectLambdaReturnTypes(lam->stmts, returnTypes);
+                const bool lamHasValueReturn = lamScanValueReturns_ > 0;
+                const bool lamHasBareReturn = lamScanBareReturns_ > 0;
+                // per §27.3 *Which block-bodied lambdas return a value*
+                // (v0.338): "A body where one path returns a value and
+                // another exits without one is a compile error, the same
+                // totality rule as for methods." Reuses the method rule's
+                // bodyAlwaysExits (§21.7); a bare `return;` beside a value
+                // return is the other spelling of the same mixed body.
+                if (lamHasValueReturn &&
+                    (lamHasBareReturn || !bodyAlwaysExits(lam->stmts))) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, lam->span.begin,
+                        "a block-bodied lambda has a path that returns a "
+                        "value and a path that exits without one \xe2\x80\x94 "
+                        "return a value on every path, or on none "
+                        "(\xc2\xa7""27.3, \xc2\xa7""21.7)");
+                }
                 if (!returnTypes.empty())
                     inferredReturn = returnTypes.front();
                 // Fallback: use int (i32) for lambdas with no visible value

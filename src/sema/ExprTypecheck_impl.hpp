@@ -981,6 +981,10 @@ private:
         std::vector<TypeRef*>& out);
     void collectLambdaReturnTypeFromStmt(const ast::Stmt* s,
                                          std::vector<TypeRef*>& out);
+    // per §27.3: syntactic counts of value-carrying / bare `return`s seen by
+    // the last collectLambdaReturnTypes walk (caller resets before the walk).
+    int lamScanValueReturns_ = 0;
+    int lamScanBareReturns_ = 0;
 
     // per §24: the payload type of an event-handler call's callee, or null
     // when `callee` is not `<event>.Subscribe/.Add/.Remove`. Used to set
