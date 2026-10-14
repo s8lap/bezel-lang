@@ -44609,6 +44609,77 @@ void Emitter::setupBoxDescriptors() {
     // { vtable*, i64 rc, record-bytes } (#422); the record bytes start TWO
     // words in. Each itable entry is a small thunk that advances `this` past
     // both words then tail-calls the real method.
+
+    // narrow #5924 item 3 (§9.2 / §35.7, v0.338): the box `Object`-slot
+    // thunks of a record or choice that DECLARES its equality pair. Equals,
+    // `i1(ptr self, ptr other)`: a null `other`, or one whose word 0 is not
+    // the receiver's own vtable (another type, a string — the one-load test
+    // boxRecordEqualsThunkCore uses, fix #2980), is unequal without the body
+    // running; otherwise the declared `Equals(other: T)` runs on the two
+    // payloads (two words past the box header). `this` is the payload's
+    // address, as every box thunk passes it; the parameter is the payload's
+    // address or its loaded value, per the member's own lowering.
+    auto boxDeclaredEqualsThunk = [&](const sema::TypeSymbol* ts,
+                                      llvm::Function* userEq) {
+        llvm::FunctionType* uty = userEq->getFunctionType();
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+        auto* thunk = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage,
+            "bz$boxeq$declared$" + std::string(ts->name), module_.get());
+        auto* entry   = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+        auto* nonNull = llvm::BasicBlock::Create(llvm_, "beq.nonnull", thunk);
+        auto* check   = llvm::BasicBlock::Create(llvm_, "beq.check", thunk);
+        auto* end     = llvm::BasicBlock::Create(llvm_, "beq.end", thunk);
+        llvm::Value* self  = thunk->getArg(0);
+        llvm::Value* other = thunk->getArg(1);
+        llvm::IRBuilder<> tb(entry);
+        tb.CreateCondBr(
+            tb.CreateICmpEQ(other, llvm::ConstantPointerNull::get(ptrTy())),
+            end, nonNull);
+        tb.SetInsertPoint(nonNull);
+        tb.CreateCondBr(
+            tb.CreateICmpEQ(tb.CreateLoad(ptrTy(), other, "beq.ovtbl"),
+                            tb.CreateLoad(ptrTy(), self, "beq.svtbl")),
+            check, end);
+        tb.SetInsertPoint(check);
+        auto payload = [&](llvm::Value* box, unsigned param,
+                           const char* nm) -> llvm::Value* {
+            llvm::Value* p = tb.CreateGEP(
+                ptrTy(), box, {llvm::ConstantInt::get(i32(), 2)}, nm);
+            llvm::Type* pty = uty->getParamType(param);
+            return pty->isPointerTy() ? p : tb.CreateLoad(pty, p);
+        };
+        llvm::Value* sv = payload(self, 0, "beq.spay");
+        llvm::Value* ov = payload(other, 1, "beq.opay");
+        llvm::Value* eq = tb.CreateCall(uty, userEq, {sv, ov}, "beq.user");
+        tb.CreateBr(end);
+        tb.SetInsertPoint(end);
+        auto* phi = tb.CreatePHI(i1(), 3, "beq.res");
+        phi->addIncoming(tb.getFalse(), entry);    // other is null
+        phi->addIncoming(tb.getFalse(), nonNull);  // other is not a boxed T
+        phi->addIncoming(eq, check);               // the declared member
+        tb.CreateRet(phi);
+        return thunk;
+    };
+    // GetHashCode, `i32(ptr self)`: the declared `GetHashCode()` on the
+    // payload.
+    auto boxDeclaredHashThunk = [&](const sema::TypeSymbol* ts,
+                                    llvm::Function* userHash) {
+        llvm::FunctionType* uty = userHash->getFunctionType();
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+        auto* thunk = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage,
+            "bz$boxhash$declared$" + std::string(ts->name), module_.get());
+        llvm::IRBuilder<> tb(llvm::BasicBlock::Create(llvm_, "entry", thunk));
+        llvm::Value* p = tb.CreateGEP(
+            ptrTy(), thunk->getArg(0), {llvm::ConstantInt::get(i32(), 2)},
+            "bhash.pay");
+        llvm::Type* pty = uty->getParamType(0);
+        tb.CreateRet(tb.CreateCall(
+            uty, userHash, {pty->isPointerTy() ? p : tb.CreateLoad(pty, p)}));
+        return thunk;
+    };
+
     for (const sema::TypeSymbol* ts : boxSupersKeys) {
         auto& supers = supersOf[ts];
         std::unordered_set<const sema::TypeSymbol*> superSet(supers.begin(),
@@ -44980,7 +45051,29 @@ void Emitter::setupBoxDescriptors() {
         bool choiceNeedsDefaultEquals =
             ts->kind == ast::TypeDeclKind::Choice &&
             !sema::isAutoEqualityBearingChoice(ts, ctx_);
-        if (choiceNeedsDefaultEquals) {
+        // narrow #5924 item 3 (§9.2 / §35.7, v0.338): a record's or a
+        // choice's DECLARED own-typed `Equals` with `GetHashCode` fills the
+        // box's `Object` slots — "the one member that fills the kind's
+        // `Object` slot", and through the slot "the member runs only on a
+        // `T` payload and any other argument compares unequal without the
+        // body running" (§9.2). The structural thunks below consult no user
+        // member, so a boxed value answered by its fields while a direct
+        // call, a hash container and an interface-dispatched `GetHashCode`
+        // answered by the declaration. An enum's thunks already reach its
+        // declared members (emitEnumEquals / emitEnumHashCode, §10.5).
+        // Non-generic kinds only: a generic record's slots are filled per
+        // instantiation (specializedBoxVtableFor) and stay as they were.
+        llvm::Function* declaredEq = nullptr;
+        llvm::Function* declaredHash = nullptr;
+        bool declaredPair =
+            (ts->kind == ast::TypeDeclKind::Record ||
+             ts->kind == ast::TypeDeclKind::Choice) &&
+            ts->genericParams.empty() &&
+            userValueEqualityPair(ts, declaredEq, declaredHash);
+        if (declaredPair) {
+            elems[kEqualsSlot]      = boxDeclaredEqualsThunk(ts, declaredEq);
+            elems[kGetHashCodeSlot] = boxDeclaredHashThunk(ts, declaredHash);
+        } else if (choiceNeedsDefaultEquals) {
             elems[kEqualsSlot]      = boxDefaultEqualsThunk();
             elems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
         } else {
