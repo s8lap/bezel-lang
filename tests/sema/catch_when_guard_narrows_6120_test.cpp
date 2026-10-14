@@ -443,15 +443,19 @@ BEZEL_TEST(sema_catch_when_guard_narrows_6120,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("9 -1\n"));
 }
 
-// ACCEPT.
+// UNCHANGED PENDING #6141. §7.4 (v0.338) admits the narrowing (the call
+// precedes the test), but `q` is mutably captured, so the catch guard keeps
+// base behaviour (ArmGuardFacts::seed's #6141 carve-out) and the program is
+// rejected exactly as on base. When #6141 lands this row flips back to an
+// accept row printing "-1 9".
 BEZEL_TEST(sema_catch_when_guard_narrows_6120,
-           captured_call_before_the_test_in_the_catch_guard_spec_7_4) {
+           captured_call_before_the_test_in_the_catch_guard_spec_7_4_unchanged_pending_6141) {
     auto r = runGuarded(R"bzl(var mut := lambda(): bool => do q := alt; return true; end;
     try Th(k); catch var c: Exception when mut() and q is B => do return q.y; end, var c2: Exception => do return -1; end end try;
     return -2;)bzl");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("-1 9\n"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "no member `y` on type `A`"));
 }
 
 // ACCEPT.

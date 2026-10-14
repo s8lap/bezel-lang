@@ -445,18 +445,20 @@ BEZEL_TEST(sema_when_guard_narrows_6082,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("9 -9\n"));
 }
 
-// ACCEPT.
+// UNCHANGED PENDING #6141. The call precedes the test, so §7.4 (v0.338) admits
+// the narrowing, but `q` is mutably captured: the guard keeps base behaviour
+// (ArmGuardFacts::seed's #6141 carve-out) and the program is rejected exactly
+// as on base. When #6141 lands this row flips back to an accept row printing
+// "-9 9".
 BEZEL_TEST(sema_when_guard_narrows_6082,
-           captured_call_before_the_test_in_the_guard_spec_7_4) {
+           captured_call_before_the_test_in_the_guard_spec_7_4_unchanged_pending_6141) {
     auto r = runGuarded(R"bzl(var q: A := o; var mut := lambda(): bool => do q := alt; return true; end;
     case k of
       _ when mut() and q is B => do return q.y; end,
       _ => do return -9; end
     end case;
     return -7;)bzl");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("-9 9\n"));
+    expectRejected(r, kNoMemberY);
 }
 
 // ACCEPT. The read precedes the reassignment.
@@ -528,4 +530,54 @@ end P;
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "no member `y` on type `A`"));
+}
+
+// The same carve-out keyed on ANY write to the captured local inside a lambda,
+// whatever the right-hand side: each spelling below leaked 32 B on the
+// commit that keyed it on a bare `new` only (review of #6023, F1). Each is
+// rejected exactly as on base until #6141 lands.
+namespace {
+JitResult runCapturedWrite(const char* lambdaBody) {
+    return runAot(std::string(kPrelude) + R"bzl(public class P
+  public static method Mk(): A => new A();
+  public static method T(k: int, o: A): int
+    var q: A := o;
+    var mut := lambda() => do )bzl" + lambdaBody + R"bzl( end;
+    case k of
+      _ when q is B => do return q.y; end,
+      _ => do mut(); return -9; end
+    end case;
+    return -7;
+  end T;
+  public static method Main(): int
+    Console.WriteLine($"{T(0, new B())} {T(0, new A())} {T(1, new B())} {T(1, new A())}");
+    return 0;
+  end Main;
+end P;
+)bzl");
+}
+}  // namespace
+
+BEZEL_TEST(sema_when_guard_narrows_6082,
+           guard_of_local_a_lambda_assigns_a_call_result_spec_7_4_unchanged_pending_6141) {
+    auto r = runCapturedWrite("q := Mk();");
+    expectRejected(r, kNoMemberY);
+}
+
+BEZEL_TEST(sema_when_guard_narrows_6082,
+           guard_of_local_a_lambda_assigns_an_if_expression_spec_7_4_unchanged_pending_6141) {
+    auto r = runCapturedWrite("q := (if true then new A() else new A());");
+    expectRejected(r, kNoMemberY);
+}
+
+BEZEL_TEST(sema_when_guard_narrows_6082,
+           guard_of_local_a_lambda_assigns_a_case_expression_spec_7_4_unchanged_pending_6141) {
+    auto r = runCapturedWrite("q := (case 0 of 0 => new A(), _ => new A());");
+    expectRejected(r, kNoMemberY);
+}
+
+BEZEL_TEST(sema_when_guard_narrows_6082,
+           guard_of_local_a_lambda_moves_a_local_into_spec_7_4_unchanged_pending_6141) {
+    auto r = runCapturedWrite("var w := new A(); q := move w;");
+    expectRejected(r, kNoMemberY);
 }

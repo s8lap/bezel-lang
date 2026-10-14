@@ -466,9 +466,6 @@ private:
     // source text); matched against a narrowed symbol's `name`. Empty in the
     // common case, which makes the per-op invalidation a cheap no-op.
     std::unordered_set<std::string_view> mutablyCapturedNames_;
-    // pending #6141: the subset of mutablyCapturedNames_ that a lambda
-    // assigns a `new …` (ArmGuardFacts::seed's carve-out).
-    std::unordered_set<std::string_view> newAssignCapturedNames_;
 
     // §22.5 (issue #1160): while type-checking parameter i's default-value
     // expression, that parameter and every parameter declared AFTER it are out
@@ -3088,14 +3085,15 @@ private:
                     ++it;
                     continue;
                 }
-                // pending #6141: a guard's type test of a local that a
-                // lambda assigns a `new …` keeps base behaviour (no narrowing
-                // of the arm body), although §7.4 (v0.338) admits it while no
-                // call intervenes. Narrowing it makes such programs compile,
-                // and the lambda's assignment leaks (#6141). Remove this
+                // pending #6141: a guard's type test of a mutably captured
+                // local (any write inside a lambda, whatever the right-hand
+                // side) keeps base behaviour (no narrowing of the arm body),
+                // although §7.4 (v0.338) admits it while no call intervenes.
+                // Narrowing it makes such programs compile, and a lambda's
+                // assignment of an owned value leaks (#6141). Remove this
                 // carve-out when #6141 lands.
                 if (it->first &&
-                    tc.newAssignCapturedNames_.count(it->first->name)) {
+                    tc.mutablyCapturedNames_.count(it->first->name)) {
                     if (e != entryTypes.end()) {
                         it->second = e->second;
                         ++it;
