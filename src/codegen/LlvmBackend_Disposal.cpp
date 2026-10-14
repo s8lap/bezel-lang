@@ -1395,6 +1395,33 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 builder_.CreateCall(dynFn, {val});
                 continue;
             }
+            // fix #6270 (§28.5 / §28.11, v0.338): a borrowing `Set<T>` whose
+            // element is generic-dict-eligible is bz_dict_t*-backed at
+            // construction (genericBackingType: records, non-nullable
+            // primitives/enums, strings), not bz_array_t*-backed.
+            // bz_array_free on that table freed the header but leaked the
+            // insertion-order array and every key copy (68 B per instance at
+            // T=int). Free it exactly as a `using var` Set local does: release
+            // a string element's +1 (held as a KEY), then bz_dict_free with no
+            // value disposer (a Set's values are sentinels). Narrow: the
+            // borrowing `Set` head only; an array-backed Set (class, interface
+            // or nullable element) and the owning family keep the free below.
+            if (!isLL && !isDict && builtinTypeName(it->collTy) == "Set" &&
+                genericBackingType(it->collTy, 0, /*isSet=*/true, nullptr)) {
+                if (collElem && !collElem->nullable &&
+                    collElem->kind == sema::TypeRef::Kind::Primitive &&
+                    collElem->primitive == sema::PrimitiveType::String) {
+                    auto* relFn = declareC("bz_set_string_keys_release",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy()});
+                    builder_.CreateCall(relFn, {val});
+                }
+                auto* dfn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
+                                     {ptrTy(), ptrTy()});
+                builder_.CreateCall(
+                    dfn, {val, llvm::ConstantPointerNull::get(ptrTy())});
+                continue;
+            }
             const char* freeName = isLL   ? "bz_llist_free"
                                   : isDict ? "bz_dict_free"
                                   :          "bz_array_free";
