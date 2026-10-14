@@ -15960,6 +15960,40 @@ bool Emitter::computeAncestorGenericSubst(
 }
 
 
+// fix #6301 (§12.1 / §12.9, v0.338): match a base-clause argument written in a
+// level's own parameters (`Array<X>`) against the concrete type the receiver's
+// static type carries (`Array<int>`), binding each bare parameter it contains.
+// 0 = matched, 1 = not derivable (the caller refuses, as for a conflicting
+// binding), 2 = the shapes can never be equal (a different head or arity).
+int Emitter::unifyBaseArg(
+        const sema::TypeRef* pattern, const sema::TypeRef* known,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& bound) {
+    if (!pattern || !known) return 0;
+    if (isBareTypeParamRef(pattern)) {
+        auto prevIt = bound.find(pattern->headName());
+        if (prevIt != bound.end() && prevIt->second != known &&
+            typeRefIdentityKey(prevIt->second) != typeRefIdentityKey(known))
+            return 1;
+        bound[pattern->headName()] = known;
+        return 0;
+    }
+    if (pattern->kind != sema::TypeRef::Kind::Named ||
+        pattern->genericArgs.empty())
+        return 0;  // concrete or another kind: nothing to invert
+    if (known->kind != sema::TypeRef::Kind::Named) return 2;
+    if (pattern->declaration || known->declaration) {
+        if (pattern->declaration != known->declaration) return 2;
+    } else if (pattern->headName() != known->headName()) {
+        return 2;
+    }
+    if (pattern->genericArgs.size() != known->genericArgs.size()) return 2;
+    for (std::size_t i = 0; i < pattern->genericArgs.size(); ++i)
+        if (int r = unifyBaseArg(pattern->genericArgs[i],
+                                 known->genericArgs[i], bound))
+            return r;
+    return 0;
+}
+
 // fix #2896 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
 // §12.9, v0.240). See the declaration comment in LlvmBackend_impl.hpp.
 //
@@ -15981,7 +16015,8 @@ bool Emitter::computeAncestorGenericSubst(
 // emitting a comparison it cannot make correct.
 bool Emitter::deriveDescendantGenericSubst(
         const sema::TypeSymbol* ancestor, const sema::TypeSymbol* descendant,
-        std::vector<DescendantLevelSubst>& outLevels) {
+        std::vector<DescendantLevelSubst>& outLevels, bool* impossible) {
+    if (impossible) *impossible = false;
     if (!ancestor || !descendant || ancestor == descendant) return false;
     // The chain descendant → … → ancestor, then reversed so it is walked from
     // the ancestor's immediate child downward (each level's bindings feed the
@@ -16021,7 +16056,27 @@ bool Emitter::deriveDescendantGenericSubst(
                 return false;
             for (std::size_t gi = 0; gi < aboveParams.size(); ++gi) {
                 const sema::TypeRef* arg = baseRef->genericArgs[gi];
-                if (!isBareTypeParamRef(arg)) continue;  // nothing to invert
+                if (!isBareTypeParamRef(arg)) {
+                    // fix #6301 (§12.1 / §12.9 / §14.1, v0.338): an argument
+                    // that is a generic type over the level's parameters
+                    // (`D<X> : B<Array<X>>`) is inverted by matching its
+                    // shape against the argument the receiver's static type
+                    // carries (`Array<int>` pins `X = int`). A shape that can
+                    // never equal it (`B<string>` against `Array<X>`) proves
+                    // this level cannot be the receiver's dynamic type.
+                    auto kit2 = known.find(aboveParams[gi]);
+                    if (kit2 != known.end() && kit2->second && arg &&
+                        arg->kind == sema::TypeRef::Kind::Named &&
+                        !arg->genericArgs.empty()) {
+                        int r = unifyBaseArg(arg, kit2->second, bound);
+                        if (r == 2) {
+                            if (impossible) *impossible = true;
+                            return false;
+                        }
+                        if (r == 1) return false;
+                    }
+                    continue;  // else nothing to invert
+                }
                 auto kit = known.find(aboveParams[gi]);
                 if (kit == known.end() || !kit->second) return false;
                 // One parameter passed to two positions (`class D<U> : B<U, U>`)
@@ -18658,7 +18713,13 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                 if (!t2->genericParams.empty()) { genericBelow = true; break; }
             if (genericBelow) {
                 std::vector<DescendantLevelSubst> levels;
-                if (!deriveDescendantGenericSubst(staticType, c, levels)) {
+                bool neverDynamic = false;
+                if (!deriveDescendantGenericSubst(staticType, c, levels,
+                                                  &neverDynamic)) {
+                    // fix #6301: `D<X> : B<Array<X>>` can never be the dynamic
+                    // type of a `B<string>` receiver; it takes no branch and
+                    // must not make the whole dispatch unenumerable.
+                    if (neverDynamic) continue;
                     // fix #5247 (§12.1 / §12.9 / §14.1, v0.313): the candidate
                     // declares parameters its base clause does not pin
                     // (`class EGO<X> : GA`): a `GA` receiver may hold any

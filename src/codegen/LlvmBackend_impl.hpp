@@ -23788,7 +23788,12 @@ private:
     // substitution does not bind.
     bool deriveDescendantGenericSubst(
         const sema::TypeSymbol* ancestor, const sema::TypeSymbol* descendant,
-        std::vector<DescendantLevelSubst>& outLevels);
+        std::vector<DescendantLevelSubst>& outLevels,
+        bool* impossible = nullptr);
+    // fix #6301: see the definition in LlvmBackend_Calls2.cpp.
+    int unifyBaseArg(
+        const sema::TypeRef* pattern, const sema::TypeRef* known,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& bound);
 
     // CG-generic: compile a specialized version of a block-body method with
     // the current genericSubst_ applied to all types.  The specialized
