@@ -1966,8 +1966,36 @@ const sema::TypeSymbol* Emitter::indexAccessReceiverDecl(
     // also covers the shapes that reach here with no `currentFn_` at all: a
     // field initializer (already the §22.8 error) and a static member (already
     // the §12.3 error) stay single-diagnostic.
+    // fix #4160 (§26.5 "Specificity ordering" worked example, §26.1, v0.338):
+    // the UNSPECIALIZED template body of a GENERIC extension method
+    // (`extension Array<T> … return this[0];`) is lowered once with `T` unbound
+    // purely to keep the module's IR valid — it is dead code, never called; only
+    // the per-instantiation specialization (genericSubst_ binding `T`, which
+    // recovers the receiver and lowers the access) ever runs. Its receiver is a
+    // builtin whose TypeRef has no TypeSymbol, so the recovery above cannot
+    // succeed for it by construction, and the "DROPPED" announcement was a false
+    // alarm on the spec's own worked example. Suppressed ONLY there: the
+    // enclosing function is an extension method whose resolved target has a
+    // generic argument that `isUnboundTemplateArg` says no active substitution
+    // binds. A specialization binds `T`, so the same access failing to recover
+    // inside one still announces.
+    bool deadGenericExtTemplateBody = false;
+    if (id && id->name == "this" && currentFn_ && !currentSpecMethodSymbol_) {
+        for (const auto& [ms, fn] : methodFns_) {
+            if (fn != currentFn_) continue;
+            if (!isExtensionMethod(ms) || !ms->extensionDecl->targetType)
+                break;
+            const sema::TypeRef* t =
+                ctx_.resolvedType(*ms->extensionDecl->targetType);
+            if (!t) break;
+            for (const sema::TypeRef* a : t->genericArgs)
+                if (isUnboundTemplateArg(a)) deadGenericExtTemplateBody = true;
+            break;
+        }
+    }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
         if ((id->name == "this" || id->name == "base") &&
+            !deadGenericExtTemplateBody &&
             !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, id->span.begin,
