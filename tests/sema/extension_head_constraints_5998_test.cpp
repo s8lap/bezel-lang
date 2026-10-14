@@ -215,3 +215,81 @@ BEZEL_TEST(sema_extension_head_constraints_5998,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n"));
 }
+
+// fix #5998 part (2) (§14.2 *A type parameter as the type argument*, case 1,
+// v0.338, L2391): `Box<W>` names its argument `W`, a parameter of `Keep`. The
+// constraint is decided at that naming site by `W`'s own constraints. `W`
+// unconstrained does not guarantee `new()`, so the declaration is rejected even
+// though `Keep` is never instantiated (the instantiation-time deferral alone
+// admitted it).
+BEZEL_TEST(sema_extension_head_constraints_5998,
+           unconstrained_type_parameter_naming_new_bound_rejected_sec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "class Box<W> where W: new() end Box; "
+        "class Keep<W> "
+        "  public method Use(): int var b := new Box<W>(); return 0; end Use; "
+        "end Keep; "
+        "class P public static method Main(): int return 0; end Main; end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasHeadDiagnostic(r, "where W: new()"));
+}
+
+// Reject rows: `value` and `class` and `notnull` are not guaranteed by the
+// parameter's own different constraint; a derived-property constraint is
+// guaranteed only by the same item.
+BEZEL_TEST(sema_extension_head_constraints_5998,
+           parameter_with_value_bound_does_not_guarantee_new_rejected_sec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "class Box<W> where W: new() end Box; "
+        "class Keep<W> where W: value "
+        "  public method Use(): int var b := new Box<W>(); return 0; end Use; "
+        "end Keep; "
+        "class P public static method Main(): int return 0; end Main; end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasHeadDiagnostic(r, "where W: new()"));
+}
+
+BEZEL_TEST(sema_extension_head_constraints_5998,
+           parameter_with_new_bound_does_not_guarantee_class_rejected_sec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "class Box<W> where W: class end Box; "
+        "class Keep<W> where W: new() "
+        "  public method Use(): int var b := new Box<W>(); return 0; end Use; "
+        "end Keep; "
+        "class P public static method Main(): int return 0; end Main; end P;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(hasHeadDiagnostic(r, "where W: class"));
+}
+
+// Accept controls: the parameter carries the same constraint, or a class/
+// IDisposable bound guarantees the requirement (L2391). The program runs.
+BEZEL_TEST(sema_extension_head_constraints_5998,
+           parameter_with_same_new_bound_accepted_control_sec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "class Box<W> where W: new() end Box; "
+        "class Keep<W> where W: new() "
+        "  public method Use(): int var b := new Box<W>(); return 7; end Use; "
+        "end Keep; "
+        "class P public static method Main(): int "
+        "  var k := new Keep<int>(); return k.Use(); end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 7);
+}
+
+BEZEL_TEST(sema_extension_head_constraints_5998,
+           parameter_with_idisposable_bound_guarantees_class_accepted_control_sec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "interface IX: IDisposable end IX; "
+        "class Box<W> where W: class end Box; "
+        "class Keep<W> where W: IDisposable "
+        "  public method Use(): int var b := new Box<W>(); return 7; end Use; "
+        "end Keep; "
+        "class P public static method Main(): int return 7; end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 7);
+}

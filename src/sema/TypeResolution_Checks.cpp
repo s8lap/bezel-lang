@@ -12684,6 +12684,44 @@ void Resolver::checkGenericConstraintsAtUseSite(
     }
 }
 
+// fix #5998 (§14.2 "A type parameter as the type argument", case 1, v0.338):
+// does the outer parameter `P`'s OWN constraint set guarantee the inner
+// requirement `kind` at every substitution it admits, as a matter of language
+// rule? Yes: `P` carries the same constraint, or a class-/value-/type-bound
+// implies `notnull`. No: the constraints provably admit a substitution that
+// fails it (`new()` is not guaranteed by `class`, `value` by `new()`, a
+// derived property only by its own item). Undecided: a type bound is present
+// where the rule would need its resolved declaration, or a derived property
+// is involved for `notnull`; the caller keeps the instantiation-time deferral.
+namespace {
+enum class ParamGuarantee { Yes, No, Undecided };
+
+ParamGuarantee paramGuarantees(const GenericParamSymbol& p,
+                               std::string_view kind) {
+    bool hasType = false, hasClass = false, hasValue = false;
+    bool hasDerived = false, hasSame = false;
+    for (const GenericParamConstraint& c : p.constraints) {
+        if (c.kind == kind) hasSame = true;
+        if (c.kind == "type") hasType = true;
+        if (c.kind == "class") hasClass = true;
+        if (c.kind == "value") hasValue = true;
+        if (c.kind == "sendable" || c.kind == "hashable") hasDerived = true;
+    }
+    if (kind == "type") return ParamGuarantee::Undecided;
+    if (hasSame) return ParamGuarantee::Yes;
+    if (kind == "notnull") {
+        if (hasClass || hasValue || hasType) return ParamGuarantee::Yes;
+        return hasDerived ? ParamGuarantee::Undecided : ParamGuarantee::No;
+    }
+    if (kind == "class") return hasType ? ParamGuarantee::Undecided
+                                        : ParamGuarantee::No;
+    if (kind == "value" || kind == "new")
+        return hasType ? ParamGuarantee::Undecided : ParamGuarantee::No;
+    // sendable / hashable: guaranteed only by the same item (§14.2 L2391).
+    return ParamGuarantee::No;
+}
+} // namespace
+
 void Resolver::recordDeferredNested(const ast::Type& argAst,
                                     const GenericParamSymbol& innerParam,
                                     const ast::TypeDecl& innerDecl,
@@ -12696,8 +12734,13 @@ void Resolver::recordDeferredNested(const ast::Type& argAst,
     if (!currentOuterType_) return;
     std::string_view outerParam = argAst.name->parts.front();
     bool ownedByOuter = false;
+    const GenericParamSymbol* outerSym = nullptr;
     for (Symbol* gp : currentOuterType_->genericParams) {
-        if (gp && gp->name == outerParam) { ownedByOuter = true; break; }
+        if (gp && gp->name == outerParam) {
+            ownedByOuter = true;
+            outerSym = dynamic_cast<const GenericParamSymbol*>(gp);
+            break;
+        }
     }
     if (!ownedByOuter) return;
 
@@ -12708,6 +12751,27 @@ void Resolver::recordDeferredNested(const ast::Type& argAst,
         if (gc.typeParam != innerParam.name) continue;
         if (!gc.modifierConstraint.empty()) continue;
         for (const auto& item : gc.items) {
+            // fix #5998: decided at this naming site by `P`'s own constraints
+            // (§14.2 L2391), not at `P`'s instantiation sites: a declaration
+            // that is never instantiated (`class Keep<W>` with `Box<W>` and
+            // `Box` requiring `W: new()`) was admitted with no check at all.
+            if (outerSym && paramGuarantees(*outerSym, item.kind) ==
+                                ParamGuarantee::No) {
+                std::string req = item.kind == "new" ? "new()"
+                                                     : std::string(item.kind);
+                ctx_.diagnostics().report(
+                    Severity::Error, innerSite.span.begin,
+                    "type argument `" + std::string(outerParam) +
+                    "` does not satisfy the constraint `where " +
+                    std::string(innerParam.name) + ": " + req + "` of `" +
+                    std::string(innerDecl.name) + "` (§14.2): the parameter `" +
+                    std::string(outerParam) + "` carries no constraint that "
+                    "guarantees it at every substitution its constraints admit; "
+                    "add a constraint on `" + std::string(outerParam) +
+                    "` that guarantees it (§14.2 \"A type parameter as the "
+                    "type argument\")");
+                continue;
+            }
             DeferredNestedObligation ob;
             ob.outerType = currentOuterType_;
             ob.outerParamName = outerParam;

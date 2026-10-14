@@ -5,5 +5,8 @@
 
 module M; class C<T> where T: new() private _x: T?; end C; interface IFoo end IFoo; class Box<W> private _b: C<W>?; end Box; class App private _u: Box<IFoo>?; end App;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: type argument `IFoo` does not satisfy the constraint `where T: new()`
+// #5998 (§14.2 L2391, v0.338): an unconstrained `W` does not satisfy the
+// requirement of `C<W>` ("decided at that site, by P's own constraints"), so
+// the rejection is at the naming declaration `Box<W>`, not at the instantiation.
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: type argument `W` does not satisfy the constraint `where T: new()`
 // CHECK-SAME: (§14.2)
