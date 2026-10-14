@@ -1115,6 +1115,57 @@ bool ExprTC::stmtsContainYield(
     return false;
 }
 
+// fix #6140: does `body` contain a `break` that leaves the loop it is the
+// body of — an unlabeled `break` not inside a nested loop, or a `break`
+// naming this loop's label at any depth (§21.5)? Syntactic, and over
+// statements only: a lambda body is its own callable and its jumps cannot
+// target an enclosing loop.
+static bool loopBodyBreaksOut(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    std::string_view loopLabel, bool nested);
+
+static bool loopStmtBreaksOut(const ast::Stmt* s, std::string_view loopLabel,
+                              bool nested) {
+    if (!s) return false;
+    if (auto* brk = dynamic_cast<const ast::BreakStmt*>(s))
+        return brk->label.empty()
+                   ? !nested
+                   : (!loopLabel.empty() && brk->label == loopLabel);
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+        if (loopBodyBreaksOut(ifs->ifBranch.body, loopLabel, nested))
+            return true;
+        for (const auto& el : ifs->elifBranches)
+            if (loopBodyBreaksOut(el.body, loopLabel, nested)) return true;
+        return loopBodyBreaksOut(ifs->elseBody, loopLabel, nested);
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(s))
+        return loopBodyBreaksOut(dob->body, loopLabel, nested);
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s))
+        return loopBodyBreaksOut(ws->body, loopLabel, /*nested=*/true);
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(s))
+        return loopBodyBreaksOut(fs->body, loopLabel, /*nested=*/true);
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+        if (loopBodyBreaksOut(ts->body, loopLabel, nested)) return true;
+        for (const auto& arm : ts->catches)
+            if (loopStmtBreaksOut(arm.body.get(), loopLabel, nested))
+                return true;
+        return loopBodyBreaksOut(ts->finallyBody, loopLabel, nested);
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+        for (const auto& arm : cs->arms)
+            if (loopBodyBreaksOut(arm.stmts, loopLabel, nested)) return true;
+    }
+    return false;
+}
+
+static bool loopBodyBreaksOut(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    std::string_view loopLabel, bool nested) {
+    for (const auto& sp : body)
+        if (loopStmtBreaksOut(sp.get(), loopLabel, nested)) return true;
+    return false;
+}
+
 bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
     if (dynamic_cast<const ast::ReturnStmt*>(&s)) return true;
     if (dynamic_cast<const ast::ThrowStmt*>(&s)) return true;
@@ -1137,14 +1188,19 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         return bodyAlwaysExits(ifs->elseBody);
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        // `while true do … end` without a reachable break never
-        // completes normally. We conservatively treat a literal-true
-        // condition as non-terminating (a break would let it fall
-        // through, which would only make us UNDER-report — never a
-        // false positive).
+        // `while true do … end` never completes normally UNLESS a `break`
+        // leaves it. fix #6140 (§21.7 "Compound statements carry no special
+        // grant … it counts as exiting on every path exactly when no path
+        // through it completes normally", §21.5, v0.338): the literal-true
+        // condition alone was taken as proof, so a loop with a `break` was
+        // "never falls through" — which §7.4's early-exit narrowing then
+        // trusted (`if s = null then while true do break; end while; end if;
+        // s.Length` compiled and dereferenced null), and which let a value
+        // method end with such a loop and no `return`.
         auto* lit =
             dynamic_cast<const ast::BoolLiteralExpr*>(ws->condition.get());
-        return lit && lit->value;
+        return lit && lit->value &&
+               !loopBodyBreaksOut(ws->body, ws->label, /*nested=*/false);
     }
     if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         return bodyAlwaysExits(dob->body);
