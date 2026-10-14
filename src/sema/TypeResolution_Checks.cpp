@@ -8140,6 +8140,11 @@ void Resolver::checkAbstractImplementations() {
             SubstMap subst;
         };
         std::vector<IfacePropObligation> ifacePropObligations;
+        // #6199 / §11.2: one entry per NON-generic interface property
+        // declaration visited. `ifaceProps` is keyed by name (first writer
+        // wins), so two interfaces declaring `Value` at different types were
+        // checked against only the first; the type compare walks this list.
+        std::vector<std::pair<PropertySymbol*, TypeSymbol*>> ifaceNonGenericProps;
         std::vector<IfaceIndexerObligation> ifaceIndexerObligations;
         // #2186: BFS over the inheritance chain tracking the per-node
         // substitution the path induces. Dedup is by (TypeSymbol, subst-key)
@@ -8442,6 +8447,8 @@ void Resolver::checkAbstractImplementations() {
                         ifaceProps.emplace(ps->name, std::make_pair(ps, cur));
                         if (!cur->genericParams.empty())
                             ifacePropObligations.push_back({ps, cur, curSubst});
+                        else
+                            ifaceNonGenericProps.emplace_back(ps, cur);
                     } else if (hasMod(ps, "abstract")) {
                         // fix #4020 / §12.5: mirrors the `methodIsAbstract`
                         // arm above and #3641's indexer arm just above this
@@ -10079,9 +10086,10 @@ void Resolver::checkAbstractImplementations() {
             // read through the interface reference, produced a garbage `int`
             // off the string's representation).
             // (`propType` is defined above the indexer loop, #6129.)
-            for (auto& [name, info] : ifaceProps) {
+            for (auto& info : ifaceNonGenericProps) {
                 PropertySymbol* ips = info.first;
                 TypeSymbol* iface = info.second;
+                std::string_view name = ips->name;
                 if (!iface || !iface->genericParams.empty()) continue;
                 const TypeRef* itype = propType(ips);
                 auto cit = concreteProps.find(name);
