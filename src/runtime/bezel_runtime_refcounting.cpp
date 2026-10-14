@@ -174,6 +174,11 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
     if (!obj) return 0;
     void* word0;
     memcpy(&word0, obj, sizeof(void*));  // obj's first word (vtable or data ptr)
+    // fix #5978 (§8.1 / §12.7, v0.338): a function value at `Object` presents
+    // the runtime's own vtable (BZ_CLOSURE_OBJVIEW_OFFSET), which no module's
+    // table lists. Before this it was a bare closure cell whose word 0 is a
+    // code pointer, so it was answered "string" here.
+    if (word0 == (void*)bz_fnval_vtable) return 0;
     if (vtable_table) {
         for (void** p = vtable_table; *p != nullptr; ++p)
             if (*p == word0) return 0;   // a known vtable → not a string
@@ -306,7 +311,11 @@ extern "C" int32_t bz_identity_hash_table_size(void) {
 //     int64_t rc    (off 16),
 //     void* envdtor (off 24),
 //     int64_t kind  (off 32),
-//     int8_t disposed (off 40) }  = 48 bytes.
+//     int8_t disposed (off 40),
+//     int8_t hashed (off 41),
+//     void* vtable  (off 48),     // #5978: the object view's header —
+//     void* sig     (off 56) }    //   `bz_fnval_vtable` + formed-type descriptor
+//   = 64 bytes.
 // `fn` is the function/thunk pointer; `env` is null (non-capturing / static
 // method reference) or points at a separately-allocated env block holding the
 // capture pointers. The rc was appended AFTER env so fn (off 0) and env (off 8)
@@ -364,12 +373,14 @@ static const int64_t BZ_CLOSURE_ENVDTOR_OFFSET = 24;
 static const int64_t BZ_CLOSURE_DISPOSED_OFFSET = 40;
 
 extern "C" void bz_closure_retain(void* c) {
+    c = bz_closure_base(c);   // #5978: either view names the same cell
     if (!c) return;
     int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
     __atomic_add_fetch(rcp, 1, __ATOMIC_ACQ_REL);
 }
 
 extern "C" void bz_closure_release(void* c) {
+    c = bz_closure_base(c);   // #5978: either view names the same cell
     if (!c) return;
     int64_t* rcp = (int64_t*)((uint8_t*)c + BZ_CLOSURE_RC_OFFSET);
     int64_t new_count = __atomic_sub_fetch(rcp, 1, __ATOMIC_ACQ_REL);
@@ -383,6 +394,11 @@ extern "C" void bz_closure_release(void* c) {
     if (new_count < 0)
         bz_refcount_overrelease_fail("closure");
     // Last reference gone.
+    // #5978 / §8.3: reap the assigned identity hash of a cell that drew one
+    // (bz_closure_value_hash sets the byte), as #2058 does for a class.
+    int8_t hashed = 0;
+    memcpy(&hashed, (uint8_t*)c + BZ_CLOSURE_HASHED_OFFSET, sizeof(int8_t));
+    if (hashed) bz_obj_identity_hash_forget(c);
     void* env;
     memcpy(&env, (uint8_t*)c + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
     // #672: invoke the typed env-disposer (if any) BEFORE freeing the env block.
@@ -429,6 +445,7 @@ extern "C" void bz_closure_release(void* c) {
 // release's last-drop path sees the flag and quarantines instead of freeing.
 // Idempotent — repeated calls are no-ops. null is a no-op.
 extern "C" void bz_closure_mark_disposed(void* c) {
+    c = bz_closure_base(c);
     if (!c) return;
     int8_t one = 1;
     memcpy((uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, &one, sizeof(int8_t));
@@ -439,6 +456,7 @@ extern "C" void bz_closure_mark_disposed(void* c) {
 // guard at the closure-invoke lower site calls this and throws
 // DisposedAccessException on a nonzero return.
 extern "C" int8_t bz_closure_is_disposed(void* c) {
+    c = bz_closure_base(c);
     if (!c) return 0;
     int8_t d = 0;
     memcpy(&d, (uint8_t*)c + BZ_CLOSURE_DISPOSED_OFFSET, sizeof(int8_t));

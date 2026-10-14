@@ -1936,6 +1936,8 @@ llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
         {
             const sema::TypeRef* fRt2 =
                 fd->type ? ctx_.resolvedType(*fd->type) : nullptr;
+            // fix #5978 (§8.1, v0.338): a function value at an `Object` static.
+            val = fnValForObjectTarget(val, fRt2, initExpr);
             val = coerceInitializerToSlot(val, instGV->getValueType(),
                                           isUnsignedTargetExpr(*initExpr));
             if (fRt2 && isNullableValueTy(fRt2))
@@ -11762,6 +11764,9 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
             {
                 const sema::TypeRef* fRt =
                     fd->type ? ctx_.resolvedType(*fd->type) : nullptr;
+                // fix #5978 (§8.1, v0.338): a function value at an `Object`
+                // static.
+                val = fnValForObjectTarget(val, fRt, initExpr);
                 val = coerceInitializerToSlot(val, gvIt->second->getValueType(),
                                               isUnsignedTargetExpr(*initExpr));
                 if (fRt && isNullableValueTy(fRt))
@@ -42514,6 +42519,7 @@ const sema::TypeRef* Emitter::listInterfaceTypeOfLocal(const ast::LocalDecl* ld)
 llvm::Value* Emitter::materializeHeapCollectionLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
     if (!cl || cl->isDict || !collTy) return nullptr;
+    noteFnAtObjectLiteral(*cl, collTy);   // #5978: see `fnAtObject_`
 
     // §15.4 (R39): the empty literal `[]` parses as a NON-dict
     // CollectionLiteralExpr (the empty form is syntactically ambiguous), but
@@ -43636,6 +43642,7 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
 llvm::Value* Emitter::materializeArrayBackedSetLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy) {
     if (!cl || cl->isDict || !setTy) return nullptr;
+    noteFnAtObjectLiteral(*cl, setTy);   // #5978: see `fnAtObject_`
     if (!collectionElemIsClass(setTy, 0)) return nullptr;
     const sema::TypeRef* elemRef =
         (!setTy->genericArgs.empty()) ? setTy->genericArgs[0] : nullptr;
@@ -43742,6 +43749,7 @@ llvm::Value* Emitter::materializeArrayBackedSetLiteral(
 llvm::Value* Emitter::materializeHeapSetLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy) {
     if (!cl || cl->isDict || !setTy) return nullptr;
+    noteFnAtObjectLiteral(*cl, setTy);   // #5978: see `fnAtObject_`
     // Require a known element type; genericBackingType returns non-null for every
     // element type the generic-dict runtime supports (all primitives, enums,
     // records, strings — §4.10 / isSet=true path).
@@ -43838,6 +43846,7 @@ llvm::Value* Emitter::materializeHeapSetLiteral(
 llvm::Value* Emitter::materializeHeapDictLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* dictTy) {
     if (!cl || !dictTy) return nullptr;
+    noteFnAtObjectLiteral(*cl, dictTy);   // #5978: see `fnAtObject_`
     if (!isDictTypeName(dictTy)) return nullptr;
     // §15.4 (R39): the empty literal `[]` parses with isDict=false; with a
     // Dictionary target it still constructs an empty dictionary (the populate

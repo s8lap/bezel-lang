@@ -3604,6 +3604,13 @@ private:
     // envdtor (field 3, off 24) is a per-lambda typed disposal function emitted
     // beside the trampoline (#672 foundation); null = no env disposal (back-compat).
     llvm::StructType* closureCellTy_ = nullptr;
+    // fix #5978: per-module function-type descriptors, keyed by
+    // fnSigIdentityKey; and the cell the most recent producer built, consumed
+    // by the forming expression's `lowerExpr` frame. A WeakVH, so an erased
+    // cell instruction reads as null rather than as whatever value is later
+    // allocated at its address.
+    std::unordered_map<std::string, llvm::Constant*> fnSigDescs_;
+    llvm::WeakVH lastFreshFnCell_;
     unsigned stringLiteralIdx_ = 0;
 
     // CG8: per-class instance layout (struct of instance fields) and each
@@ -4951,7 +4958,16 @@ private:
     // closure-cell heap layout —
     //   { ptr fn (off 0), ptr env (off 8), i64 rc (off 16), ptr envdtor (off 24),
     //     i64 kind (off 32), i8 disposed (off 40) }
-    //   = 48 bytes (LLVM may pad the tail to 8-byte alignment = 48 bytes).
+    //   = 48 bytes (LLVM may pad the tail to 8-byte alignment = 48 bytes),
+    // followed (fix #5978) by the OBJECT-VIEW header
+    //   { ptr vtable (off 48, field 6), ptr sig (off 56, field 7) } = 64 bytes.
+    // A function value held at `Object` is the address of field 6, whose word
+    // 0 is the runtime's shared `bz_fnval_vtable` and whose word 1 is the
+    // descriptor of the function type the value was formed at (see
+    // fnValToObjectView / fnSigDescriptorFor below, and
+    // bezel_runtime_internal.hpp's BZ_CLOSURE_OBJVIEW_OFFSET, which must agree
+    // with field 6's offset). A function-TYPED reference is still the cell
+    // base, so no reader of fields 0-5 changes.
     // fn (off 0) and env (off 8) keep the offsets the existing closure-call sites
     // use (fn at offset 0, env at GEP index 1); rc (field index 2, off 16) is
     // unchanged; envdtor (field index 3, off 24) is the #672 typed env-disposer;
@@ -4981,7 +4997,7 @@ private:
             closureCellTy_ = llvm::StructType::create(
                 llvm_,
                 {ptrTy(), ptrTy(), i64(), ptrTy(), i64(),
-                 llvm::Type::getInt8Ty(llvm_)},
+                 llvm::Type::getInt8Ty(llvm_), ptrTy(), ptrTy()},
                 "bz.closure");
         return closureCellTy_;
     }
@@ -5015,6 +5031,235 @@ private:
         builder_.CreateStore(
             llvm::ConstantInt::get(i64(), static_cast<int64_t>(kind)),
             builder_.CreateStructGEP(closureCellType(), cellObj, 4));
+    }
+
+    // fix #5978 (§8.1 "function types reaching `Object` ... via their
+    // reference-type heap representation" / §12.7 *Function-typed targets*,
+    // v0.338): the runtime-defined vtable every function value presents at
+    // `Object`. It is defined once, in the runtime (bezel_runtime_events.cpp),
+    // so its address is the same in every module and `bz_obj_is_string`
+    // recognises it without any per-module `bz$vtable$table` entry.
+    llvm::Constant* fnValVtable() {
+        return module_->getOrInsertGlobal(
+            "bz_fnval_vtable", llvm::ArrayType::get(ptrTy(), 6));
+    }
+
+    // §12.7 *Function-typed targets* / §27.1 (v0.338): the IDENTITY key of a
+    // function type — "slot types, modifiers and return type; parameter names
+    // and the function type's own nullability disregarded". `top` drops the
+    // outermost `?` only: a nested function type's nullability is part of the
+    // enclosing type. `t` must already be concrete (no type parameter).
+    static std::string fnSigIdentityKey(const sema::TypeRef* t, bool top) {
+        if (!t) return "v";
+        using K = sema::TypeRef::Kind;
+        std::string s;
+        switch (t->kind) {
+            case K::Function:
+                s = "(";
+                for (std::size_t i = 0; i < t->funcParams.size(); ++i) {
+                    if (i) s += ",";
+                    if (!t->funcParams[i].modifier.empty())
+                        s += std::string(t->funcParams[i].modifier) + " ";
+                    s += fnSigIdentityKey(t->funcParams[i].type, false);
+                }
+                s += ")->";
+                if (t->funcReturnOwned) s += "owned ";
+                s += fnSigIdentityKey(t->funcReturn, false);
+                break;
+            case K::Named:
+                if (t->declaration) {
+                    s = mangledTypeName(t->declaration);
+                } else {
+                    s = std::string(!t->aliasResolvedHead.empty()
+                                        ? t->aliasResolvedHead
+                                    : !t->importedName.empty()
+                                        ? t->importedName
+                                        : t->headName());
+                }
+                if (!t->genericArgs.empty()) {
+                    s += "<";
+                    for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                        if (i) s += ",";
+                        s += fnSigIdentityKey(t->genericArgs[i], false);
+                    }
+                    s += ">";
+                }
+                break;
+            case K::InlineArray:
+                s = "[" + std::to_string(t->arraySizeValue) +
+                    (t->arrayOwned ? " owned" : "") + "]" +
+                    fnSigIdentityKey(t->arrayElement, false);
+                break;
+            default: {
+                // Primitive / Unit: the linker spelling is already injective;
+                // spell the nullability below, uniformly.
+                sema::TypeRef bare = *t;
+                bare.nullable = false;
+                s = mangleTypeRefForSymbol(&bare);
+                break;
+            }
+        }
+        if (t->nullable && !(top && t->kind == K::Function)) s += "?";
+        return s;
+    }
+
+    // The descriptor of the function type `fnTy` (null: the "unknown formed
+    // type" descriptor, which no `is`/`as` target ever names). One LinkOnceODR
+    // global per identity key, so two modules forming the same function type
+    // agree on its address — the same device `pvt$<nm>` uses. Word 0 is the
+    // type's rendered name (stdlib §2.13 rule 5), which the shared ToString
+    // slot returns; the address is the type's run-time identity.
+    llvm::Constant* fnSigDescriptorFor(const sema::TypeRef* fnTy) {
+        std::string key = "?";
+        std::string rendered = "System.Object";
+        if (fnTy && fnTy->kind == sema::TypeRef::Kind::Function) {
+            if (!genericSubstSemaTy_.empty())
+                fnTy = substituteTypeRefLocal(fnTy, genericSubstSemaTy_);
+            key = fnSigIdentityKey(fnTy, /*top=*/true);
+            sema::TypeRef bare = *fnTy;
+            bare.nullable = false;
+            rendered = spec85TypeRefQualifiedName(&bare);
+        }
+        auto it = fnSigDescs_.find(key);
+        if (it != fnSigDescs_.end()) return it->second;
+        // An injective, linker-safe spelling of the key.
+        std::string sym = "bz$fnsig$";
+        static const char* hex = "0123456789abcdef";
+        for (unsigned char c : key) {
+            if (std::isalnum(c) || c == '_' || c == '.') {
+                sym += static_cast<char>(c);
+            } else {
+                sym += '$';
+                sym += hex[c >> 4];
+                sym += hex[c & 15];
+            }
+        }
+        std::string lexeme = "\"";
+        for (char c : rendered) {
+            if (c == '"' || c == '\\') lexeme += '\\';
+            lexeme += c;
+        }
+        lexeme += "\"";
+        llvm::Constant* nameStr =
+            llvm::cast<llvm::Constant>(lowerStringLiteral(lexeme, false));
+        auto* arrTy = llvm::ArrayType::get(ptrTy(), 1);
+        auto* gv = new llvm::GlobalVariable(
+            *module_, arrTy, /*isConstant=*/true,
+            llvm::GlobalValue::LinkOnceODRLinkage,
+            llvm::ConstantArray::get(arrTy, {nameStr}), sym);
+        fnSigDescs_[key] = gv;
+        return gv;
+    }
+
+    // fix #5978: fill the object-view header of a freshly calloc'd closure
+    // cell (fields 6 and 7) and publish the cell as the freshest formation, so
+    // the `lowerExpr` frame of the FORMING expression can replace the
+    // placeholder descriptor with the one of the type it was formed at.
+    void initClosureObjectHeader(llvm::Value* cellObj) {
+        builder_.CreateStore(
+            fnValVtable(),
+            builder_.CreateStructGEP(closureCellType(), cellObj, 6));
+        builder_.CreateStore(
+            fnSigDescriptorFor(nullptr),
+            builder_.CreateStructGEP(closureCellType(), cellObj, 7));
+        lastFreshFnCell_ = cellObj;
+    }
+
+    // §12.7 *Function-typed targets* (v0.338): "A function value's own type is
+    // the type it was formed at". Called by `lowerExpr` on the forming
+    // expression's own frame, where `formedTy` is that expression's type.
+    void stampFnValFormedType(llvm::Value* cellObj,
+                              const sema::TypeRef* formedTy) {
+        if (!formedTy || formedTy->kind != sema::TypeRef::Kind::Function)
+            return;
+        builder_.CreateStore(
+            fnSigDescriptorFor(formedTy),
+            builder_.CreateStructGEP(closureCellType(), cellObj, 7));
+    }
+
+    // fix #5978 (§8.1, v0.338): a function-typed reference (the cell base)
+    // -> the reference an `Object` slot holds (the cell's object-view header).
+    // Null-preserving, and idempotent on a value already converted — several
+    // positions run `boxForTarget` twice over one argument.
+    llvm::Value* fnValToObjectView(llvm::Value* cell) {
+        return builder_.CreateCall(
+            declareC("bz_fnval_as_object", ptrTy(), {ptrTy()}), {cell},
+            "fnval.obj");
+    }
+    // The function-source half of `boxForTarget`, for the placements that do
+    // not route through it (a positional record field, a choice payload): a
+    // no-op unless `init` is function-typed and `declTy` is `Object`, both
+    // read through the active monomorphization.
+    llvm::Value* fnValForObjectTarget(llvm::Value* v,
+                                      const sema::TypeRef* declTy,
+                                      const ast::Expr* init) {
+        if (!v || !declTy || !init || !v->getType()->isPointerTy()) return v;
+        const sema::TypeRef* t = resolveTypeParamRef(declTy);
+        if (!t || t->kind != sema::TypeRef::Kind::Primitive ||
+            t->primitive != sema::PrimitiveType::Object)
+            return v;
+        if (!isFnValuedExpr(*init)) return v;
+        return fnValToObjectView(v);
+    }
+    // fix #5978 (§8.1 / §27.7.1 "is an ordinary key", v0.338): the
+    // conversion sites that are decided by POSITION rather than by a store
+    // helper. A parent expression/statement records, for each operand that
+    // sits where an `Object` is expected, the type of that position; `lowerExpr`
+    // applies `fnValForObjectTarget` to the operand's value on its way out.
+    // Deciding it there (not at each consumer) covers every lowering path a
+    // builtin collection call, an assignment or an operator can take: the
+    // key/element/value arguments of a builtin collection method, the value of
+    // an assignment to an `Object` location of any shape (local, field,
+    // property, element, `??=`), and both operands of `??` / `=` / `<>` at
+    // `Object`. The recorded type is the UNRESOLVED position type (sema-owned,
+    // stable); it and the operand's own type are read through the active
+    // monomorphization at apply time, so one generic body's node is converted
+    // under `T = Object` and left alone under any other `T`.
+    std::unordered_map<const ast::Expr*, const sema::TypeRef*> fnAtObject_;
+    void noteFnAtObject(const ast::Expr* e, const sema::TypeRef* target) {
+        if (e && target) fnAtObject_[e] = target;
+    }
+    bool resolvesToObject(const sema::TypeRef* t) {
+        t = t ? resolveTypeParamRef(t) : nullptr;
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::Object;
+    }
+    // Is `e` a function value (or null) on EVERY path that produces it? Its
+    // static type says so except for `a ?? b`, which sema types by its left
+    // operand without checking the right one against it (§7.7; #6214): with a
+    // function-typed `a` and a `b` that is not one (`nn ?? "s"`, ill-typed
+    // but accepted), the value is the string whenever `a` is null. Such an
+    // expression is never converted. A right operand that yields no value
+    // (`throw`, §17.12) or the null the conversion preserves (`null`) leaves
+    // the whole a function value.
+    bool isFnValuedExpr(const ast::Expr& e) {
+        const sema::TypeRef* s = resolveTypeParamRef(ctx_.exprType(e));
+        if (!s || s->kind != sema::TypeRef::Kind::Function) return false;
+        if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e))
+            if (bin->op == "??" && bin->left && bin->right) {
+                const ast::Expr* r = bin->right.get();
+                const bool rightKeeps =
+                    dynamic_cast<const ast::ThrowExpr*>(r) ||
+                    dynamic_cast<const ast::NullLiteralExpr*>(r) ||
+                    isFnValuedExpr(*r);
+                return rightKeeps && isFnValuedExpr(*bin->left);
+            }
+        return true;
+    }
+    const sema::TypeRef* fnObjSiteReceiver(const sema::TypeRef* t,
+                                           std::string_view& head);
+    void noteFnAtObjectArgs(const sema::TypeRef* recv, std::string_view member,
+                            const std::vector<ast::CallArgument>& args);
+    void noteFnAtObjectLiteral(const ast::CollectionLiteralExpr& cl,
+                               const sema::TypeRef* collTy);
+    void noteFnAtObjectChildren(const ast::Expr& e);
+    void noteFnAtObjectStmt(const ast::Stmt& s);
+    // The inverse: an `Object`-typed reference known to hold a function value
+    // (or null) -> the cell base every invocation site expects.
+    llvm::Value* fnValFromObjectView(llvm::Value* obj) {
+        return builder_.CreateCall(
+            declareC("bz_fnval_from_object", ptrTy(), {ptrTy()}), {obj},
+            "fnval.cell");
     }
 
     // #422: emit a call to bz_closure_retain(c) — increments rc (no-op on null).

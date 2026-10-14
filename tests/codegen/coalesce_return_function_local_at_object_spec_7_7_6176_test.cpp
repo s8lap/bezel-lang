@@ -108,6 +108,41 @@ BEZEL_TEST(coalesce_return_function_local_at_object_spec_7_7_6176,
         "  end F; ");
 }
 
+// The issue's repro with the one change that makes it well-typed (`nn`
+// declared `Object?`; the issue spells `nn ?? "b"` over a nullable function
+// local, which §7.7 does not type — #6214): the result is read by an
+// interpolation hole, which needs the function value's `Object` view
+// (#5978) as well as a live cell.
+BEZEL_TEST(coalesce_return_function_local_at_object_spec_7_7_6176,
+          issue_repro_interpolated_result_is_live_7_7) {
+    const std::string src =
+        "module M; "
+        "import System; "
+        "public class Program "
+        "  public static method Pick(some: bool): ((int) -> int)? "
+        "    if some then return lambda(x: int) => x * 2; end; "
+        "    return null; "
+        "  end Pick; "
+        "  public static method F(some: bool): Object "
+        "    var nn: Object? := Program.Pick(some); "
+        "    return nn ?? \"b\"; "
+        "  end F; "
+        "  public static method Main() "
+        "    var n: int := 0; "
+        "    for var i in 0..100 do "
+        "      var s := $\"{Program.F(true)}\"; "
+        "      var u := $\"{Program.F(false)}\"; "
+        "      if s.Length > 0 and u = \"b\" then n := n + 1; end; "
+        "    end for; "
+        "    Console.WriteLine(n); "
+        "  end Main; "
+        "end Program;";
+    auto r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("101\n"));   // 0..100 inclusive
+}
+
 // Control (passes before the fix too): at a FUNCTION-typed return type the
 // `return` arm mints the caller's reference, so the local keeps its scope-end
 // release and the round trip stays balanced — leak-clean under LSan.

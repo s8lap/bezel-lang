@@ -4193,6 +4193,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // §27.7.1 (#1544): a lambda equals only itself — tag the cell REF_IDENTITY
     // (the calloc default; set explicitly to document intent and pin the value).
     initClosureKind(closureObj, FVK_REF_IDENTITY);
+    initClosureObjectHeader(closureObj);  // #5978: the Object view's header
 
     // #429 / #672 / §27.5 / §28.9: emit per-lambda envdtor if any non-`this`
     // capture exists.  The envdtor runs at last-drop (from bz_closure_release)
@@ -4691,6 +4692,9 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
             }
         }
         llvm::Value* v = lowerExpr(*a.value);
+        // fix #5978 (§8.1 / §9.5, v0.338): the positional-field conversion of
+        // `lowerNew`, at the `with` spelling of the same store.
+        v = fnValForObjectTarget(v, recordMemberTypeResolved(m), a.value.get());
         if (!v) {
             // #1386: ICE — lowerExpr returned null for a with-expression field
             // replacement value; the expression kind is not yet handled.
@@ -12177,6 +12181,9 @@ llvm::Value* Emitter::buildRecordValue(
                 if (!v) v = unitValueForTarget(v, fty, fieldArg[i]->value.get());
                 if (!v) v = boxForTarget(v, fty, fieldArg[i]->value.get());
                 if (!v) return nullptr;
+                // fix #5978 (§8.1, v0.338): a function value placed in an
+                // `Object` field takes the cell's object view.
+                v = fnValForObjectTarget(v, fty, fieldArg[i]->value.get());
                 // CG-nullable: a NULLABLE VALUE field (int?, bool?, …, and a
                 // nullable enum — issue #364) stores the tagged struct {i8
                 // hasValue; T value}, never a bare T. Wrap a plain value

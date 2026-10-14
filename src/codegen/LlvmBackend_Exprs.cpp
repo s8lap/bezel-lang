@@ -106,7 +106,20 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     llvm::Function* thisFn = currentFn_;
     fullExprFn_ = thisFn;
     ++fullExprDepth_;
+    noteFnAtObjectChildren(e);   // #5978: see `fnAtObject_`
     llvm::Value* v = lowerExprInner(e);
+    // fix #5978 (§12.7 *Function-typed targets*, v0.338): `e` formed the
+    // freshest closure cell — record the function type it was formed at.
+    if (v && v == lastFreshFnCell_) {
+        lastFreshFnCell_ = nullptr;
+        const sema::TypeRef* formedTy = ctx_.exprType(e);
+        stampFnValFormedType(v, formedTy);
+    }
+    // fix #5978: `e` sits where an `Object` is expected (see `fnAtObject_`).
+    // After the stamp above, which names the cell base.
+    if (v && !fnAtObject_.empty())
+        if (auto it = fnAtObject_.find(&e); it != fnAtObject_.end())
+            v = fnValForObjectTarget(v, it->second, &e);
     --fullExprDepth_;
     fullExprFn_ = parentFn;
     const bool atBoundary = (fullExprDepth_ == 0 || parentFn != thisFn);

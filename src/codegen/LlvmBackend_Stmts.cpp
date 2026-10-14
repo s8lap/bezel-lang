@@ -214,6 +214,7 @@ const sema::TypeSymbol* Emitter::instrumentedAutoPropertyStoreClass(
 
 
 bool Emitter::lowerStmt(const ast::Stmt& s) {
+    noteFnAtObjectStmt(s);   // #5978: see `fnAtObject_`
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // fix #3377 / §28.3: a `using var` is a SCOPE-BOUND consumer — §28.3
         // makes it non-movable ("cannot move out of `using var`; `using var`

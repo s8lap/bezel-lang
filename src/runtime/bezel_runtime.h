@@ -1253,6 +1253,20 @@ void bz_event_remove_closure(void* src, void* closure);
 // boundary.
 int32_t bz_closure_value_equals(void* a, void* b);
 
+// fix #5978 (§8.1 / §12.7 / §27.7.1, v0.338): a function value at `Object`.
+// The closure cell ends in a two-word header { vtable (off 48), sig (off 56) }
+// and the Object-typed reference is the address of that header; the
+// function-typed reference stays the cell base. `bz_fnval_as_object` /
+// `bz_fnval_from_object` convert between the two views (null-preserving,
+// idempotent on a value already in the requested view); `bz_obj_is_fnval`
+// answers whether an Object-typed value is a function value; and
+// `bz_closure_value_hash` is the §27.7.1 hash agreeing with
+// `bz_closure_value_equals` (either view accepted).
+void* bz_fnval_as_object(void* c);
+void* bz_fnval_from_object(void* o);
+int32_t bz_obj_is_fnval(void* o);
+int32_t bz_closure_value_hash(void* c);
+
 // Remove the handler with the given token. Idempotent (second call is a
 // no-op). Used by Subscription.Dispose.
 void bz_event_remove_token(void* src, int64_t token);

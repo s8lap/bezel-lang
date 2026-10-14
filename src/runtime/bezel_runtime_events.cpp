@@ -172,8 +172,91 @@ static bool bz_closure_same(void* a, void* b) {
 // match `-=` already uses (bz_closure_same above) instead of a raw closure-
 // wrapper pointer compare — see the header comment for the rationale.
 extern "C" int32_t bz_closure_value_equals(void* a, void* b) {
-    return bz_closure_same(a, b) ? 1 : 0;
+    return bz_closure_same(bz_closure_base(a), bz_closure_base(b)) ? 1 : 0;
 }
+
+// fix #5978 (§8.1 / §8.3 / §27.7.1, v0.338): the vtable every function value
+// presents at `Object` (see BZ_CLOSURE_OBJVIEW_OFFSET). Slot order is codegen's
+// class vtable prefix: [0] type descriptor chain, [1] itmap, [2] Dispose,
+// [3] ToString, [4] Equals, [5] GetHashCode. The descriptor chain is
+// `[self, null]`: no class, interface or box descriptor ever equals it, so
+// every `is`/`as` against a non-function target answers false by the ordinary
+// chain walk. The receiver of each slot is the OBJECT VIEW.
+extern "C" void* bz_fnval_as_object(void* c) {
+    if (!c) return nullptr;
+    void* word0;
+    memcpy(&word0, c, sizeof(void*));
+    if (word0 == (void*)bz_fnval_vtable) return c;      // already the view
+    return (uint8_t*)c + BZ_CLOSURE_OBJVIEW_OFFSET;
+}
+
+extern "C" void* bz_fnval_from_object(void* o) {
+    return bz_closure_base(o);
+}
+
+// 1 iff `o` (an Object-typed value, possibly null) is a function value.
+extern "C" int32_t bz_obj_is_fnval(void* o) {
+    if (!o) return 0;
+    void* word0;
+    memcpy(&word0, o, sizeof(void*));
+    return word0 == (void*)bz_fnval_vtable ? 1 : 0;
+}
+
+static void bz_fnval_obj_dispose(void*) {}
+
+static void* bz_fnval_obj_tostring(void* o) {
+    void** sig;
+    memcpy(&sig, (uint8_t*)o + sizeof(void*), sizeof(void*));
+    return sig ? sig[0] : nullptr;
+}
+
+static bool bz_fnval_obj_equals(void* a, void* b) {
+    // §27.7.1 (v0.338): the equality the hash that "holds at `Object`" agrees
+    // with (§8.3) — function-value equality, read through the object view.
+    // A non-function `b` (string, class, box, null) is never equal.
+    if (!bz_obj_is_fnval(b)) return false;
+    return bz_closure_same(bz_closure_base(a), bz_closure_base(b));
+}
+
+// §27.7.1: the hash "agrees with this equality". Assigned identity hashes
+// (§8.3, never an address) are drawn per the kind's own equality key: the code
+// pointer for a static reference (every reference to M is equal), code pointer
+// plus receiver for a class-receiver reference, the cell for a lambda or a
+// value-shaped-receiver reference (equal only to itself).
+extern "C" int32_t bz_closure_value_hash(void* c) {
+    c = bz_closure_base(c);
+    if (!c) return 0;
+    int64_t kind;
+    memcpy(&kind, (uint8_t*)c + BZ_CLOSURE_KIND_OFFSET, sizeof(int64_t));
+    void* fn;
+    memcpy(&fn, c, sizeof(void*));
+    if (kind == BZ_FVK_FN_ONLY) return bz_obj_identity_hash(fn);
+    if (kind == BZ_FVK_FN_PLUS_RECV) {
+        void* env;
+        memcpy(&env, (uint8_t*)c + BZ_CLOSURE_ENV_OFFSET, sizeof(void*));
+        void* recv = nullptr;
+        if (env) memcpy(&recv, env, sizeof(void*));
+        uint32_t h = (uint32_t)bz_obj_identity_hash(fn) * 31u +
+                     (uint32_t)bz_obj_identity_hash(recv);
+        return (int32_t)(h & 0x7fffffffu);
+    }
+    int8_t one = 1;
+    memcpy((uint8_t*)c + BZ_CLOSURE_HASHED_OFFSET, &one, sizeof(int8_t));
+    return bz_obj_identity_hash(c);
+}
+
+static int32_t bz_fnval_obj_hash(void* o) { return bz_closure_value_hash(o); }
+
+static void* bz_fnval_desc[2] = { (void*)bz_fnval_desc, nullptr };
+static void* bz_fnval_itmap[1] = { nullptr };
+extern "C" void* bz_fnval_vtable[6] = {
+    (void*)bz_fnval_desc,
+    (void*)bz_fnval_itmap,
+    (void*)bz_fnval_obj_dispose,
+    (void*)bz_fnval_obj_tostring,
+    (void*)bz_fnval_obj_equals,
+    (void*)bz_fnval_obj_hash,
+};
 
 extern "C" void bz_event_remove_closure(void* srcp, void* closure) {
     auto* s = (bz_event_source_t*)srcp;

@@ -14544,6 +14544,12 @@ bool Emitter::fillOmittedParamDefaults(
                     unitStorageTy(lowerType(params[j].type.get())));
             } else {
                 ordered[j] = lowerExpr(*dv);
+                // fix #5978 (§8.1 / §22.5, v0.338): a function-valued
+                // default meets an `Object` formal as its object view, like
+                // the explicit argument it stands in for.
+                if (params[j].type)
+                    ordered[j] = fnValForObjectTarget(
+                        ordered[j], ctx_.resolvedType(*params[j].type), dv);
                 // fix #1235 / §22.5 / §22.7: a bare `null` literal default
                 // for a nullable VALUE param (int?, enum?, nullable record)
                 // lowers as ptr null but the param's LLVM type is {i8,T}.

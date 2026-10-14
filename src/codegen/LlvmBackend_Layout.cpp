@@ -3320,6 +3320,37 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
+    // fix #5978 (§12.7 / §8.1, v0.338): a FUNCTION-typed operand (directly,
+    // or a `T` bound to a function type at this instantiation). Its lowered
+    // value is the closure cell, whose word 0 is a code pointer — every arm
+    // below that inspects the operand's first word would read it as a vtable
+    // or, failing that, as a string (`x is string` answered true at
+    // `T := (int) -> int`). A function value is an `Object` and is no string,
+    // class, interface or boxed value, so the answer against any NON-function
+    // target is static; `as Object` is §8.1's conversion to the object view.
+    {
+        const sema::TypeRef* fnOpTy =
+            resolveTypeParamRef(ctx_.exprType(*te.operand));
+        const sema::TypeRef* fnTgtTy = resolveTypeParamRef(rt);
+        if (fnOpTy && fnOpTy->kind == sema::TypeRef::Kind::Function &&
+            fnTgtTy && fnTgtTy->kind != sema::TypeRef::Kind::Function &&
+            obj->getType()->isPointerTy()) {
+            const bool toObject =
+                fnTgtTy->kind == sema::TypeRef::Kind::Primitive &&
+                fnTgtTy->primitive == sema::PrimitiveType::Object;
+            llvm::Value* holds = toObject
+                ? builder_.CreateICmpNE(
+                      obj, llvm::ConstantPointerNull::get(ptrTy()),
+                      "is.fnval.object")
+                : static_cast<llvm::Value*>(builder_.getInt1(false));
+            if (te.op == "is") return holds;
+            if (te.op == "is not")
+                return builder_.CreateXor(holds, builder_.getInt1(true));
+            if (te.op == "as" && toObject) return fnValToObjectView(obj);
+            if (te.op == "as" && lowerTypeRef(fnTgtTy)->isPointerTy())
+                return llvm::ConstantPointerNull::get(ptrTy());
+        }
+    }
     // fix #3092 narrow (§12.9/§8.6, v0.254): a BARE type-parameter target must
     // be substituted through the active monomorphization so the descriptor
     // resolution paths below can find its runtime tag. The shape is narrow on
@@ -4308,6 +4339,15 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
     }
     // Only box a value-typed source. A reference source (class/interface/
     // string/Object) already lowers to a pointer and reaches Object directly.
+    // fix #5978 (§8.1 / §12.7, v0.338): a function value reaches `Object`
+    // "via [its] reference-type heap representation" — not a box — but the
+    // cell base's word 0 is the code pointer, which every `Object` operation
+    // would read as a vtable (`o is string` answered true and `o.ToString()`
+    // freed the cell as a string). Hand the slot the cell's object view.
+    if (srcTy->kind == sema::TypeRef::Kind::Function &&
+        declTy->kind == sema::TypeRef::Kind::Primitive &&
+        v->getType()->isPointerTy())
+        return isFnValuedExpr(*init) ? fnValToObjectView(v) : v;
     if (!isBoxableValueType(srcTy) && !isNullableValueTy(srcTy)) return v;
     // The lowered value must be a scalar/struct (a value), not already a ptr
     // (which would mean it was lowered as a reference — leave it alone).
@@ -4315,6 +4355,248 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
     return boxValue(v, srcTy);
 }
 
+
+// fix #5978 (§8.1 / §27.7.1, v0.338): see `fnAtObject_`. The operands of `e`
+// that sit where an `Object` is expected.
+namespace {
+
+// fix #5978 (§8.1 / §27.7.1, v0.338): the builtin members whose parameter is
+// DECLARED at the receiver's own element / key / value type parameter
+// (Bezel_Standard_Library.md, each type's declaration) — the positions where
+// an argument meets an `Object` slot when that parameter is bound to
+// `Object`. The compiler holds no signatures for builtin members, so the
+// table is keyed on (receiver head type, member, parameter) and lists each
+// (callee, parameter) pair explicitly: a head type that is not listed has no
+// site, and a parameter of FUNCTION type (an event handler, a predicate, a
+// comparer, a factory) is never listed — its argument is a function value
+// used as one. `"new"` is the constructor, `"[]"` the indexer.
+struct FnObjSite {
+    std::string_view head, member;
+    int arg;                    // positional index of the parameter
+    std::string_view param;     // its declared name (a named argument)
+    int slot;                   // which type argument of the receiver it is
+};
+constexpr FnObjSite kFnObjSites[] = {
+    {"ICollection", "Add", 0, "item", 0},
+    {"ICollection", "Contains", 0, "item", 0},
+    {"ICollection", "Remove", 0, "item", 0},
+    {"IList", "Add", 0, "item", 0},
+    {"IList", "Contains", 0, "item", 0},
+    {"IList", "Remove", 0, "item", 0},
+    {"IList", "Insert", 1, "item", 0},
+    {"Array", "new", 1, "fill", 0},
+    {"Array", "Add", 0, "item", 0},
+    {"Array", "Insert", 1, "item", 0},
+    {"Array", "Remove", 0, "item", 0},
+    {"Array", "Contains", 0, "item", 0},
+    {"Array", "IndexOf", 0, "item", 0},
+    {"Array", "LastIndexOf", 0, "item", 0},
+    {"Set", "Add", 0, "item", 0},
+    {"Set", "TryAdd", 0, "item", 0},
+    {"Set", "Contains", 0, "item", 0},
+    {"Set", "Remove", 0, "item", 0},
+    {"LinkedList", "Add", 0, "item", 0},
+    {"LinkedList", "Contains", 0, "item", 0},
+    {"LinkedList", "Remove", 0, "item", 0},
+    {"LinkedList", "AddFirst", 0, "item", 0},
+    {"LinkedList", "AddLast", 0, "item", 0},
+    {"LinkedList", "AddBefore", 1, "item", 0},
+    {"LinkedList", "AddAfter", 1, "item", 0},
+    {"LinkedList", "Find", 0, "item", 0},
+    {"Stack", "Push", 0, "item", 0},
+    {"Stack", "Contains", 0, "item", 0},
+    {"Queue", "Enqueue", 0, "item", 0},
+    {"Queue", "Contains", 0, "item", 0},
+    {"ArraySpan", "IndexOf", 0, "value", 0},
+    {"ArraySpan", "Contains", 0, "value", 0},
+    {"ArraySpan", "Fill", 0, "value", 0},
+    {"ReadOnlyArraySpan", "IndexOf", 0, "value", 0},
+    {"ReadOnlyArraySpan", "Contains", 0, "value", 0},
+    {"Dictionary", "[]", 0, "key", 0},
+    {"Dictionary", "Add", 0, "key", 0},
+    {"Dictionary", "Add", 1, "value", 1},
+    {"Dictionary", "TryAdd", 0, "key", 0},
+    {"Dictionary", "TryAdd", 1, "value", 1},
+    {"Dictionary", "ContainsKey", 0, "key", 0},
+    {"Dictionary", "Contains", 0, "key", 0},
+    {"Dictionary", "Remove", 0, "key", 0},
+    {"Dictionary", "TryGetValue", 0, "key", 0},
+    {"Dictionary", "GetOrNull", 0, "key", 0},
+    {"Dictionary", "GetOrAdd", 0, "key", 0},
+    {"Counter", "Increment", 0, "key", 0},
+    {"Counter", "CountOf", 0, "key", 0},
+    {"Counter", "Contains", 0, "key", 0},
+    {"Counter", "Remove", 0, "key", 0},
+    {"EventSource", "Raise", 0, "payload", 0},
+    {"SharedEventSource", "Raise", 0, "payload", 0},
+    {"AsyncEventSource", "RaiseAsync", 0, "payload", 0},
+    {"TaskCompletionSource", "SetResult", 0, "result", 0},
+    {"TaskCompletionSource", "TrySetResult", 0, "result", 0},
+};
+
+// The receiver type argument `(head, member)`'s parameter at position `arg`
+// (or named `name`) is declared at, or -1.
+int fnObjSiteSlot(std::string_view head, std::string_view member,
+                  std::size_t arg, std::string_view name) {
+    for (const FnObjSite& s : kFnObjSites) {
+        if (s.head != head || s.member != member) continue;
+        if (name.empty() ? static_cast<std::size_t>(s.arg) == arg
+                         : s.param == name)
+            return s.slot;
+    }
+    return -1;
+}
+
+}  // namespace
+
+// The builtin generic type `t` names, as the table spells its head, with its
+// type arguments; null for a user type or a non-generic one.
+const sema::TypeRef* Emitter::fnObjSiteReceiver(const sema::TypeRef* t,
+                                                std::string_view& head) {
+    if (t) t = resolveTypeParamRef(t);
+    if (!t || t->kind != sema::TypeRef::Kind::Named || t->genericArgs.empty())
+        return nullptr;
+    // Builtin heads only (the test `isCollectionTypeName` makes): a user
+    // type's arguments are converted against its declared formals.
+    if (t->declaration &&
+        (t->declaration->decl || !t->declaration->moduleName.empty()))
+        return nullptr;
+    head = builtinTypeName(t);
+    return head.empty() ? nullptr : t;
+}
+
+void Emitter::noteFnAtObjectArgs(const sema::TypeRef* recv,
+                                 std::string_view member,
+                                 const std::vector<ast::CallArgument>& args) {
+    std::string_view head;
+    recv = fnObjSiteReceiver(recv, head);
+    if (!recv) return;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const ast::Expr* a = args[i].value.get();
+        if (!a) continue;
+        const int slot = fnObjSiteSlot(head, member, i, args[i].name);
+        if (slot >= 0 &&
+            static_cast<std::size_t>(slot) < recv->genericArgs.size())
+            noteFnAtObject(a, recv->genericArgs[slot]);
+    }
+}
+
+// A literal's elements are stores into the collection it builds: its elements
+// at the element type, a dictionary literal's keys and values at the key and
+// value types. A literal is not a general expression (§15.4) — `lowerExpr`
+// answers null for one and each materializer lowers the elements against the
+// target it was handed — so the materializers call this with that target. (A
+// spread element is a collection, never a function value: left alone at
+// apply.)
+void Emitter::noteFnAtObjectLiteral(const ast::CollectionLiteralExpr& cl,
+                                    const sema::TypeRef* collTy) {
+    std::string_view head;
+    const sema::TypeRef* ct = fnObjSiteReceiver(collTy, head);
+    if (!ct) return;
+    if (ct->genericArgs.size() == 2) {
+        if (fnObjSiteSlot(head, "Add", 1, {}) != 1) return;
+        for (auto& k : cl.keys) noteFnAtObject(k.get(), ct->genericArgs[0]);
+        for (auto& v : cl.elements)
+            noteFnAtObject(v.get(), ct->genericArgs[1]);
+    } else if (ct->genericArgs.size() == 1 && !cl.isDict &&
+               fnObjSiteSlot(head, "Contains", 0, {}) == 0) {
+        for (auto& v : cl.elements)
+            noteFnAtObject(v.get(), ct->genericArgs[0]);
+    }
+}
+
+void Emitter::noteFnAtObjectChildren(const ast::Expr& e) {
+    if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (!bin->left || !bin->right) return;
+        if (bin->op == "??") {
+            // §7.7 (v0.338): "for a left operand of type `T?`, the right
+            // operand must be implicitly convertible (§5.1) to `T` or to
+            // `T?`". Only where `T` is `Object` is an operand a function
+            // value at an `Object` position; each is then converted on ITS
+            // OWN static type (the apply step in `lowerExpr` tests it). A
+            // `??` typed at a function type (`nn ?? throw …`, `nn ?? g`)
+            // yields a function-typed value: its operands stay cell bases,
+            // and the whole is converted by whichever `Object` position it
+            // reaches, if any — see `isFnValuedExpr`.
+            const sema::TypeRef* t = ctx_.exprType(e);
+            if (resolvesToObject(t)) {
+                noteFnAtObject(bin->left.get(), t);
+                noteFnAtObject(bin->right.get(), t);
+            }
+        } else if (bin->op == "=" || bin->op == "<>") {
+            // §27.7.1 (v0.338): a function value's hash "holds at `Object`,
+            // where a capture-free function value is admitted (§28.3's
+            // *Set-erasing positions*) and is an ordinary key", and §8.3 has
+            // the hash agree with equality — compare the two as objects.
+            const sema::TypeRef* lt = ctx_.exprType(*bin->left);
+            const sema::TypeRef* rt = ctx_.exprType(*bin->right);
+            if (resolvesToObject(lt)) noteFnAtObject(bin->right.get(), lt);
+            if (resolvesToObject(rt)) noteFnAtObject(bin->left.get(), rt);
+        } else if (bin->op == "in") {
+            // §4.8: `x in coll` is `coll.Contains(x)`.
+            std::string_view head;
+            if (const sema::TypeRef* ct =
+                    fnObjSiteReceiver(ctx_.exprType(*bin->right), head)) {
+                const int slot = fnObjSiteSlot(head, "Contains", 0, {});
+                if (slot >= 0 &&
+                    static_cast<std::size_t>(slot) < ct->genericArgs.size())
+                    noteFnAtObject(bin->left.get(), ct->genericArgs[slot]);
+            }
+        }
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        // §27.3: the expression body of a lambda whose function type returns
+        // `Object`. (A block body's `return` is noted as a statement.)
+        const sema::TypeRef* lt = ctx_.exprType(e);
+        if (lt && lt->kind == sema::TypeRef::Kind::Function &&
+            !lam->isBlockBody)
+            noteFnAtObject(lam->exprBody.get(), lt->funcReturn);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (ix->target)
+            noteFnAtObjectArgs(ctx_.exprType(*ix->target), "[]", ix->indices);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        noteFnAtObjectArgs(ctx_.exprType(e), "new", ne->args);
+        return;
+    }
+    auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!call || call->args.empty()) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return;
+    noteFnAtObjectArgs(ctx_.exprType(*ma->target), ma->member, call->args);
+}
+
+void Emitter::noteFnAtObjectStmt(const ast::Stmt& s) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // `:=` and `??=` into an `Object` location of any shape.
+        if (as->target && as->value && (as->op == ":=" || as->op == "??="))
+            noteFnAtObject(as->value.get(), ctx_.exprType(*as->target));
+        // An indexer store's key (`d[f] := v`): the target is lowered as a
+        // place, not through `lowerExpr`, so its indices are noted here.
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(as->target.get()))
+            if (ix->target)
+                noteFnAtObjectArgs(ctx_.exprType(*ix->target), "[]",
+                                   ix->indices);
+    } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        // §29: `yield return` into an iterator of `Object`.
+        if (ys->value) noteFnAtObject(ys->value.get(), iterElemSemaTy_);
+    } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (!rs->value) return;
+        // A block-bodied lambda's `return` (a method's is converted by
+        // `boxForTarget` against its declared return type).
+        if (!currentReturnTypeNode_)
+            noteFnAtObject(rs->value.get(), currentLambdaReturnSemaTy_);
+        // §30.5: an async body's `return` stores into its task's result; the
+        // declared type is the `Task<Object>`, so `boxForTarget` does not see
+        // an `Object` target.
+        if (asyncResultSemaType_)
+            noteFnAtObject(rs->value.get(), asyncResultSemaType_);
+    }
+}
 
 // fix #4619 (§8.6 / §25.2 / §8.4 / §28.9, v0.307): §8.6-box a collection
 // MEMBERSHIP QUERY — the `x` of `.Contains(x)` / `.IndexOf(x)` / `.Remove(x)` /
@@ -7032,6 +7314,7 @@ llvm::Value* Emitter::buildMethodClosureCell(llvm::Function* thunk,
     initClosureRc(closureObj);      // #422: producer's reference, rc := 1
     initClosureEnvdtor(closureObj); // #672: foundation null envdtor
     initClosureKind(closureObj, kind); // §27.7.1 (#1544): equality-rule tag
+    initClosureObjectHeader(closureObj); // #5978: the Object view's header
     return closureObj;
 }
 
@@ -7684,6 +7967,7 @@ llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
     initClosureRc(closureObj);
     initClosureEnvdtor(closureObj);
     initClosureKind(closureObj, kind); // §27.7.1 (#1544): equality-rule tag
+    initClosureObjectHeader(closureObj); // #5978: the Object view's header
     return closureObj;
 }
 

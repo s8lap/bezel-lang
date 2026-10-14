@@ -139,6 +139,36 @@ static const int64_t BZ_FVK_REF_IDENTITY = 0;
 static const int64_t BZ_FVK_FN_PLUS_RECV  = 1;
 static const int64_t BZ_FVK_FN_ONLY       = 2;
 
+// fix #5978 (§8.1 / §12.7 / §27.7.1, v0.338): the OBJECT VIEW of a function
+// value. §8.1 has a function type reach `Object` "via [its] reference-type
+// heap representation" — no box — yet word 0 of the closure cell is the code
+// pointer every invocation site loads, so the cell base cannot carry the
+// vtable word every `Object` operation reads. The cell therefore ends in a
+// two-word header
+//     { vtable (off 48), sig (off 56) }
+// and a function value held at `Object` is the address of THAT header (cell
+// base + BZ_CLOSURE_OBJVIEW_OFFSET): word 0 is `bz_fnval_vtable`, the one
+// vtable shared by every function value, and word 1 is the descriptor of the
+// function type the value was formed at (§12.7 *Function-typed targets*),
+// whose first word is that type's rendered name. A function-TYPED reference
+// stays the cell base, so no existing reader of fn/env/rc/envdtor/kind moves.
+static const int64_t BZ_CLOSURE_OBJVIEW_OFFSET = 48;
+// One byte of the padding after `disposed` (off 40): set once the cell has
+// been given an assigned identity hash, so bz_closure_release reaps the
+// side-table entry only for a cell that has one.
+static const int64_t BZ_CLOSURE_HASHED_OFFSET = 41;
+extern "C" void* bz_fnval_vtable[6];
+// Either view of a function value -> the cell base. A cell base's word 0 is a
+// code pointer and can never equal the vtable's address.
+static inline void* bz_closure_base(void* c) {
+    if (!c) return c;
+    void* word0;
+    memcpy(&word0, c, sizeof(void*));
+    if (word0 == (void*)bz_fnval_vtable)
+        return (uint8_t*)c - BZ_CLOSURE_OBJVIEW_OFFSET;
+    return c;
+}
+
 // ---- shared string-header layout constants + rc initializer ----
 static const int64_t BZ_STRING_SIZEOF = 32;
 // Byte offset of the rc field inside the header (after data/len/width + pad).

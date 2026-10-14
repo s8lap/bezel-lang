@@ -7560,7 +7560,13 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                      ++fi) {
                     const ast::CallArgument* a = payloadArg[fi];
                     if (a && a->value) {
-                        payloadFields.push_back(lowerExpr(*a->value));
+                        // fix #5978 (§8.1, v0.338): a function value placed
+                        // in an `Object` payload takes the object view.
+                        const ast::Param& pf = cc->caseDecl->payload[fi];
+                        payloadFields.push_back(fnValForObjectTarget(
+                            lowerExpr(*a->value),
+                            pf.type ? ctx_.resolvedType(*pf.type) : nullptr,
+                            a->value.get()));
                     } else {
                         // Defensive — sema should reject; use undef of the
                         // right type so the InsertValue below stays well-
