@@ -339,3 +339,34 @@ BEZEL_TEST(sema_generic_method_reference_list_5814,
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "IComparable<T>"));
 }
+
+// §14.5 (v0.338): an explicit list supplies EXACTLY the declared count
+// (stdlib §2.2: `Min`/`Max`/`Clamp` declare one type parameter, `Abs` none).
+// `Math.Max<int, int>` as a reference compiled and died with SIGSEGV (#6295).
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           math_reference_wrong_type_argument_count_rejected_14_5) {
+    const char* refs[][2] = {
+        {"(int, int) -> int", "Math.Max<int, int>"},
+        {"(int, int) -> int", "Math.Min<int, int>"},
+        {"(int, int, int) -> int", "Math.Clamp<int, int>"},
+        {"(int) -> int", "Math.Abs<int>"},
+        {"(int) -> int", "Math.Sign<int, int>"},
+    };
+    for (auto& ref : refs) {
+        auto r = runAot(std::string("module Conf; public class Program "
+            "public static method Main() var m: ") + ref[0] + " := " + ref[1] +
+            "; end Main; end Program;");
+        BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "explicit type argument(s)"));
+    }
+}
+
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           math_callee_wrong_type_argument_count_rejected_14_5) {
+    auto r = runAot(
+        "module Conf; public class Program public static method Main() "
+        "  Console.WriteLine(Math.Max<int, int>(3, 1)); "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "explicit type argument(s)"));
+}

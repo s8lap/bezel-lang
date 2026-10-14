@@ -29852,6 +29852,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 else rejectBuiltinStatic();
             }
             else if (cls == "Math") {
+                // per §14.5 (v0.338, #5814): an explicit type-argument list is
+                // all-or-nothing and supplies EXACTLY the declared count
+                // (stdlib §2.2: `Min`/`Max`/`Clamp`/`Sign` declare one type parameter,
+                // every other `Math` member none). A wrong count - at a
+                // reference or a callee - is rejected here; it used to be
+                // accepted and the formed reference crashed (SIGSEGV).
+                if (!ma.typeArgs.empty() &&
+                    (m=="Abs"||m=="Sqrt"||m=="Pow"||m=="Ceiling"||
+                     m=="Floor"||m=="Round"||m=="Truncate"||m=="Pi"||m=="Tau"||
+                     m=="Fmod"||m=="IEEERemainder"||m=="DivRem"||
+                     ((m=="Min"||m=="Max"||m=="Clamp"||m=="Sign") &&
+                      ma.typeArgs.size() != 1))) {
+                    const bool generic = m=="Min"||m=="Max"||m=="Clamp"||m=="Sign";
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`Math." + std::string(m) + "` is given " +
+                            std::to_string(ma.typeArgs.size()) +
+                            " explicit type argument(s), but it declares " +
+                            (generic ? "1 type parameter" : "no type parameters") +
+                            " \xE2\x80\x94 an explicit type-argument list must "
+                            "supply exactly as many arguments as the method "
+                            "declares type parameters; there are no partial "
+                            "lists (\xC2\xA7""14.5, \xC2\xA7""27.6, v0.338)");
+                }
                 if (m=="Abs"||m=="Sign") setInt();
                 else if (m=="Sqrt"||m=="Pow"||
                          m=="Ceiling"||m=="Floor"||m=="Round"||m=="Truncate"||
