@@ -10566,6 +10566,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
                 bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
                 bool savedArgCtx = pendingLambdaArgContext_;
+                // fix #6107: the function type an explicit type argument gives
+                // this lambda argument's bare-`T` formal (set below).
+                TypeRef* explicitFnFormal = nullptr;
                 if (auto* lam =
                         dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                     // fix #3756 (§27.4): a call-argument lambda always has a
@@ -10622,7 +10625,25 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // `resolvedDeclType`, which is where the formal's type
                     // lives when there is no AST decl (§2.8.2 clause 1).
                     if (calleeMs2) {
-                        if (auto* pt = formalFnParamType2(pos2)) {
+                        TypeRef* ptFormal = formalFnParamType2(pos2);
+                        // fix #6107 (§12.7 "the target's where inferred" /
+                        // §14.5, v0.338): a formal that is the method's own
+                        // bare generic `T`, bound by an EXPLICIT type argument
+                        // to a function type (`Pass<(string) -> int>(lambda(x)
+                        // => x.Length)`), is that function type — the lambda is
+                        // typed against it like a function-typed formal. Only
+                        // an explicit argument (methodSubst) qualifies; an
+                        // inferred `T` stays on the generic-inference path
+                        // (#505, #5117).
+                        if (ptFormal && isBareOwnGenericRef(ptFormal)) {
+                            auto sit = methodSubst.find(ptFormal->headName());
+                            ptFormal = (sit != methodSubst.end() && sit->second &&
+                                        sit->second->kind ==
+                                            TypeRef::Kind::Function)
+                                           ? sit->second : nullptr;
+                            explicitFnFormal = ptFormal;
+                        }
+                        if (auto* pt = ptFormal) {
                             if (pt->kind == TypeRef::Kind::Function &&
                                 !pt->funcParams.empty()) {
                                 // #1140 / §14: a function-typed param `(T)->R`
@@ -10817,6 +10838,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         : nullptr;
                 visitExpr(*a.value);
                 refOutArgTargetNode_ = savedRefOut;
+                // fix #6107 (§12.7 "the target's where inferred", v0.338): the
+                // lambda argument at an explicit function-typed type argument
+                // is formed at that type, so its expression type IS the
+                // substituted formal (not the body-inferred return).
+                if (explicitFnFormal) {
+                    TypeRef* lamT = ctx_.exprType(*a.value);
+                    if (lamT && lamT->kind == TypeRef::Kind::Function &&
+                        lamT->funcParams.size() ==
+                            explicitFnFormal->funcParams.size())
+                        ctx_.setExprType(a.value.get(), explicitFnFormal);
+                }
                 // per §22.12 rule 5 (v0.180, #1542): the handler argument
                 // (arg 0) of a `<static event>.Subscribe(...)` / `.Add(...)`
                 // call must be capture-free — a non-capturing lambda or a
