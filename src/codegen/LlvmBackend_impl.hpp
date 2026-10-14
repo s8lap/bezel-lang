@@ -8927,6 +8927,47 @@ private:
                                           const sema::MethodSymbol* iface) {
         if (!iface) return nullptr;
         sema::MethodSymbol* nameOnly = nullptr;
+        // fix #6158 (§11.2 / §22.6, v0.338): a GENERIC interface's method is
+        // matched under the class's instantiation of it (`Put(x: T)` of
+        // `IL<T>` on `Both: IL<string>` is witnessed by `Put(x: string)`),
+        // which is what `findInterfaceImplAt` compares. With the bare `T`
+        // the passes below match nothing and the arity pick took the
+        // first-declared same-arity overload, so `ib.Put("a")` ran
+        // `Put(x: bool)`. Only when the class reaches the interface at
+        // exactly ONE concrete instantiation: two or more get their own
+        // tables from the caller (#5115).
+        if (iface->parent && !iface->parent->genericParams.empty()) {
+            const std::vector<const sema::TypeRef*>* only = nullptr;
+            std::size_t n = 0;
+            auto insts = collectConcreteGenericBaseInsts(cls);
+            for (auto& inst : insts)
+                if (inst.first == iface->parent) {
+                    ++n;
+                    only = &inst.second;
+                }
+            // A generic class listing the interface at its OWN parameter
+            // (`Gen<U>: IL<U>`) has no concrete instantiation; match under
+            // the arguments as written on the one class that lists it.
+            std::vector<const sema::TypeRef*> written;
+            if (n == 0) {
+                for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t))
+                    for (std::size_t bi = 0; bi < t->baseTypes.size() &&
+                                             bi < t->baseTypeRefs.size();
+                         ++bi)
+                        if (t->baseTypes[bi] == iface->parent &&
+                            t->baseTypeRefs[bi]) {
+                            ++n;
+                            written.assign(
+                                t->baseTypeRefs[bi]->genericArgs.begin(),
+                                t->baseTypeRefs[bi]->genericArgs.end());
+                            only = &written;
+                        }
+            }
+            if (n == 1)
+                if (sema::MethodSymbol* at =
+                        findInterfaceImplAt(cls, iface, *only))
+                    return at;
+        }
         // fix #5999 (§22.6 / §11.2, v0.338): among same-name same-arity
         // overloads the witness is the one whose parameter types equal the
         // interface method's (an implementation may widen `T` to `T?`), so a
@@ -9014,6 +9055,11 @@ private:
             std::string_view head;
             bool nullable = false;
             const sema::TypeRef* rt = p->resolvedDeclType;
+            // fix #6158: a LOCALLY declared interface's parameter carries
+            // only its AST type, so a non-parameter type beside the `T` one
+            // (`Put(x: bool)`, `F(x: Animal, y: T)`) read as null here and
+            // the overload naming it could never be the witness.
+            if (!rt && p->declType) rt = ctx_.resolvedType(*p->declType);
             if (rt && rt->kind == sema::TypeRef::Kind::Named &&
                 !rt->declaration && rt->genericArgs.empty()) {
                 head = rt->headName();
@@ -9039,34 +9085,53 @@ private:
             }
             return rt ? substituteTypeRefLocal(rt, subst) : nullptr;
         };
-        for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t)) {
-            for (sema::Symbol* m : t->members) {
-                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                if (!ms || isStaticMethod(ms) || ms->name != iface->name ||
-                    !methodFns_.count(ms) ||
-                    ms->params.size() != iface->params.size())
-                    continue;
-                bool match = true;
-                for (std::size_t i = 0; match && i < ms->params.size(); ++i) {
-                    auto* cp = dynamic_cast<const sema::ParameterSymbol*>(
-                        ms->params[i]);
-                    auto* ip = dynamic_cast<const sema::ParameterSymbol*>(
-                        iface->params[i]);
-                    const sema::TypeRef* ct = cp ? cp->resolvedDeclType : nullptr;
-                    if (!ct && cp && cp->declType)
-                        ct = ctx_.resolvedType(*cp->declType);
-                    const sema::TypeRef* it = ip ? ifaceParamTy(ip) : nullptr;
-                    if (!ct || !it) { match = false; break; }
-                    if (methodSigTypeRefEqual(ct, it)) continue;
-                    // §11.2: an implementation may widen `T` to `T?`.
-                    if (ct->nullable && !it->nullable) {
-                        sema::TypeRef stripped = *ct;
-                        stripped.nullable = false;
-                        if (methodSigTypeRefEqual(&stripped, it)) continue;
+        // fix #6158 (§11.2 / §22.6, v0.338): two declaration-less Named
+        // types are the same type only under the same name — a built-in
+        // class (`Exception` beside `ArgumentException`) or a type parameter
+        // — where `methodSigTypeRefEqual` alone calls any two equal. And the
+        // EXACT witness is looked for before the `T` -> `T?` widening one:
+        // with `F(x: T?)` declared before `F(x: T)` in the class, a single
+        // pass handed the interface's `F(x: T)` slot to the widened overload.
+        auto sameTy = [](const sema::TypeRef* ct, const sema::TypeRef* it) {
+            if (ct->kind == sema::TypeRef::Kind::Named &&
+                it->kind == sema::TypeRef::Kind::Named && !ct->declaration &&
+                !it->declaration && ct->headName() != it->headName())
+                return false;
+            return methodSigTypeRefEqual(ct, it);
+        };
+        for (int widen = 0; widen < 2; ++widen) {
+            for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t)) {
+                for (sema::Symbol* m : t->members) {
+                    auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                    if (!ms || isStaticMethod(ms) ||
+                        ms->name != iface->name || !methodFns_.count(ms) ||
+                        ms->params.size() != iface->params.size())
+                        continue;
+                    bool match = true;
+                    for (std::size_t i = 0; match && i < ms->params.size();
+                         ++i) {
+                        auto* cp = dynamic_cast<const sema::ParameterSymbol*>(
+                            ms->params[i]);
+                        auto* ip = dynamic_cast<const sema::ParameterSymbol*>(
+                            iface->params[i]);
+                        const sema::TypeRef* ct =
+                            cp ? cp->resolvedDeclType : nullptr;
+                        if (!ct && cp && cp->declType)
+                            ct = ctx_.resolvedType(*cp->declType);
+                        const sema::TypeRef* it =
+                            ip ? ifaceParamTy(ip) : nullptr;
+                        if (!ct || !it) { match = false; break; }
+                        if (sameTy(ct, it)) continue;
+                        // §11.2: an implementation may widen `T` to `T?`.
+                        if (widen && ct->nullable && !it->nullable) {
+                            sema::TypeRef stripped = *ct;
+                            stripped.nullable = false;
+                            if (sameTy(&stripped, it)) continue;
+                        }
+                        match = false;
                     }
-                    match = false;
+                    if (match) return ms;
                 }
-                if (match) return ms;
             }
         }
         return nullptr;

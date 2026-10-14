@@ -2052,6 +2052,13 @@ std::string ExprTC::refOutNarrowedCopyOutHint(const ast::Expr& operand,
            tmp + "`)";
 }
 
+// Defined with `substituteMemberType`, below.
+static bool ancestorGenericSubst(
+    const TypeRef* recvTy, const TypeSymbol* derived,
+    const TypeSymbol* parent, bool throughInterfaces,
+    std::unordered_map<std::string_view, TypeRef*>& out,
+    const std::unordered_set<std::string_view>* excludeNames);
+
 // §22.6/§12.1 (#1090): collect same-name overloads across the class hierarchy.
 void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                                        std::vector<MethodSymbol*>& out) {
@@ -2067,8 +2074,8 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
     // call resolved against the receiver's OWN (most-derived) declared type
     // seeing two same-arity candidates and mis-classifying a `null` argument
     // as inapplicable to both, per #22.6's exact/convert grid — #1560).
-    // (A generic base param compares unequal to its concrete override and is
-    // left for §22.6 ranking to disambiguate.)
+    // A generic base's parameter is compared at the derived class's
+    // instantiation of that base (fix #6001 R1, below).
     auto shadows = [&](MethodSymbol* d, MethodSymbol* b) -> bool {
         if (d->params.size() != b->params.size()) return false;
         for (std::size_t i = 0; i < d->params.size(); ++i) {
@@ -2100,6 +2107,26 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
             if (isBuiltinExceptionRef(dt) && isBuiltinExceptionRef(bt) &&
                 namedRefSimpleName(dt) != namedRefSimpleName(bt))
                 return false;
+            // fix #6001 R1 (§12.2 / §12.1, v0.338): a base member declared
+            // on a GENERIC base is compared at the instantiation the derived
+            // class names (`D: B<int>` overriding `Q(x: T)` as `Q(x: int)`).
+            // Since #6001 ranks candidates at their substituted signatures,
+            // the unsubstituted comparison left the base member beside its
+            // override as a second, equally exact candidate. §12.2: "an
+            // inherited overload set does not extend across the inheritance
+            // boundary".
+            if (bt && d->parent != b->parent && b->parent &&
+                !b->parent->genericParams.empty()) {
+                std::unordered_set<std::string_view> own;
+                for (Symbol* gp : b->genericParams)
+                    if (gp) own.insert(gp->name);
+                std::unordered_map<std::string_view, TypeRef*> sub;
+                if (ancestorGenericSubst(nullptr, d->parent, b->parent,
+                                         /*throughInterfaces=*/false, sub,
+                                         &own) &&
+                    !sub.empty())
+                    bt = substituteReturnType(bt, sub);
+            }
             if (!overrideParamTypeMatches(dt, bt, isByRef)) return false;
         }
         return true;
@@ -2683,6 +2710,9 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // §22.6 defaulted-arity tie-break (v0.181, #1561): does candidate c's
     // binding leave any parameter to be filled by its declared default?
     std::vector<bool> fillsDefault(cands.size(), false);
+    // Does candidate c have a parameter spelled with its declaring type's
+    // own type parameter (substituted at the receiver, fix #6001)?
+    std::vector<bool> spelledWithTypeParam(cands.size(), false);
     // fix #2985 (§22.6 / §5.1, v0.240): §5.1 "Constant narrowing" says "An
     // expression of integer type that is a compile-time constant implicitly
     // converts to any integer type whose range contains its value" and the
@@ -2729,6 +2759,42 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // the case `narrowIntConstantToTarget` already supports (literals + local /
     // module consts); bundling #2986 would risk regressing this fix when the
     // member-const resolver changes.
+    const ast::Expr* recvTarget = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        recvTarget = ma->target.get();
+    else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                 ce.callee.get()))
+        recvTarget = ncm->target.get();
+    // The three substitutions the single-candidate argument check applies
+    // (`checkArgsAgainstParams`), in its order: the receiver's own arguments
+    // (`substituteMemberType`, which also walks a base CLASS chain), a bare
+    // type-parameter receiver's constraint arguments, and — for an interface
+    // receiver that inherits the member's interface (`IJ: IL<string>`) — the
+    // arguments composed along the interface chain. The method's own type
+    // parameters shadow the type's and are excluded, as there.
+    auto paramTypeAtReceiver = [&](const TypeRef* pt,
+                                   MethodSymbol* cand) -> const TypeRef* {
+        TypeSymbol* par = cand->parent;
+        if (!pt || !par || par->genericParams.empty()) return pt;
+        std::unordered_set<std::string_view> ownGenerics;
+        for (Symbol* gp : cand->genericParams)
+            if (gp) ownGenerics.insert(gp->name);
+        TypeRef* sub = substituteMemberType(const_cast<TypeRef*>(pt),
+                                            recvTarget, par, &ownGenerics);
+        if (!recvTarget) return sub;
+        auto cs = constraintReceiverSubst(recvTarget, par);
+        if (cs.empty()) {
+            const TypeRef* rt = ctx_.exprType(*recvTarget);
+            if (rt && rt->declaration && rt->declaration != par &&
+                rt->declaration->kind == ast::TypeDeclKind::Interface &&
+                !ancestorGenericSubst(rt, rt->declaration, par,
+                                      /*throughInterfaces=*/true, cs,
+                                      &ownGenerics))
+                cs.clear();
+        }
+        for (std::string_view own : ownGenerics) cs.erase(own);
+        return cs.empty() ? sub : substituteReturnType(sub, cs);
+    };
     for (std::size_t c = 0; c < cands.size(); ++c) {
         const std::size_t np = sema::formalParamCount(*cands[c]);
         for (std::size_t j = 0; j < np; ++j) {
@@ -2753,6 +2819,17 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             // method type parameter, so this is a no-op for every
             // pre-existing (non-generic, or already-conflicting) candidate
             // shape — see `phase1Subst`'s computation above.
+            // fix #6001 (§22.6 / §14.1, v0.338): a candidate declared on a
+            // GENERIC type ranks at the receiver's instantiation — §22.6's
+            // "substituted signatures". A parameter spelled with the type's
+            // own parameter (`x: T` on `G<T>` or `IL<T>`) was graded as the
+            // bare, declaration-less `T`, which no argument converts to, so
+            // every candidate was inapplicable.
+            {
+                const TypeRef* before = pt;
+                pt = paramTypeAtReceiver(pt, cands[c]);
+                if (pt != before) spelledWithTypeParam[c] = true;
+            }
             if (pt && !phase1Subst[c].empty())
                 pt = substituteReturnType(const_cast<TypeRef*>(pt),
                                           phase1Subst[c]);
@@ -2793,6 +2870,60 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             argIdxRows[c].push_back(ai);
         }
         candNames[c] = methodSignatureString(initial->name, *cands[c]);
+    }
+    // fix #6001 (§22.6 / §14.1, v0.338), recorded interpretation pending
+    // #6220(c): when a candidate spelled with the type's parameter
+    // (`Q(x: T)` on `G<T>`) substitutes to EXACTLY the signature of a
+    // candidate spelled without one (`Q(x: string)`, receiver `G<string>`),
+    // §22.6 ranks two identical rows and says nothing more. Before #6001 the
+    // `T` row was never applicable, so the concrete declaration was chosen;
+    // keep that selection rather than turn the call into an ambiguity until
+    // the spec rules on coinciding substituted signatures.
+    {
+        std::vector<bool> drop(cands.size(), false);
+        for (std::size_t c = 0; c < cands.size(); ++c) {
+            if (!spelledWithTypeParam[c]) continue;
+            for (std::size_t d = 0; d < cands.size() && !drop[c]; ++d) {
+                if (d == c || spelledWithTypeParam[d] ||
+                    paramTypes[d].size() != paramTypes[c].size() ||
+                    argIdxRows[d] != argIdxRows[c] ||
+                    fillsDefault[d] != fillsDefault[c])
+                    continue;
+                bool same = true;
+                for (std::size_t i = 0; same && i < paramTypes[c].size();
+                     ++i)
+                    same = paramTypes[c][i] && paramTypes[d][i] &&
+                           typeRefEqual(paramTypes[c][i], paramTypes[d][i]);
+                if (same) drop[c] = true;
+            }
+        }
+        if (std::find(drop.begin(), drop.end(), true) != drop.end()) {
+            std::size_t k = 0;
+            for (std::size_t c = 0; c < cands.size(); ++c) {
+                if (drop[c]) continue;
+                if (k != c) {
+                    cands[k] = cands[c];
+                    binds[k] = std::move(binds[c]);
+                    phase1Subst[k] = std::move(phase1Subst[c]);
+                    paramTypes[k] = std::move(paramTypes[c]);
+                    argTypeRows[k] = std::move(argTypeRows[c]);
+                    argIdxRows[k] = std::move(argIdxRows[c]);
+                    candNames[k] = std::move(candNames[c]);
+                    fillsDefault[k] = fillsDefault[c];
+                    spelledWithTypeParam[k] = spelledWithTypeParam[c];
+                }
+                ++k;
+            }
+            for (auto* v : {&paramTypes, &argTypeRows}) v->resize(k);
+            cands.resize(k);
+            binds.resize(k);
+            phase1Subst.resize(k);
+            argIdxRows.resize(k);
+            candNames.resize(k);
+            fillsDefault.resize(k);
+            spelledWithTypeParam.resize(k);
+            if (cands.size() == 1) return cands[0];
+        }
     }
     // resolveOverload classifies column i of every candidate against a single
     // shared argument-type vector, so each column must correspond to the SAME
