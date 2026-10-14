@@ -29,8 +29,22 @@ bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
     if (p->nullable != a->nullable) return false;
     if (p->kind == sema::TypeRef::Kind::Primitive)
         return p->primitive == a->primitive;
-    if (p->kind == sema::TypeRef::Kind::Named)
-        return p->declaration == a->declaration;
+    if (p->kind == sema::TypeRef::Kind::Named) {
+        if (p->declaration != a->declaration) return false;
+        // #6074 (§12.1 / §27.8, v0.338): a builtin generic (`Array<int>`) has no
+        // declaration, so the pointer test above alone matched `Array<int>` and
+        // `Array<string>` alike and the first indexer won. Compare the
+        // alias-transparent head and the generic arguments, recursively.
+        if (!p->declaration) {
+            std::string_view ph = p->headName(), ah = a->headName();
+            if (!ph.empty() && !ah.empty() && ph != ah) return false;
+        }
+        if (p->genericArgs.size() != a->genericArgs.size()) return false;
+        for (std::size_t i = 0; i < p->genericArgs.size(); ++i)
+            if (!indexerArgMatches(p->genericArgs[i], a->genericArgs[i]))
+                return false;
+        return true;
+    }
     return false;
 }
 

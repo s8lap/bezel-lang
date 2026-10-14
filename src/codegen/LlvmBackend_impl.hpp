@@ -9530,6 +9530,7 @@ private:
             // sharing broke across the local/imported boundary.
             for (const auto& p : md->params) {
                 key += "#";
+                key += slotGenericArgSuffix(p.type ? ctx_.resolvedType(*p.type) : nullptr);
                 if (p.type) {
                     const sema::TypeRef* tr = ctx_.resolvedType(*p.type);
                     if (tr && tr->kind == sema::TypeRef::Kind::Primitive) {
@@ -9586,6 +9587,7 @@ private:
             for (sema::Symbol* p : ms->params) {
                 key += "#";
                 auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+                key += slotGenericArgSuffix(pps ? pps->resolvedDeclType : nullptr);
                 sema::TypeRef* tr = pps ? pps->resolvedDeclType : nullptr;
                 if (!tr) {
                     key += "?";
@@ -9667,6 +9669,56 @@ private:
         return key;
     }
 
+    // #6074 (§12.1 / §27.8, v0.338): a parameter's slot key must distinguish its
+    // generic ARGUMENTS, not only the head name, so the `Array<int>` and
+    // `Array<string>` overloads of one member get distinct slots (both collided
+    // on the head `Array`, and a base-typed call to either dispatched the
+    // override). Returns "" for a non-generic type, so every existing
+    // non-generic key is byte-identical. Otherwise "<a,b>", each argument
+    // spelled alias-transparently (headName), with its nullability and its own
+    // arguments recursively. Emitted immediately after the parameter's `#`, on
+    // both the local-AST and the imported (ParameterSymbol) side, so a local
+    // override and an imported base agree.
+    static std::string slotGenericArgSuffix(const sema::TypeRef* tr) {
+        if (!tr || tr->genericArgs.empty()) return "";
+        std::string s = "<";
+        for (const sema::TypeRef* a : tr->genericArgs) {
+            if (a) {
+                std::string_view h = a->headName();
+                if (h.empty() && a->kind == sema::TypeRef::Kind::Primitive) {
+                    // A primitive argument (`Array<int>`) has no syntactic head
+                    // name on an imported side; spell it as the primitive key.
+                    switch (a->primitive) {
+                        case sema::PrimitiveType::Bool:    h = "bool";    break;
+                        case sema::PrimitiveType::Char:    h = "char";    break;
+                        case sema::PrimitiveType::String:  h = "string";  break;
+                        case sema::PrimitiveType::Byte:    h = "byte";    break;
+                        case sema::PrimitiveType::SByte:   h = "sbyte";   break;
+                        case sema::PrimitiveType::Short:   h = "short";   break;
+                        case sema::PrimitiveType::UShort:  h = "ushort";  break;
+                        case sema::PrimitiveType::Int:     h = "int";     break;
+                        case sema::PrimitiveType::UInt:    h = "uint";    break;
+                        case sema::PrimitiveType::Long:    h = "long";    break;
+                        case sema::PrimitiveType::ULong:   h = "ulong";   break;
+                        case sema::PrimitiveType::Float:   h = "float";   break;
+                        case sema::PrimitiveType::Double:  h = "double";  break;
+                        case sema::PrimitiveType::Decimal: h = "decimal"; break;
+                        case sema::PrimitiveType::Object:  h = "Object";  break;
+                        default: break;
+                    }
+                }
+                s += h.empty() ? std::string("?") : std::string(h);
+                if (a->nullable) s += "?";
+                s += slotGenericArgSuffix(a);
+            } else {
+                s += "?";
+            }
+            s += ",";
+        }
+        s += ">";
+        return s;
+    }
+
     // #1080 / §23.4: a vtable-slot key for an INDEXER that distinguishes
     // overloads by their index-parameter signature (two indexers `[i: int]` and
     // `[s: bool]` must get DISTINCT slots, not collide on the shared name
@@ -9702,6 +9754,7 @@ private:
                 // a new slot and the base body was dispatched. aliasResolvedHead
                 // is the sanctioned alias-transparent head (TypeRef::headName).
                 const sema::TypeRef* atr = p.type ? ctx_.resolvedType(*p.type) : nullptr;
+                key += slotGenericArgSuffix(atr);  // #6074
                 if (atr && !atr->aliasResolvedHead.empty()) {
                     key += std::string(atr->aliasResolvedHead);
                     key += ".";
@@ -9718,6 +9771,7 @@ private:
             for (sema::Symbol* p : ps->indexerParams) {
                 key += "#";
                 auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+                key += slotGenericArgSuffix(pps ? pps->resolvedDeclType : nullptr);
                 sema::TypeRef* tr = pps ? pps->resolvedDeclType : nullptr;
                 if (!tr) {
                     key += "?";

@@ -300,9 +300,11 @@ inline constexpr std::uint32_t kSchemaVersion = 7;
 // schema version is reserved for changes that alter the wire format's meaning
 // in a way an old reader cannot survive (issue #328's read-older rule, the
 // Java .class model). The producer content revision is reserved for changes
-// in WHAT THE WRITER WRITES — every commit that adds a new metadata field, a
-// new fold into the semantic hash, a new modifier-rendering, etc., must bump
-// it. Without the stamp, an additive content change is LOADED SILENTLY by a
+// in WHAT THE WRITER WRITES, and in the importer-visible codegen ABI (the
+// vtable slot keys and layout an importer reproduces from the metadata). A
+// commit that adds a new metadata field, a new fold into the semantic hash, a
+// new modifier-rendering, or changes that ABI must bump it by hand.
+// Without the stamp, an additive content change is LOADED SILENTLY by a
 // new compiler reading an old artifact: the new field's hash fold is missing,
 // the new modifier's readers hit the "absent" branch, and the importer
 // makes a wrong call about ownership, layout, or disposal — exactly the
@@ -323,7 +325,12 @@ inline constexpr std::uint32_t kSchemaVersion = 7;
 // compiler reading a pre-#3540 artifact would look "Box" up in a table keyed by
 // "Outer.Box", miss, and fall back to the i32 lowering, i.e. reproduce the very
 // defect on a stale dependency instead of rejecting it.
-inline constexpr std::uint32_t kProducerContentRevision = 2;
+// fix #6074 (§12.1 / §27.8, v0.338) bumped 2 -> 3: the vtable slot key of a
+// parameter with generic ARGUMENTS now includes those arguments, which changes
+// the importer-visible codegen ABI. An artifact stamped with another revision
+// is refused at import with the existing diagnostic (rc 1, "built by a
+// compiler with a different metadata content revision"), and must be rebuilt.
+inline constexpr std::uint32_t kProducerContentRevision = 3;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
