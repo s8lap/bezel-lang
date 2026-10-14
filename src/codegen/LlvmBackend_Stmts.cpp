@@ -7582,7 +7582,21 @@ void Emitter::registerForLoopSpillSlots(
 bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     // Handle collection literal `for var x in [e1, e2, ...] do`:
-    // Lower each element into a temp alloca and iterate.
+    // Lower each element into a temp alloca, then iterate it with the SAME
+    // direct-indexed loop as a named inline array (the `far.*` blocks at the
+    // end of this function).
+    //
+    // fix #6139 / §21.5: this arm used to carry its own copy of that loop with
+    // no `loopStack_` frame, no increment block and no body-terminator check,
+    // so a `break`/`continue` in the body found no frame (and was dropped) or
+    // found an ENCLOSING loop's frame (and jumped out of that one), and an
+    // unconditional jump left the back-edge after a terminator (malformed IR).
+    // §21.5 has the unlabeled forms "target the immediately enclosing loop",
+    // which this loop is. Sharing the one loop below gives the literal source
+    // the frame, the advance point (the index increment, per §21.5's
+    // direct-indexed form) and the exit obligations of every other source.
+    llvm::AllocaInst* litArrAddr = nullptr;
+    llvm::ArrayType* litArrTy = nullptr;
     if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
             fs.iterable.get())) {
         if (!cl->isDict && !cl->elements.empty()) {
@@ -7611,33 +7625,8 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 builder_.CreateStore(ev,
                     builder_.CreateGEP(at, tmp, {builder_.getInt32(0), builder_.getInt32(i)}));
             }
-            // Now iterate as a normal array.
-            uint64_t n = N;
-            auto* idxSlot2 = entryAlloca(i32());
-            builder_.CreateStore(builder_.getInt32(0), idxSlot2);
-            auto* varSlot2 = entryAlloca(elemTy);
-            locals_[&fs] = varSlot2;
-            auto* condBB2 = llvm::BasicBlock::Create(llvm_, "clit.cond", currentFn_);
-            auto* bodyBB2 = llvm::BasicBlock::Create(llvm_, "clit.body", currentFn_);
-            auto* endBB2 = llvm::BasicBlock::Create(llvm_, "clit.end", currentFn_);
-            builder_.CreateBr(condBB2);
-            builder_.SetInsertPoint(condBB2);
-            llvm::Value* idx2 = builder_.CreateLoad(i32(), idxSlot2);
-            builder_.CreateCondBr(
-                builder_.CreateICmpSLT(idx2, builder_.getInt32((uint32_t)n)),
-                bodyBB2, endBB2);
-            builder_.SetInsertPoint(bodyBB2);
-            llvm::Value* elem2 = builder_.CreateLoad(elemTy,
-                builder_.CreateGEP(at, tmp,
-                    {builder_.getInt32(0), idx2}));
-            builder_.CreateStore(elem2, varSlot2);
-            lowerForBody(fs);
-            llvm::Value* inc2 = builder_.CreateAdd(
-                builder_.CreateLoad(i32(), idxSlot2), builder_.getInt32(1));
-            builder_.CreateStore(inc2, idxSlot2);
-            builder_.CreateBr(condBB2);
-            builder_.SetInsertPoint(endBB2);
-            return true;
+            litArrAddr = tmp;
+            litArrTy = at;
         }
     }
     // §4.15 (#549): for var x in span — direct indexed loop over ArraySpan<T>
@@ -7645,7 +7634,8 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     // span.Start .. span.Start+span.Length with bz_array_ptr_at on Source).
     {
         auto* iterTy = ctx_.exprType(*fs.iterable);
-        if (isSpanLikeTypeName(iterTy) || isIReadOnlySpanType(iterTy)) {
+        if (!litArrAddr &&
+            (isSpanLikeTypeName(iterTy) || isIReadOnlySpanType(iterTy))) {
             llvm::Value* spanVal = nullptr;
             if (isIReadOnlySpanType(iterTy)) {
                 // §29.2 / §4.16 (#1262): an IReadOnlySpan<T> value is a box
@@ -7733,12 +7723,12 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
         // above falls through for any reason (shouldn't, after #2553), refuse
         // the array-backed iteration here and return false so the generic
         // for-handlers take over instead of miscompiling.
-        if (iterTy && iterTy->astNode && iterTy->astNode->name &&
+        if (!litArrAddr && iterTy && iterTy->astNode && iterTy->astNode->name &&
             !iterTy->astNode->name->parts.empty() &&
             iterTy->headName() == "SortedSet") {
             return false;
         }
-        if (isCollectionTypeName(iterTy)) {
+        if (!litArrAddr && isCollectionTypeName(iterTy)) {
             llvm::Value* arrObj = lowerExpr(*fs.iterable);
             if (!arrObj) return false;
             // Determine element type from generic arg.
@@ -7869,8 +7859,11 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
         }
     }
     // Try the lvalue path first (local/field/parameter — no spill needed).
-    llvm::Type* arrSlotTy = nullptr;
-    llvm::Value* arrAddr = lvalueAddr(*fs.iterable, arrSlotTy);
+    // #6139: a collection-literal source was materialised above — iterate that
+    // temp; its elements were evaluated exactly once, before the loop.
+    llvm::Type* arrSlotTy = litArrTy;
+    llvm::Value* arrAddr =
+        litArrAddr ? litArrAddr : lvalueAddr(*fs.iterable, arrSlotTy);
     // If the iterable is an expression (e.g. a method call returning [N]T),
     // evaluate it and spill the array value to a temp alloca so we have an
     // address to GEP through.
