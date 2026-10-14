@@ -239,3 +239,125 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
     BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan reports the leak → ran=false
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// ===========================================================================
+// #6170 step 1 — a BORROW string payload argument (`var s := ...;
+// var a := P.Ok(s);`). §28.9 (v0.338): a string is runtime-managed and every
+// owner holds its own reference; §35.4: a value-like choice is an ordinary
+// copyable value whose disposal is defined by its active case. The construction
+// stored `s`'s pointer raw, so the #2115 release could not arm (releasing the
+// payload would drop `s`'s reference), and the escape walk treated the
+// construction argument as an escape of `s`, so `s` leaked too: 400
+// allocations per 200 iterations, both with and without a later read of `s`.
+//
+// The fix retains a borrow payload argument at the construction of an ARMED
+// (non-escaping) value-like choice local, so the choice owns +1 and its
+// scope-end release arms, and the argument position becomes a non-consuming
+// read of `s`, so `s` keeps its own release. Each program loops 200 times so a
+// one-allocation leak cannot hide, and runs under runAotChecked (ASan + LSan):
+// a leak or a use-after-free both give ran=false. Measured pre-fix on
+// 7ff64583: every arm below leaks (LSan), rc=1.
+// ===========================================================================
+namespace {
+std::string choiceBorrowProgram6170(const std::string& stepBody) {
+    return "module M; "
+           "choice P Ok(v: string), Two(a: string, b: string), No; end P; "
+           "choice G<T> Val(v: T), Emp; end G; "
+           "class Program "
+           "  static method Step(k: int): int "
+           "    var n := 0; " +
+           stepBody +
+           "    return n; "
+           "  end Step; "
+           "  public static method Main(): int "
+           "    var total := 0; "
+           "    for var k in 0..<200 do total := total + Program.Step(k); end; "
+           "    if total > 0 then return 0; end; "
+           "    return 1; "
+           "  end Main; "
+           "end Program;";
+}
+}  // namespace
+
+// THE PIN: the issue's named-argument shape.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_35_4_borrow_payload_arg_retained_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var s := \"s\" + k.ToString(); var a := P.Ok(s); n := 1; "));
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan leak (400 allocs) → ran=false
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// The source is read AFTER the construction, and the choice is case-matched
+// with an arm binding: both owners stay live together and release once each.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_35_5_borrow_payload_case_matched_source_read_after_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var s := \"s\" + k.ToString(); var a := P.Ok(s); "
+        "case a of Ok(var t) => do n := t.Length; end, "
+        "  Two(var x, var y) => do n := 0; end, No => do n := 0; end end case; "
+        "n := n + s.Length; "));
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// The choice dies in an inner block while the source is read after it: the
+// choice's release must drop only its OWN reference (a use-after-free on
+// `s.Length` otherwise).
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_borrow_payload_source_outlives_choice_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var s := \"s\" + k.ToString(); "
+        "do var a := P.Ok(s); n := 1; end; "
+        "n := n + s.Length; "));
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// The source is reassigned after the construction (its old value is released
+// by the reassignment) while the choice still holds it, and the same source
+// fills two payload fields (two retains, two releases).
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_borrow_payload_source_reassigned_and_twice_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var s := \"s\" + k.ToString(); var a := P.Two(s, s); "
+        "s := \"z\" + k.ToString(); n := s.Length; "));
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// A generic choice at T = string, a mixed borrow + producer payload, and a
+// choice inside a loop body with a `break` (every exit releases once).
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_35_4_borrow_payload_generic_mixed_and_break_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var s := \"s\" + k.ToString(); var g := G<string>.Val(s); "
+        "var m := P.Two(s, \"w\" + k.ToString()); "
+        "for var i in 0..<3 do var a := P.Ok(s); "
+        "  if i = 1 then break; end; n := n + 1; end; "
+        "n := n + s.Length; "));
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// An exception unwinds out of the block holding the choice: the unwind path
+// releases the choice's own reference and the source survives for the read
+// after the `try`.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_3_borrow_payload_unwind_releases_once_6170) {
+    JitResult r = runAotChecked(choiceBorrowProgram6170(
+        "var s := \"s\" + k.ToString(); "
+        "try do var a := P.Ok(s); "
+        "  if k > 100 then throw new InvalidOperationException(\"x\"); end; "
+        "  n := 1; end; "
+        "catch InvalidOperationException => do n := 2; end end try; "
+        "n := n + s.Length; "));
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

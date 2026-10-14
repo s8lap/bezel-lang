@@ -23668,7 +23668,8 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
 
 
 const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
-        const ast::Node* ldNode) const {
+        const ast::Node* ldNode,
+        std::vector<const ast::Expr*>* retainedArgs) const {
     // fix #2115 / §28.9 / §35.4: classify a `var` choice local for scope-end
     // managed-payload release. The value-like choice struct is a value-typed
     // stack slot; a +1 producer string stored into a case payload
@@ -23677,10 +23678,9 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // leaks unless the scope-end auto-dispose releases the active case's string
     // slot. This helper recognizes the shape that makes a scope-end release
     // SOUND: the slot provably owns +1 on the active case's strings (every
-    // string payload arg is a +1 producer or a sentinel literal), so a single
-    // release balances the +1. A BORROW payload arg (a field/param/identifier
-    // read) is rejected: releasing it would drop a reference owned elsewhere
-    // (double-release / UAF). The escape walk (collectStringReleaseEligible,
+    // string payload arg is a +1 producer or a sentinel literal, or — fix
+    // #6170 — a borrow the construction lowering retains for this local), so a
+    // single release balances the +1. The escape walk (collectStringReleaseEligible,
     // via StringEscapeWalker) is the SECOND gate — performed by the caller — so
     // a copied/returned/captured/case-matched local is never armed (its value
     // may alias into a longer-lived owner; a scope-end release would dangle or
@@ -23751,6 +23751,18 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // (a literal-only payload is all sentinels). Non-string fields are ignored
     // (the active-case release walk only touches string-typed payload slots).
     bool anyProducer = false;
+    // fix #6170 (§28.9 / §35.3 / §35.4, v0.338): a BORROW string arg (a local,
+    // parameter or field read) no longer disqualifies the local. The §35.3
+    // construction lowering RETAINS each such arg when the local is armed
+    // (`valueLikeChoiceCtorRetainedArgs`), so the slot owns +1 on it exactly
+    // as it owns a producer's +1 — the plain-string owner model (§28.9: every
+    // owner holds its own reference). Positional args only: the retain and
+    // this walk both index payload fields by argument position, which a §22.5
+    // named-arg reorder would break.
+    bool allPositional = true;
+    for (const auto& a : call->args)
+        if (!a.name.empty()) { allPositional = false; break; }
+    std::vector<const ast::Expr*> borrowArgs;
     for (std::size_t i = 0; i < cc->caseDecl->payload.size(); ++i) {
         const ast::Param& pf = cc->caseDecl->payload[i];
         if (!pf.type) continue;
@@ -23780,10 +23792,16 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
         bool isLiteral =
             dynamic_cast<const ast::StringLiteralExpr*>(arg) ||
             dynamic_cast<const ast::VerbatimStringExpr*>(arg);
-        if (!isProducer && !isLiteral) return nullptr;  // borrow arg — unsafe
+        if (!isProducer && !isLiteral) {
+            if (!allPositional) return nullptr;  // borrow arg, unmappable
+            borrowArgs.push_back(arg);  // fix #6170: retained at construction
+            continue;
+        }
         if (isProducer) anyProducer = true;
     }
-    if (!anyProducer) return nullptr;  // no +1 to reclaim (literal-only payload)
+    if (!anyProducer && borrowArgs.empty())
+        return nullptr;  // no +1 to reclaim (literal-only payload)
+    if (retainedArgs) *retainedArgs = std::move(borrowArgs);
     return rt;  // eligible — the slot owns +1 on the active case's strings.
 }
 
@@ -28339,6 +28357,13 @@ struct StringEscapeWalker {
     // the alias site, so for them a copy genuinely aliases a single reference
     // and must keep tainting the source.
     const std::unordered_set<const void*>* borrowRetainedAliases = nullptr;
+    // fix #6170 (§28.9 / §35.3 / §35.4, v0.338): construction-argument nodes
+    // that the §35.3 choice-case construction lowering RETAINS (see
+    // `valueLikeChoiceCtorRetainedArgs`). Such an argument position is a
+    // non-consuming read: the constructed value holds its OWN reference, so
+    // the source local keeps (and may release) its own. Null => every
+    // construction argument stays a conservative escape.
+    const std::unordered_set<const void*>* retainedCtorArgs = nullptr;
     // fix #4068 / §28.3 / §28.9 / stdlib §5 (v0.295): path-sensitive branch
     // analysis. The default walk is PATH-INSENSITIVE — when the walker hits
     // an `if`/`while`/`for` it walks every reachable branch in sequence and
@@ -29712,6 +29737,8 @@ struct StringEscapeWalker {
 
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
+        // fix #6170: a retained choice-construction argument is a read.
+        if (retainedCtorArgs && retainedCtorArgs->count(e)) safeRead = true;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // FINDING [1]: inside a lambda body, a captured-local read always
             // escapes — the env outlives the scope (safe-read does not apply).
@@ -34516,63 +34543,6 @@ void Emitter::collectStringReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::Node* ld : producerCandidates) {
-        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
-        w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
-        // fix #2481 (consumer 1/3): OPT-IN the case-scrutinee relaxation — see
-        // the scrutineeBorrowMode flag comment (struct StringEscapeWalker,
-        // above) for the full soundness argument. A plain `string` producer
-        // local used ONLY as a `case` scrutinee (matched against string-
-        // literal/`_`/`var t` patterns — records/choice-case destructuring
-        // patterns cannot target a `string` scrutinee, sema rejects them)
-        // previously stayed an unconditional escape, so its scope-end release
-        // never armed for the shape most real `case`-on-a-string code uses.
-        w.scrutineeBorrowMode = true;
-        // fix #2764: a plain `var other := <this local>;` COPY into a local
-        // that armStringLocalRefcount retains at bind is a borrow, not an
-        // escape — see the borrowRetainedAliases member comment. The set is
-        // fully populated by the scan above, before any walk runs.
-        w.borrowRetainedAliases = &stringBorrowAll_;
-        // fix #2900: mirror the object-string-aliased set so a `var other
-        // := o;` (a copy of an `Object` alias that itself aliases a string)
-        // is also a borrow — `other` retains, `o`'s own +1 stays in `o`,
-        // and the source's release stays armed. Must run AFTER
-        // collectObjectStringReleaseEligible (which populates the set).
-        w.objectStringBorrowAliases = &objectStringBorrowAll_;
-        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
-        if (!w.escaped)
-            stringReleaseEligible_.insert(static_cast<const void*>(ld));
-    }
-    // #429: a BORROW-bound string local is eligible for retain-at-bind +
-    // scope-end release ONLY if the SAME conservative escape walk proves it never
-    // escapes. The walk is the identical over-approximation used for producers
-    // (any non-safe-read use ⇒ escaped ⇒ excluded ⇒ no release), so releasing an
-    // eligible borrow local's retained +1 at scope end is provably free of UAF
-    // (no escaping alias exists past the scope) and of double-free (once per
-    // exit). An ESCAPING borrow local is still RETAINED (in armStringLocalRefcount)
-    // but NOT released — its +1 leaks, which is safe.
-    for (const ast::Node* ld : borrowCandidates) {
-        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
-        w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
-        // fix #2481 (consumer 1/3): mirrors the producer-candidates loop
-        // above — same scrutineeBorrowMode opt-in, same soundness argument
-        // (independent of whether the slot's +1 came from a producer or a
-        // retained borrow; either way the slot owns exactly one reference
-        // and armsBindingsSafe proves no arm binding escapes it).
-        w.scrutineeBorrowMode = true;
-        // fix #2764: mirrors the producer loop above — a copy-of-a-copy
-        // (`var a := p; var b := a;`) leaked `a`'s retained +1 for the same
-        // reason a copy of a producer leaked the producer's. `b`'s own retain
-        // is independent of `a`'s, so `a` keeps its release.
-        w.borrowRetainedAliases = &stringBorrowAll_;
-        // fix #2900: mirror the object-string-aliased set, same reason as
-        // the producer loop above (a copy of an `Object` alias of a
-        // string is a borrow too).
-        w.objectStringBorrowAliases = &objectStringBorrowAll_;
-        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
-        if (!w.escaped)
-            stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
-    }
     // fix #2115 / §28.9 / §35.4: a value-like choice local whose construction
     // mints +1 string payload(s) is eligible for the scope-end active-case
     // string release iff the SAME conservative escape walk proves it never
@@ -34604,6 +34574,91 @@ void Emitter::collectStringReleaseEligible(
         if (!w.escaped)
             valueLikeChoiceStrReleaseEligible_.insert(
                 static_cast<const void*>(ld));
+    }
+    // fix #6170 (§28.9 / §35.3 / §35.4, v0.338): the choice walk above now runs
+    // BEFORE the string walks, because its verdict feeds them. For every armed
+    // choice local, each BORROW string payload argument of its construction is
+    // retained by the §35.3 construction lowering (LlvmBackend_Calls2.cpp,
+    // fix #6170), so the constructed value owns its own +1 and the argument
+    // position is a non-consuming READ of the source (`retainedCtorArgs`) —
+    // the source local keeps its own scope-end release. The argument nodes are
+    // recorded IN `valueLikeChoiceStrReleaseEligible_` itself (an argument
+    // expression is never a local-declaration node, so the keys cannot
+    // collide): that set is saved and restored as a unit with
+    // `stringReleaseEligible_` around every nested body emission, so the
+    // walker's relaxation of a source local and the lowering's retain can
+    // never come apart (a source release without the matching retain would be
+    // a use-after-free).
+    std::unordered_set<const void*> retainedCtorArgs;
+    for (const ast::Node* ld : valueLikeChoiceCandidates) {
+        if (!valueLikeChoiceStrReleaseEligible_.count(
+                static_cast<const void*>(ld)))
+            continue;
+        std::vector<const ast::Expr*> borrowArgs;
+        if (!valueLikeChoiceLocalMintsStringPayload(ld, &borrowArgs)) continue;
+        for (const ast::Expr* a : borrowArgs)
+            retainedCtorArgs.insert(static_cast<const void*>(a));
+    }
+    for (const void* a : retainedCtorArgs)
+        valueLikeChoiceStrReleaseEligible_.insert(a);
+    for (const ast::Node* ld : producerCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
+        // fix #2481 (consumer 1/3): OPT-IN the case-scrutinee relaxation — see
+        // the scrutineeBorrowMode flag comment (struct StringEscapeWalker,
+        // above) for the full soundness argument. A plain `string` producer
+        // local used ONLY as a `case` scrutinee (matched against string-
+        // literal/`_`/`var t` patterns — records/choice-case destructuring
+        // patterns cannot target a `string` scrutinee, sema rejects them)
+        // previously stayed an unconditional escape, so its scope-end release
+        // never armed for the shape most real `case`-on-a-string code uses.
+        w.scrutineeBorrowMode = true;
+        // fix #2764: a plain `var other := <this local>;` COPY into a local
+        // that armStringLocalRefcount retains at bind is a borrow, not an
+        // escape — see the borrowRetainedAliases member comment. The set is
+        // fully populated by the scan above, before any walk runs.
+        w.borrowRetainedAliases = &stringBorrowAll_;
+        // fix #2900: mirror the object-string-aliased set so a `var other
+        // := o;` (a copy of an `Object` alias that itself aliases a string)
+        // is also a borrow — `other` retains, `o`'s own +1 stays in `o`,
+        // and the source's release stays armed. Must run AFTER
+        // collectObjectStringReleaseEligible (which populates the set).
+        w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            stringReleaseEligible_.insert(static_cast<const void*>(ld));
+    }
+    // #429: a BORROW-bound string local is eligible for retain-at-bind +
+    // scope-end release ONLY if the SAME conservative escape walk proves it never
+    // escapes. The walk is the identical over-approximation used for producers
+    // (any non-safe-read use ⇒ escaped ⇒ excluded ⇒ no release), so releasing an
+    // eligible borrow local's retained +1 at scope end is provably free of UAF
+    // (no escaping alias exists past the scope) and of double-free (once per
+    // exit). An ESCAPING borrow local is still RETAINED (in armStringLocalRefcount)
+    // but NOT released — its +1 leaks, which is safe.
+    for (const ast::Node* ld : borrowCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
+        // fix #2481 (consumer 1/3): mirrors the producer-candidates loop
+        // above — same scrutineeBorrowMode opt-in, same soundness argument
+        // (independent of whether the slot's +1 came from a producer or a
+        // retained borrow; either way the slot owns exactly one reference
+        // and armsBindingsSafe proves no arm binding escapes it).
+        w.scrutineeBorrowMode = true;
+        // fix #2764: mirrors the producer loop above — a copy-of-a-copy
+        // (`var a := p; var b := a;`) leaked `a`'s retained +1 for the same
+        // reason a copy of a producer leaked the producer's. `b`'s own retain
+        // is independent of `a`'s, so `a` keeps its release.
+        w.borrowRetainedAliases = &stringBorrowAll_;
+        // fix #2900: mirror the object-string-aliased set, same reason as
+        // the producer loop above (a copy of an `Object` alias of a
+        // string is a borrow too).
+        w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        w.retainedCtorArgs = &retainedCtorArgs;  // fix #6170
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
     }
 }
 

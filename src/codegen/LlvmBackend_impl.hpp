@@ -19023,8 +19023,13 @@ private:
     // `localDeclInitView`, so a §21.1 runtime `const` (ast::LocalConstDecl) is
     // classified exactly as its `var` (ast::LocalDecl) twin is. Any other node
     // yields an all-null view and answers null.
+    // fix #6170: `retainedArgs`, when non-null, receives the string payload
+    // arguments that are neither +1 producers nor literals (borrows); the
+    // construction lowering retains each of them for an eligible local, so the
+    // slot owns +1 on every active-case string either way.
     const sema::TypeRef* valueLikeChoiceLocalMintsStringPayload(
-        const ast::Node* ldNode) const;
+        const ast::Node* ldNode,
+        std::vector<const ast::Expr*>* retainedArgs = nullptr) const;
     // fix #2115: register (if eligible) the scope-end managed-payload release of
     // a value-like choice local. Called from lowerLocalDecl after the slot store;
     // gated on valueLikeChoiceStrReleaseEligible_ (the escape walk's verdict) so

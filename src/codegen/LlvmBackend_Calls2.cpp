@@ -7668,6 +7668,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             lowerExpr(*a->value),
                             pf.type ? ctx_.resolvedType(*pf.type) : nullptr,
                             a->value.get()));
+                        // fix #6170 (§28.9 / §35.3 / §35.4, v0.338): a BORROW
+                        // string arg of an armed value-like choice local's
+                        // construction is retained, so the constructed value
+                        // owns its own +1 (the plain-string owner model) and
+                        // the scope-end release of BOTH the local and the
+                        // source is balanced. The node is in the set only when
+                        // collectStringReleaseEligible both armed the local
+                        // and relaxed the source's escape walk on this exact
+                        // argument; with no matching release the retain is a
+                        // leak, never a use-after-free — so it is NOT gated on
+                        // `currentFn_` (an unmatched retain is the safe side).
+                        llvm::Value* pv = payloadFields.back();
+                        if (pv && pv->getType()->isPointerTy() &&
+                            valueLikeChoiceStrReleaseEligible_.count(
+                                static_cast<const void*>(a->value.get())))
+                            emitStringRetain(pv);
                     } else {
                         // Defensive — sema should reject; use undef of the
                         // right type so the InsertValue below stays well-
