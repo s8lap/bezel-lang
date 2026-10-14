@@ -8213,6 +8213,12 @@ void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
 // error is reported here rather than letting codegen build an ill-typed
 // result PHI and crash. When EVERY arm diverges, the case yields no value
 // and no type is recorded.
+// Defined below (§12.9 recursive type-argument identity).
+static bool typeArgIdentical(
+    const TypeRef* a, const TypeRef* b,
+    const std::unordered_set<std::string_view>* freeNames,
+    bool checkTopNullability);
+
 void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
     TypeRef* common = nullptr;     // running common type of the value arms
     bool haveValueArm = false;     // at least one non-diverging arm seen
@@ -8240,6 +8246,8 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
     bool sawNullArm = false;
     bool haveNonNullValueArm = false;
     bool allNonNullValueArmsString = true;
+    TypeRef* nonNullCommon = nullptr;  // common type of the non-`null` arms
+    std::vector<TypeRef*> nonNullArmTypes;
     for (const auto& arm : cse.arms) {
         // Only expression-bodied arms produce a value (statement / `do…end`
         // arms are statement-position only, §19.2). A bottom-typed arm body
@@ -8252,6 +8260,15 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
         TypeRef* at = ctx_.exprType(*arm.exprBody);
         if (!at) continue;  // diverging (bottom) arm — no constraint
         if (!isNullLit) {
+            // fix #6086 (§20, §19.1, v0.338): the running common type of the
+            // arms that are NOT a bare `null` — the type §20's null-arm rule
+            // lifts to its nullable form (see after the loop).
+            nonNullArmTypes.push_back(at);
+            if (!haveNonNullValueArm) {
+                nonNullCommon = at;
+            } else if (nonNullCommon) {
+                nonNullCommon = commonTypeOf(nonNullCommon, at);
+            }
             haveNonNullValueArm = true;
             // fix #5310 (§20, §19.2, §28.3, §28.9, v0.313): the arm may be a
             // NULLABLE `string?` too. §20's null-arm rule target-types the bare
@@ -8302,6 +8319,78 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
         strq->nullable = true;
         ctx_.setExprType(&e, strq);
         return;
+    }
+    // fix #6086 (§20 *Bare `null`*, §19.1 *Expression-position type*,
+    // v0.338): the same rule for a REFERENCE-class result. §19.1 makes the
+    // construct's type "the left-fold of its arm-body types under the §20
+    // common-type rule", and §20 says a bare `null` branch "imposes no
+    // constraint of its own: it target-types to the nullable form of the other
+    // branches' common type". Folding the `null` arm's `Object?` placeholder
+    // instead made `(case k of 0 => b, _ => null)` with `b: B` an `Object?`:
+    // an inferred `var r := (case …)` then had no members (`r.y` degraded to a
+    // zero read with an `internal:` warning) and could reach a `B?` slot only
+    // through the unchecked `Object` downcast #6023 removes. typeConditional
+    // has applied the nullable-form rule to every type since #1089; this
+    // brings the `case` atom into line for the arm kinds whose value is one
+    // pointer at every static type — a user class or interface, and a built-in
+    // exception class (§31.4) — so the result PHI lowerCaseExpr builds is the
+    // same `ptr` meet it built for the `Object?` typing. The value-type
+    // null-arm results stay on the pre-#1952 fold, for the reason recorded
+    // above (#573).
+    //
+    // pending #6112: two arms that are DIFFERENT instantiations of one generic
+    // type (`Bx<B>` and `Bx<A>`) have a "common type" here only because
+    // commonTypeOf admits the pair; reading a member through it is a
+    // wrong-layout read (#6112, the same overflow with no `null` arm at all).
+    // Under the `Object?` fold the null-arm form of that shape had no members
+    // and so stayed memory-safe; it keeps that typing until #6112 settles what
+    // the pair's common type is.
+    bool mixedInstantiations = false;
+    for (std::size_t i = 0; i < nonNullArmTypes.size(); ++i) {
+        for (std::size_t j = i + 1; j < nonNullArmTypes.size(); ++j) {
+            const TypeRef* x = nonNullArmTypes[i];
+            const TypeRef* y = nonNullArmTypes[j];
+            if (x->kind != TypeRef::Kind::Named ||
+                y->kind != TypeRef::Kind::Named)
+                continue;
+            if (x->genericArgs.empty() && y->genericArgs.empty()) continue;
+            if (x->declaration != y->declaration ||
+                x->headName() != y->headName())
+                continue;
+            // typeArgIdentical compares every NESTED argument's nullability
+            // (#6109): `Bx<int>` / `Bx<int?>` and `Bx<B>` / `Bx<B?>` are
+            // different instantiations with different field layouts (§7.1,
+            // v0.338). The arm's own top-level nullability is not part of
+            // the instantiation.
+            if (!typeArgIdentical(x, y, nullptr,
+                                  /*checkTopNullability=*/false))
+                mixedInstantiations = true;
+        }
+    }
+    if (sawNullArm && haveNonNullValueArm && nonNullCommon && !reported &&
+        !mixedInstantiations) {
+        TypeRef* nn = nonNullCommon;
+        bool isRefClass = false;
+        if (nn->kind == TypeRef::Kind::Named) {
+            if (nn->declaration) {
+                isRefClass =
+                    nn->declaration->kind == ast::TypeDeclKind::Class ||
+                    nn->declaration->kind == ast::TypeDeclKind::Interface;
+            } else {
+                isRefClass = nn->genericArgs.empty() &&
+                             common::isBuiltinExceptionName(nn->headName()) &&
+                             currentScopeGenericParamNames().count(
+                                 nn->headName()) == 0;
+            }
+        }
+        if (isRefClass) {
+            if (!nn->nullable) {
+                nn = ctx_.makeTypeRef(*nn);
+                nn->nullable = true;
+            }
+            ctx_.setExprType(&e, nn);
+            return;
+        }
     }
     // Record the folded common type (when there was a value-producing arm) so
     // member access on the case result (`(case … end).M`) resolves. When every
