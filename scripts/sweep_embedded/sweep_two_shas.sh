@@ -10,7 +10,8 @@
 #   - git, bash, python3, and a worktree WT (default: the git toplevel of the current directory)
 #     with a configured in-tree build/ dir (scripts/lane_setup.sh). WT is used ONLY to build bezelc.
 #   - WT must be clean (git status empty) and must not be used by another lane or build, because
-#     this script switches it to the detached sha when a cached binary is missing and restores it.
+#     this script switches it to the detached sha when a cached binary is missing and restores it
+#     (also on failure or SIGINT/SIGTERM during the build), but WT must still be a dedicated clean worktree.
 #   - Cached binaries $SCRATCH/bezelc-<sha8> are reused; a missing one is built through
 #     scripts/agent_check.sh --probe (bezelc only, via dev_heavy).
 #
@@ -46,13 +47,28 @@ if [ ! -f "$S/trivial.bzl" ]; then
   printf 'module Probe;\n' > "$S/trivial.bzl"
 fi
 
+restore_wt() {  # EXIT/INT/TERM handler set by build(); restores WT, clears its traps, never fails
+  trap - EXIT INT TERM
+  git -C "$WT" switch "${restore_args[@]}" >/dev/null 2>&1 \
+    || echo "WARNING: could not restore $WT (git switch ${restore_args[*]})" >&2
+  return 0
+}
+
 build() {  # $1 sha
   [ -x "$S/bezelc-$1" ] && { echo "cached bezelc-$1"; return; }
   cd "$WT"; [ -z "$(git status --short)" ] || { echo "WT dirty" >&2; exit 2; }
-  orig=$(git rev-parse --abbrev-ref HEAD); git switch --detach "$1" >/dev/null
+  # Record the original position before switching: a branch name, or the full sha if detached.
+  if [ "$(git rev-parse --abbrev-ref HEAD)" = HEAD ]; then
+    restore_args=(--detach "$(git rev-parse HEAD)")
+  else
+    restore_args=("$(git rev-parse --abbrev-ref HEAD)")
+  fi
+  trap restore_wt EXIT; trap 'restore_wt; exit 130' INT; trap 'restore_wt; exit 143' TERM
+  git switch --detach "$1" >/dev/null
   echo "building at $(git rev-parse HEAD)"; git diff "$1" --stat -- src | wc -l
-  scripts/agent_check.sh --probe "$S/trivial.bzl" && cp build/bezelc "$S/bezelc-$1"
-  [ "$orig" = HEAD ] || git switch "$orig" >/dev/null
+  scripts/agent_check.sh --probe "$S/trivial.bzl" || { echo "probe build failed at $1" >&2; exit 3; }
+  cp build/bezelc "$S/bezelc-$1"
+  restore_wt
   sha256sum "$S/bezelc-$1"
 }
 build "$A"; build "$B"
