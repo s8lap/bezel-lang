@@ -48083,6 +48083,63 @@ llvm::Value* Emitter::emitIsBoxedUnit(llvm::Value* other) {
 // nullable boxing rule's "strip the wrapper" path covers that, but it is
 // NOT a body-record type on its own and stays outside this box (the
 // narrowing below sees the bare Range<T> after the wrapper is stripped).
+// fix #4126 (§8.3 / §9.2 / stdlib §9.8, v0.338): the ONE definition of
+// `Range<T>`'s generated equality and hash over its lowered storage.
+//
+// stdlib §9.8: "`Range<T>` is a compiler-intrinsic record" whose "six declared
+// properties are the type's auto-property surface for the language's generated
+// members (spec §8.5/§9.2)", and §8.3 gives a body-only record
+// "property-by-property value equality". The six properties are a function of
+// the four storage words {i64 start, i64 end, i64 step, i8 flags}:
+// `IsEndInclusive` is flags bit 0, a null `Start`/`End` is flags bit 1/2 with
+// the word itself a canonical 0 (the RangeExpr lowering in
+// LlvmBackend_Exprs.cpp is the sole producer, §16.4), and `IsOpenEnded` /
+// `IsEmpty` are computed from those. Two ranges therefore agree on all six
+// properties exactly when the four words are equal, which is what is compared.
+//
+// Shared by the box vtable thunks (ensureRangeBoxVtable, below) and by the
+// direct `r.Equals(other)` / `r.GetHashCode()` calls (lowerValueSemMethodOn),
+// so §8.3's "if `a.Equals(b)` then `a.GetHashCode() = b.GetHashCode()`" holds
+// across the boxed and unboxed spellings by construction.
+llvm::Value* Emitter::emitRangeStorageEquals(llvm::Value* a, llvm::Value* b) {
+    llvm::Value* all = nullptr;
+    for (unsigned i = 0; i < 4; ++i) {
+        llvm::Value* eq = builder_.CreateICmpEQ(
+            builder_.CreateExtractValue(a, {i}, "rngeq.a"),
+            builder_.CreateExtractValue(b, {i}, "rngeq.b"), "rngeq.f");
+        all = all ? builder_.CreateAnd(all, eq, "rngeq.all") : eq;
+    }
+    return all;
+}
+
+// §8.3 requires an ORDER-SENSITIVE combiner ("a commutative combiner such as
+// plain XOR does not satisfy this"): each i64 word is folded to i32 (high half
+// XOR low half, so the whole word contributes), and the running value is
+// rotated left by 13 before the next word is XORed in.
+llvm::Value* Emitter::emitRangeStorageHash(llvm::Value* payload) {
+    auto fold = [&](unsigned idx) -> llvm::Value* {
+        llvm::Value* v = builder_.CreateExtractValue(payload, {idx}, "rngh.w");
+        llvm::Value* hi = builder_.CreateLShr(v, 32, "rngh.hi");
+        llvm::Value* lo = builder_.CreateAnd(
+            v, llvm::ConstantInt::get(i64(), 0xFFFFFFFFLL), "rngh.lo");
+        return builder_.CreateTrunc(builder_.CreateXor(lo, hi, "rngh.x64"),
+                                    i32(), "rngh.h32");
+    };
+    auto rotl = [&](llvm::Value* v, unsigned n) -> llvm::Value* {
+        return builder_.CreateOr(builder_.CreateShl(v, n),
+                                 builder_.CreateLShr(v, 32 - n), "rngh.rot");
+    };
+    llvm::Value* acc = fold(0);
+    acc = builder_.CreateXor(rotl(acc, 13), fold(1), "rngh.c1");
+    acc = builder_.CreateXor(rotl(acc, 13), fold(2), "rngh.c2");
+    acc = builder_.CreateXor(
+        rotl(acc, 13),
+        builder_.CreateZExt(builder_.CreateExtractValue(payload, {3u}, "rngh.flg"),
+                            i32(), "rngh.flgh"),
+        "rngh.c3");
+    return acc;
+}
+
 bool Emitter::rangeBoxable(const sema::TypeRef* rt) {
     if (!rt || rt->nullable) return false;
     return isRangeType(rt);
@@ -48253,21 +48310,7 @@ llvm::GlobalVariable* Emitter::ensureRangeBoxVtable(const sema::TypeRef* rt) {
             ptrTy(), other, {builder_.getInt32(2)}, "rngeq.op");
         llvm::Value* sPay = builder_.CreateLoad(payloadTy, sp, "rngeq.spay");
         llvm::Value* oPay = builder_.CreateLoad(payloadTy, op, "rngeq.opay");
-        llvm::Value* sSt   = builder_.CreateExtractValue(sPay, {0u}, "rngeq.sst");
-        llvm::Value* oSt   = builder_.CreateExtractValue(oPay, {0u}, "rngeq.ost");
-        llvm::Value* sEn   = builder_.CreateExtractValue(sPay, {1u}, "rngeq.sen");
-        llvm::Value* oEn   = builder_.CreateExtractValue(oPay, {1u}, "rngeq.oen");
-        llvm::Value* sStep = builder_.CreateExtractValue(sPay, {2u}, "rngeq.sstep");
-        llvm::Value* oStep = builder_.CreateExtractValue(oPay, {2u}, "rngeq.ostep");
-        llvm::Value* sFlg  = builder_.CreateExtractValue(sPay, {3u}, "rngeq.sflg");
-        llvm::Value* oFlg  = builder_.CreateExtractValue(oPay, {3u}, "rngeq.oflg");
-        llvm::Value* eqSt   = builder_.CreateICmpEQ(sSt, oSt, "rngeq.eqst");
-        llvm::Value* eqEn   = builder_.CreateICmpEQ(sEn, oEn, "rngeq.eqen");
-        llvm::Value* eqStep = builder_.CreateICmpEQ(sStep, oStep, "rngeq.eqstep");
-        llvm::Value* eqFlg  = builder_.CreateICmpEQ(sFlg, oFlg, "rngeq.eqflg");
-        llvm::Value* allEq  = builder_.CreateAnd(
-            builder_.CreateAnd(eqSt, eqEn),
-            builder_.CreateAnd(eqStep, eqFlg), "rngeq.all");
+        llvm::Value* allEq = emitRangeStorageEquals(sPay, oPay);
         builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
@@ -48303,46 +48346,10 @@ llvm::GlobalVariable* Emitter::ensureRangeBoxVtable(const sema::TypeRef* rt) {
             ptrTy(), self, {builder_.getInt32(2)}, "rngh.pptr");
         llvm::Value* payload = builder_.CreateLoad(
             rangeStructType(), pptr, "rngh.payload");
-        // Hash each storage field down to i32 then combine order-sensitively.
-        // The four storage words are {i64 start, i64 end, i64 step, i8 flags};
-        // emitValueHashCode does NOT understand the synthetic rangeStructType
-        // (it is the lowered representation, not the source Range<T>), so the
-        // hash is computed directly here over the storage bits. The unit-box
-        // thunk (above) uses a constant; using a constant here would let
-        // three different boxed ranges "agree" at hash 0 and pass a vacuous
-        // test — #2915 spelled out the trap. The body of each field's mix is
-        // an in-IR bit scramble; the constants are fixed and arbitrary (the
-        // only requirement §8.3 names is that the combiner not be commutative).
-        llvm::Value* stRaw   = builder_.CreateExtractValue(payload, {0u}, "rngh.st");
-        llvm::Value* enRaw   = builder_.CreateExtractValue(payload, {1u}, "rngh.en");
-        llvm::Value* stepRaw = builder_.CreateExtractValue(payload, {2u}, "rngh.step");
-        llvm::Value* flgRaw  = builder_.CreateExtractValue(payload, {3u}, "rngh.flg");
-        // The i64 → i32 hash: take the high 32 bits XOR'd into the low 32 bits
-        // (so the result is sensitive to the FULL 64-bit value, not just the
-        // low half). The i8 → i32 hash: zero-extend (the value already fits).
-        auto i64Hash = [&](llvm::Value* v) -> llvm::Value* {
-            llvm::Value* hi = builder_.CreateLShr(v, 32, "rngh.hi");
-            llvm::Value* lo = builder_.CreateAnd(
-                v, llvm::ConstantInt::get(i64(), 0xFFFFFFFFLL), "rngh.lo");
-            llvm::Value* h64 = builder_.CreateXor(lo, hi, "rngh.x64");
-            return builder_.CreateTrunc(h64, i32(), "rngh.h32");
-        };
-        llvm::Value* stH   = i64Hash(stRaw);
-        llvm::Value* enH   = i64Hash(enRaw);
-        llvm::Value* stepH = i64Hash(stepRaw);
-        llvm::Value* flgH  = builder_.CreateZExt(flgRaw, i32(), "rngh.flgh");
-        // Order-sensitive combine: 32-bit rotate-left by 13 between each
-        // XOR. The rotate constant is fixed and arbitrary; the requirement
-        // §8.3 names is only that the function not be commutative.
-        auto rotl = [&](llvm::Value* v, unsigned n) -> llvm::Value* {
-            return builder_.CreateOr(
-                builder_.CreateShl(v, n),
-                builder_.CreateLShr(v, 32 - n), "rngh.rot");
-        };
-        llvm::Value* acc = stH;
-        acc = builder_.CreateXor(rotl(acc, 13), enH, "rngh.c1");
-        acc = builder_.CreateXor(rotl(acc, 13), stepH, "rngh.c2");
-        acc = builder_.CreateXor(rotl(acc, 13), flgH, "rngh.c3");
+        // The storage hash itself is emitRangeStorageHash's (above), shared
+        // with the direct `r.GetHashCode()` call so the boxed and unboxed
+        // answers cannot drift (fix #4126).
+        llvm::Value* acc = emitRangeStorageHash(payload);
         builder_.CreateRet(acc);
     }
 

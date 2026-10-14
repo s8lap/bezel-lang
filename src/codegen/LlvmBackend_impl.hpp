@@ -4214,6 +4214,11 @@ private:
     // range bytes to bz_box_release for a type this admitted but the minter
     // could not build (the #2796 SIGSEGV shape).
     bool rangeBoxable(const sema::TypeRef* rt);
+    // fix #4126 (§8.3 / stdlib §9.8): `Range<T>`'s generated equality / hash
+    // over two (one) loaded `rangeStructType()` values — the single definition
+    // the box thunks and the direct member calls share.
+    llvm::Value* emitRangeStorageEquals(llvm::Value* a, llvm::Value* b);
+    llvm::Value* emitRangeStorageHash(llvm::Value* payload);
     llvm::GlobalVariable* ensureRangeBoxVtable(const sema::TypeRef* rt);
     // The box DESCRIPTOR for a boxable `Range<T>` — the type-test-target
     // counterpart of ensureRangeBoxVtable (the same global, so `o is Range<int>`

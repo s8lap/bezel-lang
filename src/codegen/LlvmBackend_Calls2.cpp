@@ -3620,7 +3620,25 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                   // §35.7/§14.2 (#2083 rework): T bound to a value-like
                   // choice (`where T: hashable` admits one, #2087) routes
                   // to the choice branch of lowerValueSemMethodOn.
-                  concrete->declaration->kind == ast::TypeDeclKind::Choice));
+                  concrete->declaration->kind == ast::TypeDeclKind::Choice)) ||
+                // fix #4126 (§8.3 / stdlib §9.8, v0.338): T bound to
+                // `Range<U>`, the intrinsic record whose builtin symbol is
+                // stamped `Class` — it is a value, never a vtable pointer.
+                // `Equals` is admitted here only when its argument is a
+                // `Range` or the null literal: an argument of any other static
+                // type inside a generic body is an `Object`-like parameter,
+                // and a caller that hands such a parameter an `Object` local
+                // holding a box leaks the box (#6149, on base too). Base
+                // rejected this spelling outright; it stays rejected until
+                // that leak is fixed, so no program goes from rejected to
+                // leaking.
+                (isRangeType(concrete) && !concrete->nullable &&
+                 (isGetHashCode ||
+                  (call.args.size() == 1 && call.args[0].value &&
+                   (dynamic_cast<const ast::NullLiteralExpr*>(
+                        call.args[0].value.get()) != nullptr ||
+                    isRangeType(resolveTypeParamRef(
+                        ctx_.exprType(*call.args[0].value)))))));
             bool concreteRefSem =
                 (concrete->kind == K::Named && concrete->declaration &&
                  (concrete->declaration->kind == ast::TypeDeclKind::Class ||
@@ -3777,7 +3795,12 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     bool choiceValueSem = dispatchTy->kind == sema::TypeRef::Kind::Named &&
         dispatchTy->declaration &&
         dispatchTy->declaration->kind == ast::TypeDeclKind::Choice;
-    if (!primValueSem && !namedValueSem && !choiceValueSem) return nullptr;
+    // fix #4126 (§8.3 / stdlib §9.8, v0.338): `Range<T>` is the intrinsic
+    // record the `Class`-stamped builtin symbol hides from `namedValueSem`;
+    // its generated Equals/GetHashCode dispatch with the other value kinds.
+    bool rangeValueSem = isRangeType(dispatchTy) && (isEquals || isGetHashCode);
+    if (!primValueSem && !namedValueSem && !choiceValueSem && !rangeValueSem)
+        return nullptr;
 
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv) return nullptr;
@@ -4007,6 +4030,68 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
             return builder_.CreateICmpEQ(recv, other, "prim.eq");
         }
         return nullptr;
+    }
+    // fix #4126 (§8.3 / §9.2 / stdlib §9.8, v0.338): a `Range<T>` receiver.
+    // stdlib §9.8: "`Range<T>` is a compiler-intrinsic record" whose declared
+    // properties are "the type's auto-property surface for the language's
+    // generated members", so §8.3's body-only-record row applies:
+    // "property-by-property value equality", with a `GetHashCode` consistent
+    // with it. `builtinClassSym` stamps the symbol `Class`, so the record arm
+    // below never saw it, and the reference-semantics dispatch further out
+    // requires a POINTER receiver while a range lowers to the `%bz.range`
+    // VALUE — both members degraded to a zero (`False` / `0`) behind an
+    // `internal:` warning. Measured on ea54f59e: `r1.Equals(r2)` for two
+    // `1..5` answered False while `r1 = r2` answered True.
+    //
+    // The comparison and the hash are the box thunks' own
+    // (emitRangeStorageEquals / emitRangeStorageHash), so a range and its box
+    // cannot disagree. An argument whose static type is not this very
+    // `Range<T>` — `Object`, a nullable form, another `Range<U>`, an unrelated
+    // type — takes §8.1's universal route exactly as the record arm's does:
+    // the generated `Equals` is the `Object` slot, where "any other argument
+    // compares unequal without the body running" (§9.2), decided by the box
+    // identity. ToString keeps its own working path (emitRangeToString).
+    if (isRangeType(recvTy) && !recvTy->nullable &&
+        (isEquals || isGetHashCode)) {
+        llvm::StructType* rst = rangeStructType();
+        if (recv->getType()->isPointerTy())
+            recv = builder_.CreateLoad(rst, recv, "rng.recv");
+        if (recv->getType() != rst) return nullptr;
+        if (isGetHashCode) return emitRangeStorageHash(recv);
+        if (!call.args[0].value) return nullptr;
+        const ast::Expr& argE = *call.args[0].value;
+        const sema::TypeRef* at = resolveTypeParamRef(ctx_.exprType(argE));
+        bool argIsOwnRange = at && !at->nullable && isRangeType(at) &&
+            typeRefIdentityKey(at) == typeRefIdentityKey(recvTy);
+        // A `Range<T>?` argument of the receiver's own instantiation lowers to
+        // the `{hasValue, %bz.range}` tagged value, which has no `Object` box
+        // of its own to dispatch through: null is unequal (§8.3), a present
+        // value compares as the own-typed argument does.
+        bool argIsOwnNullableRange = false;
+        if (at && at->nullable && isRangeType(at)) {
+            sema::TypeRef inner = *at;
+            inner.nullable = false;
+            argIsOwnNullableRange =
+                typeRefIdentityKey(&inner) == typeRefIdentityKey(recvTy);
+        }
+        if (!argIsOwnRange && !argIsOwnNullableRange)
+            return lowerValueSemUniversalEquals(recvTy, recv, call);
+        llvm::Value* other = lowerExpr(argE);
+        if (!other) return nullptr;
+        if (argIsOwnNullableRange) {
+            auto* nst = llvm::dyn_cast<llvm::StructType>(other->getType());
+            if (!nst || nst->getNumElements() != 2 ||
+                nst->getElementType(1) != rst)
+                return nullptr;
+            return builder_.CreateAnd(
+                nullablePrimHasValue(other),
+                emitRangeStorageEquals(recv, nullablePrimValue(other)),
+                "rng.eq.opt");
+        }
+        if (other->getType()->isPointerTy())
+            other = builder_.CreateLoad(rst, other, "rng.other");
+        if (other->getType() != rst) return nullptr;
+        return emitRangeStorageEquals(recv, other);
     }
     if (recvTy->kind != sema::TypeRef::Kind::Named ||
         !recvTy->declaration)
