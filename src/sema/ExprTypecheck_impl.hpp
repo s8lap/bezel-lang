@@ -843,6 +843,11 @@ private:
     // the §28.8 transferring rule governs the slot and the §28.3 borrow
     // rule's check is suppressed. Cleared alongside pendingLambdaTargetReturn_.
     bool pendingLambdaTargetReturnOwned_ = false;
+    // fix #6161 (§22.6 *Lambda-literal arguments*): true when the threaded
+    // target return slot came from ONE member of an overload set (the call /
+    // `new` site binds the first same-name / same-arity formal, not the
+    // overload resolution's pick), so the slot must not classify the lambda.
+    bool pendingLambdaTargetAmbiguous_ = false;
 
     // fix #3756 (§27.4 / §27.1, v0.286): true while visiting a lambda literal
     // that is a DIRECT call- or constructor-argument — a target-type context
@@ -976,6 +981,7 @@ private:
     // old flat first-return scan that missed returns nested below one wrapper
     // level and silently fell back to `int`, and (b) detect §27.3 divergent
     // returns (≥2 value returns whose types are not all the same).
+    bool isSoleNamedCandidate(const sema::MethodSymbol* ms);
     void collectLambdaReturnTypes(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
         std::vector<TypeRef*>& out);

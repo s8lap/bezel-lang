@@ -825,6 +825,43 @@ void ExprTC::collectLambdaReturnTypeFromStmt(const ast::Stmt* s,
     // expressions and is excluded by construction.
 }
 
+// fix #6161 (§22.6 *Lambda-literal arguments*, v0.338): true only when `ms` is
+// POSITIVELY the single candidate of its name — one same-name method across the
+// declaring type and every base type, or one same-name method across all
+// extension blocks (module + imported) for an extension method. Any path that
+// cannot be counted (no declaring type, no extension decl) is not sole, so the
+// lambda-vs-target classification stays silent there (the overload resolution
+// decides).
+bool ExprTC::isSoleNamedCandidate(const sema::MethodSymbol* ms) {
+    if (!ms) return false;
+    int n = 0;
+    auto countIn = [&](const std::vector<Symbol*>& members) {
+        for (Symbol* m : members)
+            if (auto* o = dynamic_cast<MethodSymbol*>(m))
+                if (o->name == ms->name) ++n;
+    };
+    if (ms->extensionDecl) {
+        if (ctx_.module())
+            for (Symbol* child : ctx_.module()->children)
+                if (auto* e = dynamic_cast<ExtensionSymbol*>(child))
+                    countIn(e->members);
+        for (ExtensionSymbol* e : importedExtensions_) countIn(e->members);
+        return n == 1;
+    }
+    if (!ms->parent) return false;
+    std::vector<const TypeSymbol*> work{ms->parent}, seen;
+    while (!work.empty()) {
+        const TypeSymbol* t = work.back();
+        work.pop_back();
+        if (!t || std::find(seen.begin(), seen.end(), t) != seen.end())
+            continue;
+        seen.push_back(t);
+        countIn(t->members);
+        for (auto* b : t->baseTypes) work.push_back(b);
+    }
+    return n == 1;
+}
+
 void ExprTC::collectLambdaReturnTypes(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
         std::vector<TypeRef*>& out) {
@@ -10678,8 +10715,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             explicitFnFormal = ptFormal;
                         }
                         if (auto* pt = ptFormal) {
-                            if (pt->kind == TypeRef::Kind::Function &&
-                                !pt->funcParams.empty()) {
+                            // fix #6161 (§27.3): a ZERO-parameter function type
+                            // threads too — its return slot is what classifies
+                            // a procedure lambda literal against a value-
+                            // returning target. The param threading below is a
+                            // no-op for an empty list.
+                            if (pt->kind == TypeRef::Kind::Function) {
                                 // #1140 / §14: a function-typed param `(T)->R`
                                 // on a generic class Box<T> instantiated as
                                 // Box<int> must yield `(int)->R` for lambda
@@ -10783,6 +10824,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 // inferred type argument.
                                 if (!mentionsOwnGeneric(pt->funcReturn)) {
                                     pendingLambdaTargetReturn_ = pt->funcReturn;
+                                    // fix #6161 (§22.6): a formal of an
+                                    // OVERLOADED callee is one candidate's,
+                                    // not the resolution's pick.
+                                    pendingLambdaTargetAmbiguous_ =
+                                        !isSoleNamedCandidate(calleeMs2);
                                     // fix #1820 (§28.3 / §28.8): the call-arg's
                                     // `funcReturnOwned` marker travels alongside
                                     // the inner slot, exactly like the typed-local
@@ -10943,6 +10989,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 pendingLambdaParamTypes_ = savedLamParams;
                 pendingLambdaTargetReturn_ = savedLamTargetRet;
                 pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
+                pendingLambdaTargetAmbiguous_ = false;
                 pendingLambdaArgContext_ = savedArgCtx;
             }
             // per §7.4 (#1188): a `ref`/`out` argument can be reassigned by the
@@ -11219,6 +11266,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 }
             }
         }
+        bool ctorOverloaded = false;
+        if (ne->type)
+            if (auto* rtO = ctx_.resolvedType(*ne->type))
+                if (rtO->kind == TypeRef::Kind::Named && rtO->declaration) {
+                    int nc = 0;
+                    for (Symbol* m : rtO->declaration->members)
+                        if (auto* cs = dynamic_cast<ConstructorSymbol*>(m))
+                            if (!cs->isStatic) ++nc;
+                    ctorOverloaded = nc != 1;
+                }
         // partial #2668: the constructor analogue of #2657's
         // `formalOutParamType2`. Prefers the AST declaration (so a LOCAL
         // constructor is bit-identical) and falls back to the imported
@@ -11553,8 +11610,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                 pendingLambdaArgContext_ = true;
                 if (TypeRef* pt = formalCtorOutParamType(posn)) {
-                    if (pt->kind == TypeRef::Kind::Function &&
-                        !pt->funcParams.empty()) {
+                    // fix #6161 (§27.3): zero-parameter targets thread too.
+                    if (pt->kind == TypeRef::Kind::Function) {
                         // Build the class-level substitution map from the
                         // `new` expression's RESOLVED type's bound generic
                         // args, mapping the class's type-parameter name to
@@ -11598,6 +11655,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         // same class-level substitution as the params.
                         pendingLambdaTargetReturn_ = pt->funcReturn;
                         pendingLambdaTargetReturnOwned_ = pt->funcReturnOwned;
+                        // fix #6161 (§22.6): several constructors => the formal
+                        // is one candidate's, not the resolution's pick.
+                        pendingLambdaTargetAmbiguous_ = ctorOverloaded;
                         if (!classSubst.empty() &&
                             pendingLambdaTargetReturn_)
                             pendingLambdaTargetReturn_ =
@@ -11615,6 +11675,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             pendingLambdaParamTypes_ = savedLamParamsNew;
             pendingLambdaTargetReturn_ = savedLamTargetRetNew;
             pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwnedNew;
+            pendingLambdaTargetAmbiguous_ = false;
             refOutArgTargetNode_ = savedRefOutNew;
             currentLiteralWideningHint_ = savedNewHint;
             // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
@@ -11900,6 +11961,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // inherit it.
         bool lamTargetRetOwned = pendingLambdaTargetReturnOwned_;
         pendingLambdaTargetReturnOwned_ = false;
+        const bool lamTargetAmbiguous = pendingLambdaTargetAmbiguous_;
+        pendingLambdaTargetAmbiguous_ = false;
         // §27.3 (v0.217, #2101): the optional return-type ascription. When
         // present it behaves exactly as a method's declared return type —
         // each `return e;` (and an expression body) is checked against it
@@ -12675,6 +12738,33 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         inferredReturn =
                             ctx_.primitiveTypeRef(PrimitiveType::Int);
                     }
+                }
+                // fix #6161 (§27.3 *Which block-bodied lambdas return a value*,
+                // v0.338): "A target type, when present, is checked against
+                // this classification — a procedure-bodied lambda does not
+                // convert to a value-returning function type". A concrete
+                // (primitive / declared-type) non-unit target return slot at a
+                // procedure lambda literal is that conversion. A generic-
+                // parameter slot (`Named`, no declaration) is not concrete
+                // here and stays unchecked.
+                // A DIVERGING body (every path throws / `while true`, no bare
+                // `return;`) is exempt: whether such a body is a procedure
+                // lambda is an open spec question (§27.3 "exactly when no
+                // path ... executes a value-carrying return" vs "the same
+                // totality rule as for methods"), so behaviour is unchanged.
+                const bool lamDiverges =
+                    !lamHasBareReturn && bodyAlwaysExits(lam->stmts);
+                if (lamTargetRet && !lamTargetAmbiguous && !lam->isAsync &&
+                    !lamHasValueReturn && !lamDiverges &&
+                    (lamTargetRet->kind == TypeRef::Kind::Primitive ||
+                     (lamTargetRet->kind == TypeRef::Kind::Named &&
+                      lamTargetRet->declaration))) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, lam->span.begin,
+                        "a procedure-bodied lambda (no path executes a "
+                        "value-carrying `return`) does not convert to a "
+                        "function type whose return type is a value "
+                        "(\xc2\xa7""27.3)");
                 }
                 // §27.3 (v0.226, #2107): the divergent-return error fires only
                 // when the lambda has NEITHER a return-type ascription NOR a
