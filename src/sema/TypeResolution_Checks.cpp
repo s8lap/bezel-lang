@@ -8118,6 +8118,16 @@ void Resolver::checkAbstractImplementations() {
             // (`: I<int>` -> {T -> int}), applied to the ELEMENT type compare.
             SubstMap subst;
         };
+        // #6130 / §11.2: one property obligation per (generic interface,
+        // instantiation) visit. `ifaceProps` is keyed by name and records no
+        // substitution, so a generic interface's property type could never be
+        // compared; this vector carries the substitution per visit, in BFS order.
+        struct IfacePropObligation {
+            PropertySymbol* ips;
+            TypeSymbol* iface;
+            SubstMap subst;
+        };
+        std::vector<IfacePropObligation> ifacePropObligations;
         std::vector<IfaceIndexerObligation> ifaceIndexerObligations;
         // #2186: BFS over the inheritance chain tracking the per-node
         // substitution the path induces. Dedup is by (TypeSymbol, subst-key)
@@ -8418,6 +8428,8 @@ void Resolver::checkAbstractImplementations() {
                         // Record the interface's required property name.
                         ifacePropertyNames.insert(ps->name);
                         ifaceProps.emplace(ps->name, std::make_pair(ps, cur));
+                        if (!cur->genericParams.empty())
+                            ifacePropObligations.push_back({ps, cur, curSubst});
                     } else if (hasMod(ps, "abstract")) {
                         // fix #4020 / §12.5: mirrors the `methodIsAbstract`
                         // arm above and #3641's indexer arm just above this
@@ -10102,6 +10114,60 @@ void Resolver::checkAbstractImplementations() {
                         "exactly (no covariance) (§9.1 / §11.2)");
                 }
             }
+        }
+        // #6130 / §11.2 (v0.338): the property-type compare above skips every
+        // generic interface (its member type needs the instantiation's
+        // substitution). "Return types must match exactly (no covariance in
+        // this version)" and "same name and type" read each side through its
+        // own substitution: the interface's through the visit that reached it
+        // (`: I<int>` -> {T -> int}), the implementation's through its
+        // declaring class's. One obligation per instantiation visit.
+        for (auto& obl : ifacePropObligations) {
+            PropertySymbol* ips = obl.ips;
+            const TypeRef* itype = propType(ips);
+            if (!itype) continue;
+            const TypeRef* isub = propTypeUnder(itype, obl.subst);
+            auto cit = concreteProps.find(ips->name);
+            if (cit != concreteProps.end()) {
+                const TypeRef* ctype = propType(cit->second);
+                if (!ctype) continue;
+                if (propTypeMatches(isub,
+                                    propTypeUnder(ctype,
+                                                  classSubstOf(cit->second))))
+                    continue;
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    ctx_.isImported(cit->second) ? t->declLoc
+                                                 : cit->second->declLoc,
+                    std::string("property `") + std::string(ips->name) +
+                    "` implements interface `" +
+                    std::string(obl.iface->name) +
+                    "` with a different type than the interface declares "
+                    "\xE2\x80\x94 the property type does not match exactly (no "
+                    "covariance) under the interface's substitution "
+                    "(\xC2\xA7""11.2)");
+                continue;
+            }
+            auto pfit = concretePosFields.find(ips->name);
+            if (pfit == concretePosFields.end()) continue;
+            FieldSymbol* fs = pfit->second;
+            const TypeRef* ctype =
+                (fs->posParam && fs->posParam->type)
+                    ? ctx_.resolvedType(*fs->posParam->type)
+                    : nullptr;
+            if (!ctype) continue;
+            SubstMap tsub;
+            auto tit = classSubst.find(t);
+            if (tit != classSubst.end()) tsub = tit->second;
+            if (propTypeMatches(isub, propTypeUnder(ctype, tsub))) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string("property `") + std::string(ips->name) +
+                "` implements interface `" + std::string(obl.iface->name) +
+                "` with a positional field of a different type than the "
+                "interface declares \xE2\x80\x94 the property type does not "
+                "match exactly (no covariance) under the interface's substitution "
+                "(\xC2\xA7""9.1 / \xC2\xA7""11.2)");
         }
     }
 }
