@@ -72,7 +72,10 @@ BEZEL_TEST(function_value_object_members_spec_27_7_1_5943,
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\nTrue\nTrue\n"));
 }
 
-// §27.7.1's three equality kinds through `Equals`, each with its hash.
+// §27.7.1's three equality kinds through `Equals`, each with its hash. The
+// class-receiver pair is compared with `=` at its function type: `a1.Equals(a2)`
+// would place a receiver-bearing reference at `Equals(Object)`'s argument,
+// invalid under §28.3 *Set-erasing positions* (v0.338; #6261, #6215).
 BEZEL_TEST(function_value_object_members_spec_27_7_1_5943,
           equals_and_hash_follow_function_value_equality_27_7_1) {
     const std::string src = std::string(kDecls) +
@@ -88,7 +91,7 @@ BEZEL_TEST(function_value_object_members_spec_27_7_1_5943,
         "    var a1: (int) -> int := acc.Add; "
         "    var a2: (int) -> int := acc.Add; "
         "    var a3: (int) -> int := acc2.Add; "
-        "    Console.WriteLine($\"{a1.Equals(a2)} {a1.Equals(a3)} "
+        "    Console.WriteLine($\"{a1 = a2} {a1 = a3} "
         "{a1.GetHashCode() = a2.GetHashCode()}\"); "
         "    var l: (int) -> int := lambda(x: int) => x; "
         "    var l2: (int) -> int := lambda(x: int) => x; "

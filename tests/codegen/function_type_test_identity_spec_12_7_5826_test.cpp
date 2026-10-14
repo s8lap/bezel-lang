@@ -115,12 +115,11 @@ BEZEL_TEST(function_type_test_identity_spec_12_7_5826,
 BEZEL_TEST(function_type_test_identity_spec_12_7_5826,
           identity_is_slot_types_modifiers_and_return_type_12_7) {
     const std::string src = mainWith(
-        "    using var acc := new Acc(3); "
         "    var t: (int) -> int := Util.Twice; "
         "    var ot: Object := t; "
         "    Console.WriteLine($\"{ot is (int) -> int} {ot is (string) -> int} "
         "{ot is (int) -> long} {ot is (int, int) -> int} {ot is () -> int}\"); "
-        "    var i: (int) -> int := acc.Add; "
+        "    var i: (int) -> int := lambda(x: int) => x + 1; "
         "    var oi: Object := i; "
         "    Console.WriteLine($\"{oi is (int) -> int} {oi is (int) -> long}\"); "
         "    var b: (ref int) -> () := Util.Bump; "

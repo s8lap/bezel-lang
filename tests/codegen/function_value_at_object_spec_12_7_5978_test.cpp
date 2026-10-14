@@ -112,11 +112,10 @@ BEZEL_TEST(function_value_at_object_spec_12_7_5978,
           every_source_kind_is_no_string_class_interface_or_box_12_7) {
     const std::string src = mainWith(
         "    var k: int := 5; "
-        "    using var acc := new Acc(3); "
         "    var i: int := 0; "
         "    while i < 60 do "
         "      var f1: (int) -> int := Util.Twice; "
-        "      var f2: (int) -> int := acc.Add; "
+        "      var f2: (int) -> int := lambda(x: int) => x + k + 1; "
         "      var f3: (int) -> int := lambda(x: int) => x + 1; "
         "      var f4: (int) -> int := lambda(x: int) => x + k; "
         "      var n1: Object? := f1; "
@@ -192,7 +191,9 @@ BEZEL_TEST(function_value_at_object_spec_12_7_5978,
 // key". So at `Object` a static reference equals every reference to the same
 // method; a class-receiver reference equals one over the same receiver; a
 // lambda equals only itself and never a method reference; and the hash
-// agrees with equality.
+// agrees with equality. The class-receiver reference is compared at its
+// function type (`=`), not at `Object`: an instance method reference at
+// `Object` is §28.3 *Set-erasing positions* (v0.338) invalid (#6215, #6261).
 BEZEL_TEST(function_value_at_object_spec_12_7_5978,
           equals_and_hash_at_object_follow_function_value_equality_27_7_1) {
     const std::string src = mainWith(
@@ -210,21 +211,19 @@ BEZEL_TEST(function_value_at_object_spec_12_7_5978,
         "      var l1: (int) -> int := lambda(x: int) => x + 1; "
         "      var l2: (int) -> int := lambda(x: int) => x + 1; "
         "      var os1: Object? := s1; var os2: Object? := s2; "
-        "      var os3: Object? := s3; var om1: Object? := m1; "
-        "      var om2: Object? := m2; var om3: Object? := m3; "
+        "      var os3: Object? := s3; "
         "      var ol1: Object? := l1; var ol2: Object? := l2; "
-        "      if os1 = null or os2 = null or os3 = null or om1 = null or "
-        "         om2 = null or om3 = null or ol1 = null or ol2 = null then "
+        "      if os1 = null or os2 = null or os3 = null or "
+        "         ol1 = null or ol2 = null then "
         "        return; "
         "      end; "
         "      if os1!.Equals(os2!) and "
         "         os1!.GetHashCode() = os2!.GetHashCode() then "
         "        good := good + 1; end; "
         "      if not os1!.Equals(os3!) then good := good + 1; end; "
-        "      if om1!.Equals(om2!) and "
-        "         om1!.GetHashCode() = om2!.GetHashCode() then "
+        "      if m1 = m2 and m1.GetHashCode() = m2.GetHashCode() then "
         "        good := good + 1; end; "
-        "      if not om1!.Equals(om3!) then good := good + 1; end; "
+        "      if m1 <> m3 then good := good + 1; end; "
         "      if ol1!.Equals(ol1!) and "
         "         ol1!.GetHashCode() = ol1!.GetHashCode() then "
         "        good := good + 1; end; "
@@ -244,8 +243,13 @@ BEZEL_TEST(function_value_at_object_spec_12_7_5978,
 // `Dictionary<Object, int>` finds a static reference through a SEPARATE
 // evaluation and a class-receiver reference through a separate evaluation
 // over the same receiver.
+// PENDING #6215: `var o2: Object := acc.Add` is a receiver-bearing method
+// reference at an `Object` initializer, which §28.3 *Set-erasing positions*
+// (v0.338) rejects; the compiler still accepts it. No spelling keeps the
+// class-receiver key (a function type is not hashable, §27.7.1), so the row
+// is renamed, not re-spelled; flip it when #6215 lands.
 BEZEL_TEST(function_value_at_object_spec_12_7_5978,
-          function_value_is_an_ordinary_object_key_27_7_1) {
+          function_value_is_an_ordinary_object_key_27_7_1_pending_6215) {
     const std::string src = std::string(kDecls) +
         "public class Program "
         "  public static method MakeStatic(): Object => Util.Twice; "
@@ -536,8 +540,8 @@ BEZEL_TEST(function_value_at_object_spec_12_7_5978,
 // so a stored bare cell never matched its converted query: `f in d`,
 // `Contains`, `IndexOf`, `Remove` and the indexer all answered "absent".
 //
-// Each row runs every function-value kind (static reference, instance
-// reference, lambda, capturing lambda) for 100 iterations and asserts the
+// Each row runs every function-value kind (static reference, lambda, capturing lambda,
+// second capturing lambda) for 100 iterations and asserts the
 // printed answers (`Util.T` prints `is string` / `is Acc` of what it reads
 // back: `False/False` for a function value, `True/False` for a string; that
 // it is THE function type is #5826's subject). They run on `runAot`: a function value stored into a
@@ -564,7 +568,7 @@ constexpr const char* kKindDecls =
 struct FnKind { const char* name; const char* expr; };
 constexpr FnKind kFnKinds[] = {
     {"static reference", "Util.Twice"},
-    {"instance reference", "a.Add"},
+    {"second capturing lambda", "lambda(x: int) => x + i + 1"},
     {"lambda", "lambda(x: int) => x + 1"},
     {"capturing lambda", "lambda(x: int) => x + i"},
 };
@@ -606,7 +610,7 @@ void expectEveryKind(const std::string& members, const std::string& body,
 
 // §27.7.1 "is an ordinary key" / §4.8 `key in dict`: a function key stored
 // by `Add` and by the indexer is found by `in`, `ContainsKey`, the indexer
-// and `Remove`. (`f in d` answered False; the instance-reference and
+// and `Remove`. (`f in d` answered False; the
 // capturing kinds overflowed the stack in the key hash.)
 BEZEL_TEST(function_value_at_object_spec_12_7_5978,
           dictionary_object_key_is_found_by_in_and_indexer_27_7_1) {
