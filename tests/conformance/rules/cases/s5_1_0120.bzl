@@ -7,8 +7,30 @@
 //! expect: accept
 module Conf;
 
+public class OneShot: IEnumerator<int>
+  private _started: bool := false;
+
+  public constructor()
+  end constructor;
+
+  public method MoveNext(): bool
+    if _started then
+      return false;
+    end;
+    _started := true;
+    return true;
+  end MoveNext;
+
+  public property Current: int => 5;
+end OneShot;
+
 public class Bag: IEnumerable<int>
-  public method GetEnumerator(): owned IEnumerator<int> => new Array<int>().GetEnumerator();
+  public constructor()
+  end constructor;
+
+  public method GetEnumerator(): owned IEnumerator<int>
+    return new OneShot();
+  end GetEnumerator;
 end Bag;
 
 public class C
