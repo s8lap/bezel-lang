@@ -17998,6 +17998,8 @@ struct MutablyCapturedScan {
     explicit MutablyCapturedScan(std::unordered_set<std::string_view>& o)
         : out(o) {}
     std::unordered_set<std::string_view>& out;
+    // pending #6141: the subset assigned a `new …` inside a lambda.
+    std::unordered_set<std::string_view>* newAssigned = nullptr;
     int lambdaDepth = 0;
     std::vector<std::string_view> shadowed;  // active lambda-parameter names
 
@@ -18138,6 +18140,11 @@ void MutablyCapturedScan::stmt(const ast::Stmt* s) {
         expr(es->expr.get());
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
         recordTarget(as->target.get());  // `x := …` inside a lambda captures x
+        if (newAssigned && lambdaDepth > 0 &&
+            dynamic_cast<const ast::NewExpr*>(as->value.get()))
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                if (!isShadowed(id->name)) newAssigned->insert(id->name);
         expr(as->target.get());
         expr(as->value.get());
     } else if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
@@ -18191,7 +18198,9 @@ void ExprTC::computeMutablyCaptured(
     const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
     const ast::Expr* exprBody) {
     mutablyCapturedNames_.clear();
+    newAssignCapturedNames_.clear();
     MutablyCapturedScan scan{mutablyCapturedNames_};
+    scan.newAssigned = &newAssignCapturedNames_;
     if (exprBody) scan.expr(exprBody);
     if (stmts) scan.body(*stmts);
 }

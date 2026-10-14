@@ -466,6 +466,9 @@ private:
     // source text); matched against a narrowed symbol's `name`. Empty in the
     // common case, which makes the per-op invalidation a cheap no-op.
     std::unordered_set<std::string_view> mutablyCapturedNames_;
+    // pending #6141: the subset of mutablyCapturedNames_ that a lambda
+    // assigns a `new …` (ArmGuardFacts::seed's carve-out).
+    std::unordered_set<std::string_view> newAssignCapturedNames_;
 
     // §22.5 (issue #1160): while type-checking parameter i's default-value
     // expression, that parameter and every parameter declared AFTER it are out
@@ -3078,10 +3081,31 @@ private:
             entryField = tc.fieldNarrowed_;
             seeded = true;
             tc.collectNarrowings(&guard, /*forTrueBranch=*/true);
-            for (const auto& [sym, ty] : tc.narrowings_) {
-                auto e = entryTypes.find(sym);
-                if (e == entryTypes.end() || e->second != ty)
-                    seededTypes.emplace_back(sym, ty);
+            for (auto it = tc.narrowings_.begin();
+                 it != tc.narrowings_.end();) {
+                auto e = entryTypes.find(it->first);
+                if (e != entryTypes.end() && e->second == it->second) {
+                    ++it;
+                    continue;
+                }
+                // pending #6141: a guard's type test of a local that a
+                // lambda assigns a `new …` keeps base behaviour (no narrowing
+                // of the arm body), although §7.4 (v0.338) admits it while no
+                // call intervenes. Narrowing it makes such programs compile,
+                // and the lambda's assignment leaks (#6141). Remove this
+                // carve-out when #6141 lands.
+                if (it->first &&
+                    tc.newAssignCapturedNames_.count(it->first->name)) {
+                    if (e != entryTypes.end()) {
+                        it->second = e->second;
+                        ++it;
+                    } else {
+                        it = tc.narrowings_.erase(it);
+                    }
+                    continue;
+                }
+                seededTypes.emplace_back(it->first, it->second);
+                ++it;
             }
         }
         ~ArmGuardFacts() {
