@@ -30279,6 +30279,67 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // leave untyped for now (downstream uses are in synthesized
                 // Deserialize which only reads typed results from binder calls).
             }
+            // fix #6267 (§3.4, stdlib §4.4–§4.8, v0.338): a bare collection
+            // TYPE NAME used as a member-access target WITHOUT a call
+            // (`Array.Foo;`, `var y := Array.Length;`, `Array.Sort;`) names no
+            // static member of that type, and this builtin-class arm has no
+            // fallback reject, so the access fell through silently (or
+            // degraded to a zero-initialized local). Report the same
+            // diagnostic the call form uses (#6265, typeCall's isArrLike
+            // arm) and stop. Scope: the bare IdentifierExpr target only (the
+            // generic spelling `Array<int>.Foo` is a separate, unchanged
+            // path) and not the call callee (typeCall owns that form).
+            // `FromCollectionLiteral` is a stdlib-declared static on every
+            // sequence collection (the literal witness, §15.4), and
+            // `FrozenArray.From` a declared static factory: both are exempt
+            // so a real static member is never rejected here.
+            // The target must NAME the type (a TypeSymbol), not a value of
+            // that type: `fa.Length` on a `FrozenArray` local is an instance
+            // access and must not reach this reject.
+            const bool typeNameTarget =
+                ma.target &&
+                dynamic_cast<const ast::IdentifierExpr*>(ma.target.get()) &&
+                dynamic_cast<const TypeSymbol*>(ctx_.exprSymbol(*ma.target)) &&
+                !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target));
+            if (&ma != calleeOfCallCtx_ && typeNameTarget) {
+                const bool collectionName =
+                    cls == "Array" || cls == "OwningArray" ||
+                    cls == "Stack" || cls == "OwningStack" ||
+                    cls == "Queue" || cls == "OwningQueue" ||
+                    cls == "Set" || cls == "OwningSet" ||
+                    cls == "LinkedList" || cls == "OwningLinkedList" ||
+                    cls == "SortedSet" ||
+                    cls == "Dictionary" || cls == "OwningDictionary" ||
+                    cls == "SortedDictionary" || cls == "FrozenArray";
+                const bool declaredStatic =
+                    m == "FromCollectionLiteral" ||
+                    (cls == "FrozenArray" && m == "From");
+                // §27.6 / §26.5: an extension block may declare a member of
+                // that name, and `Array<int>.Twice` is then a type-qualified
+                // reference to it (the primitive form `int.Doubled`, #1633).
+                // Such a name is not a "no static member" case, so it is left
+                // to the extension path rather than rejected here.
+                const auto extensionDeclares = [&](const ExtensionSymbol* x) {
+                    for (const Symbol* mem : x->members)
+                        if (mem && mem->name == m) return true;
+                    return false;
+                };
+                bool extensionNamed = false;
+                if (ctx_.module())
+                    for (const Symbol* c : ctx_.module()->children)
+                        if (const auto* x = dynamic_cast<const ExtensionSymbol*>(c))
+                            extensionNamed = extensionNamed || extensionDeclares(x);
+                for (const ExtensionSymbol* x : importedExtensions_)
+                    extensionNamed = extensionNamed || extensionDeclares(x);
+                if (collectionName && !declaredStatic && !extensionNamed) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "'" + std::string(cls) +
+                            "' has no static method or property '" +
+                            std::string(m) + "' (§3.4)");
+                    return;
+                }
+            }
         } else if (targetType->kind == ast::TypeDeclKind::Record ||
                    targetType->kind == ast::TypeDeclKind::Enum ||
                    targetType->kind == ast::TypeDeclKind::Choice) {
