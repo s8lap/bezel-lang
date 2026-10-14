@@ -156,3 +156,96 @@ BEZEL_TEST(sema_owning_buffer_defaultable_5821,
         r, "record `Port` has a non-defaultable component or is constructor-only"));
     BEZEL_EXPECT_TRUE(diagContains(r, "§17.11"));
 }
+
+// REJECT — fix #5821 (§14.2 two-presentation paragraph, v0.338): a generic body
+// that constructs `OwningBuffer<T>(n)` at its own `T` is read at each
+// instantiation. `H<Level>` supplies a non-defaultable enum, so the
+// instantiation is rejected, naming the constructor and the parameter's
+// `default(T)` use (line 5 of the body).
+BEZEL_TEST(sema_owning_buffer_defaultable_5821,
+           owning_buffer_generic_body_instantiated_at_non_defaultable_rejected_spec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "enum Level Low := 1, High := 2; end Level; "
+        "class H<T> "
+        "  public static method Mk(n: int): int "
+        "    using var b := new OwningBuffer<T>(n); "
+        "    return b.Length; "
+        "  end Mk; "
+        "end H; "
+        "class Main "
+        "  public static method Main(): int "
+        "    return H<Level>.Mk(4); "
+        "  end Main; "
+        "end Main;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(
+        r, "does not satisfy the one-argument `OwningBuffer<T>(n)` constructor"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "`Level`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§14.2"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§17.11"));
+}
+
+// ACCEPT control — the generic body instantiated at `int` (defaultable) runs.
+BEZEL_TEST(sema_owning_buffer_defaultable_5821,
+           owning_buffer_generic_body_instantiated_at_int_accepted_control_spec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "class H<T> "
+        "  public static method Mk(n: int): int "
+        "    using var b := new OwningBuffer<T>(n); "
+        "    return b.Length; "
+        "  end Mk; "
+        "end H; "
+        "class Main "
+        "  public static method Main(): int "
+        "    return H<int>.Mk(4); "
+        "  end Main; "
+        "end Main;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 4);
+}
+
+// ACCEPT control — the generic body instantiated at an enum WITH a zero
+// constant is defaultable, so the instantiation is admitted and runs.
+BEZEL_TEST(sema_owning_buffer_defaultable_5821,
+           owning_buffer_generic_body_instantiated_at_defaultable_enum_accepted_control_spec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "enum Level Low := 0, High := 2; end Level; "
+        "class H<T> "
+        "  public static method Mk(n: int): int "
+        "    using var b := new OwningBuffer<T>(n); "
+        "    return b.Length; "
+        "  end Mk; "
+        "end H; "
+        "class Main "
+        "  public static method Main(): int "
+        "    return H<Level>.Mk(4); "
+        "  end Main; "
+        "end Main;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 4);
+}
+
+// ACCEPT control — a reference-typed instantiation keeps the class presentation
+// (no default needed), so the generic body is admitted at a class.
+BEZEL_TEST(sema_owning_buffer_defaultable_5821,
+           owning_buffer_generic_body_instantiated_at_class_accepted_control_spec_14_2) {
+    auto r = runAot(
+        "module M; "
+        "class Ref end Ref; "
+        "class H<T> "
+        "  public static method Mk(n: int): int "
+        "    using var b := new OwningBuffer<T>(n); "
+        "    return b.Length; "
+        "  end Mk; "
+        "end H; "
+        "class Main "
+        "  public static method Main(): int "
+        "    return H<Ref?>.Mk(4); "
+        "  end Main; "
+        "end Main;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 4);
+}

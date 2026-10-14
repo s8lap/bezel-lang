@@ -1248,6 +1248,22 @@ private:
     std::vector<DefaultTypeParamUse> defaultTypeParamUses_;
     std::vector<GenericInstantiationSite> genericInstantiationSites_;
 
+    // fix #5821 (§14.2 two-presentation paragraph, v0.338; stdlib §4.14): a
+    // one-argument `new OwningBuffer<T>(n)` in a generic body whose `T` is a
+    // bare type parameter in scope. The value presentation's constructor
+    // initializes every slot to `default(T)`, so each instantiation whose
+    // substituted argument is a value type that is not defaultable is rejected
+    // at the instantiation site (checkDeferredOneArgBufferInstantiations). Kept
+    // apart from defaultTypeParamUses_ so it neither dedupes against nor
+    // changes the verdicts of a `default(T)` use of the same parameter.
+    struct OneArgBufferUse {
+        const void* owner;        // ast::MethodDecl or ast::TypeDecl
+        std::string param;
+        SourceLocation loc;       // the constructor call
+    };
+    std::vector<OneArgBufferUse> oneArgBufferUses_;
+    void checkDeferredOneArgBufferInstantiations();
+
     // Record a `default(T)` over the bare type parameter `param`, owned by
     // `owner` (the method when `param` is method-level, else the enclosing
     // type).

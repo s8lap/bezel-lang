@@ -1578,6 +1578,28 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
                 "\xC2\xA7""4.14); use the two-argument constructor with an "
                 "init function, or make the type defaultable");
         }
+        // fix #5821 (§14.2 two-presentation paragraph, v0.338): a bare type
+        // parameter of the enclosing method or class is read at each
+        // instantiation (checkDeferredOneArgBufferInstantiations), not here.
+        // Extensions declare no generic parameters of their own (§26.4), so
+        // only the method and class owners are keys.
+        if (!el->nullable && el->kind == TypeRef::Kind::Named &&
+            !el->declaration && el->genericArgs.empty() &&
+            !el->isAliasQualifiedBuiltin()) {
+            std::string_view pn = el->headName();
+            const void* owner = nullptr;
+            if (currentMethodDecl_)
+                for (const auto& gp : currentMethodDecl_->genericParams)
+                    if (gp.name == pn) owner = currentMethodDecl_;
+            if (!owner && currentType_ && currentType_->decl)
+                if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                        currentType_->decl))
+                    for (const auto& gp : td->genericParams)
+                        if (gp.name == pn) owner = td;
+            if (owner)
+                oneArgBufferUses_.push_back(
+                    {owner, std::string(pn), ne.span.begin});
+        }
     }
 
     // fix #3425 (§22.5 / §17.7, v0.283): §22.5 binding for a NAMED argument on

@@ -428,7 +428,56 @@ void ExprTC::propagateDefaultTypeParamChains() {
     }
 }
 
+// fix #5821 (§14.2 two-presentation paragraph, v0.338; stdlib §4.14): see
+// the declaration in ExprTypecheck_impl.hpp. The presentation is selected by
+// the substituted argument, so only an enum, choice or record substitution
+// reaches the value presentation's one-argument constructor here (the same
+// scope as the concrete-argument check in checkBuiltinClosedConstructorSurface).
+void ExprTC::checkDeferredOneArgBufferInstantiations() {
+    if (oneArgBufferUses_.empty() || genericInstantiationSites_.empty())
+        return;
+    for (const auto& site : genericInstantiationSites_) {
+        bool takes = false;
+        SourceLocation useLoc{};
+        for (const auto& u : oneArgBufferUses_)
+            if (u.owner == site.owner && u.param == site.param) {
+                takes = true;
+                useLoc = u.loc;
+                break;
+            }
+        if (!takes) continue;
+        const TypeRef* a = site.arg;
+        if (!a || a->kind != TypeRef::Kind::Named || !a->declaration ||
+            a->nullable)
+            continue;
+        const ast::TypeDeclKind k = a->declaration->kind;
+        if (k != ast::TypeDeclKind::Enum && k != ast::TypeDeclKind::Choice &&
+            k != ast::TypeDeclKind::Record)
+            continue;
+        if (!defaultIllFormed(a)) continue;
+        std::string tn(a->declaration->name);
+        std::string why =
+            k == ast::TypeDeclKind::Enum
+                ? "it is an enum with no declared constant of underlying "
+                  "value 0"
+            : k == ast::TypeDeclKind::Choice
+                ? "a choice type has no default (\xC2\xA7""35.10)"
+                : "it is a record one of whose components has no default";
+        ctx_.diagnostics().report(
+            Severity::Error, site.loc,
+            "type argument `" + site.argName + "` does not satisfy the "
+            "one-argument `OwningBuffer<T>(n)` constructor (\xC2\xA7""14.2 "
+            "two-presentation paragraph, v0.338; stdlib \xC2\xA7""4.14): the "
+            "generic body constructs it at `T` (line " +
+            std::to_string(useLoc.line) + "), whose slots are `default(T)`, "
+            "and " + why + " (\xC2\xA7""17.11), so `" + tn + "` is not "
+            "admitted there; use the two-argument constructor with an init "
+            "function, or make the type defaultable");
+    }
+}
+
 void ExprTC::checkDeferredDefaultInstantiations() {
+    checkDeferredOneArgBufferInstantiations();
     if (defaultTypeParamUses_.empty() || genericInstantiationSites_.empty())
         return;
     propagateDefaultTypeParamChains();
