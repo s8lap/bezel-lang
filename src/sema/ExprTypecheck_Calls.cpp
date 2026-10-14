@@ -8506,12 +8506,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // diagnostic the other builtin type names use and stop.
                 if (!recvTy && !colName.empty() &&
                     dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()) &&
-                    (colName == "Array" || colName == "OwningArray" ||
-                     colName == "Stack" || colName == "OwningStack" ||
-                     colName == "Queue" || colName == "OwningQueue" ||
-                     colName == "Set" || colName == "OwningSet" ||
-                     colName == "LinkedList" || colName == "OwningLinkedList" ||
-                     colName == "SortedSet")) {
+                    common::isArrLikeCollectionName(colName)) {
                     ctx_.diagnostics().report(
                         Severity::Error, ce.span.begin,
                         "'" + std::string(colName) +
@@ -30302,15 +30297,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 dynamic_cast<const TypeSymbol*>(ctx_.exprSymbol(*ma.target)) &&
                 !isUserDeclaredTypeSym(ctx_.exprSymbol(*ma.target));
             if (&ma != calleeOfCallCtx_ && typeNameTarget) {
-                const bool collectionName =
-                    cls == "Array" || cls == "OwningArray" ||
-                    cls == "Stack" || cls == "OwningStack" ||
-                    cls == "Queue" || cls == "OwningQueue" ||
-                    cls == "Set" || cls == "OwningSet" ||
-                    cls == "LinkedList" || cls == "OwningLinkedList" ||
-                    cls == "SortedSet" ||
-                    cls == "Dictionary" || cls == "OwningDictionary" ||
-                    cls == "SortedDictionary" || cls == "FrozenArray";
+                const bool collectionName = common::isBareCollectionTypeName(cls);
                 const bool declaredStatic =
                     m == "FromCollectionLiteral" ||
                     (cls == "FrozenArray" && m == "From");

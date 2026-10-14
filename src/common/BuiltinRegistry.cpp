@@ -226,6 +226,14 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
     "LinkedList", "OwningLinkedList",
 };
 
+// fix #6265 / #6267 (§3.4, stdlib §4.4–§4.11, §4.18): the isArrLike family of
+// collection TYPE NAMES that a bare-name static access (`Array.Foo(x)`,
+// `Array.Foo;`) is checked against. Consumed via isArrLikeCollectionName.
+constexpr std::array<std::string_view, 11> kArrLikeCollectionNames = {
+    "Array", "OwningArray", "Stack", "OwningStack", "Queue", "OwningQueue",
+    "Set", "OwningSet", "LinkedList", "OwningLinkedList", "SortedSet",
+};
+
 // #2809 / §32.5 / stdlib §10.1–§10.3: the FFI-boundary BUFFER classes. See the
 // header for why the set exists and who consults it. `IntPtr`/`UIntPtr` are
 // §32.7 pointer-sized integer VALUE types, not buffers, and stay out.
@@ -1064,6 +1072,14 @@ bool isDictionaryName(std::string_view n) {
 bool isLinkedListName(std::string_view n) {
     return contains(kLinkedListNames, n);
 }  // per §4.6 / §4.7 — bz_llist_t*-backed linked-list names
+
+bool isArrLikeCollectionName(std::string_view n) {
+    return contains(kArrLikeCollectionNames, n);
+}  // per §3.4 / §4.4–§4.11, §4.18 — #6265 bare-name static check family
+
+bool isBareCollectionTypeName(std::string_view n) {
+    return isArrLikeCollectionName(n) || isDictionaryName(n) || n == "FrozenArray";
+}  // per §3.4 / §4.5–§4.8, §4.19 — #6267 member-access check family (Dictionary + FrozenArray added)
 
 bool isFfiBufferBuiltinName(std::string_view n) {
     return contains(kFfiBufferBuiltins, n);

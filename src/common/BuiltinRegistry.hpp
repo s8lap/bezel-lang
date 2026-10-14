@@ -239,6 +239,13 @@ bool isDictionaryName(std::string_view n);
 // bz_llist_t*-backed collections.  Backs isLinkedListTypeName. // per §4.6/§4.7
 bool isLinkedListName(std::string_view n);
 
+// fix #6265 / #6267 (§3.4): the collection TYPE NAMES checked for a bare-name
+// static access with no declared member. isArrLikeCollectionName is the
+// isArrLike family (the call form, #6265); isBareCollectionTypeName is that
+// family plus the dictionary family and FrozenArray (the member form, #6267).
+bool isArrLikeCollectionName(std::string_view n);
+bool isBareCollectionTypeName(std::string_view n);
+
 // #2809 / spec §32.5 / stdlib §10.1–§10.3: the three FFI-boundary BUFFER
 // classes — `CString`, `WString`, `RawBytes`. Each is a raw malloc'd buffer
 // (or, for RawBytes, a { ptr, len } struct over one), NOT a `%bz.string` and
