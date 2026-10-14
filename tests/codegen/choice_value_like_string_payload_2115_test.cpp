@@ -423,3 +423,209 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
+
+// ===========================================================================
+// #6170 step 3: a class FIELD of a value-like choice type is an OWNER of its
+// strings (§28.9 v0.338: every owner holds its own reference; §35.4). A store
+// retains the new value and releases the old one, and the class disposer
+// releases the value the field holds. Reads that keep the value take their own
+// reference: `var x := F;` retains at bind, and `case F of` pins the value an
+// arm binds from until the construct completes (§19.3: the arm, or its guard,
+// may overwrite the field while the binding is live). Before this, nothing
+// released a field's payload: every program below leaked 400 or more
+// allocations per 200 iterations on the step-2 compiler (LSan, rc=1).
+// ===========================================================================
+namespace {
+std::string choiceFieldProgram6170(const std::string& classes,
+                                   const std::string& stepBody) {
+    return std::string(
+               "module M;\n"
+               "choice P Ok(v: string), Err(code: int, msg: string), No; "
+               "end P;\n"
+               "choice W<T> Some(x: T), None; end W;\n") +
+           classes +
+           "\nclass Program\n"
+           "  static method Step(k: int): int\n" +
+           stepBody +
+           "\n  end Step;\n"
+           "  public static method Main(): int\n"
+           "    var total := 0;\n"
+           "    for var k in 0..<200 do total := total + Program.Step(k); "
+           "end;\n"
+           "    Console.WriteLine(total.ToString());\n"
+           "    return 0;\n"
+           "  end Main;\n"
+           "end Program;\n";
+}
+}  // namespace
+
+// THE PIN: a field initialized by its declaration, overwritten by methods
+// (a producer payload, then a borrowed one), and released by the disposer.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_35_4_field_store_and_dispose_own_the_value_6170) {
+    JitResult r = runAotChecked(choiceFieldProgram6170(
+        "class H\n"
+        "  private V: P := P.No;\n"
+        "  public method Set(k: int) V := P.Err(k, \"e\" + k.ToString()); "
+        "end Set;\n"
+        "  public method Set2(s: string) V := P.Ok(s); end Set2;\n"
+        "  public method Len(): int var n := 0; case V of Ok(var s) => "
+        "n := s.Length, Err(_, var m) => n := m.Length, No => n := 0 "
+        "end case; return n; end Len;\n"
+        "end H;",
+        "    using var h := new H();\n"
+        "    h.Set(k);\n"
+        "    var t := \"t\" + k.ToString();\n"
+        "    h.Set2(t);\n"
+        "    h.Set(k + 1);\n"
+        "    return h.Len();"));
+    BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan leak (800 allocs) → ran=false
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("692") != std::string::npos);
+}
+
+// `var x := F;` holds its own reference: the field is overwritten (in the
+// same object, and in another object through a parameter) before x is read.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_field_bind_read_outlives_overwrite_6170) {
+    JitResult r = runAotChecked(choiceFieldProgram6170(
+        "class H\n"
+        "  private V: P := P.No;\n"
+        "  public method Set(k: int) V := P.Ok(\"v\" + k.ToString()); "
+        "end Set;\n"
+        "  public method Get(): int\n"
+        "    var x := V;\n"
+        "    V := P.No;\n"
+        "    var n := 0;\n"
+        "    case x of Ok(var s) => n := s.Length, _ => n := 0 end case;\n"
+        "    return n;\n"
+        "  end Get;\n"
+        "  public method Steal(o: H): int\n"
+        "    const x := o.V;\n"
+        "    o.V := P.Ok(\"w\" + o.Get().ToString());\n"
+        "    var n := 0;\n"
+        "    case x of Ok(var s) => n := s.Length, _ => n := 0 end case;\n"
+        "    return n;\n"
+        "  end Steal;\n"
+        "end H;",
+        "    using var a := new H();\n"
+        "    using var b := new H();\n"
+        "    a.Set(k);\n"
+        "    var n := b.Steal(a);\n"
+        "    a.Set(k + 1);\n"
+        "    return n + a.Get();"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// §19.3: an arm body, and a guard, overwrite the field while the arm's
+// binding is live; the binding is read afterwards (a use-after-free without
+// the pin, a leak without the field release).
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_19_3_case_on_field_pins_binding_across_overwrite_6170) {
+    JitResult r = runAotChecked(choiceFieldProgram6170(
+        "class H\n"
+        "  private V: P := P.No;\n"
+        "  public method Set(k: int) V := P.Ok(\"v\" + k.ToString()); "
+        "end Set;\n"
+        "  public method Clear(): bool V := P.No; return true; end Clear;\n"
+        "  public method Go(k: int): int\n"
+        "    var n := 0;\n"
+        "    case V of\n"
+        "      Ok(var s) => do V := P.Err(k, \"x\" + k.ToString()); "
+        "n := s.Length; end,\n"
+        "      Err(_, var m) when Clear() => n := m.Length,\n"
+        "      _ => n := 0\n"
+        "    end case;\n"
+        "    return n;\n"
+        "  end Go;\n"
+        "end H;",
+        "    using var h := new H();\n"
+        "    h.Set(k);\n"
+        "    var a := h.Go(k);\n"
+        "    return a + h.Go(k);"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// The pin is released on every exit out of an arm: `return`, an exception,
+// and `break` / `continue` out of a loop around the case.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_3_case_on_field_pin_released_on_every_exit_6170) {
+    JitResult r = runAotChecked(choiceFieldProgram6170(
+        "class H\n"
+        "  private V: P := P.No;\n"
+        "  public method Set(k: int) V := P.Ok(\"v\" + k.ToString()); "
+        "end Set;\n"
+        "  public method Ret(): int\n"
+        "    case V of Ok(var s) => do V := P.No; return s.Length; end, "
+        "_ => do return 0; end end case;\n"
+        "  end Ret;\n"
+        "  public method Thr(): int\n"
+        "    case V of Ok(var s) => do V := P.No; if s.Length > 0 then "
+        "throw new InvalidOperationException(\"t\"); end; end, _ => () "
+        "end case;\n"
+        "    return 0;\n"
+        "  end Thr;\n"
+        "  public method Loop(): int\n"
+        "    var n := 0;\n"
+        "    for var i in 0..<3 do\n"
+        "      case V of Ok(var s) => do V := P.Ok(\"z\" + i.ToString()); "
+        "n := n + s.Length; if i = 1 then break; end; end, "
+        "_ => do continue; end end case;\n"
+        "    end;\n"
+        "    return n;\n"
+        "  end Loop;\n"
+        "end H;",
+        "    using var h := new H();\n"
+        "    var n := 0;\n"
+        "    h.Set(k);\n"
+        "    n := n + h.Ret();\n"
+        "    h.Set(k);\n"
+        "    n := n + h.Loop();\n"
+        "    h.Set(k);\n"
+        "    try\n"
+        "      n := n + h.Thr();\n"
+        "    catch\n"
+        "      InvalidOperationException => do n := n + 1; end\n"
+        "    end try;\n"
+        "    return n;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// A field-to-field store, a constructor that reads the initialized field
+// before overwriting it, a base-class field stored from a subclass, a generic
+// choice at T = string, and a binding-free case expression.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_35_4_field_owner_shapes_6170) {
+    JitResult r = runAotChecked(choiceFieldProgram6170(
+        "class B\n"
+        "  protected V: P := P.Ok(\"init\");\n"
+        "  private U: P;\n"
+        "  private G: W<string> := W<string>.None;\n"
+        "  public constructor(k: int)\n"
+        "    U := V;\n"
+        "    V := P.Ok(\"c\" + k.ToString());\n"
+        "    G := W<string>.Some(\"g\" + k.ToString());\n"
+        "  end constructor;\n"
+        "  public method Move() U := V; V := P.No; end Move;\n"
+        "  public method Tag(): int return (case V of Ok(_) => 1, "
+        "Err(_, _) => 2, No => 3); end Tag;\n"
+        "  public method Len(): int var n := 0; case U of Ok(var s) => "
+        "n := s.Length, _ => n := 0 end case; case G of Some(var t) => "
+        "n := n + t.Length, None => () end case; return n; end Len;\n"
+        "end B;\n"
+        "class D: B\n"
+        "  public constructor(k: int) base(k); end constructor;\n"
+        "  public method Set(k: int) V := P.Ok(\"d\" + k.ToString()); "
+        "end Set;\n"
+        "end D;",
+        "    using var h := new D(k);\n"
+        "    h.Set(k);\n"
+        "    h.Move();\n"
+        "    h.Set(k + 1);\n"
+        "    return h.Len() + h.Tag();"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

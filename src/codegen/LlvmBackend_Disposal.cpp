@@ -1975,6 +1975,29 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
     }
 
+    // fix #6170 step 3 (§28.9 / §35.4, v0.338): release the strings a
+    // value-like choice FIELD owns (the module scan admitted it, so every
+    // store retained — see collectValueLikeChoiceFieldOwners), then zero the
+    // slot so a re-entrant base-core dispose finds tag 0 with null strings and
+    // releases nothing. Own members only, like the walks above: an inherited
+    // slot is released by the base CORE disposer.
+    {
+        llvm::StructType* vst = classStruct(ts);
+        for (const sema::Symbol* m : ts->members) {
+            auto idxIt = fieldIndex_.find(m);
+            if (idxIt == fieldIndex_.end()) continue;
+            const sema::TypeRef* vrt = valueLikeChoiceFieldOwnerType(m);
+            if (!vrt) continue;
+            llvm::Value* addr = builder_.CreateStructGEP(
+                vst, currentThis_, idxIt->second, "vlcf.addr");
+            emitValueLikeChoiceActiveCaseStrRelease(addr, vrt->declaration, vrt,
+                                                    /*retain=*/false);
+            builder_.CreateStore(
+                llvm::Constant::getNullValue(vst->getElementType(idxIt->second)),
+                addr);
+        }
+    }
+
     // #480 / §24 / §28 (#1176): free each instance event's backing
     // EventSource. emitInstanceInit allocated one bz_event_source_new per
     // instance EventSymbol (sync and async); those allocations are NOT visited

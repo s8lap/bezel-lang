@@ -178,6 +178,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // THE CALL ITSELF IS UNAFFECTED: `lowerExprInner` has already emitted it, so
     // its side effects stand. Only the (nonexistent) result is dropped.
     if (v && v->getType()->isVoidTy()) return nullptr;
+    // fix #6170 step 3 (§28.9 / §35.4, v0.338): `var x := <owned field>;` /
+    // `const x := <owned field>;` reads a value-like choice field that owns its
+    // strings (collectValueLikeChoiceFieldOwners). The binding takes its own
+    // references, so a later overwrite or disposal of the field cannot dangle
+    // it; the #2115 scope-end release returns them when the local is armed.
+    if (v && !valueLikeChoiceFieldBindReads_.empty()) {
+        auto it = valueLikeChoiceFieldBindReads_.find(&e);
+        if (it != valueLikeChoiceFieldBindReads_.end())
+            if (const sema::TypeRef* rt =
+                    valueLikeChoiceFieldOwnerType(it->second))
+                retainValueLikeChoiceValue(&e, v, rt);
+    }
     return v;
 }
 

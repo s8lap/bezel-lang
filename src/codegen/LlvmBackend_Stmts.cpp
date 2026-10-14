@@ -1966,6 +1966,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerOwnedChoiceFieldStore(*as->target, addr, rhs,
                                                          as->value.get());
+                // fix #6170 step 3 (§28.9 / §35.4, v0.338): a value-like
+                // choice field that owns its strings (the module scan admitted
+                // it) retains the new value and releases the old one.
+                if (!handled && as->op == ":=")
+                    handled = lowerValueLikeChoiceFieldStore(
+                        *as->target, addr, rhs, as->value.get());
                 if (!handled) {
                     // fix #2960 / §8.6 / §28.9 (v0.240): drop-on-overwrite
                     // for a managed Object/interface LOCAL. The pre-pass admits
@@ -11469,6 +11475,40 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                           !markedSrcSlot && scrut &&
                           caseScrutRereadable(cs.scrutinee.get());
     }
+    // fix #6170 step 3 (§19.3 / §28.9 / §35.4, v0.338): the scrutinee reads a
+    // value-like choice FIELD that owns its strings. An arm's bindings borrow
+    // the payload, and the arm (or its guard) may overwrite the field or
+    // dispose its owner, which releases what the field held. So the value an
+    // arm binds from is PINNED — retained into `vlcPin` — for the rest of the
+    // construct, and released at its completion or by the dispose-stack entry
+    // on a `return`/`throw`/`break` out of an arm. The pin starts zeroed (tag
+    // 0, null strings), which the release walk treats as a no-op.
+    llvm::AllocaInst* vlcPin = nullptr;
+    const sema::TypeRef* vlcPinRef = nullptr;
+    if (const sema::TypeRef* prt =
+            cs.scrutinee && scrut
+                ? valueLikeChoiceFieldOwnerRead(cs.scrutinee.get())
+                : nullptr) {
+        // The scan admits this read only where a pin can be registered; a
+        // shape that cannot pin is reported rather than left to dangle.
+        if (scrut->getType()->isPointerTy() || disposeStack_.empty() ||
+            emittingDisposerBody_) {
+            ctx_.diagnostics().report(
+                Severity::Error, cs.span.begin,
+                "internal: case on an owning value-like choice field cannot "
+                "pin its scrutinee (#6170)");
+        } else {
+            vlcPin = entryAlloca(scrut->getType());
+            builder_.CreateStore(
+                llvm::Constant::getNullValue(scrut->getType()), vlcPin);
+            vlcPinRef = prt;
+            Disposal d{vlcPin, nullptr};
+            d.valueLikeChoiceStrRelease = true;
+            d.valueLikeChoiceStrReleaseTy = prt->declaration;
+            d.valueLikeChoiceStrReleaseRef = prt;
+            disposeStack_.back().push_back(d);
+        }
+    }
     auto* endBB =
         llvm::BasicBlock::Create(llvm_, "casestmt.end", currentFn_);
     for (std::size_t armIdx = 0; armIdx < cs.arms.size(); ++armIdx) {
@@ -11503,6 +11543,19 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                                                  "choice.this.reread");
                 if (reread->getType() == scrut->getType()) armScrut = reread;
             }
+        }
+        // fix #6170 step 3: pin the value this arm binds from (see vlcPin).
+        // Retain-before-release, so re-pinning the same value is sound.
+        if (vlcPin && patternBindsAnySlot(arm.pattern.get())) {
+            llvm::Value* oldPin = builder_.CreateLoad(
+                vlcPin->getAllocatedType(), vlcPin, "vlcpin.old");
+            llvm::AllocaInst* oldTmp = entryAlloca(oldPin->getType());
+            builder_.CreateStore(oldPin, oldTmp);
+            builder_.CreateStore(armScrut, vlcPin);
+            emitValueLikeChoiceActiveCaseStrRelease(
+                vlcPin, vlcPinRef->declaration, vlcPinRef, /*retain=*/true);
+            emitValueLikeChoiceActiveCaseStrRelease(
+                oldTmp, vlcPinRef->declaration, vlcPinRef, /*retain=*/false);
         }
         llvm::Value* pm = nullptr;
         if (!cs.scrutinee) {
@@ -11664,6 +11717,22 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     // position". Emitted at the top of endBB, after every arm body has
     // finished, so a pattern binding (a borrow of the scrutinee, §19.3) is
     // never read past it.
+    // fix #6170 step 3: the construct is complete; drop the pin (see vlcPin).
+    if (vlcPin) {
+        emitValueLikeChoiceActiveCaseStrRelease(
+            vlcPin, vlcPinRef->declaration, vlcPinRef, /*retain=*/false);
+        builder_.CreateStore(
+            llvm::Constant::getNullValue(vlcPin->getAllocatedType()), vlcPin);
+        if (!disposeStack_.empty()) {
+            auto& scope = disposeStack_.back();
+            for (auto it = scope.begin(); it != scope.end(); ++it) {
+                if (it->slot == vlcPin) {
+                    scope.erase(it);
+                    break;
+                }
+            }
+        }
+    }
     if (scrutChoiceSlot && scrutChoiceRef) {
         emitOwningChoiceLocationDisposal(scrutChoiceSlot, scrutChoiceRef);
         // Zero the slot so any later traversal of this Disposal entry is a

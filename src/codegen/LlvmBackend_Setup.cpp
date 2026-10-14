@@ -13943,6 +13943,20 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                         returnSourceIsCalleeOwnedCollection(init));
             }
         }
+        // fix #6170 step 3 (§28.9 / §35.4, v0.338): a value-like choice field
+        // that owns its strings takes its own references to the initializer's
+        // value. The slot is calloc-zeroed, so there is nothing to release.
+        if (v && t->kind == ast::TypeDeclKind::Class)
+            if (const sema::TypeRef* vrt = valueLikeChoiceFieldOwnerType(m)) {
+                RecordSubstGuard subst(this, vrt);
+                if (v->getType() == choiceStruct(vrt->declaration))
+                    retainValueLikeChoiceValue(init, v, vrt);
+                else
+                    ctx_.diagnostics().report(
+                        Severity::Error, init->span.begin,
+                        "internal: value-like choice field initializer has an "
+                        "unexpected value type (#6170)");
+            }
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
@@ -23761,6 +23775,10 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // string; either may later be reassigned, which retains the new value and
     // releases the old (lowerValueLikeChoiceLocalReassign).
     if (valueLikeChoiceLocalIsCopy(ldNode)) return rt;
+    // fix #6170 step 3: a read of a value-like choice field that owns its
+    // strings is retained whole as it is lowered (lowerExpr), so the local
+    // owns its own references.
+    if (valueLikeChoiceFieldBindReads_.count(v.init)) return rt;
     if (auto* cc0 = dynamic_cast<sema::ChoiceCaseSymbol*>(
             ctx_.exprSymbol(*v.init));
         cc0 && cc0->caseDecl && cc0->caseDecl->payload.empty() &&
@@ -28120,15 +28138,88 @@ bool Emitter::lowerValueLikeChoiceLocalReassign(const ast::AssignmentStmt& as) {
     }
     llvm::Value* nv = lowerExpr(*as.value);
     if (!nv) return true;  // lowering already reported
-    if (!retainValueLikeChoiceConstructionBorrows(as.value.get(), nv, rt)) {
-        llvm::AllocaInst* tmp = entryAlloca(nv->getType());
-        builder_.CreateStore(nv, tmp);
-        emitValueLikeChoiceActiveCaseStrRelease(tmp, rt->declaration, rt,
-                                                /*retain=*/true);
-    }
+    retainValueLikeChoiceValue(as.value.get(), nv, rt);
     emitValueLikeChoiceActiveCaseStrRelease(slot, rt->declaration, rt,
                                             /*retain=*/false);
     builder_.CreateStore(nv, slot);
+    return true;
+}
+
+// fix #6170 step 2/3 (§28.9 / §35.4, v0.338): give the value `nv` (lowered
+// from `e`) its own references. A positional construction already owns its +1
+// producers and literals, so only its borrowed string args are retained;
+// anything else (a copy, a field read, a call result) is retained whole.
+void Emitter::retainValueLikeChoiceValue(const ast::Expr* e, llvm::Value* nv,
+                                         const sema::TypeRef* rt) {
+    if (!nv || !rt || !rt->declaration) return;
+    if (retainValueLikeChoiceConstructionBorrows(e, nv, rt)) return;
+    llvm::AllocaInst* tmp = entryAlloca(nv->getType());
+    builder_.CreateStore(nv, tmp);
+    emitValueLikeChoiceActiveCaseStrRelease(tmp, rt->declaration, rt,
+                                            /*retain=*/true);
+}
+
+// fix #6170 step 3 (§28.9 / §35.4, v0.338) — see the declaration. The field a
+// bare name or member access reads, when it is a candidate of the scan.
+const sema::Symbol* Emitter::valueLikeChoiceFieldCandidateOf(
+        const ast::Expr* e) {
+    if (!e) return nullptr;
+    if (!dynamic_cast<const ast::IdentifierExpr*>(e) &&
+        !dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return nullptr;
+    auto* fs = dynamic_cast<const sema::FieldSymbol*>(ctx_.exprSymbol(*e));
+    if (!fs) return nullptr;
+    if (!valueLikeChoiceFieldScanDone_) collectValueLikeChoiceFieldOwners();
+    return valueLikeChoiceFieldCandidates_.count(fs) ? fs : nullptr;
+}
+
+const sema::TypeRef* Emitter::valueLikeChoiceFieldOwnerType(
+        const sema::Symbol* m) {
+    if (!m) return nullptr;
+    if (!valueLikeChoiceFieldScanDone_) collectValueLikeChoiceFieldOwners();
+    if (!valueLikeChoiceFieldOwners_.count(m)) return nullptr;
+    const sema::TypeRef* rt = resolveTypeParamRef(recordMemberType(m));
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return nullptr;
+    return rt;
+}
+
+const sema::TypeRef* Emitter::valueLikeChoiceFieldOwnerRead(
+        const ast::Expr* e) {
+    const sema::Symbol* m = valueLikeChoiceFieldCandidateOf(e);
+    return m ? valueLikeChoiceFieldOwnerType(m) : nullptr;
+}
+
+// fix #6170 step 3 (§28.9 / §35.4, v0.338): `<field> := v` on an admitted
+// field. The field owns its value's strings: retain the new value (its
+// borrowed construction args only, or the whole value), release the value the
+// slot held, store. Retain-before-release keeps `F := F` sound. The scan
+// admits a field only when every write to it is an assignment statement or
+// its declaration initializer, so this is the only store an admitted field's
+// slot ever receives after construction (the slot starts zeroed, which the
+// release walk reads as tag 0 with null strings — a no-op).
+bool Emitter::lowerValueLikeChoiceFieldStore(const ast::Expr& target,
+                                             llvm::Value* fieldAddr,
+                                             llvm::Value* newVal,
+                                             const ast::Expr* valueExpr) {
+    if (!fieldAddr || !newVal) return false;
+    const sema::Symbol* m = valueLikeChoiceFieldCandidateOf(&target);
+    const sema::TypeRef* rt = valueLikeChoiceFieldOwnerType(m);
+    if (!rt) return false;
+    {
+        RecordSubstGuard subst(this, rt);
+        if (newVal->getType() != choiceStruct(rt->declaration)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                "internal: value-like choice field store has an unexpected "
+                "value type (#6170)");
+            return true;
+        }
+    }
+    retainValueLikeChoiceValue(valueExpr, newVal, rt);
+    emitValueLikeChoiceActiveCaseStrRelease(fieldAddr, rt->declaration, rt,
+                                            /*retain=*/false);
+    builder_.CreateStore(newVal, fieldAddr);
     return true;
 }
 
@@ -34574,6 +34665,9 @@ void Emitter::collectStringReleaseEligible(
     stringBorrowAll_.clear();
     stringLocalCandidates_.clear();               // fix #2817
     valueLikeChoiceStrReleaseEligible_.clear();  // fix #2115
+    // fix #6170 step 3: the field-owner scan feeds the const predicate
+    // valueLikeChoiceLocalMintsStringPayload below, so it runs first.
+    collectValueLikeChoiceFieldOwners();
     // fix #2641: pin the body this walk analyzed, so an inline `out var`
     // recipient — an IdentifierExpr inside an argument list, which the
     // LocalDecl-only statement scan below can never enumerate — can be
@@ -42374,6 +42468,450 @@ void Emitter::collectBoxStorageFields() {
             if (isOk) boxStorageFields_.insert(voidPtr);
         }
     }
+}
+
+
+// fix #6170 step 3 (§28.9 "Runtime-managed types" / §35.4 / §13.2 / §19.3,
+// v0.338): which class fields of a value-like choice type OWN their value's
+// strings? See the declaration in LlvmBackend_impl.hpp.
+//
+// A string payload the field holds stays alive only while the field (or some
+// other owner) holds a reference to it. Once the field releases on overwrite
+// and on disposal, every place that keeps a payload past that point must hold
+// its own reference. This scan admits a field only when every access to it in
+// the module is one of the shapes below. Each shape is one where codegen takes
+// that reference or the value is never kept:
+//
+//   WRITES
+//   - `<field> := v` (an AssignmentStmt with operator `:=`).
+//     lowerValueLikeChoiceFieldStore retains v and releases the old value.
+//   - The field's own declaration initializer. emitOwnFieldInit retains the
+//     value into the zeroed slot.
+//   READS
+//   - `var x := <field>;` / `const x := <field>;`. The read retains the whole
+//     value (valueLikeChoiceFieldBindReads_). The local releases it if the
+//     #2115 walk arms it; otherwise it leaks, never dangles.
+//   - `<owned field> := <field>` and an owned field's initializer. The store
+//     retains. This is an edge: the read is admitted only while the target
+//     field is admitted too, so the admitted set is a greatest fixpoint.
+//   - `case <field> of` as a statement whose pattern bindings never leave
+//     their arm (StringEscapeWalker::armsBindingsSafe). lowerCaseStmt retains
+//     the value an arm binds from for the rest of the case. This covers an arm
+//     that overwrites the field, or disposes its owner, while a binding is
+//     still live.
+//   - `case <field> of` as an expression none of whose arms binds anything.
+//     Nothing borrowed from the value outlives the tag test.
+//
+// Everything else declines the field: a call argument, a return, a capture,
+// a comparison, a `ref`/`out` argument, any access inside a lambda, `async`
+// or iterator body, or a `bind` clause. So does any node kind the traversal
+// does not recognize. A declined field keeps the pre-existing behaviour
+// (nothing releases the payload: a leak, never a use-after-free). The
+// traversal mirrors collectRecordFieldWriteSites below and fails closed the
+// same way.
+//
+// CANDIDATES are fields of a class compiled in this module that is not
+// generic, has no primary constructor and is not serialized; the field is a
+// non-static body field of a non-nullable value-like choice type with a
+// `string` payload somewhere. A public or protected field of a public class is
+// excluded, because another module could read or write it and this scan
+// cannot see that module.
+void Emitter::collectValueLikeChoiceFieldOwners() {
+    if (valueLikeChoiceFieldScanDone_) return;
+    valueLikeChoiceFieldScanDone_ = true;
+
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+        if (!td || ctx_.isImported(ts)) continue;
+        if (!td->genericParams.empty() || td->hasPositionalFields ||
+            td->serializedClass)
+            continue;
+        for (const sema::Symbol* m : ts->members) {
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+            if (!fs || isStaticField(fs) || fs->posParam) continue;
+            if (fs->parent != ts) continue;
+            if (!dynamic_cast<const ast::FieldDecl*>(fs->decl)) continue;
+            if (ts->visibility == ast::Visibility::Public &&
+                (fs->visibility == ast::Visibility::Public ||
+                 fs->visibility == ast::Visibility::Protected))
+                continue;
+            const sema::TypeRef* rt = resolveTypeParamRef(recordMemberType(fs));
+            if (!rt || rt->nullable || rt->kind != sema::TypeRef::Kind::Named ||
+                !rt->declaration ||
+                rt->declaration->kind != ast::TypeDeclKind::Choice)
+                continue;
+            auto verdict = common::classifyChoiceType(rt, ctx_);
+            if (!verdict || *verdict != common::ChoiceClassification::ValueLike)
+                continue;
+            // Never a slot the #4253 record-field release also walks.
+            if (isRecordWithStringFieldsTypeRef(rt)) continue;
+            bool anyString = false;
+            for (const sema::ChoiceCaseSymbol* cc :
+                 choiceCasesOf(rt->declaration)) {
+                if (!cc || !cc->caseDecl) continue;
+                for (const ast::Param& pf : cc->caseDecl->payload) {
+                    const sema::TypeRef* ft = common::substitutedChoicePayloadType(
+                        pf, rt->declaration, rt, ctx_);
+                    if (ft && ft->kind == sema::TypeRef::Kind::Primitive &&
+                        ft->primitive == sema::PrimitiveType::String)
+                        anyString = true;
+                }
+            }
+            if (anyString) valueLikeChoiceFieldCandidates_.insert(fs);
+        }
+    }
+    if (valueLikeChoiceFieldCandidates_.empty()) return;
+
+    std::unordered_set<const sema::Symbol*> declined;
+    // (read field, target field): the read is admitted only while the target is.
+    std::vector<std::pair<const sema::Symbol*, const sema::Symbol*>> edges;
+    std::unordered_map<const ast::Expr*, const sema::Symbol*> bindReads;
+    bool incomplete = false;
+
+    auto candidateOf = [&](const ast::Expr* e) -> const sema::Symbol* {
+        if (!e) return nullptr;
+        if (!dynamic_cast<const ast::IdentifierExpr*>(e) &&
+            !dynamic_cast<const ast::MemberAccessExpr*>(e))
+            return nullptr;
+        auto* fs = dynamic_cast<const sema::FieldSymbol*>(ctx_.exprSymbol(*e));
+        return fs && valueLikeChoiceFieldCandidates_.count(fs) ? fs : nullptr;
+    };
+
+    enum class Use { Other, BindInit, StoreRhs, CaseScrut };
+    // A body where the shapes above do not hold (lambda, async, iterator,
+    // `bind` clause): every access declines.
+    bool unsupported = false;
+    // Candidates accessed in the member being walked (declined afterwards if
+    // the member turns out to be an iterator).
+    std::vector<const sema::Symbol*> touched;
+    bool sawYield = false;
+
+    std::function<void(const ast::Expr*, Use, const sema::Symbol*)> walkExpr;
+    std::function<void(const ast::Stmt*)> walkStmt;
+    // While true, every candidate the visited subtree names is WRITTEN in an
+    // unrecognized way (a `ref`/`out` argument, a non-`:=` assignment, a
+    // nested write target).
+    bool inWriteTarget = false;
+    auto noteWrite = [&](const ast::Expr* e) {
+        if (!e) return;
+        const bool saved = inWriteTarget;
+        inWriteTarget = true;
+        walkExpr(e, Use::Other, nullptr);
+        inWriteTarget = saved;
+    };
+    auto walkArgs = [&](const std::vector<ast::CallArgument>& args) {
+        for (const ast::CallArgument& a : args) {
+            if (!a.value) continue;
+            if (a.modifier == "ref" || a.modifier.rfind("out", 0) == 0)
+                noteWrite(a.value.get());
+            walkExpr(a.value.get(), Use::Other, nullptr);
+        }
+    };
+    auto walkArms = [&](const std::vector<ast::CaseArm>& arms) {
+        for (const ast::CaseArm& arm : arms) {
+            walkExpr(arm.guard.get(), Use::Other, nullptr);
+            walkExpr(arm.exprBody.get(), Use::Other, nullptr);
+            for (const auto& s : arm.stmts) walkStmt(s.get());
+        }
+    };
+
+    walkExpr = [&](const ast::Expr* e, Use use, const sema::Symbol* storeTo) {
+        if (!e) return;
+        if (inWriteTarget) {
+            if (auto* w = dynamic_cast<const sema::FieldSymbol*>(
+                    ctx_.exprSymbol(*e));
+                w && valueLikeChoiceFieldCandidates_.count(w))
+                declined.insert(w);
+        } else if (const sema::Symbol* f = candidateOf(e)) {
+            touched.push_back(f);
+            if (unsupported) {
+                declined.insert(f);
+            } else {
+                switch (use) {
+                case Use::BindInit: bindReads[e] = f; break;
+                case Use::StoreRhs: edges.emplace_back(f, storeTo); break;
+                case Use::CaseScrut: break;
+                case Use::Other: declined.insert(f); break;
+                }
+            }
+        }
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::FloatLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::CharLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::StringLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::VerbatimStringExpr*>(e)) return;
+        if (dynamic_cast<const ast::BoolLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(e)) return;
+        if (dynamic_cast<const ast::IdentifierExpr*>(e)) return;
+        if (dynamic_cast<const ast::TypeOfExpr*>(e)) return;
+        if (dynamic_cast<const ast::NameOfExpr*>(e)) return;
+        if (dynamic_cast<const ast::DefaultExpr*>(e)) return;
+        if (dynamic_cast<const ast::UnitExpr*>(e)) return;
+        if (dynamic_cast<const ast::MarkedTransferExpr*>(e)) return;
+        const Use o = Use::Other;
+        if (auto* si = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (const auto& part : si->parts) walkExpr(part.expr.get(), o, nullptr);
+            return; }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            walkExpr(ma->target.get(), o, nullptr); return; }
+        if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+            walkExpr(nm->target.get(), o, nullptr); return; }
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+            walkExpr(ce->callee.get(), o, nullptr); walkArgs(ce->args); return; }
+        if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            walkExpr(nc->callee.get(), o, nullptr); walkArgs(nc->args); return; }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            walkExpr(ix->target.get(), o, nullptr); walkArgs(ix->indices); return; }
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            walkExpr(pb->operand.get(), o, nullptr); return; }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+            walkArgs(ne->args); return; }
+        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            walkExpr(be->left.get(), o, nullptr);
+            walkExpr(be->right.get(), o, nullptr); return; }
+        if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            walkExpr(ue->operand.get(), o, nullptr); return; }
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            walkExpr(tt->operand.get(), o, nullptr); return; }
+        if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            walkExpr(co->condition.get(), o, nullptr);
+            walkExpr(co->thenValue.get(), o, nullptr);
+            walkExpr(co->elseValue.get(), o, nullptr); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            walkExpr(th->operand.get(), o, nullptr); return; }
+        if (auto* rg = dynamic_cast<const ast::RangeExpr*>(e)) {
+            walkExpr(rg->lo.get(), o, nullptr); walkExpr(rg->hi.get(), o, nullptr);
+            walkExpr(rg->step.get(), o, nullptr); return; }
+        if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+            walkExpr(we->source.get(), o, nullptr);
+            for (const auto& a : we->assigns) walkExpr(a.value.get(), o, nullptr);
+            return; }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (const auto& el : cl->elements) walkExpr(el.get(), o, nullptr);
+            for (const auto& k : cl->keys) walkExpr(k.get(), o, nullptr);
+            return; }
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            const bool saved = unsupported;
+            unsupported = true;
+            walkExpr(lam->exprBody.get(), o, nullptr);
+            for (const auto& s : lam->stmts) walkStmt(s.get());
+            for (const ast::Param& p : lam->params)
+                walkExpr(p.defaultValue.get(), o, nullptr);
+            unsupported = saved;
+            return; }
+        if (auto* cx = dynamic_cast<const ast::CaseExpr*>(e)) {
+            bool binds = false;
+            for (const ast::CaseArm& arm : cx->arms)
+                if (patternBindsAnySlot(arm.pattern.get())) binds = true;
+            walkExpr(cx->scrutinee.get(), binds ? o : Use::CaseScrut, nullptr);
+            walkArms(cx->arms);
+            return; }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            const bool saved = unsupported;
+            unsupported = true;
+            for (const auto& c : bx->clauses) walkStmt(c.get());
+            walkExpr(bx->body.get(), o, nullptr);
+            unsupported = saved;
+            return; }
+        incomplete = true;
+    };
+
+    walkStmt = [&](const ast::Stmt* s) {
+        if (!s) return;
+        const Use o = Use::Other;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            const bool plain = !ld->isUsing && !ld->isBindAtomClause;
+            walkExpr(ld->initializer.get(), plain ? Use::BindInit : o, nullptr);
+            return; }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            walkExpr(lc->value.get(), Use::BindInit, nullptr); return; }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            const sema::Symbol* tf =
+                as->op == ":=" ? candidateOf(as->target.get()) : nullptr;
+            if (tf) {
+                // The recognized write: walk only the receiver.
+                touched.push_back(tf);
+                if (unsupported) declined.insert(tf);
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        as->target.get()))
+                    walkExpr(ma->target.get(), o, nullptr);
+                walkExpr(as->value.get(), Use::StoreRhs, tf);
+            } else {
+                noteWrite(as->target.get());
+                walkExpr(as->value.get(), o, nullptr);
+            }
+            return; }
+        if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            noteWrite(is->target.get()); return; }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            walkExpr(rs->value.get(), o, nullptr); return; }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            walkExpr(es->expr.get(), o, nullptr); return; }
+        if (auto* th = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            walkExpr(th->value.get(), o, nullptr); return; }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            walkExpr(ds->value.get(), o, nullptr); return; }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            sawYield = true;
+            walkExpr(ys->value.get(), o, nullptr); return; }
+        if (dynamic_cast<const ast::BreakStmt*>(s)) return;
+        if (dynamic_cast<const ast::ContinueStmt*>(s)) return;
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+            walkExpr(ifs->ifBranch.condition.get(), o, nullptr);
+            for (const auto& b : ifs->ifBranch.body) walkStmt(b.get());
+            for (const auto& br : ifs->elifBranches) {
+                walkExpr(br.condition.get(), o, nullptr);
+                for (const auto& b : br.body) walkStmt(b.get());
+            }
+            for (const auto& b : ifs->elseBody) walkStmt(b.get());
+            return; }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            walkExpr(ws->condition.get(), o, nullptr);
+            for (const auto& b : ws->body) walkStmt(b.get()); return; }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            walkExpr(fs->iterable.get(), o, nullptr);
+            walkExpr(fs->withExpr.get(), o, nullptr);
+            for (const auto& b : fs->body) walkStmt(b.get()); return; }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (const auto& b : db->body) walkStmt(b.get()); return; }
+        if (auto* tr = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (const auto& b : tr->body) walkStmt(b.get());
+            for (const ast::CatchArm& c : tr->catches) {
+                walkExpr(c.guard.get(), o, nullptr);
+                walkStmt(c.body.get());
+            }
+            for (const auto& b : tr->finallyBody) walkStmt(b.get());
+            return; }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            bool safe = false;
+            if (cs->scrutinee && candidateOf(cs->scrutinee.get())) {
+                StringEscapeWalker w{ctx_, nullptr};
+                safe = w.armsBindingsSafe(cs->arms);
+            }
+            walkExpr(cs->scrutinee.get(), safe ? Use::CaseScrut : o, nullptr);
+            walkArms(cs->arms);
+            return; }
+        incomplete = true;
+    };
+
+    // One member body: an `async` method, a destructor, or an iterator (a
+    // body with a `yield`) declines every candidate it accesses.
+    auto walkBody = [&](bool unsupportedBody,
+                        const std::function<void()>& walk) {
+        touched.clear();
+        sawYield = false;
+        const bool saved = unsupported;
+        if (unsupportedBody) unsupported = true;
+        walk();
+        unsupported = saved;
+        if (sawYield)
+            for (const sema::Symbol* f : touched) declined.insert(f);
+        touched.clear();
+    };
+    auto hasModifier = [](const std::vector<std::string_view>& mods,
+                          std::string_view m) {
+        for (auto x : mods)
+            if (x == m) return true;
+        return false;
+    };
+
+    std::function<void(const ast::Member*)> walkMember;
+    walkMember = [&](const ast::Member* mem) {
+        if (!mem) return;
+        const Use o = Use::Other;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(mem)) {
+            // The declaration initializer is a store into this field.
+            const sema::Symbol* self = nullptr;
+            for (const sema::Symbol* c : valueLikeChoiceFieldCandidates_)
+                if (c->decl == fd) { self = c; break; }
+            walkBody(false, [&] {
+                walkExpr(fd->initializer.get(), self ? Use::StoreRhs : o, self);
+            });
+            return; }
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(mem)) {
+            walkBody(false, [&] {
+                walkExpr(pd->autoInitializer.get(), o, nullptr);
+                walkExpr(pd->exprBody.get(), o, nullptr);
+                for (const ast::PropertyAccessor& acc : pd->accessors) {
+                    walkExpr(acc.exprBody.get(), o, nullptr);
+                    for (const auto& s : acc.stmts) walkStmt(s.get());
+                }
+            });
+            return; }
+        if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem)) {
+            walkBody(hasModifier(md->modifiers, "async"), [&] {
+                walkExpr(md->exprBody.get(), o, nullptr);
+                for (const auto& s : md->stmts) walkStmt(s.get());
+                for (const ast::Param& p : md->params)
+                    walkExpr(p.defaultValue.get(), o, nullptr);
+            });
+            return; }
+        if (auto* od = dynamic_cast<const ast::OperatorDecl*>(mem)) {
+            walkBody(false, [&] {
+                walkExpr(od->exprBody.get(), o, nullptr);
+                for (const auto& s : od->stmts) walkStmt(s.get());
+            });
+            return; }
+        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(mem)) {
+            walkBody(false, [&] {
+                for (const auto& s : cd->body) walkStmt(s.get());
+                for (const ast::Param& p : cd->params)
+                    walkExpr(p.defaultValue.get(), o, nullptr);
+            });
+            return; }
+        // A destructor body is lowered with no dispose-stack registration
+        // (emittingDisposerBody_), so neither a bind-read local nor a case
+        // pin can be released there: every access declines.
+        if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(mem)) {
+            walkBody(/*unsupported=*/true, [&] {
+                for (const auto& s : dd->body) walkStmt(s.get());
+            });
+            return; }
+        if (dynamic_cast<const ast::InvariantDecl*>(mem)) return;
+        if (dynamic_cast<const ast::EventDecl*>(mem)) return;
+        if (auto* kd = dynamic_cast<const ast::ConstDecl*>(mem)) {
+            walkBody(false, [&] { walkExpr(kd->value.get(), o, nullptr); });
+            return; }
+        if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(mem)) {
+            if (nt->decl)
+                for (const auto& sub : nt->decl->members) walkMember(sub.get());
+            return; }
+        incomplete = true;
+    };
+
+    for (const auto& sym : ctx_.symbols()) {
+        const ast::Node* d = sym ? sym->decl : nullptr;
+        if (!d) continue;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(d)) {
+            for (const auto& mem : td->members) walkMember(mem.get());
+        } else if (auto* xd = dynamic_cast<const ast::ExtensionDecl*>(d)) {
+            for (const auto& mem : xd->members) walkMember(mem.get());
+        } else if (auto* mem = dynamic_cast<const ast::Member*>(d)) {
+            walkMember(mem);
+        }
+    }
+    if (incomplete) return;  // fail closed: no field is admitted
+
+    // Greatest fixpoint: drop a field whose value is stored into one that is
+    // not (or no longer) admitted.
+    std::unordered_set<const sema::Symbol*> admitted;
+    for (const sema::Symbol* c : valueLikeChoiceFieldCandidates_)
+        if (!declined.count(c)) admitted.insert(c);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto& [from, to] : edges) {
+            if (admitted.count(from) && !admitted.count(to)) {
+                admitted.erase(from);
+                changed = true;
+            }
+        }
+    }
+    valueLikeChoiceFieldOwners_ = std::move(admitted);
+    for (const auto& [e, f] : bindReads)
+        if (valueLikeChoiceFieldOwners_.count(f))
+            valueLikeChoiceFieldBindReads_[e] = f;
 }
 
 

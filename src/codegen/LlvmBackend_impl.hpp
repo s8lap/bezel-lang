@@ -19163,6 +19163,39 @@ private:
     bool retainValueLikeChoiceConstructionBorrows(const ast::Expr* e,
                                                   llvm::Value* nv,
                                                   const sema::TypeRef* rt);
+    // fix #6170 step 3 (§28.9 / §35.4 / §13.2, v0.338): a class FIELD of a
+    // value-like choice type with a string payload is an OWNER of its value's
+    // strings: every store retains the new value and releases the old one, and
+    // the class disposer releases the value the field holds. That is sound only
+    // if every read of the field takes its own reference or is pinned while
+    // anything borrowed from it is live, so a field is admitted only when a
+    // module-wide scan finds every read and write of it in a recognized
+    // position (see collectValueLikeChoiceFieldOwners). Other fields keep the
+    // pre-existing behaviour, which leaks the payload.
+    void collectValueLikeChoiceFieldOwners();
+    bool valueLikeChoiceFieldScanDone_ = false;
+    // The candidates (type and declaration shape only) and the admitted ones.
+    std::unordered_set<const sema::Symbol*> valueLikeChoiceFieldCandidates_;
+    std::unordered_set<const sema::Symbol*> valueLikeChoiceFieldOwners_;
+    // `var x := <field read>;` / `const x := <field read>;` initializer nodes:
+    // the read retains the whole value, so the local holds its own reference.
+    std::unordered_map<const ast::Expr*, const sema::Symbol*>
+        valueLikeChoiceFieldBindReads_;
+    // The candidate field `e` reads (bare name or member access), or null.
+    const sema::Symbol* valueLikeChoiceFieldCandidateOf(const ast::Expr* e);
+    // The field's instantiated choice TypeRef if `m` is admitted, else null.
+    const sema::TypeRef* valueLikeChoiceFieldOwnerType(const sema::Symbol* m);
+    // `e` is a read of an admitted field: its choice TypeRef, else null.
+    const sema::TypeRef* valueLikeChoiceFieldOwnerRead(const ast::Expr* e);
+    // Give the freshly lowered value `nv` of `e` its own references: only the
+    // borrowed string args of a positional construction, else the whole value.
+    void retainValueLikeChoiceValue(const ast::Expr* e, llvm::Value* nv,
+                                    const sema::TypeRef* rt);
+    // The store into an admitted field: retain new, release old, store.
+    bool lowerValueLikeChoiceFieldStore(const ast::Expr& target,
+                                        llvm::Value* fieldAddr,
+                                        llvm::Value* newVal,
+                                        const ast::Expr* valueExpr);
 
     // #429 (closure RETURN category) / §28.9 / §28.3: true when `init` is a
     // call to a user-defined, locally-compiled method whose declared return type
