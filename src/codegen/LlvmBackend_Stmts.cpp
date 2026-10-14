@@ -1634,8 +1634,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // slot's leading bytes (garbage read back as the record's fields). A
             // no-op for every RHS that is not the receiver pointer, and for a
             // slot whose type is not exactly the receiver record's struct.
-            if (as->op == ":=")
+            if (as->op == ":=") {
                 rhs = coerceThisRecordValue(rhs, elemTy);
+                // fix #6317 (§9.1/§7.2, v0.338): a `record?` / `choice?` slot
+                // is the tagged `{i8, T}`; `this` loads to the bare payload.
+                rhs = coerceThisRecordValue(rhs, slotPayloadTy(elemTy));
+            }
             // §8.6: a value-typed RHS assigned to an Object/interface lvalue is
             // boxed (so a later is/as/dispatch on the target sees a box). Keyed
             // off the target's static type; a no-op for reference RHS (#399).

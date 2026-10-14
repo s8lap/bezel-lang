@@ -2688,6 +2688,19 @@ llvm::Value* Emitter::coerceThisRecordValue(llvm::Value* v,
 }
 
 
+// fix #6317 (§9.1 / §35.1, v0.338): `v` is the current record/choice receiver
+// pointer -> the receiver's struct value (a copy), else `v` unchanged.
+llvm::Value* Emitter::loadThisValueIfRecv(llvm::Value* v) {
+    if (!v || v != currentThis_) return v;
+    const sema::TypeSymbol* rec = currentReceiverRecordType();
+    if (!rec) return v;
+    llvm::StructType* st = rec->kind == ast::TypeDeclKind::Choice
+                               ? choiceStruct(rec)
+                               : recordStruct(rec);
+    return coerceThisRecordValue(v, st);
+}
+
+
 // issue #460 / #462 / §14.1: install the type-parameter substitution for a
 // concrete generic-record instantiation (`Box<string>`), so a subsequent
 // recordStruct specializes the field layout, and recordMemberTypeResolved maps

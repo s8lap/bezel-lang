@@ -6348,6 +6348,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             call.args.size() == 1 && call.args[0].value) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
+            // fix #6317 (§9.1/§35.1, v0.338): a record/choice `this` is the
+            // receiver's ADDRESS; the element slot stores the VALUE.
+            v = loadThisValueIfRecv(v);
             // fix #5201 (§5.1, v0.313): the slot's allocated type must equal
             // the element's LLVM type so the runtime memcpy of `esz` bytes
             // reads exactly the slot's bytes. `lowerExpr` returns the source
