@@ -8901,6 +8901,32 @@ void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
 // readonly auto-property slipped through (an ACCEPT_TRAP). A local variable
 // that shadows the property resolves to a LocalSymbol, so the dynamic_cast
 // below leaves it untouched.
+// §A.6 `LValue` (v0.338, #6071): see the declaration in ExprTypecheck_impl.hpp.
+// The walk follows only the `.`/`[ ]` spine a LValue may have; the first
+// null-conditional member node on it is the reported position.
+void ExprTC::checkLValueChainShape(const ast::Expr& target,
+                                   const SourceLocation& loc,
+                                   const char* incOp) {
+    const ast::Expr* cur = &target;
+    while (cur) {
+        if (dynamic_cast<const ast::NullCondMemberExpr*>(cur)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("`?.` cannot appear in an assignment target") +
+                (incOp ? std::string(" of `") + incOp + "`" : std::string()) +
+                ": an LValue is an identifier or `this` extended by `.name` "
+                "and `[index]` only (\xC2\xA7""A.6 LValue, \xC2\xA7""7.5)");
+            return;
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(cur))
+            cur = ma->target.get();
+        else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(cur))
+            cur = ix->target.get();
+        else
+            return;
+    }
+}
+
 void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
                                       const SourceLocation& loc,
                                       const char* incOp) {
@@ -23206,9 +23232,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // of a third hand-maintained mirror of it (§17.6: "Read-only
             // locations cannot be incremented"). Passing `nullptr` for
             // `incOp` keeps every diagnostic here byte-identical.
-            if (as->target)
+            if (as->target) {
+                checkLValueChainShape(*as->target, as->span.begin,
+                                      /*incOp=*/nullptr);
                 checkPropertyWriteTarget(*as->target, as->span.begin,
                                          /*incOp=*/nullptr);
+            }
             // Slice S7: readonly field assignment outside a ctor.
             checkReadonlyAssignment(*as);
             // Slice T2: plain `:=` assignment must be primitive-
@@ -24500,10 +24529,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // #2309 branch above keeps its own distinct record diagnostic (its
         // target resolves to a FieldSymbol, so `ps` is null here and the two
         // can never both fire).
-        if (is->target)
+        if (is->target) {
+            checkLValueChainShape(
+                *is->target, is->target->span.begin,
+                /*incOp=*/(is->op == "--" ? "--" : "++"));
             checkPropertyWriteTarget(
                 *is->target, is->target->span.begin,
                 /*incOp=*/(is->op == "--" ? "--" : "++"));
+        }
         // fix #4290 (§17.6/§22.8, v0.298): the FIELD sibling of the
         // `checkPropertyWriteTarget` call directly above — that call's
         // `dynamic_cast<PropertySymbol*>` fails for a plain

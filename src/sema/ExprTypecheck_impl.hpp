@@ -2440,6 +2440,15 @@ private:
                                   const SourceLocation& loc,
                                   const char* incOp);
 
+    // §A.6 `LValue` (v0.338, #6071): an assignment, compound-assignment or
+    // `++`/`--` target is `Identifier` or `this` extended only by `.Identifier`
+    // and `[ArgList]`; the null-conditional `?.` is not in the production, so
+    // a `?.` hop anywhere along the target's chain is a compile error.
+    // `incOp` is null for an assignment target, else "++"/"--".
+    void checkLValueChainShape(const ast::Expr& target,
+                               const SourceLocation& loc,
+                               const char* incOp);
+
     // §22.3 "ref and out argument locations" (v0.184, #1682): validates a
     // bare `ref`/`out` call argument's operand against the section's
     // assignable-storage-location categories — a mutable local variable, a
