@@ -18963,7 +18963,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(
         // parameter `I<A>` does not pin). When exactly one generic
         // implementer can hold such an instantiation the default runs that
         // class's own body (see `ifaceOpenFamilies`); otherwise the default
-        // traps with a message rather than running another class's body.
+        // keeps the older shape's last-implementer choice (below).
         const std::vector<std::string_view> ifNames =
             sema::genericParamNames(staticType);
         if (ifNames.size() == ifaceArgs->size()) {
@@ -19360,12 +19360,35 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(
     // instantiation the scan named, has its own branch; the later-module
     // guard is off). It runs that class's own implementation, compiled under
     // the call's environment as the dispatch always compiled its default;
-    // two or more such classes cannot be told apart and trap.
+    // Two or more such classes cannot be told apart. The default then keeps
+    // the older shape's choice, the LAST implementer in scan order: right
+    // whenever the receiver is an instance of that class. Trapping there
+    // would abort programs that ran correctly before this fix (review of
+    // 6c4da456: two open families with only the last-declared one built).
+    // Reaching the right body for every receiver needs per-call-site
+    // dispatchers filled in at module end (residual of narrow #6307).
     sema::MethodSymbol* trapShapeImpl = nullptr;
     if (ifaceTrapDefault && !descGuard && ifaceOpenFamilies.size() == 1) {
         if (sema::MethodSymbol* fam = mostDerived(ifaceOpenFamilies[0])) {
             defaultImpl = fam;
             defaultGeneric = true;
+            ifaceTrapDefault = false;
+        }
+    }
+    if (ifaceTrapDefault && !descGuard) {
+        const sema::TypeSymbol* lastCls = nullptr;
+        sema::MethodSymbol* lastImpl = nullptr;
+        for (const sema::TypeSymbol* c : candidateClasses) {
+            if (!implementsIface(c, staticType)) continue;
+            if (!descArray_.count(c)) continue;
+            if (sema::MethodSymbol* impl = mostDerived(c)) {
+                lastCls = c;
+                lastImpl = impl;
+            }
+        }
+        if (lastImpl) {
+            defaultImpl = lastImpl;
+            defaultGeneric = !lastCls->genericParams.empty();
             ifaceTrapDefault = false;
         }
     }

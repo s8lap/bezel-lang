@@ -383,3 +383,44 @@ BEZEL_TEST(codegen_iface_generic_dispatch_6307, open_generic_family_beside_non_g
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(r.stdoutText == "1\n");
 }
+
+// Review of 6c4da456 (s01): two generic families `B1<S,T>`, `B2<S,T>` built only
+// inside `F<X>.Make` at a parameter `I<int>` does not pin, and only the LAST-declared
+// family is built at runtime. The dispatch cannot enumerate either instantiation;
+// its default keeps the older shape's last-implementer choice, which is `B2`'s body
+// here. 6c4da456 aborted ("...could not enumerate (#6307)", rc 134) on this program,
+// which printed "2\n2\n" before #6307.
+BEZEL_TEST(codegen_iface_generic_dispatch_6307, two_open_families_last_built_12_1_v0338) {
+    auto r = runAot(
+        "module M; "
+        "interface I<T> method Q<U>(e: U, t: T): int; end I; "
+        "class B1<S,T>: I<T> public constructor() end constructor; public method Q<U>(e: U, t: T): int => 1; end B1; "
+        "class B2<S,T>: I<T> public constructor() end constructor; public method Q<U>(e: U, t: T): int => 2; end B2; "
+        "class F<X> public constructor() end constructor; public method Make(k: int): owned I<int> "
+        " if k = 0 then return new B1<X,int>(); end if; return new B2<X,int>(); end Make; end F; "
+        "class P public static method Main(): int var f := new F<bool>(); "
+        " using var a := f.Make(1); using var b := f.Make(1); "
+        " Console.WriteLine(a.Q<string>(\"x\", 1)); Console.WriteLine(b.Q<string>(\"x\", 1)); return 0; end Main; end P; ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "2\n2\n");
+}
+
+// Review of 6c4da456 (s03): the same shape with the instantiations built in
+// `G<Z>.Mk` / `G<Z>.Mk1` at the caller's own parameter, only `Mk` (the last-declared
+// family `B2`) used. "2\n" before #6307; 6c4da456 aborted.
+BEZEL_TEST(codegen_iface_generic_dispatch_6307, two_open_families_generic_factory_12_1_v0338) {
+    auto r = runAot(
+        "module M; "
+        "interface I<T> method Q<U>(e: U, t: T): int; end I; "
+        "class B1<S,T>: I<T> public constructor() end constructor; public method Q<U>(e: U, t: T): int => 1; end B1; "
+        "class B2<S,T>: I<T> public constructor() end constructor; public method Q<U>(e: U, t: T): int => 2; end B2; "
+        "class G<Z> public constructor() end constructor; public method Mk(): owned I<Z> return new B2<bool,Z>(); end Mk; "
+        " public method Mk1(): owned I<Z> return new B1<bool,Z>(); end Mk1; end G; "
+        "class P public static method Main(): int var g := new G<int>(); "
+        " using var a := g.Mk(); "
+        " Console.WriteLine(a.Q<string>(\"x\", 1)); return 0; end Main; end P; ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.exitCode == 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText == "2\n");
+}
