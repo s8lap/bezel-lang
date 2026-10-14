@@ -13151,7 +13151,12 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                    // §6.5 / §24 (#1646): owned EventSource<T>/AsyncEventSource<T>
                    // field (user-constructed) also needs freeing if the ctor body
                    // throws after it was assigned.
-                   isOwnedEventSourceField(fs))) {
+                   isOwnedEventSourceField(fs) ||
+                   // fix #6170 step 3 (§22.9 / §28.9 / §35.4, v0.338): a
+                   // value-like choice field that owns its strings
+                   // (collectValueLikeChoiceFieldOwners) holds references a
+                   // body store took; emitOwnedFieldDisposals releases them.
+                   valueLikeChoiceFieldOwnerType(fs))) {
             hasOwnedToClean = true;
             break;
         }
@@ -34678,6 +34683,72 @@ void Emitter::collectClosureReleaseEligible(
 }
 
 
+// fix #6170 step 2/3 (§28.9 / §35.4, v0.338): see the declaration. The
+// #2115 choice walk (stringReleaseMode off, scrutineeBorrowMode on) run to its
+// greatest fixpoint over the owner set, hoisted out of
+// collectStringReleaseEligible so the field-owner scan computes the very same
+// armed set.
+std::unordered_set<const void*> Emitter::valueLikeChoiceOwnerFixpoint(
+        const std::vector<const ast::Node*>& cands,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::unordered_set<const void*> owners;
+    for (const ast::Node* ld : cands)
+        owners.insert(static_cast<const void*>(ld));
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const ast::Node* ld : cands) {
+            if (!owners.count(static_cast<const void*>(ld))) continue;
+            StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+            // stringReleaseMode stays false (see collectStringReleaseEligible).
+            w.scrutineeBorrowMode = true;  // fix #2450
+            w.choiceOwnerAliases = &owners;  // fix #6170 step 2
+            for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+            if (w.escaped) {
+                owners.erase(static_cast<const void*>(ld));
+                changed = true;
+            }
+        }
+    }
+    return owners;
+}
+
+// fix #6170 step 3 (§28.9 / §35.4, v0.338): see the declaration. The
+// candidate rule and the nested-block recursion mirror
+// collectStringReleaseEligible's scan (a +1 string producer is never a choice
+// candidate there, so it is skipped first here too).
+std::unordered_set<const void*> Emitter::valueLikeChoiceOwnersOfBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::vector<const ast::Node*> cands;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        LocalDeclInitView v = localDeclInitView(s);
+        if (v.init && !v.isUsing && !isPlusOneStringProducer(v.init) &&
+            valueLikeChoiceLocalMintsStringPayload(s))
+            cands.push_back(s);
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+    return valueLikeChoiceOwnerFixpoint(cands, body);
+}
+
 void Emitter::collectStringReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     stringReleaseEligible_.clear();
@@ -34866,24 +34937,8 @@ void Emitter::collectStringReleaseEligible(
     // greatest fixpoint: start from every candidate and drop escaping ones
     // until nothing changes. On the final set every relaxation a walk used
     // names a local that is still armed, i.e. one that really retains.
-    std::unordered_set<const void*> choiceOwners;
-    for (const ast::Node* ld : valueLikeChoiceCandidates)
-        choiceOwners.insert(static_cast<const void*>(ld));
-    for (bool changed = true; changed;) {
-        changed = false;
-        for (const ast::Node* ld : valueLikeChoiceCandidates) {
-            if (!choiceOwners.count(static_cast<const void*>(ld))) continue;
-            StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
-            // stringReleaseMode stays false — see the rationale above.
-            w.scrutineeBorrowMode = true;  // fix #2450
-            w.choiceOwnerAliases = &choiceOwners;  // fix #6170 step 2
-            for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
-            if (w.escaped) {
-                choiceOwners.erase(static_cast<const void*>(ld));
-                changed = true;
-            }
-        }
-    }
+    std::unordered_set<const void*> choiceOwners =
+        valueLikeChoiceOwnerFixpoint(valueLikeChoiceCandidates, body);
     for (const void* ld : choiceOwners)
         valueLikeChoiceStrReleaseEligible_.insert(ld);
     // fix #6170 (§28.9 / §35.3 / §35.4, v0.338): the choice walk above now runs
@@ -42509,8 +42564,9 @@ void Emitter::collectBoxStorageFields() {
 //     value into the zeroed slot.
 //   READS
 //   - `var x := <field>;` / `const x := <field>;`. The read retains the whole
-//     value (valueLikeChoiceFieldBindReads_). The local releases it if the
-//     #2115 walk arms it; otherwise it leaks, never dangles.
+//     value (valueLikeChoiceFieldBindReads_), and the local's #2115 scope-end
+//     release returns it. Admitted only when the #2115 walk arms the local
+//     (see the fixpoint at the end).
 //   - `<owned field> := <field>` and an owned field's initializer. The store
 //     retains. This is an edge: the read is admitted only while the target
 //     field is admitted too, so the admitted set is a greatest fixpoint.
@@ -42588,6 +42644,19 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
     // (read field, target field): the read is admitted only while the target is.
     std::vector<std::pair<const sema::Symbol*, const sema::Symbol*>> edges;
     std::unordered_map<const ast::Expr*, const sema::Symbol*> bindReads;
+    // fix #6170 step 3: where each bind read binds. The read's retain is
+    // returned only by the bound local's #2115 scope-end release, so a field
+    // is admitted only while every local bound from it is armed (checked
+    // after the walk, below). curBody / curBindDecl are the member body and
+    // the declaration being walked.
+    struct BindSite {
+        const sema::Symbol* field;
+        const ast::Node* decl;
+        const std::vector<std::unique_ptr<ast::Stmt>>* body;
+    };
+    std::vector<BindSite> bindSites;
+    const std::vector<std::unique_ptr<ast::Stmt>>* curBody = nullptr;
+    const ast::Node* curBindDecl = nullptr;
     bool incomplete = false;
 
     auto candidateOf = [&](const ast::Expr* e) -> const sema::Symbol* {
@@ -42650,7 +42719,13 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
                 declined.insert(f);
             } else {
                 switch (use) {
-                case Use::BindInit: bindReads[e] = f; break;
+                case Use::BindInit:
+                    bindReads[e] = f;
+                    if (curBody && curBindDecl)
+                        bindSites.push_back({f, curBindDecl, curBody});
+                    else
+                        declined.insert(f);
+                    break;
                 case Use::StoreRhs: edges.emplace_back(f, storeTo); break;
                 case Use::CaseScrut: break;
                 case Use::Other: declined.insert(f); break;
@@ -42743,10 +42818,15 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
         const Use o = Use::Other;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
             const bool plain = !ld->isUsing && !ld->isBindAtomClause;
+            curBindDecl = ld;
             walkExpr(ld->initializer.get(), plain ? Use::BindInit : o, nullptr);
+            curBindDecl = nullptr;
             return; }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
-            walkExpr(lc->value.get(), Use::BindInit, nullptr); return; }
+            curBindDecl = lc;
+            walkExpr(lc->value.get(), Use::BindInit, nullptr);
+            curBindDecl = nullptr;
+            return; }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
             const sema::Symbol* tf =
                 as->op == ":=" ? candidateOf(as->target.get()) : nullptr;
@@ -42856,14 +42936,18 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
                 walkExpr(pd->exprBody.get(), o, nullptr);
                 for (const ast::PropertyAccessor& acc : pd->accessors) {
                     walkExpr(acc.exprBody.get(), o, nullptr);
+                    curBody = &acc.stmts;
                     for (const auto& s : acc.stmts) walkStmt(s.get());
+                    curBody = nullptr;
                 }
             });
             return; }
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem)) {
             walkBody(hasModifier(md->modifiers, "async"), [&] {
                 walkExpr(md->exprBody.get(), o, nullptr);
+                curBody = &md->stmts;
                 for (const auto& s : md->stmts) walkStmt(s.get());
+                curBody = nullptr;
                 for (const ast::Param& p : md->params)
                     walkExpr(p.defaultValue.get(), o, nullptr);
             });
@@ -42871,12 +42955,16 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
         if (auto* od = dynamic_cast<const ast::OperatorDecl*>(mem)) {
             walkBody(false, [&] {
                 walkExpr(od->exprBody.get(), o, nullptr);
+                curBody = &od->stmts;
                 for (const auto& s : od->stmts) walkStmt(s.get());
+                curBody = nullptr;
             });
             return; }
         if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(mem)) {
             walkBody(false, [&] {
+                curBody = &cd->body;
                 for (const auto& s : cd->body) walkStmt(s.get());
+                curBody = nullptr;
                 for (const ast::Param& p : cd->params)
                     walkExpr(p.defaultValue.get(), o, nullptr);
             });
@@ -42919,19 +43007,43 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
     std::unordered_set<const sema::Symbol*> admitted;
     for (const sema::Symbol* c : valueLikeChoiceFieldCandidates_)
         if (!declined.count(c)) admitted.insert(c);
-    for (bool changed = true; changed;) {
-        changed = false;
-        for (const auto& [from, to] : edges) {
-            if (admitted.count(from) && !admitted.count(to)) {
-                admitted.erase(from);
-                changed = true;
+    // fix #6170 step 3: and a field one of whose bind reads lands in a local
+    // the #2115 walk does not arm (`var x := h.F; Use(x);`). Such a local
+    // never releases the reference the read takes, so admitting the field
+    // would turn a leak-free program into a leaking one. Whether a local is
+    // armed depends on the admitted set (a bind-read local is a candidate only
+    // while its field is admitted), so the whole computation is iterated to
+    // its greatest fixpoint: assume the current set, compute each body's armed
+    // locals, drop a field with an unarmed bind-read local, repeat.
+    for (;;) {
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (const auto& [from, to] : edges) {
+                if (admitted.count(from) && !admitted.count(to)) {
+                    admitted.erase(from);
+                    changed = true;
+                }
             }
         }
+        valueLikeChoiceFieldOwners_ = admitted;
+        valueLikeChoiceFieldBindReads_.clear();
+        for (const auto& [e, f] : bindReads)
+            if (admitted.count(f)) valueLikeChoiceFieldBindReads_[e] = f;
+        std::unordered_map<const void*, std::unordered_set<const void*>> armed;
+        bool dropped = false;
+        for (const BindSite& b : bindSites) {
+            if (!admitted.count(b.field)) continue;
+            auto it = armed.find(b.body);
+            if (it == armed.end())
+                it = armed.emplace(b.body, valueLikeChoiceOwnersOfBody(*b.body))
+                         .first;
+            if (!it->second.count(static_cast<const void*>(b.decl))) {
+                admitted.erase(b.field);
+                dropped = true;
+            }
+        }
+        if (!dropped) break;
     }
-    valueLikeChoiceFieldOwners_ = std::move(admitted);
-    for (const auto& [e, f] : bindReads)
-        if (valueLikeChoiceFieldOwners_.count(f))
-            valueLikeChoiceFieldBindReads_[e] = f;
 }
 
 

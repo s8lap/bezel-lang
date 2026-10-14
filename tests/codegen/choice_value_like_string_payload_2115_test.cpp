@@ -705,3 +705,38 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
     BEZEL_EXPECT_EQ(r2.exitCode, 0);
     BEZEL_EXPECT_TRUE(r2.stdoutText.find("890") != std::string::npos);
 }
+
+// Review of step 3 (a): `var x := h.F;` where x is then passed to a call, so
+// the #2115 walk does not arm x. The bind read retained the value and nothing
+// released it: MEASURED LSan 400 allocations on ee5a1029, clean on r30-c1. A
+// field with a bind-read local that is not armed is no longer admitted as an
+// owner. Expected total: len("q<k>") summed = 20 + 270 + 400 = 690.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_28_9_field_bind_read_into_unarmed_local_6170) {
+    JitResult r = runAotChecked(choiceReviewProgram6170(
+        "class H11 public F: P; public constructor(p: P) F := p; "
+        "end constructor; end H11;",
+        "    var h := new H11(P.Ok(q)); var x := h.F; n := Program.Len(x);"));
+    BEZEL_EXPECT_TRUE(r.ran);  // pre-fix: LSan leak (400 allocs)
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("690") != std::string::npos);
+}
+
+// Review of step 3 (b): the constructor stores the field and then throws.
+// §22.9: a constructor body's exception disposes every owned field it had
+// assigned; the ctor-cleanup block was not emitted for a class whose only
+// owned slot is a value-like choice field, so the store's retain leaked:
+// MEASURED LSan 400 allocations on ee5a1029, clean on r30-c1. Expected
+// total: 200 caught constructions, n = 2 each.
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_22_9_field_store_then_ctor_throw_6170) {
+    JitResult r = runAotChecked(choiceReviewProgram6170(
+        "class H12 public F: P; public constructor(p: P) F := p; "
+        "throw new InvalidOperationException(\"c\"); end constructor; "
+        "end H12;",
+        "    try var h := new H12(P.Ok(q)); n := 1; catch "
+        "InvalidOperationException => do n := 2; end end try;"));
+    BEZEL_EXPECT_TRUE(r.ran);  // pre-fix: LSan leak (400 allocs)
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("400") != std::string::npos);
+}

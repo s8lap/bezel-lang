@@ -18366,6 +18366,19 @@ private:
     // Compute stringReleaseEligible_ for a block body (see the .cpp).
     void collectStringReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #6170 step 2/3 (§28.9 / §35.4, v0.338): the #2115 armed set of
+    // value-like choice owner locals among `cands` (all declared in `body`):
+    // the greatest fixpoint of the choice escape walk, where a copy into or an
+    // assignment from another armed local is a read (choiceOwnerAliases).
+    std::unordered_set<const void*> valueLikeChoiceOwnerFixpoint(
+        const std::vector<const ast::Node*>& cands,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // fix #6170 step 3: the same armed set for a whole body, with the
+    // candidates found by collectStringReleaseEligible's own scan rule. Used
+    // by collectValueLikeChoiceFieldOwners, which runs before any body is
+    // lowered.
+    std::unordered_set<const void*> valueLikeChoiceOwnersOfBody(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
     // fix #2696 / §28.1 / §28.9 / §4.6: give every non-nullable `string`
     // PARAMETER this body ASSIGNS TO an independent +1 at bind, so the
