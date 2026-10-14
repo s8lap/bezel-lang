@@ -7553,6 +7553,59 @@ void ExprTC::checkAssignable(
         bool toUserClass = to->kind == TypeRef::Kind::Named &&
                            to->declaration &&
                            to->declaration->kind == ast::TypeDeclKind::Class;
+        // fix #6023 (§5.1 "Reference conversions", §31.4, v0.338): built-in
+        // exception → built-in exception. Neither side carries a TypeSymbol,
+        // so the declaration-keyed Named↔Named check above (the one that
+        // reports a user base-to-derived conversion) never saw the pair and it
+        // reached the catch-all accept: `var io: IOException := e` with
+        // `e: Exception`, and `Handle(new Exception("x"))` against
+        // `Handle(e: IOException)`, both compiled. §5.1 converts a class only
+        // "to base class, transitively", so the pair is accepted exactly when
+        // the target is the source or one of its ancestors in the built-in
+        // hierarchy (`common::builtinExceptionParentOf`, the table
+        // `namedAncestorChain` and the §22.6 grader #5862 already read). The
+        // heads are read through `headName()` so a transparent alias (§27.8)
+        // of either side is judged as the type it names.
+        if (from->kind == TypeRef::Kind::Named && !from->declaration &&
+            from->genericArgs.empty() && !fromIsTypeVar &&
+            to->kind == TypeRef::Kind::Named && !to->declaration &&
+            to->genericArgs.empty() && !toIsTypeVar) {
+            std::string_view fromH = from->headName();
+            std::string_view toH = to->headName();
+            if (common::isBuiltinExceptionName(fromH) &&
+                common::isBuiltinExceptionName(toH)) {
+                bool widens = false;
+                std::size_t guard = 0;
+                for (std::string_view cur = fromH; !cur.empty() && guard < 64;
+                     cur = common::builtinExceptionParentOf(cur), ++guard) {
+                    if (cur == toH) { widens = true; break; }
+                }
+                // pending #6083: see ExprTypecheck_impl.hpp.
+                if (!widens && !pendingTypeFactAdmits(fromExpr, to)) {
+                    bool downcast = false;
+                    guard = 0;
+                    for (std::string_view cur = toH;
+                         !cur.empty() && guard < 64;
+                         cur = common::builtinExceptionParentOf(cur), ++guard) {
+                        if (cur == fromH) { downcast = true; break; }
+                    }
+                    const std::string f(fromH), t(toH);
+                    reportNotConvertible(
+                        downcast
+                            ? "a base-to-derived (downcast) conversion is not "
+                              "implicit: `" + t + "` derives from `" + f +
+                              "`, not the reverse; test the runtime type with "
+                              "`is " + t + "` (§12.7) or convert with `as " +
+                              t + "` (§17.4), which yields `" + t + "?`"
+                            : "the built-in exception type `" + f +
+                              "` is not a `" + t + "` — `" + t + "` is not a "
+                              "base of it (§31.4)");
+                    return;
+                }
+                if (from->nullable && !to->nullable) { reportNullable(); return; }
+                return;
+            }
+        }
         // Repro A: built-in class → user class.
         if (fromBuiltinClass && toUserClass &&
             !hasNamedAncestor(from, to->declaration->name)) {
