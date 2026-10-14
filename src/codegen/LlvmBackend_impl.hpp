@@ -9653,6 +9653,31 @@ private:
                         return false;
                 return true;
             }
+            // fix #6301 (§12.1, v0.338): a function / inline-array type is
+            // compared structurally THROUGH the frames, so a class parameter
+            // inside it (`(T) -> U`) is read as its argument.
+            if (rx->kind == sema::TypeRef::Kind::Function) {
+                if (rx->funcParams.size() != ry->funcParams.size() ||
+                    rx->funcReturnOwned != ry->funcReturnOwned)
+                    return false;
+                for (std::size_t k = 0; k < rx->funcParams.size(); ++k)
+                    if (rx->funcParams[k].modifier !=
+                            ry->funcParams[k].modifier ||
+                        !self(self, rx->funcParams[k].type, xr.frame,
+                              ry->funcParams[k].type, yr.frame))
+                        return false;
+                if (!rx->funcReturn && !ry->funcReturn) return true;
+                return self(self, rx->funcReturn, xr.frame, ry->funcReturn,
+                            yr.frame);
+            }
+            if (rx->kind == sema::TypeRef::Kind::InlineArray) {
+                if (rx->arrayOwned != ry->arrayOwned) return false;
+                if (rx->arraySizeValue >= 0 && ry->arraySizeValue >= 0 &&
+                    rx->arraySizeValue != ry->arraySizeValue)
+                    return false;
+                return self(self, rx->arrayElement, xr.frame, ry->arrayElement,
+                            yr.frame);
+            }
             sema::TypeRef nx = *rx, ny = *ry;
             nx.nullable = ny.nullable = false;
             return methodSigTypeRefEqual(&nx, &ny, true);
