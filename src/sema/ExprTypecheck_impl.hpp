@@ -3934,6 +3934,15 @@ private:
     MethodSymbol* resolveMethodOverload(MethodSymbol* initial,
                                         const ast::CallExpr& ce);
 
+    // fix #6312 (§14.5, §22.6, v0.338): a call whose explicit type-argument
+    // list left exactly ONE generic candidate of an overload set, mapped to
+    // that candidate. `resolveMethodOverload` returns such a sole survivor
+    // without judging its substituted signature, so `checkCallArity` runs
+    // the single-candidate argument check on it (the same
+    // `checkArgsAgainstParams` a non-overloaded generic method gets).
+    std::unordered_map<const ast::CallExpr*, MethodSymbol*>
+        explicitListSoleSurvivor_;
+
     // §22.6/§12.1 (#1090): collect every same-name method overload visible on
     // `start` and its base classes, most-derived first, with a more-derived
     // overload shadowing a less-derived one of the same signature (so an

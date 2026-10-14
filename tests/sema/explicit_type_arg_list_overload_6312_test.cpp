@@ -31,6 +31,34 @@ std::string run(const std::string& classes, const std::string& body) {
     return r.stdoutText;
 }
 
+// The sole candidate an explicit list leaves gets the call check a
+// non-overloaded generic method gets (§22.6 stage 3, §5.1), so its
+// rejection is that check's diagnostic.
+const char* const kSurvivorNeedle =
+    "has a type that is not implicitly convertible to the target type (§5.1)";
+
+std::string reject(const std::string& classes, const std::string& body) {
+    auto r = runAot("module M;\n" + classes +
+                    "public class Program\n"
+                    "  public static method Main(): int\n" + body +
+                    "    return 0;\n"
+                    "  end Main;\n"
+                    "end Program;\n");
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kSurvivorNeedle));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+    std::string all;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error) all += d.message + "\n";
+    return all;
+}
+
+const char* const kAnimals =
+    "public class Animal end Animal;\n"
+    "public class Dog: Animal\n"
+    "  public method Bark(): int => 7;\n"
+    "end Dog;\n";
+
 }  // namespace
 
 // s14_5_0012: the list reaches only the generic candidate; no list prefers the non-generic one (§22.6).
@@ -184,7 +212,7 @@ public class Program
   end Main;
 end Program;
 )");
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no overload of `S` is applicable"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kSurvivorNeedle));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_FALSE(r.ran);
 }
@@ -206,6 +234,150 @@ public class Program
   end Main;
 end Program;
 )");
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "no overload of `S` is applicable"));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kSurvivorNeedle));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// Review round 2 (#6312), u1: the sole survivor `S<V>(x: Array<V>)` at
+// `S<IMark>` does not take a `Marked`; it printed 0 (the generic body run on
+// a class instance as if it were an Array). §22.6 stage 3 / §5.1.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_class_argument_to_array_param_rejected_spec_22_6) {
+    reject(
+        "public interface IMark end IMark;\n"
+        "public class Marked: IMark end Marked;\n"
+        "public class C\n"
+        "  public method S(x: string): int => 1;\n"
+        "  public method S<V>(x: Array<V>): int => x.Count;\n"
+        "end C;\n",
+        "    using var c := new C();\n"
+        "    using var m := new Marked();\n"
+        "    Console.WriteLine(c.S<IMark>(m));\n");
+}
+
+// Review round 2 (#6312), u2: the static sole survivor `F<V>(x: V) where V:
+// Dog` at `F<Dog>` given an Animal ran `x.Bark()` on an Animal and printed 7.
+// A base-to-derived conversion is never implicit (§5.1).
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_base_to_derived_argument_rejected_spec_5_1) {
+    const std::string errs = reject(
+        std::string(kAnimals) +
+        "public class D2\n"
+        "  public static method F(x: string): int => 1;\n"
+        "  public static method F<V>(x: V): int where V: Dog => x.Bark();\n"
+        "end D2;\n",
+        "    using var a := new Animal();\n"
+        "    Console.WriteLine(D2.F<Dog>(a));\n");
+    BEZEL_EXPECT_TRUE(errs.find("downcast") != std::string::npos);
+}
+
+// Review round 2 (#6312): a negative constant at the survivor's `ulong`
+// parameter does not fit its range (§5.1); it compiled.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_negative_constant_to_ulong_rejected_spec_5_1) {
+    const std::string errs = reject(
+        "public class C\n"
+        "  public method S(x: string): int => 1;\n"
+        "  public method S<V>(x: V): int => 10;\n"
+        "end C;\n",
+        "    using var c := new C();\n"
+        "    Console.WriteLine(c.S<ulong>(-1));\n");
+    BEZEL_EXPECT_TRUE(errs.find("does not fit the target's range") !=
+                      std::string::npos);
+}
+
+// Review round 2 (#6312): an int at the survivor's enum parameter; between an
+// enum and its underlying integer no conversion is implicit (§5.1).
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_int_to_enum_rejected_spec_5_1) {
+    const std::string errs = reject(
+        "public enum Color\n"
+        "  Red, Green;\n"
+        "end Color;\n"
+        "public class C\n"
+        "  public method S(x: string): int => 1;\n"
+        "  public method S<V>(x: V): int => 10;\n"
+        "end C;\n",
+        "    using var c := new C();\n"
+        "    Console.WriteLine(c.S<Color>(1));\n");
+    BEZEL_EXPECT_TRUE(errs.find("enum and its underlying integer") !=
+                      std::string::npos);
+}
+
+// Over-rejection guard: the same survivor given a Dog satisfies both the
+// argument and the `where V: Dog` constraint and runs.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_applicable_argument_runs_spec_22_6) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(kAnimals) +
+        "public class D2\n"
+        "  public static method F(x: string): int => 1;\n"
+        "  public static method F<V>(x: V): int where V: Dog => x.Bark();\n"
+        "end D2;\n",
+        "    using var d := new Dog();\n"
+        "    Console.WriteLine(D2.F<Dog>(d));\n"),
+        "7\n");
+}
+
+// Over-rejection guard (§12.9): an `out` interface parameter is covariant, so
+// `IBox<Dog>` reaches `IBox<Animal>` at the survivor (reviewer cov3, with the
+// getter returning `owned` so the program is otherwise well-formed).
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_covariant_user_interface_runs_spec_12_9) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(kAnimals) +
+        "public interface IBox<out T>\n"
+        "  method Get(): owned T;\n"
+        "end IBox;\n"
+        "public class DBox: IBox<Dog>\n"
+        "  public method Get(): owned Dog => new Dog();\n"
+        "end DBox;\n"
+        "public class C\n"
+        "  public method S(x: string): int => 1;\n"
+        "  public method S<V>(x: IBox<V>): int => 10;\n"
+        "end C;\n",
+        "    using var c := new C();\n"
+        "    using var d := new DBox();\n"
+        "    var b: IBox<Dog> := d;\n"
+        "    Console.WriteLine(c.S<Animal>(b));\n"),
+        "10\n");
+}
+
+// Over-rejection guard, reviewer cov3 as written for two generic candidates
+// (getter `owned`, as above): the covariant argument keeps the first.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, covariant_user_interface_two_candidates_runs_spec_12_9) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(kAnimals) +
+        "public interface IBox<out T>\n"
+        "  method Get(): owned T;\n"
+        "end IBox;\n"
+        "public class DBox: IBox<Dog>\n"
+        "  public method Get(): owned Dog => new Dog();\n"
+        "end DBox;\n"
+        "public class C\n"
+        "  public method S<V>(x: IBox<V>): int => 10;\n"
+        "  public method S<V>(x: IBox<IBox<V>>): int => 20;\n"
+        "end C;\n",
+        "    using var c := new C();\n"
+        "    using var d := new DBox();\n"
+        "    var b: IBox<Dog> := d;\n"
+        "    Console.WriteLine(c.S<Animal>(b));\n"),
+        "10\n");
+}
+
+// Over-rejection guard: an `Array<Dog>` reaches the survivor's
+// `IEnumerable<Animal>` (Array implements `IEnumerable<out T>`, §12.9), and a
+// widening or fitting constant reaches its primitive parameter (§5.1). The
+// base rejected both, ranking the non-generic `S(x: string)` too.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_implicit_conversions_run_spec_5_1) {
+    BEZEL_EXPECT_EQ(run(
+        std::string(kAnimals) +
+        "public class C\n"
+        "  public method S(x: string): int => 1;\n"
+        "  public method S<V>(x: V): int => 10;\n"
+        "  public method T(x: string): int => 1;\n"
+        "  public method T<V>(x: IEnumerable<V>): int => 20;\n"
+        "end C;\n",
+        "    using var c := new C();\n"
+        "    using var l := new Array<Dog>();\n"
+        "    var i: int := 3;\n"
+        "    Console.WriteLine(c.T<Animal>(l));\n"
+        "    Console.WriteLine(c.S<long>(i));\n"
+        "    Console.WriteLine(c.S<byte>(7));\n"),
+        "20\n10\n10\n");
 }

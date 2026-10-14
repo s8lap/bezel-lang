@@ -2612,52 +2612,6 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 }
                 cands.swap(lc);
                 binds.swap(lb);
-                // The narrowing can leave one candidate that nothing re-checks
-                // (a generic candidate of an overload set is not re-checked
-                // after selection), so `S(x: string)` beside `S<V>(x: V)` at
-                // `c.S<int>("abc")` would run the generic body on a string.
-                // The same certain-evidence test rejects it here.
-                if (cands.size() == 1 && cands[0]->parent &&
-                    cands[0]->parent->genericParams.empty()) {
-                    const auto* sd =
-                        dynamic_cast<const ast::MethodDecl*>(cands[0]->decl);
-                    std::unordered_map<std::string_view, TypeRef*> sub;
-                    bool resolved = sd && sd->genericParams.size() ==
-                                              listTypeArgs->size();
-                    for (std::size_t gi = 0; resolved &&
-                                             gi < sd->genericParams.size();
-                         ++gi) {
-                        TypeRef* ta = (*listTypeArgs)[gi]
-                                          ? ctx_.resolvedType(*(*listTypeArgs)[gi])
-                                          : nullptr;
-                        if (!ta) resolved = false;
-                        else sub[sd->genericParams[gi].name] = ta;
-                    }
-                    bool bad = false;
-                    for (std::size_t j = 0; resolved && !bad &&
-                                            j < sd->params.size();
-                         ++j) {
-                        const int ai = binds[0].paramToArg[j];
-                        if (ai < 0 || !sd->params[j].type) continue;
-                        const auto& arg = ce.args[static_cast<std::size_t>(ai)];
-                        if (!arg.modifier.empty() || !arg.value) continue;
-                        TypeRef* pt = ctx_.resolvedType(*sd->params[j].type);
-                        if (!pt) continue;
-                        pt = substituteReturnType(pt, sub);
-                        bad = definitelyInapplicable(ctx_.exprType(*arg.value),
-                                                     pt);
-                    }
-                    if (bad) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ce.span.begin,
-                            "no overload of `" + std::string(initial->name) +
-                                "` is applicable to these arguments; the "
-                                "explicit type-argument list leaves every "
-                                "candidate requiring a conversion that §5.1 "
-                                "does not admit as implicit (§14.5, §22.6)");
-                        return arityFallback();
-                    }
-                }
             }
         }
     }
@@ -2854,7 +2808,33 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             binds.swap(ob);
         }
     }
-    if (cands.size() == 1) return cands[0];
+    // fix #6312 (§22.6 stage 3, §14.5, v0.338): a candidate returned here
+    // as the only one left is not judged against its substituted signature
+    // below, and `checkCallArity` skips the per-argument check for a generic
+    // member of an overload set. Where an explicit type-argument list of its
+    // arity reached it, the list binds every type parameter and no inference
+    // runs (§14.5), so the survivor is exactly a non-overloaded generic call:
+    // record it for `checkCallArity` to run that call's full check, which is
+    // §22.6 stage 3's "applicability over the (substituted) signatures"
+    // (§5.1 conversions, §12.9 variance). Its `where` constraints are
+    // checked after resolution on the selected candidate, as for any call.
+    auto soleSurvivor = [&](MethodSymbol* m) -> MethodSymbol* {
+        const std::vector<std::unique_ptr<ast::Type>>* lta = nullptr;
+        if (auto* a1 =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            lta = &a1->typeArgs;
+        else if (auto* a2 = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     ce.callee.get()))
+            lta = &a2->typeArgs;
+        else if (auto* a3 =
+                     dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
+            lta = &a3->typeArgs;
+        if (m && overloads.size() > 1 && lta && !lta->empty() &&
+            m->genericParams.size() == lta->size())
+            explicitListSoleSurvivor_[&ce] = m;
+        return m;
+    };
+    if (cands.size() == 1) return soleSurvivor(cands[0]);
 
     // A discard argument (`out _`) is outside the value-conversion ranking of
     // §22.6's worked examples; fall back to arity/first-bind.
@@ -3223,7 +3203,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             candNames.resize(k);
             fillsDefault.resize(k);
             spelledWithTypeParam.resize(k);
-            if (cands.size() == 1) return cands[0];
+            if (cands.size() == 1) return soleSurvivor(cands[0]);
         }
     }
     // resolveOverload classifies column i of every candidate against a single
@@ -16576,6 +16556,22 @@ void ExprTC::checkCallArity(
     std::vector<MethodSymbol*> overloads;
     collectHierarchyOverloads(ms->parent, ms->name, overloads);
     if (overloads.size() != 1) {
+        // fix #6312 (§22.6 stage 3, §14.5, v0.338): the explicit type-argument
+        // list left `ms` as the only candidate, and resolution returned it
+        // without judging it (see `soleSurvivor` in resolveMethodOverload).
+        // Give it the call check a non-overloaded generic method gets — the
+        // single-overload arm at the end of this function, verbatim — so an
+        // argument the substituted parameter does not admit is the same
+        // §5.1 rejection, not a generic body run on the wrong type.
+        if (auto ss = explicitListSoleSurvivor_.find(&ce);
+            ss != explicitListSoleSurvivor_.end() && ss->second == ms) {
+            checkArgsAgainstParams(md->params, ce.args, ce.span.begin,
+                                   std::string("call to `") +
+                                   std::string(ms->name) + "`",
+                                   recvTarget, ms->parent, md,
+                                   /*extBinding=*/nullptr, explicitSubst);
+            return;
+        }
         // Multi-overload set: overload resolution already validated the call
         // against the chosen overload, so re-checking would double-report. The
         // one gap is a call that matches NO overload (resolution fell back to a
