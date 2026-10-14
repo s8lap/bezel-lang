@@ -3105,8 +3105,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     allParamTys.push_back(ptrTy());  // env_ptr (slot 0)
     for (llvm::Type* t : userParamTys) allParamTys.push_back(t);
 
-    static std::atomic<unsigned> lamCounter{0};
-    unsigned lamId = lamCounter.fetch_add(1);
+    unsigned lamId = synthSeq_.lambda++;
     std::string lamName = "lam$" + std::to_string(lamId);
     auto* fnTy = llvm::FunctionType::get(retTy, allParamTys, false);
     auto* fn = llvm::Function::Create(

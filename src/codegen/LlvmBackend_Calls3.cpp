@@ -6141,9 +6141,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                     //    The adapter loads fn+env from the cell, calls
                     //    fn(env, arg...), releases the closure, and marshals
                     //    the result. per §30.14 / fix #1490/#1491.
-                    static std::atomic<unsigned> spawnLamCtr{0};
                     std::string aName = "spawn.lam$" +
-                        std::to_string(spawnLamCtr.fetch_add(1));
+                        std::to_string(synthSeq_.spawnLambda++);
                     auto* aTy = llvm::FunctionType::get(
                         ptrTy(), {ptrTy()}, false);
                     auto* adapter = llvm::Function::Create(
@@ -6425,9 +6424,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             //     free the array, then call origFn(p0, p1, …).
             // Return value: origFn's result cast to void* (or null for void).
             // per §30.14 / #693
-            static std::atomic<unsigned> spawnAdaptCtr{0};
             std::string adaptName = "spawn.adapter$" +
-                std::to_string(spawnAdaptCtr.fetch_add(1));
+                std::to_string(synthSeq_.spawnAdapter++);
             auto* adaptFnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
             auto* adapter = llvm::Function::Create(
                 adaptFnTy, llvm::Function::InternalLinkage,

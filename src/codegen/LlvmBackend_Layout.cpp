@@ -5996,10 +5996,9 @@ llvm::Value* Emitter::makeGenericMethodThunk(sema::MethodSymbol* ms,
                                       kind);
 
     auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
-    static std::atomic<unsigned> gThunkCtr{0};
     auto* thunk = llvm::Function::Create(
         thunkFnTy, llvm::Function::InternalLinkage,
-        "gthunk$" + std::to_string(gThunkCtr.fetch_add(1)), module_.get());
+        "gthunk$" + std::to_string(synthSeq_.genericThunk++), module_.get());
 
     llvm::Function* savedFn = currentFn_;
     llvm::Value* savedThis = currentThis_;
@@ -6380,8 +6379,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
                                               thunkParamTys, false);
 
     // Create thunk function.
-    static std::atomic<unsigned> thunkCtr{0};
-    std::string thunkName = "thunk$" + std::to_string(thunkCtr.fetch_add(1));
+    std::string thunkName = "thunk$" + std::to_string(synthSeq_.methodThunk++);
     auto* thunk = llvm::Function::Create(
         thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
 
@@ -6829,10 +6827,9 @@ llvm::Value* Emitter::makeObjectMemberThunk(const ast::MemberAccessExpr& ma,
     paramTys.push_back(ptrTy());  // env
     if (takesOther) paramTys.push_back(ptrTy());  // other
     auto* thunkFnTy = llvm::FunctionType::get(retTy, paramTys, false);
-    static std::atomic<unsigned> objThunkCtr{0};
     std::string thunkName = "objthunk$" +
         std::string(memberName) + "$" +
-        std::to_string(objThunkCtr.fetch_add(1));
+        std::to_string(synthSeq_.objThunk++);
     auto* thunk = llvm::Function::Create(
         thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
     // Save emitter state (mirrors makeMethodThunk's preamble).
@@ -7104,10 +7101,9 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
         return buildMethodClosureCell(cit->second, /*instMethod=*/false,
                                       /*receiverVal=*/nullptr, FVK_FN_ONLY);
 
-    static std::atomic<unsigned> primThunkCtr{0};
     std::string thunkName = "primthunk$" + std::string(id->name) + "$" +
                             std::string(ma.member) + "$" +
-                            std::to_string(primThunkCtr.fetch_add(1));
+                            std::to_string(synthSeq_.primThunk++);
     auto* thunk = llvm::Function::Create(
         thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
 
@@ -7533,8 +7529,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
 
     // Thunk fn type: retTy thunk(ptr env). A getter takes no user params.
     auto* thunkFnTy = llvm::FunctionType::get(retTy, {ptrTy()}, false);
-    static std::atomic<unsigned> pthunkCtr{0};
-    std::string thunkName = "pthunk$" + std::to_string(pthunkCtr.fetch_add(1));
+    std::string thunkName = "pthunk$" + std::to_string(synthSeq_.propThunk++);
     auto* thunk = llvm::Function::Create(
         thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
 

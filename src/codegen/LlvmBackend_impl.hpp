@@ -1199,6 +1199,26 @@ private:
     sema::SemaContext& ctx_;
     llvm::LLVMContext& llvm_;
     std::unique_ptr<llvm::Module> module_;
+    // Sequence numbers for the backend-synthesized internal functions and
+    // types (`lam$N`, `thunk$N`, `async.lambda.N`, ...). PER EMITTER, i.e. per
+    // compilation, so the emitted names — and therefore the object bytes — are
+    // a function of the program alone. They were function-local statics, which
+    // carried across every emitModule call in a process: the AOT test harness
+    // forks each compile from a parent that has run in-process codegen, so the
+    // same program got different names after a different test history (object
+    // reproducibility; tests/support/object_reproducibility_test.cpp).
+    struct SynthNameSeqs {
+        unsigned lambda = 0;         // lam$N
+        unsigned asyncLambdaSm = 0;  // async.lambda.N
+        unsigned genericThunk = 0;   // gthunk$N
+        unsigned methodThunk = 0;    // thunk$N
+        unsigned objThunk = 0;       // objthunk$<member>$N
+        unsigned primThunk = 0;      // primthunk$<recv>$<member>$N
+        unsigned propThunk = 0;      // pthunk$N
+        unsigned raiseAsyncShim = 0; // __bz_raiseasync_shim_N
+        unsigned spawnLambda = 0;    // spawn.lam$N
+        unsigned spawnAdapter = 0;   // spawn.adapter$N
+    } synthSeq_;
     llvm::IRBuilder<> builder_;
     // §28.2 v0.134 / issue #601: true when building in checked disposal mode.
     // When set, emitFunctionBody and ensurePropertyAccessorFn prepend a

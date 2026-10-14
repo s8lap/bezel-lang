@@ -2361,8 +2361,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         fields.push_back(pit->second);
     }
 
-    static std::atomic<unsigned> lamSmCounter{0};
-    unsigned smId = lamSmCounter.fetch_add(1);
+    unsigned smId = synthSeq_.asyncLambdaSm++;
     auto* stateStructTy = llvm::StructType::create(
         llvm_, fields, "async.lambda." + std::to_string(smId));
 

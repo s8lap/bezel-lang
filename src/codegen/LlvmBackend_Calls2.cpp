@@ -5034,9 +5034,8 @@ llvm::Value* Emitter::emitAsyncEventRaise(llvm::Value* srcPtr,
     auto* shimFnTy = llvm::FunctionType::get(
         ptrTy(), {ptrTy(), ptrTy()}, false);
 
-    static std::atomic<unsigned> shimSeq{0};
     std::string shimName =
-        "__bz_raiseasync_shim_" + std::to_string(shimSeq.fetch_add(1));
+        "__bz_raiseasync_shim_" + std::to_string(synthSeq_.raiseAsyncShim++);
     auto* shimFn = llvm::Function::Create(
         shimFnTy, llvm::Function::InternalLinkage, shimName, module_.get());
     shimFn->addFnAttr(llvm::Attribute::AlwaysInline);
