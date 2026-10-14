@@ -15939,6 +15939,27 @@ struct ParamEscapeWalker {
         return ps && ps->declType == paramDeclType;
     }
 
+    // fix #6142 (§12.7 / §8.6, v0.338): the tracked parameter as the operand
+    // of an operator, read at a primitive value type — `o + 1` inside
+    // `if o is int then`. The operator reads the box's PAYLOAD (an unbox load,
+    // §12.7's narrowing of a boxed value) and the result is a fresh value: the
+    // box itself goes nowhere, so this is a read, not an escape. The same
+    // payload-copy argument as #3200's LocalDecl relaxation below. Treating it
+    // as an escape suppressed the caller's post-call `bz_box_release`, and each
+    // call leaked its argument box. `string` and `Object` are excluded: a
+    // string operand is the reference itself, not a payload copy.
+    // Not inside a lambda body: a read there goes through the closure's
+    // capture of the box, which the walker does not reason about.
+    int lambdaDepth = 0;
+    bool isUnboxedRead(const ast::Expr* e) {
+        if (lambdaDepth != 0 || !isTarget(e)) return false;
+        const sema::TypeRef* t = ctx.exprType(*e);
+        if (!t || t->kind != sema::TypeRef::Kind::Primitive) return false;
+        using P = sema::PrimitiveType;
+        return t->primitive != P::None && t->primitive != P::Object &&
+               t->primitive != P::String;
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
@@ -15957,12 +15978,14 @@ struct ParamEscapeWalker {
                                  b->left.get()) != nullptr;
                 bool rNull = dynamic_cast<const ast::NullLiteralExpr*>(
                                  b->right.get()) != nullptr;
-                expr(b->left.get(), /*safeRead=*/rNull);
-                expr(b->right.get(), /*safeRead=*/lNull);
+                expr(b->left.get(), /*safeRead=*/rNull || isUnboxedRead(
+                                                     b->left.get()));
+                expr(b->right.get(), /*safeRead=*/lNull || isUnboxedRead(
+                                                      b->right.get()));
                 return;
             }
-            expr(b->left.get(), /*safeRead=*/false);
-            expr(b->right.get(), /*safeRead=*/false);
+            expr(b->left.get(), /*safeRead=*/isUnboxedRead(b->left.get()));
+            expr(b->right.get(), /*safeRead=*/isUnboxedRead(b->right.get()));
             return;
         }
         // Direct method call with `v` as receiver: receiver read; not escape.
@@ -16021,8 +16044,10 @@ struct ParamEscapeWalker {
         // Everything else conservatively escapes: lambda capture, collection
         // literal, with, new, throw, interpolation, unary, range.
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            ++lambdaDepth;
             if (lam->exprBody) expr(lam->exprBody.get(), false);
             for (auto& s : lam->stmts) stmt(s.get());
+            --lambdaDepth;
             return;
         }
         if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
@@ -16051,7 +16076,7 @@ struct ParamEscapeWalker {
         // safe.)
         // Recurse conservatively on a few key shapes.
         if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
-            expr(u->operand.get(), false);
+            expr(u->operand.get(), isUnboxedRead(u->operand.get()));
             return;
         }
         if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
