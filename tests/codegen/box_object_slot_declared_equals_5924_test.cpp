@@ -209,3 +209,192 @@ BEZEL_TEST(box_object_slot_declared_equals_9_2_5924,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("100 0 100 0 0 0\n"));
 }
+
+// ---------------------------------------------------------------------------
+// fix #6015 (fix-forward of the #5924 item 3 thunks): a pair declared OFF the
+// `Object` slot's exact shape keeps the box slots it had before the declared
+// thunks existed.
+//
+// The thunks return the declared member's result as the slot's own `i1` /
+// `i32`. §8.1 (v0.338) gives the slot's shape — `Equals(other: Object?): bool`,
+// `GetHashCode(): int` — and §9.2 (v0.338) names the value kind's member "at
+// `GetHashCode(): int`". The pair was matched by name and parameter list only,
+// so a member returning `int?` / `bool?` (an optional aggregate) or any other
+// type made the thunk `ret` an ill-typed value and the MODULE failed IR
+// verification — with no boxing anywhere in the program (the two sema rows
+// record_override_{gethashcode,equals}_nullable_return_unchanged_pending_6011
+// declare the record and call the member directly). A member with a parameter
+// mode, a generic member or a `uint` hash type-checked and silently ran
+// through the box instead: `Equals(out other: R)` WROTE through the
+// argument's box.
+//
+// Whether such a member fills the slot is spec-question #6011 (open), so these
+// rows rule nothing: they pin the behaviour the same programs had BEFORE the
+// declared thunks — member-wise equality and hash through the box, the
+// generated members of §9.1 / §35.7 — and each fails without the fix (the
+// first four at compile time, the rest on the counters).
+//
+// Counters, in order: Equals with a key-equal / member-wise-equal / different
+// argument, a fourth argument (null for a record, another arm for a choice),
+// a foreign argument (a boxed int / null); then GetHashCode against a
+// key-equal box, a member-wise-equal box, and the declared hash's value.
+// Member-wise through the box is "0 100 0 0 0 0 100 0"; the declared pair
+// would answer "100 100 0 0 0 100 100 100".
+//
+// No row goes through `Set<Object>` / `Dictionary<Object, V>`: every box
+// handed to those containers leaks 24 bytes independently of this change
+// (#4717, measured on the pre-#5924 compiler too), so a checked row there
+// cannot be green on any compiler.
+
+namespace {
+
+const char* kStructuralThroughBox = "0 100 0 0 0 0 100 0\n";
+
+std::string recordWith(const std::string& eq, const std::string& hash) {
+    return "public record R(X: int, Y: int)\n" + eq + hash + "end R;\n";
+}
+std::string choiceWith(const std::string& eq, const std::string& hash) {
+    return "public choice C\n"
+           "  P(x: int), Q;\n"
+           "  public method Key(): int => (case this of P(v) => v mod 10, Q => -1);\n" +
+           eq + hash + "end C;\n";
+}
+
+const char* kRecEq =
+    "  public method Equals(other: R): bool => (X mod 10) = (other.X mod 10);\n";
+const char* kRecHash =
+    "  public method GetHashCode(): int => (X mod 10) + 500;\n";
+const char* kChoEq =
+    "  public method Equals(other: C): bool => Key() = other.Key();\n";
+const char* kChoHash =
+    "  public method GetHashCode(): int => Key() + 500;\n";
+
+JitResult runRecordThroughBox(const std::string& decls) {
+    return runAotChecked(countingProg(
+        decls,
+        "      var o: Object := new R(5, 1);\n"
+        "      var p: Object := new R(15, 1);\n"
+        "      var q: Object := new R(5, 1);\n" +
+            holder("hEq", "new R(15, 1)") + holder("hSame", "new R(5, 1)") +
+            holder("hNe", "new R(6, 1)") + holder("hNull", nullptr) +
+            holder("hInt", "5"),
+        {"o.Equals(hEq.O)", "o.Equals(hSame.O)", "o.Equals(hNe.O)",
+         "o.Equals(hNull.O)", "o.Equals(hInt.O)",
+         "o.GetHashCode() = p.GetHashCode()",
+         "o.GetHashCode() = q.GetHashCode()", "o.GetHashCode() = 505"}));
+}
+
+JitResult runChoiceThroughBox(const std::string& decls) {
+    return runAotChecked(countingProg(
+        decls,
+        "      var o: Object := C.P(5);\n"
+        "      var p: Object := C.P(15);\n"
+        "      var q: Object := C.P(5);\n" +
+            holder("hEq", "C.P(15)") + holder("hSame", "C.P(5)") +
+            holder("hNe", "C.P(6)") + holder("hArm", "C.Q") +
+            holder("hNull", nullptr),
+        {"o.Equals(hEq.O)", "o.Equals(hSame.O)", "o.Equals(hNe.O)",
+         "o.Equals(hArm.O)", "o.Equals(hNull.O)",
+         "o.GetHashCode() = p.GetHashCode()",
+         "o.GetHashCode() = q.GetHashCode()", "o.GetHashCode() = 505"}));
+}
+
+}  // namespace
+
+// The sema row's own record (`override GetHashCode(): int?` beside an
+// own-typed `Equals`), now BOXED: `Object.Equals` / `Object.GetHashCode` on it
+// compile, run, and answer member-wise as before. Pending #6011.
+BEZEL_TEST(box_object_slot_declared_equals_9_2_5924,
+           record_nullable_gethashcode_object_receiver_unchanged_pending_6011) {
+    JitResult r = runRecordThroughBox(recordWith(
+        "  public override method Equals(other: R): bool =>\n"
+        "    (X mod 10) = (other.X mod 10);\n",
+        "  public override method GetHashCode(): int? => (X mod 10) + 500;\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string(kStructuralThroughBox));
+}
+
+// The other sema row's record (`override Equals(other: R): bool?`), boxed.
+BEZEL_TEST(box_object_slot_declared_equals_9_2_5924,
+           record_nullable_equals_object_receiver_unchanged_pending_6011) {
+    JitResult r = runRecordThroughBox(recordWith(
+        "  public override method Equals(other: R): bool? =>\n"
+        "    (X mod 10) = (other.X mod 10);\n",
+        "  public override method GetHashCode(): int => (X mod 10) + 500;\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string(kStructuralThroughBox));
+}
+
+// The same two nullable returns on a choice. Pending #6011.
+BEZEL_TEST(box_object_slot_declared_equals_9_2_5924,
+           choice_nullable_pair_object_receiver_unchanged_pending_6011) {
+    JitResult h = runChoiceThroughBox(choiceWith(
+        kChoEq, "  public method GetHashCode(): int? => Key() + 500;\n"));
+    BEZEL_EXPECT_TRUE(h.ran);
+    BEZEL_EXPECT_EQ(h.stdoutText, std::string(kStructuralThroughBox));
+    JitResult e = runChoiceThroughBox(choiceWith(
+        "  public method Equals(other: C): bool? => Key() = other.Key();\n",
+        kChoHash));
+    BEZEL_EXPECT_TRUE(e.ran);
+    BEZEL_EXPECT_EQ(e.stdoutText, std::string(kStructuralThroughBox));
+}
+
+// A plain member at another NON-nullable return type (`GetHashCode(): long`
+// on a record, `Equals(other: C): int` on a choice) is not at the slot's shape
+// either (§8.1, v0.338): it failed IR verification the same way.
+BEZEL_TEST(box_object_slot_declared_equals_9_2_5924,
+           other_return_type_object_receiver_unchanged) {
+    JitResult h = runRecordThroughBox(recordWith(
+        kRecEq,
+        "  public method GetHashCode(): long => long((X mod 10) + 500);\n"));
+    BEZEL_EXPECT_TRUE(h.ran);
+    BEZEL_EXPECT_EQ(h.stdoutText, std::string(kStructuralThroughBox));
+    JitResult e = runChoiceThroughBox(choiceWith(
+        "  public method Equals(other: C): int => Key() + other.Key();\n",
+        kChoHash));
+    BEZEL_EXPECT_TRUE(e.ran);
+    BEZEL_EXPECT_EQ(e.stdoutText, std::string(kStructuralThroughBox));
+}
+
+// `Equals(out other: R)` / `Equals(ref other: R)`: the thunk type-checked (the
+// parameter is a pointer either way) and handed the member the ARGUMENT's box
+// payload as its `out` / `ref` target, so the `out` body overwrote the boxed
+// argument, and every argument of the receiver's type compared equal.
+BEZEL_TEST(box_object_slot_declared_equals_9_2_5924,
+           equals_parameter_mode_object_receiver_unchanged) {
+    JitResult o = runRecordThroughBox(recordWith(
+        "  public method Equals(out other: R): bool\n"
+        "    other := new R(X, Y);\n"
+        "    return true;\n"
+        "  end Equals;\n",
+        kRecHash));
+    BEZEL_EXPECT_TRUE(o.ran);
+    BEZEL_EXPECT_EQ(o.stdoutText, std::string(kStructuralThroughBox));
+    JitResult f = runRecordThroughBox(recordWith(
+        "  public method Equals(ref other: R): bool =>\n"
+        "    (X mod 10) = (other.X mod 10);\n",
+        kRecHash));
+    BEZEL_EXPECT_TRUE(f.ran);
+    BEZEL_EXPECT_EQ(f.stdoutText, std::string(kStructuralThroughBox));
+}
+
+// A GENERIC member (`Equals<U>(other: R)`, `GetHashCode<U>()`) and a `uint`
+// hash also type-checked and ran through the box.
+BEZEL_TEST(box_object_slot_declared_equals_9_2_5924,
+           generic_member_and_uint_hash_object_receiver_unchanged) {
+    JitResult g = runRecordThroughBox(recordWith(
+        "  public method Equals<U>(other: R): bool =>\n"
+        "    (X mod 10) = (other.X mod 10);\n",
+        kRecHash));
+    BEZEL_EXPECT_TRUE(g.ran);
+    BEZEL_EXPECT_EQ(g.stdoutText, std::string(kStructuralThroughBox));
+    JitResult c = runChoiceThroughBox(choiceWith(
+        kChoEq, "  public method GetHashCode<U>(): int => Key() + 500;\n"));
+    BEZEL_EXPECT_TRUE(c.ran);
+    BEZEL_EXPECT_EQ(c.stdoutText, std::string(kStructuralThroughBox));
+    JitResult u = runRecordThroughBox(recordWith(
+        kRecEq,
+        "  public method GetHashCode(): uint => uint((X mod 10) + 500);\n"));
+    BEZEL_EXPECT_TRUE(u.ran);
+    BEZEL_EXPECT_EQ(u.stdoutText, std::string(kStructuralThroughBox));
+}

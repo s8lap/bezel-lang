@@ -44743,6 +44743,63 @@ void Emitter::setupBoxDescriptors() {
             uty, userHash, {pty->isPointerTy() ? p : tb.CreateLoad(pty, p)}));
         return thunk;
     };
+    // fix #6015 (§8.1 / §9.2, v0.338): the two thunks above return the
+    // declared member's result AS the slot's own `i1` / `i32`, so they are
+    // sound only for a pair declared at exactly the `Object` slot's shape —
+    // §8.1's `Equals(other): bool` and `GetHashCode(): int`, the signature
+    // §9.2 names ("at `GetHashCode(): int`"). userValueEqualityPair matches
+    // by name and parameter list alone: a member returning `int?` / `bool?`
+    // (an optional aggregate), or any other type, made the thunk `ret` a
+    // value of the wrong type, and the module failed IR verification even
+    // where no value of the kind was ever boxed. Whether such a member fills
+    // the slot at all is spec-question #6011, so nothing is ruled here: a
+    // pair off the exact shape — a return type other than non-nullable
+    // `bool` / `int`, a generic or `async` member, an `other` carrying a
+    // parameter mode or a default — keeps the structural slots it had before
+    // the declared thunks existed. The LLVM signature is checked last, as a
+    // backstop, so no declaration can reach a thunk it does not type-check
+    // against.
+    auto declaredPairFillsObjectSlots = [&](const sema::TypeSymbol* ts,
+                                            llvm::Function* eqFn,
+                                            llvm::Function* hashFn) -> bool {
+        auto returnsExactly = [&](sema::MethodSymbol* ms,
+                                  sema::PrimitiveType want) -> bool {
+            const sema::TypeRef* rt = sema::methodReturnResolvedType(*ms, ctx_);
+            return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                   !rt->nullable && rt->primitive == want;
+        };
+        bool eqOk = false;
+        bool hashOk = false;
+        for (sema::Symbol* sym : ts->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (!ms) continue;
+            auto mit = methodFns_.find(ms);
+            if (mit == methodFns_.end()) continue;
+            if (mit->second != eqFn && mit->second != hashFn) continue;
+            if (!ms->genericParams.empty() || isAsyncMethod(ms)) return false;
+            if (mit->second == eqFn) {
+                auto* ps = ms->params.size() == 1
+                               ? dynamic_cast<sema::ParameterSymbol*>(
+                                     ms->params[0])
+                               : nullptr;
+                if (!ps || !ps->modifier.empty() || ps->hasDefault)
+                    return false;
+                if (!returnsExactly(ms, sema::PrimitiveType::Bool))
+                    return false;
+                eqOk = true;
+            } else {
+                if (!ms->params.empty() ||
+                    !returnsExactly(ms, sema::PrimitiveType::Int))
+                    return false;
+                hashOk = true;
+            }
+        }
+        if (!eqOk || !hashOk) return false;
+        llvm::FunctionType* ety = eqFn->getFunctionType();
+        llvm::FunctionType* hty = hashFn->getFunctionType();
+        return ety->getReturnType() == i1() && ety->getNumParams() == 2 &&
+               hty->getReturnType() == i32() && hty->getNumParams() == 1;
+    };
 
     for (const sema::TypeSymbol* ts : boxSupersKeys) {
         auto& supers = supersOf[ts];
@@ -45170,7 +45227,8 @@ void Emitter::setupBoxDescriptors() {
             (ts->kind == ast::TypeDeclKind::Record ||
              ts->kind == ast::TypeDeclKind::Choice) &&
             ts->genericParams.empty() &&
-            userValueEqualityPair(ts, declaredEq, declaredHash);
+            userValueEqualityPair(ts, declaredEq, declaredHash) &&
+            declaredPairFillsObjectSlots(ts, declaredEq, declaredHash);
         if (declaredPair) {
             elems[kEqualsSlot]      = boxDeclaredEqualsThunk(ts, declaredEq);
             elems[kGetHashCodeSlot] = boxDeclaredHashThunk(ts, declaredHash);
