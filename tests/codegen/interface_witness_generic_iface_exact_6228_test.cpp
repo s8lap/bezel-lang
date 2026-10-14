@@ -77,3 +77,68 @@ BEZEL_TEST(interface_witness_generic_iface_exact_6228,
         "  return 0; end Main; end P;\n"),
         "1\n9\n1\n9\n");
 }
+
+// Part (2) of #6228: a generic METHOD's own type parameter nested in a builtin
+// generic, called through a non-generic interface. The class declares the
+// two-parameter overload first; the one-argument call must run the
+// one-argument body (the generic-method dispatch matched `Array<V>` against
+// `Array<U>` only at a top-level own `<T>`, so the nested pair found no
+// candidate and the arity pick took the first declared overload).
+// Spec §11.2 (v0.338): the call's arguments select the overload whose
+// parameter types match, and §14.2 / §22.6 match a method's own type parameter
+// at the same position in the override and the interface member.
+BEZEL_TEST(interface_witness_generic_iface_exact_6228,
+           generic_method_own_param_nested_in_builtin_one_arg_call_spec_11_2) {
+    BEZEL_EXPECT_EQ(out(
+        "module M;\n"
+        "interface I method S<U>(x: Array<U>): int; "
+        "method S<U>(x: Array<U>, y: int): int; end I;\n"
+        "class C: I public method S<V>(x: Array<V>, y: int): int => 2; "
+        "public method S<V>(x: Array<V>): int => 1; end C;\n"
+        "class P public static method Main(): int\n"
+        "  using var c := new C(); var i: I := c;\n"
+        "  using var a := new Array<int>();\n"
+        "  Console.WriteLine(i.S<int>(a).ToString());\n"
+        "  return 0; end Main; end P;\n"),
+        "1\n");
+}
+
+// The same shape with a same-arity sibling `Array<string>` overload declared
+// first: the nested `Array<V>` overload is the one `Array<int>` selects.
+BEZEL_TEST(interface_witness_generic_iface_exact_6228,
+           generic_method_own_param_nested_same_arity_sibling_spec_11_2) {
+    BEZEL_EXPECT_EQ(out(
+        "module M;\n"
+        "interface I method S<U>(x: Array<U>): int; end I;\n"
+        "class C: I public method S<V>(x: Array<string>): int => 1; "
+        "public method S<V>(x: Array<V>): int => 2; end C;\n"
+        "class P public static method Main(): int\n"
+        "  using var c := new C(); var i: I := c;\n"
+        "  using var a := new Array<int>();\n"
+        "  Console.WriteLine(i.S<int>(a).ToString());\n"
+        "  return 0; end Main; end P;\n"),
+        "2\n");
+}
+
+// Both arities and both nested shapes on one interface, against the
+// class-typed oracle: 2*10 + 4 - 4 = 20.
+BEZEL_TEST(interface_witness_generic_iface_exact_6228,
+           generic_method_own_param_nested_both_arities_spec_11_2) {
+    BEZEL_EXPECT_EQ(out(
+        "module M;\n"
+        "interface I method S<U>(x: Array<U>): int; "
+        "method S<U>(x: Array<U>, y: int): int; end I;\n"
+        "class C: I public method S<V>(x: Array<string>, y: int): int => 3; "
+        "public method S<V>(x: Array<V>, y: int): int => 4; "
+        "public method S<V>(x: Array<V>): int => 2; "
+        "public method S<V>(x: Array<string>): int => 1; end C;\n"
+        "class P public static method Use(i: I): int\n"
+        "  using var a := new Array<int>();\n"
+        "  return i.S<int>(a) * 10 + i.S<int>(a, 1) - 4;\n"
+        "  end Use;\n"
+        "  public static method Main(): int\n"
+        "  using var c := new C();\n"
+        "  Console.WriteLine(P.Use(c).ToString());\n"
+        "  return 0; end Main; end P;\n"),
+        "20\n");
+}

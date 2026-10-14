@@ -9472,8 +9472,32 @@ private:
             // alone misses same-text overrides; compare structurally.
             if (pa->declType && pb->declType) {
                 if (astTypesEqualForSig(pa->declType, pb->declType)) continue;
-                if (isOwnTypeParamRef(a, pa->declType) &&
-                    isOwnTypeParamRef(b, pb->declType))
+                // fix #6228 (§14.2 / §22.6, v0.338): an own type parameter
+                // nested in a type argument (`S<V>(x: Array<V>)` against an
+                // interface's `S<U>(x: Array<U>)`) is the same kind of thing
+                // at the same position as a top-level one, so the walk
+                // recurses; before, only a top-level own `<T>` matched and
+                // the nested pair fell to the arity pick.
+                auto sameOwnShape = [&](auto& self, const ast::Type* x,
+                                        const ast::Type* y) -> bool {
+                    if (!x || !y) return false;
+                    if (isOwnTypeParamRef(a, x) && isOwnTypeParamRef(b, y))
+                        return true;
+                    if (x->kind != ast::TypeKind::Named ||
+                        y->kind != ast::TypeKind::Named ||
+                        x->nullable != y->nullable || !x->name || !y->name ||
+                        x->name->parts.size() != y->name->parts.size() ||
+                        x->genericArgs.size() != y->genericArgs.size())
+                        return false;
+                    for (size_t k = 0; k < x->name->parts.size(); ++k)
+                        if (x->name->parts[k] != y->name->parts[k]) return false;
+                    for (size_t k = 0; k < x->genericArgs.size(); ++k)
+                        if (!self(self, x->genericArgs[k].get(),
+                                  y->genericArgs[k].get()))
+                            return false;
+                    return true;
+                };
+                if (sameOwnShape(sameOwnShape, pa->declType, pb->declType))
                     continue;
                 return false;
             }
