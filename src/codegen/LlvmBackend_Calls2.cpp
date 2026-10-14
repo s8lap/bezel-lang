@@ -6994,7 +6994,10 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             : slot(s), saved(s) { slot = v; }
         ~CallSiteLocScope() { slot = saved; }
     } callSiteLocScope(callSiteLoc_, call.span.begin);
-    llvm::Value* v = lowerCallDispatch(call);
+    // fix #5943 (§27.7.1, v0.338): `Object`'s members on a function-typed
+    // receiver, decided before the dispatch (no arm there knows the kind).
+    llvm::Value* v = lowerFnValObjectMemberCall(call);
+    if (!v) v = lowerCallDispatch(call);
     // fix #5436 (§15.3 *Parameter passing*, v0.314): emitted AFTER
     // `lowerCallDispatch`, so the value the call read out of each argument slot
     // is already in the callee's frame — the same ordering #4566's two sites

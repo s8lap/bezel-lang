@@ -3036,6 +3036,12 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
     // keeps §18.5's `"null"`.
     if (fieldTy && fieldTy->kind == K::Unit && !fieldTy->nullable)
         return lowerStringLiteral(kUnitToStringSource, false);
+    // fix #5943 (§27.7.1 / §8.5, v0.338): a function value renders as its
+    // `ToString` — the formed type — at every rendering site, through the
+    // cell's object view (a no-op on a value already converted).
+    if (fieldTy && fieldTy->kind == K::Function && !fieldTy->nullable &&
+        val && val->getType()->isPointerTy())
+        return lowerObjectToString(fnValToObjectView(val));
     // per §8.3/§9.1: a NULLABLE REFERENCE field (string?, Object?, nullable
     // class/interface) is a plain `ptr` with a real null. A null field renders
     // as the literal "null" — the same rendering null interpolation uses
@@ -3413,6 +3419,93 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
 // on bz_obj_is_string: a string returns itself (§9.6 string.ToString = this); a
 // class/box dispatches through vtable[kToStringSlot]. A null receiver renders as
 // the literal "null" (the same rendering null interpolation uses).
+// fix #5943 (§27.7.1 "Equality of function values" / §8.1, v0.338). A function
+// type is an `Object` (§8.1), so `Object`'s three members are callable on a
+// function-typed receiver, and §27.7.1 gives `Equals` the function-value
+// equality with a hash that agrees with it. No call arm knew the receiver
+// kind, so the call did not lower (the #2434 / #3079 degrade). The receiver's
+// object view (#5978) carries the shared function-value vtable, whose slots
+// are exactly these three members, so the call is the ordinary `Object`
+// dispatch over that view. Declines (null) for every other shape: a `?.`
+// call, a different member or arity, a receiver that is not function-typed
+// at this instantiation.
+bool Emitter::isFnValObjectMemberCall(const ast::CallExpr& call) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target || !ma->typeArgs.empty()) return false;
+    const bool isHash = ma->member == "GetHashCode" && call.args.empty();
+    const bool isToStr = ma->member == "ToString" && call.args.empty();
+    const bool isEq = ma->member == "Equals" && call.args.size() == 1 &&
+                      call.args[0].value && call.args[0].modifier.empty();
+    if (!isHash && !isToStr && !isEq) return false;
+    const sema::TypeRef* recvTy =
+        resolveTypeParamRef(ctx_.exprType(*ma->target));
+    return recvTy && recvTy->kind == sema::TypeRef::Kind::Function &&
+           !recvTy->nullable;
+}
+
+llvm::Value* Emitter::lowerFnValObjectMemberCall(const ast::CallExpr& call) {
+    if (!isFnValObjectMemberCall(call)) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    const bool isHash = ma->member == "GetHashCode";
+    const bool isToStr = ma->member == "ToString";
+    // A receiver (or argument) that is ITSELF a forming expression —
+    // `Util.Twice.GetHashCode()`, `f.Equals(lambda …)` — yields a fresh cell
+    // nothing binds; these members keep no reference, so it is released
+    // once the answer is computed. `lastStampedFnCell_` is the proof of
+    // freshness: reset here, it can only name a cell stamped while lowering
+    // this operand, and it equals the operand's value only when the operand
+    // is that cell's own forming expression (a read of a local is a load).
+    // A lambda LITERAL here is a temporary exactly as one in an argument
+    // position is (#3778): the same flag moves its captured cells' release
+    // to the captured local's own scope.
+    const bool savedInArg = inArgumentLambda_;
+    auto lowerOperand = [&](const ast::Expr& oe) {
+        const bool lit = dynamic_cast<const ast::LambdaExpr*>(&oe) != nullptr;
+        if (lit) inArgumentLambda_ = true;
+        llvm::Value* ov = lowerExpr(oe);
+        inArgumentLambda_ = savedInArg;
+        // `collectCellFreeEligible` classed the literal non-escaping, so
+        // `lowerLambda` queued its captured cells: arm their scope-end free.
+        if (lit) consumeLastLambdaCapturedCells();
+        return ov;
+    };
+    lastStampedFnCell_ = nullptr;
+    llvm::Value* cell = lowerOperand(*ma->target);
+    if (!cell || !cell->getType()->isPointerTy()) return nullptr;
+    llvm::Value* freshRecv =
+        (cell == static_cast<llvm::Value*>(lastStampedFnCell_)) ? cell
+                                                                : nullptr;
+    llvm::Value* recv = fnValToObjectView(cell);
+    if (isHash || isToStr) {
+        llvm::Value* r = isHash ? lowerObjectGetHashCode(recv)
+                                : lowerObjectToString(recv);
+        if (freshRecv) emitClosureRelease(freshRecv);
+        return r;
+    }
+    const ast::Expr& argE = *call.args[0].value;
+    lastStampedFnCell_ = nullptr;
+    llvm::Value* other = lowerOperand(argE);
+    if (!other) return nullptr;
+    llvm::Value* freshArg =
+        (other == static_cast<llvm::Value*>(lastStampedFnCell_)) ? other
+                                                                 : nullptr;
+    llvm::Value* r = nullptr;
+    if (!other->getType()->isPointerTy()) {
+        // A value-typed argument is no function value: §27.7.1's equality
+        // holds between function values only, so the answer is `false` (the
+        // argument was still evaluated above).
+        r = builder_.getInt1(false);
+    } else {
+        const sema::TypeRef* argTy = resolveTypeParamRef(ctx_.exprType(argE));
+        if (argTy && argTy->kind == sema::TypeRef::Kind::Function)
+            other = fnValToObjectView(other);
+        r = lowerObjectEquals(recv, other);
+    }
+    if (freshArg) emitClosureRelease(freshArg);
+    if (freshRecv) emitClosureRelease(freshRecv);
+    return r;
+}
+
 llvm::Value* Emitter::lowerObjectToString(llvm::Value* recv) {
     if (!recv || !recv->getType()->isPointerTy()) return nullptr;
 

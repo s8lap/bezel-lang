@@ -204,7 +204,12 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // over-release safety.
     llvm::Value* savedBoxMint = lastBoxMint_;
     lastBoxMint_ = nullptr;
+    lastStampedFnCell_ = nullptr;   // #5943: see the Function arm below
     llvm::Value* arg = lowerExpr(*call.args[0].value);
+    // #5943: the argument is itself a forming expression — a fresh function
+    // cell nothing binds (`lowerFnValObjectMemberCall`'s freshness proof).
+    const bool freshFnArg =
+        arg && arg == static_cast<llvm::Value*>(lastStampedFnCell_);
     bool inlineBoxMint = (lastBoxMint_ && arg == lastBoxMint_);
     lastBoxMint_ = savedBoxMint;
     // fix #3104 (§4.7 / §8.5 / stdlib §2.1, v0.255): `lowerExpr` for a unit-
@@ -544,6 +549,14 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             strPtr = emitValueToString(arg, argTy);
             if (!strPtr) return false;
             releaseRender = true;   // a fresh +1 concat accumulator
+        } else if (argTy->kind == sema::TypeRef::Kind::Function &&
+                   !argTy->nullable && arg->getType()->isPointerTy()) {
+            // fix #5943 (§27.7.1 / §8.5, v0.338): a function value prints its
+            // `ToString`, through the one renderer.
+            strPtr = emitValueToString(arg, argTy);
+            if (!strPtr) return false;
+            if (freshFnArg) emitClosureRelease(arg);
+            releaseRender = true;
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
                    argTy->declaration) {
             // fix #2878 (§8.5 / §28.3 / §28.9, v0.240): route the whole Named

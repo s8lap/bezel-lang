@@ -114,6 +114,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         lastFreshFnCell_ = nullptr;
         const sema::TypeRef* formedTy = ctx_.exprType(e);
         stampFnValFormedType(v, formedTy);
+        lastStampedFnCell_ = v;   // #5943: see the member's comment
     }
     // fix #5978: `e` sits where an `Object` is expected (see `fnAtObject_`).
     // After the stamp above, which names the cell base.
@@ -549,6 +550,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 d.unwindOnly = true;
                 d.stringRelease = true;
                 disposeStack_.back().push_back(d);
+                lastStampedFnCell_ = nullptr;   // #5943: see the Function arm
                 ev = lowerExpr(*part.expr);
                 inlineBoxMint = lastBoxMint_;
                 lastBoxMint_ = savedBoxMint;
@@ -970,6 +972,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     if (!pv && rt && rt->kind == sema::TypeRef::Kind::Unit &&
                         !rt->nullable)
                         pv = emitValueToString(ev, rt);
+                    // fix #5943 (§27.7.1 / §18.5, v0.338): a function-typed
+                    // hole renders the value's `ToString`.
+                    if (!pv && rt &&
+                        rt->kind == sema::TypeRef::Kind::Function &&
+                        !rt->nullable) {
+                        // A hole that is itself a forming expression
+                        // (`$"{Util.Twice}"`) holds a fresh cell nothing
+                        // binds: release it once rendered (the freshness
+                        // proof is `lowerFnValObjectMemberCall`'s).
+                        const bool fresh =
+                            ev->getType()->isPointerTy() &&
+                            ev == static_cast<llvm::Value*>(lastStampedFnCell_);
+                        pv = emitValueToString(ev, rt);
+                        if (pv && fresh) emitClosureRelease(ev);
+                    }
                     // fix #2661 (spec §8.5 / §18.5, v0.252): a SPAN or a
                     // `Range<T>` hole. Exactly the #2913 shape one type over:
                     // both lower to a STRUCT whose TypeRef carries no user

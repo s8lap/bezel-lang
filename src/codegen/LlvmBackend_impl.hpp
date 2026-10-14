@@ -3611,6 +3611,11 @@ private:
     // allocated at its address.
     std::unordered_map<std::string, llvm::Constant*> fnSigDescs_;
     llvm::WeakVH lastFreshFnCell_;
+    // fix #5943: the cell `lowerExpr` most recently stamped — i.e. returned
+    // by its own forming expression. A consumer that resets this, lowers an
+    // operand and reads the operand's value back here holds a FRESH, unbound
+    // cell (the producer's single reference) and must release it.
+    llvm::WeakVH lastStampedFnCell_;
     unsigned stringLiteralIdx_ = 0;
 
     // CG8: per-class instance layout (struct of instance fields) and each
@@ -10673,6 +10678,13 @@ private:
     // class/box dispatches through vtable[kToStringSlot]. Returns the result
     // string, or nullptr if the receiver cannot be lowered.
     llvm::Value* lowerObjectToString(llvm::Value* recv);
+    // fix #5943 (§27.7.1 / §8.1, v0.338): `f.GetHashCode()` / `f.Equals(x)` /
+    // `f.ToString()` on a FUNCTION-typed receiver — `Object`'s members, run
+    // on the receiver's object view. Null when `call` is not that shape.
+    // The gate of `lowerFnValObjectMemberCall`, shared with the capture-cell
+    // pre-pass (`collectCellFreeEligible`), which must agree with it.
+    bool isFnValObjectMemberCall(const ast::CallExpr& call);
+    llvm::Value* lowerFnValObjectMemberCall(const ast::CallExpr& call);
 
     // stdlib §3.1 / §8.5 / §18.5: `StringBuilder.ToString()` — concatenate the
     // parts array into one fresh `%bz.string` (rc := 1, a `+1` the consumer

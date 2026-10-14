@@ -40564,9 +40564,25 @@ void Emitter::collectCellFreeEligible(
                 // capture cell leaks per-invocation (no UAF; the envdtor
                 // releases only string/function captures, never a boxed
                 // value-type capture).
+                // fix #5943 (§27.7.1, v0.338): a lambda literal that is the
+                // receiver or the argument of a function value's own
+                // `Equals` / `GetHashCode` / `ToString` is released by
+                // `lowerFnValObjectMemberCall` once the answer is computed —
+                // the IIFE's reasoning, at the same kind of position.
+                const ast::LambdaExpr* fnMemberRecvLam = nullptr;
+                const bool fnMemberCall = em.isFnValObjectMemberCall(*c);
+                if (fnMemberCall)
+                    if (auto* fma = dynamic_cast<const ast::MemberAccessExpr*>(
+                            c->callee.get()))
+                        fnMemberRecvLam =
+                            dynamic_cast<const ast::LambdaExpr*>(
+                                fma->target.get());
                 if (auto* iifeLam =
                         dynamic_cast<const ast::LambdaExpr*>(c->callee.get())) {
                     collectLambdaCaptures(iifeLam, em, /*isNonEscaping=*/true);
+                } else if (fnMemberRecvLam) {
+                    collectLambdaCaptures(fnMemberRecvLam, em,
+                                          /*isNonEscaping=*/true);
                 } else {
                     expr(c->callee.get(), false);
                 }
@@ -40854,7 +40870,8 @@ void Emitter::collectCellFreeEligible(
                     // lowerCall, beside #1073's own call-bounded closure release.
                     if (auto* argLam = dynamic_cast<const ast::LambdaExpr*>(
                             c->args[ai].value.get())) {
-                        if (em.isCallBoundedClosureArgPosition(*c, ai)) {
+                        if (fnMemberCall ||
+                            em.isCallBoundedClosureArgPosition(*c, ai)) {
                             collectLambdaCaptures(argLam, em,
                                                   /*isNonEscaping=*/true);
                             continue;
