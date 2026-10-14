@@ -953,7 +953,7 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
 // deliberately does not name them) stay OUT — they render lowercase or
 // not at all, respectively.
 BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
-    static constexpr std::array<std::string_view, 84> kSnapshot = {
+    static constexpr std::array<std::string_view, 85> kSnapshot = {
         // fix #5186 (spec §8.1, v0.311; stdlib §2.13): the §3.4 reserved
         // keyword primitives whose module is `System`. These two rows
         // mirror the chain-head resolution the table enables
@@ -999,6 +999,8 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
         // §6 System.Threading — sync, atomics, channels, nursery, etc.
         "Mutex", "Lock", "Semaphore", "SemaphoreToken", "Atomic",
         "AtomicInteger", "TaskCompletionSource", "OwningTaskCompletionSource",
+        // fix #6079 (§2.3 L161, v0.338): Task — the Task family's home module.
+        "Task",
         "TaskScope", "CancellationToken", "CancellationTokenSource",
         "Channel", "ChannelSender", "Domain",
         // §7 System.IO — FileStream.

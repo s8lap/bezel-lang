@@ -1328,7 +1328,7 @@ struct BuiltinClassModulePath {
     std::string_view name;
     std::string_view modulePath;
 };
-constexpr std::array<BuiltinClassModulePath, 87> kBuiltinClassModulePaths = {{
+constexpr std::array<BuiltinClassModulePath, 88> kBuiltinClassModulePaths = {{
     // fix #5186 (spec §8.1, v0.311; stdlib §2.13): `Object` and `Type` are the
     // §2.3 Row 1 core types whose module is `System`. The `Object` row is the
     // type-argument rendering (§2.13 rule 3 / `spec85TypeRefQualifiedName`'s
@@ -1439,6 +1439,12 @@ constexpr std::array<BuiltinClassModulePath, 87> kBuiltinClassModulePaths = {{
     // type annotation and therefore not in §8.5's default path.
     // stdlib §6 (System.Threading): the §6.2/§6.3 sync primitives, §6.4
     // atomics, §6.6 task-completion sources, §6.10 nursery, §30.15 channels.
+    // fix #6079 (spec §2.3 L161, v0.338; §2.7 rule 2): the Task family's
+    // qualified spelling `System.Threading.Task` under `import System.Threading;`.
+    // `Task` sits in sema's kClassesOutsideTable (closed-class set), not here,
+    // so without this row `builtinTypeHomeModuleOf("Task")` is empty and the
+    // #6040 qualified-builtin arm in TypeResolution_Names.cpp never matches.
+    {"Task", "System.Threading"},
     {"Mutex", "System.Threading"},
     {"Lock", "System.Threading"},
     {"Semaphore", "System.Threading"},
