@@ -202,6 +202,17 @@ extern "C" int32_t bz_obj_is_fnval(void* o) {
     return word0 == (void*)bz_fnval_vtable ? 1 : 0;
 }
 
+// fix #5826 (§12.7 *Function-typed targets*, v0.338): 1 iff `o` (an
+// Object-typed value, possibly null) is a function value whose formed-type
+// descriptor — word 1 of the object view — is `sig`. Identity of the function
+// type is identity of the descriptor's address.
+extern "C" int32_t bz_fnval_is_type(void* o, void* sig) {
+    if (!bz_obj_is_fnval(o)) return 0;
+    void* own;
+    memcpy(&own, (uint8_t*)o + sizeof(void*), sizeof(void*));
+    return own == sig ? 1 : 0;
+}
+
 static void bz_fnval_obj_dispose(void*) {}
 
 static void* bz_fnval_obj_tostring(void* o) {

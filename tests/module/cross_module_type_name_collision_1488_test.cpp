@@ -256,4 +256,59 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
     BEZEL_EXPECT_EQ(code, 42);
 }
 
+// (d) §12.7 *Function-typed targets* (v0.338) over §2.8.3 rule 3 (issue
+// #5826): a function type's identity includes its slot types' identities, so
+// `(LibA.Tx) -> ()` and `(LibD.Tx) -> ()` are different function types even
+// though both slots are spelled `Tx`. Tested on values formed in the consumer
+// AND on values formed inside each library (the formed-type descriptor is
+// shared across artifacts, so a library-formed value must match the
+// consumer's spelling of its own type and no other).
+// Exit code: 1|2|4|8 for the four matches that must hold; 16..128 for the
+// four that must not.
+BEZEL_TEST(cross_module_type_name_collision_1488,
+          function_type_test_distinguishes_same_named_slot_types_spec_12_7) {
+    int code = buildAndRunTwoLibs(
+        "module LibA; "
+        "public class Tx "
+        "  public constructor() end constructor; "
+        "end Tx; "
+        "public static class HA "
+        "  public static method Take(t: Tx) end Take; "
+        "  public static method Formed(): Object => HA.Take; "
+        "end HA;",
+        "module LibD; "
+        "public class Tx "
+        "  public constructor() end constructor; "
+        "end Tx; "
+        "public static class HD "
+        "  public static method Take(t: Tx) end Take; "
+        "  public static method Formed(): Object => HD.Take; "
+        "end HD;",
+        "module App; "
+        "import LibA; "
+        "import LibD as D; "
+        "class Program "
+        "  public static method Main(): int "
+        "    var ok := 0; "
+        "    var fa: (LibA.Tx) -> () := LibA.HA.Take; "
+        "    var fd: (D.Tx) -> () := D.HD.Take; "
+        "    var oa: Object := fa; "
+        "    var od: Object := fd; "
+        "    if oa is (LibA.Tx) -> () then ok := ok + 1; end; "
+        "    if od is (D.Tx) -> () then ok := ok + 2; end; "
+        "    if oa is (D.Tx) -> () then ok := ok + 16; end; "
+        "    if od is (LibA.Tx) -> () then ok := ok + 32; end; "
+        "    var la: Object := LibA.HA.Formed(); "
+        "    var ld: Object := D.HD.Formed(); "
+        "    if la is (LibA.Tx) -> () then ok := ok + 4; end; "
+        "    if ld is (D.Tx) -> () then ok := ok + 8; end; "
+        "    if la is (D.Tx) -> () then ok := ok + 64; end; "
+        "    if ld is (LibA.Tx) -> () then ok := ok + 128; end; "
+        "    return ok; "
+        "  end Main; "
+        "end Program;",
+        "fn_type_slot_identity");
+    BEZEL_EXPECT_EQ(code, 15);
+}
+
 }  // namespace bezel::module

@@ -1265,6 +1265,10 @@ int32_t bz_closure_value_equals(void* a, void* b);
 void* bz_fnval_as_object(void* c);
 void* bz_fnval_from_object(void* o);
 int32_t bz_obj_is_fnval(void* o);
+// fix #5826 (§12.7 *Function-typed targets*, v0.338): whether an Object-typed
+// value is a function value formed at the function type whose descriptor is
+// `sig` (0 for null and for every non-function value).
+int32_t bz_fnval_is_type(void* o, void* sig);
 int32_t bz_closure_value_hash(void* c);
 
 // Remove the handler with the given token. Idempotent (second call is a

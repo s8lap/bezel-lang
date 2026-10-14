@@ -3350,6 +3350,44 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             if (te.op == "as" && lowerTypeRef(fnTgtTy)->isPointerTy())
                 return llvm::ConstantPointerNull::get(ptrTy());
         }
+        // fix #5826 (§12.7 *Function-typed targets*, v0.338): a FUNCTION-typed
+        // target (written, or a `T` bound to a function type at this
+        // instantiation) "is decided by identity of the function type, not by
+        // §27.1.1's assignability: it succeeds exactly when the operand holds
+        // a function value whose own function type is identical to the
+        // target's". The value's own type is the descriptor stamped at its
+        // formation (word 1 of the object view, `stampFnValFormedType`), which
+        // no retyping rewrites; the target's is `fnSigDescriptorFor`, one
+        // address per identity key (slot types, modifiers, return type — the
+        // type's own nullability dropped), so the test is one pointer
+        // compare. `bz_fnval_is_type` answers 0 for null and for every
+        // operand that is not a function value (a string, a class instance, a
+        // box). `as` yields the function-typed reference — the cell base — or
+        // null (§12.7: "`null` if the cast fails").
+        if (fnTgtTy && fnTgtTy->kind == sema::TypeRef::Kind::Function &&
+            fnOpTy && obj->getType()->isPointerTy() &&
+            (te.op == "is" || te.op == "is not" || te.op == "as")) {
+            const bool opIsFn = fnOpTy->kind == sema::TypeRef::Kind::Function;
+            const bool opIsRefLocation = isObjectOrInterfaceTarget(fnOpTy);
+            if (opIsFn || opIsRefLocation) {
+                llvm::Value* view = opIsFn ? fnValToObjectView(obj) : obj;
+                llvm::Value* hit = builder_.CreateICmpNE(
+                    builder_.CreateCall(
+                        declareC("bz_fnval_is_type", i32(),
+                                 {ptrTy(), ptrTy()}),
+                        {view, fnSigDescriptorFor(fnTgtTy)}),
+                    builder_.getInt32(0), "is.fntype");
+                if (te.op == "is") { releaseFreshBoxTemp(); return hit; }
+                if (te.op == "is not") {
+                    releaseFreshBoxTemp();
+                    return builder_.CreateXor(hit, builder_.getInt1(true));
+                }
+                llvm::Value* cell = opIsFn ? obj : fnValFromObjectView(obj);
+                return builder_.CreateSelect(
+                    hit, cell, llvm::ConstantPointerNull::get(ptrTy()),
+                    "as.fntype");
+            }
+        }
     }
     // fix #3092 narrow (§12.9/§8.6, v0.254): a BARE type-parameter target must
     // be substituted through the active monomorphization so the descriptor
