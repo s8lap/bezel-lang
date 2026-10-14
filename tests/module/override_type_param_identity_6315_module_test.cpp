@@ -77,14 +77,15 @@ struct Outcome6315 {
 // Builds the library object, compiles the importer with its stderr captured
 // (the property under test is the §12.1 diagnostic), and, when it compiles,
 // runs it and captures stdout.
-Outcome6315 buildImporter6315(const std::string& appSrc) {
+Outcome6315 buildImporter6315(const std::string& appSrc,
+                              const char* libSrc = kLib6315) {
     namespace fs = std::filesystem;
     Outcome6315 o;
     auto dir = fs::temp_directory_path();
     std::string stem = unique_stem("bz6315_");
     TempFile6315 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile6315 aObj((dir / (stem + "_a.o")).string());
-    writeSource6315(aSrc.path, kLib6315);
+    writeSource6315(aSrc.path, libSrc);
     {
         bezel::Driver driver;
         o.libBuilt = driver.compileObject(aSrc.path, aObj.path).success;
@@ -139,6 +140,32 @@ Outcome6315 buildImporter6315(const std::string& appSrc) {
 
 std::string app6315(const std::string& cls, const std::string& main = "") {
     return "module App6315;\nimport Lib6315;\n" + cls +
+           "public class Program\n"
+           "  public static method Main(): int\n" + main +
+           "    return 0;\n"
+           "  end Main;\n"
+           "end Program;\n";
+}
+
+// #6321 (§27.8, §12.1, v0.338): an imported base whose member types are
+// spelled through a generic alias of a generic alias. An alias is a pure
+// synonym, so `Id2<X>` and `Id2<Id<X>>` are `X`. Before the fix `Id2<X>`
+// resolved to the inner alias's unsubstituted parameter, and the exported
+// member type carried that stale spelling.
+const char* kLib6321 =
+    "module Lib6321;\n"
+    "type Id<A> := A;\n"
+    "type Id2<T> := Id<T>;\n"
+    "public class AB<X>\n"
+    "  public constructor() end constructor;\n"
+    "  public virtual method M(x: Id2<X>): string => \"bm\";\n"
+    "  public virtual method R(x: X): Id2<X> => x;\n"
+    "  public virtual method R2(x: X): Id2<Id<X>> => x;\n"
+    "  public virtual property [i: Id2<X>]: string => \"bi\";\n"
+    "end AB;\n";
+
+std::string app6321(const std::string& cls, const std::string& main = "") {
+    return "module App6321;\nimport Lib6321;\n" + cls +
            "public class Program\n"
            "  public static method Main(): int\n" + main +
            "    return 0;\n"
@@ -247,6 +274,79 @@ BEZEL_TEST(override_type_param_identity_6315_module,
     BEZEL_EXPECT_TRUE(o.compiled);
     BEZEL_EXPECT_TRUE(o.ran);
     BEZEL_EXPECT_EQ(o.stdoutText, std::string("dm\nnull\nfm\ngnull\n"));
+}
+
+// #6321 (§27.8, §12.1, v0.338): the imported `AB<X>` spells its return types
+// `Id2<X>` and `Id2<Id<X>>`, both of which are `X`, so `Q` overrides them. Before
+// the fix the importer read `Id2<X>` as the alias's stale `T` and reported the
+// return type as a mismatch. The calls go through a derived receiver, because
+// the imported generic base-receiver call is still the #783 limitation.
+BEZEL_TEST(override_type_param_identity_6315_module,
+           imported_alias_of_alias_return_parameter_and_key_accepted_6321_spec_27_8) {
+    Outcome6315 o = buildImporter6315(app6321(
+        "public class E<Q>: AB<Q>\n"
+        "  public constructor() end constructor;\n"
+        "  public override method M(x: Q): string => \"dm\";\n"
+        "  public override method R(x: Q): Q => x;\n"
+        "  public override method R2(x: Q): Q => x;\n"
+        "  public override property [i: Q]: string => \"di\";\n"
+        "end E;\n",
+        "    var e := new E<int>();\n"
+        "    Console.WriteLine(e.M(1));\n"
+        "    Console.WriteLine(e.R(7));\n"
+        "    Console.WriteLine(e.R2(8));\n"
+        "    Console.WriteLine(e[2]);\n"), kLib6321);
+    BEZEL_EXPECT_TRUE(o.libBuilt);
+    BEZEL_EXPECT_TRUE(o.compiled);
+    BEZEL_EXPECT_TRUE(o.stderrText.find("does not match the base member") ==
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(o.ran);
+    BEZEL_EXPECT_EQ(o.stdoutText, std::string("dm\n7\n8\ndi\n"));
+}
+
+// #6321: with the alias read through, the imported `Id2<X>` is still `X`, not the
+// derived class's other parameter `W`, at the return type, the parameter and the
+// index key.
+BEZEL_TEST(override_type_param_identity_6315_module,
+           imported_alias_of_alias_return_other_parameter_rejected_6321_spec_12_1) {
+    Outcome6315 o = buildImporter6315(app6321(
+        "public class E<Q, W>: AB<Q>\n"
+        "  public constructor() end constructor;\n"
+        "  public override method R(x: Q): W => throw new Exception(\"y\");\n"
+        "end E;\n"), kLib6321);
+    BEZEL_EXPECT_TRUE(o.libBuilt);
+    BEZEL_EXPECT_FALSE(o.compiled);
+    BEZEL_EXPECT_TRUE(o.stderrText.find(
+        "override of `R` does not match the base member's return type (§12.1)") !=
+        std::string::npos);
+}
+
+BEZEL_TEST(override_type_param_identity_6315_module,
+           imported_alias_of_alias_param_other_parameter_rejected_6321_spec_12_1) {
+    Outcome6315 o = buildImporter6315(app6321(
+        "public class E<Q, W>: AB<Q>\n"
+        "  public constructor() end constructor;\n"
+        "  public override method M(x: W): string => \"dm\";\n"
+        "end E;\n"), kLib6321);
+    BEZEL_EXPECT_TRUE(o.libBuilt);
+    BEZEL_EXPECT_FALSE(o.compiled);
+    BEZEL_EXPECT_TRUE(o.stderrText.find(
+        "override of `M` does not match the base member's parameter types (§12.1)") !=
+        std::string::npos);
+}
+
+BEZEL_TEST(override_type_param_identity_6315_module,
+           imported_alias_of_alias_key_other_parameter_rejected_6321_spec_12_1) {
+    Outcome6315 o = buildImporter6315(app6321(
+        "public class E<Q, W>: AB<Q>\n"
+        "  public constructor() end constructor;\n"
+        "  public override property [i: W]: string => \"di\";\n"
+        "end E;\n"), kLib6321);
+    BEZEL_EXPECT_TRUE(o.libBuilt);
+    BEZEL_EXPECT_FALSE(o.compiled);
+    BEZEL_EXPECT_TRUE(o.stderrText.find(
+        "override of `indexer` does not match the base member's index parameter "
+        "types (§12.1)") != std::string::npos);
 }
 
 }  // namespace bezel::module

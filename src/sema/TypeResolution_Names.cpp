@@ -2837,7 +2837,8 @@ TypeRef* Resolver::substituteAliasGenericArgs(
     return sema::substituteGenericArgs(
         tr,
         sema::SubstArgs{ctx_, subst, useLoc,
-                        /*validateNestedInlineArrays=*/true});
+                        /*validateNestedInlineArrays=*/true,
+                        /*aliasChainParams=*/true});
 }
 
 // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (fix #2735; family F12 of the

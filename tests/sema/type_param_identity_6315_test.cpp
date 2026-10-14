@@ -875,3 +875,353 @@ end Program;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "em\nem\nem\n");
 }
+
+// #6321 (§27.8, §12.1, v0.338): an alias is a pure synonym, so a generic alias
+// of a generic alias (`type Id2<T> := Id<T>`) at `X` is `X`. Before the fix,
+// resolving `Id2<X>` left the inner alias's parameter unsubstituted: the node
+// was spelled `Id<T>` and carried the stale head `T`. The #6315 return-type
+// spelling walk then reported a valid override as a mismatch. `Id2<int>` was
+// also not `int`. The rows below are the issue's repros, then the parameter and
+// index-key sites, then the #6315 rejects read through the alias.
+
+// The issue repro: the base returns `Id2<X>`, the override returns `Q`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_return_bare_parameter_accepted_6321_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+type Nl<T> := T?;
+public abstract class B<X>
+  public constructor() end constructor;
+  public abstract method R(): Id2<X>;
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method R(): Q => throw new Exception("x");
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<string>();
+    Console.WriteLine("ok");
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ok\n");
+}
+
+// The issue repro: the base returns `Id2<Id<X>>`, the override returns `Q`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_nested_return_bare_parameter_accepted_6321_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+type Nl<T> := T?;
+public abstract class B<X>
+  public constructor() end constructor;
+  public abstract method R(): Id2<Id<X>>;
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method R(): Q => throw new Exception("x");
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<string>();
+    Console.WriteLine("ok");
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ok\n");
+}
+
+// Control: the alias on both sides (accepted before the fix as well).
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_return_both_sides_accepted_6321_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+type Nl<T> := T?;
+public abstract class B<X>
+  public constructor() end constructor;
+  public abstract method R(): Id2<X>;
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method R(): Id2<Q> => throw new Exception("x");
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<string>();
+    Console.WriteLine("ok");
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ok\n");
+}
+
+// Control: the nested alias on both sides.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_nested_return_both_sides_accepted_6321_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+type Nl<T> := T?;
+public abstract class B<X>
+  public constructor() end constructor;
+  public abstract method R(): Id2<Id<X>>;
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method R(): Id2<Id<Q>> => throw new Exception("x");
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<string>();
+    Console.WriteLine("ok");
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ok\n");
+}
+
+// A base-receiver call reaches the override, and the `Id2<X>` return carries the string. Before the fix this was rejected, and the same program accepted at the base checkout printed the string pointer as an integer.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_return_value_through_base_receiver_6321_spec_27_8) {
+    auto r = runAot(R"(
+module M;
+type Id<A> := A;
+type Id2<T> := Id<T>;
+type Id3<U> := Id2<U>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method R(x: X): Id2<X> => x;
+  public virtual method R3(x: X): Id3<X> => x;
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method R(x: Q): Q
+    Console.WriteLine("derived");
+    return x;
+  end R;
+  public override method R3(x: Q): Q
+    Console.WriteLine("derived3");
+    return x;
+  end R3;
+end E;
+public class Program
+  public static method Main(): int
+    var b: B<string> := new E<string>();
+    Console.WriteLine(b.R("a"));
+    Console.WriteLine(b.R3("c"));
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "derived\na\nderived3\nc\n");
+}
+
+// The parameter and index-key sites: `Id2<X>` and `Id2<Id<X>>` are `X`, so `Q` overrides them (rejected before the fix). The calls go through the derived receiver. A base-receiver call at an aliased parameter reaches the base body, the separate #6323.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_parameter_and_index_key_accepted_6321_spec_27_8) {
+    auto r = runAot(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method M(x: Id2<X>): string => "bm";
+  public virtual method N(x: Id2<Id<X>>): string => "bn";
+  public virtual property [i: Id2<X>]: string => "bi";
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method M(x: Q): string => "dm";
+  public override method N(x: Q): string => "dn";
+  public override property [i: Q]: string => "di";
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<int>();
+    Console.WriteLine(e.M(1));
+    Console.WriteLine(e.N(2));
+    Console.WriteLine(e[3]);
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "dm\ndn\ndi\n");
+}
+
+// `Id2<int>` is `int` and `Id2<string>` is `string` at a field, a parameter and a local. Before the fix both were the unbound `T`, and `+` on them was rejected.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_value_type_is_the_aliased_type_6321_spec_27_8) {
+    auto r = runAot(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class C
+  public constructor() end constructor;
+  public F: Id2<int> := 0;
+  public method Add(x: Id2<int>, y: Id2<string>): string => y + (x + 1).ToString();
+end C;
+public class Program
+  public static method Main(): int
+    var c := new C();
+    c.F := 41;
+    var v: Id2<long> := 5;
+    Console.WriteLine(c.Add(c.F, "v="));
+    Console.WriteLine(v + 1);
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "v=42\n6\n");
+}
+
+// #6315 through the alias: `Id2<X>` is `X`, i.e. `Q`, not the class's other parameter `W`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_return_other_parameter_rejected_6321_spec_12_1) {
+    auto r = runAot(std::string(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method R(): Id2<X> => throw new Exception("x");
+end B;
+public class E<Q, W>: B<Q>
+  public constructor() end constructor;
+  public override method R(): W => throw new Exception("y");
+end E;
+)") + kMain);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "override of `R` does not match the base member's return type (§12.1)"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// `Array<Id2<Id<X>>>` is `Array<Q>`, not `Array<W>`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_nested_return_other_parameter_rejected_6321_spec_12_1) {
+    auto r = runAot(std::string(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method R(): Array<Id2<Id<X>>> => throw new Exception("x");
+end B;
+public class E<Q, W>: B<Q>
+  public constructor() end constructor;
+  public override method R(): Array<W> => throw new Exception("y");
+end E;
+)") + kMain);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "override of `R` does not match the base member's return type (§12.1)"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// The alias on the derived side: `Id2<W>` is `W`, not `X` bound to `Q`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_derived_side_return_other_parameter_rejected_6321_spec_12_1) {
+    auto r = runAot(std::string(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method R(): X => throw new Exception("x");
+end B;
+public class E<Q, W>: B<Q>
+  public constructor() end constructor;
+  public override method R(): Id2<W> => throw new Exception("y");
+end E;
+)") + kMain);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "override of `R` does not match the base member's return type (§12.1)"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// The parameter site: `Id2<X>` is not `W`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_param_other_parameter_rejected_6321_spec_12_1) {
+    auto r = runAot(std::string(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method M(x: Id2<X>): int => 1;
+end B;
+public class E<Q, W>: B<Q>
+  public constructor() end constructor;
+  public override method M(x: W): int => 2;
+end E;
+)") + kMain);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "override of `M` does not match the base member's parameter types (§12.1)"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// `(Id2<X>) -> int` is `(Q) -> int`, not `(W) -> int`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_function_param_other_parameter_rejected_6321_spec_12_1) {
+    auto r = runAot(std::string(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method M(f: (Id2<X>) -> int): int => 1;
+end B;
+public class E<Q, W>: B<Q>
+  public constructor() end constructor;
+  public override method M(f: (W) -> int): int => 2;
+end E;
+)") + kMain);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "override of `M` does not match the base member's parameter types (§12.1)"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// The index-key site: `Id2<Id<X>>` is not `W`.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_index_key_other_parameter_rejected_6321_spec_12_1) {
+    auto r = runAot(std::string(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual property [i: Id2<Id<X>>]: int => 1;
+end B;
+public class E<Q, W>: B<Q>
+  public constructor() end constructor;
+  public override property [i: W]: int => 2;
+end E;
+)") + kMain);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "override of `indexer` does not match the base member's index parameter types (§12.1)"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}

@@ -57,6 +57,13 @@ struct SubstArgs {
     const std::unordered_map<std::string_view, TypeRef*>& subst;
     SourceLocation useLoc{};
     bool validateNestedInlineArrays = false;
+    // #6321 (§27.8, v0.338): alias substitution only. A generic alias's
+    // body that names another alias (`type Id2<T> := Id<T>`) resolves its
+    // inner alias to a bare type-parameter node whose `astNode` is the inner
+    // use site (`Id<T>`), so the syntactic head (`Id`) does not name the
+    // parameter; the parameter's name is in `aliasResolvedHead` (`T`). When
+    // true, such a node is also looked up by `aliasResolvedHead`.
+    bool aliasChainParams = false;
 };
 
 // The single authority. See SubstArgs above for parameter semantics.

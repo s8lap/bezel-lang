@@ -7,6 +7,7 @@
 //   - ExprTC::substituteGenericFieldType       (src/sema/ExprTypecheck.cpp)
 
 #include "sema/SubstArgs.hpp"
+#include "sema/TypeResolution.hpp"
 
 #include "ast/Node.hpp"
 #include "support/Diagnostic.hpp"
@@ -57,11 +58,20 @@ std::string_view paramHead(const TypeRef* sub) {
 TypeRef* applyBareParamSubst(const TypeRef* sub,
                               const std::unordered_map<std::string_view, TypeRef*>& subst,
                               SemaContext& ctx,
-                              SourceLocation useLoc) {
+                              SourceLocation useLoc,
+                              bool aliasChainParams) {
     if (!sub || sub->kind != TypeRef::Kind::Named || sub->declaration) return nullptr;
     std::string_view head = paramHead(sub);
-    if (head.empty()) return nullptr;
-    auto it = subst.find(head);
+    auto it = head.empty() ? subst.end() : subst.find(head);
+    // #6321 (§27.8, v0.338): an alias-of-alias body's parameter node carries
+    // the inner alias's use site as `astNode`; its parameter name is its
+    // `aliasResolvedHead` (see SubstArgs::aliasChainParams). A built-in head
+    // (`type E := Exception`) is not a parameter of this alias.
+    if (it == subst.end() && aliasChainParams && sub->astNode &&
+        sub->genericArgs.empty() && !sub->aliasResolvedHead.empty() &&
+        sub->aliasResolvedHead != head &&
+        !isBuiltinTypeName(sub->aliasResolvedHead))
+        it = subst.find(sub->aliasResolvedHead);
     if (it == subst.end()) return nullptr;
     TypeRef* substituted = it->second;
     if (sub->nullable && substituted && !substituted->nullable) {
@@ -98,7 +108,8 @@ TypeRef* substituteGenericArgs(TypeRef* tr, const SubstArgs& args) {
             // (param name not in subst), fall through to the recursive walk —
             // the parameter may be a non-Named shape (rare) or a NAME not in
             // this particular subst (e.g. a different generic's parameter).
-            if (TypeRef* substituted = applyBareParamSubst(tr, args.subst, args.ctx, args.useLoc)) {
+            if (TypeRef* substituted = applyBareParamSubst(tr, args.subst, args.ctx, args.useLoc,
+                                                           args.aliasChainParams)) {
                 return substituted;
             }
             // Not a bare-parameter reference — recurse into genericArgs so
