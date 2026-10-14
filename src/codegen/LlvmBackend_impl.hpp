@@ -23855,8 +23855,25 @@ private:
     // (vtable[0]), and for each candidate class call the monomorphized override
     // it most-derives, defaulting to the static class's own specialization.
     // Returns the call result, or nullptr if this path does not apply.
-    llvm::Value* emitVirtualGenericDispatch(sema::MethodSymbol* ms,
-                                            std::vector<llvm::Value*>& args);
+    // fix #6307 (§11.2 / §12.1, v0.338): `ifaceArgs`, when given, are the
+    // concrete arguments of the interface instantiation the receiver is
+    // statically typed at (`I<int>`; empty for a non-generic interface). An
+    // interface-parent dispatch then gives every implementer instantiation
+    // whose class implements exactly that instantiation its own branch, and
+    // a receiver matching none traps.
+    llvm::Value* emitVirtualGenericDispatch(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        const std::vector<const sema::TypeRef*>* ifaceArgs = nullptr);
+    // fix #6307: the instantiations of interface `iface` that `t` implements
+    // through its base clauses (class chain and interface inheritance), each
+    // argument read through `m` (`t`'s own parameters -> their arguments).
+    // `unknown` is set when a base clause on the way records no arguments.
+    void collectIfaceInstantiations(
+        const sema::TypeSymbol* t,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>& m,
+        const sema::TypeSymbol* iface,
+        std::vector<std::vector<const sema::TypeRef*>>& out, bool& unknown,
+        int depth = 0);
 
     // CG-generic: emit a method body inline with the current genericSubst_
     // active, binding `this` and the parameters to the actual arguments.

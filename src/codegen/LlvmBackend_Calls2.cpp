@@ -16950,7 +16950,72 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 instanceLayoutDiffersFromErasedTemplate(ms->parent))
                 genericMethodBound = true;
             if (genericMethodBound) {
-                llvm::Value* r = emitVirtualGenericDispatch(ms, args);
+                // fix #6307 (§11.2 / §12.1, v0.338): the interface
+                // instantiation the receiver is typed at (`I<int>`, or the
+                // one a sub-interface `K<int>` names); empty for a
+                // non-generic interface. Unknown -> the dispatch keeps its
+                // older shape.
+                std::vector<const sema::TypeRef*> ifaceArgs;
+                bool haveIfaceArgs = false;
+                if (isIfaceMethod) {
+                    const sema::TypeSymbol* iface = ms->parent;
+                    if (sema::genericParamNames(iface).empty()) {
+                        haveIfaceArgs = true;
+                    } else if (ifaceRecvTy) {
+                        // Written concretely: read as is. (Not through
+                        // genericSubstSemaTy_: that is the CALLEE's
+                        // environment here, keyed by the interface's names.)
+                        const sema::TypeRef* rt = ifaceRecvTy;
+                        if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                            rt->declaration) {
+                            std::vector<std::vector<const sema::TypeRef*>> got;
+                            if (rt->declaration == iface) {
+                                got.emplace_back(rt->genericArgs.begin(),
+                                                 rt->genericArgs.end());
+                            } else {
+                                const sema::TypeSymbol* rd = rt->declaration;
+                                const std::vector<std::string_view> rn =
+                                    sema::genericParamNames(rd);
+                                std::unordered_map<std::string_view,
+                                                   const sema::TypeRef*> m;
+                                if (rn.size() == rt->genericArgs.size())
+                                    for (std::size_t k = 0; k < rn.size(); ++k)
+                                        m[rn[k]] = rt->genericArgs[k];
+                                bool unk = false;
+                                if (rn.size() == rt->genericArgs.size())
+                                    collectIfaceInstantiations(rd, m, iface,
+                                                               got, unk);
+                                if (unk) got.clear();
+                            }
+                            if (got.size() == 1 && descArgsConcrete(got[0])) {
+                                ifaceArgs = std::move(got[0]);
+                                haveIfaceArgs = true;
+                            }
+                        }
+                        // The receiver's arguments name the CALLER's
+                        // parameters (`i: I<Z>` in `G<Z>.Run`), which the
+                        // callee environment lowerCall installed for this
+                        // call no longer binds; that environment binds the
+                        // interface's own parameters to them instead.
+                        if (!haveIfaceArgs) {
+                            std::vector<const sema::TypeRef*> env;
+                            for (std::string_view n :
+                                 sema::genericParamNames(iface)) {
+                                auto it = genericSubstSemaTy_.find(n);
+                                if (it == genericSubstSemaTy_.end()) break;
+                                env.push_back(it->second);
+                            }
+                            if (env.size() ==
+                                    sema::genericParamNames(iface).size() &&
+                                descArgsConcrete(env)) {
+                                ifaceArgs = std::move(env);
+                                haveIfaceArgs = true;
+                            }
+                        }
+                    }
+                }
+                llvm::Value* r = emitVirtualGenericDispatch(
+                    ms, args, haveIfaceArgs ? &ifaceArgs : nullptr);
                 if (r != nullptr || diverged_) {
                     return r;  // emitVirtualGenericDispatch runs emitPendingCheck per call
                 }
@@ -18590,8 +18655,44 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
 // We load the receiver's runtime descriptor (vtable[0] = td$C), compare it
 // against each candidate class's descriptor global, and call the monomorphized
 // specialization of the override/implementation that candidate runs.
-llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
-                                        std::vector<llvm::Value*>& args) {
+void Emitter::collectIfaceInstantiations(
+    const sema::TypeSymbol* t,
+    const std::unordered_map<std::string_view, const sema::TypeRef*>& m,
+    const sema::TypeSymbol* iface,
+    std::vector<std::vector<const sema::TypeRef*>>& out, bool& unknown,
+    int depth) {
+    if (!t || depth > 64) return;
+    for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+        const sema::TypeSymbol* b = t->baseTypes[bi];
+        if (!b) continue;
+        const sema::TypeRef* ref =
+            bi < t->baseTypeRefs.size() ? t->baseTypeRefs[bi] : nullptr;
+        const std::vector<std::string_view> names = sema::genericParamNames(b);
+        std::vector<const sema::TypeRef*> a;
+        std::unordered_map<std::string_view, const sema::TypeRef*> bm;
+        if (!names.empty()) {
+            if (!ref || ref->genericArgs.size() != names.size()) {
+                unknown = true;
+                continue;
+            }
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                const sema::TypeRef* x = substituteTypeRefLocal(
+                    ref->genericArgs[i], m);
+                a.push_back(x);
+                bm[names[i]] = x;
+            }
+        }
+        if (b == iface) {
+            out.push_back(std::move(a));
+            continue;
+        }
+        collectIfaceInstantiations(b, bm, iface, out, unknown, depth + 1);
+    }
+}
+
+llvm::Value* Emitter::emitVirtualGenericDispatch(
+        sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
+        const std::vector<const sema::TypeRef*>* ifaceArgs) {
     if (args.empty() || !args[0]->getType()->isPointerTy()) return nullptr;
     const sema::TypeSymbol* staticType = ms->parent;
     if (!staticType) return nullptr;
@@ -18653,6 +18754,12 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // generic below the static type.
     std::vector<llvm::Constant*> defaultDescs;
     bool defaultGeneric = false;
+    // fix #6307: an interface-parent dispatch at a known instantiation names
+    // every implementer by a branch; its default path traps.
+    bool ifaceTrapDefault = false;
+    // fix #6307: the generic implementers that may hold an instantiation of
+    // `I<A>` the scan below cannot name (one built only inside generic code).
+    std::vector<const sema::TypeSymbol*> ifaceOpenFamilies;
 
     // Every class whose instances could reach the call: the module's own
     // classes, then (fix #5124, §11 override semantics / §2.8.3 rule 4,
@@ -18828,7 +18935,271 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             }
             branches.push_back(std::move(b));
         }
-    } else {
+    } else if (ifaceArgs) {
+        // fix #6307 (§11.2 / §12.1, v0.338): INTERFACE parent, receiver typed
+        // at a known instantiation `I<A>`. §11.2: "the implementing member
+        // must match the interface member's signature exactly — same name,
+        // same parameter types (after substituting the interface's type
+        // arguments), …", so the body a receiver runs depends on the
+        // instantiation of `I` its class implements, not only on the class;
+        // §12.1 makes the most-derived override of that member the one that
+        // runs. Every implementer instantiation is therefore given its own
+        // branch, keyed by its own descriptor:
+        //   * a non-generic class: its shared descriptor; the witness is the
+        //     member whose parameters equal `I.Q`'s under `T := A`, read
+        //     through the chain into the class's scope (a class listing
+        //     `I<int>` and `I<string>` has one witness per instantiation, and
+        //     `C: B<int>` overriding `B<T>.Q` is matched through `B<int>`);
+        //   * a generic class: each concrete instantiation that implements
+        //     `I<A>`, named by its per-instantiation descriptor (#1843):
+        //     those the base clauses pin from `A` (`B<T>: I<T>` at `I<int>`
+        //     is `B<int>`) and those the program resolves elsewhere
+        //     (`B<bool, int>` for `B<S, T>: I<T>`).
+        // The old shape compared only shared descriptors, which a generic
+        // receiver never carries, and ran the LAST implementer's body for
+        // every receiver no branch matched: right or wrong by declaration
+        // order. A receiver no branch matches is an instantiation this call
+        // site could not enumerate (one built only inside generic code, at a
+        // parameter `I<A>` does not pin). When exactly one generic
+        // implementer can hold such an instantiation the default runs that
+        // class's own body (see `ifaceOpenFamilies`); otherwise the default
+        // traps with a message rather than running another class's body.
+        const std::vector<std::string_view> ifNames =
+            sema::genericParamNames(staticType);
+        if (ifNames.size() == ifaceArgs->size()) {
+            const std::string wantKey = descIdentityKey(staticType, *ifaceArgs);
+            using CMap =
+                std::unordered_map<std::string_view, const sema::TypeRef*>;
+            SlotSubst ifSubst;
+            if (!ifNames.empty()) {
+                SlotSubst::Frame f;
+                f.names = ifNames;
+                f.args = *ifaceArgs;
+                ifSubst.frames.push_back(std::move(f));
+            }
+            // Bind `c`'s parameters by matching a pattern written in `c`'s
+            // scope against a concrete type. Loose: the instantiation it
+            // proposes is re-checked below against the exact `I<A>`.
+            auto unify = [&](auto& self, const sema::TypeSymbol* c,
+                             const sema::TypeRef* p, const sema::TypeRef* x,
+                             CMap& bind) -> bool {
+                if (!p || !x) return false;
+                std::string_view nm = slotBareParamName(p);
+                if (!nm.empty() && !p->nullable) {
+                    for (std::string_view gp : sema::genericParamNames(c)) {
+                        if (gp != nm) continue;
+                        auto it = bind.find(gp);
+                        if (it == bind.end()) {
+                            bind[gp] = x;
+                            return true;
+                        }
+                        return typeRefIdentityKey(it->second) ==
+                               typeRefIdentityKey(x);
+                    }
+                }
+                if (p->kind != x->kind || p->nullable != x->nullable)
+                    return false;
+                if (p->kind == sema::TypeRef::Kind::Named) {
+                    if (p->declaration != x->declaration) return false;
+                    if (!p->declaration && p->headName() != x->headName())
+                        return false;
+                    if (p->genericArgs.size() != x->genericArgs.size())
+                        return false;
+                    for (std::size_t k = 0; k < p->genericArgs.size(); ++k)
+                        if (!self(self, c, p->genericArgs[k],
+                                  x->genericArgs[k], bind))
+                            return false;
+                    return true;
+                }
+                return typeRefIdentityKey(p) == typeRefIdentityKey(x);
+            };
+            // The witness of `I<A>.ms` on `c` at the class-parameter binding
+            // `own` (empty for a non-generic `c`): the most-derived member
+            // whose parameters equal `ms`'s, each side read through its own
+            // concrete frame; `declMap` receives the declarer's binding.
+            auto witnessAt = [&](const sema::TypeSymbol* c, const CMap& own,
+                                 CMap& declMap) -> sema::MethodSymbol* {
+                CMap m = own;
+                for (const sema::TypeSymbol* t = c; t;) {
+                    SlotSubst cs;
+                    const std::vector<std::string_view> tn =
+                        sema::genericParamNames(t);
+                    bool bound = true;
+                    if (!tn.empty()) {
+                        SlotSubst::Frame f;
+                        f.names = tn;
+                        for (std::string_view n : tn) {
+                            auto it = m.find(n);
+                            if (it == m.end() || !it->second) {
+                                bound = false;
+                                break;
+                            }
+                            f.args.push_back(it->second);
+                        }
+                        cs.frames.push_back(std::move(f));
+                    }
+                    if (bound)
+                        for (sema::Symbol* sym : t->members) {
+                            auto* cand = dynamic_cast<sema::MethodSymbol*>(sym);
+                            if (!cand || isStaticMethod(cand) ||
+                                cand->name != ms->name ||
+                                cand->genericParams.size() !=
+                                    ms->genericParams.size() ||
+                                cand->params.size() != ms->params.size() ||
+                                !methodFns_.count(cand))
+                                continue;
+                            if (methodSigParamsMatchUnder(cand, &cs, ms,
+                                                          &ifSubst)) {
+                                declMap = m;
+                                return cand;
+                            }
+                        }
+                    const sema::TypeSymbol* base = baseClassOf(t);
+                    if (!base) break;
+                    CMap bm;
+                    const std::vector<std::string_view> bn =
+                        sema::genericParamNames(base);
+                    if (!bn.empty()) {
+                        const sema::TypeRef* ref = baseTypeRefOf(t, base);
+                        if (!ref || ref->genericArgs.size() != bn.size())
+                            return nullptr;
+                        for (std::size_t i = 0; i < bn.size(); ++i)
+                            bm[bn[i]] =
+                                substituteTypeRefLocal(ref->genericArgs[i], m);
+                    }
+                    m = std::move(bm);
+                    t = base;
+                }
+                return nullptr;
+            };
+            // The binding of `impl`'s declarer on `c`'s chain at `own`.
+            auto declarerMap = [&](const sema::TypeSymbol* c, const CMap& own,
+                                   const sema::TypeSymbol* decl,
+                                   CMap& out) -> bool {
+                CMap m = own;
+                for (const sema::TypeSymbol* t = c; t;) {
+                    if (t == decl) {
+                        out = m;
+                        return true;
+                    }
+                    const sema::TypeSymbol* base = baseClassOf(t);
+                    if (!base) break;
+                    CMap bm;
+                    const std::vector<std::string_view> bn =
+                        sema::genericParamNames(base);
+                    if (!bn.empty()) {
+                        const sema::TypeRef* ref = baseTypeRefOf(t, base);
+                        if (!ref || ref->genericArgs.size() != bn.size())
+                            return false;
+                        for (std::size_t i = 0; i < bn.size(); ++i)
+                            bm[bn[i]] =
+                                substituteTypeRefLocal(ref->genericArgs[i], m);
+                    }
+                    m = std::move(bm);
+                    t = base;
+                }
+                return false;
+            };
+            std::vector<Branch> all;
+            for (const sema::TypeSymbol* c : candidateClasses) {
+                if (!implementsIface(c, staticType)) continue;
+                auto sit = descArray_.find(c);
+                if (sit == descArray_.end()) continue;
+                const std::vector<std::string_view> cn =
+                    sema::genericParamNames(c);
+                // The instantiations of `c` to consider, by identity key.
+                std::map<std::string, std::vector<const sema::TypeRef*>> insts;
+                if (cn.empty()) {
+                    insts.emplace(std::string(), std::vector<const sema::TypeRef*>{});
+                } else {
+                    std::vector<std::vector<const sema::TypeRef*>> pats;
+                    bool unk = false;
+                    collectIfaceInstantiations(c, {}, staticType, pats, unk);
+                    bool mayMatch = unk;
+                    for (const auto& pat : pats) {
+                        if (pat.size() != ifaceArgs->size()) continue;
+                        CMap bind;
+                        bool ok = true;
+                        for (std::size_t k = 0; ok && k < pat.size(); ++k)
+                            ok = unify(unify, c, pat[k], (*ifaceArgs)[k], bind);
+                        if (!ok) continue;
+                        mayMatch = true;
+                        std::vector<const sema::TypeRef*> a;
+                        for (std::string_view n : cn) {
+                            auto it = bind.find(n);
+                            if (it == bind.end()) { ok = false; break; }
+                            a.push_back(it->second);
+                        }
+                        if (ok && descArgsConcrete(a))
+                            insts.emplace(descIdentityKey(c, a), std::move(a));
+                    }
+                    if (mayMatch) ifaceOpenFamilies.push_back(c);
+                    for (const auto& [node, tr] : ctx_.allResolvedTypes()) {
+                        if (!tr || tr->kind != sema::TypeRef::Kind::Named ||
+                            tr->declaration != c ||
+                            tr->genericArgs.size() != cn.size())
+                            continue;
+                        std::vector<const sema::TypeRef*> a(
+                            tr->genericArgs.begin(), tr->genericArgs.end());
+                        if (!descArgsConcrete(a)) continue;
+                        insts.emplace(descIdentityKey(c, a), std::move(a));
+                    }
+                }
+                for (auto& [key, a] : insts) {
+                    CMap own;
+                    for (std::size_t k = 0; k < cn.size(); ++k) own[cn[k]] = a[k];
+                    std::vector<std::vector<const sema::TypeRef*>> got;
+                    bool unk = false;
+                    collectIfaceInstantiations(c, own, staticType, got, unk);
+                    bool match = false;
+                    for (const auto& g : got)
+                        if (g.size() == ifaceArgs->size() &&
+                            descIdentityKey(staticType, g) == wantKey)
+                            match = true;
+                    Branch b{c, nullptr};
+                    CMap declMap;
+                    if (match) b.impl = witnessAt(c, own, declMap);
+                    if (!match && !(unk && cn.empty()))
+                        continue;  // never the dynamic type of an `I<A>`
+                    if (!b.impl) {
+                        // Not comparable (an imported base without recorded
+                        // arguments, a widened `T?` parameter): the arity /
+                        // signature pick the dispatch has always made. A
+                        // generic class needs a binding for its declarer, so
+                        // it falls to the trap instead.
+                        b.impl = mostDerived(c);
+                        if (!b.impl) continue;
+                        if (!cn.empty() &&
+                            !declarerMap(c, own, b.impl->parent, declMap))
+                            continue;
+                    }
+                    if (!cn.empty()) {
+                        llvm::GlobalVariable* pid = instanceDescriptorFor(c, a);
+                        if (!pid || pid == sit->second) continue;
+                        b.desc = pid;
+                    }
+                    if (b.impl->parent &&
+                        !sema::genericParamNames(b.impl->parent).empty()) {
+                        if (declMap.empty() &&
+                            !declarerMap(c, own, b.impl->parent, declMap))
+                            declMap.clear();
+                        for (const auto& [nm, tr] : declMap) {
+                            if (!tr) continue;
+                            b.substLlvm[nm] = lowerTypeRef(tr);
+                            b.substSema[nm] = tr;
+                        }
+                        b.hasSubst = !b.substSema.empty();
+                    }
+                    all.push_back(std::move(b));
+                }
+            }
+            if (!all.empty() || !ifaceOpenFamilies.empty()) {
+                branches = std::move(all);
+                ifaceTrapDefault = true;
+            }
+        }
+    }
+    if (ifaceParent && !ifaceTrapDefault) {
         // INTERFACE parent: there is no instantiable static type, so every
         // implementer class must be matched by its OWN descriptor (two classes
         // may share an inherited implementation but still need distinct branches,
@@ -18849,7 +19220,8 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         all.pop_back();
         branches = std::move(all);
     }
-    if (!defaultImpl) return nullptr;  // no implementation found — bail safely
+    if (!defaultImpl && !ifaceTrapDefault)
+        return nullptr;  // no implementation found — bail safely
 
     // fix #5214 (§11 / §12.1 / §14.2 / §2.8.3 rule 4, v0.313): the
     // LATER-MODULE guard. The candidate scan above is closed-world: it sees
@@ -18982,6 +19354,28 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // applies (an INTERNAL degrade while any constraint-route specialization
     // is built becomes this located error). An implementation WITHOUT its
     // body is still refused.
+    // fix #6307: when exactly ONE generic implementer may hold an
+    // instantiation no branch names, a receiver reaching the default can only
+    // be an instance of that class (every other implementer, and every
+    // instantiation the scan named, has its own branch; the later-module
+    // guard is off). It runs that class's own implementation, compiled under
+    // the call's environment as the dispatch always compiled its default;
+    // two or more such classes cannot be told apart and trap.
+    sema::MethodSymbol* trapShapeImpl = nullptr;
+    if (ifaceTrapDefault && !descGuard && ifaceOpenFamilies.size() == 1) {
+        if (sema::MethodSymbol* fam = mostDerived(ifaceOpenFamilies[0])) {
+            defaultImpl = fam;
+            defaultGeneric = true;
+            ifaceTrapDefault = false;
+        }
+    }
+    // A trapping dispatch with no branch at all takes its call shape from an
+    // open family's implementation (never called).
+    if (ifaceTrapDefault && branches.empty()) {
+        for (const sema::TypeSymbol* c : ifaceOpenFamilies)
+            if ((trapShapeImpl = mostDerived(c))) break;
+        if (!trapShapeImpl) return nullptr;
+    }
     bool anyConstraintRoute = false;
     {
         // Fix-forward 4: an imported implementation whose bound-carrying body
@@ -18992,7 +19386,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             return importedGenericLacksConstraintBody5009(ctx_, m);
         };
         bool constraintRouteImpl = refused(ms);
-        if (refused(defaultImpl)) constraintRouteImpl = true;
+        if (defaultImpl && refused(defaultImpl)) constraintRouteImpl = true;
         for (const Branch& b : branches)
             if (refused(b.impl)) constraintRouteImpl = true;
         if (constraintRouteImpl) {
@@ -19127,8 +19521,15 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
 
     // Build all specializations up front (each into its own standalone function);
     // none is emitted inline into the current block.
-    llvm::Function* defFn = specForImpl(defaultImpl);
-    if (!defFn) return anyConstraintRoute ? constraintRouteFail() : nullptr;
+    // fix #6307: a trapping default has no body; the first branch fixes the
+    // call shape instead.
+    llvm::Function* defFn = defaultImpl ? specForImpl(defaultImpl) : nullptr;
+    if (!defFn && !ifaceTrapDefault)
+        return anyConstraintRoute ? constraintRouteFail() : nullptr;
+    llvm::Function* trapShapeFn =
+        trapShapeImpl ? specForImpl(trapShapeImpl) : nullptr;
+    if (trapShapeImpl && !trapShapeFn)
+        return anyConstraintRoute ? constraintRouteFail() : nullptr;
     // fix #2896: carry the descriptor CONSTANT, not the class — for a generic
     // candidate it is the per-instantiation global, not `descArray_[cls]`.
     std::vector<std::pair<llvm::Constant*, llvm::Function*>> brFns;
@@ -19149,7 +19550,8 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // been emitted into the current block — so a disagreement is a clean bail to
     // the caller's existing path rather than half an emitted dispatch.
     for (std::size_t i = 0; i < brFns.size(); ++i)
-        if (brFns[i].second->getFunctionType() != defFn->getFunctionType())
+        if (brFns[i].second->getFunctionType() !=
+            (defFn ? defFn : brFns[0].second)->getFunctionType())
             return anyConstraintRoute ? constraintRouteFail() : nullptr;
     if (anyConstraintRoute && degradedSinceMark()) return constraintRouteFail();
     // fix #5124: the unknown-class guard needs every default-running class's
@@ -19164,7 +19566,8 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // single specialization is correct (the dynamic type always most-derives it).
     // fix #5124: not on the constraint route, whose default is guarded below.
     // fix #5214: nor where a later module's class may reach the call.
-    if (brFns.empty() && !anyConstraintRoute && !slotGuard && !descGuard) {
+    if (brFns.empty() && !anyConstraintRoute && !slotGuard && !descGuard &&
+        defFn) {
         if (args.size() != defFn->arg_size()) return nullptr;
         llvm::Value* r = builder_.CreateCall(defFn, args);
         emitPendingCheck();
@@ -19174,7 +19577,10 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // Emit the dispatch: load td = vptr[0], compare against each branch class's
     // descriptor, call its specialization; otherwise the default. The call result
     // (if non-void) is collected into a phi over the per-branch end blocks.
-    llvm::FunctionType* defTy = defFn->getFunctionType();
+    llvm::Function* shapeFn =
+        defFn ? defFn : (!brFns.empty() ? brFns[0].second : trapShapeFn);
+    if (!shapeFn) return nullptr;
+    llvm::FunctionType* defTy = shapeFn->getFunctionType();
     llvm::Type* retTy = defTy->getReturnType();
     bool hasResult = !retTy->isVoidTy();
 
@@ -19187,6 +19593,8 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     llvm::BasicBlock* endBB =
         llvm::BasicBlock::Create(llvm_, "vgen.end", currentFn_);
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incoming;
+    llvm::Value* lastBranchCall = nullptr;  // fix #6307: void sentinel
+    llvm::Value* trapCall = nullptr;
 
     for (std::size_t i = 0; i < brFns.size(); ++i) {
         llvm::Value* eq = builder_.CreateICmpEQ(td, brFns[i].first, "vgen.is");
@@ -19198,6 +19606,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         builder_.SetInsertPoint(thenBB);
         if (args.size() != brFns[i].second->arg_size()) return nullptr;
         llvm::Value* cr = builder_.CreateCall(brFns[i].second, args);
+        lastBranchCall = cr;
         emitPendingCheck();
         incoming.push_back({hasResult ? cr : nullptr,
                             builder_.GetInsertBlock()});
@@ -19205,7 +19614,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         builder_.SetInsertPoint(nextBB);
     }
     // Default branch (current block = the last nextBB).
-    if (args.size() != defFn->arg_size()) return nullptr;
+    if (args.size() != shapeFn->arg_size()) return nullptr;
     // fix #5124 (§11 override semantics / §2.8.3 rule 4, v0.313): the
     // unknown-class guard. This dispatch is closed-world: it knows the classes
     // of the modules loaded into THIS compile. A library's call site cannot
@@ -19225,7 +19634,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // slot holding the default's
     // function, runs a known override's specialization when its slot holds
     // that override's function, and aborts otherwise.
-    if (anyConstraintRoute || slotGuard || descGuard) {
+    if (anyConstraintRoute || slotGuard || descGuard || ifaceTrapDefault) {
         llvm::BasicBlock* okBB =
             llvm::BasicBlock::Create(llvm_, "vgen.known", currentFn_);
         for (llvm::Constant* dd : defaultDescs) {
@@ -19287,10 +19696,12 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             // The default implementation's own identity, when its declarer
             // chain is non-generic (the class-parent `guardDefaultFn`).
             bool defChainGeneric = false;
-            for (const sema::TypeSymbol* t = defaultImpl->parent; t;
-                 t = baseClassOf(t))
+            for (const sema::TypeSymbol* t =
+                     defaultImpl ? defaultImpl->parent : nullptr;
+                 t; t = baseClassOf(t))
                 if (!t->genericParams.empty()) defChainGeneric = true;
-            auto dfit = methodFns_.find(defaultImpl);
+            auto dfit = defaultImpl ? methodFns_.find(defaultImpl)
+                                    : methodFns_.end();
             if (!defChainGeneric && dfit != methodFns_.end() && dfit->second)
                 guardDefaultFn = llvm::cast<llvm::Constant>(dfit->second);
         }
@@ -19342,11 +19753,16 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         }
         auto* failFn = declareC("bz_debug_assert_fail",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
-        builder_.CreateCall(
+        trapCall = builder_.CreateCall(
             failFn,
             {lowerStringLiteralConst(
                 // a source-form literal: the quotes are stripped
-                unboundGuard
+                ifaceTrapDefault && !descGuard
+                    ? "\"interface call to generic method `" +
+                          std::string(ms->name) +
+                          "` reached a receiver whose class instantiation "
+                          "this call site could not enumerate (#6307)\""
+                : unboundGuard
                     ? "\"virtual call to generic method `" +
                           std::string(ms->name) +
                           "` reached an instantiation of a generic subclass "
@@ -19367,6 +19783,20 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                 false)});
         builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);
+    }
+    if (!defFn) {
+        // fix #6307: nothing reaches okBB (no default-running descriptor and
+        // no default function identity); every receiver ran a branch.
+        builder_.CreateUnreachable();
+        builder_.SetInsertPoint(endBB);
+        if (!hasResult) return lastBranchCall ? lastBranchCall : trapCall;
+        // Every receiver traps: endBB has no predecessor, and the code the
+        // caller goes on emitting into it is unreachable.
+        if (incoming.empty()) return llvm::PoisonValue::get(retTy);
+        llvm::PHINode* phi =
+            builder_.CreatePHI(retTy, incoming.size(), "vgen.res");
+        for (auto& [v, bb] : incoming) phi->addIncoming(v, bb);
+        return phi;
     }
     llvm::Value* dr = builder_.CreateCall(defFn, args);
     emitPendingCheck();
