@@ -29882,6 +29882,54 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 "from the target (\xC2\xA7""27.6, \xC2\xA7""14.5, "
                                 "v0.338)");
                     }
+                    // per §27.6 (v0.338): `Math.Max<T>` with its list, NOT the
+                    // callee of a call, is a function value `(T, T) -> T`
+                    // (`Clamp`: `(T, T, T) -> T`), formed at the one type
+                    // argument. Leaving it untyped made codegen's CG60 return
+                    // a null closure cell, which the call then jumped through
+                    // (SIGSEGV, #5814). A callee is typed by typeCall.
+                    else if (&ma != calleeOfCallCtx_ &&
+                             ma.typeArgs.size() == 1 && ma.typeArgs[0]) {
+                        TypeRef* ta = ctx_.resolvedType(*ma.typeArgs[0]);
+                        // The formation is an instantiation site (§14.1): the
+                        // `where T: IComparable<T>` constraint (§14.2, stdlib
+                        // §2.2) is read here exactly as at a call with the
+                        // same list (the call-side check is in typeCall).
+                        bool admitted = true;
+                        if (ta && ta->kind == TypeRef::Kind::Named &&
+                            ta->declaration) {
+                            TypeSymbol* icmp =
+                                ctx_.builtinInterfaceSym("IComparable");
+                            admitted = !ta->nullable && icmp &&
+                                isSubtype(ta->declaration, icmp) &&
+                                (ta->declaration->kind !=
+                                     ast::TypeDeclKind::Interface ||
+                                 selfComparableIfaceArg(ta, icmp));
+                        } else if (ta && ta->kind != TypeRef::Kind::Primitive) {
+                            admitted = false;
+                        }
+                        if (ta && !admitted) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ma.span.begin,
+                                "type argument does not satisfy the constraint "
+                                "`where T: IComparable<T>` \xE2\x80\x94 `Math." +
+                                    std::string(m) + "` requires an argument "
+                                    "type that implements `IComparable<T>` "
+                                    "(\xC2\xA7""14.2, \xC2\xA7""27.6, stdlib "
+                                    "\xC2\xA7""2.2, v0.338)");
+                        } else if (ta) {
+                            auto* ft = ctx_.makeTypeRef();
+                            ft->kind = TypeRef::Kind::Function;
+                            const std::size_t n = (m == "Clamp") ? 3 : 2;
+                            for (std::size_t i = 0; i < n; ++i) {
+                                TypeRef::FuncParam fp;
+                                fp.type = ta;
+                                ft->funcParams.push_back(fp);
+                            }
+                            ft->funcReturn = ta;
+                            ctx_.setExprType(&ma, ft);
+                        }
+                    }
                     /* otherwise valid, untyped */
                 }
                 else rejectBuiltinStatic();

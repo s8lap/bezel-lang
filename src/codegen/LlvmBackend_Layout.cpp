@@ -7079,7 +7079,10 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
         ? dynamic_cast<const ast::IdentifierExpr*>(ma.target.get()) : nullptr;
     if (!id) return nullptr;
     sema::PrimitiveType pt = sema::primitiveFromName(id->name);
-    if (pt == sema::PrimitiveType::None) return nullptr;
+    // §27.6 (v0.338, #5814): the built-in `Math` selectors reference through
+    // tryLowerBuiltinClassCall; one thunk per type argument (identity key).
+    const bool isMath = id->name == "Math";
+    if (pt == sema::PrimitiveType::None && !isMath) return nullptr;
 
     // Thunk signature: ret (ptr env, params…) — the closure ABI the LINQ
     // trampolines and the general function-value call site expect (fn(env, args)).
@@ -7096,6 +7099,8 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
     // pointer — a static reference is FVK_FN_ONLY, so §27.7.1 equality is by fn
     // alone (the #1170 stability reasoning applied to primitive intrinsics).
     std::pair<int, std::string> key{static_cast<int>(pt), std::string(ma.member)};
+    if (isMath && !fnTy->funcParams.empty())
+        key.second += "|" + typeRefIdentityKey(fnTy->funcParams[0].type);
     if (auto cit = primIntrinsicThunks_.find(key);
         cit != primIntrinsicThunks_.end())
         return buildMethodClosureCell(cit->second, /*instMethod=*/false,
@@ -7165,7 +7170,8 @@ llvm::Value* Emitter::makePrimIntrinsicThunk(const ast::MemberAccessExpr& ma,
         synthCall->args.push_back(std::move(arg));
     }
 
-    llvm::Value* result = tryLowerPrimitiveStaticCall(*synthCall);
+    llvm::Value* result = isMath ? tryLowerBuiltinClassCall(*synthCall)
+                                 : tryLowerPrimitiveStaticCall(*synthCall);
 
     // Drop the per-arg value overrides now that the body is emitted; keep the
     // tree (and its exprType keys) alive by parking it in the owner vector.
@@ -7205,7 +7211,14 @@ bool Emitter::isPrimIntrinsicMethodRef(const ast::Expr* e) const {
     const sema::TypeRef* t = ctx_.exprType(*e);      // sema typed it as a value
     if (!t || t->kind != sema::TypeRef::Kind::Function) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    return id && sema::primitiveFromName(id->name) != sema::PrimitiveType::None;
+    if (!id) return false;
+    // §27.6 (v0.338, #5814): `Math.Max<T>` / `Min<T>` / `Clamp<T>` formed
+    // with their type-argument list — typed by sema's built-in Math arm as a
+    // function value — is backed by the same thunk (no MethodSymbol).
+    if (id->name == "Math")
+        return ma->member == "Min" || ma->member == "Max" ||
+               ma->member == "Clamp";
+    return sema::primitiveFromName(id->name) != sema::PrimitiveType::None;
 }
 
 // fix #2781 (§8.1 / §14.2 / §27.6): mirror of isPrimIntrinsicMethodRef for

@@ -283,3 +283,59 @@ BEZEL_TEST(sema_generic_method_reference_list_5814,
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(
         r, "`Math.Max` is a reference to a generic method and names no type arguments"));
 }
+
+// s27_6_0014 — `Math.Max<int>` formed with its list is a function value
+// `(int, int) -> int` (§27.6, v0.338). Before the fix the reference was left
+// untyped, codegen's CG60 produced a null closure cell and the invocation
+// crashed (rc 139). Min/Clamp/long/double/string/record arguments are read,
+// and the formation is looped under the ASan oracle for the cell's release.
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           math_max_with_type_argument_list_is_formed_and_invoked_27_6) {
+    auto r = runAotChecked(
+        "module Conf; "
+        "public record Pt: IComparable<Pt> "
+        "  public x: int; "
+        "  public method CompareTo(o: Pt): int => this.x - o.x; "
+        "end Pt; "
+        "public class Program "
+        "  public static method Apply(f: (int, int) -> int, a: int, b: int): int "
+        "    => f(a, b); "
+        "  public static method Main() "
+        "    var m: (int, int) -> int := Math.Max<int>; "
+        "    Console.WriteLine(m(3, 5)); "
+        "    var d: (double, double) -> double := Math.Min<double>; "
+        "    Console.WriteLine(d(3.5, 1.25)); "
+        "    var c: (int, int, int) -> int := Math.Clamp<int>; "
+        "    Console.WriteLine(c(9, 1, 5)); "
+        "    var s: (string, string) -> string := Math.Max<string>; "
+        "    Console.WriteLine(s(\"a\", \"b\")); "
+        "    var p: (Pt, Pt) -> Pt := Math.Max<Pt>; "
+        "    Console.WriteLine(p(new Pt(1), new Pt(4)).x); "
+        "    var t := 0; var i := 0; "
+        "    while i < 200 do "
+        "      var f: (int, int) -> int := Math.Max<int>; "
+        "      t := t + f(i, 3) + Apply(Math.Min<int>, i, 7); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(t); "
+        "    Console.WriteLine(Math.Max<int>(1, 2)); "
+        "  end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\n1.25\n5\nb\n4\n21278\n2\n"));
+}
+
+// §27.6 / §14.2 (v0.338): the formation is an instantiation site, so
+// `Math.Max<W>` over a type with no `IComparable<W>` is rejected there, as the
+// call `Math.Max<W>(a, b)` is.
+BEZEL_TEST(sema_generic_method_reference_list_5814,
+           math_max_reference_constraint_checked_at_formation_27_6) {
+    auto r = runAot(
+        "module Conf; "
+        "public class W public constructor() end constructor; end W; "
+        "public class Program public static method Main() "
+        "  var m: (W, W) -> W := Math.Max<W>; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "IComparable<T>"));
+}
