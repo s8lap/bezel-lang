@@ -31781,11 +31781,15 @@ bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) {
     // (b) Non-capturing lambda.
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(entryExpr)) {
         const std::vector<Symbol*>* paramSyms = ctx_.lambdaParams(lam);
-        std::unordered_set<const Symbol*> ownParams;
+        CaptureScope scope;
         if (paramSyms) {
-            for (const Symbol* ps : *paramSyms) ownParams.insert(ps);
+            for (const Symbol* ps : *paramSyms) scope.params.insert(ps);
         }
-        return !lambdaBodyCaptures(lam, ownParams);
+        // per §30.14 (#6284): a name declared inside this entry lambda's
+        // body is not a capture; the entry's source range decides that.
+        scope.entryBegin = lam->span.begin.offset;
+        scope.entryEnd = lam->span.end.offset;
+        return !lambdaBodyCaptures(lam, scope);
     }
 
     // Any other expression kind: not a recognized capture-free entry form.
@@ -31794,18 +31798,17 @@ bool ExprTC::isCaptureFreeEntry(const ast::Expr* entryExpr) {
 
 bool ExprTC::lambdaBodyCaptures(
     const ast::LambdaExpr* lam,
-    const std::unordered_set<const Symbol*>& ownParamSyms) const {
+    const CaptureScope& scope) const {
     if (!lam) return false;
-    if (lam->exprBody && exprCaptures(*lam->exprBody, ownParamSyms))
+    if (lam->exprBody && exprCaptures(*lam->exprBody, scope))
         return true;
     for (const auto& s : lam->stmts) {
-        if (s && stmtCaptures(*s, ownParamSyms)) return true;
+        if (s && stmtCaptures(*s, scope)) return true;
     }
     return false;
 }
 
-bool ExprTC::exprCaptures(const ast::Expr& e,
-                           const std::unordered_set<const Symbol*>& ownParamSyms) const {
+bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
     // Check this node.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         Symbol* sym = ctx_.exprSymbol(*id);
@@ -31813,80 +31816,89 @@ bool ExprTC::exprCaptures(const ast::Expr& e,
         // Captured if it resolves to a local or parameter NOT in our own params.
         bool isLocal = dynamic_cast<LocalSymbol*>(sym) != nullptr;
         bool isParam = dynamic_cast<ParameterSymbol*>(sym) != nullptr;
-        if ((isLocal || isParam) && !ownParamSyms.count(sym)) return true;
-        return false;
+        if (!isLocal && !isParam) return false;
+        if (scope.params.count(sym)) return false;
+        // per §30.14 (#6284): declared inside the entry lambda's body (a
+        // LocalDecl, a loop or catch variable, a pattern binding): not a
+        // capture. The declaring node's file offset decides it.
+        if (const ast::Node* d = sym->decl) {
+            if (d->span.begin.line != 0 &&
+                d->span.begin.offset >= scope.entryBegin &&
+                d->span.begin.offset < scope.entryEnd)
+                return false;
+        }
+        return true;
     }
     // Recurse into children.
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-        if (be->left && exprCaptures(*be->left, ownParamSyms)) return true;
-        if (be->right && exprCaptures(*be->right, ownParamSyms)) return true;
+        if (be->left && exprCaptures(*be->left, scope)) return true;
+        if (be->right && exprCaptures(*be->right, scope)) return true;
     } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-        if (ue->operand && exprCaptures(*ue->operand, ownParamSyms)) return true;
+        if (ue->operand && exprCaptures(*ue->operand, scope)) return true;
     } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
-        if (ma->target && exprCaptures(*ma->target, ownParamSyms)) return true;
+        if (ma->target && exprCaptures(*ma->target, scope)) return true;
     } else if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
-        if (nm->target && exprCaptures(*nm->target, ownParamSyms)) return true;
+        if (nm->target && exprCaptures(*nm->target, scope)) return true;
     } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
-        if (ce->callee && exprCaptures(*ce->callee, ownParamSyms)) return true;
+        if (ce->callee && exprCaptures(*ce->callee, scope)) return true;
         for (const auto& a : ce->args)
-            if (a.value && exprCaptures(*a.value, ownParamSyms)) return true;
+            if (a.value && exprCaptures(*a.value, scope)) return true;
     } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         for (const auto& a : ne->args)
-            if (a.value && exprCaptures(*a.value, ownParamSyms)) return true;
+            if (a.value && exprCaptures(*a.value, scope)) return true;
     } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
-        if (ix->target && exprCaptures(*ix->target, ownParamSyms)) return true;
+        if (ix->target && exprCaptures(*ix->target, scope)) return true;
         for (const auto& idx : ix->indices)
-            if (idx.value && exprCaptures(*idx.value, ownParamSyms)) return true;
+            if (idx.value && exprCaptures(*idx.value, scope)) return true;
     } else if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
-        if (co->condition && exprCaptures(*co->condition, ownParamSyms)) return true;
-        if (co->thenValue && exprCaptures(*co->thenValue, ownParamSyms)) return true;
-        if (co->elseValue && exprCaptures(*co->elseValue, ownParamSyms)) return true;
+        if (co->condition && exprCaptures(*co->condition, scope)) return true;
+        if (co->thenValue && exprCaptures(*co->thenValue, scope)) return true;
+        if (co->elseValue && exprCaptures(*co->elseValue, scope)) return true;
     } else if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
         // per §30.14: a capture written only inside `$"..."` (e.g. `$"c={n}"`)
         // is a capture of the Spawn entry lambda, exactly like a bare `n`.
         for (const auto& part : is->parts)
-            if (part.expr && exprCaptures(*part.expr, ownParamSyms)) return true;
+            if (part.expr && exprCaptures(*part.expr, scope)) return true;
     } else if (auto* innerLam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         // A nested lambda: it has its OWN params; captures from its perspective
         // may or may not propagate. For Domain.Spawn capture check, a nested
         // lambda that captures outer scope IS a capture of the Spawn entry lambda.
         const std::vector<Symbol*>* innerParams = ctx_.lambdaParams(innerLam);
-        std::unordered_set<const Symbol*> allHidden = ownParamSyms;
+        CaptureScope allHidden = scope;
         if (innerParams) {
-            for (const Symbol* ps : *innerParams) allHidden.insert(ps);
+            for (const Symbol* ps : *innerParams) allHidden.params.insert(ps);
         }
         if (lambdaBodyCaptures(innerLam, allHidden)) return true;
     }
     return false;
 }
 
-bool ExprTC::stmtCaptures(const ast::Stmt& s,
-                           const std::unordered_set<const Symbol*>& ownParamSyms) const {
+bool ExprTC::stmtCaptures(const ast::Stmt& s, const CaptureScope& scope) const {
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        if (rs->value && exprCaptures(*rs->value, ownParamSyms)) return true;
+        if (rs->value && exprCaptures(*rs->value, scope)) return true;
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->target && exprCaptures(*as->target, ownParamSyms)) return true;
-        if (as->value && exprCaptures(*as->value, ownParamSyms)) return true;
+        if (as->target && exprCaptures(*as->target, scope)) return true;
+        if (as->value && exprCaptures(*as->value, scope)) return true;
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        if (es->expr && exprCaptures(*es->expr, ownParamSyms)) return true;
+        if (es->expr && exprCaptures(*es->expr, scope)) return true;
     } else if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->initializer && exprCaptures(*ld->initializer, ownParamSyms)) return true;
+        if (ld->initializer && exprCaptures(*ld->initializer, scope)) return true;
     } else if (auto* is = dynamic_cast<const ast::IfStmt*>(&s)) {
         // IfStmt: condition is in ifBranch.condition per ast::IfStmt::Branch.
         if (is->ifBranch.condition &&
-            exprCaptures(*is->ifBranch.condition, ownParamSyms)) return true;
+            exprCaptures(*is->ifBranch.condition, scope)) return true;
         for (const auto& sub : is->ifBranch.body)
-            if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+            if (sub && stmtCaptures(*sub, scope)) return true;
         for (const auto& elif : is->elifBranches) {
-            if (elif.condition && exprCaptures(*elif.condition, ownParamSyms)) return true;
+            if (elif.condition && exprCaptures(*elif.condition, scope)) return true;
             for (const auto& sub : elif.body)
-                if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+                if (sub && stmtCaptures(*sub, scope)) return true;
         }
         for (const auto& sub : is->elseBody)
-            if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+            if (sub && stmtCaptures(*sub, scope)) return true;
     } else if (auto* wb = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         for (const auto& sub : wb->body)
-            if (sub && stmtCaptures(*sub, ownParamSyms)) return true;
+            if (sub && stmtCaptures(*sub, scope)) return true;
     }
     return false;
 }

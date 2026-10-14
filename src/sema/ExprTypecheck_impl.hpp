@@ -4576,19 +4576,31 @@ private:
     // whose body references no locals from the enclosing scope).
     bool isCaptureFreeEntry(const ast::Expr* entryExpr);
 
+    // §30.14 (#6284): the capture walk's scope. `params` holds the symbols
+    // the walk treats as declared inside the entry lambda (its own params,
+    // and nested-lambda params as the walk descends). A local or parameter
+    // whose declaring node lies inside the entry lambda's source range
+    // [entryBegin, entryEnd) is declared in the lambda body, so it is not a
+    // capture; one declared before the lambda is. Offsets are file-absolute
+    // (interpolation sub-parses rebase onto the hole's file position).
+    struct CaptureScope {
+        std::unordered_set<const Symbol*> params;
+        std::uint32_t entryBegin = 0;
+        std::uint32_t entryEnd = 0;
+    };
+
     // Helper: does the lambda body (recursively) reference any identifier
-    // whose resolved symbol is NOT in `ownParamSyms` and is a local or
-    // parameter symbol (i.e. captured from the outer scope)?
+    // whose resolved symbol is neither in `scope.params` nor declared inside
+    // the entry lambda, and is a local or parameter symbol (i.e. captured
+    // from the outer scope)?
     bool lambdaBodyCaptures(
         const ast::LambdaExpr* lam,
-        const std::unordered_set<const Symbol*>& ownParamSyms) const;
+        const CaptureScope& scope) const;
 
     // Walk the given expression tree and check if any IdentifierExpr
-    // resolves to a symbol that is a local/parameter NOT in ownParamSyms.
-    bool exprCaptures(const ast::Expr& e,
-                      const std::unordered_set<const Symbol*>& ownParamSyms) const;
-    bool stmtCaptures(const ast::Stmt& s,
-                      const std::unordered_set<const Symbol*>& ownParamSyms) const;
+    // resolves to a captured local/parameter (see CaptureScope).
+    bool exprCaptures(const ast::Expr& e, const CaptureScope& scope) const;
+    bool stmtCaptures(const ast::Stmt& s, const CaptureScope& scope) const;
 
     void visitChildren(const ast::Expr& e);
 };
