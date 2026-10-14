@@ -2035,10 +2035,18 @@ private:
             if (ctx_.exprType(e) && !isLazyEnumerableExprType(e)) {
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         ce->callee.get())) {
+                    // Only stdlib §5's IEnumerable operators consume; an Object
+                    // member (ToString, GetHashCode, Equals, GetType) is not on
+                    // §29.11's consumption list. (#6197 follow-up)
+                    const bool isLinqMember =
+                        common::isBuiltinCollectionLinqOperatorName(
+                            ma->member) ||
+                        common::isStringLinqOperatorMemberName(ma->member);
                     if (const auto* rid =
                             dynamic_cast<const ast::IdentifierExpr*>(
                                 ma->target.get())) {
-                        if (isLazyEnumerableExprType(*ma->target)) {
+                        if (isLinqMember &&
+                            isLazyEnumerableExprType(*ma->target)) {
                             checkRead(*rid);
                             markLazyConsumed(*rid, "terminal operator");
                             for (const auto& a : ce->args) visitCallArg(a);

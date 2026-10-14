@@ -578,3 +578,100 @@ BEZEL_TEST(linq_single_consumption_1226,
         "  return n + q.Count(); "
         "end Main; end C;"), false);
 }
+
+// §29.11 v0.338 consumption list: only "Enumeration or a terminal operator"
+// spends the right; an Object member on the query (ToString, GetHashCode,
+// Equals, GetType) is not on it, so a following single real terminal must not
+// draw the consumed-binding diagnostic (#6197 follow-up). Whether the Object
+// member itself compiles is a separate matter (#2457), so these assert only the
+// ABSENCE of the consumed text.
+BEZEL_TEST(linq_single_consumption_1226,
+           object_member_tostring_before_terminal_not_consumption_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(daErrorContains(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var o := q.ToString(); "
+        "  var n := q.Count(); "
+        "  "
+        "  return n; "
+        "end Main; end C;",
+        "was already consumed"), false);
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           object_member_tostring_after_terminal_not_consumption_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(daErrorContains(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  "
+        "  var n := q.Count(); "
+        "  var o := q.ToString(); "
+        "  return n; "
+        "end Main; end C;",
+        "was already consumed"), false);
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           object_member_gethashcode_before_terminal_not_consumption_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(daErrorContains(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var o := q.GetHashCode(); "
+        "  var n := q.Count(); "
+        "  "
+        "  return n; "
+        "end Main; end C;",
+        "was already consumed"), false);
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           object_member_gethashcode_after_terminal_not_consumption_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(daErrorContains(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  "
+        "  var n := q.Count(); "
+        "  var o := q.GetHashCode(); "
+        "  return n; "
+        "end Main; end C;",
+        "was already consumed"), false);
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           object_member_gettype_before_terminal_not_consumption_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(daErrorContains(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  var o := q.GetType(); "
+        "  var n := q.Count(); "
+        "  "
+        "  return n; "
+        "end Main; end C;",
+        "was already consumed"), false);
+}
+
+BEZEL_TEST(linq_single_consumption_1226,
+           object_member_gettype_after_terminal_not_consumption_6197_spec_29_11) {
+    BEZEL_EXPECT_EQ(daErrorContains(
+        "module M; class C public static method Main(): int "
+        "  using var a := new Array<int>(); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var q := a.Where(lambda(x) => x > 1); "
+        "  "
+        "  var n := q.Count(); "
+        "  var o := q.GetType(); "
+        "  return n; "
+        "end Main; end C;",
+        "was already consumed"), false);
+}
+
