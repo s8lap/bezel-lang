@@ -23709,6 +23709,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         std::vector<std::pair<std::unordered_map<Symbol*, TypeRef*>,
                               std::unordered_map<Symbol*, TypeRef*>>>
             typeExits;
+        // fix #6156 (§7.4 "How narrowing is invalidated", v0.338):
+        // "reassignment from a nullable-typed expression" ends the knowledge a
+        // declaration or an assignment established (`initNarrowed_`) exactly
+        // as it ends a null test's. That set was restored by assignment after
+        // the branches, so `var s: string? := "ab"; if k = 1 then s := n;
+        // end if; s.Length` kept `s` non-null and dereferenced null. It joins
+        // like the null set now: an entry fact survives only when every
+        // fall-through path still carries it. (A fact a branch ESTABLISHED is
+        // not added here; the null set's own all-paths join already carries
+        // it.)
+        std::vector<std::unordered_set<Symbol*>> initExits;
         if (ifs->ifBranch.condition) {
             visitExpr(*ifs->ifBranch.condition);
             checkConditionIsBool(*ifs->ifBranch.condition, "if");
@@ -23738,6 +23749,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             fallThroughExits.push_back(nullNarrowed_);
             fieldExits.push_back(fieldNarrowed_);
             typeExits.emplace_back(branchEntryTypes, narrowings_);
+            initExits.push_back(initNarrowed_);
         }
         narrowings_ = savedNarrowings;
         initNarrowed_ = savedInitNarrowed;
@@ -23799,6 +23811,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 fallThroughExits.push_back(nullNarrowed_);
                 fieldExits.push_back(fieldNarrowed_);
                 typeExits.emplace_back(branchEntryTypes, narrowings_);
+                initExits.push_back(initNarrowed_);
             }
             narrowings_ = savedNarrowings;
             initNarrowed_ = savedInitNarrowed;
@@ -23824,6 +23837,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             fallThroughExits.push_back(nullNarrowed_);
             fieldExits.push_back(fieldNarrowed_);
             typeExits.emplace_back(branchEntryTypes, narrowings_);
+            initExits.push_back(initNarrowed_);
         }
         // After-if type narrowings: the entry facts no fall-through path
         // invalidated (#6113). With no fall-through path the after-if point
@@ -23841,6 +23855,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
         }
         initNarrowed_ = savedInitNarrowed;
+        for (const auto& branchEnd : initExits) {   // #6156
+            for (auto it = initNarrowed_.begin(); it != initNarrowed_.end();) {
+                if (branchEnd.count(*it)) ++it;
+                else it = initNarrowed_.erase(it);
+            }
+        }
         // After-if nullability = intersection of all fall-through exit sets.
         if (fallThroughExits.empty()) {
             // Every path exits the method; the after-if point is unreachable.
