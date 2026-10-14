@@ -118,21 +118,50 @@ test_groups() { [ -r "$MANIFEST" ] && cut -f1 "$MANIFEST" | paste -sd' ' -; }
 # --- reconfigure (picks up any newly-added test *.cpp) + build a target -------
 # Reconfigure is quiet unless it fails; the build hard-stops on failure so a
 # stale binary can never be mistaken for a passing run.
+# Skip the reconfigure when nothing it exists for can have changed: CMake
+# globs tests/ at CONFIGURE time (a NEW or REMOVED test *.cpp needs it), and
+# CMakeLists.txt edits re-run cmake by themselves inside the build. So stamp the
+# sorted test-source path list (names only) and reconfigure only when it
+# differs, or on a tree never configured by this script (no cache, not
+# RelWithDebInfo per #3013, or no manifest).
+TESTLIST_STAMP="$BUILD_DIR/.agent_check_testlist.sha"
+testlist_sha() { (cd "$ROOT" && find tests -name '*.cpp' | LC_ALL=C sort | sha1sum | cut -d' ' -f1); }
+reconfigure_needed() {
+  grep -qx 'CMAKE_BUILD_TYPE:STRING=RelWithDebInfo' "$BUILD_DIR/CMakeCache.txt" 2>/dev/null || return 0
+  [ -r "$MANIFEST" ] || return 0
+  [ "$(cat "$TESTLIST_STAMP" 2>/dev/null)" = "$(testlist_sha)" ] || return 0
+  return 1
+}
 reconfigure() {
+  reconfigure_needed || return 0
+  local sha; sha="$(testlist_sha)"
   # -DCMAKE_BUILD_TYPE=RelWithDebInfo is REQUIRED (#3013): without it CMake leaves the build type
   # empty, which drops -DNDEBUG and leaves asserts live — 55 of 59 lane trees
   # were in that state, validating a different bezelc than the gate accepts.
   "$DH" build cmake -S "$ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=RelWithDebInfo >"$SCRATCH/agent_configure.log" 2>&1 \
     || { echo "agent_check: CONFIGURE FAILED (see $SCRATCH/agent_configure.log):" >&2
          tail -20 "$SCRATCH/agent_configure.log" >&2; exit 1; }
+  printf '%s\n' "$sha" > "$TESTLIST_STAMP"
 }
-build_target() {  # $1 = cmake target ; $2 = binary to remove first (stale guard)
-  local target="$1" bin="$2"
-  [ -n "$bin" ] && rm -f "$bin"
-  echo "== agent_check: reconfigure + build $target (dev_heavy, foreground) =="
+# Stale-binary guard (origin: 0bd1fb11, "a failed/partial build can never leave
+# an old binary behind"). It used to `rm -f` every binary before EVERY build,
+# forcing a relink (~2 s sema, ~9 s codegen) even when nothing changed. Now the
+# build system decides and we PROVE the result: after the build each binary
+# must be at least as new as libbezel_core.a (all it links from); an older one
+# (the dependency graph missed a relink) is removed and rebuilt once, and a
+# still-stale or missing binary is a hard failure.
+build_target() {  # $1 = cmake target ; $2 = binary to verify after the build
+  local target="$1" bin="$2" core_a="$BUILD_DIR/libbezel_core.a"
+  echo "== agent_check: build $target (dev_heavy, foreground) =="
   reconfigure
   "$DH" build cmake --build "$BUILD_DIR" -j"$JOBS" --target "$target" \
     || { echo "agent_check: BUILD FAILED ($target)" >&2; exit 1; }
+  if [ -n "$bin" ] && [ -f "$core_a" ] && [ -e "$bin" ] && [ "$bin" -ot "$core_a" ]; then
+    echo "agent_check: $bin is OLDER than libbezel_core.a - forcing a relink" >&2
+    rm -f "$bin"
+    "$DH" build cmake --build "$BUILD_DIR" -j"$JOBS" --target "$target" \
+      || { echo "agent_check: BUILD FAILED ($target, forced relink)" >&2; exit 1; }
+  fi
   [ -z "$bin" ] || [ -x "$bin" ] || { echo "agent_check: $bin not produced" >&2; exit 1; }
 }
 
@@ -148,18 +177,27 @@ build_tests() {
     if [ -n "$AREA" ] && [ -z "$(test_binaries)" ]; then
       die "unknown --area '$AREA'; known areas: $(test_groups)"
     fi
-    while IFS= read -r b; do [ -n "$b" ] && rm -f "$b"; done < <(test_binaries)
   fi
   build_target "$target" ""
   [ -r "$MANIFEST" ] || die "build succeeded but the test-binary manifest is missing ($MANIFEST)"
   if [ -n "$AREA" ] && [ -z "$(test_binaries)" ]; then
     die "unknown --area '$AREA'; known areas: $(test_groups)"
   fi
+  local core_a="$BUILD_DIR/libbezel_core.a" restale=()
   while IFS= read -r b; do
     [ -n "$b" ] || continue
     [ -x "$b" ] || die "build reported success but $b is missing"
+    { [ -f "$core_a" ] && [ "$b" -ot "$core_a" ]; } && restale+=("$b")
     n=$(( n + 1 ))
   done < <(test_binaries)
+  if [ "${#restale[@]}" -gt 0 ]; then
+    echo "agent_check: ${#restale[@]} test binary(ies) OLDER than libbezel_core.a - forcing a relink" >&2
+    rm -f "${restale[@]}"
+    build_target "$target" ""
+    for b in "${restale[@]}"; do
+      { [ -x "$b" ] && ! [ "$b" -ot "$core_a" ]; } || die "$b still stale/missing after a forced relink"
+    done
+  fi
   [ "$n" -gt 0 ] || die "the test-binary manifest is empty ($MANIFEST)"
   warn_stale_other_areas
 }
@@ -221,6 +259,46 @@ binaries_matching() {  # $1 = filter -> "<path> <count>" per matching binary
   return 0
 }
 
+# Run one binary's matching tests as $3 disjoint shards (the harness's own
+# BEZEL_SHARD_COUNT/INDEX, as tests/run_parallel.sh uses), then print ONE merged
+# result: every shard's per-test output, then a single summary in the harness's
+# exact format with passed/failed summed, and the NATIVE SANITIZER / NATIVE
+# SANITIZER INFRA / CHECKED TOOLCHAIN / INFRA lines printed once with their
+# counts summed. Returns 124 if any shard timed out, else 1 if any failed.
+run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
+  local f="$1" bin="$2" n="$3" out="$4" i r rc=0 pids=() sl=()
+  for (( i=0; i<n; i++ )); do
+    sl[i]="$SCRATCH/shard_${i}.$(basename "$bin").log"
+    mkdir -p "$SCRATCH/shard_tmp/$i"
+    ( "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env TMPDIR="$SCRATCH/shard_tmp/$i" \
+        BEZEL_TEST_FILTER="$f" BEZEL_SHARD_COUNT="$n" BEZEL_SHARD_INDEX="$i" "$bin" \
+        > "${sl[i]}" 2>&1 ) &
+    pids+=($!)
+  done
+  for i in "${!pids[@]}"; do
+    wait "${pids[i]}"; r=$?
+    if [ "$r" -eq 124 ]; then rc=124; elif [ "$r" -ne 0 ] && [ "$rc" -ne 124 ]; then rc=1; fi
+  done
+  {
+    cat "${sl[@]}" | grep -a -vE '^[0-9]+ passed, [0-9]+ failed|^(NATIVE SANITIZER( INFRA)?|CHECKED TOOLCHAIN|INFRA): [0-9]+ '
+    cat "${sl[@]}" | awk '
+      /^[0-9]+ passed, [0-9]+ failed/ { p += $1; fl += $3
+        for (j = 2; j <= NF; j++) if ($j == "total") tot = $(j-1) }
+      /^(NATIVE SANITIZER( INFRA)?|CHECKED TOOLCHAIN|INFRA): [0-9]+ / {
+        k = $0; sub(/: .*/, "", k)
+        if (!(k in line)) { line[k] = $0; order[++no] = k }
+        v = $0; sub(/^[^:]*: /, "", v); sub(/ .*/, "", v); cnt[k] += v }
+      END {
+        filt = tot - p - fl
+        printf "\n%d passed, %d failed", p, fl
+        if (filt > 0) printf ", %d filtered", filt
+        printf ", %d total\n", tot
+        for (q = 1; q <= no; q++) { k = order[q]; l = line[k]
+          sub(/: [0-9]+ /, ": " cnt[k] " ", l); print l } }'
+  } | tee "$out"
+  return "$rc"
+}
+
 # --- probe mode: compile (and optionally run under ASan) ONE .bzl -------------
 if [ "${1:-}" = "--probe" ]; then
   shift
@@ -264,14 +342,26 @@ fi
 # compose in EITHER order.
 NO_LIT=0
 RUN_LIT=0
+# --jobs N / AGENT_CHECK_JOBS: shards per test binary for a filtered run
+# (default min(4, nproc/4); 1 = the exact old serial behaviour). Stripped here
+# for the same compose-in-any-order reason as --no-lit.
+_ncpu="$(nproc 2>/dev/null || echo 4)"
+SHARDS="${AGENT_CHECK_JOBS:-$(( _ncpu / 4 < 4 ? _ncpu / 4 : 4 ))}"
+[ "$SHARDS" != 0 ] || SHARDS=1   # nproc < 4
 _ac_args=()
+_next_jobs=0
 for _a in "$@"; do
+  if [ "$_next_jobs" = 1 ]; then SHARDS="$_a"; _next_jobs=0; continue; fi
   case "$_a" in
     --no-lit) NO_LIT=1 ;;
     --lit) RUN_LIT=1 ;;
+    --jobs) _next_jobs=1 ;;
+    --jobs=*) SHARDS="${_a#--jobs=}" ;;
     *) _ac_args+=("$_a") ;;
   esac
 done
+[ "$_next_jobs" = 0 ] || die "--jobs needs a number"
+case "$SHARDS" in ''|*[!0-9]*|0) die "--jobs/AGENT_CHECK_JOBS must be a positive integer (got '$SHARDS')" ;; esac
 set -- "${_ac_args[@]}"
 
 # --- --area <group>: restrict the BUILD and the RUN to one test binary --------
@@ -431,8 +521,13 @@ for f in "$@"; do
     # monitor + signal the whole process tree (env forks the actual binary).
     # Exit 124 = timeout fired; the n<want check below also catches this case
     # but the explicit 124 check gives a clearer message (#5450).
-    "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env BEZEL_TEST_FILTER="$f" "$bin" 2>&1 | tee "$blog"
-    rc=${PIPESTATUS[0]}
+    nsh=$SHARDS; [ "$nsh" -le "$want" ] || nsh=$want
+    if [ "$nsh" -le 1 ]; then
+      "$DH" suite timeout "$BEZEL_GTEST_TIMEOUT" env BEZEL_TEST_FILTER="$f" "$bin" 2>&1 | tee "$blog"
+      rc=${PIPESTATUS[0]}
+    else
+      run_sharded "$f" "$bin" "$nsh" "$blog"; rc=$?
+    fi
     if [ "$rc" -eq 124 ]; then
       echo "agent_check: $(basename "$bin") timed out after ${BEZEL_GTEST_TIMEOUT}s (exit 124) — likely a hang; see $blog"
       f_rc=1
