@@ -250,3 +250,31 @@ BEZEL_TEST(nested_lambda_no_target_return_4525,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("45\n"));
 }
+
+// fix-forward #4525/#6284 (§27.5 / §28.14 / §28.9, v0.338): the control's
+// shape looped 200x. `k`'s capture cell is reached by the outer procedure-slot
+// lambda and, through it, by a lambda literal at a call-bounded argument
+// position of its body. That inner lambda is dropped when `Ap` returns, so
+// the cell is freed at `Main`'s scope end. Under LeakSanitizer (runAotChecked)
+// a cell nobody frees is 200 reported leaks, not one hidden by a stale pointer.
+BEZEL_TEST(nested_lambda_no_target_return_4525,
+           call_bounded_nested_lambda_in_procedure_slot_frees_the_cell_looped_spec_27_3) {
+    auto r = runAotChecked(
+        "module M; "
+        "class C "
+        "  public static method Run(f: (int) -> ()) f(2); end Run; "
+        "  public static method Ap(f: (int) -> int): int return f(40); end Ap; "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var i in 0..<200 do "
+        "      var k := i; "
+        "      Run(lambda(e) => do total := total + e + Ap(lambda(x) => x + k); end); "
+        "    end; "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("28300\n"));
+}

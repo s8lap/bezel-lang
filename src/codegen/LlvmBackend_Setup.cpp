@@ -40640,7 +40640,31 @@ void Emitter::collectCellFreeEligible(
                         findLamsE(m->target.get()); return; }
                     if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
                         findLamsE(c->callee.get());
-                        for (auto& a : c->args) findLamsE(a.value.get()); return; }
+                        for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
+                            // fix #4525 / #6284 (§27.5 / §28.14 / §28.9,
+                            // v0.338): a lambda LITERAL at a call-bounded
+                            // argument position inside a NON-ESCAPING outer
+                            // lambda is dropped when that call returns, so it
+                            // cannot outlive the outer's env: its captures are
+                            // non-escaping, like the #3766 `var h :=` form and
+                            // the outer walker's #3498 arm. Widening them to
+                            // escaping left the frame-owned cell (`k` in
+                            // `Run(lambda(e) => ... Ap(lambda(x) => x + k))`)
+                            // freed by nobody.
+                            if (isNonEscaping)
+                                if (auto* argLam = dynamic_cast<
+                                        const ast::LambdaExpr*>(
+                                        c->args[ai].value.get()))
+                                    if (em.isCallBoundedClosureArgPosition(
+                                            *c, ai)) {
+                                        collectLambdaCaptures(
+                                            argLam, em,
+                                            /*isNonEscaping=*/true);
+                                        continue;
+                                    }
+                            findLamsE(c->args[ai].value.get());
+                        }
+                        return; }
                     if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
                         findLamsE(c->callee.get());
                         for (auto& a : c->args) findLamsE(a.value.get()); return; }
