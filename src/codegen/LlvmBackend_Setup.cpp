@@ -17982,12 +17982,23 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // Without this, lowerLambda has no context, derives `i32` from the body
     // literal, and emits `ret i32 42` into a function whose call site expects
     // `{i8,i32}` → IR verification failure.
+    //
+    // fix #4525 (§27.3, v0.338): a lambda initializer of a local with NO
+    // declared function type is "a context with no target type", so whatever
+    // target an enclosing expression armed is not its own and is cleared for
+    // it. The one enclosing target that survives into a lambda body is a
+    // function-typed RETURN (`(int) -> () -> string`, #731's descent), and a
+    // helper closure declared in such a body — `var g := lambda() => k;`
+    // ahead of `return lambda() => …;` — took that returned function's
+    // return type (`ret i32` in a `ptr` function, IR verifier).
     const sema::TypeRef* savedExpectedForLambdaDecl = expectedFunctionType_;
-    if (init && declType && dynamic_cast<const ast::LambdaExpr*>(init)) {
-        if (const sema::TypeRef* declTR = ctx_.resolvedType(*declType)) {
-            if (declTR->kind == sema::TypeRef::Kind::Function)
-                expectedFunctionType_ = declTR;
-        }
+    if (init && dynamic_cast<const ast::LambdaExpr*>(init)) {
+        const sema::TypeRef* declTR =
+            declType ? ctx_.resolvedType(*declType) : nullptr;
+        if (declTR && declTR->kind == sema::TypeRef::Kind::Function)
+            expectedFunctionType_ = declTR;
+        else
+            expectedFunctionType_ = nullptr;
     }
     // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): arm the
     // `recordCallResultInitOutermost_` flag for the duration of the init

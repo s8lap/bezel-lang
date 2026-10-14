@@ -1626,10 +1626,27 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // funcReturn — not the outer's full type. Descend before body emission so a
     // nested body-lambda derives the right return type; otherwise the inner
     // lambda's body was typed against the wrong expected type → `ret i32` vs ptr.
+    //
+    // fix #4525 (§27.3, v0.338): and when the outer's return is NOT a function
+    // type, the body has no function-typed result position at all, so the
+    // outer's target must not stay armed while the body is lowered. It did:
+    // a lambda formed inside the body at a position that supplies no target
+    // (`var g := lambda() => k;`) read the ENCLOSING lambda's target through
+    // the `retTy == i32()` "unresolved" fallback above and took its return
+    // type — `void` under an event handler or any `(…) -> ()` slot, so the
+    // closure was declared `void` and called as `i32` (the result register
+    // read as garbage: 130 plain / 18 under ASan where 5 is correct), and
+    // `ptr` under a `-> string` slot (`ret i32` in a `ptr` function, IR
+    // verifier). §27.3: "Expression-bodied lambdas need no inference rule:
+    // the body expression's type is the return type", and a target-less
+    // block body infers from its own `return e;` expressions — never from a
+    // target that belongs to another lambda.
     const sema::TypeRef* savedExpectedFT = expectedFunctionType_;
     if (expectedFunctionType_ && expectedFunctionType_->funcReturn &&
         expectedFunctionType_->funcReturn->kind == sema::TypeRef::Kind::Function)
         expectedFunctionType_ = expectedFunctionType_->funcReturn;
+    else
+        expectedFunctionType_ = nullptr;
     llvm::Function* savedFn = currentFn_;
     llvm::Value* savedThis = currentThis_;
     llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
@@ -3048,15 +3065,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // as any other unannotated async lambda before this fix.
     const sema::TypeRef* asyncDeclaredTaskTy = nullptr;
     if (lam.isAsync) {
+        // fix #4525: this lambda's OWN target — `expectedFunctionType_` was
+        // re-pointed for the body above (#731) and is no longer it.
         bool haveAnnotation =
-            expectedFunctionType_ && expectedFunctionType_->funcReturn &&
-            expectedFunctionType_->funcReturn->kind ==
+            savedExpectedFT && savedExpectedFT->funcReturn &&
+            savedExpectedFT->funcReturn->kind ==
                 sema::TypeRef::Kind::Named;
         if (haveAnnotation) {
             // The annotation IS authoritative for the void-vs-value distinction
             // (§30.6): a bare `Task` (no generic arg) is a no-value task — leave
             // T null; `Task<T>` / `OwningTask<T>` carries the element type T.
-            const sema::TypeRef* taskTy = expectedFunctionType_->funcReturn;
+            const sema::TypeRef* taskTy = savedExpectedFT->funcReturn;
             asyncDeclaredTaskTy = taskTy;
             if (!taskTy->genericArgs.empty() && taskTy->genericArgs[0])
                 asyncResultElemSemaTy = taskTy->genericArgs[0];
