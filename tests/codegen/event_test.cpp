@@ -15,25 +15,15 @@
 // AsyncEventSource<T>, §24.5) are deferred — async is not implemented.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness
-#include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
-using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& program) {
     auto r = runAot(program);
     BEZEL_EXPECT_TRUE(r.ran);
-    return r.ran ? r.exitCode : -999;
-}
-
-// Rows that stay on the deprecated JIT oracle: their program is one the spec
-// rejects on the AOT path (see the commit body for the spec sentence). They are
-// kept, not deleted, so the behaviour they pin stays under test.
-int runJitLeftover(const std::string& program) {
-    auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
 
@@ -100,8 +90,8 @@ BEZEL_TEST(codegen_events_24, dispose_subscription_unsubscribes_handler) {
         "var b := new Button(); "
         "do using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "          // box.V = 5
-        "s.Dispose(); end; "        // remove the handler (§2.11)
-        "b.Fire(100); "        // no handler left — no-op
+        "s.Dispose(); "        // remove the handler (§2.11)
+        "b.Fire(100); end; "        // no handler left — no-op
         "return box.V; ")), 5);
 }
 
@@ -258,32 +248,30 @@ BEZEL_TEST(codegen_events_24, subscribe_past_capacity_grows_all_fire_24_5) {
 }
 
 // D11 / §2.11 / §24.4: Subscription disposal is type-based, not tied to a
-// literal `.Subscribe(...)` declarator. A Subscription obtained from a
-// METHOD whose return type is `Subscription` disposes the same way: `.Dispose()`
-// removes the handler, so the subsequent Raise is a no-op. (Before the fix the
-// recognition was purely syntactic — a method-returned Subscription's `.Dispose`
-// was a no-op and the handler stayed subscribed, returning 50 here.)
+// literal `.Subscribe(...)` declarator. A Subscription obtained from a METHOD
+// whose return type is `Subscription` disposes the same way: `.Dispose()`
+// removes the handler, so the subsequent Raise is a no-op. The handler is
+// capture-free (it bumps the static Tot.V): §28.14 admits a capture-free
+// callback with no bounding object ("capture-free callbacks are always
+// admitted"), so the method-returned form is admitted on the AOT path.
 BEZEL_TEST(codegen_events_24, dispose_method_returned_subscription_unsubscribes) {
-    BEZEL_EXPECT_EQ(runJitLeftover(
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Box; "
+        "class Tot public static V: int := 0; end Tot; "
         "class Button "
         "  public event Clicked: Ev; "
         "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
-        "  public method Wire(box: Box): Subscription "         // returns Subscription
-        "    return Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "  public method Wire(): Subscription "                 // returns Subscription
+        "    return Clicked.Subscribe(lambda(e) => do Tot.V := Tot.V + e.N; end); "
         "  end Wire; "
         "end Button; "
         "class C public static method Main(): int "
-        "  var box := new Box(); var b := new Button(); "
-        "  var s := b.Wire(box); "                              // method-returned Subscription
+        "  var b := new Button(); "
+        "  var s := b.Wire(); "                                 // method-returned Subscription
         "  s.Dispose(); "                                       // §2.11 unsubscribe
         "  b.Fire(50); "                                        // handler gone — no-op
-        "  return box.V; "
+        "  return Tot.V; "
         "end Main; end C;"), 0);
 }
 
@@ -316,31 +304,33 @@ BEZEL_TEST(codegen_events_24, using_var_subscription_scope_end_auto_disposes) {
         "end Main; end C;"), 5);
 }
 
-// D11 / §2.11: a Subscription passed as a PARAMETER disposes by type. The helper
-// receives `s: Subscription` and calls `s.Dispose()`, which unsubscribes the
-// original handler. (Before the fix a Subscription parameter lowered to a
-// non-pointer and the `.Dispose()` was skipped, returning 7.)
+// D11 / §2.11 / §28.6: a Subscription passed to an `owned` PARAMETER disposes by
+// type. The helper receives `s: owned Subscription` and calls `s.Dispose()`,
+// which unsubscribes the handler; `Kill(move s)` transfers ownership (§28.8).
+// The handler is capture-free (static Tot.V), admitted by §28.14 without a
+// bounding object. A non-`owned` parameter may not call Dispose (§28.6), so the
+// owned form is the admitted one.
 BEZEL_TEST(codegen_events_24, dispose_parameter_subscription_unsubscribes) {
-    BEZEL_EXPECT_EQ(runJitLeftover(
+    BEZEL_EXPECT_EQ(run(
         "module M; "
         "record Ev(N: int); "
-        "class Box "
-        "  public V: int := 0; "
-        "  public method Add(x: int) V := V + x; end Add; "
-        "end Box; "
+        "class Tot public static V: int := 0; end Tot; "
         "class Button "
         "  public event Clicked: Ev; "
         "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "  public method Wire(): owned Subscription "
+        "    return Clicked.Subscribe(lambda(e) => do Tot.V := Tot.V + e.N; end); "
+        "  end Wire; "
         "end Button; "
         "class Helper "
-        "  public static method Kill(s: Subscription) s.Dispose(); end Kill; "
+        "  public static method Kill(owned s: Subscription) s.Dispose(); end Kill; "
         "end Helper; "
         "class C public static method Main(): int "
-        "  var box := new Box(); var b := new Button(); "
-        "  var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
-        "  Helper.Kill(s); "                    // dispose through a parameter
+        "  var b := new Button(); "
+        "  var s := b.Wire(); "
+        "  Helper.Kill(move s); "                    // dispose through an owned parameter
         "  b.Fire(7); "                         // handler gone — no-op
-        "  return box.V; "
+        "  return Tot.V; "
         "end Main; end C;"), 0);
 }
 
@@ -383,8 +373,8 @@ BEZEL_TEST(codegen_events_24, dispose_literal_declarator_subscription_still_work
         "var box := new Box(); var b := new Button(); "
         "do using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "                           // handler live → +5
-        "s.Dispose(); end; "                         // literal declarator dispose
-        "b.Fire(100); "                         // handler gone — no-op
+        "s.Dispose(); "                         // literal declarator dispose
+        "b.Fire(100); end; "                         // handler gone — no-op
         "return box.V; ")), 5);
 }
 
