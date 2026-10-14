@@ -278,3 +278,91 @@ BEZEL_TEST(nested_lambda_no_target_return_4525,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("28300\n"));
 }
+
+// fix-forward #4525 (§27.3 / §27.5 / §28.9, v0.338): row 5's IIFE shape looped
+// 200x. `(lambda() => k)()` sits in the body of `g`, itself bound by `var g :=`
+// inside the procedure-slot lambda. The IIFE closure is released right after
+// its call, so `k`'s cell is freed once, at the loop body's scope end. Before
+// the fix the #1135 widening marked `k` escaping and nobody freed the cell.
+BEZEL_TEST(nested_lambda_no_target_return_4525,
+           nested_iife_in_procedure_slot_frees_the_cell_looped_spec_27_3) {
+    auto r = runAotChecked(
+        "module M; "
+        "class C "
+        "  public static method Run(f: (int) -> ()) f(2); end Run; "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var i in 0..<200 do "
+        "      var k := i; "
+        "      Run(lambda(e) => do "
+        "        var g := lambda() => (lambda() => k)(); "
+        "        total := total + e + g(); "
+        "      end); "
+        "    end; "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("20300\n"));
+}
+
+// fix-forward #4525 (§27.3 / §27.5 / §28.9, v0.338): row 5's lambda-returning-
+// lambda shape looped 200x. Every call of `g` is invoked at once (`g()()`), so
+// each closure `g` returns is released inside the expression and `k`'s cell is
+// freed once, at the loop body's scope end.
+BEZEL_TEST(nested_lambda_no_target_return_4525,
+           lambda_returning_lambda_invoked_at_once_frees_the_cell_looped_spec_27_3) {
+    auto r = runAotChecked(
+        "module M; "
+        "class C "
+        "  public static method Run(f: (int) -> ()) f(2); end Run; "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var i in 0..<200 do "
+        "      var k := i; "
+        "      Run(lambda(e) => do "
+        "        var g := lambda() => lambda() => k + 1; "
+        "        total := total + e + g()(); "
+        "      end); "
+        "    end; "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("20500\n"));
+}
+
+// fix-forward #4525 (§27.5 / §28.9, v0.338): the use-after-free guard. The
+// closure `g` returns is STORED in `h` and called twice after `g`'s own frame
+// is gone, then `k` is read again in `Main` after `Run` returns. The cell must
+// outlive `h` and every read of `k`, and still be freed exactly once (ASan:
+// no heap-use-after-free, no double free, no leak over 200 iterations).
+BEZEL_TEST(nested_lambda_no_target_return_4525,
+           returned_inner_lambda_stored_and_called_later_no_uaf_looped_spec_27_5) {
+    auto r = runAotChecked(
+        "module M; "
+        "class C "
+        "  public static method Run(f: (int) -> ()) f(2); end Run; "
+        "  public static method Main(): int "
+        "    var total := 0; "
+        "    for var i in 0..<200 do "
+        "      var k := i; "
+        "      Run(lambda(e) => do "
+        "        var g := lambda() => lambda() => k + 1; "
+        "        var h := g(); "
+        "        total := total + e + h() + h(); "
+        "      end); "
+        "      total := total + k; "
+        "    end; "
+        "    Console.WriteLine(total); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("60500\n"));
+}

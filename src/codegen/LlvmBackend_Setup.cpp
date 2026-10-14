@@ -40248,6 +40248,191 @@ void Emitter::collectCellFreeEligible(
         // MethodOwnership::scopedFormalAt's callee matching in full.
         std::unordered_map<const ast::Expr*, const ast::LocalDecl*> usingInitOf;
 
+        // fix #4525 (§27.3 / §27.5 / §28.9, v0.338): nested lambdas `g` —
+        // reclassified non-escaping by #3766 inside a non-escaping outer
+        // lambda — whose bare expression body is itself a lambda `H` and every
+        // call `g(...)` of which is consumed inside the outer body (see
+        // resultConsumedLocally). Each `H` instance then dies before the
+        // outer's env, so the #1135 widening need not mark its captures
+        // escaping. Filled by the #3766 arm, read by the widening walker.
+        std::unordered_set<const void*> resultConsumedLocally4525;
+
+        // fix #4525 (§27.3 / §27.5 / §28.9, v0.338): is every occurrence of
+        // the local `gDecl` in `outer`'s body a call `g(...)` whose result is
+        // either invoked at once (`g(...)(...)`: the temporary is released
+        // after the call, like an IIFE) or is the whole initializer of a
+        // `var/const h := g(...)` whose binding `h` the ClosureEscapeWalker
+        // proves non-escaping (so `h` dies at the outer's scope end)? A
+        // reference inside a nested lambda is left to the caller's own
+        // ClosureEscapeWalker (FINDING [1] marks it escaped), so this walk
+        // skips LambdaExpr bodies. Fail-closed: any node kind not enumerated
+        // here answers "no", leaving the documented #1135 leak.
+        bool resultConsumedLocally(const ast::LambdaExpr* outer,
+                                   const ast::Stmt* gDecl) const {
+            bool ok = true;
+            auto isG = [&](const ast::Expr* e) {
+                auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+                auto* loc = id ? dynamic_cast<sema::LocalSymbol*>(
+                                     ctx.exprSymbol(*id))
+                               : nullptr;
+                return loc && loc->decl &&
+                       static_cast<const void*>(loc->decl) ==
+                           static_cast<const void*>(gDecl);
+            };
+            auto bindingStaysLocal = [&](const ast::Stmt* decl) {
+                ClosureEscapeWalker hw{ctx, static_cast<const void*>(decl)};
+                if (outer->exprBody) hw.expr(outer->exprBody.get(), false);
+                for (auto& s : outer->stmts) hw.stmt(s.get());
+                return !hw.escaped;
+            };
+            std::function<void(const ast::Expr*)> ex;
+            std::function<void(const ast::Stmt*)> st;
+            ex = [&](const ast::Expr* e) {
+                if (!e || !ok) return;
+                if (isG(e)) { ok = false; return; }
+                if (dynamic_cast<const ast::IdentifierExpr*>(e) ||
+                    dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+                    dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+                    dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+                    dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+                    dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+                    dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+                    dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+                    dynamic_cast<const ast::UnitExpr*>(e) ||
+                    dynamic_cast<const ast::TypeOfExpr*>(e) ||
+                    dynamic_cast<const ast::NameOfExpr*>(e) ||
+                    dynamic_cast<const ast::DefaultExpr*>(e) ||
+                    dynamic_cast<const ast::LambdaExpr*>(e))
+                    return;
+                if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+                    // `g(...)(...)`: the inner call's result is invoked here.
+                    if (auto* ic = dynamic_cast<const ast::CallExpr*>(
+                            c->callee.get()))
+                        if (isG(ic->callee.get())) {
+                            for (auto& a : ic->args) ex(a.value.get());
+                            for (auto& a : c->args) ex(a.value.get());
+                            return;
+                        }
+                    ex(c->callee.get());
+                    for (auto& a : c->args) ex(a.value.get());
+                    return;
+                }
+                if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+                    ex(c->callee.get());
+                    for (auto& a : c->args) ex(a.value.get());
+                    return;
+                }
+                if (auto* is2 = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+                    for (auto& part : is2->parts) ex(part.expr.get());
+                    return;
+                }
+                if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+                    ex(m->target.get()); return; }
+                if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
+                    ex(m->target.get()); return; }
+                if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+                    ex(ix->target.get());
+                    for (auto& a : ix->indices) ex(a.value.get());
+                    return;
+                }
+                if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+                    ex(p->operand.get()); return; }
+                if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+                    for (auto& a : n->args) ex(a.value.get());
+                    return;
+                }
+                if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+                    ex(b->left.get()); ex(b->right.get()); return; }
+                if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+                    ex(u->operand.get()); return; }
+                if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+                    ex(t->operand.get()); return; }
+                if (auto* co = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+                    ex(co->condition.get()); ex(co->thenValue.get());
+                    ex(co->elseValue.get()); return; }
+                if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+                    ex(th->operand.get()); return; }
+                if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+                    ex(r->lo.get()); ex(r->hi.get()); ex(r->step.get()); return; }
+                if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+                    ex(w->source.get());
+                    for (auto& a : w->assigns) ex(a.value.get());
+                    return;
+                }
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+                    for (auto& el : cl->elements) ex(el.get());
+                    for (auto& k : cl->keys) ex(k.get());
+                    return;
+                }
+                ok = false;  // CaseExpr, BindExpr, MarkedTransferExpr, future kinds
+            };
+            st = [&](const ast::Stmt* s) {
+                if (!s || !ok) return;
+                LocalDeclInitView v = localDeclInitView(s);
+                if (dynamic_cast<const ast::LocalDecl*>(s) ||
+                    dynamic_cast<const ast::LocalConstDecl*>(s)) {
+                    if (auto* c = dynamic_cast<const ast::CallExpr*>(v.init))
+                        if (isG(c->callee.get())) {
+                            for (auto& a : c->args) ex(a.value.get());
+                            if (!bindingStaysLocal(s)) ok = false;
+                            return;
+                        }
+                    ex(v.init);
+                    return;
+                }
+                if (dynamic_cast<const ast::BreakStmt*>(s) ||
+                    dynamic_cast<const ast::ContinueStmt*>(s) ||
+                    dynamic_cast<const ast::LocalTypeDecl*>(s))
+                    return;
+                if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+                    ex(as->target.get()); ex(as->value.get()); return; }
+                if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                    ex(rs->value.get()); return; }
+                if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+                    ex(ts->value.get()); return; }
+                if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+                    ex(es->expr.get()); return; }
+                if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+                    ex(ds->value.get()); return; }
+                if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
+                    ex(is->target.get()); return; }
+                if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                    ex(is->ifBranch.condition.get());
+                    for (auto& b : is->ifBranch.body) st(b.get());
+                    for (auto& br : is->elifBranches) {
+                        ex(br.condition.get());
+                        for (auto& b : br.body) st(b.get()); }
+                    for (auto& b : is->elseBody) st(b.get());
+                    return;
+                }
+                if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                    ex(ws->condition.get());
+                    for (auto& b : ws->body) st(b.get());
+                    return;
+                }
+                if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                    ex(fs->iterable.get());
+                    for (auto& b : fs->body) st(b.get());
+                    return;
+                }
+                if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                    for (auto& b : d->body) st(b.get());
+                    return;
+                }
+                if (auto* ts2 = dynamic_cast<const ast::TryStmt*>(s)) {
+                    for (auto& b : ts2->body) st(b.get());
+                    for (auto& c : ts2->catches) {
+                        ex(c.guard.get()); st(c.body.get()); }
+                    for (auto& b : ts2->finallyBody) st(b.get());
+                    return;
+                }
+                ok = false;  // CaseStmt, YieldStmt, future kinds
+            };
+            if (outer->exprBody) ex(outer->exprBody.get());
+            for (auto& s : outer->stmts) st(s.get());
+            return ok;
+        }
+
         // Track whether we're inside a "direct initializer" position for a
         // `var` local that is in closureReleaseEligible_. Only at the TOP
         // level (safePos=true) can a lambda be non-escaping.
@@ -40534,6 +40719,19 @@ void Emitter::collectCellFreeEligible(
                                                   /*isNonEscaping=*/true);
                             return;
                         }
+                        // fix #4525 (§27.3 / §27.5 / §28.9, v0.338): `nl` is
+                        // the bare expression body of a non-escaping `lam`
+                        // whose every call result the enclosing body consumes
+                        // (`g()()` or a non-escaping `var h := g()`), so every
+                        // `nl` instance dies before the cell's owning scope.
+                        if (isNonEscaping && lam->stmts.empty() &&
+                            lam->exprBody.get() == nl &&
+                            resultConsumedLocally4525.count(
+                                static_cast<const void*>(lam))) {
+                            collectLambdaCaptures(nl, em,
+                                                  /*isNonEscaping=*/true);
+                            return;
+                        }
                         // fix #3804 (§27.5 / §15.3 / §28.9, v0.294): `nl` is
                         // `lam`'s own PROVEN transparent forward target
                         // (either `lam`'s bare exprBody IS `nl`, or `nl` is
@@ -40611,6 +40809,17 @@ void Emitter::collectCellFreeEligible(
                                 cew.expr(lam->exprBody.get(), false);
                             for (auto& s : lam->stmts) cew.stmt(s.get());
                             if (!cew.escaped) {
+                                // fix #4525: `var g := lambda() => H` whose
+                                // every call result is consumed in `lam`'s
+                                // body — the widening below may then treat
+                                // `H` as non-escaping (see the field).
+                                if (nl->stmts.empty() &&
+                                    dynamic_cast<const ast::LambdaExpr*>(
+                                        nl->exprBody.get()) &&
+                                    resultConsumedLocally(lam,
+                                                          currentParentStmt))
+                                    resultConsumedLocally4525.insert(
+                                        static_cast<const void*>(nl));
                                 inVarInit = false;
                                 currentParentStmt = nullptr;
                                 collectLambdaCaptures(nl, em,
@@ -40639,6 +40848,21 @@ void Emitter::collectCellFreeEligible(
                     if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
                         findLamsE(m->target.get()); return; }
                     if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+                        // fix #4525 (§27.3 / §27.5 / §28.9, v0.338): an IIFE
+                        // `(lambda() => k)()` inside a NON-ESCAPING outer
+                        // lambda is the outer walker's #2182 shape one level
+                        // down: the call is followed by emitClosureRelease, so
+                        // the callee closure never outlives this expression.
+                        if (isNonEscaping)
+                            if (auto* iifeLam = dynamic_cast<
+                                    const ast::LambdaExpr*>(c->callee.get())) {
+                                inVarInit = false;
+                                currentParentStmt = nullptr;
+                                collectLambdaCaptures(iifeLam, em,
+                                                      /*isNonEscaping=*/true);
+                                for (auto& a : c->args) findLamsE(a.value.get());
+                                return;
+                            }
                         findLamsE(c->callee.get());
                         for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
                             // fix #4525 / #6284 (§27.5 / §28.14 / §28.9,
