@@ -2539,6 +2539,129 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     }
     if (cands.empty()) return arityFallback();
 
+    // fix #6312 (§14.5, §22.6, v0.338): the one conservative "this argument
+    // certainly does not reach this parameter" test the explicit-list paths
+    // share. Certain only for (a) two primitives where a non-integer side
+    // keeps §5.1's constant narrowing out of play and `classifyArg` grades
+    // NotApplicable, and (b) two instantiations of the SAME type known to be
+    // invariant in its arguments, a built-in `Array` or a user class or
+    // record, whose arguments `classifyArg` grades NotApplicable. Interfaces
+    // and delegates may declare `out`/`in` variance (§11.3), which
+    // `classifyArg` does not model, so they stay on the old pick.
+    auto definitelyInapplicable = [&](const TypeRef* at, const TypeRef* pt) {
+        if (!at || !pt || at->nullable || pt->nullable) return false;
+        auto isIntPrim = [](const TypeRef* t) {
+            switch (t->primitive) {
+                case PrimitiveType::Byte: case PrimitiveType::SByte:
+                case PrimitiveType::Short: case PrimitiveType::UShort:
+                case PrimitiveType::Int: case PrimitiveType::UInt:
+                case PrimitiveType::Long: case PrimitiveType::ULong:
+                    return true;
+                default: return false;
+            }
+        };
+        if (at->kind == TypeRef::Kind::Primitive &&
+            pt->kind == TypeRef::Kind::Primitive) {
+            if (isIntPrim(at) && isIntPrim(pt)) return false;
+            return classifyArg(at, pt) == ArgMatch::NotApplicable;
+        }
+        if (at->kind == TypeRef::Kind::Named &&
+            pt->kind == TypeRef::Kind::Named && !at->genericArgs.empty() &&
+            at->genericArgs.size() == pt->genericArgs.size() &&
+            at->declaration == pt->declaration &&
+            at->headName() == pt->headName()) {
+            const bool invariant =
+                at->declaration
+                    ? (at->declaration->kind == ast::TypeDeclKind::Class ||
+                       at->declaration->kind == ast::TypeDeclKind::Record)
+                    : at->headName() == "Array";
+            return invariant &&
+                   classifyArg(at, pt) == ArgMatch::NotApplicable;
+        }
+        return false;
+    };
+    // fix #6312 (§14.5, v0.338): "the list's length selects first: a
+    // non-generic candidate takes no list". A call that writes method type
+    // arguments reaches only candidates declaring that many type parameters;
+    // before, `c.S<int>(1)` ranked the non-generic `S(x: int)` alongside the
+    // generic `S<V>(x: V)` and picked the non-generic one. Applied only when
+    // some candidate takes the list: a name with none keeps the pre-existing
+    // path (and its diagnostics).
+    {
+        const std::vector<std::unique_ptr<ast::Type>>* listTypeArgs = nullptr;
+        if (auto* lma = dynamic_cast<const ast::MemberAccessExpr*>(
+                ce.callee.get()))
+            listTypeArgs = &lma->typeArgs;
+        else if (auto* lncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     ce.callee.get()))
+            listTypeArgs = &lncm->typeArgs;
+        else if (auto* lid = dynamic_cast<const ast::IdentifierExpr*>(
+                     ce.callee.get()))
+            listTypeArgs = &lid->typeArgs;
+        if (listTypeArgs && !listTypeArgs->empty()) {
+            std::vector<std::size_t> keep;
+            for (std::size_t c = 0; c < cands.size(); ++c)
+                if (cands[c]->genericParams.size() == listTypeArgs->size())
+                    keep.push_back(c);
+            if (!keep.empty() && keep.size() != cands.size()) {
+                std::vector<MethodSymbol*> lc;
+                std::vector<BindResult> lb;
+                for (std::size_t c : keep) {
+                    lc.push_back(cands[c]);
+                    lb.push_back(std::move(binds[c]));
+                }
+                cands.swap(lc);
+                binds.swap(lb);
+                // The narrowing can leave one candidate that nothing re-checks
+                // (a generic candidate of an overload set is not re-checked
+                // after selection), so `S(x: string)` beside `S<V>(x: V)` at
+                // `c.S<int>("abc")` would run the generic body on a string.
+                // The same certain-evidence test rejects it here.
+                if (cands.size() == 1 && cands[0]->parent &&
+                    cands[0]->parent->genericParams.empty()) {
+                    const auto* sd =
+                        dynamic_cast<const ast::MethodDecl*>(cands[0]->decl);
+                    std::unordered_map<std::string_view, TypeRef*> sub;
+                    bool resolved = sd && sd->genericParams.size() ==
+                                              listTypeArgs->size();
+                    for (std::size_t gi = 0; resolved &&
+                                             gi < sd->genericParams.size();
+                         ++gi) {
+                        TypeRef* ta = (*listTypeArgs)[gi]
+                                          ? ctx_.resolvedType(*(*listTypeArgs)[gi])
+                                          : nullptr;
+                        if (!ta) resolved = false;
+                        else sub[sd->genericParams[gi].name] = ta;
+                    }
+                    bool bad = false;
+                    for (std::size_t j = 0; resolved && !bad &&
+                                            j < sd->params.size();
+                         ++j) {
+                        const int ai = binds[0].paramToArg[j];
+                        if (ai < 0 || !sd->params[j].type) continue;
+                        const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+                        if (!arg.modifier.empty() || !arg.value) continue;
+                        TypeRef* pt = ctx_.resolvedType(*sd->params[j].type);
+                        if (!pt) continue;
+                        pt = substituteReturnType(pt, sub);
+                        bad = definitelyInapplicable(ctx_.exprType(*arg.value),
+                                                     pt);
+                    }
+                    if (bad) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "no overload of `" + std::string(initial->name) +
+                                "` is applicable to these arguments; the "
+                                "explicit type-argument list leaves every "
+                                "candidate requiring a conversion that §5.1 "
+                                "does not admit as implicit (§14.5, §22.6)");
+                        return arityFallback();
+                    }
+                }
+            }
+        }
+    }
+
     // §22.3 / §22.6 (#952): the call-site `ref`/`out` modifier participates in
     // overload APPLICABILITY and is MANDATORY at the call site. A `ref`
     // parameter is filled only by a `ref` argument; an `out`/`out owned`
@@ -3266,6 +3389,56 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             // cands[c] IS the MethodSymbol* so we can directly use cands[c]
             // with r.applicable[c].
             //
+            // fix #6312 (§14.5, §22.6, v0.338): "when a full explicit list is
+            // supplied, no inference runs" and the bound parameter types take
+            // part in applicability; "when none of the candidates applies,
+            // the call is an error". A generic instantiation argument leaves
+            // the grid undecided (`judgeable`), and a generic candidate of an
+            // overload set is never re-checked after selection, so a list
+            // that fits no candidate compiled. Reject only on certain
+            // evidence: every candidate is generic, takes the list's length,
+            // ranked with its explicit substitution, and carries a position
+            // where the argument and the substituted parameter are both
+            // primitives that do not convert, or are instantiations of the
+            // SAME generic type whose arguments do not convert. Anything
+            // less certain (function types, nullable mismatch, interfaces)
+            // keeps the pre-existing selection.
+            {
+                const std::vector<std::unique_ptr<ast::Type>>* lta = nullptr;
+                if (auto* a1 = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ce.callee.get()))
+                    lta = &a1->typeArgs;
+                else if (auto* a2 = dynamic_cast<const ast::NullCondMemberExpr*>(
+                             ce.callee.get()))
+                    lta = &a2->typeArgs;
+                else if (auto* a3 = dynamic_cast<const ast::IdentifierExpr*>(
+                             ce.callee.get()))
+                    lta = &a3->typeArgs;
+                bool allExplicit = lta && !lta->empty() && !cands.empty();
+                bool noneApplies = allExplicit;
+                for (std::size_t c = 0; c < cands.size() && noneApplies; ++c) {
+                    if (cands[c]->genericParams.size() != lta->size() ||
+                        phase1Subst[c].empty()) {
+                        noneApplies = false;
+                        break;
+                    }
+                    bool bad = false;
+                    for (std::size_t i = 0; i < argTypes.size() && !bad; ++i)
+                        bad = definitelyInapplicable(argTypeRows[c][i],
+                                                     paramTypes[c][i]);
+                    if (!bad) noneApplies = false;
+                }
+                if (noneApplies) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "no overload of `" + std::string(initial->name) +
+                            "` is applicable to these arguments; the explicit "
+                            "type-argument list leaves every candidate "
+                            "requiring a conversion that §5.1 does not admit "
+                            "as implicit (§14.5, §22.6)" + extNote);
+                    return arityFallback();
+                }
+            }
             // fix #5859 (§22.6 / §5.1 / §31.4, v0.334): `Undecidable` also
             // arrives with EVERY candidate marked inapplicable when the
             // ARGUMENT's type is a built-in class reference (see
