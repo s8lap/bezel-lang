@@ -22582,8 +22582,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                        tTy->kind == TypeRef::Kind::Named &&
                        tTy->declaration &&
                        (rTy->kind == TypeRef::Kind::Primitive ||
-                        (rTy->kind == TypeRef::Kind::Named &&
-                         rTy->declaration))) {
+                        rTy->kind == TypeRef::Kind::Named)) {
                 // §6.6/§25.2 (#2162): a NAMED TARGET (record/class/enum/
                 // interface/choice) with a compound `op=` desugars to
                 // `x := x op e` (§6.6). The binary `x op e` has a result R
@@ -22653,8 +22652,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         return Q::Inapplicable;
                     const bool sameNull = operandTy->nullable == pt->nullable;
                     if (pt->kind == TypeRef::Kind::Primitive) {
-                        if (operandTy->kind != TypeRef::Kind::Primitive)
+                        if (operandTy->kind != TypeRef::Kind::Primitive) {
+                            // fix #6091 (§5.1 reference conversion, §25.2,
+                            // v0.338): a declaration-less stdlib class (no
+                            // TypeSymbol, e.g. StringBuilder) reaches the
+                            // `Object` root by an implicit reference
+                            // conversion, so it is an applicable operand.
+                            if (pt->primitive == PrimitiveType::Object &&
+                                operandTy->kind == TypeRef::Kind::Named &&
+                                !operandTy->declaration &&
+                                implicitlyConvertible(operandTy, pt))
+                                return Q::Converting;
                             return Q::Inapplicable;
+                        }
                         if (pt->primitive == operandTy->primitive)
                             return sameNull ? Q::Exact : Q::Converting;
                         if (primitiveWidens(operandTy->primitive, pt->primitive))
@@ -22667,10 +22677,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                          operandTy);
                         return Q::Converting;
                     }
-                    if (pt->kind != TypeRef::Kind::Named || !pt->declaration ||
-                        operandTy->kind != TypeRef::Kind::Named ||
-                        !operandTy->declaration)
+                    if (pt->kind != TypeRef::Kind::Named ||
+                        operandTy->kind != TypeRef::Kind::Named)
                         return Q::Inapplicable;
+                    // fix #6091 (§6.6/§25.2, v0.338): a declaration-less
+                    // stdlib class on either side (StringBuilder, Exception)
+                    // has no TypeSymbol, so the pointer tests below cannot
+                    // grade it. Grade it as the binary operator path does
+                    // (classifyArg, #5862): Exact, Convert, or inapplicable.
+                    // Before the #6091 entry change this operand never
+                    // reached this check, and `v += sb` was accepted.
+                    if (!pt->declaration || !operandTy->declaration) {
+                        // typeRefEqual compares declaration pointers only, so
+                        // two declaration-less stdlib classes of different
+                        // names (StringBuilder vs Exception) would both read
+                        // as Exact. Outside the built-in exception hierarchy,
+                        // which classifyArg grades by name, such a pair is
+                        // never convertible (§5.1: no stdlib subtyping).
+                        if (!pt->declaration && !operandTy->declaration &&
+                            !isBuiltinExceptionRef(pt) &&
+                            namedRefSimpleName(pt) !=
+                                namedRefSimpleName(operandTy))
+                            return Q::Inapplicable;
+                        switch (classifyArg(operandTy, pt)) {
+                            case ArgMatch::Exact:
+                                return sameNull ? Q::Exact : Q::Converting;
+                            case ArgMatch::Convert: return Q::Converting;
+                            case ArgMatch::NotApplicable: return Q::Inapplicable;
+                        }
+                    }
                     if (pt->declaration == operandTy->declaration)
                         return sameNull ? Q::Exact : Q::Converting;
                     if (isSubtype(operandTy->declaration, pt->declaration))
