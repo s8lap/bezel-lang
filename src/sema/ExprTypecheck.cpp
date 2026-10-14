@@ -24514,6 +24514,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             fieldNarrowed_ = fieldCondState;
             collectNarrowings(falseCond, /*forTrueBranch=*/false);
         };
+        // §7.4 (v0.338): an early exit "(or `throw`, `break`, `continue` in
+        // that branch)" leaves the surviving path narrowed. Inside a loop a
+        // branch that ends at a `break`/`continue` does not reach the join;
+        // its state already reached the jump's target through
+        // recordLoopEdgeNarrowing (#6114, #6139).
+        auto branchLeaves = [&](const std::vector<std::unique_ptr<ast::Stmt>>&
+                                    body) {
+            return bodyAlwaysExits(body) ||
+                   (loopDepth_ > 0 && loopBodyEndUnreachable(body));
+        };
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
         recordPendingCondTypeFacts(ifs->ifBranch.condition.get(),
                                    /*forTrueBranch=*/true);  // pending #6083
@@ -24530,7 +24540,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
             currentScope_ = saveScope;
         }
-        if (!bodyAlwaysExits(ifs->ifBranch.body)) {
+        if (!branchLeaves(ifs->ifBranch.body)) {
             fallThroughExits.push_back(nullNarrowed_);
             fieldExits.push_back(fieldNarrowed_);
             typeExits.emplace_back(branchEntryTypes, narrowings_);
@@ -24590,7 +24600,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 for (const auto& bs : el.body) if (bs) visitStmt(*bs);
                 currentScope_ = saveScope;
             }
-            if (!bodyAlwaysExits(el.body)) {
+            if (!branchLeaves(el.body)) {
                 fallThroughExits.push_back(nullNarrowed_);
                 fieldExits.push_back(fieldNarrowed_);
                 typeExits.emplace_back(branchEntryTypes, narrowings_);
@@ -24621,7 +24631,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
         notePendingExit(ifs->elseBody, /*isImplicitElse=*/!ifs->hasElse);
         // The else path falls through unless an explicit else body always exits.
-        if (!ifs->hasElse || !bodyAlwaysExits(ifs->elseBody)) {
+        if (!ifs->hasElse || !branchLeaves(ifs->elseBody)) {
             fallThroughExits.push_back(nullNarrowed_);
             fieldExits.push_back(fieldNarrowed_);
             typeExits.emplace_back(branchEntryTypes, narrowings_);

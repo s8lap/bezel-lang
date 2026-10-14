@@ -389,3 +389,66 @@ BEZEL_TEST(sema_loop_back_edge_narrowing_6114,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("2 6 2\n"));
 }
+
+// ACCEPT (#6139's shape). §7.4 (v0.338) "an early exit … (or `throw`,
+// `break`, `continue` in that branch), the surviving path is narrowed": the
+// read relies on this iteration's `break`-exit narrowing, not on the fact
+// carried in. Before the fix the `break` branch joined after the `if`, so the
+// read fell back on the declaration's fact and was rejected.
+BEZEL_TEST(sema_loop_back_edge_narrowing_6114,
+           null_break_exit_narrows_this_iteration_spec_7_4) {
+    auto r = run(R"bzl(
+  public static method T(o: A, alt: A, n: string?): int
+    var q: A := o; var s: string? := "ab"; var t := 0; var i := 0;
+    while i < 3 do if s = null then break; end if; t := t + s.Length; s := n; i := i + 1; end while;
+    return t;
+  end T;)bzl");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("2 10 2\n"));
+}
+
+// ACCEPT. The same through `continue`.
+BEZEL_TEST(sema_loop_back_edge_narrowing_6114,
+           null_continue_exit_narrows_this_iteration_spec_7_4) {
+    auto r = run(R"bzl(
+  public static method T(o: A, alt: A, n: string?): int
+    var q: A := o; var s: string? := "ab"; var t := 0; var i := 0;
+    while i < 3 do i := i + 1; if s = null then continue; end if; t := t + s.Length; s := n; end while;
+    return t;
+  end T;)bzl");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("2 10 2\n"));
+}
+
+// ACCEPT. The `break` branch has an `else` that falls through; only the
+// `else` path joins.
+BEZEL_TEST(sema_loop_back_edge_narrowing_6114,
+           null_break_exit_with_else_narrows_this_iteration_spec_7_4) {
+    auto r = run(R"bzl(
+  public static method T(o: A, alt: A, n: string?): int
+    var q: A := o; var s: string? := "ab"; var t := 0; var i := 0;
+    while i < 3 do if s = null then break; else t := t + 1; end if; t := t + s.Length; s := n; i := i + 1; end while;
+    return t;
+  end T;)bzl");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3 13 3\n"));
+}
+
+// REJECT control. The `break` is conditional, so the branch can fall through
+// to the join without the fact, and the read on iteration 2 relies on the
+// fact carried in, which `s := n` invalidated.
+BEZEL_TEST(sema_loop_back_edge_narrowing_6114,
+           null_conditional_break_does_not_narrow_spec_7_4) {
+    auto r = run(R"bzl(
+  public static method T(o: A, alt: A, n: string?): int
+    var q: A := o; var s: string? := "ab"; var t := 0; var i := 0;
+    while i < 3 do if s = null then if i > 5 then break; end if; end if; t := t + s.Length; s := n; i := i + 1; end while;
+    return t;
+  end T;)bzl");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "the knowledge that it is non-null was established before the loop"));
+}
