@@ -1517,12 +1517,66 @@ std::string_view builtinClassModulePathOf(std::string_view name) {
 // the alias/qualifier resolution, so the row lives in this home-only table
 // and cannot change any §8.5 rendering. Without it, `System.Collections.Linq.
 // IGrouping<K, V>` fell through to "unresolved type name `System`".
+//
+// fix #6154 (spec §2.3, v0.338; §2.7 rule 2): the same gap for every OTHER
+// interface head and the few non-interface heads the §2.3 always-available
+// table names whose home has no §8.5 row (`IEnumerable<T>` under
+// `System.Collections.Generic`, `IOrderedEnumerable<T>` under
+// `System.Collections.Linq`, `IComparable<T>` under `System`, ...). Each row
+// is the module the §2.3 table lists the name under; a qualifier naming any
+// other module still falls through (`System.Text.IEnumerable<int>` stays
+// rejected). The §8.5 table is untouched: these names have no
+// class-rendering row to change.
 struct BuiltinHomeOnlyModulePath {
     std::string_view name;
     std::string_view modulePath;
 };
-constexpr std::array<BuiltinHomeOnlyModulePath, 1> kBuiltinHomeOnlyModulePaths = {{
+constexpr std::array<BuiltinHomeOnlyModulePath, 36> kBuiltinHomeOnlyModulePaths = {{
     {"IGrouping", "System.Collections.Linq"},
+    {"IOrderedEnumerable", "System.Collections.Linq"},
+    // §2.3 `System.Collections.Generic` row: the iteration and collection
+    // interfaces, then the owning-collection interfaces.
+    {"IEnumerable", "System.Collections.Generic"},
+    {"IEnumerator", "System.Collections.Generic"},
+    {"IAsyncEnumerable", "System.Collections.Generic"},
+    {"IAsyncEnumerator", "System.Collections.Generic"},
+    {"IReadOnlyCollection", "System.Collections.Generic"},
+    {"IReadOnlyList", "System.Collections.Generic"},
+    {"ICollection", "System.Collections.Generic"},
+    {"IList", "System.Collections.Generic"},
+    {"IOwningEnumerable", "System.Collections.Generic"},
+    {"IOwningEnumerator", "System.Collections.Generic"},
+    {"IOwningAsyncEnumerable", "System.Collections.Generic"},
+    {"IOwningAsyncEnumerator", "System.Collections.Generic"},
+    {"IOwningCollection", "System.Collections.Generic"},
+    {"IOwningList", "System.Collections.Generic"},
+    {"IEqualityComparer", "System.Collections.Generic"},
+    {"DictionaryEntry", "System.Collections.Generic"},
+    {"OwningSlotMap", "System.Collections.Generic"},
+    {"Span", "System.Collections.Generic"},
+    {"ReadOnlySpan", "System.Collections.Generic"},
+    {"ArraySpan", "System.Collections.Generic"},
+    {"ReadOnlyArraySpan", "System.Collections.Generic"},
+    // §2.3 `System.Text` row.
+    {"Encoding", "System.Text"},
+    {"ReadOnlyStringSpan", "System.Text"},
+    // §2.3 `System` row: the interface heads, and the FFI-boundary types.
+    {"IComparable", "System"},
+    {"IEquatable", "System"},
+    {"ISerializer", "System"},
+    {"IDeserializer", "System"},
+    {"ISerializable", "System"},
+    {"IDeserializable", "System"},
+    {"IntPtr", "System"},
+    {"UIntPtr", "System"},
+    {"IDisposable", "System"},
+    {"IAsyncDisposable", "System"},
+    // IEvent / IAsyncEvent / ISharedEvent are held out pending #6241: §6.5
+    // places them under System.Threading, so a `System.` row would newly
+    // accept a spelling the stdlib text does not give them.
+    // §2.3 Task family: the owning task is declared with `Task` under
+    // System.Threading (qualified spelling needs `import System.Threading;`).
+    {"OwningTask", "System.Threading"},
 }};
 
 std::string_view builtinTypeHomeModuleOf(std::string_view name) {
