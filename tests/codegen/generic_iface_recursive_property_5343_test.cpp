@@ -1,6 +1,7 @@
 // Regression test for issue #5343 — §14.1 ("Generic declarations") / §23.2
 // ("Properties and Indexers": expression-bodied property) / §12.1 ("Members
-// are non-virtual by default" / override type identity), v0.313.
+// are non-virtual by default" / override type identity), v0.313; rows
+// re-expressed at v0.338 (see THE SHAPE below).
 //
 // THE DEFECT. A recursive expression-bodied property
 // `override property Rec: T => (if _next = null then _v else _next!.Rec)`
@@ -14,16 +15,33 @@
 // erased body stayed in a slot the read site calls as i64, and the program died
 // with exit 139 in `bz$BoxM$Rec$propget`.
 //
+// THE SHAPE. The rows were written (v0.313) against a NON-generic
+// `interface IRecM readonly property Rec: int; end` with `class BoxM<T> : IRecM`
+// and `Rec: T`. That declaration is ill-formed under §11.2 (v0.338): a member
+// matches an interface member only with "a return type that is exactly equal
+// under the interface's substitution" and "Return types must match exactly (no
+// covariance in this version)"; `T` is not exactly `int` (and at `BoxM<long>`
+// / `BoxM<double>` no reading makes it so). #6200 made the compiler reject it,
+// the same way the METHOD analogue (`method Get(): Z` against `Get(): int`)
+// was already rejected (spec-question #6264 asks whether a per-instantiation
+// reading is intended). The rows below keep the defect's load-bearing shape —
+// the property's type IS the class's type parameter, so the int and long
+// specializations' accessors differ in return ABI from the erased template —
+// through a GENERIC interface `IRecM<T>` with `Rec: T`, which `BoxM<T>`
+// implements at every instantiation. The old spelling is pinned as a located
+// §11.2 reject (last row).
+//
 // THE DISCRIMINATOR IS NOT INSTANTIATION COUNT. Measured on the pre-fix tree:
 // a program with a SINGLE `BoxM<long>` instantiation exits 139; the same source
 // with a single `BoxM<int>` exits 0. The axis that decides is whether the
 // property's declared type is the type parameter (so the specialization's
-// return type differs from the erasure). The four rows below therefore vary
+// return type differs from the erasure). The rows below therefore vary
 // INSTANTIATION COUNT on ONE generic class and hold everything else fixed —
 // (a) one, (b) two, (c) three — plus (d) a control row that pins the VALUES, so
 // a fix that cross-wires a slot between instantiations is caught by a wrong
 // answer rather than passing silently.
 
+#include <regex>
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -32,6 +50,7 @@
 
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
+using bezel::test::JitResult;
 
 namespace {
 
@@ -53,10 +72,10 @@ void expectBoth(const char* src, int expectedExit) {
 // type from the erased template's i32.
 constexpr const char* kClassAndHeader = R"BZL(
 module P;
-interface IRecM
-  readonly property Rec: int;
+interface IRecM<T>
+  readonly property Rec: T;
 end IRecM;
-class BoxM<T> : IRecM
+class BoxM<T> : IRecM<T>
   private _v: T;
   private _next: BoxM<T>?;
   public constructor(v: T, next: BoxM<T>?) _v := v; _next := next; end constructor;
@@ -190,4 +209,65 @@ class C
 end C;
 )BZL").c_str(),
                0);
+}
+
+// Row (f) — THROUGH THE INTERFACE. The same int / long return-ABI split read
+// through `IRecM<int>` and `IRecM<long>` references, so the itable's `Rec`
+// slot (the #5343 fix's `needsSpecItable` arm) is exercised as well as the
+// vtable's. Distinct per-instantiation values catch a cross-wired slot.
+BEZEL_TEST(generic_iface_recursive_property_5343, through_generic_interface_int_and_long) {
+    expectBoth(withMain(R"BZL(
+class C
+  public static method Main(): int
+    var gl := new BoxM<long>(100L, new BoxM<long>(200L, new BoxM<long>(300L, null)));
+    var gi := new BoxM<int>(10, new BoxM<int>(20, new BoxM<int>(30, null)));
+    var il: IRecM<long> := gl;
+    var ii: IRecM<int> := gi;
+    if il.Rec <> 300L then return 1; end if;
+    if ii.Rec <> 30 then return 2; end if;
+    return 0;
+  end Main;
+end C;
+)BZL").c_str(),
+               0);
+}
+
+// Row (g) — THE v0.313 SPELLING IS REJECTED. `class BoxM<T> : IRecM` against
+// a NON-generic `IRecM` declaring `Rec: int`: per §11.2 (v0.338) the return
+// type must be "exactly equal under the interface's substitution", and `T` is
+// not `int`, so the declaration is a located compile error (#6200) — even
+// though this program only instantiates `BoxM<int>`. The method arm rejects
+// the same shape; whether conformance could instead be read per instantiation
+// is spec-question #6264 (reading recorded there: at the declaration).
+BEZEL_TEST(generic_iface_recursive_property_5343, nongeneric_interface_int_property_typed_by_class_parameter_rejects_spec_11_2) {
+    JitResult r = runAot(R"BZL(
+module P;
+interface IRecM
+  readonly property Rec: int;
+end IRecM;
+class BoxM<T> : IRecM
+  private _v: T;
+  private _next: BoxM<T>?;
+  public constructor(v: T, next: BoxM<T>?) _v := v; _next := next; end constructor;
+  public override property Rec: T => (if _next = null then _v else _next!.Rec);
+end BoxM;
+class C
+  public static method Main(): int
+    var bi := new BoxM<int>(1, new BoxM<int>(2, new BoxM<int>(3, null)));
+    if bi.Rec <> 3 then return 1; end if;
+    return 0;
+  end Main;
+end C;
+)BZL");
+    BEZEL_EXPECT_TRUE(!r.ran);
+    const std::regex located(
+        ":10:[0-9]+: property `Rec` implements interface `IRecM` with a "
+        "different type than the interface declares");
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            std::regex_search(d.message, located) &&
+            d.message.find("11.2)") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
 }
