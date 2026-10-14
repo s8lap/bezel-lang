@@ -9406,7 +9406,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
+            // #6115: what the left operand established, before the right
+            // operand's evaluation can invalidate it.
+            auto seededNull = nullNarrowed_;
+            auto seededInit = initNarrowed_;
+            auto seededNarrow = narrowings_;
             visitExpr(*be->right);
+            recordCondSpoiled(be, seededNull, seededInit, seededNarrow);
             // fix #2258 / §7.4: un-seed the left operand's true-facts by
             // INTERSECTING with the saved state, never by assigning it. The
             // right operand's visit can legitimately INVALIDATE a fact that
@@ -9433,7 +9439,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto savedNarrow = narrowings_;
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/false);
+            // #6115: what the left operand established, before the right
+            // operand's evaluation can invalidate it.
+            auto seededNull = nullNarrowed_;
+            auto seededInit = initNarrowed_;
+            auto seededNarrow = narrowings_;
             visitExpr(*be->right);
+            recordCondSpoiled(be, seededNull, seededInit, seededNarrow);
             intersectNarrowingSetsWith(savedNull, savedInit, savedNarrow, savedField);
         } else if (be->right) {
             visitExpr(*be->right);

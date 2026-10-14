@@ -15804,11 +15804,18 @@ void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
     // narrows both `x` and `y` non-null in the `else` of `if (x = null or
     // y = null) ... else ... end;`.
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(cond)) {
+        // fix #6115: between the two operands, drop what the right
+        // operand's evaluation invalidated (see condSpoiled_). The right
+        // operand's own facts are collected after the drop, so a test that
+        // FOLLOWS the invalidating call (`Rs(ref q, alt) and q is B`, or
+        // `q is B and Rs(ref q, alt) and q is B`) still narrows.
         if (be->op == "and" && forTrueBranch) {
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
+            dropCondSpoiled(be);
             collectNarrowings(be->right.get(), /*forTrueBranch=*/true);
         } else if (be->op == "or" && !forTrueBranch) {
             collectNarrowings(be->left.get(), /*forTrueBranch=*/false);
+            dropCondSpoiled(be);
             collectNarrowings(be->right.get(), /*forTrueBranch=*/false);
         }
     }
@@ -15836,6 +15843,38 @@ void ExprTC::collectNarrowings(const ast::Expr* cond, bool forTrueBranch) {
             !dynamic_cast<const ast::TypeTestExpr*>(ue->operand.get())) {
             collectNarrowings(ue->operand.get(), !forTrueBranch);
         }
+    }
+}
+
+// fix #6115: see condSpoiled_ in ExprTypecheck_impl.hpp.
+void ExprTC::recordCondSpoiled(
+    const ast::Expr* node,
+    const std::unordered_set<Symbol*>& seededNull,
+    const std::unordered_set<Symbol*>& seededInit,
+    const std::unordered_map<Symbol*, TypeRef*>& seededNarrowings) {
+    std::vector<Symbol*> spoiled;
+    for (Symbol* s : seededNull)
+        if (!nullNarrowed_.count(s)) spoiled.push_back(s);
+    for (Symbol* s : seededInit)
+        if (!initNarrowed_.count(s)) spoiled.push_back(s);
+    for (const auto& [s, ty] : seededNarrowings) {
+        auto cur = narrowings_.find(s);
+        if (cur == narrowings_.end() || cur->second != ty)
+            spoiled.push_back(s);
+    }
+    if (spoiled.empty())
+        condSpoiled_.erase(node);
+    else
+        condSpoiled_[node] = std::move(spoiled);
+}
+
+void ExprTC::dropCondSpoiled(const ast::Expr* node) {
+    auto it = condSpoiled_.find(node);
+    if (it == condSpoiled_.end()) return;
+    for (Symbol* s : it->second) {
+        nullNarrowed_.erase(s);
+        initNarrowed_.erase(s);
+        narrowings_.erase(s);
     }
 }
 
@@ -23729,8 +23768,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // establishment happens via collectNarrowings below, never inside a
         // plain expression visit).
         auto fieldCondState = fieldNarrowed_;
-        nullNarrowed_ = entryNullNarrowed;
-        fieldNarrowed_ = fieldCondState;
+        // fix #6115 (§7.4 "How narrowing is invalidated", §12.7, v0.338): the
+        // local sets get the same running condition-context the field facts
+        // have. `nullChain` / `initChain` / `typeChain` are the state in
+        // which the NEXT condition of the chain is evaluated: the entry state
+        // minus every drop the conditions visited so far performed, plus the
+        // false-branch facts of the conditions already known false. Every
+        // branch starts from the chain, never from the statement's entry —
+        // resetting to the entry resurrected a fact a condition had
+        // invalidated (`if Clear(ref s) then … else s.Length`).
+        for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
+            if (entryNullNarrowed.count(*it)) ++it;
+            else it = nullNarrowed_.erase(it);
+        }
+        for (auto it = initNarrowed_.begin(); it != initNarrowed_.end();) {
+            if (savedInitNarrowed.count(*it)) ++it;
+            else it = initNarrowed_.erase(it);
+        }
+        auto nullChain = nullNarrowed_;
+        auto initChain = initNarrowed_;
+        auto typeChain = narrowings_;
+        // Step the chain past `falseCond` being false: the state the next
+        // condition (or the `else` body) starts in.
+        auto advanceChain = [&](const ast::Expr* falseCond) {
+            narrowings_ = typeChain;
+            nullNarrowed_ = nullChain;
+            initNarrowed_ = initChain;
+            fieldNarrowed_ = fieldCondState;
+            collectNarrowings(falseCond, /*forTrueBranch=*/false);
+        };
         collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/true);
         auto branchEntryTypes = narrowings_;   // #6113
         {
@@ -23751,8 +23817,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             typeExits.emplace_back(branchEntryTypes, narrowings_);
             initExits.push_back(initNarrowed_);
         }
-        narrowings_ = savedNarrowings;
-        initNarrowed_ = savedInitNarrowed;
         for (std::size_t i = 0; i < ifs->elifBranches.size(); ++i) {
             const auto& el = ifs->elifBranches[i];
             // §7.4 (v0.214, #2116): this elif CONDITION executes only when
@@ -23772,31 +23836,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // `if x = null then return 0; elif x.Length > 0 …` ACCEPT —
             // entry + prior false-branch facts sees x nullable, and the
             // else-branch narrowing seeds x non-null for the elif BODY.
-            fieldNarrowed_ = fieldCondState;
-            collectFieldNarrowings(
-                i == 0 ? ifs->ifBranch.condition.get()
-                       : ifs->elifBranches[i - 1].condition.get(),
-                /*forTrueBranch=*/false);
-            nullNarrowed_ = entryNullNarrowed;
-            collectNarrowings(ifs->ifBranch.condition.get(),
-                              /*forTrueBranch=*/false);
-            for (std::size_t j = 0; j < i; ++j)
-                collectNarrowings(ifs->elifBranches[j].condition.get(),
-                                  /*forTrueBranch=*/false);
+            //
+            // #6115: the chain is that state for all four sets.
+            advanceChain(i == 0 ? ifs->ifBranch.condition.get()
+                                : ifs->elifBranches[i - 1].condition.get());
             if (el.condition) {
                 visitExpr(*el.condition);
                 checkConditionIsBool(*el.condition, "elif");
             }
             fieldCondState = fieldNarrowed_;
+            nullChain = nullNarrowed_;
+            initChain = initNarrowed_;
+            typeChain = narrowings_;
             // This elif is reached only when every preceding condition was
-            // false (their else-narrowings hold) and this condition is true.
-            nullNarrowed_ = entryNullNarrowed;
-            fieldNarrowed_ = fieldCondState;
-            collectNarrowings(ifs->ifBranch.condition.get(),
-                              /*forTrueBranch=*/false);
-            for (std::size_t j = 0; j < i; ++j)
-                collectNarrowings(ifs->elifBranches[j].condition.get(),
-                                  /*forTrueBranch=*/false);
+            // false (their else-narrowings are in the chain) and this
+            // condition is true.
             collectNarrowings(el.condition.get(), /*forTrueBranch=*/true);
             branchEntryTypes = narrowings_;   // #6113
             {
@@ -23813,16 +23867,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 typeExits.emplace_back(branchEntryTypes, narrowings_);
                 initExits.push_back(initNarrowed_);
             }
-            narrowings_ = savedNarrowings;
-            initNarrowed_ = savedInitNarrowed;
         }
         // The else body (explicit or implicit fall-through): all preceding
-        // guards were false, so each contributes its else-branch narrowing.
-        nullNarrowed_ = entryNullNarrowed;
-        fieldNarrowed_ = fieldCondState;  // §7.4 #2116: drop-respecting base
-        collectNarrowings(ifs->ifBranch.condition.get(), /*forTrueBranch=*/false);
-        for (const auto& el : ifs->elifBranches)
-            collectNarrowings(el.condition.get(), /*forTrueBranch=*/false);
+        // guards were false, so each contributes its else-branch narrowing
+        // (the earlier ones are already in the chain).
+        advanceChain(ifs->elifBranches.empty()
+                         ? ifs->ifBranch.condition.get()
+                         : ifs->elifBranches.back().condition.get());
         branchEntryTypes = narrowings_;   // #6113
         {
             Scope bodyScope;  // per §21.6 / §21.1 (#5314): block scope

@@ -3276,6 +3276,25 @@ private:
     // from the snapshot). Pure set/map algebra over integer keys and pointer
     // identity — order-independent, so it is deterministic across shard
     // processes (#2116).
+    // fix #6115 (§7.4 "How narrowing is invalidated", §12.7, v0.338): the
+    // locals whose narrowing the LEFT operand of an `and` / `or` established
+    // and the RIGHT operand's evaluation then invalidated — `q is B and
+    // Rs(ref q, alt)`, `s <> null and Clear(ref s)`, `q is B and mutb()` with
+    // `q` mutably captured. The right operand runs after the left one's test,
+    // so on the path where the whole condition holds the left fact is already
+    // dead. Recorded by the and/or visit (visitChildren), keyed by the
+    // operator node, and consumed by collectNarrowings, which is what every
+    // construct that narrows from a condition calls (`if`/`elif`, `while`,
+    // the conditional expression, `when` guards): it drops these locals'
+    // facts between collecting the left operand and the right one.
+    std::unordered_map<const ast::Expr*, std::vector<Symbol*>> condSpoiled_;
+    void recordCondSpoiled(
+        const ast::Expr* node,
+        const std::unordered_set<Symbol*>& seededNull,
+        const std::unordered_set<Symbol*>& seededInit,
+        const std::unordered_map<Symbol*, TypeRef*>& seededNarrowings);
+    void dropCondSpoiled(const ast::Expr* node);
+
     void intersectNarrowingSetsWith(
         const std::unordered_set<Symbol*>& otherNull,
         const std::unordered_set<Symbol*>& otherInit,
