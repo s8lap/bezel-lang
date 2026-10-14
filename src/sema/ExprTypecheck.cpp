@@ -24707,12 +24707,27 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
             Scope* saveScope = currentScope_;
             currentScope_ = &armScope;
-            if (arm.guard) visitExpr(*arm.guard);
-            // Slice S27: a bare `throw;` is valid inside a catch
-            // arm body (but not in the try body or finally).
-            ++catchDepth_;
-            if (arm.body) visitStmt(*arm.body);
-            --catchDepth_;
+            {
+                // fix #6120 (§7.4, §4.1, §31.2.1, v0.338): §7.4 establishes a
+                // narrowing in "a `when` guard (§19.4, narrowing that arm's
+                // body)", and a catch arm's guard is that §19.4 guard (§4.1:
+                // "a `case`/`catch` arm's `when` guard (§19.4)"; §31.2.1:
+                // "Inside the guard, the bound variable (if any) is in
+                // scope"). So, like the `case`-arm guard of #6082,
+                // `catch var c: Exception when c is MyError => …` reads `c` as
+                // a `MyError` in the body. The facts end with the arm (the
+                // destructor runs before the exit joins below read the sets).
+                ArmGuardFacts guardFacts(*this);
+                if (arm.guard) {
+                    visitExpr(*arm.guard);
+                    guardFacts.seed(*arm.guard);
+                }
+                // Slice S27: a bare `throw;` is valid inside a catch
+                // arm body (but not in the try body or finally).
+                ++catchDepth_;
+                if (arm.body) visitStmt(*arm.body);
+                --catchDepth_;
+            }
             currentScope_ = saveScope;
             // §7.4 #2116: fold this catch arm's exit into the after-try join
             // AND the next arm's running base.
