@@ -31845,7 +31845,7 @@ bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
         // per §30.14 (#6284): declared inside the entry lambda's body (a
         // LocalDecl, a loop or catch variable, a pattern binding): not a
         // capture. The declaring node's file offset decides it.
-        if (scope.ownLocalExclusion) {
+        if (scope.ownLocalExclusion || scope.inNewWalk) {
             const ast::Node* d = sym->decl;
             if (d && d->span.begin.line != 0 &&
                 d->span.begin.offset >= scope.entryBegin &&
@@ -31854,6 +31854,12 @@ bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
         }
         return true;
     }
+    // per §30.14 (#6285): the expression kinds below (type test, throw,
+    // postfix bang, range, with, null-conditional call, collection literal,
+    // case) were not walked before #6285 (`for var i in 1..n` hid `n` in a
+    // RangeExpr), so their children carry inNewWalk (CaptureScope).
+    CaptureScope nw = scope;
+    nw.inNewWalk = true;
     // Recurse into children.
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         if (be->left && exprCaptures(*be->left, scope)) return true;
@@ -31889,6 +31895,43 @@ bool ExprTC::exprCaptures(const ast::Expr& e, const CaptureScope& scope) const {
         inner.ownLocalExclusion = true;
         for (const auto& part : is->parts)
             if (part.expr && exprCaptures(*part.expr, inner)) return true;
+    } else if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        if (tt->operand && exprCaptures(*tt->operand, nw)) return true;
+    } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        if (th->operand && exprCaptures(*th->operand, nw)) return true;
+    } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand && exprCaptures(*pb->operand, nw)) return true;
+    } else if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        if (rg->lo && exprCaptures(*rg->lo, nw)) return true;
+        if (rg->hi && exprCaptures(*rg->hi, nw)) return true;
+        if (rg->step && exprCaptures(*rg->step, nw)) return true;
+    } else if (auto* wx = dynamic_cast<const ast::WithExpr*>(&e)) {
+        if (wx->source && exprCaptures(*wx->source, nw)) return true;
+        for (const auto& asg : wx->assigns)
+            if (asg.value && exprCaptures(*asg.value, nw)) return true;
+    } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        if (nc->callee && exprCaptures(*nc->callee, nw)) return true;
+        for (const auto& a : nc->args)
+            if (a.value && exprCaptures(*a.value, nw)) return true;
+    } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        // Dict form: `elements` holds the values, `keys` the parallel keys.
+        for (const auto& el : cl->elements)
+            if (el && exprCaptures(*el, nw)) return true;
+        for (const auto& k : cl->keys)
+            if (k && exprCaptures(*k, nw)) return true;
+    } else if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        // per §30.14 (#6285): a case arm is walked, like a statement-position
+        // case (stmtCaptures), so a capture in an arm body is seen. The arms
+        // are not visited by the pre-#6285 walk, hence inNewWalk.
+        CaptureScope arms = scope;
+        arms.inNewWalk = true;
+        if (cx->scrutinee && exprCaptures(*cx->scrutinee, arms)) return true;
+        for (const auto& arm : cx->arms) {
+            if (arm.guard && exprCaptures(*arm.guard, arms)) return true;
+            if (arm.exprBody && exprCaptures(*arm.exprBody, arms)) return true;
+            for (const auto& sub : arm.stmts)
+                if (sub && stmtCaptures(*sub, arms)) return true;
+        }
     } else if (auto* innerLam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         // A nested lambda: it has its OWN params; captures from its perspective
         // may or may not propagate. For Domain.Spawn capture check, a nested
@@ -31929,6 +31972,50 @@ bool ExprTC::stmtCaptures(const ast::Stmt& s, const CaptureScope& scope) const {
     } else if (auto* wb = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         for (const auto& sub : wb->body)
             if (sub && stmtCaptures(*sub, scope)) return true;
+    }
+    // per §30.14 (#6285): the statement kinds below were not visited before
+    // #6285, so a capture inside them went undetected (`Domain.Spawn(lambda()
+    // => do for var i in 1..2 do Console.WriteLine(n); end; end)` compiled).
+    // Everything beneath them is walked with inNewWalk set (see CaptureScope).
+    // Break, Continue and LocalTypeDecl carry no expression operands.
+    CaptureScope newWalk = scope;
+    newWalk.inNewWalk = true;
+    auto stmtsCapture = [this](const auto& stmts, const CaptureScope& sc) {
+        for (const auto& sub : stmts)
+            if (sub && stmtCaptures(*sub, sc)) return true;
+        return false;
+    };
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value && exprCaptures(*lc->value, newWalk)) return true;
+    } else if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (th->value && exprCaptures(*th->value, newWalk)) return true;
+    } else if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (inc->target && exprCaptures(*inc->target, newWalk)) return true;
+    } else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value && exprCaptures(*ds->value, newWalk)) return true;
+    } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value && exprCaptures(*ys->value, newWalk)) return true;
+    } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition && exprCaptures(*ws->condition, newWalk)) return true;
+        if (stmtsCapture(ws->body, newWalk)) return true;
+    } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable && exprCaptures(*fs->iterable, newWalk)) return true;
+        if (fs->withExpr && exprCaptures(*fs->withExpr, newWalk)) return true;
+        if (stmtsCapture(fs->body, newWalk)) return true;
+    } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        if (stmtsCapture(ts->body, newWalk)) return true;
+        for (const auto& arm : ts->catches) {
+            if (arm.guard && exprCaptures(*arm.guard, newWalk)) return true;
+            if (arm.body && stmtCaptures(*arm.body, newWalk)) return true;
+        }
+        if (stmtsCapture(ts->finallyBody, newWalk)) return true;
+    } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee && exprCaptures(*cs->scrutinee, newWalk)) return true;
+        for (const auto& arm : cs->arms) {
+            if (arm.guard && exprCaptures(*arm.guard, newWalk)) return true;
+            if (arm.exprBody && exprCaptures(*arm.exprBody, newWalk)) return true;
+            if (stmtsCapture(arm.stmts, newWalk)) return true;
+        }
     }
     return false;
 }

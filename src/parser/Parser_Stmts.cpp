@@ -661,8 +661,12 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     // with the statement-form `do … end;` that parseStatement() would
                     // normally produce. The `;` is consumed when present and silently
                     // omitted when absent (e.g. when `,` or `end` follows `end`).
+                    // per §30.14 (#6285): the block takes the `do` keyword's
+                    // position (a catch binding's declaring node is this body).
+                    const auto doLoc = current_.location;
                     advance(); // past `do`
                     auto blk = std::make_unique<ast::DoEndBlock>();
+                    blk->span.begin = doLoc;
                     while (!isKeyword("end") && !isKeyword("catch") &&
                            !isKeyword("finally") &&
                            current_.kind != TokenKind::EndOfFile) {
@@ -693,12 +697,18 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     // Expression-leading (includes bare `throw` re-raise and
                     // `throw expr`). Parse the expression first, then detect
                     // the increment/assignment/expression-stmt forms.
+                    // per §30.14 (#6285): the synthesized body statement takes
+                    // the body's start position, as the case-arm path does, so
+                    // a capture walk can tell a body-declared name from an
+                    // outer one by the declaring node's offset.
+                    const auto bodyStart = current_.location;
                     auto lhs = parseExpression();
                     if (current_.kind == TokenKind::Punctuator &&
                         (current_.text == "++" || current_.text == "--")) {
                         auto inc = std::make_unique<ast::IncrementStmt>();
                         inc->target = std::move(lhs);
                         inc->op = current_.text;
+                        inc->span.begin = bodyStart;
                         advance();
                         if (!consumePunctuator(";")) {
                             diagnostics_.report(
@@ -721,6 +731,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                         auto a = std::make_unique<ast::AssignmentStmt>();
                         a->target = std::move(lhs);
                         a->op = current_.text;
+                        a->span.begin = bodyStart;
                         advance();
                         // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned`
                         // assignment-position transfer marker `y := owned x;`
@@ -743,6 +754,7 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                         if (lhs || isPunctuator(";")) {
                             auto es = std::make_unique<ast::ExpressionStmt>();
                             es->expr = std::move(lhs);
+                            es->span.begin = bodyStart;
                             consumePunctuator(";"); // optional — present in stmt form, absent in expr form
                             arm.body = std::move(es);
                         }

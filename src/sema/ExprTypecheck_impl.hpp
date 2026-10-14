@@ -4598,6 +4598,14 @@ private:
         // apply the exclusion there (base never walked them, so an own local
         // inside `$"..."` was accepted); see the InterpolatedStringExpr arm.
         bool ownLocalExclusion = true;
+        // per §30.14 (#6285): set once the walk is inside a statement or case
+        // arm that the pre-#6285 walk never visited (for, while, try/catch/
+        // finally, case arms, throw, discard, yield, and everything beneath
+        // them). At the plain extern caller (ownLocalExclusion false) an
+        // own-local use is still a capture where base saw it (top level,
+        // if, do…end), so base's verdict there is unchanged; in the newly
+        // walked statements the own-local exclusion applies.
+        bool inNewWalk = false;
     };
 
     // Helper: does the lambda body (recursively) reference any identifier
