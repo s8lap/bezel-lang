@@ -24,9 +24,20 @@ namespace {
 // `Nullable` parameter and a `NonNull` parameter as the same shape and the
 // resolver picks the wrong one (mirrors the identically-shaped fix in
 // ExprTypecheck_Exprs.cpp's sema-side `allParamsMatch`).
-bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
+bool indexerArgMatchesUnder(const sema::TypeRef* p, const SlotSubst* ps,
+                            std::size_t pf, const sema::TypeRef* a,
+                            const SlotSubst* as, std::size_t af) {
+    // fix #6075 (§12.1 / §14.1 / §27.8, v0.338): a bare type parameter on
+    // either side is first followed through its substitution (`T` -> `int`), so
+    // an interface member over `Array<T>` matches the `Array<int>` override a
+    // `D: G<int>` writes. The nullability of the original spelling is kept.
+    bool pn = p && p->nullable, an = a && a->nullable;
+    SlotResolved pr = resolveSlotParam(p, ps, pf);
+    SlotResolved ar = resolveSlotParam(a, as, af);
+    p = pr.type; a = ar.type;
     if (!p || !a || p->kind != a->kind) return false;
-    if (p->nullable != a->nullable) return false;
+    pn = pn || p->nullable; an = an || a->nullable;
+    if (pn != an) return false;
     if (p->kind == sema::TypeRef::Kind::Primitive)
         return p->primitive == a->primitive;
     if (p->kind == sema::TypeRef::Kind::Named) {
@@ -41,11 +52,16 @@ bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
         }
         if (p->genericArgs.size() != a->genericArgs.size()) return false;
         for (std::size_t i = 0; i < p->genericArgs.size(); ++i)
-            if (!indexerArgMatches(p->genericArgs[i], a->genericArgs[i]))
+            if (!indexerArgMatchesUnder(p->genericArgs[i], ps, pr.frame,
+                                        a->genericArgs[i], as, ar.frame))
                 return false;
         return true;
     }
     return false;
+}
+
+bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
+    return indexerArgMatchesUnder(p, nullptr, 0, a, nullptr, 0);
 }
 
 // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): an
@@ -186,16 +202,36 @@ const sema::PropertySymbol* Emitter::findIndexer(
     const sema::TypeSymbol* ts, const sema::PropertySymbol* ifaceIdx) const {
     if (!ts || !ifaceIdx) return nullptr;
     const std::size_t nparams = indexerParamCount(ifaceIdx);
-    for (const sema::TypeSymbol* t = ts; t; t = baseClassOf(t)) {
-        for (const sema::Symbol* m : t->members) {
+    // fix #6075: the interface's parameters read through the arguments the
+    // implementing class chain gives it (`G<T>: IG<T>`, `D: G<int>`), and each
+    // candidate's through its own ancestor substitution, so `[i: Array<T>]` on
+    // the interface meets `[i: Array<int>]` on the override.
+    const std::vector<SlotChainLevel> levels = slotChainLevels(ts);
+    SlotSubst ifaceSubst;
+    for (const SlotChainLevel& lv : levels) {
+        const sema::TypeSymbol* ifc = ifaceIdx->parent;
+        const sema::TypeRef* ref = ifc ? baseTypeRefOf(lv.type, ifc) : nullptr;
+        if (!ref) continue;
+        SlotSubst::Frame f;
+        f.names = sema::genericParamNames(ifc);
+        if (f.names.empty() || ref->genericArgs.size() != f.names.size()) break;
+        for (const sema::TypeRef* a : ref->genericArgs) f.args.push_back(a);
+        ifaceSubst.frames.push_back(std::move(f));
+        for (const auto& fr : lv.subst.frames) ifaceSubst.frames.push_back(fr);
+        break;
+    }
+    for (std::size_t li = 0; li < levels.size(); ++li) {
+        for (const sema::Symbol* m : levels[li].type->members) {
             auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
             if (!indexerCandidateWireable(ps)) continue;
             if (indexerParamCount(ps) != nparams) continue;
             bool all = true;
             for (std::size_t k = 0; k < nparams; ++k) {
-                if (!indexerArgMatches(indexerParamType(ctx_, ps, k),
-                                       indexerParamType(ctx_, ifaceIdx, k))) {
+                if (!indexerArgMatchesUnder(indexerParamType(ctx_, ps, k),
+                                            &levels[li].subst, 0,
+                                            indexerParamType(ctx_, ifaceIdx, k),
+                                            &ifaceSubst, 0)) {
                     all = false;
                     break;
                 }

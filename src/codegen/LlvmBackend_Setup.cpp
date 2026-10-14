@@ -4160,6 +4160,45 @@ void Emitter::buildVtable(const sema::TypeSymbol* t) {
         slots = vtableMethods_[base];
         nameSlot = vtableNameSlot_[base];
     }
+    // fix #6075 (§12.1 / §14.1 / §27.8, v0.338): for a derived class of a GENERIC
+    // base (`Dv: G<int>`), the base's virtual members are keyed by their declared
+    // type parameters (`[i: T]`, `Foo(x: Array<T>)`), so a derived override
+    // spelled with the argument (`[i: int]`, `Foo(x: Array<int>)`) found no key
+    // and appended a new slot, and a base-typed call dispatched the base body.
+    // Re-key each ancestor's virtual members with the type arguments of every
+    // base reference on the way up to `t` substituted (at any depth of the
+    // parameter type, through a multi-level chain), and alias that key to the
+    // member's own slot, so the override reuses it.
+    {
+        const std::vector<SlotChainLevel> levels = slotChainLevels(t);
+        for (std::size_t k = 1; k < levels.size(); ++k) {
+            const sema::TypeSymbol* anc = levels[k].type;
+            const SlotSubst& subst = levels[k].subst;
+            bool anyNames = false;
+            for (const auto& f : subst.frames) anyNames |= !f.names.empty();
+            if (!anyNames) continue;
+            for (sema::Symbol* m : anc->members) {
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(m)) {
+                    if (isStaticMethod(ms) || !isVirtual(ms)) continue;
+                    const std::string plain = methodSlotKey(ms);
+                    const std::string sub = methodSlotKey(ms, &subst);
+                    if (sub == plain) continue;
+                    if (auto it = nameSlot.find(plain); it != nameSlot.end())
+                        nameSlot.emplace(sub, it->second);
+                    continue;
+                }
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ps || !isVirtualIndexer(ps)) continue;
+                const std::string plain = indexerSlotKey(ps);
+                const std::string sub = indexerSlotKey(ps, &subst);
+                if (sub == plain) continue;
+                if (auto it = nameSlot.find(plain); it != nameSlot.end())
+                    nameSlot.emplace(sub, it->second);
+                if (auto it = nameSlot.find(plain + "$set"); it != nameSlot.end())
+                    nameSlot.emplace(sub + "$set", it->second);
+            }
+        }
+    }
     // Vtable (CG35-itable + §8.6 #417 + §9.6 #946): [0]=td$C, [1]=itmap$C,
     // [2]=Dispose, [3]=ToString, [4]=Equals(Object?), [5]=GetHashCode,
     // [6..]=virtual members. So a virtual member's slot is its position in

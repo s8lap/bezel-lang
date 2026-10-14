@@ -798,6 +798,69 @@ bool calleeBodyUsesFormalOnlyByInvocation(const ast::MethodDecl& md,
 bool resolvedFormalIsFunction(const ast::Type& t,
                               const sema::SemaContext& ctx);
 
+// fix #6075 (§12.1 / §14.1 / §27.8, v0.338): the type arguments of a generic
+// BASE, bound to the base's type-parameter names. `class G<T>` with a virtual
+// member over `T` (or over a type CONTAINING `T`: `Array<T>`, `Stack<T?>`),
+// overridden in `Dv: G<int>` with the argument spelled out, keyed the base
+// member by the declared `T` and the override by `int`, so the override got a
+// new slot and a base-typed call dispatched the base body. buildVtable adds
+// the base member's key with the arguments substituted, so the override
+// reuses the base slot. The substitution is ONE canonical rendering applied
+// at any depth of the parameter type: slotGenericArgSuffix and the bare-
+// parameter arm of the slot keys both resolve a type-parameter name through
+// the frames before spelling it.
+//
+// `frames[0]` binds the DECLARING class's parameters to arguments written in
+// the scope of its derived class; `frames[1]` binds THAT class's parameters
+// (`D<U>: G<Stack<U>>` -> U) to the arguments of its own derived class, and
+// so on up to the class being built, so a multi-level chain composes.
+struct SlotSubst {
+    struct Frame {
+        std::vector<std::string_view> names;     // declared type-parameter names
+        std::vector<const sema::TypeRef*> args;  // arguments, next frame's scope
+    };
+    std::vector<Frame> frames;
+};
+// The name `tr` carries when it is shaped like a bare type-parameter
+// reference (Named, no declaration, no generic arguments, not an alias, not
+// an import-alias-qualified builtin), on the local side (single-part AST
+// name) and the imported side (metadata importedName, no AST); else "".
+inline std::string_view slotBareParamName(const sema::TypeRef* tr) {
+    if (!tr || tr->kind != sema::TypeRef::Kind::Named || tr->declaration ||
+        !tr->genericArgs.empty() || !tr->aliasResolvedHead.empty() ||
+        tr->isAliasQualifiedBuiltin())
+        return {};
+    if (tr->astNode) {
+        if (!tr->astNode->name || tr->astNode->name->parts.size() != 1)
+            return {};
+        return tr->astNode->name->parts[0];
+    }
+    return tr->importedName;
+}
+// A type reached through the substitution: the type itself and the index of
+// the frame its own names are bound by.
+struct SlotResolved {
+    const sema::TypeRef* type;
+    std::size_t frame;
+};
+// Follow `tr` through the frames while it is a bare parameter one of them
+// binds (`T` -> `U` -> `int`); otherwise return it unchanged.
+inline SlotResolved resolveSlotParam(const sema::TypeRef* tr,
+                                     const SlotSubst* s, std::size_t frame) {
+    while (s && tr && frame < s->frames.size()) {
+        std::string_view name = slotBareParamName(tr);
+        if (name.empty()) break;
+        const SlotSubst::Frame& f = s->frames[frame];
+        const sema::TypeRef* bound = nullptr;
+        for (std::size_t i = 0; i < f.names.size() && i < f.args.size(); ++i)
+            if (f.names[i] == name) { bound = f.args[i]; break; }
+        if (!bound) break;
+        tr = bound;
+        ++frame;
+    }
+    return {tr, frame};
+}
+
 // Per-module emitter. Holds the LLVM context/module/builder and lowers the
 // checked AST. Grows one expression/statement kind per codegen slice.
 class Emitter {
@@ -7040,6 +7103,50 @@ private:
         const sema::TypeSymbol* ts,
         const sema::PropertySymbol* ifaceIdx) const;
 
+    // fix #6075 (§12.1 / §14.1 / §27.8, v0.338): `t` and each of its base classes,
+    // most-derived first, with the substitution that maps that ancestor's type
+    // parameters into `t`'s own scope (empty for `t` itself), composed through a
+    // multi-level chain (`D2: D<int>`, `D<U>: G<Stack<U>>`). The walk stops at a
+    // base whose generic arguments are not recorded (an imported base without a
+    // TypeRef): that ancestor and the ones above it are not substituted, which
+    // leaves their keys as before.
+    struct SlotChainLevel {
+        const sema::TypeSymbol* type;
+        SlotSubst subst;
+    };
+    std::vector<SlotChainLevel> slotChainLevels(const sema::TypeSymbol* t) const {
+        std::vector<SlotChainLevel> out;
+        if (!t) return out;
+        out.push_back({t, {}});
+        std::vector<SlotSubst::Frame> chain;  // chain[k-1]: ancestor k's parameters
+        const sema::TypeSymbol* child = t;
+        while (const sema::TypeSymbol* anc = baseClassOf(child)) {
+            SlotSubst::Frame f;
+            f.names = sema::genericParamNames(anc);
+            if (!f.names.empty()) {
+                const sema::TypeRef* ref = baseTypeRefOf(child, anc);
+                if (!ref || ref->genericArgs.size() != f.names.size()) break;
+                for (const sema::TypeRef* a : ref->genericArgs) f.args.push_back(a);
+            }
+            chain.push_back(std::move(f));
+            SlotChainLevel lv{anc, {}};
+            lv.subst.frames.assign(chain.rbegin(), chain.rend());
+            out.push_back(std::move(lv));
+            child = anc;
+        }
+        return out;
+    }
+    // The TypeRef through which `child` names its base `base` (carries the
+    // generic arguments); null when none is recorded.
+    static const sema::TypeRef* baseTypeRefOf(const sema::TypeSymbol* child,
+                                              const sema::TypeSymbol* base) {
+        for (std::size_t i = 0; i < child->baseTypes.size() &&
+                                i < child->baseTypeRefs.size(); ++i)
+            if (child->baseTypes[i] == base && child->baseTypeRefs[i])
+                return child->baseTypeRefs[i];
+        return nullptr;
+    }
+
     // §23.4 (#1172): select the indexer OVERLOAD for the access `ix` by its
     // FULL parameter list — the candidate's parameter count must equal the
     // number of index arguments AND each parameter type must structurally match
@@ -8981,33 +9088,44 @@ private:
             if (!t && ps->declType) t = ctx_.resolvedType(*ps->declType);
             return t;
         };
-        auto sigMatches = [&](const sema::MethodSymbol* ms, bool widen) {
+        // fix #6075: the interface's parameters read through the arguments the
+        // implementing class chain gives it, each candidate's through its own
+        // ancestor substitution (same construction as findIndexer).
+        const std::vector<SlotChainLevel> levels = slotChainLevels(cls);
+        SlotSubst ifaceSubst;
+        for (const SlotChainLevel& lv : levels) {
+            const sema::TypeSymbol* ifc = iface->parent;
+            const sema::TypeRef* ref = ifc ? baseTypeRefOf(lv.type, ifc) : nullptr;
+            if (!ref) continue;
+            SlotSubst::Frame f;
+            f.names = sema::genericParamNames(ifc);
+            if (f.names.empty() || ref->genericArgs.size() != f.names.size()) break;
+            for (const sema::TypeRef* a : ref->genericArgs) f.args.push_back(a);
+            ifaceSubst.frames.push_back(std::move(f));
+            for (const auto& fr : lv.subst.frames) ifaceSubst.frames.push_back(fr);
+            break;
+        }
+        auto sigMatches = [&](const sema::MethodSymbol* ms,
+                              const SlotSubst& cs, bool widen) {
             for (std::size_t i = 0; i < ms->params.size(); ++i) {
                 const sema::TypeRef* ct = paramTy(ms->params[i]);
                 const sema::TypeRef* it = paramTy(iface->params[i]);
                 if (!ct || !it) return false;
-                // fix #6171 (§11.2): `exact` compares a built-in's head name
-                // and recurses over generic arguments and function-type
-                // parameter / return types.
-                if (methodSigTypeRefEqual(ct, it, true)) continue;
-                if (widen && ct->nullable && !it->nullable) {
-                    sema::TypeRef stripped = *ct;
-                    stripped.nullable = false;
-                    if (methodSigTypeRefEqual(&stripped, it, true)) continue;
-                }
-                return false;
+                if (!witnessParamEqualUnder(ct, &cs, 0, it, &ifaceSubst, 0,
+                                            widen && i < ms->params.size()))
+                    return false;
             }
             return true;
         };
         for (int widen = 0; widen < 2; ++widen) {
-            for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t)) {
-                for (sema::Symbol* m : t->members) {
+            for (const SlotChainLevel& lv : levels) {
+                for (sema::Symbol* m : lv.type->members) {
                     auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
                     if (!ms || isStaticMethod(ms) || ms->name != iface->name ||
                         !methodFns_.count(ms) ||
                         ms->params.size() != iface->params.size())
                         continue;
-                    if (sigMatches(ms, widen != 0)) return ms;
+                    if (sigMatches(ms, lv.subst, widen != 0)) return ms;
                 }
             }
         }
@@ -9139,6 +9257,66 @@ private:
         return nullptr;
     }
 
+    // fix #6075 (§12.1 / §14.1 / §22.6, v0.338): the witness predicate of
+    // findInterfaceImpl read through substitution. A bare type parameter on
+    // either side is followed through its frames first (the interface's `T`
+    // through the arguments the implementing chain gives it, a candidate's own
+    // `T` through its ancestor chain), and generic arguments are compared
+    // recursively, so `IG<T>.Foo(x: T)` meets `D.Foo(x: int)` for `D: G<int>`
+    // and does NOT meet an unrelated `Foo(x: int)` overload of `C<T>: IG<T>`.
+    // `widen` admits a nullable candidate parameter against a non-null one
+    // (§11.2, top level only). A leaf compares under the #6171 exact mode.
+    static bool witnessParamEqualUnder(const sema::TypeRef* c,
+                                       const SlotSubst* cs, std::size_t cf,
+                                       const sema::TypeRef* i,
+                                       const SlotSubst* is, std::size_t ifr,
+                                       bool widen) {
+        if (!c || !i) return c == i;
+        bool cn = c->nullable, in = i->nullable;
+        SlotResolved cr = resolveSlotParam(c, cs, cf);
+        SlotResolved ir = resolveSlotParam(i, is, ifr);
+        if (!cr.type || !ir.type) return false;
+        cn = cn || cr.type->nullable;
+        in = in || ir.type->nullable;
+        if (cn != in && !(widen && cn && !in)) return false;
+        if (cr.type->kind == sema::TypeRef::Kind::Named &&
+            ir.type->kind == sema::TypeRef::Kind::Named &&
+            !cr.type->genericArgs.empty() &&
+            cr.type->genericArgs.size() == ir.type->genericArgs.size()) {
+            if (!cr.type->declaration && !ir.type->declaration) {
+                if (cr.type->headName() != ir.type->headName()) return false;
+            } else if (cr.type->declaration != ir.type->declaration) {
+                return false;
+            }
+            for (std::size_t k = 0; k < cr.type->genericArgs.size(); ++k)
+                if (!witnessParamEqualUnder(cr.type->genericArgs[k], cs,
+                                            cr.frame, ir.type->genericArgs[k],
+                                            is, ir.frame, false))
+                    return false;
+            return true;
+        }
+        if (cr.type->kind == sema::TypeRef::Kind::Function &&
+            ir.type->kind == sema::TypeRef::Kind::Function) {
+            if (cr.type->funcParams.size() != ir.type->funcParams.size() ||
+                cr.type->funcReturnOwned != ir.type->funcReturnOwned)
+                return false;
+            for (std::size_t k = 0; k < cr.type->funcParams.size(); ++k)
+                if (cr.type->funcParams[k].modifier !=
+                        ir.type->funcParams[k].modifier ||
+                    !witnessParamEqualUnder(cr.type->funcParams[k].type, cs,
+                                            cr.frame,
+                                            ir.type->funcParams[k].type, is,
+                                            ir.frame, false))
+                    return false;
+            return witnessParamEqualUnder(cr.type->funcReturn, cs, cr.frame,
+                                          ir.type->funcReturn, is, ir.frame,
+                                          false);
+        }
+        sema::TypeRef a = *cr.type, b = *ir.type;
+        a.nullable = false;
+        b.nullable = false;
+        return methodSigTypeRefEqual(&a, &b, true);
+    }
     // fix #5113 (§22.6 / §14.2 / §12, v0.307): structural TypeRef equality for
     // method-signature matching in `findMethodBySignature`. Same KIND + same
     // nullability; for Named types, same declaration pointer OR (for type
@@ -9484,6 +9662,57 @@ private:
         return nullptr;
     }
 
+    // The spelling of a substituted argument, in the form the AST branch of the
+    // matching slot key (methodSlotKey when !indexerKey, indexerSlotKey when
+    // indexerKey) writes for the same type, so a base key re-spelled with the
+    // substitution equals the derived override's key.
+    static std::string slotHeadSpelling(const sema::TypeRef* tr, bool indexerKey) {
+        if (!tr) return "?";
+        if (tr->kind == sema::TypeRef::Kind::Primitive) {
+            switch (tr->primitive) {
+                case sema::PrimitiveType::Bool:    return "bool";
+                case sema::PrimitiveType::Char:    return "char";
+                case sema::PrimitiveType::String:  return "string";
+                case sema::PrimitiveType::Byte:    return "byte";
+                case sema::PrimitiveType::SByte:   return "sbyte";
+                case sema::PrimitiveType::Short:   return "short";
+                case sema::PrimitiveType::UShort:  return "ushort";
+                case sema::PrimitiveType::Int:     return "int";
+                case sema::PrimitiveType::UInt:    return "uint";
+                case sema::PrimitiveType::Long:    return "long";
+                case sema::PrimitiveType::ULong:   return "ulong";
+                case sema::PrimitiveType::Float:   return "float";
+                case sema::PrimitiveType::Double:  return "double";
+                case sema::PrimitiveType::Decimal: return "decimal";
+                case sema::PrimitiveType::Object:  return "Object";
+                default:                           return "?";
+            }
+        }
+        if (!indexerKey && tr->kind == sema::TypeRef::Kind::Named &&
+            tr->declaration && !tr->declaration->name.empty()) {
+            std::string s(tr->declaration->moduleName);
+            s += ".";
+            s += std::string(tr->declaration->name);
+            return s;
+        }
+        std::string_view h = tr->headName();
+        return h.empty() ? std::string("?") : std::string(h);
+    }
+    // The key text of one parameter whose type is a bare type parameter bound
+    // by `subst`: its suffix, head and the closing ".", exactly as the
+    // unsubstituted arm writes the same type spelled in the derived class.
+    // Empty when `tr` is not such a parameter (the caller writes it as before).
+    std::string slotSubstitutedParam(const sema::TypeRef* tr, const SlotSubst* subst,
+                                     bool indexerKey) {
+        if (!subst) return "";
+        SlotResolved r = resolveSlotParam(tr, subst, 0);
+        if (r.type == tr) return "";
+        std::string key = slotGenericArgSuffix(r.type, subst, r.frame);
+        key += slotHeadSpelling(r.type, indexerKey);
+        key += ".";
+        return key;
+    }
+
     // fix #5122 (§22.6 / §12 / §12.1, v0.307): a vtable-slot key for a METHOD
     // that distinguishes overloads sharing name AND arity but differing in
     // parameter types. #1085 keyed by name+arity (distinct arities → distinct
@@ -9502,7 +9731,8 @@ private:
     // an identifier, the trailing `.` distinguishes a key that includes the
     // spelling from one that did not (a `?` placeholder), and the arity is
     // preserved (cheap redundancy against the spelling list).
-    std::string methodSlotKey(const sema::MethodSymbol* ms) {
+    std::string methodSlotKey(const sema::MethodSymbol* ms,
+                              const SlotSubst* subst = nullptr) {
         std::string key(ms->name);
         key += "#";
         key += std::to_string(ms->params.size());
@@ -9530,7 +9760,14 @@ private:
             // sharing broke across the local/imported boundary.
             for (const auto& p : md->params) {
                 key += "#";
-                key += slotGenericArgSuffix(p.type ? ctx_.resolvedType(*p.type) : nullptr);
+                const sema::TypeRef* ptr = p.type ? ctx_.resolvedType(*p.type) : nullptr;
+                // fix #6075: a bare base type parameter bound by `subst` is
+                // spelled as its argument (see buildVtable).
+                if (std::string sp = slotSubstitutedParam(ptr, subst, false); !sp.empty()) {
+                    key += sp;
+                    continue;
+                }
+                key += slotGenericArgSuffix(ptr, subst, 0);
                 if (p.type) {
                     const sema::TypeRef* tr = ctx_.resolvedType(*p.type);
                     if (tr && tr->kind == sema::TypeRef::Kind::Primitive) {
@@ -9587,8 +9824,13 @@ private:
             for (sema::Symbol* p : ms->params) {
                 key += "#";
                 auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
-                key += slotGenericArgSuffix(pps ? pps->resolvedDeclType : nullptr);
                 sema::TypeRef* tr = pps ? pps->resolvedDeclType : nullptr;
+                // fix #6075: the imported side of the same substitution.
+                if (std::string sp = slotSubstitutedParam(tr, subst, false); !sp.empty()) {
+                    key += sp;
+                    continue;
+                }
+                key += slotGenericArgSuffix(tr, subst, 0);
                 if (!tr) {
                     key += "?";
                 } else if (tr->kind == sema::TypeRef::Kind::Primitive) {
@@ -9679,37 +9921,28 @@ private:
     // arguments recursively. Emitted immediately after the parameter's `#`, on
     // both the local-AST and the imported (ParameterSymbol) side, so a local
     // override and an imported base agree.
-    static std::string slotGenericArgSuffix(const sema::TypeRef* tr) {
+    static std::string slotGenericArgSuffix(const sema::TypeRef* tr,
+                                            const SlotSubst* subst = nullptr,
+                                            std::size_t frame = 0) {
         if (!tr || tr->genericArgs.empty()) return "";
         std::string s = "<";
-        for (const sema::TypeRef* a : tr->genericArgs) {
-            if (a) {
+        for (const sema::TypeRef* orig : tr->genericArgs) {
+            if (orig) {
+                // fix #6075: an argument that is a base type parameter bound by
+                // `subst` is spelled as what it is bound to, at any depth.
+                SlotResolved r = resolveSlotParam(orig, subst, frame);
+                const sema::TypeRef* a = r.type;
                 std::string_view h = a->headName();
                 if (h.empty() && a->kind == sema::TypeRef::Kind::Primitive) {
                     // A primitive argument (`Array<int>`) has no syntactic head
                     // name on an imported side; spell it as the primitive key.
-                    switch (a->primitive) {
-                        case sema::PrimitiveType::Bool:    h = "bool";    break;
-                        case sema::PrimitiveType::Char:    h = "char";    break;
-                        case sema::PrimitiveType::String:  h = "string";  break;
-                        case sema::PrimitiveType::Byte:    h = "byte";    break;
-                        case sema::PrimitiveType::SByte:   h = "sbyte";   break;
-                        case sema::PrimitiveType::Short:   h = "short";   break;
-                        case sema::PrimitiveType::UShort:  h = "ushort";  break;
-                        case sema::PrimitiveType::Int:     h = "int";     break;
-                        case sema::PrimitiveType::UInt:    h = "uint";    break;
-                        case sema::PrimitiveType::Long:    h = "long";    break;
-                        case sema::PrimitiveType::ULong:   h = "ulong";   break;
-                        case sema::PrimitiveType::Float:   h = "float";   break;
-                        case sema::PrimitiveType::Double:  h = "double";  break;
-                        case sema::PrimitiveType::Decimal: h = "decimal"; break;
-                        case sema::PrimitiveType::Object:  h = "Object";  break;
-                        default: break;
-                    }
+                    std::string p = slotHeadSpelling(a, false);
+                    s += p;
+                } else {
+                    s += h.empty() ? std::string("?") : std::string(h);
                 }
-                s += h.empty() ? std::string("?") : std::string(h);
-                if (a->nullable) s += "?";
-                s += slotGenericArgSuffix(a);
+                if (orig->nullable || a->nullable) s += "?";
+                s += slotGenericArgSuffix(a, subst, r.frame);
             } else {
                 s += "?";
             }
@@ -9725,7 +9958,8 @@ private:
     // ".this"). A base virtual indexer and its derived override have the same
     // index signature → the same key → the override reuses the base's slot
     // (mirrors how #1085 keys method-overload slots by arity).
-    std::string indexerSlotKey(const sema::PropertySymbol* ps) {
+    std::string indexerSlotKey(const sema::PropertySymbol* ps,
+                               const SlotSubst* subst = nullptr) {
         std::string key(ps->name);  // ".this"
         // fix #2545 (§23.4 / §12.1 / §2.8.2 clause 1, v0.236): an abstract
         // IMPORTED indexer has no ast::PropertyDecl (ModuleLoader's Indexer
@@ -9754,7 +9988,13 @@ private:
                 // a new slot and the base body was dispatched. aliasResolvedHead
                 // is the sanctioned alias-transparent head (TypeRef::headName).
                 const sema::TypeRef* atr = p.type ? ctx_.resolvedType(*p.type) : nullptr;
-                key += slotGenericArgSuffix(atr);  // #6074
+                // fix #6075: a bare base type parameter bound by `subst` is
+                // spelled as its argument (see buildVtable).
+                if (std::string sp = slotSubstitutedParam(atr, subst, true); !sp.empty()) {
+                    key += sp;
+                    continue;
+                }
+                key += slotGenericArgSuffix(atr, subst, 0);  // #6074
                 if (atr && !atr->aliasResolvedHead.empty()) {
                     key += std::string(atr->aliasResolvedHead);
                     key += ".";
@@ -9771,8 +10011,13 @@ private:
             for (sema::Symbol* p : ps->indexerParams) {
                 key += "#";
                 auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
-                key += slotGenericArgSuffix(pps ? pps->resolvedDeclType : nullptr);
                 sema::TypeRef* tr = pps ? pps->resolvedDeclType : nullptr;
+                // fix #6075: the imported side of the same substitution.
+                if (std::string sp = slotSubstitutedParam(tr, subst, true); !sp.empty()) {
+                    key += sp;
+                    continue;
+                }
+                key += slotGenericArgSuffix(tr, subst, 0);
                 if (!tr) {
                     key += "?";
                 } else if (tr->kind == sema::TypeRef::Kind::Primitive) {
