@@ -261,3 +261,56 @@ BEZEL_TEST(sema_ref_param_move_only_5566,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("ran\n"));
 }
+
+// --- call-site rows: a `ref` argument bound to a type-parameter `ref` parameter
+// at a move-only substitution (§22.3, v0.338) -------------------------------
+
+// §22.3 `ref` bullet: "at a substitution that makes that type a move-only value
+// type, no argument binds it". The issue's repro: `U.Put<Bundle>(ref b)`.
+BEZEL_TEST(sema_ref_param_move_only_5566,
+           generic_call_explicit_owning_choice_rejected_sec_22_3) {
+    auto r = runAot(kPrelude +
+                    "class U public static method Put<T>(ref x: T): int return 1; end Put; end U; "
+                    "class P public static method Main(): int "
+                    "var b := Bundle.Empty; return U.Put<Bundle>(ref b); end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnostic(r, "binds a location of an owning-classified choice"));
+}
+
+// The same call with the type argument INFERRED (§14.5 unifies T to Bundle).
+BEZEL_TEST(sema_ref_param_move_only_5566,
+           generic_call_inferred_owning_choice_rejected_sec_22_3) {
+    auto r = runAot(kPrelude +
+                    "class U public static method Put<T>(ref x: T): int return 1; end Put; end U; "
+                    "class P public static method Main(): int "
+                    "var b := Bundle.Empty; return U.Put(ref b); end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnostic(r, "binds a location of an owning-classified choice"));
+}
+
+// The class-level parameter form: `Box<Bundle>.Set(ref v)` binds `T` at Bundle.
+BEZEL_TEST(sema_ref_param_move_only_5566,
+           class_type_param_ref_at_owning_choice_rejected_sec_22_3) {
+    auto r = runAot(kPrelude +
+                    "class Box<T> public static method Set(ref x: T): int return 1; end Set; end Box; "
+                    "class P public static method Main(): int "
+                    "var b := Bundle.Empty; return Box<Bundle>.Set(ref b); end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(hasRefDiagnostic(r, "binds a location of an owning-classified choice"));
+}
+
+// Accept control (§22.3, v0.338): a `ref` argument at a COPYABLE substitution
+// binds, both explicitly and inferred; the program runs.
+BEZEL_TEST(sema_ref_param_move_only_5566,
+           generic_call_ref_copyable_substitution_control_sec_22_3) {
+    auto r = runAot(kPrelude +
+                    "class U public static method Put<T>(ref x: T): int return 1; end Put; end U; "
+                    "class P public static method Main(): int "
+                    "var n := 3; var c := Color.Red; "
+                    "Console.WriteLine(U.Put<int>(ref n) + U.Put(ref c)); "
+                    "return 0; end Main; end P;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("2\n"));
+}

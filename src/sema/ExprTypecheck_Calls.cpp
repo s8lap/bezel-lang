@@ -19367,6 +19367,32 @@ void ExprTC::checkArgsAgainstParams(
             if (classParent)
                 for (auto* cgp : classParent->genericParams)
                     if (cgp) tpNames.insert(cgp->name);
+            // §22.3 (v0.338, #5566): a `ref` parameter whose declared type is or
+            // contains a type parameter binds nothing at a substitution that
+            // makes it a move-only value type: "no argument binds it". The
+            // declaration is not rejected (the bullet), so the call is where it
+            // is. Exact unification (§14.5) makes the argument's own type the
+            // substituted referent type, so judging the argument is judging the
+            // location. Judged on the RAW declared type, before substitution.
+            if (am == "ref" && refOutParamTypeMentionsTypeParam(
+                                   ctx_.resolvedType(*rp.type), tpNames)) {
+                if (TypeRef* mtArgTy = ctx_.exprType(*a.value)) {
+                    const char* moveOnlyKind = nullptr;
+                    if (common::isMoveOnlyValueType(mtArgTy, ctx_,
+                                                    moveOnlyKind)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, a.value->span.begin,
+                            std::string("the `ref` argument for parameter `") +
+                                std::string(rp.name) + "` to " + calleeDesc +
+                                " binds a location of " + moveOnlyKind +
+                                " — a move-only value type, which no `ref` "
+                                "argument may bind at this substitution (\xc2\xa7"
+                                "22.3); take the value as a plain parameter "
+                                "and return it, or use `out`");
+                        continue;
+                    }
+                }
+            }
             if (refOutParamTypeMentionsTypeParam(rparamTy, tpNames)) continue;
             TypeRef* rargTy = ctx_.exprType(*a.value);
             if (rparamTy && rargTy && !typeRefEqual(rargTy, rparamTy)) {
