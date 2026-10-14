@@ -296,3 +296,136 @@ end Program;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "2\n");
 }
+
+// --- #6000 positional type parameters (§12.1, v0.338) ----------------------
+// An override's own type parameters correspond to the overridden method's by
+// POSITION (§12.1). The swapped form `P<X,Y>(a: Y, b: X)` against `P<A,B>(a: A,
+// b: B)` names the same two parameters in the opposite slots and must not match.
+namespace {
+const char* kPosProgramSwap =
+    "module M;\n"
+    "public class B\n"
+    "  public constructor() end constructor;\n"
+    "  public virtual method P<A, B>(a: A, b: B): int => 1;\n"
+    "end B;\n"
+    "public class C: B\n"
+    "  public constructor() end constructor;\n"
+    "  public override method P<X, Y>(a: Y, b: X): int => 2;\n"
+    "end C;\n"
+    "public class Program\n"
+    "  public static method Main(): int return 0; end Main;\n"
+    "end Program;\n";
+}  // namespace
+
+// #6000 (§12.1, v0.338): `P<X,Y>(a: Y, b: X)` swaps the base's positions.
+BEZEL_TEST(override_builtin_class_param_6000, swapped_own_type_params_rejected_spec_12_1) {
+    auto r = runAot(kPosProgramSwap);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "does not match the base member's parameter types"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #6000 (§12.1, v0.338): an own type parameter named `Exception` shadows the
+// class `Exception` in the override, so `s: ArgumentException` does not match
+// the base's `s: Exception`.
+BEZEL_TEST(override_builtin_class_param_6000, own_type_param_named_exception_rejected_spec_12_1) {
+    auto r = runAot(R"(
+module M;
+public class B
+  public constructor() end constructor;
+  public virtual method Q<T>(e: T, s: Exception): int => 1;
+end B;
+public class C: B
+  public constructor() end constructor;
+  public override method Q<Exception>(e: Exception, s: ArgumentException): int => 2;
+end C;
+public class Program
+  public static method Main(): int return 0; end Main;
+end Program;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "does not match the base member's parameter types"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #6000 (§12.1, v0.338): the same shadowing name in the SAME spelling on both
+// sides is still a different type: the derived `Exception` is the own type
+// parameter, the base `Exception` is the class.
+BEZEL_TEST(override_builtin_class_param_6000, own_type_param_named_exception_same_spelling_rejected_spec_12_1) {
+    auto r = runAot(R"(
+module M;
+public class B
+  public constructor() end constructor;
+  public virtual method Q<T>(e: T, s: Exception): int => 1;
+end B;
+public class C: B
+  public constructor() end constructor;
+  public override method Q<Exception>(e: Exception, s: Exception): int => 2;
+end C;
+public class Program
+  public static method Main(): int return 0; end Main;
+end Program;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, "does not match the base member's parameter types"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// Accept control (§12.1, v0.338): alpha-renamed own type parameters in the
+// SAME positions match and the override runs.
+BEZEL_TEST(override_builtin_class_param_6000, alpha_renamed_own_type_params_accepted_spec_12_1) {
+    auto r = runAot(R"(
+module M;
+public class Bt
+  public constructor() end constructor;
+  public virtual method P<A, Q2>(a: A, b: Q2): int => 1;
+end Bt;
+public class C: Bt
+  public constructor() end constructor;
+  public override method P<X, Y>(a: X, b: Y): int => 2;
+end C;
+public class Program
+  public static method Main(): int
+    var b: Bt := new C();
+    Console.WriteLine(b.P<int, string>(3, "s"));
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n");
+}
+
+// Accept control (§12.1, v0.338): an own type parameter named `Exception` in
+// the position of the base's own type parameter matches it, and a generic base
+// class parameter substituted by the derived class matches positionally.
+BEZEL_TEST(override_builtin_class_param_6000, typaram_named_exception_and_generic_base_accepted_spec_12_1) {
+    auto r = runAot(R"(
+module M;
+public class B<T>
+  public constructor() end constructor;
+  public virtual method Q<U>(e: T, u: U): int => 1;
+end B;
+public class C: B<int>
+  public constructor() end constructor;
+  public override method Q<Exception>(e: int, u: Exception): int => 2;
+end C;
+public class Program
+  public static method Main(): int
+    var c: C := new C();
+    using var x := new Exception("x");
+    Console.WriteLine(c.Q<Exception>(1, x));
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n");
+}
