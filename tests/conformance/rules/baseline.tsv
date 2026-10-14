@@ -59,6 +59,7 @@ s2_7_0007	pass
 s2_7_0035	pass	
 s2_7_0036	pass	
 s2_7_0037	pass	
+s2_7_0038	pass	
 s2_8_1_0001	pass	
 s2_8_1_0002	pass	
 s2_8_1_0003	pass	
@@ -90,6 +91,7 @@ s3_4_0001	pass
 s3_4_0002	pass	
 s3_4_0003	pass	
 s3_4_0004	pass	
+s3_4_0005	pass	
 s3_5_0001	pass	
 s3_5_0002	pass	
 s3_5_0003	pass	
@@ -249,7 +251,7 @@ s7_4_0043	pass
 s7_4_0044	pass	
 s7_4_0045	pass	
 s7_4_0046	pass	
-s7_4_0047	fail	#6114
+s7_4_0047	pass	
 s7_4_0048	pass	
 s7_5_0001	pass	
 s7_5_0002	pass	
@@ -816,6 +818,7 @@ s15_3_0011	pass
 s15_3_0012	pass	
 s15_3_0014	pass	
 s15_3_0015	pass	
+s15_3_0018	pass	
 s15_4_0001	pass	
 s15_4_0002	pass	
 s15_4_0003	pass	
@@ -1034,11 +1037,12 @@ s19_3_0027	pass
 s19_3_0028	pass	
 s19_3_0069	pass	
 s19_3_0070	pass	
+s19_3_0071	pass	
 s19_4_0001	pass	
 s19_4_0032	pass	
-s19_4_0033	fail	#6082
+s19_4_0033	pass	
 s19_4_0034	pass	
-s19_4_0035	fail	#6120
+s19_4_0035	pass	
 s19_5_0001	pass	
 s19_6_0001	pass	
 s19_6_0002	pass	
@@ -1450,7 +1454,7 @@ s27_3_0043	pass
 s27_3_0044	pass	
 s27_3_0046	pass	
 s27_3_0048	pass	
-s27_3_0049	fail	#6283
+s27_3_0049	pass	
 s27_3_0050	pass	
 s27_3_0051	pass	
 s27_3_0052	pass	
