@@ -1380,6 +1380,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         propagateBB_ = nullptr; unwindTarget_ = nullptr;
         currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0;
         pendingArgsDisposal_.reset();
+        llvm::AllocaInst* asyncMainArgsSlot = nullptr;  // fix #6231
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
         builder_.SetInsertPoint(entry);
         // fix #633 / §33.4: async Main(args: Array<string>) has C ABI signature
@@ -1395,9 +1396,16 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 builder_.CreateCall(bz_args_fn, {argc, argv}, "main.args"),
                 argsSlot);
             paramSlots_[ms->params[0]] = argsSlot;
-            pendingArgsDisposal_ = Disposal{argsSlot, nullptr};
-            pendingArgsDisposal_->collection = true;
-            pendingArgsDisposal_->collectionElemDisposer = stringElementReleaseThunk();
+            // fix #6231 (§33.4 / §28.3, v0.338): the args array is freed HERE,
+            // in `main`, after the Main task settles (below) — not through
+            // pendingArgsDisposal_. The body lowers in Resume, whose root
+            // dispose frame is pushed by hand and never drains that pending
+            // Disposal, so it stayed armed: the args array leaked, and the
+            // first nested body that opened a root scope (a block lambda, a
+            // `Domain.Spawn` body) drained it and emitted a free of THIS
+            // function's alloca ("Referring to an instruction in another
+            // function!").
+            asyncMainArgsSlot = argsSlot;
         } else {
             bindParameters(fn, isInstance, &ms->params);
         }
@@ -1653,6 +1661,22 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             auto* freeTaskFn = declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
                                         {ptrTy()});
             builder_.CreateCall(freeTaskFn, {outerTask});
+            // fix #6231 (§33.4, v0.338): free `args` (and release each string
+            // element) once, after the task settled and the pool is joined, so
+            // no continuation can still read it. The fault edge above exits
+            // through bz_unhandled_exception's `_exit`, like the synchronous
+            // path's process-boundary exit.
+            if (asyncMainArgsSlot) {
+                llvm::Value* arr = builder_.CreateLoad(
+                    ptrTy(), asyncMainArgsSlot, "main.args.free");
+                llvm::Value* disp = stringElementReleaseThunk();
+                builder_.CreateCall(
+                    declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                             {ptrTy(), ptrTy()}),
+                    {arr, disp ? disp
+                               : llvm::cast<llvm::Value>(
+                                     llvm::ConstantPointerNull::get(ptrTy()))});
+            }
             builder_.CreateRet(res ? res : builder_.getInt32(0));
         } else {
             // Return the outer task pointer (the method's Task / Task<T> result).
