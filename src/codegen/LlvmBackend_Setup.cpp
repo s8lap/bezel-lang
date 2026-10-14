@@ -44610,6 +44610,70 @@ void Emitter::setupBoxDescriptors() {
     // words in. Each itable entry is a small thunk that advances `this` past
     // both words then tail-calls the real method.
 
+    // fix #6015 (§9.2 / §14.2, v0.338): the itable entry of an interface
+    // member SPELLED as one of `Object`'s virtual members. §14.2: such a
+    // member "is matched ... by the member that fills the type's `Object`
+    // slot", and "on a receiver boxed to the interface the call reaches the
+    // witness through the box ...; an argument that is not a boxed value of
+    // the type, `null` included, compares unequal". The box's own vtable slot
+    // is exactly that member behind exactly that argument test, so the entry
+    // forwards to it: load the receiver's vtable (word 0 of the box) and
+    // tail-call `vtable[slot]` with the arguments unchanged. Reading the slot
+    // off the RECEIVER rather than naming a thunk keeps a generic record's
+    // per-instantiation vtable (specializedBoxVtableFor) in charge of its own
+    // layout. One forwarder per slot serves every boxed value kind.
+    llvm::Function* objectSlotForwarders[kVirtualMethodsBase] = {};
+    auto objectSlotForwarder = [&](unsigned slot) -> llvm::Function* {
+        if (objectSlotForwarders[slot]) return objectSlotForwarders[slot];
+        // The three slots' ABIs, as lowerObjectToString / lowerObjectEquals /
+        // lowerObjectGetHashCode call them.
+        llvm::FunctionType* fnTy = nullptr;
+        const char* nm = nullptr;
+        if (slot == kEqualsSlot) {
+            fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+            nm = "bz$boxfwd$equals";
+        } else if (slot == kGetHashCodeSlot) {
+            fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, false);
+            nm = "bz$boxfwd$hash";
+        } else {
+            fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+            nm = "bz$boxfwd$tostring";
+        }
+        auto* fwd = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage, nm, module_.get());
+        llvm::IRBuilder<> fb(llvm::BasicBlock::Create(llvm_, "entry", fwd));
+        llvm::Value* vt = fb.CreateLoad(ptrTy(), fwd->getArg(0), "fwd.vt");
+        llvm::Value* slotPtr = fb.CreateGEP(
+            ptrTy(), vt, {llvm::ConstantInt::get(i32(), slot)}, "fwd.slot");
+        llvm::Value* target = fb.CreateLoad(ptrTy(), slotPtr, "fwd.fn");
+        std::vector<llvm::Value*> fwdArgs;
+        for (llvm::Argument& a : fwd->args()) fwdArgs.push_back(&a);
+        fb.CreateRet(fb.CreateCall(fnTy, target, fwdArgs));
+        objectSlotForwarders[slot] = fwd;
+        return fwd;
+    };
+    // Does `ms` take exactly one parameter, typed `Object` or `Object?`?
+    auto takesOneObject = [&](const sema::MethodSymbol* ms) -> bool {
+        if (ms->params.size() != 1) return false;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[0]);
+        const sema::TypeRef* pt =
+            !ps ? nullptr
+                : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                : ps->resolvedDeclType);
+        return pt && pt->kind == sema::TypeRef::Kind::Primitive &&
+               pt->primitive == sema::PrimitiveType::Object;
+    };
+    // Which `Object` slot an interface member is spelled as, else 0 (§8.1:
+    // `Equals(other: Object?)` — or `Object`, by §11.2's nullability
+    // widening — `GetHashCode()`, `ToString()`).
+    auto objectSlotSpelling = [&](const sema::MethodSymbol* im) -> unsigned {
+        if (im->name == "GetHashCode" && im->params.empty())
+            return kGetHashCodeSlot;
+        if (im->name == "ToString" && im->params.empty())
+            return kToStringSlot;
+        return im->name == "Equals" && takesOneObject(im) ? kEqualsSlot : 0u;
+    };
+
     // narrow #5924 item 3 (§9.2 / §35.7, v0.338): the box `Object`-slot
     // thunks of a record or choice that DECLARES its equality pair. Equals,
     // `i1(ptr self, ptr other)`: a null `other`, or one whose word 0 is not
@@ -44768,6 +44832,43 @@ void Emitter::setupBoxDescriptors() {
             for (sema::MethodSymbol* im : ifaceMethods) {
                 llvm::Constant* fp = llvm::ConstantPointerNull::get(ptrTy());
                 sema::MethodSymbol* impl = findInterfaceImpl(ts, im);
+                // fix #6015 (§9.2 / §14.2, v0.338): an interface member
+                // spelled as one of `Object`'s virtual members is witnessed
+                // by the member filling that `Object` slot. For `Equals` that
+                // is the kind's OWN-TYPED member, declared or generated —
+                // which findInterfaceImpl's name-and-arity pick handed to the
+                // box thunk below as if it took the interface's `Object?`:
+                // the thunk forwarded the argument's BOX POINTER into a
+                // parameter lowered as the enum's integer or the choice's
+                // struct, so an equal payload compared unequal, `null`
+                // compared equal to the zero constant, and a choice's body
+                // matched on a garbage tag. A kind with no declared member
+                // (the generated one is no MethodSymbol) left the entry null,
+                // and so did a generated `GetHashCode`/`ToString`: the call
+                // jumped to address 0. All three reach the slot instead. A
+                // member declared AT the slot's own signature keeps the
+                // direct thunk: a declared `GetHashCode()`/`ToString()`, and
+                // an `Equals` declared at `Object?` (the spelling §9.2
+                // rejects on a value kind, #5924 item 1, while it is still
+                // accepted).
+                if (unsigned slot = objectSlotSpelling(im)) {
+                    if (slot == kEqualsSlot) {
+                        impl = nullptr;
+                        for (sema::Symbol* m : ts->members) {
+                            auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                            if (ms && !isStaticMethod(ms) &&
+                                ms->name == "Equals" && takesOneObject(ms) &&
+                                methodFns_.count(ms)) {
+                                impl = ms;
+                                break;
+                            }
+                        }
+                    }
+                    if (!impl) {
+                        itabElems.push_back(objectSlotForwarder(slot));
+                        continue;
+                    }
+                }
                 if (impl) {
                     auto mit = methodFns_.find(impl);
                     if (mit != methodFns_.end()) {
