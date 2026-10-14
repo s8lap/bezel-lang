@@ -9483,6 +9483,27 @@ private:
                     if (!x || !y) return false;
                     if (isOwnTypeParamRef(a, x) && isOwnTypeParamRef(b, y))
                         return true;
+                    // fix #6228 (§22.6 / §14.2, v0.338): a function-typed
+                    // formal's parameters and return are walked the same way,
+                    // so `(V) -> int` of `T<V>` meets `(U) -> int` of an
+                    // interface's `T<U>` position for position.
+                    if (x->kind == ast::TypeKind::Function &&
+                        y->kind == ast::TypeKind::Function) {
+                        if (x->nullable != y->nullable ||
+                            x->funcReturnOwned != y->funcReturnOwned ||
+                            x->funcParams.size() != y->funcParams.size())
+                            return false;
+                        for (size_t k = 0; k < x->funcParams.size(); ++k) {
+                            if (x->funcParams[k].modifier !=
+                                    y->funcParams[k].modifier ||
+                                !self(self, x->funcParams[k].type.get(),
+                                      y->funcParams[k].type.get()))
+                                return false;
+                        }
+                        return (!x->funcReturn && !y->funcReturn) ||
+                               self(self, x->funcReturn.get(),
+                                    y->funcReturn.get());
+                    }
                     if (x->kind != ast::TypeKind::Named ||
                         y->kind != ast::TypeKind::Named ||
                         x->nullable != y->nullable || !x->name || !y->name ||

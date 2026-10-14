@@ -2775,7 +2775,45 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // it is a separate concern.
     std::vector<std::unordered_map<std::string_view, TypeRef*>> phase1Subst(
         cands.size());
+    // fix #6228 (§22.6 "Generic candidates" / §14.5, v0.338): a call that
+    // writes its method type arguments (`c.S<int>(b)`) has no inference to
+    // run: each generic candidate with the same count of type parameters
+    // ranks with its signature substituted by those explicit arguments, the
+    // same substitution the instantiation path applies later. Before, the
+    // bare `V` of `S<V>(x: Array<V>)` and `S<V>(x: Array<Array<V>>)` both
+    // ranked inapplicable against `Array<Array<int>>` and the arity pick
+    // took the first declaration.
+    const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs = nullptr;
+    if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
+            ce.callee.get()))
+        callTypeArgs = &callMa->typeArgs;
+    else if (auto* callNcm =
+                 dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get()))
+        callTypeArgs = &callNcm->typeArgs;
+    else if (auto* callId =
+                 dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
+        callTypeArgs = &callId->typeArgs;
     for (std::size_t c = 0; c < cands.size(); ++c) {
+        if (callTypeArgs && !callTypeArgs->empty()) {
+            const auto* emd =
+                dynamic_cast<const ast::MethodDecl*>(cands[c]->decl);
+            if (emd && !emd->genericParams.empty() &&
+                emd->genericParams.size() == callTypeArgs->size()) {
+                bool allResolved = true;
+                for (std::size_t gi = 0; gi < emd->genericParams.size(); ++gi) {
+                    TypeRef* ta = (*callTypeArgs)[gi]
+                                      ? ctx_.resolvedType(*(*callTypeArgs)[gi])
+                                      : nullptr;
+                    if (!ta) { allResolved = false; break; }
+                    phase1Subst[c][emd->genericParams[gi].name] = ta;
+                }
+                if (allResolved) continue;
+                phase1Subst[c].clear();
+            }
+        }
+    }
+    for (std::size_t c = 0; c < cands.size(); ++c) {
+        if (!phase1Subst[c].empty()) continue;  // explicit arguments applied
         // SEAM-DEBT: #5101 deliberately scoped to same-module candidates only
         // (see the "Scope" comment above) — `unifyArgSubst` needs the
         // declared `ast::Type` node to walk, which an imported generic
