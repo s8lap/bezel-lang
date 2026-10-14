@@ -42669,6 +42669,7 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
         if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        // SEAM-DEBT: #3152 local-only scan; an imported class is skipped on the next line
         auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
         if (!td || ctx_.isImported(ts)) continue;
         if (!td->genericParams.empty() || td->hasPositionalFields ||
@@ -42678,6 +42679,7 @@ void Emitter::collectValueLikeChoiceFieldOwners() {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (!fs || isStaticField(fs) || fs->posParam) continue;
             if (fs->parent != ts) continue;
+            // SEAM-DEBT: #3152 member of a class compiled in this module (imports skipped above)
             if (!dynamic_cast<const ast::FieldDecl*>(fs->decl)) continue;
             if (ts->visibility == ast::Visibility::Public &&
                 (fs->visibility == ast::Visibility::Public ||

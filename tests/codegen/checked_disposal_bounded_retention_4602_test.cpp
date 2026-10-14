@@ -293,7 +293,6 @@ BEZEL_TEST(codegen_checked_disposal_bounded_retention_4602,
     bezel::codegen::CodegenOptions opts;
     opts.checkedDisposal = true;
     auto r = runAotChecked(src, opts);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("594\n"));
 }
