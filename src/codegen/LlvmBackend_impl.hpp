@@ -8691,25 +8691,14 @@ private:
                 const sema::TypeRef* ct = paramTy(ms->params[i]);
                 const sema::TypeRef* it = paramTy(iface->params[i]);
                 if (!ct || !it) return false;
-                // A Named type without a declaration is a type parameter or
-                // a built-in (e.g. ArgumentException): compare by head name
-                // (a generic interface's unsubstituted `T` then never matches
-                // a concrete parameter and keeps the arity pick below).
-                if (ct->kind == sema::TypeRef::Kind::Named &&
-                    it->kind == sema::TypeRef::Kind::Named &&
-                    (!ct->declaration || !it->declaration)) {
-                    if (ct->declaration || it->declaration ||
-                        ct->headName() != it->headName() ||
-                        ct->nullable != it->nullable ||
-                        ct->genericArgs.size() != it->genericArgs.size())
-                        return false;
-                    continue;
-                }
-                if (methodSigTypeRefEqual(ct, it)) continue;
+                // fix #6171 (§11.2): `exact` compares a built-in's head name
+                // and recurses over generic arguments and function-type
+                // parameter / return types.
+                if (methodSigTypeRefEqual(ct, it, true)) continue;
                 if (widen && ct->nullable && !it->nullable) {
                     sema::TypeRef stripped = *ct;
                     stripped.nullable = false;
-                    if (methodSigTypeRefEqual(&stripped, it)) continue;
+                    if (methodSigTypeRefEqual(&stripped, it, true)) continue;
                 }
                 return false;
             }
@@ -8836,8 +8825,13 @@ private:
     // SAME method-param position (a method's own `<T>` referenced by position
     // is the same kind of thing on every override). Concrete types still
     // recurse on genericArgs. Unit and Error kinds compare equal.
+    // `exact` (fix #6171, §11.2 / §22.6 stage 4): the witness predicate for
+    // findInterfaceImpl. Two declaration-less Named refs (a built-in or a type
+    // parameter) are equal only when their head names match, and Function /
+    // InlineArray types are compared structurally instead of never matching.
     static bool methodSigTypeRefEqual(const sema::TypeRef* a,
-                                      const sema::TypeRef* b) {
+                                      const sema::TypeRef* b,
+                                      bool exact = false) {
         if (a == b) return true;
         if (!a || !b) return false;
         if (a->kind != b->kind) return false;
@@ -8851,7 +8845,10 @@ private:
                 // position, so its own `<T>` (or `<U>`) is the same "kind of
                 // thing" — comparing the *name* would be wrong because the
                 // override redeclares the type param under its own scope.
-                if (!a->declaration && !b->declaration) return true;
+                if (!a->declaration && !b->declaration && !exact) return true;
+                if (!a->declaration && !b->declaration &&
+                    a->headName() != b->headName())
+                    return false;
                 if ((a->declaration == nullptr) != (b->declaration == nullptr))
                     return false;
                 if (a->declaration && a->declaration != b->declaration)
@@ -8859,7 +8856,7 @@ private:
                 if (a->genericArgs.size() != b->genericArgs.size()) return false;
                 for (size_t i = 0; i < a->genericArgs.size(); ++i) {
                     if (!methodSigTypeRefEqual(a->genericArgs[i],
-                                               b->genericArgs[i]))
+                                               b->genericArgs[i], exact))
                         return false;
                 }
                 return true;
@@ -8868,8 +8865,24 @@ private:
             case sema::TypeRef::Kind::Error:
                 return true;
             case sema::TypeRef::Kind::InlineArray:
+                if (!exact) return false;  // not part of #5113 repro shapes
+                if (a->arrayOwned != b->arrayOwned) return false;
+                if (a->arraySizeValue >= 0 && b->arraySizeValue >= 0 &&
+                    a->arraySizeValue != b->arraySizeValue)
+                    return false;
+                return methodSigTypeRefEqual(a->arrayElement, b->arrayElement,
+                                             true);
             case sema::TypeRef::Kind::Function:
-                return false;  // not part of #5113 repro shapes
+                if (!exact) return false;  // not part of #5113 repro shapes
+                if (a->funcParams.size() != b->funcParams.size() ||
+                    a->funcReturnOwned != b->funcReturnOwned)
+                    return false;
+                for (size_t i = 0; i < a->funcParams.size(); ++i)
+                    if (a->funcParams[i].modifier != b->funcParams[i].modifier ||
+                        !methodSigTypeRefEqual(a->funcParams[i].type,
+                                               b->funcParams[i].type, true))
+                        return false;
+                return methodSigTypeRefEqual(a->funcReturn, b->funcReturn, true);
         }
         return false;
     }
