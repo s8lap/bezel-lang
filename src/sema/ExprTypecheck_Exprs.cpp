@@ -12568,8 +12568,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     inferredReturn = returnTypes.front();
                 // Fallback: use int (i32) for lambdas with no visible value
                 // return (a procedure lambda / all-bare-returns body).
-                if (!inferredReturn)
-                    inferredReturn = ctx_.primitiveTypeRef(PrimitiveType::Int);
+                // fix #6107 (§27.3 *Which block-bodied lambdas return a
+                // value*, v0.338): a non-async block body with no value-
+                // carrying `return e;` is a procedure lambda — its type is
+                // `(…) -> ()`, not `() -> int`.
+                if (!inferredReturn) {
+                    if (!lam->isAsync) {
+                        inferredReturn = ctx_.makeTypeRef();
+                        inferredReturn->kind = TypeRef::Kind::Unit;
+                    } else {
+                        inferredReturn =
+                            ctx_.primitiveTypeRef(PrimitiveType::Int);
+                    }
+                }
                 // §27.3 (v0.226, #2107): the divergent-return error fires only
                 // when the lambda has NEITHER a return-type ascription NOR a
                 // target return type (lamTargetRet), AND the body has ≥2 value
