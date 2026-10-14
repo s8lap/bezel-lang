@@ -10849,7 +10849,35 @@ private:
     // §22.16: true when `classType`'s conjunction has at least one clause, so
     // `emitInvariantCheck` would emit something. Gates face creation, so a
     // program with no `invariant` member mints no faces at all.
+    //
+    // fix #4645 (§22.16, v0.338): "would emit something" is asked of the
+    // DYNAMIC class — true also when a subclass known to this compilation
+    // adds a clause (`dynamicInvariantArms`).
     bool hasClassInvariant(const sema::TypeSymbol* classType) const;
+
+    // fix #4645 (§22.16, v0.338): "an external call through a base-typed
+    // reference evaluates the full dynamic class invariant — base and derived
+    // conjunction". One entry per non-generic strict subclass of a
+    // non-generic `classType` (no generic class between them, #6204) in this
+    // compilation that declares invariant members of its own, with those
+    // clauses in declaration order; entries are ordered base-first.
+    // `emitInvariantCheck` evaluates each entry's clauses behind an is-a test
+    // on the receiver. Memoized: `descArray_` is complete before any body is
+    // lowered.
+    const std::vector<std::pair<const sema::TypeSymbol*,
+                                std::vector<const ast::Expr*>>>&
+    dynamicInvariantArms(const sema::TypeSymbol* classType) const;
+    mutable std::unordered_map<
+        const sema::TypeSymbol*,
+        std::vector<std::pair<const sema::TypeSymbol*,
+                              std::vector<const ast::Expr*>>>>
+        dynamicInvariantArms_;
+    // fix #4645 (§22.16, v0.338): the descriptors of every non-generic class
+    // this compilation names; `emitInvariantCheck` runs the subclass arms
+    // only for a receiver whose vtable[0] is in it (see
+    // `dynamicInvariantArms`). Built once per module, on first use.
+    llvm::GlobalVariable* knownClassDescTable();
+    llvm::GlobalVariable* knownClassDescTable_ = nullptr;
 
     // §22.16: the unchecked face of `ms`, minted on demand, or null when `ms`
     // is not an instrumented public member (then the sole face already IS the

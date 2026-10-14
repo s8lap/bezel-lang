@@ -7538,10 +7538,166 @@ void Emitter::collectInvariantChain(
 // invariant? Exactly the question `emitInvariantCheck`'s `if (chain.empty())
 // return;` asks, so a class with no clause anywhere in its chain mints no
 // unchecked face and the whole two-face machinery stays inert for it.
+//
+// fix #4645 (§22.16, v0.338): the question is asked of the DYNAMIC class.
+// §22.16: "Dispatch checks the dynamic class's invariant: an external call
+// through a base-typed reference evaluates the full dynamic class invariant —
+// base and derived conjunction". A member declared by `classType` therefore
+// sits on an instrumented boundary as soon as ANY class that can be the
+// receiver's dynamic class carries a clause — `classType`'s own chain, or a
+// subclass's (`dynamicInvariantArms`). Answering from the static chain alone
+// left a member of an invariant-less base with ONE face, so once its prologue
+// evaluates the subclass's clauses a `this`-receiver call from that subclass
+// would have nothing unchecked to bind to — §22.16's reentrancy exemption
+// lost, and `invariant(Ok());` over an inherited `Ok()` back to #4597's
+// unbounded recursion.
 bool Emitter::hasClassInvariant(const sema::TypeSymbol* classType) const {
     std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>> chain;
     collectInvariantChain(classType, chain);
-    return !chain.empty();
+    if (!chain.empty()) return true;
+    return !dynamicInvariantArms(classType).empty();
+}
+
+
+// fix #4645 (§22.16, v0.338): the part of a receiver's DYNAMIC class
+// invariant that its STATIC class's conjunction does not contain.
+//
+// §22.16: "The class invariant of C is the conjunction of every invariant
+// member of C and of every base class, evaluated base-first, declaration
+// order within each class", and "an external call through a base-typed
+// reference evaluates the full dynamic class invariant — base and derived
+// conjunction". The instrumentation points live in the member's DECLARING
+// class (a method's own prologue/epilogue) or at a call site typed by it (a
+// setter store), and both used to evaluate that class's conjunction only: a
+// method `D` inherits unchanged from `B` checked `B`'s clauses and skipped
+// every clause `D` adds — measured, a `D` whose `invariant(_x >= 0);` is
+// false after an inherited `Bump` returned normally through a `B` reference
+// AND through a `D` reference.
+//
+// Returns one ARM per class that (a) strictly derives from `classType`,
+// (b) is known to this compilation, and (c) declares clauses of its OWN. The
+// caller guards each arm by an is-a test on the receiver and evaluates that
+// class's own clauses, so the dynamic class's conjunction is assembled at run
+// time out of statically emitted pieces. Arms are ordered by inheritance
+// depth: along the one chain a given object matches, that IS §22.16's
+// base-first order (arms of sibling branches fail their test and contribute
+// nothing).
+//
+// WHY AN IS-A TEST AND NOT A VTABLE/DESCRIPTOR SLOT. A slot carrying "this
+// class's invariant function" moves the artifact ABI, and the §22.16 face
+// split exists only under `--checked-contracts`, a per-compilation flag the
+// artifact interface does not record (the reasoning #4613 recorded for the
+// same choice). The is-a walk reads only the descriptor array every object
+// already carries (vtable[0], `emitIsA`), so no layout moves and a
+// release-mode and a checked-contracts artifact still link.
+//
+// GENERIC CLASSES ARE NOT ARMS (#6204). An instance of a generic class
+// carries a PER-INSTANTIATION descriptor at vtable[0], not the shared
+// `descArray_` entry, so an is-a test against the shared entry never matches
+// it — measured, the arm was dead at run time. Worse, its clauses would be
+// lowered inside the base member's body with the class's type parameters
+// unbound, and a clause using a universal member on `T` (`_v.Equals(_w)`,
+// `_v.ToString()`) then failed to compile in checked mode. A class is skipped
+// when it, or any class between it and `classType`, is generic; a generic
+// `classType` has no arms. Generic classes evaluate no invariant anywhere
+// yet (#6204), so this is the pre-fix behaviour for them.
+//
+// ONLY DYNAMIC CLASSES THIS COMPILATION NAMES (`emitInvariantCheck`'s
+// known-class gate). The arms run only when the receiver's exact class is one
+// whose descriptor this compilation holds. A subclass compiled into a module
+// that IMPORTS this one is unnameable here; the is-a test alone would still
+// match it against an arm's class, and the importer cannot reach the
+// exporter's private unchecked face for a `this`-receiver call (the #4597
+// residual), so that call would run these arms on an instance §22.16 lets be
+// broken — measured, a false violation (99 where 42 is required) through a
+// clause-less exported base. Gating keeps such a receiver at exactly the
+// pre-fix behaviour: the static class's chain only.
+//
+// RECORDED RESIDUAL (the "unnameable dynamic target" of #4613, filed as
+// #6206): for that same importer-declared subclass, external calls to an
+// inherited exporter member evaluate the static chain only, so the clauses
+// of the subclass and of any exported class between it and `classType` are
+// not evaluated at the exporter's instrumentation points.
+const std::vector<std::pair<const sema::TypeSymbol*,
+                            std::vector<const ast::Expr*>>>&
+Emitter::dynamicInvariantArms(const sema::TypeSymbol* classType) const {
+    auto cached = dynamicInvariantArms_.find(classType);
+    if (cached != dynamicInvariantArms_.end()) return cached->second;
+    struct Arm {
+        const sema::TypeSymbol* cls;
+        unsigned depth;
+        std::string key;
+        std::vector<const ast::Expr*> own;
+    };
+    std::vector<Arm> arms;
+    if (classType && classType->genericParams.empty()) {
+        for (const auto& [ts, desc] : descArray_) {
+            if (!ts || !desc || ts == classType ||
+                ts->kind != ast::TypeDeclKind::Class ||
+                !ts->genericParams.empty())
+                continue;
+            // Strict subclass test, measuring how far below `classType` it is.
+            // A generic class on the path disqualifies the arm (see above).
+            unsigned depth = 0;
+            bool derives = false;
+            bool genericBetween = false;
+            for (const sema::TypeSymbol* c = baseClassOf(ts); c;
+                 c = baseClassOf(c)) {
+                ++depth;
+                if (c == classType) { derives = true; break; }
+                if (!c->genericParams.empty()) genericBetween = true;
+            }
+            if (!derives || genericBetween) continue;
+            // The ONE walk of §22.16's conjunction (`collectInvariantChain`),
+            // filtered to the clauses `ts` itself declares: the base classes'
+            // clauses belong to the static chain or to a shallower arm.
+            std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>>
+                chain;
+            collectInvariantChain(ts, chain);
+            Arm arm{ts, depth, desc->getName().str(), {}};
+            for (const auto& iv : chain)
+                if (iv.first == ts) arm.own.push_back(iv.second);
+            if (!arm.own.empty()) arms.push_back(std::move(arm));
+        }
+    }
+    // #3020: `descArray_` is pointer-keyed, so order the arms explicitly —
+    // depth first (the base-first axis), then the descriptor's symbol name
+    // (unique per class) so sibling branches are emitted deterministically.
+    std::sort(arms.begin(), arms.end(), [](const Arm& a, const Arm& b) {
+        if (a.depth != b.depth) return a.depth < b.depth;
+        return a.key < b.key;
+    });
+    auto& out = dynamicInvariantArms_[classType];
+    for (auto& a : arms) out.emplace_back(a.cls, std::move(a.own));
+    return out;
+}
+
+// fix #4645 (§22.16, v0.338): the known-class gate's table — a null-terminated
+// constant array of the descriptor (`descArray_` entry, i.e. vtable[0]) of
+// every non-generic class this compilation names. One table per module, built
+// on first use (`descArray_` is complete before any body is lowered), so each
+// instrumentation point carries one small scan loop rather than a comparison
+// per class. Ordered by descriptor name (#3020: `descArray_` is
+// pointer-keyed).
+llvm::GlobalVariable* Emitter::knownClassDescTable() {
+    if (knownClassDescTable_) return knownClassDescTable_;
+    std::vector<llvm::GlobalVariable*> descs;
+    for (const auto& [ts, desc] : descArray_)
+        if (ts && desc && ts->kind == ast::TypeDeclKind::Class &&
+            ts->genericParams.empty())
+            descs.push_back(desc);
+    std::sort(descs.begin(), descs.end(),
+              [](const llvm::GlobalVariable* a, const llvm::GlobalVariable* b) {
+                  return a->getName() < b->getName();
+              });
+    std::vector<llvm::Constant*> elems(descs.begin(), descs.end());
+    elems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
+    knownClassDescTable_ = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::PrivateLinkage,
+        llvm::ConstantArray::get(arrTy, elems), "inv.known.classes");
+    return knownClassDescTable_;
 }
 
 
@@ -7802,7 +7958,24 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
     // §22.16 conjunction, base-first (see `collectInvariantChain`).
     std::vector<std::pair<const sema::TypeSymbol*, const ast::Expr*>> chain;
     collectInvariantChain(classType, chain);
-    if (chain.empty()) return;
+    // fix #4645 (§22.16, v0.338): "Dispatch checks the dynamic class's
+    // invariant: an external call through a base-typed reference evaluates
+    // the full dynamic class invariant — base and derived conjunction".
+    // `classType` is the STATIC class of this instrumentation point (the
+    // member's declaring class); the clauses a subclass adds are evaluated
+    // behind an is-a test on the receiver, AFTER the static chain, which keeps
+    // "evaluated base-first" (see `dynamicInvariantArms`).
+    //
+    // Construction exit is the one point where the two classes coincide:
+    // §22.16 "the normal completion of the most-derived constructor" is wired
+    // at the `new` site, whose class IS the dynamic class, so it has no arms.
+    // `disposeAndFreeOnThrow` is that mode's flag (see the declaration).
+    static const std::vector<std::pair<const sema::TypeSymbol*,
+                                       std::vector<const ast::Expr*>>>
+        kNoArms;
+    const auto& arms =
+        disposeAndFreeOnThrow ? kNoArms : dynamicInvariantArms(classType);
+    if (chain.empty() && arms.empty()) return;
 
     // Push the interior-code gate.
     const bool savedInside = insideInvariantCheck_;
@@ -7819,9 +7992,10 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
     // currentThis_ + scope. We save and rely on the predicate lowering
     // path; nothing else here mutates the per-function scope.
 
-    for (const auto& iv : chain) {
-        llvm::Value* condV = lowerExpr(*iv.second);
-        if (!condV) continue;  // purity/type-error already diagnosed upstream
+    auto emitClause = [&](const sema::TypeSymbol* declaring,
+                          const ast::Expr* clause) {
+        llvm::Value* condV = lowerExpr(*clause);
+        if (!condV) return;  // purity/type-error already diagnosed upstream
         llvm::Value* failed = builder_.CreateNot(condV, "inv.fail");
         auto* throwBB =
             llvm::BasicBlock::Create(llvm_, "inv.throw", currentFn_);
@@ -7849,10 +8023,70 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
             builder_.CreateCall(freeFn(), {thisVal});
         }
         std::string msg = std::string("invariant of ") +
-                          std::string(iv.first->name) + " failed";
+                          std::string(declaring->name) + " failed";
         llvm::Value* msgStr = lowerStringLiteral("\"" + msg + "\"", false);
         emitThrowContractViolation(msgStr);
         builder_.SetInsertPoint(contBB);
+    };
+
+    for (const auto& iv : chain) emitClause(iv.first, iv.second);
+
+    // fix #4645: the derived half of the dynamic conjunction, behind the
+    // known-class gate (see `dynamicInvariantArms`): only a receiver whose
+    // exact class this compilation names reaches the arms.
+    llvm::BasicBlock* dynSkipBB = nullptr;
+    if (!arms.empty()) {
+        llvm::GlobalVariable* known = knownClassDescTable();
+        auto* gateBB = llvm::BasicBlock::Create(llvm_, "inv.known", currentFn_);
+        auto* loopBB =
+            llvm::BasicBlock::Create(llvm_, "inv.known.loop", currentFn_);
+        auto* cmpBB =
+            llvm::BasicBlock::Create(llvm_, "inv.known.cmp", currentFn_);
+        auto* nextBB =
+            llvm::BasicBlock::Create(llvm_, "inv.known.next", currentFn_);
+        auto* armsBB = llvm::BasicBlock::Create(llvm_, "inv.arms", currentFn_);
+        dynSkipBB = llvm::BasicBlock::Create(llvm_, "inv.arms.end", currentFn_);
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(thisVal,
+                                  llvm::ConstantPointerNull::get(ptrTy())),
+            dynSkipBB, gateBB);
+        builder_.SetInsertPoint(gateBB);
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), thisVal);
+        llvm::Value* desc = builder_.CreateLoad(ptrTy(), vptr);  // vtable[0]
+        builder_.CreateBr(loopBB);
+        builder_.SetInsertPoint(loopBB);
+        auto* idx = builder_.CreatePHI(i32(), 2);
+        idx->addIncoming(builder_.getInt32(0), gateBB);
+        llvm::Value* elem = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(ptrTy(), known, {idx}));
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(elem,
+                                  llvm::ConstantPointerNull::get(ptrTy())),
+            dynSkipBB, cmpBB);
+        builder_.SetInsertPoint(cmpBB);
+        builder_.CreateCondBr(builder_.CreateICmpEQ(elem, desc), armsBB,
+                              nextBB);
+        builder_.SetInsertPoint(nextBB);
+        idx->addIncoming(builder_.CreateAdd(idx, builder_.getInt32(1)), nextBB);
+        builder_.CreateBr(loopBB);
+        builder_.SetInsertPoint(armsBB);
+    }
+    for (const auto& [armCls, own] : arms) {
+        auto descIt = descArray_.find(armCls);
+        if (descIt == descArray_.end() || !descIt->second) continue;
+        llvm::Value* isArm = emitIsA(thisVal, descIt->second);
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "inv.dyn", currentFn_);
+        auto* joinBB =
+            llvm::BasicBlock::Create(llvm_, "inv.dyn.end", currentFn_);
+        builder_.CreateCondBr(isArm, armBB, joinBB);
+        builder_.SetInsertPoint(armBB);
+        for (const ast::Expr* clause : own) emitClause(armCls, clause);
+        builder_.CreateBr(joinBB);
+        builder_.SetInsertPoint(joinBB);
+    }
+    if (dynSkipBB) {
+        builder_.CreateBr(dynSkipBB);
+        builder_.SetInsertPoint(dynSkipBB);
     }
 
     currentThis_ = savedThis;
