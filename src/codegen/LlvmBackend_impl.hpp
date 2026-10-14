@@ -1764,6 +1764,10 @@ private:
     // compilation so the exprType entries set on their argument nodes never
     // outlive their key (one small tree per cached thunk).
     std::vector<std::unique_ptr<ast::CallExpr>> primIntrinsicSynthCalls_;
+    // fix #6024 (§7.5, v0.338): the synthetic `.Count`/`.Length` nodes built by
+    // the `?.` count arm in lowerExpr (see there). Kept alive for the whole
+    // compilation so the exprType entries set on them never outlive their key.
+    std::vector<std::unique_ptr<ast::MemberAccessExpr>> nullCondCountSynth_;
     // §27.7.1 (v0.180, #1544): cached property-getter-reference thunk per
     // property symbol — the SAME #1170 stability reasoning as methodThunks_
     // above, applied to a property used as a function value (§27.6, `var f:

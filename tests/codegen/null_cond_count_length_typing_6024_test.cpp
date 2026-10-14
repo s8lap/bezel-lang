@@ -11,9 +11,10 @@
 // The `Array`/`Stack` `?.Length` rows keep the `.` form's Count-vs-Length
 // rejection (§4.4 / §4.11, #4811 / #5416).
 //
-// Scope: the VALUE lowering of a collection `?.Count` is a separate codegen
-// gap (the degrade warning persists on an accepted `int?` initializer); only
-// the typing half is pinned here, plus the already-working `string?.Length`.
+// Scope: the typing half is pinned by the rejects above, plus the
+// already-working `string?.Length`. The VALUE lowering of a collection
+// `?.Count` / `?.Length` is pinned by the value rows at the end of this file
+// (non-null prints the count, null prints the `?? -1` fallback).
 
 #include "support/aot_result_asserts.hpp"
 #include <string>
@@ -172,7 +173,8 @@ BEZEL_TEST(null_cond_count_length_typing_6024,
 // Accept controls: the rejects above must not touch `Set?.Count`,
 // `Dictionary?.Count`, the LINQ call spelling `s?.Count()`, or a user class's
 // own `Count` / `Length` members (value runs; collection `Count` is only
-// compiled here, its value lowering being the separate codegen gap above).
+// compiled here; its value lowering is pinned by the value rows at the end
+// of this file).
 BEZEL_TEST(null_cond_count_length_typing_6024,
            nullcond_count_accept_controls_spec_7_5) {
     auto r = runAot(
@@ -196,4 +198,154 @@ BEZEL_TEST(null_cond_count_length_typing_6024,
         "end Main; end Program;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "3\n4\n3\n");
+}
+
+// ─── #6024 (residual): the VALUE of a collection `?.Count` ───
+// §7.5, v0.338: `x?.M` yields `int?`; a non-null receiver gives the count and
+// a null receiver gives null, so `?? -1` falls back. Pre-fix the value was
+// degraded to a zero-initialized `int` (#2434 warning), so a 2-element array
+// printed 0 for its non-null count and the null receiver's fallback was lost.
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           array_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v1; "
+        "class Program public static method Main(): int "
+        "  var b: Array<int>? := new Array<int>(); "
+        "  b!.Add(1); b!.Add(2); "
+        "  var n: Array<int>? := null; "
+        "  Console.WriteLine(b?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           stack_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v2; "
+        "class Program public static method Main(): int "
+        "  var s: Stack<int>? := new Stack<int>(); "
+        "  s!.Push(1); s!.Push(2); s!.Push(3); "
+        "  var n: Stack<int>? := null; "
+        "  Console.WriteLine(s?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "3\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           set_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v3; "
+        "class Program public static method Main(): int "
+        "  var st: Set<int>? := new Set<int>(); "
+        "  st!.Add(5); st!.Add(6); "
+        "  var n: Set<int>? := null; "
+        "  Console.WriteLine(st?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           dictionary_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v4; "
+        "class Program public static method Main(): int "
+        "  var d: Dictionary<string, int>? := new Dictionary<string, int>(); "
+        "  d!.Add(\"a\", 1); d!.Add(\"b\", 2); "
+        "  var n: Dictionary<string, int>? := null; "
+        "  Console.WriteLine(d?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           linked_list_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v5; "
+        "class Program public static method Main(): int "
+        "  var l: LinkedList<int>? := new LinkedList<int>(); "
+        "  l!.AddLast(1); l!.AddLast(2); "
+        "  var n: LinkedList<int>? := null; "
+        "  Console.WriteLine(l?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           queue_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v6; "
+        "class Program public static method Main(): int "
+        "  var q: Queue<int>? := new Queue<int>(); "
+        "  q!.Enqueue(7); "
+        "  var n: Queue<int>? := null; "
+        "  Console.WriteLine(q?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "1\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           sorted_set_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v7; "
+        "class Program public static method Main(): int "
+        "  var s: SortedSet<int>? := new SortedSet<int>(); "
+        "  s!.Add(4); s!.Add(9); "
+        "  var n: SortedSet<int>? := null; "
+        "  Console.WriteLine(s?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           sorted_dictionary_nullcond_count_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v8; "
+        "class Program public static method Main(): int "
+        "  var d: SortedDictionary<int, int>? := new SortedDictionary<int, int>(); "
+        "  d!.Add(1, 10); "
+        "  var n: SortedDictionary<int, int>? := null; "
+        "  Console.WriteLine(d?.Count ?? -1); "
+        "  Console.WriteLine(n?.Count ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "1\n-1\n");
+}
+
+BEZEL_TEST(null_cond_count_length_typing_6024,
+           string_builder_nullcond_length_value_spec_7_5) {
+    auto r = runAot(
+        "module M6024v9; "
+        "class Program public static method Main(): int "
+        "  var sb: StringBuilder? := new StringBuilder(); "
+        "  sb!.Append(\"abcd\"); "
+        "  var n: StringBuilder? := null; "
+        "  Console.WriteLine(sb?.Length ?? -1); "
+        "  Console.WriteLine(n?.Length ?? -1); "
+        "  return 0; "
+        "end Main; end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "4\n-1\n");
 }

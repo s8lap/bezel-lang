@@ -134,9 +134,9 @@ BEZEL_TEST(sema_member_set_residual_6081,
 }
 
 // ── C1 — the declared member: StringBuilder `.Length` runs (§3.1). The `?.`
-// form is accepted (`r.ran`: the program compiles and runs): its VALUE lowering on a
-// StringBuilder head degrades (the #2434 / #3079 codegen gap, pre-existing and
-// not pinned here), so its stdout is not asserted.
+// form is accepted (`r.ran`: the program compiles and runs); its VALUE lowering on a
+// StringBuilder head is pinned by the #6024 value rows (null_cond_count_length_typing_6024_test.cpp),
+// so this test does not assert its stdout.
 BEZEL_TEST(sema_member_set_residual_6081,
            stringbuilder_length_dot_runs_stdlib_3_1) {
     auto r = runAot(
@@ -180,7 +180,7 @@ BEZEL_TEST(sema_member_set_residual_6081,
 }
 
 // ── C3 — the declared member on the resizable Array: `.Count` runs (§4.4).
-// The `?.Count` form is accepted (`r.ran`); its value lowering degrades on a collection head (pre-existing, not pinned here).
+// The `?.Count` form is accepted (`r.ran`); its value lowering on a collection head is pinned by the #6024 value rows (null_cond_count_length_typing_6024_test.cpp).
 BEZEL_TEST(sema_member_set_residual_6081,
            array_count_dot_runs_stdlib_4_4) {
     auto r = runAot(

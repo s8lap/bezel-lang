@@ -3045,6 +3045,67 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return ncPhi;
             }
         }
+        // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
+        // collection head, typed `int?` by resolveNullCondMember. The receiver
+        // is lowered ONCE; a null receiver yields null, otherwise the `.` form's
+        // own Count/Length lowering (the MemberAccessExpr arm below) runs on a
+        // synthetic `.` node whose target is a pinned placeholder carrying the
+        // already-lowered receiver (the makePrimIntrinsicThunk pattern), and the
+        // scalar count is wrapped as a present `int?` {hasValue; count}.
+        if ((nm->member == "Count" || nm->member == "Length") &&
+            ctx_.exprSymbol(e) == nullptr) {
+            const sema::TypeRef* ncCntTy = ctx_.exprType(e);
+            const sema::TypeRef* ncRcvTy = ctx_.exprType(*nm->target);
+            if (ncCntTy && ncCntTy->kind == sema::TypeRef::Kind::Primitive &&
+                ncCntTy->primitive == sema::PrimitiveType::Int &&
+                ncCntTy->nullable && ncRcvTy &&
+                ncRcvTy->kind == sema::TypeRef::Kind::Named &&
+                !ncRcvTy->declaration) {
+                llvm::Value* ncRcv = lowerExpr(*nm->target);
+                if (!ncRcv || !ncRcv->getType()->isPointerTy()) return nullptr;
+                auto* ncEntryBB = builder_.GetInsertBlock();
+                auto* ncAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "ncct.access", currentFn_);
+                auto* ncEndBB = llvm::BasicBlock::Create(
+                    llvm_, "ncct.end", currentFn_);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpEQ(
+                        ncRcv, llvm::ConstantPointerNull::get(ptrTy())),
+                    ncEndBB, ncAccessBB);
+                builder_.SetInsertPoint(ncAccessBB);
+                auto placeholder = std::make_unique<ast::IdentifierExpr>();
+                placeholder->name = nm->member;
+                ctx_.setExprType(placeholder.get(),
+                                 const_cast<sema::TypeRef*>(ncRcvTy));
+                exprValueOverride_[placeholder.get()] = ncRcv;
+                auto dotted = std::make_unique<ast::MemberAccessExpr>();
+                dotted->span = e.span;
+                dotted->member = nm->member;
+                dotted->target = std::move(placeholder);
+                const ast::Expr* placeholderKey = dotted->target.get();
+                ctx_.setExprType(dotted.get(),
+                                 ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+                llvm::Value* ncCount = lowerExpr(*dotted);
+                exprValueOverride_.erase(placeholderKey);
+                nullCondCountSynth_.push_back(std::move(dotted));
+                if (!ncCount || !ncCount->getType()->isIntegerTy(32))
+                    return nullptr;
+                auto* nst = llvm::StructType::get(
+                    llvm_, {nullablePrimHasValTy(), i32()});
+                llvm::Value* ncWrapped = builder_.CreateInsertValue(
+                    builder_.CreateInsertValue(
+                        llvm::UndefValue::get(nst),
+                        llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u}),
+                    ncCount, {1u});
+                auto* ncAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(ncEndBB);
+                builder_.SetInsertPoint(ncEndBB);
+                auto* ncPhi = builder_.CreatePHI(nst, 2);
+                ncPhi->addIncoming(llvm::ConstantAggregateZero::get(nst), ncEntryBB);
+                ncPhi->addIncoming(ncWrapped, ncAccessEnd);
+                return ncPhi;
+            }
+        }
         // fix #3015 (§7.5 / §23.2 / §23.3, v0.240): `q?.P` on a nullable class
         // receiver, where P is a NON-VIRTUAL computed property getter —
         // expression-bodied `=> expr` (§23.2) or block-form `get => do … end;`
