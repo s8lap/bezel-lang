@@ -6159,30 +6159,60 @@ TypeRef* Resolver::applyGenericSubst(
         tr, sema::SubstArgs{ctx_, genericSubst});
 }
 
+// §12.1 (#6299): the positions, in each class's `baseTypes`, of the base-type
+// path from `from` down to `target` (depth-first, first path found). Returns
+// false when `target` is not reachable through `baseTypes`.
+static bool baseTypePathTo(const TypeSymbol* from, const TypeSymbol* target,
+                           std::vector<std::size_t>& path, int depth) {
+    if (!from || depth > 64) return false;
+    for (std::size_t bi = 0; bi < from->baseTypes.size(); ++bi) {
+        const TypeSymbol* b = from->baseTypes[bi];
+        if (!b) continue;
+        path.push_back(bi);
+        if (b == target || baseTypePathTo(b, target, path, depth + 1))
+            return true;
+        path.pop_back();
+    }
+    return false;
+}
+
 void Resolver::buildBaseGenericSubst(
         MethodSymbol* derived, MethodSymbol* base,
         std::unordered_map<std::string_view, TypeRef*>& out) {
     // Example: Container<T> base, IntBox : Container<int> derived → {T → int}.
     // Look up the base type's TypeRef from the derived class's baseTypeRefs
     // (which store the resolved generic args).
+    //
+    // §12.1 / §11.2 (#6299): an INDIRECT base is reached through the chain.
+    // `D<T>: B<T>` with `E1: D<int>` binds B's T to int: each level's
+    // generic arguments are written in the scope of the class below it, so
+    // they are substituted by the bindings composed so far (the derived
+    // class's own parameters stay as written: the identity). A chain that
+    // records no argument at some level leaves the map empty, as before.
     TypeSymbol* derivedClass = derived ? derived->parent : nullptr;
     TypeSymbol* baseClass = base ? base->parent : nullptr;
     if (!derivedClass || !baseClass) return;
-    for (std::size_t bi = 0; bi < derivedClass->baseTypes.size(); ++bi) {
-        if (derivedClass->baseTypes[bi] != baseClass) continue;
-        TypeRef* baseRef = (bi < derivedClass->baseTypeRefs.size())
-                           ? derivedClass->baseTypeRefs[bi] : nullptr;
-        if (!baseRef) break;
-        // Match base class generic params to the concrete args.
-        for (std::size_t gi = 0; gi < baseClass->genericParams.size() &&
-             gi < baseRef->genericArgs.size(); ++gi) {
+    std::vector<std::size_t> path;
+    if (!baseTypePathTo(derivedClass, baseClass, path, 0)) return;
+    std::unordered_map<std::string_view, TypeRef*> bound;  // child's params → derived-scope args
+    const TypeSymbol* child = derivedClass;
+    for (std::size_t bi : path) {
+        const TypeSymbol* anc = child->baseTypes[bi];
+        TypeRef* ref = (bi < child->baseTypeRefs.size())
+                       ? child->baseTypeRefs[bi] : nullptr;
+        if (!ref) { out.clear(); return; }
+        std::unordered_map<std::string_view, TypeRef*> next;
+        for (std::size_t gi = 0; gi < anc->genericParams.size() &&
+             gi < ref->genericArgs.size(); ++gi) {
             if (auto* gp = dynamic_cast<GenericParamSymbol*>(
-                              baseClass->genericParams[gi])) {
-                out[gp->name] = baseRef->genericArgs[gi];
+                              anc->genericParams[gi])) {
+                next[gp->name] = applyGenericSubst(ref->genericArgs[gi], bound);
             }
         }
-        break;
+        bound = std::move(next);
+        child = anc;
     }
+    out = std::move(bound);
 }
 
 // #1592: is `mod` a parameter modifier that passes the argument BY
