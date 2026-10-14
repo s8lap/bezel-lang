@@ -6754,6 +6754,76 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // fix #6312 (§5.1 "Reference conversions", §12.9, v0.338): a primitive
+    // (`string` included) or a user-declared type reaching a BUILT-IN GENERIC
+    // collection, span or iterable-interface instantiation. The arm above
+    // needs a Named `from`, and every built-in-class arm below needs
+    // `to->genericArgs` empty, so `Take(3)` against `Take(x: Array<int>)`
+    // reached the catch-all accept and the IR verifier aborted on an `i32`
+    // passed for a `ptr`; with `S<V>(x: Array<V>)` at `S<int>(3)` the body
+    // ran on a reinterpreted integer. §5.1 lists no conversion into these
+    // types from such a source: none is a base class of a value or a user
+    // type; a primitive conforms only to its compiler-provided interfaces
+    // (§11.8), never a collection interface; `string` implements exactly
+    // `IEnumerable<char>` (§4.6), and §12.9's variance is for reference-typed
+    // arguments only, so no other instantiation; and a span (stdlib §4.14,
+    // §4.15) is no user type's base or interface. A user type reaching a
+    // collection interface is judged by its declared bases in the arm above,
+    // so only the span heads are added for it here.
+    if (to->kind == TypeRef::Kind::Named && !to->declaration &&
+        !to->genericArgs.empty() &&
+        !(from->kind == TypeRef::Kind::Named && !from->declaration)) {
+        const std::string_view toH = to->headName();
+        const bool spanHead = toH == "Span" || toH == "ReadOnlySpan" ||
+                              toH == "ArraySpan" ||
+                              toH == "ReadOnlyArraySpan";
+        const bool collectionHead =
+            toH == "Array" || toH == "OwningArray" || toH == "Dictionary" ||
+            toH == "OwningDictionary" || toH == "SortedDictionary" ||
+            toH == "SortedSet" || toH == "Stack" || toH == "OwningStack" ||
+            toH == "Queue" || toH == "OwningQueue" || toH == "Set" ||
+            toH == "OwningSet" || toH == "LinkedList" ||
+            toH == "OwningLinkedList" || toH == "FrozenArray" ||
+            toH == "OwningBuffer";
+        const bool iterableHead =
+            common::isIterableInterfaceHead(toH) || toH == "IReadOnlyList" ||
+            toH == "IReadOnlyCollection" || toH == "IList" ||
+            toH == "ICollection" || toH == "IOwningList" ||
+            toH == "IOwningCollection";
+        const bool fromPrim = from->kind == TypeRef::Kind::Primitive &&
+                              from->primitive != PrimitiveType::Object;
+        const bool fromString =
+            fromPrim && from->primitive == PrimitiveType::String;
+        const bool fromUser = from->kind == TypeRef::Kind::Named &&
+                              from->declaration;
+        bool reject = false;
+        if (fromPrim && (spanHead || collectionHead)) reject = true;
+        else if (fromPrim && !fromString && iterableHead) reject = true;
+        else if (fromString && iterableHead) {
+            // `string` → `IEnumerable<char>` is its declared conformance;
+            // any other head, or an element type that is concretely not
+            // `char`, is not. An element still naming a type variable is
+            // left to inference / instantiation.
+            const TypeRef* el = to->genericArgs.size() == 1
+                                    ? to->genericArgs[0]
+                                    : nullptr;
+            const bool elConcreteNonChar =
+                el && ((el->kind == TypeRef::Kind::Primitive &&
+                        (el->primitive != PrimitiveType::Char ||
+                         el->nullable)) ||
+                       (el->kind == TypeRef::Kind::Named && el->declaration));
+            reject = toH != "IEnumerable" || elConcreteNonChar;
+        } else if (fromUser && spanHead) {
+            reject = true;
+        }
+        if (reject) {
+            reportNotConvertible(
+                std::string("§5.1 has no implicit conversion from this "
+                            "source to the built-in generic type `") +
+                std::string(toH) + "<…>`");
+            return;
+        }
+    }
     // §27.6 (#756): a target-typed PROPERTY REFERENCE. `var f: () -> T := b.P`
     // where P is a property whose getter returns T — a property read is a value
     // by default, but when the target is a zero-arg function returning the

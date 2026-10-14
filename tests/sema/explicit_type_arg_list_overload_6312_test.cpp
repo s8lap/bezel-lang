@@ -381,3 +381,117 @@ BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_implicit_conversi
         "    Console.WriteLine(c.S<byte>(7));\n"),
         "20\n10\n10\n");
 }
+
+// Review round 3 (#6312): a primitive, a `string` or a user class reaching a
+// built-in generic collection, span or iterable-interface parameter. §5.1
+// lists no conversion into those types from such a source (a primitive
+// conforms only to its §11.8 interfaces, `string` only to `IEnumerable<char>`
+// per §4.6, a span is no class's base or interface). The survivor printed 10
+// (and with a `x.Count` body hit the IR verifier); the non-overloaded and
+// inferred shapes hit the IR verifier on the base too.
+namespace {
+
+void rejectBuiltinGeneric(const std::string& classes, const std::string& body,
+                          const std::string& head) {
+    const std::string errs = reject(classes, body);
+    BEZEL_EXPECT_TRUE(errs.find("to the built-in generic type `" + head +
+                                "<…>`") != std::string::npos);
+}
+
+std::string survivorClass(const std::string& param, const std::string& body) {
+    return "public class Dog end Dog;\n"
+           "public class C\n"
+           "  public method S(x: string): int => 1;\n"
+           "  public method S<V>(x: " + param + "): int => " + body + ";\n"
+           "end C;\n";
+}
+
+}  // namespace
+
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_int_to_array_param_rejected_spec_5_1) {
+    rejectBuiltinGeneric(survivorClass("Array<V>", "10"),
+                         "    using var c := new C();\n"
+                         "    Console.WriteLine(c.S<int>(3));\n"
+                         "    Console.WriteLine(c.S<long>(3L));\n",
+                         "Array");
+}
+
+// The reviewer's ICE body: the survivor reads `x.Count` off the integer.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_int_to_array_param_count_body_rejected_spec_5_1) {
+    rejectBuiltinGeneric(survivorClass("Array<V>", "x.Count"),
+                         "    using var c := new C();\n"
+                         "    Console.WriteLine(c.S<int>(12345));\n",
+                         "Array");
+}
+
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_string_to_array_param_rejected_spec_5_1) {
+    rejectBuiltinGeneric(survivorClass("Array<V>", "10"),
+                         "    using var c := new C();\n"
+                         "    Console.WriteLine(c.S<char>(\"s\"));\n",
+                         "Array");
+}
+
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_int_to_ienumerable_param_rejected_spec_5_1) {
+    rejectBuiltinGeneric(survivorClass("IEnumerable<V>", "10"),
+                         "    using var c := new C();\n"
+                         "    Console.WriteLine(c.S<int>(3));\n",
+                         "IEnumerable");
+}
+
+// `string` implements `IEnumerable<char>` only (§4.6); §12.9's variance is
+// for reference-typed arguments, so `IEnumerable<int>` is not reached.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_string_to_ienumerable_int_rejected_spec_4_6) {
+    rejectBuiltinGeneric(survivorClass("IEnumerable<V>", "10"),
+                         "    using var c := new C();\n"
+                         "    Console.WriteLine(c.S<int>(\"s\"));\n",
+                         "IEnumerable");
+}
+
+BEZEL_TEST(explicit_type_arg_list_overload_6312, sole_survivor_int_and_class_to_span_params_rejected_spec_5_1) {
+    rejectBuiltinGeneric(survivorClass("Span<V>", "10"),
+                         "    using var c := new C();\n"
+                         "    Console.WriteLine(c.S<int>(3));\n",
+                         "Span");
+    rejectBuiltinGeneric(survivorClass("ReadOnlySpan<V>", "10"),
+                         "    using var c := new C();\n"
+                         "    using var d := new Dog();\n"
+                         "    Console.WriteLine(c.S<Dog>(d));\n",
+                         "ReadOnlySpan");
+}
+
+// The standalone shapes: a non-overloaded method with a concrete `Array<int>`
+// parameter, and an inferred call to a sole generic method.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, standalone_int_to_array_param_rejected_spec_5_1) {
+    rejectBuiltinGeneric("public class C\n"
+                         "  public method T(x: Array<int>): int => x.Count;\n"
+                         "  public method U<V>(x: Array<V>): int => x.Count;\n"
+                         "end C;\n",
+                         "    using var c := new C();\n"
+                         "    Console.WriteLine(c.T(3));\n"
+                         "    Console.WriteLine(c.U(3));\n",
+                         "Array");
+}
+
+BEZEL_TEST(explicit_type_arg_list_overload_6312, standalone_int_to_nullable_array_local_rejected_spec_5_1) {
+    rejectBuiltinGeneric("",
+                         "    var a: Array<int>? := 3;\n"
+                         "    var e: IEnumerable<int> := 4;\n",
+                         "Array");
+}
+
+// Over-rejection guard: `string` reaches `IEnumerable<char>`, its declared
+// conformance (§4.6), at the survivor, a concrete parameter and inferred.
+BEZEL_TEST(explicit_type_arg_list_overload_6312, string_to_ienumerable_char_runs_spec_4_6) {
+    BEZEL_EXPECT_EQ(run(
+        "public class C\n"
+        "  public method S(x: int): int => 1;\n"
+        "  public method S<V>(x: IEnumerable<V>): int => 10;\n"
+        "  public method T(x: IEnumerable<char>): int => 20;\n"
+        "  public method U<V>(x: IEnumerable<V>): int => 30;\n"
+        "end C;\n",
+        "    using var c := new C();\n"
+        "    Console.WriteLine(c.S<char>(\"ab\"));\n"
+        "    Console.WriteLine(c.T(\"ab\"));\n"
+        "    Console.WriteLine(c.U(\"ab\"));\n"),
+        "10\n20\n30\n");
+}
