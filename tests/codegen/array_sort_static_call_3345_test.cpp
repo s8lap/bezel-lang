@@ -13,6 +13,7 @@
 //
 // per spec §3, stdlib §4.4 / §4.5 (v0.278).
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -154,14 +155,76 @@ BEZEL_TEST(array_sort_static_call_3345, static_sort_as_statement) {
 // IdentifierExpr target).
 // ===========================================================================
 
-BEZEL_TEST(array_sort_static_call_3345, static_sort_non_array_arg_rejected) {
+// fix #6265 (spec §3.4, stdlib §4.4/§4.5, v0.338): the stdlib declares no static
+// member on a collection type NAME; the #3345 sugar admits only a well-formed
+// `Array.Sort(<Array<T>>)`. Anything else is rejected with the same "has no
+// static method or property" diagnostic the other builtin type names use, at
+// the call's real line:col. The weak oracle this replaces (`!r.ran ||
+// r.exitCode != 0`) was also satisfied by the compiler SEGFAULTING (rc 139):
+// `failedAtCompileTimeWithRealLocation` rejects a crash/signal outcome, and
+// the needle pins the specific message.
+namespace {
+bool rejectedNoStatic(const std::string& body, const char* needle) {
     auto r = runAot(
         "module M; class C public static method Main(): int "
-        "  var x: int := 42; "
-        "  Array.Sort(x); "  // x is int, not Array<T>
-        "  return 0; "
+        "  var x: int := 42; " + body + " return 0; "
         "end Main; end C;");
-    // Compile must FAIL cleanly (no crash), with exit != 0 or no run.
-    // Pre-#3345: exit 139 (SIGSEGV in sema).
-    BEZEL_EXPECT_TRUE(!r.ran || r.exitCode != 0);
+    return bezel::test::failedAtCompileTimeWithRealLocation(r) &&
+           bezel::test::diagnosticMessageContains(r, needle);
+}
+}  // namespace
+
+BEZEL_TEST(array_sort_static_call_3345, static_sort_non_array_arg_rejected) {
+    // x is int, not Array<T>: the issue's literal repro.
+    BEZEL_EXPECT_TRUE(rejectedNoStatic(
+        "Array.Sort(x);",
+        "'Array' has no static method or property 'Sort' (\xC2\xA7""3.4)"));
+}
+
+BEZEL_TEST(array_sort_static_call_3345, static_call_wrong_shape_rejected_not_crash) {
+    const char* kSort = "has no static method or property 'Sort'";
+    BEZEL_EXPECT_TRUE(rejectedNoStatic("Array.Sort();", kSort));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic("Array.Sort(\"s\");", kSort));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic("Array.Sort(null);", kSort));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic("OwningArray.Sort(x);", kSort));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic(
+        "Array.Reverse(x);", "has no static method or property 'Reverse'"));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic(
+        "Array.Fill(x, 1);", "has no static method or property 'Fill'"));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic(
+        "Array.Foo(x);", "has no static method or property 'Foo'"));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic(
+        "Stack.Foo(x);", "'Stack' has no static method or property 'Foo'"));
+    BEZEL_EXPECT_TRUE(rejectedNoStatic(
+        "var y := Array.Get(x, 0);", "has no static method or property 'Get'"));
+}
+
+// fix #6265 regression guard: a nullable array NARROWED to non-null is a valid
+// static-call argument (exprType still carries nullable=true on the narrowed
+// identifier, so the sugar must not key on it) — spec §7.4.
+BEZEL_TEST(array_sort_static_call_3345, static_call_narrowed_nullable_arg_accepted) {
+    auto r1 = runAot(
+        "module M; class C public static method Main(): int "
+        "  var a: Array<int>? := [3, 1]; "
+        "  if a <> null then Array.Sort(a); return a[0]; end; return 9; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r1.ran);
+    BEZEL_EXPECT_EQ(r1.exitCode, 1);
+    auto r2 = runAot(
+        "module M; class C public static method Main(): int "
+        "  var a: Array<int>? := [3, 1]; "
+        "  if a = null then return 9; end; Array.Sort(a); return a[0]; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r2.ran);
+    BEZEL_EXPECT_EQ(r2.exitCode, 1);
+    auto r3 = runAot(
+        "module M; class C "
+        "  public static method F(a: Array<int>?): int "
+        "    if a <> null then Array.Reverse(a); return a[0]; end; return 9; "
+        "  end F; "
+        "  public static method Main(): int "
+        "    var a: Array<int> := [3, 1]; return F(a); "
+        "  end Main; end C;");
+    BEZEL_EXPECT_TRUE(r3.ran);
+    BEZEL_EXPECT_EQ(r3.exitCode, 1);
 }

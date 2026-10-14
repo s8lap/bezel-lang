@@ -8378,6 +8378,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         return;
                     }
                 }
+                // fix #6265 (§3.4, stdlib §4.4/§4.5, v0.338): a call whose
+                // target is the bare NAME of a collection family
+                // (`Array.Sort(x)` with a non-array `x`, `Stack.Foo(x)`) has a
+                // null `recvTy`, and the collection-family block below
+                // dereferences `recvTy->genericArgs` unguarded — a compile-time
+                // SIGSEGV (rc 139). The #3345 static-call sugar above has
+                // already returned for a well-formed `Array.Sort(<Array<T>>)`;
+                // anything else that reaches here is a static call the stdlib
+                // does not declare on a type name, so report the same
+                // diagnostic the other builtin type names use and stop.
+                if (!recvTy && !colName.empty() &&
+                    dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()) &&
+                    (colName == "Array" || colName == "OwningArray" ||
+                     colName == "Stack" || colName == "OwningStack" ||
+                     colName == "Queue" || colName == "OwningQueue" ||
+                     colName == "Set" || colName == "OwningSet" ||
+                     colName == "LinkedList" || colName == "OwningLinkedList" ||
+                     colName == "SortedSet")) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "'" + std::string(colName) +
+                            "' has no static method or property '" +
+                            std::string(m) + "' (§3.4)");
+                    return;
+                }
                 // §8.5 / §8.6 (#417): `o.ToString()` where o: Object or an
                 // interface — the universal Object.ToString (no MethodSymbol,
                 // dispatched through the vtable ToString slot in codegen). The
