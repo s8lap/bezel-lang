@@ -10053,7 +10053,13 @@ void Resolver::checkAbstractImplementations() {
         // interface member's type needs type-argument substitution before it
         // can be compared, which is deferred (so generic conformance is never
         // false-rejected here).
-        if (t->genericParams.empty()) {
+        // #6200 / §11.2 (v0.338): NOT gated on `t` being non-generic. A generic
+        // class `K<Z>: B<Z>, N` against a NON-generic interface `N` compares
+        // the member under the class's own substitution (`X -> Z`): `Z` is not
+        // exactly `int` (generic code is checked once, at its declaration), so
+        // it rejects instead of binding `K<string>` to `Value: int`. Generic
+        // INTERFACES are skipped per entry below (their own arm follows).
+        {
             // §2.8.2/§11.2/§12.5 (#2380): the PROPERTY sibling of #2373's
             // METHOD fix in this same function. `ps` here is applied to BOTH
             // sides of the comparison below (`ips`, always from an interface
