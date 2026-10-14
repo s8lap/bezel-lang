@@ -14,14 +14,25 @@
 // Scope: synchronous events only. Async events (IAsyncEvent<T> /
 // AsyncEventSource<T>, §24.5) are deferred — async is not implemented.
 
+#include "support/aot_support.hpp"   // runAot — AOT test harness
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runJit;
 
 namespace {
 
 int run(const std::string& program) {
+    auto r = runAot(program);
+    BEZEL_EXPECT_TRUE(r.ran);
+    return r.ran ? r.exitCode : -999;
+}
+
+// Rows that stay on the deprecated JIT oracle: their program is one the spec
+// rejects on the AOT path (see the commit body for the spec sentence). They are
+// kept, not deleted, so the behaviour they pin stays under test.
+int runJitLeftover(const std::string& program) {
     auto r = runJit(program);
     return r.ran ? r.exitCode : -999;
 }
@@ -57,7 +68,7 @@ BEZEL_TEST(codegen_events_24, subscribe_lambda_then_raise_runs_handler) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); b.Fire(7); "
         "return box.V; ")), 12);  // 5 + 7
 }
@@ -75,8 +86,8 @@ BEZEL_TEST(codegen_events_24, multiple_handlers_all_fire) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s1 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
-        "var s2 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N * 10); end); "
+        "using var s1 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s2 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N * 10); end); "
         "b.Fire(2); "
         "return box.V; ")), 22);  // 2 + 20
 }
@@ -87,9 +98,9 @@ BEZEL_TEST(codegen_events_24, dispose_subscription_unsubscribes_handler) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "do using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "          // box.V = 5
-        "s.Dispose(); "        // remove the handler (§2.11)
+        "s.Dispose(); end; "        // remove the handler (§2.11)
         "b.Fire(100); "        // no handler left — no-op
         "return box.V; ")), 5);
 }
@@ -184,7 +195,7 @@ BEZEL_TEST(codegen_events_24, no_payload_event_raise_and_subscribe) {
         "end App; "
         "class C public static method Main(): int "
         "  var box := new Box(); var a := new App(); "
-        "  var s := a.Ping.Subscribe(lambda() => do box.Bump(); end); "
+        "  using var s := a.Ping.Subscribe(lambda() => do box.Bump(); end); "
         "  a.Fire(); a.Fire(); a.Fire(); "
         "  return box.V; "
         "end Main; end C;"), 3);
@@ -206,7 +217,7 @@ BEZEL_TEST(codegen_events_24, handler_reads_payload_record_fields) {
         "end Emitter; "
         "class C public static method Main(): int "
         "  var box := new Box(); var em := new Emitter(); "
-        "  var s := em.Moved.Subscribe(lambda(e) => do box.Add(e.X + e.Y); end); "
+        "  using var s := em.Moved.Subscribe(lambda(e) => do box.Add(e.X + e.Y); end); "
         "  em.Fire(3, 4); "
         "  return box.V; "
         "end Main; end C;"), 7);  // 3 + 4
@@ -219,7 +230,7 @@ BEZEL_TEST(codegen_events_24, event_backing_field_is_per_instance) {
         "var box := new Box(); "
         "var b1 := new Button(); "
         "var b2 := new Button(); "
-        "var s := b1.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s := b1.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b2.Fire(99); "      // b2 has no subscribers — does not touch box
         "b1.Fire(4); "       // b1's handler fires
         "return box.V; ")), 4);
@@ -236,12 +247,12 @@ BEZEL_TEST(codegen_events_24, subscribe_past_capacity_grows_all_fire_24_5) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); "
         "var b := new Button(); "
-        "var s1 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
-        "var s2 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
-        "var s3 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
-        "var s4 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
-        "var s5 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "  // grows past 4
-        "var s6 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s1 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s2 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s3 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s4 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "using var s5 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "  // grows past 4
+        "using var s6 := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "
         "return box.V; ")), 30);  // 6 handlers * 5
 }
@@ -253,7 +264,7 @@ BEZEL_TEST(codegen_events_24, subscribe_past_capacity_grows_all_fire_24_5) {
 // recognition was purely syntactic — a method-returned Subscription's `.Dispose`
 // was a no-op and the handler stayed subscribed, returning 50 here.)
 BEZEL_TEST(codegen_events_24, dispose_method_returned_subscription_unsubscribes) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runJitLeftover(
         "module M; "
         "record Ev(N: int); "
         "class Box "
@@ -310,7 +321,7 @@ BEZEL_TEST(codegen_events_24, using_var_subscription_scope_end_auto_disposes) {
 // original handler. (Before the fix a Subscription parameter lowered to a
 // non-pointer and the `.Dispose()` was skipped, returning 7.)
 BEZEL_TEST(codegen_events_24, dispose_parameter_subscription_unsubscribes) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runJitLeftover(
         "module M; "
         "record Ev(N: int); "
         "class Box "
@@ -350,7 +361,7 @@ BEZEL_TEST(codegen_events_24, dispose_field_subscription_unsubscribes) {
         "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
         "end Button; "
         "class Holder "
-        "  public sub: Subscription?; "
+        "  public owned sub: Subscription?; "
         "  public method Stop() sub!.Dispose(); end Stop; "
         "end Holder; "
         "class C public static method Main(): int "
@@ -370,9 +381,9 @@ BEZEL_TEST(codegen_events_24, dispose_field_subscription_unsubscribes) {
 BEZEL_TEST(codegen_events_24, dispose_literal_declarator_subscription_still_works) {
     BEZEL_EXPECT_EQ(run(prog(
         "var box := new Box(); var b := new Button(); "
-        "var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "do using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(5); "                           // handler live → +5
-        "s.Dispose(); "                         // literal declarator dispose
+        "s.Dispose(); end; "                         // literal declarator dispose
         "b.Fire(100); "                         // handler gone — no-op
         "return box.V; ")), 5);
 }
@@ -396,7 +407,7 @@ BEZEL_TEST(codegen_events_24, subscription_in_size1_inline_array_runs_d5) {
 // element's `.Dispose()`, Fire(40) is a no-op.
 BEZEL_TEST(codegen_events_24, dispose_size1_inline_array_subscription_element) {
     BEZEL_EXPECT_EQ(run(prog(
-        "var box := new Box(); var b := new Button(); "
+        "using var box := new Box(); using var b := new Button(); "
         "var subs: [1]Subscription; "
         "subs[0] := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
         "b.Fire(3); "                           // handler live → +3
@@ -476,4 +487,89 @@ BEZEL_TEST(codegen_events, all_handlers_run_when_no_throw_747) {
         "    using var s2 := s.Changed.Subscribe(lambda(e) => do total := total + 10; end); "
         "    s.Fire(5); return total; "  // 15
         "  end Main; end C;"), 15);
+}
+
+// §28.14 (v0.338, #477 port): the capture-bearing handler bound by a plain
+// `var s` is NOT admitted. Its bounding object (the receiver `b`) is not a
+// `using var` local and is not `this`, so the capture admits no bounding object
+// (the spec's off-idiom case: bind the Subscription with `using var`). The
+// program is the subscribe_lambda_then_raise_runs_handler shape with `var`.
+BEZEL_TEST(codegen_events_24, plain_var_capturing_subscription_not_admitted_28_14) {
+    auto r = runAot(prog(
+        "var box := new Box(); "
+        "var b := new Button(); "
+        "var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "b.Fire(5); "
+        "return box.V; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool cited = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("a capture-bearing closure is not admitted here") != std::string::npos) cited = true;
+    BEZEL_EXPECT_TRUE(cited);
+}
+
+// §28.6 "Who may call Dispose()": a non-`owned` parameter is a borrow, so
+// `Dispose()` on it is rejected (the owner disposes). Shape: the
+// dispose_parameter_subscription_unsubscribes program with the capture admitted
+// by `using var s`, so the only diagnostic is the parameter Dispose.
+BEZEL_TEST(codegen_events_24, dispose_non_owned_parameter_rejected_28_6) {
+    auto r = runAot(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class Button "
+        "  public event Clicked: Ev; "
+        "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "end Button; "
+        "class Helper "
+        "  public static method Kill(s: Subscription) s.Dispose(); end Kill; "
+        "end Helper; "
+        "class C public static method Main(): int "
+        "  using var box := new Box(); using var b := new Button(); "
+        "  using var s := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "  Helper.Kill(s); "
+        "  return box.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool cited = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("cannot call `Dispose()` on parameter") != std::string::npos) cited = true;
+    BEZEL_EXPECT_TRUE(cited);
+}
+
+// §28.6 "Who may call Dispose()": Dispose through a field read is rejected; a
+// non-`owned` field is always a borrow. Shape: the dispose_field_subscription
+// program with `sub` non-owned (the original row's shape).
+BEZEL_TEST(codegen_events_24, dispose_through_non_owned_field_read_rejected_28_6) {
+    auto r = runAot(
+        "module M; "
+        "record Ev(N: int); "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class Button "
+        "  public event Clicked: Ev; "
+        "  public method Fire(n: int) Clicked.Raise(new Ev(n)); end Fire; "
+        "end Button; "
+        "class Holder "
+        "  public sub: Subscription?; "
+        "  public method Stop() sub!.Dispose(); end Stop; "
+        "end Holder; "
+        "class C public static method Main(): int "
+        "  using var box := new Box(); using var b := new Button(); "
+        "  using var h := new Holder(); "
+        "  h.sub := b.Clicked.Subscribe(lambda(e) => do box.Add(e.N); end); "
+        "  h.Stop(); "
+        "  b.Fire(9); "
+        "  return box.V; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool cited = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("cannot call `Dispose()` through a field read") != std::string::npos) cited = true;
+    BEZEL_EXPECT_TRUE(cited);
 }
