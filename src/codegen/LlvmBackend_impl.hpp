@@ -827,9 +827,19 @@ struct SlotSubst {
 // name) and the imported side (metadata importedName, no AST); else "".
 inline std::string_view slotBareParamName(const sema::TypeRef* tr) {
     if (!tr || tr->kind != sema::TypeRef::Kind::Named || tr->declaration ||
-        !tr->genericArgs.empty() || !tr->aliasResolvedHead.empty() ||
-        tr->isAliasQualifiedBuiltin())
+        !tr->genericArgs.empty() || tr->isAliasQualifiedBuiltin())
         return {};
+    // fix #6323 (§27.8, §12.1, v0.338): an alias of a type parameter
+    // (`Id<X>`, `Id2<X>` with `type Id<T> := T`) resolves to that parameter
+    // with the use site as `astNode`; the parameter's name is its
+    // `aliasResolvedHead`. Read it as that parameter, so the base key is
+    // substituted like a bare `X` and an override spelled `Q` (or `Id2<Q>`)
+    // shares the base slot. A built-in head (`type E := Exception`) is not
+    // a parameter.
+    if (!tr->aliasResolvedHead.empty()) {
+        if (sema::isBuiltinTypeName(tr->aliasResolvedHead)) return {};
+        return tr->aliasResolvedHead;
+    }
     if (tr->astNode) {
         if (!tr->astNode->name || tr->astNode->name->parts.size() != 1)
             return {};

@@ -279,8 +279,9 @@ BEZEL_TEST(override_type_param_identity_6315_module,
 // #6321 (§27.8, §12.1, v0.338): the imported `AB<X>` spells its return types
 // `Id2<X>` and `Id2<Id<X>>`, both of which are `X`, so `Q` overrides them. Before
 // the fix the importer read `Id2<X>` as the alias's stale `T` and reported the
-// return type as a mismatch. The calls go through a derived receiver, because
-// the imported generic base-receiver call is still the #783 limitation.
+// return type as a mismatch. The calls go through the derived receiver and,
+// at an `int` instantiation (a reference-type one is still the #783
+// limitation), through the imported base receiver (#6323: the slot key).
 BEZEL_TEST(override_type_param_identity_6315_module,
            imported_alias_of_alias_return_parameter_and_key_accepted_6321_spec_27_8) {
     Outcome6315 o = buildImporter6315(app6321(
@@ -295,13 +296,18 @@ BEZEL_TEST(override_type_param_identity_6315_module,
         "    Console.WriteLine(e.M(1));\n"
         "    Console.WriteLine(e.R(7));\n"
         "    Console.WriteLine(e.R2(8));\n"
-        "    Console.WriteLine(e[2]);\n"), kLib6321);
+        "    Console.WriteLine(e[2]);\n"
+        "    var b: AB<int> := e;\n"
+        "    Console.WriteLine(b.M(1));\n"
+        "    Console.WriteLine(b.R(7));\n"
+        "    Console.WriteLine(b.R2(8));\n"
+        "    Console.WriteLine(b[2]);\n"), kLib6321);
     BEZEL_EXPECT_TRUE(o.libBuilt);
     BEZEL_EXPECT_TRUE(o.compiled);
     BEZEL_EXPECT_TRUE(o.stderrText.find("does not match the base member") ==
                       std::string::npos);
     BEZEL_EXPECT_TRUE(o.ran);
-    BEZEL_EXPECT_EQ(o.stdoutText, std::string("dm\n7\n8\ndi\n"));
+    BEZEL_EXPECT_EQ(o.stdoutText, std::string("dm\n7\n8\ndi\ndm\n7\n8\ndi\n"));
 }
 
 // #6321: with the alias read through, the imported `Id2<X>` is still `X`, not the

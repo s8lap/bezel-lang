@@ -1038,7 +1038,7 @@ end Program;
     BEZEL_EXPECT_EQ(r.stdoutText, "derived\na\nderived3\nc\n");
 }
 
-// The parameter and index-key sites: `Id2<X>` and `Id2<Id<X>>` are `X`, so `Q` overrides them (rejected before the fix). The calls go through the derived receiver. A base-receiver call at an aliased parameter reaches the base body, the separate #6323.
+// The parameter and index-key sites: `Id2<X>` and `Id2<Id<X>>` are `X`, so `Q` overrides them (rejected before the fix). The calls go through both receivers; #6323: the base receiver reaches the override (the vtable slot key reads the alias as its parameter).
 BEZEL_TEST(type_param_identity_6315, alias_of_alias_parameter_and_index_key_accepted_6321_spec_27_8) {
     auto r = runAot(R"(
 module M;
@@ -1062,6 +1062,10 @@ public class Program
     Console.WriteLine(e.M(1));
     Console.WriteLine(e.N(2));
     Console.WriteLine(e[3]);
+    var b: B<int> := e;
+    Console.WriteLine(b.M(1));
+    Console.WriteLine(b.N(2));
+    Console.WriteLine(b[3]);
     return 0;
   end Main;
 end Program;
@@ -1069,7 +1073,7 @@ end Program;
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "dm\ndn\ndi\n");
+    BEZEL_EXPECT_EQ(r.stdoutText, "dm\ndn\ndi\ndm\ndn\ndi\n");
 }
 
 // `Id2<int>` is `int` and `Id2<string>` is `string` at a field, a parameter and a local. Before the fix both were the unbound `T`, and `+` on them was rejected.
@@ -1224,4 +1228,112 @@ end E;
     BEZEL_EXPECT_TRUE(hasErrorContaining(r, "override of `indexer` does not match the base member's index parameter types (§12.1)"));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// #6323 (§12.1, §27.8, v0.338): a base member whose parameter or index key is an
+// alias of the class type parameter keyed its vtable slot by the alias's
+// spelling (`X`), not by the substituted argument, so the override got a slot of
+// its own and a base-receiver call ran the base body.
+
+// The issue repro: `M(x: Id<X>)` overridden by `M(x: Q)`; the index key as well.
+BEZEL_TEST(type_param_identity_6315, alias_parameter_base_receiver_dispatches_to_override_6323_spec_12_1) {
+    auto r = runAot(R"(
+module M;
+type Id<T> := T;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method M(x: Id<X>): string => "base";
+  public virtual property [i: Id<X>]: string => "bi";
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method M(x: Q): string => "derived";
+  public override property [i: Q]: string => "di";
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<int>();
+    var b: B<int> := e;
+    Console.WriteLine(b.M(1));
+    Console.WriteLine(e.M(1));
+    Console.WriteLine(b[2]);
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "derived\nderived\ndi\n");
+}
+
+// The alias on both sides (`M(x: Id2<X>)` by `M(x: Id2<Q>)`, likewise `Id3`): dispatched correctly before #6321 only because both sides kept the same stale `T`; #6321 alone made it run the base body.
+BEZEL_TEST(type_param_identity_6315, alias_of_alias_parameter_both_sides_base_receiver_6323_spec_12_1) {
+    auto r = runAot(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+type Id3<U> := Id2<U>;
+public class B<X>
+  public constructor() end constructor;
+  public virtual method M(x: Id2<X>): string => "bm";
+  public virtual method N(x: Id3<X>): string => "bn";
+  public virtual method P(x: Id2<Id<X>>): string => "bp";
+end B;
+public class E<Q>: B<Q>
+  public constructor() end constructor;
+  public override method M(x: Id2<Q>): string => "dm";
+  public override method N(x: Id3<Q>): string => "dn";
+  public override method P(x: Id2<Id<Q>>): string => "dp";
+end E;
+public class Program
+  public static method Main(): int
+    var b: B<int> := new E<int>();
+    Console.WriteLine(b.M(5));
+    Console.WriteLine(b.N(5));
+    Console.WriteLine(b.P(5));
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "dm\ndn\ndp\n");
+}
+
+// An interface indexer keyed by an alias of its parameter (and a method over one), called through the interface. The single-alias indexer crashed (SIGSEGV) before the fix.
+BEZEL_TEST(type_param_identity_6315, alias_interface_indexer_and_method_through_interface_6323_spec_11_2) {
+    auto r = runAot(R"(
+module M;
+type Id<T> := T;
+type Id2<T> := Id<T>;
+public interface I<X>
+  readonly property [i: Id<X>]: string;
+  method M(x: Id2<X>): string;
+end I;
+public interface J<X>
+  readonly property [i: Id2<Id<X>>]: string;
+end J;
+public class E<Q>: I<Q>, J<Q>
+  public constructor() end constructor;
+  public property [i: Q]: string => "di";
+  public method M(x: Q): string => "dm";
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<int>();
+    var i: I<int> := e;
+    var j: J<int> := e;
+    Console.WriteLine(i[5]);
+    Console.WriteLine(i.M(5));
+    Console.WriteLine(j[5]);
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "di\ndm\ndi\n");
 }
