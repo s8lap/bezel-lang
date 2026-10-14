@@ -12657,11 +12657,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // value*, v0.338): a non-async block body with no value-
                 // carrying `return e;` is a procedure lambda — its type is
                 // `(…) -> ()`, not `() -> int`.
+                // fix #6195 (pending the owner's ruling on §27.3 for a body
+                // that only DIVERGES): see the condition below.
                 if (!inferredReturn) {
                     // A value-carrying return with an unresolved operand type
                     // (already diagnosed) keeps the `int` fallback: the body
                     // is still not a procedure lambda, so no unit cascade.
-                    if (!lam->isAsync && !lamHasValueReturn) {
+                    // fix #6195: a DIVERGING body with no bare `return;`
+                    // (throw / `while true` / all paths; `break` is not
+                    // analysed, as on origin/main) keeps `int` as well.
+                    if (!lam->isAsync && !lamHasValueReturn &&
+                        !(bodyAlwaysExits(lam->stmts) &&
+                          !lamHasBareReturn)) {
                         inferredReturn = ctx_.makeTypeRef();
                         inferredReturn->kind = TypeRef::Kind::Unit;
                     } else {
