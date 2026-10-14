@@ -10083,8 +10083,19 @@ void Resolver::checkAbstractImplementations() {
                     if (candParamCount(cps) != nparams) continue;
                     bool all = true;
                     for (std::size_t k = 0; k < nparams; ++k) {
-                        TypeRef* pty = candParamTy(cps, k);
-                        TypeRef* ity = ifaceParamTy(k);
+                        // #6308 / §12.1, §11.2: each side is read in its
+                        // own class's scope — the obligation's key type
+                        // through the chain substitution its visit induced
+                        // (`B<T>` under `: B<string>` binds T to string), the
+                        // candidate's through the substitution of the class
+                        // that declares it (a generic ancestor `N<U>` keeps
+                        // its members in terms of U) — the same pair of
+                        // accessors the element-type compare below uses.
+                        const TypeRef* pty =
+                            propTypeUnder(candParamTy(cps, k),
+                                          classSubstOf(cps));
+                        const TypeRef* ity =
+                            propTypeUnder(ifaceParamTy(k), obl.subst);
                         if (!pty || !ity || !typeRefEqual(pty, ity)) {
                             all = false;
                             break;
