@@ -1398,7 +1398,8 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // fix #6270 (§28.5 / §28.11, v0.338): a borrowing `Set<T>` whose
             // element is generic-dict-eligible is bz_dict_t*-backed at
             // construction (genericBackingType: records, non-nullable
-            // primitives/enums, strings), not bz_array_t*-backed.
+            // primitives/enums, strings, plain-value inline arrays), not
+            // bz_array_t*-backed.
             // bz_array_free on that table freed the header but leaked the
             // insertion-order array and every key copy (68 B per instance at
             // T=int). Free it exactly as a `using var` Set local does: release
@@ -4117,6 +4118,36 @@ bool Emitter::inlineArrayElementCarriesString(const sema::TypeRef* tr) {
     return false;
 }
 
+
+// fix #5882 (§3.6 / §8.3, v0.338; #6238): see the declaration. Termination is
+// the same finite value-type DAG argument as inlineArrayElementCarriesString.
+bool Emitter::inlineArrayElementIsPlainValue(const sema::TypeRef* tr) {
+    if (!tr) return false;
+    using K = sema::TypeRef::Kind;
+    if (tr->kind == K::Primitive)
+        return tr->primitive != sema::PrimitiveType::String &&
+               tr->primitive != sema::PrimitiveType::Object;
+    if (tr->kind == K::InlineArray)
+        return !tr->arrayOwned && tr->arrayElement &&
+               inlineArrayElementIsPlainValue(tr->arrayElement);
+    if (tr->kind != K::Named || !tr->declaration) return false;
+    // A class / interface element is a borrowed reference compared by
+    // identity (§8.3); the key copy holds it exactly as a `[N]C` local does,
+    // with no count to keep.
+    if (tr->declaration->kind == ast::TypeDeclKind::Enum ||
+        tr->declaration->kind == ast::TypeDeclKind::Class ||
+        tr->declaration->kind == ast::TypeDeclKind::Interface)
+        return true;
+    if (tr->declaration->kind != ast::TypeDeclKind::Record) return false;
+    RecordSubstGuard guard(this, tr);
+    std::vector<const sema::Symbol*> storage;
+    collectRecordStorage(tr->declaration, storage);
+    for (const sema::Symbol* m : storage) {
+        const sema::TypeRef* mty = recordMemberTypeResolved(m);
+        if (mty == tr || !inlineArrayElementIsPlainValue(mty)) return false;
+    }
+    return true;
+}
 
 // fix #2326 / §9.8 v0.228: release every `string` storage reachable from
 // inline-array element type at array ADDRESS `arrAddr` for the array

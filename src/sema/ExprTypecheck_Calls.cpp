@@ -890,6 +890,57 @@ void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
         "change the target type to a dictionary (§15.4)");
 }
 
+// fix #5882 (§15.4 / §3.6 clause (c), v0.338; the #6237 limitation): see the
+// declaration in ExprTypecheck_impl.hpp.
+bool reportHashKeyInlineArrayLiteral(DiagnosticEngine& diags,
+                                     const TypeRef* containerTy,
+                                     const ast::Expr* keyArg,
+                                     std::string_view member) {
+    if (!containerTy || !keyArg) return false;
+    auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(keyArg);
+    if (!cl || cl->isDict) return false;
+    if (containerTy->kind != TypeRef::Kind::Named ||
+        containerTy->declaration || !containerTy->astNode ||
+        !containerTy->astNode->name ||
+        containerTy->astNode->name->parts.empty())
+        return false;
+    std::string_view head = containerTy->aliasResolvedHead.empty()
+                                ? containerTy->headName()
+                                : std::string_view(containerTy->aliasResolvedHead);
+    const bool isDictHead = head == "Dictionary" || head == "OwningDictionary";
+    const bool isSetHead = head == "Set" || head == "OwningSet";
+    if (!isDictHead && !isSetHead) return false;
+    if (containerTy->genericArgs.empty() || !containerTy->genericArgs[0] ||
+        containerTy->genericArgs[0]->kind != TypeRef::Kind::InlineArray)
+        return false;
+    // Only the members whose FIRST parameter is the key / element (`K` / `T`);
+    // `in` passes an empty member name. A Set's collection-taking members
+    // (`UnionWith`, `IsSubsetOf`, ...) take a collection literal legitimately.
+    if (!member.empty()) {
+        const bool keyMember =
+            isDictHead
+                ? (member == "Add" || member == "ContainsKey" ||
+                   member == "Contains" || member == "Remove" ||
+                   member == "TryGetValue" || member == "TryAdd" ||
+                   member == "GetOrAdd" || member == "GetOrNull" ||
+                   member == "TryPopValue")
+                : (member == "Add" || member == "Contains" ||
+                   member == "Remove");
+        if (!keyMember) return false;
+    }
+    std::string keySpelled =
+        collectionLiteralTargetSpelling(containerTy->genericArgs[0]);
+    diags.report(
+        Severity::Error, keyArg->span.begin,
+        "a collection literal written directly as a `" + std::string(head) +
+        "` " + (isDictHead ? "key" : "element") + " of inline-array type `" +
+        keySpelled + "` is not lowered by this compiler (#6237): \xC2\xA7"
+        "15.4 admits it, but the " + (isDictHead ? "key" : "element") +
+        " would be silently lost. Bind it to a local first "
+        "(`var k: " + keySpelled + " := [...];`) and pass the local");
+    return true;
+}
+
 // per §15.4 (#1825): the POSITIVE side of `isCollectionLiteralInterfaceTarget`.
 // A collection literal is admissible (i.e. codegen can materialise it
 // against this target) when the target is one of:
@@ -1538,10 +1589,27 @@ bool isLinqHashableOperator(std::string_view m) {
 // §27.7.1's first-kind equality and never hashes. So `Contains` at a FUNCTION
 // element type on those four heads skips the gate; `IEnumerable<fn>.Contains`
 // (§5's hashable block) and every other operator keep it.
+//
+// fix #5882 (stdlib §4 "Equality search" / §15.1.2, v0.338): the same holds
+// for an INLINE ARRAY of a function type (`[2](int) -> int`, `[2]((int) ->
+// int)?`). Stdlib §4 admits the search "only where the element type,
+// nullability stripped, has a member for … the first kind", and it has none
+// "exactly where the same comparison between two values of the type draws"
+// §15.1.2's use-site error; `a = b` over `[2](int) -> int` compiles (§15.1.2's
+// element-wise equality over §27.7.1's), so the element has one. #5882 made
+// isEqualityBearing recurse into an inline array's element (§3.6 clause (c)),
+// which would otherwise have turned this admitted search into a hashable
+// rejection. An inline array whose element is a non-hashable RECORD keeps the
+// gate: such a record has no first-kind equality (`Array<NH>.Contains` is
+// rejected), and stdlib §4 names "or an inline array of one" with it.
 bool linqHashableGateApplies(std::string_view colName, std::string_view m,
                              const TypeRef* srcElem = nullptr) {
     if (colName == "SortedSet" && m == "Contains") return false;
-    if (m == "Contains" && srcElem && srcElem->kind == TypeRef::Kind::Function &&
+    const TypeRef* searched = srcElem;
+    while (searched && searched->kind == TypeRef::Kind::InlineArray)
+        searched = searched->arrayElement;
+    if (m == "Contains" && searched &&
+        searched->kind == TypeRef::Kind::Function &&
         (colName == "Array" || colName == "Stack" || colName == "Queue" ||
          colName == "LinkedList"))
         return false;
@@ -8304,6 +8372,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }();
                 using P = PrimitiveType;
                 const auto& m = ma->member;
+                // fix #5882 (§15.4, v0.338; #6237): a collection literal in the
+                // key / element position of an inline-array-keyed Dictionary /
+                // Set is not lowered — reject it rather than drop it silently.
+                if (!ce.args.empty() && ce.args[0].value)
+                    reportHashKeyInlineArrayLiteral(ctx_.diagnostics(), recvTy,
+                                                    ce.args[0].value.get(), m);
                 // fix #3331 (C2, stdlib §4.14 + proposal 0116 D8, v0.278):
                 // `OwningBuffer<T>.DangerousPointer()` is the FFI buffer
                 // address accessor documented in stdlib §4.14 (proposal 0033),

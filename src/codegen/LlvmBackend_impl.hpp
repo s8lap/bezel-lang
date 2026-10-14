@@ -14432,6 +14432,17 @@ private:
     // argument is the same finite-DAG walk over the value-type graph.
     bool inlineArrayElementCarriesString(const sema::TypeRef* tr);
 
+    // fix #5882 (§3.6 / §8.3, v0.338; the #6238 limitation): is an inline-
+    // array element a PLAIN value — no string, Object, function or choice
+    // anywhere in it (through nullable wrappers, nested inline arrays and
+    // record fields; a class / interface reference is plain — it is borrowed
+    // and compared by identity)? Only such an element is admitted to
+    // the generic-backed Dictionary / Set path by genericBackingType: the
+    // hash table copies the key bytes without retaining their references,
+    // so a `[N]string` key leaked every key string (7160 B / 50 iterations
+    // under LSan). Other shapes keep the pre-#5882 lowering until #6238.
+    bool inlineArrayElementIsPlainValue(const sema::TypeRef* tr);
+
     // fix #2425 / §9.8 / §28.9 / §35.4 v0.235: does value-like choice `ts`
     // own, directly (a `string` payload field in some declared case) or
     // transitively (through a non-nullable nested-record or nested-choice

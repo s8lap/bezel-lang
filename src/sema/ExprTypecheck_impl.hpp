@@ -167,6 +167,22 @@ void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
 void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
                                               SourceLocation loc,
                                               const TypeRef* target);
+// fix #5882 (§15.4, v0.338; the #6237 limitation): a collection literal
+// written directly in the key / element position of a `Dictionary` /
+// `OwningDictionary` / `Set` / `OwningSet` whose key / element type is an
+// INLINE ARRAY (`d[[1, 2]]`, `d.ContainsKey([1, 2])`, `s.Contains([1, 2])`,
+// `[1, 2] in s`). §15.4 admits the literal, but no key-position lowering
+// materializes it (codegen's `lowerExpr` returns null for a literal), so each
+// such operation compiled to a silently dropped store or a constant
+// `0`/`False` result once #5882 made the key generic-backed. Until #6237 lands
+// that lowering, report it here with the bind-to-a-local remedy. `member` is
+// the called member's name (empty for `in` and the indexer); only the members
+// whose first parameter is the key / element are covered. Returns true when
+// it reported.
+bool reportHashKeyInlineArrayLiteral(DiagnosticEngine& diags,
+                                     const TypeRef* containerTy,
+                                     const ast::Expr* keyArg,
+                                     std::string_view member);
 
 // §27.1.1 (v0.180): exact structural equality of two TypeRefs — the INVARIANT
 // fallback for a function-value slot that is not a bare, non-generic

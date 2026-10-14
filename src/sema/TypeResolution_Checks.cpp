@@ -4715,7 +4715,7 @@ void Resolver::checkHashContainerKeys() {
     // outside the recursive §9.2 admissible-component rule — the #2110
     // key-position half). The reason clause is kind-aware so an owning-choice
     // key does not draw the record-worded message.
-    auto reasonClause = [&](const TypeRef* keyRef) -> std::string {
+    auto reasonClauseOne = [&](const TypeRef* keyRef) -> std::string {
         // §3.6 clause (e) (v0.338, #5827): a function type is not hashable.
         if (keyRef && keyRef->kind == TypeRef::Kind::Function)
             return "it is a function type, which is not **hashable** "
@@ -4747,6 +4747,24 @@ void Resolver::checkHashContainerKeys() {
                "with `Equals(T)` and `override GetHashCode`, \xC2\xA7""25.2). "
                "Give it an auto-hashable form, or declare custom "
                "equality.";
+    };
+    // §3.6 clause (c) (v0.338): an inline array is hashable iff its element
+    // type is (fix #5882 made isEqualityBearing recurse). Name the clause, then
+    // give the element's own reason.
+    auto reasonClause = [&](const TypeRef* keyRef) -> std::string {
+        if (keyRef && keyRef->kind == TypeRef::Kind::InlineArray &&
+            keyRef->arrayElement) {
+            const TypeRef* elem = keyRef->arrayElement;
+            while (elem->kind == TypeRef::Kind::InlineArray && elem->arrayElement)
+                elem = elem->arrayElement;
+            std::string elemName =
+                elem->declaration ? "`" + std::string(elem->declaration->name) + "`"
+                                  : std::string("its element type");
+            return "it is an inline array whose element type is not hashable "
+                   "(\xC2\xA7""3.6 clause (c)), and " + elemName + " is not "
+                   "hashable because " + reasonClauseOne(elem);
+        }
+        return reasonClauseOne(keyRef);
     };
 
     // Pass 1: direct (non-generic-param) key check (the original #1338 logic).

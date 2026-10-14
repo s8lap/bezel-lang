@@ -3917,8 +3917,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             ctx_.setExprType(&e, elem);
                         }
                     } else if (isDict && tt->genericArgs.size() > 1 &&
-                             tt->genericArgs[1])
+                             tt->genericArgs[1]) {
+                        // fix #5882 (§15.4, v0.338; #6237): `d[[1, 2]]` over an
+                        // inline-array key is not lowered — reject, don't drop.
+                        if (!ix->indices.empty() && ix->indices[0].value)
+                            reportHashKeyInlineArrayLiteral(
+                                ctx_.diagnostics(), tt,
+                                ix->indices[0].value.get(), {});
                         ctx_.setExprType(&e, tt->genericArgs[1]);
+                    }
                     // §3.3 (#883): ReadOnlyStringSpan[i] → char (the i-th code
                     // point of the viewed range). Non-generic, so its element
                     // type is the fixed `char` primitive (not genericArgs[0]).
@@ -7936,6 +7943,11 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         // diagnostics differ, as §16.6 says they may; the verdict agrees).
         TypeRef* inLt = be.left ? ctx_.exprType(*be.left) : nullptr;
         TypeRef* inRt = be.right ? ctx_.exprType(*be.right) : nullptr;
+        // fix #5882 (§15.4, v0.338; #6237): `[1, 2] in s` over an
+        // inline-array-keyed Set / Dictionary is not lowered — reject it.
+        if (be.left)
+            reportHashKeyInlineArrayLiteral(ctx_.diagnostics(), inRt,
+                                            be.left.get(), {});
         if (inLt && inLt->nullable && inRt &&
             inRt->kind == TypeRef::Kind::Named &&
             inRt->declaration == ctx_.builtinClassSym("Range") &&

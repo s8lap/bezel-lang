@@ -2459,6 +2459,14 @@ bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx) {
     // equality search (stdlib §4) stays admitted: linqHashableGateApplies
     // skips this predicate for it.
     if (ty->kind == TypeRef::Kind::Function) return false;
+    // §3.6 clause (c) (v0.338; the #5494 ruling): "an inline array of any
+    // §15.1 form whose element type is `T` or `T?`, where `T` is itself not
+    // hashable" is not hashable. Recurse on the element (its nullability is
+    // erased exactly as for a top-level `T?` below). fix #5882: an inline-array
+    // key is now generic-backed in codegen, so the admissibility gate must be
+    // the spec's, not "every inline array".
+    if (ty->kind == TypeRef::Kind::InlineArray && ty->arrayElement)
+        return isEqualityBearing(ty->arrayElement, ctx);
     // The underlying type carries the equality contract; a nullable key `K?`
     // is hashable iff `K` is (the null-safe `=` of §8.4 handles null).
     if (ty->kind != TypeRef::Kind::Named || !ty->declaration)

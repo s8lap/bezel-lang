@@ -482,6 +482,26 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
     else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
              ty->declaration->kind == ast::TypeDeclKind::Enum)
         eligible = true;  // enum key/element (lowers to i32; value-compared)
+    else if (!ty->nullable && ty->kind == K::InlineArray && !ty->arrayOwned &&
+             ty->arrayElement &&
+             // #6238: only a plain-value element (no string / reference);
+             // see inlineArrayElementIsPlainValue.
+             inlineArrayElementIsPlainValue(ty) &&
+             !(collTy && (collTy->headName() == "SortedDictionary" ||
+                          collTy->headName() == "SortedSet")))
+        // fix #5882 (§3.6 / §8.3 / §15.1.2, v0.338): a non-owning inline
+        // array `[N]T` / `[N]T?` is hashable ("Element-by-element value
+        // equality (§15.1.2)", "Hash combining element hashes in slot
+        // order"), so it is a legal key/element. Its stored bytes are the
+        // `[N x T]` aggregate; buildValueHashTrampoline folds the slots via
+        // emitValueHashCode and buildValueEqTrampoline compares them via
+        // emitValueEquality. Returning null here sent the key to the STRING
+        // fast path, which GEPs the aggregate as a `%bz.string` (IR verifier
+        // failure for a dictionary; a silently wrong array-backed `Set`).
+        // The sorted containers stay out: their identity is `CompareTo`
+        // (stdlib §4.17 / §4.18) and an inline array has none, so they keep
+        // their existing `where K: IComparable<K>` rejection.
+        eligible = true;
     else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
              ty->declaration->kind == ast::TypeDeclKind::Choice)
         // §35.7 (#2047): a value-like auto-hashable choice key/element
