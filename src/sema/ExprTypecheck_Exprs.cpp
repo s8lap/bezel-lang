@@ -12658,7 +12658,10 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // carrying `return e;` is a procedure lambda — its type is
                 // `(…) -> ()`, not `() -> int`.
                 if (!inferredReturn) {
-                    if (!lam->isAsync) {
+                    // A value-carrying return with an unresolved operand type
+                    // (already diagnosed) keeps the `int` fallback: the body
+                    // is still not a procedure lambda, so no unit cascade.
+                    if (!lam->isAsync && !lamHasValueReturn) {
                         inferredReturn = ctx_.makeTypeRef();
                         inferredReturn->kind = TypeRef::Kind::Unit;
                     } else {

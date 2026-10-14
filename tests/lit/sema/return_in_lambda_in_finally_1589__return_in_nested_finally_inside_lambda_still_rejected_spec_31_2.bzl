@@ -14,3 +14,7 @@ module M; class C public static method Foo(): int var n := 0; try n := n + 1; fi
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `return` inside a `finally` block is a compile error
 // CHECK-SAME: (§31.2)
+// fix #6190: the unresolved `x` operand of the value `return` must not turn the
+// lambda into a unit procedure lambda (§27.3), which cascaded
+// "operator `+` is not defined for a unit (`()`) operand".
+// CHECK-NOT: is not defined for a unit
