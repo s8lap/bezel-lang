@@ -2578,6 +2578,76 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             return invariant &&
                    classifyArg(at, pt) == ArgMatch::NotApplicable;
         }
+        // fix #6322 (§22.6 stage 3, §5.1, §12.9, v0.338): two instantiations of
+        // DIFFERENT types. The arm above only reaches two instantiations of the
+        // SAME declaration (`at->declaration == pt->declaration` and equal head
+        // names), so with two same-arity GENERIC candidates whose substituted
+        // parameter types are two different families — `S<V>(x: Array<V>)` beside
+        // `S<V>(x: Box<Box<Box<V>>>)`, the shape #6312's non-author review
+        // measured — neither was judged and the pick fell to
+        // `arityFallback`'s first-declared candidate.
+        //
+        // MEASURED at 389ca74b: `c.S<Dog>(aa)` with `aa: Array<Animal>` printed
+        // 10, running the `Array<Dog>` body on an `Array<Animal>`. §12.9 makes
+        // `Array` invariant in its element, so `Array<Animal>` is NOT an
+        // `Array<Dog>` (§5.1 admits no such conversion), and `Array<Animal>` is
+        // certainly not a `Box<Box<Box<Dog>>>` either — NO candidate applies,
+        // which §22.6 stage 3 makes an error ("when none of the candidates
+        // applies, the call is an error").
+        //
+        // Certain, and the reason it is safe to widen: a §5.1 named-to-named
+        // conversion is identity, a §12 subtype→supertype step, or (for a
+        // primitive source) boxing. Both sides here are NAMED, so boxing is out,
+        // and identity is excluded by the declarations differing. What remains
+        // is the subtype step, and BOTH directions of it are checked: neither
+        // declaration reaches the other through `baseTypes`. A declared
+        // `out`/`in` VARIANT parameter cannot rescue it either — §12.9's
+        // variance applies between two instantiations of ONE declaration, which
+        // is the arm above, not across two unrelated ones. The
+        // declaration-less side (a built-in `Array`, a synthesized builtin
+        // interface) is compared by simple name through the same
+        // `hasNamedAncestor` walk `checkAssignable` uses for built-ins, so
+        // `Array<Animal>` is not judged unrelated to a parameter spelled
+        // `IEnumerable<Dog>` when the stdlib makes `Array<T>` an
+        // `IEnumerable<T>`.
+        //
+        // Interfaces and delegates with VARIANT parameters are still excluded,
+        // and deliberately so: `classifyArg`/`implicitlyConvertible` do not
+        // model §12.9 variance, so a pair whose declarations DIFFER but which
+        // could still be related by a generic-implementation conformance
+        // (`IBox<Dog>` reaching `IBox<Animal>` through a different head) is
+        // left on the old pick rather than risk a spurious rejection.
+        if (at->kind == TypeRef::Kind::Named &&
+            pt->kind == TypeRef::Kind::Named &&
+            !at->genericArgs.empty() && !pt->genericArgs.empty()) {
+            const bool sameHead =
+                at->declaration && pt->declaration
+                    ? at->declaration == pt->declaration
+                    : at->headName() == pt->headName();
+            if (sameHead) return false;  // the arm above owns same-declaration
+            // Refuse when EITHER side's declaration carries a variant type
+            // parameter: variance is exactly the relation this predicate does
+            // not model, so its presence makes the pair unjudgeable rather than
+            // inapplicable.
+            auto hasVariant = [](const TypeRef* t) {
+                if (!t->declaration) return false;
+                for (Symbol* gp : t->declaration->genericParams) {
+                    auto* g = dynamic_cast<const GenericParamSymbol*>(gp);
+                    if (g && (g->variance == "in" || g->variance == "out"))
+                        return true;
+                }
+                return false;
+            };
+            if (hasVariant(at) || hasVariant(pt)) return false;
+            auto reaches = [&](const TypeRef* from, const TypeRef* to) {
+                if (from->declaration && to->declaration)
+                    return isSubtype(from->declaration, to->declaration);
+                return hasNamedAncestor(const_cast<TypeRef*>(from),
+                                        to->headName());
+            };
+            // Neither direction reachable => no §12 conversion exists.
+            return !reaches(at, pt) && !reaches(pt, at);
+        }
         return false;
     };
     // fix #6312 (§14.5, v0.338): "the list's length selects first: a
