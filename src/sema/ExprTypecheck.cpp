@@ -6774,22 +6774,41 @@ void ExprTC::checkAssignable(
         !to->genericArgs.empty() &&
         !(from->kind == TypeRef::Kind::Named && !from->declaration)) {
         const std::string_view toH = to->headName();
+        // The head sets are read off the SHARED CLASSIFIER, not spelled here:
+        // they ARE the enumerable-wrap grid's axes, and a site that spells
+        // them locally drifts from the one that mints the wrapper frame
+        // (#3419; scripts/check_enumerable_grid_spellings.py). Measured
+        // set-equal to the literals this arm carried, in BOTH directions:
+        //   * `isArrayBackedCollectionName | isDictionaryName |
+        //     isLinkedListName` is exactly the sixteen built-in collection
+        //     CLASS heads — the three codegen dispatch partitions over
+        //     stdlib §4.4–§4.8, §4.14, §4.17–§4.19, which together cover
+        //     every collection the list named. Note it is deliberately NOT
+        //     `isArrayEnumeratorWrapSourceName`: a primitive must not reach
+        //     `Set<T>`/`SortedSet<T>`/`FrozenArray<T>` either, and those are
+        //     excluded from the WRAP for an unrelated reason (§29.2
+        //     snapshot-vs-wrap, see the header).
+        //   * `isIterableInterfaceHead | isBuiltinForInEnumerableHead` plus
+        //     the two owning collection interfaces is exactly the fourteen
+        //     iterator and collection-interface heads (§4.4–§4.5, §4.12–§4.13).
+        // Neither narrower — a narrower arm fails to reject, re-opening the
+        // IR-verifier hole above — nor wider, which would reject a legal
+        // conversion. // per §5.1, §4.6, §12.9, v0.338
+        //
+        // The four SPAN heads are not a grid axis and no predicate owns them
+        // (a span is no wrap source and no iterator-format head). The fifth
+        // span class, `ReadOnlyStringSpan` (stdlib §3.3), is non-generic and
+        // so cannot reach an arm guarded on a non-empty generic-argument list.
         const bool spanHead = toH == "Span" || toH == "ReadOnlySpan" ||
                               toH == "ArraySpan" ||
                               toH == "ReadOnlyArraySpan";
-        const bool collectionHead =
-            toH == "Array" || toH == "OwningArray" || toH == "Dictionary" ||
-            toH == "OwningDictionary" || toH == "SortedDictionary" ||
-            toH == "SortedSet" || toH == "Stack" || toH == "OwningStack" ||
-            toH == "Queue" || toH == "OwningQueue" || toH == "Set" ||
-            toH == "OwningSet" || toH == "LinkedList" ||
-            toH == "OwningLinkedList" || toH == "FrozenArray" ||
-            toH == "OwningBuffer";
+        const bool collectionHead = common::isArrayBackedCollectionName(toH) ||
+                                    common::isDictionaryName(toH) ||
+                                    common::isLinkedListName(toH);
         const bool iterableHead =
-            common::isIterableInterfaceHead(toH) || toH == "IReadOnlyList" ||
-            toH == "IReadOnlyCollection" || toH == "IList" ||
-            toH == "ICollection" || toH == "IOwningList" ||
-            toH == "IOwningCollection";
+            common::isIterableInterfaceHead(toH) ||
+            common::isBuiltinForInEnumerableHead(toH) ||
+            toH == "IOwningList" || toH == "IOwningCollection";
         const bool fromPrim = from->kind == TypeRef::Kind::Primitive &&
                               from->primitive != PrimitiveType::Object;
         const bool fromString =

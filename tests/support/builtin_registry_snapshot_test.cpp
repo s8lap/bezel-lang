@@ -1242,3 +1242,112 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_int_count_property_head_set) {
                                "string", "int", "Task", ""})
         BEZEL_EXPECT_FALSE(isBuiltinIntCountPropertyHead(n));
 }
+
+// --- The two COMPOSITE head sets #6312's `checkAssignable` arm derives, pinned
+// as unions. fix-forward #6312 (§5.1, §4.6, §12.9, v0.338): that arm spelled
+// its sixteen built-in collection heads and fourteen iterator / collection-
+// interface heads as local `toH == "..."` chains, which is what
+// scripts/check_enumerable_grid_spellings.py (#3419) exists to catch. It now
+// reads them off the shared classifier as a UNION of the tables pinned above.
+//
+// The five component snapshots pin the PARTS. They do NOT pin the union: each
+// one's negatives are a handful of near-neighbours, so adding a fresh head to
+// `kArrayBackedCollections` / `kDictionaryNames` / `kLinkedListNames` /
+// `kIterableInterfaceHeads` / `kBuiltinForInEnumerableHeads` would leave all
+// five green while SILENTLY WIDENING the #6312 arm — which rejects the
+// conversion, and so would start rejecting legal programs. The mirror failure
+// (a DROP in any of the five) narrows the arm and re-opens the IR-verifier
+// hole `Take(3)` against `Take(x: Array<int>)` came through. Both directions
+// are pinned here.
+//
+// A name may be an INTERFACE head, a collection head, or neither; no name is
+// both, so the two unions are disjoint and together name every built-in
+// container head #6312 rejects a primitive at. The SPAN heads (`Span`,
+// `ReadOnlySpan`, `ArraySpan`, `ReadOnlyArraySpan`, stdlib §4.14–§4.15) are
+// deliberately absent from BOTH: a span is no wrap source and no
+// iterator-format head, so no predicate owns them, and #6312's arm spells
+// them locally.
+BEZEL_TEST(builtin_registry_snapshot,
+           composite_container_head_unions_cover_6312_builtin_targets) {
+    // The sixteen built-in collection CLASS heads (stdlib §4.4–§4.8, §4.14,
+    // §4.17–§4.19) — the three codegen dispatch partitions, which between them
+    // name every collection.
+    static constexpr std::array<std::string_view, 16> kCollections = {
+        "Array",        "Dictionary",   "Set",           "Stack",
+        "Queue",        "LinkedList",   "SortedDictionary", "SortedSet",
+        "OwningArray",  "OwningDictionary", "OwningSet",  "OwningStack",
+        "OwningQueue",  "OwningLinkedList", "OwningBuffer", "FrozenArray",
+    };
+    for (auto n : kCollections)
+        BEZEL_EXPECT_TRUE(isArrayBackedCollectionName(n) ||
+                          isDictionaryName(n) || isLinkedListName(n));
+    // Not a collection: the interface and span heads, the task family, the
+    // FFI buffers, the node/spin-off types, and the non-collections.
+    for (std::string_view n : {"IEnumerable", "IEnumerator", "IList",
+                               "ICollection", "IReadOnlyList",
+                               "IReadOnlyCollection", "IOwningList",
+                               "IOwningCollection", "Span", "ReadOnlySpan",
+                               "ArraySpan", "ReadOnlyArraySpan",
+                               "ReadOnlyStringSpan", "LinkedListNode",
+                               "Task", "OwningTask", "CString", "WString",
+                               "RawBytes", "IReadOnlySpan", "IGrouping",
+                               // The reserved builtins that are neither a
+                               // collection nor an interface head: the slot map
+                               // (§4.16), the bit reader/writer family (§4.15),
+                               // the string/sync/channel/atomic classes and the
+                               // exception record.
+                               "Counter", "OwningSlotMap", "SlotHandle",
+                               "BitReader", "BitWriter", "ArrayBitReader",
+                               "ArrayBitWriter", "StringBuilder", "Channel",
+                               "ChannelSender", "Stopwatch", "Random",
+                               "Atomic", "AtomicInteger", "Shared", "Weak",
+                               "CancellationToken", "ExceptionInfo", "Buffer",
+                               "string", "int", ""})
+        BEZEL_EXPECT_FALSE(isArrayBackedCollectionName(n) ||
+                           isDictionaryName(n) || isLinkedListName(n));
+
+    // The fourteen iterator and collection-interface heads (stdlib §4.4–§4.5,
+    // §4.12–§4.13) — `isIterableInterfaceHead | isBuiltinForInEnumerableHead`
+    // plus the two owning collection interfaces, which no predicate owns as a
+    // group.
+    static constexpr std::array<std::string_view, 14> kIterables = {
+        "IEnumerable", "IEnumerator", "IAsyncEnumerable", "IAsyncEnumerator",
+        "IOwningEnumerable", "IOwningEnumerator", "IOwningAsyncEnumerable",
+        "IOwningAsyncEnumerator", "IReadOnlyList", "IReadOnlyCollection",
+        "IList", "ICollection", "IOwningList", "IOwningCollection",
+    };
+    for (auto n : kIterables)
+        BEZEL_EXPECT_TRUE(isIterableInterfaceHead(n) ||
+                          isBuiltinForInEnumerableHead(n) ||
+                          n == "IOwningList" || n == "IOwningCollection");
+    // The out-of-vocabulary neighbours: the collection CLASS heads (a disjoint
+    // union — no name is both), the event / serialization / disposable faces,
+    // and the spans.
+    for (std::string_view n : {"Array", "OwningArray", "Dictionary",
+                               "OwningDictionary", "Set", "OwningSet",
+                               "SortedSet", "Stack", "OwningStack", "Queue",
+                               "OwningQueue", "LinkedList", "OwningLinkedList",
+                               "OwningBuffer", "FrozenArray", "Span",
+                               "ReadOnlySpan", "ArraySpan",
+                               "ReadOnlyArraySpan", "IEvent", "IAsyncEvent",
+                               "ISharedEvent", "IGrouping", "ISerializer",
+                               "IDeserializer", "ISerializable",
+                               "IDeserializable", "IDisposable",
+                               "IAsyncDisposable", "IFormattable",
+                               "IEqualityComparer", "IReadOnlySpan",
+                               // The reserved builtins that are neither a
+                               // collection nor an iterator head, and the
+                               // near-miss interface names whose only relation
+                               // to the two unions is a shared prefix.
+                               "Buffer", "StringBuilder", "Channel",
+                               "ChannelSender", "Stopwatch", "Random", "Shared",
+                               "Weak", "CancellationToken",
+                               "CancellationTokenSource", "OwningTask",
+                               "OwningSlotMap", "SlotHandle", "BitReader",
+                               "BitWriter", "ArrayBitReader", "ArrayBitWriter",
+                               "ExceptionInfo", "ICounter", "ITimeSpan",
+                               "IReadOnlySet", "Task", ""})
+        BEZEL_EXPECT_FALSE(isIterableInterfaceHead(n) ||
+                           isBuiltinForInEnumerableHead(n) ||
+                           n == "IOwningList" || n == "IOwningCollection");
+}
