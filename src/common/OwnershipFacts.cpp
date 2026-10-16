@@ -2,6 +2,8 @@
 #include "common/BuiltinRegistry.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,6 +16,7 @@
 #include "sema/SubstArgs.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
+#include "sema/TypeResolution.hpp"
 
 // #1414 Stage 4 Phase A — the shared ownership-facts core (see the header).
 //
@@ -1468,11 +1471,26 @@ bool isBorrowBearingRecordCommon(
 // the recursion on self-/mutually-referential types — it catches the
 // in-progress case the cache cannot, because the cache only stores FINAL
 // verdicts, never the cycle guard's `ValueLike`.  // per §35.1, §35.4, §28.1
+//
+// fix #6166 (§35.11, v0.338): the cache is keyed on the INSTANTIATION BEING
+// CLASSIFIED — the type as written plus the type it denotes under `env`
+// (`choiceClassMemoKey` below) — not on the `TypeRef*`. "Classification is
+// evaluated **per instantiation**", and a pointer is not an instantiation in
+// either direction: a DECLARED payload type (`x: InnerU<T>`) is one TypeRef
+// shared by every instantiation of its choice, with a different verdict under
+// each env, while `substitutedChoicePayloadType` hands out the same
+// instantiation under a fresh TypeRef on every call.
+struct ChoiceClassMemo {
+    // Lookup-only (never iterated), so the unordered map cannot introduce
+    // ordering nondeterminism.
+    std::unordered_map<std::string, ChoiceClassification> byInstantiation;
+};
+
 std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, sema::SemaContext& ctx,
     const RecordSubstEnv* env,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
-    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+    ChoiceClassMemo* memo =
         nullptr);
 
 // §28.1 (v0.226, #2130): the file-local `owned`-marker erasure oracle impl,
@@ -1486,7 +1504,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
-    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+    ChoiceClassMemo* memo =
         nullptr);
 
 // §9.7's borrow-carrying-field kinds, applied to one resolved field type in
@@ -1891,7 +1909,7 @@ bool payloadFieldTypeIsMoveOnly(
     sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
-    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+    ChoiceClassMemo* memo =
         nullptr) {
     if (!ft) return false;
     // §15.3: an owning inline array is a move-only value type. We do NOT
@@ -1944,7 +1962,7 @@ bool payloadFieldTypeIsBorrowCarrying(
     sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
     const RecordSubstEnv* env,
-    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo =
+    ChoiceClassMemo* memo =
         nullptr) {
     if (!ft) return false;
     switch (ft->kind) {
@@ -2007,6 +2025,285 @@ bool payloadFieldTypeIsBorrowCarrying(
     }
 }
 
+// fix #6166 (§35.1, v0.338): true iff choice declaration `start` reaches itself
+// through the choice-typed payloads that it and the choices it names DECLARE
+// (type arguments are not followed). These are the edges the owning leg of
+// `classifyChoiceCore` recurses along without consuming a type argument, so a
+// declaration that answers true can be re-entered at a new instantiation
+// forever (`choice G<T> X(v: G<Inner<T>>)`). Every such declaration violates
+// §35.1 ("A choice payload field may not, directly or transitively through
+// value-typed components ..., have the declaring choice's own type") and is
+// diagnosed by `Resolver::checkChoiceSelfContainment`, whose walk is a
+// superset of this one (it also follows records and inline arrays, which the
+// owning leg does not enter).
+bool choiceDeclarationNamesItselfByValue(
+    const sema::TypeSymbol* start, const sema::TypeSymbol* cur,
+    sema::SemaContext& ctx, std::unordered_set<const sema::TypeSymbol*>& seen) {
+    for (const sema::ChoiceCaseSymbol* ccs : sema::choiceCasesOf(cur)) {
+        if (!ccs || !ccs->caseDecl) continue;
+        for (const auto& pf : ccs->caseDecl->payload) {
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx.resolvedType(*pf.type);
+            if (!ft || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration ||
+                ft->declaration->kind != ast::TypeDeclKind::Choice)
+                continue;
+            if (ft->declaration == start) return true;
+            if (seen.insert(ft->declaration).second &&
+                choiceDeclarationNamesItselfByValue(start, ft->declaration,
+                                                    ctx, seen))
+                return true;
+        }
+    }
+    return false;
+}
+
+// fix #6166 (§35.4 rule 1, §35.11, v0.338): how a SUBSTITUTED choice payload
+// of the owning leg relates to the instantiations being classified on the
+// current path.
+//
+// `substitutedChoicePayloadType` allocates a fresh TypeRef per call, so the
+// pointer-keyed `choiceSeen` guard never recognises a payload instantiation
+// that is already on the path. The lookup is therefore STRUCTURAL
+// (`sema::typeRefEqual`: declaration + type arguments), i.e. keyed on the
+// instantiation §35.11 classifies ("Classification is evaluated per
+// instantiation"), not on the declaration: `InnerU<Own>` reached from
+// `InnerU<InnerU<Own>>` shares the declaration and is a DIFFERENT
+// instantiation, which is classified by recursion (the #3933 false cycle,
+// reopened by a declaration-keyed test, made `InnerU<InnerU<Own>>` copyable).
+//
+//  * Cycle — the edge adds nothing (the reading the pointer guard gives a
+//    re-entry). Two shapes, both §35.1 violations, so neither occurs in a
+//    program that compiles:
+//      - the SAME instantiation is on the path;
+//      - a different instantiation of a declaration that names itself by
+//        value (`choiceDeclarationNamesItselfByValue`): polymorphic recursion
+//        (`G<int>` -> `G<Inner<int>>` -> ...), which produces a new
+//        instantiation at every step, so no instantiation-keyed test stops it.
+//        This is the reading the declaration-site walk gave such a choice
+//        before #6048, kept so the §35.1 diagnostic is still what the user
+//        sees.
+//  * Limit — `kMaxEmbeddedSameDeclarationOnPath` instantiations of the
+//    payload's declaration are on the path, EACH of which embeds in the
+//    payload (`typeRefEmbeds`: it can be obtained from the payload by deleting
+//    type constructors), and the declaration does not name itself. This is the
+//    signature of a GROWING instantiation closure, the one §14.6 rejects at
+//    the declaration (`E<T>` holding `D<E<Inner<T>>>`: `E<int>`,
+//    `E<Inner<int>>`, `E<Inner<Inner<int>>>`, ...), which must still terminate
+//    here because classification is queried before that diagnostic stops the
+//    compilation. It is what makes the walk terminate with no assumption about
+//    the program: a path that never repeats an instantiation visits some
+//    declaration without end, and among infinitely many finite types over the
+//    program's finitely many type constructors some are embedded in later
+//    ones without end (Kruskal's tree theorem), so the count is reached.
+//    The count is an implementation limit, not a spec rule, and reaching it is
+//    REPORTED (`reportChoiceClassificationLimit`) — it is never answered with
+//    a classification the program then silently compiles under.
+//  * Classify — anything else: a genuinely different instantiation, classified
+//    by recursion. In particular no number of DISTINCT declarations on a path
+//    is ever counted: `choice A0 X(v: Opt<A1>), N;` ... `A39` puts forty
+//    instantiations of `Opt` on one path, none embedded in another, and every
+//    one is classified (a count of same-declaration instantiations alone made
+//    that chain owning past thirty-two). A re-entry through type arguments
+//    (`InnerU<InnerU<...<int>>>` at any depth) shrinks the type, so the
+//    on-path instantiations are LARGER than the payload and none embeds in it.
+enum class ChoicePathEdge { Classify, Cycle, Limit };
+
+constexpr std::size_t kMaxEmbeddedSameDeclarationOnPath = 32;
+
+// The components of `t` that are themselves types: type arguments, an inline
+// array's element, a function type's parameters and result.
+void typeRefComponents(const sema::TypeRef* t,
+                       std::vector<const sema::TypeRef*>& out) {
+    for (const sema::TypeRef* arg : t->genericArgs) out.push_back(arg);
+    if (t->arrayElement) out.push_back(t->arrayElement);
+    for (const auto& fp : t->funcParams) out.push_back(fp.type);
+    if (t->funcReturn) out.push_back(t->funcReturn);
+}
+
+// True iff `a` and `b` have the same outermost type constructor.
+bool typeRefSameConstructor(const sema::TypeRef* a, const sema::TypeRef* b) {
+    if (a->kind != b->kind || a->nullable != b->nullable) return false;
+    switch (a->kind) {
+        case sema::TypeRef::Kind::Primitive:
+            return a->primitive == b->primitive;
+        case sema::TypeRef::Kind::Named:
+            return a->declaration == b->declaration &&
+                   (a->declaration || a->headName() == b->headName()) &&
+                   a->genericArgs.size() == b->genericArgs.size();
+        case sema::TypeRef::Kind::Unit:
+            return true;
+        case sema::TypeRef::Kind::InlineArray:
+            return a->arrayOwned == b->arrayOwned &&
+                   a->arraySizeValue == b->arraySizeValue;
+        case sema::TypeRef::Kind::Function:
+            return a->funcParams.size() == b->funcParams.size() &&
+                   a->funcReturnOwned == b->funcReturnOwned;
+        default:
+            return false;  // Error
+    }
+}
+
+// True iff `small` embeds in `big`: `small` is `big` with zero or more type
+// constructors deleted (each replaced by one of its own components). Equal
+// types embed in each other. Memoized per (small, big) pair: unmemoized, a
+// failing comparison of two depth-n nestings retries every alignment of one
+// against the other (a binomial number of them).
+using TypeRefEmbedMemo =
+    std::unordered_map<const sema::TypeRef*,
+                       std::unordered_map<const sema::TypeRef*, bool>>;
+
+bool typeRefEmbedsMemo(const sema::TypeRef* small, const sema::TypeRef* big,
+                       TypeRefEmbedMemo& memo) {
+    if (!small || !big) return false;
+    auto& row = memo[small];
+    if (auto it = row.find(big); it != row.end()) return it->second;
+    std::vector<const sema::TypeRef*> bigParts;
+    typeRefComponents(big, bigParts);
+    bool result = false;
+    if (typeRefSameConstructor(small, big)) {
+        std::vector<const sema::TypeRef*> smallParts;
+        typeRefComponents(small, smallParts);
+        result = smallParts.size() == bigParts.size();
+        for (std::size_t i = 0; result && i < smallParts.size(); ++i)
+            result = typeRefEmbedsMemo(smallParts[i], bigParts[i], memo);
+    }
+    for (std::size_t i = 0; !result && i < bigParts.size(); ++i)
+        result = typeRefEmbedsMemo(small, bigParts[i], memo);
+    // `memo[small]` again: the recursion may have rehashed the outer map.
+    memo[small][big] = result;
+    return result;
+}
+
+bool typeRefEmbeds(const sema::TypeRef* small, const sema::TypeRef* big) {
+    TypeRefEmbedMemo memo;
+    return typeRefEmbedsMemo(small, big, memo);
+}
+
+ChoicePathEdge choicePayloadPathEdge(
+    const sema::TypeRef* payloadTy, sema::SemaContext& ctx,
+    const std::unordered_set<const sema::TypeRef*>& choiceSeen) {
+    if (!payloadTy || payloadTy->kind != sema::TypeRef::Kind::Named ||
+        !payloadTy->declaration ||
+        payloadTy->declaration->kind != ast::TypeDeclKind::Choice)
+        return ChoicePathEdge::Classify;
+    // The set is unordered; every answer below is order-independent (an
+    // existence test and a count).
+    std::size_t sameDeclaration = 0;
+    std::size_t embedded = 0;
+    for (const sema::TypeRef* onPath : choiceSeen) {
+        if (onPath->declaration != payloadTy->declaration) continue;
+        if (onPath == payloadTy || sema::typeRefEqual(onPath, payloadTy))
+            return ChoicePathEdge::Cycle;
+        ++sameDeclaration;
+        if (typeRefEmbeds(onPath, payloadTy)) ++embedded;
+    }
+    if (sameDeclaration == 0) return ChoicePathEdge::Classify;
+    std::unordered_set<const sema::TypeSymbol*> declSeen;
+    if (choiceDeclarationNamesItselfByValue(payloadTy->declaration,
+                                            payloadTy->declaration, ctx,
+                                            declSeen))
+        return ChoicePathEdge::Cycle;
+    return embedded >= kMaxEmbeddedSameDeclarationOnPath
+               ? ChoicePathEdge::Limit
+               : ChoicePathEdge::Classify;
+}
+
+// fix #6166: the `Limit` edge, reported. Once per declaration: classification
+// is queried from many sites and the path reaches the limit from each.
+void reportChoiceClassificationLimit(const sema::TypeRef* payloadTy,
+                                     sema::SemaContext& ctx) {
+    const std::string msg =
+        std::string("choice `") + std::string(payloadTy->declaration->name) +
+        "` is reached through more than " +
+        std::to_string(kMaxEmbeddedSameDeclarationOnPath) +
+        " instantiations of itself, each nested in the next, while "
+        "classifying a choice that holds it: the implementation limit on an "
+        "instantiation chain that keeps growing (§14.6, §35.4)";
+    for (const auto& d : ctx.diagnostics().diagnostics())
+        if (d.message == msg) return;
+    ctx.diagnostics().report(Severity::Error, payloadTy->declaration->declLoc,
+                             msg);
+}
+
+// fix #6166 (§35.11, v0.338): the per-call cache's key — see `ChoiceClassMemo`.
+// `appendChoiceMemoKey` spells a type structurally; with `resolve` it first
+// follows a bare type parameter through `env` (and on through the env its
+// substitution carries), so the spelling is that of the type DENOTED.
+void appendChoiceMemoKey(std::string& out, const sema::TypeRef* t,
+                         const RecordSubstEnv* env, bool resolve) {
+    for (int hop = 0; resolve && t && hop < 64; ++hop) {
+        if (t->kind != sema::TypeRef::Kind::Named || t->declaration) break;
+        const RecordSubstEnv::Entry sub = resolveRecordFieldSubst(t, env);
+        if (!sub.ty || sub.ty == t) break;
+        t = sub.ty;
+        env = sub.env;
+    }
+    if (!t) {
+        out += '~';
+        return;
+    }
+    if (t->nullable) out += '?';
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Primitive:
+            out += 'p';
+            out += std::to_string(static_cast<int>(t->primitive));
+            break;
+        case sema::TypeRef::Kind::Unit:
+            out += 'u';
+            break;
+        case sema::TypeRef::Kind::Named:
+            if (t->declaration) {
+                out += 'd';
+                out += std::to_string(
+                    reinterpret_cast<std::uintptr_t>(t->declaration));
+            } else {
+                out += 'g';  // a type parameter nothing here substitutes
+                out += t->headName();
+            }
+            if (!t->genericArgs.empty()) {
+                out += '<';
+                for (const sema::TypeRef* arg : t->genericArgs) {
+                    appendChoiceMemoKey(out, arg, env, resolve);
+                    out += ',';
+                }
+                out += '>';
+            }
+            break;
+        case sema::TypeRef::Kind::InlineArray:
+            out += t->arrayOwned ? "[o" : "[b";
+            out += std::to_string(t->arraySizeValue);
+            if (t->arraySizeValue < 0) {
+                out += '@';  // unfolded size: only the same node is the same
+                out += std::to_string(
+                    reinterpret_cast<std::uintptr_t>(t->arraySize));
+            }
+            out += ':';
+            appendChoiceMemoKey(out, t->arrayElement, env, resolve);
+            out += ']';
+            break;
+        default:
+            // Function / Error: no leg of the classification looks inside one,
+            // so its identity is all the key needs.
+            out += 'x';
+            out += std::to_string(reinterpret_cast<std::uintptr_t>(t));
+            break;
+    }
+}
+
+// The verdict of `classifyChoiceCore(rt, env)` is a function of two readings
+// of `rt`: AS WRITTEN (the owning leg substitutes payloads from
+// `rt->genericArgs` and does not consult `env`) and AS DENOTED under `env`
+// (the borrow leg resolves bare parameters through it). Both are in the key.
+std::string choiceClassMemoKey(const sema::TypeRef* rt,
+                               const RecordSubstEnv* env) {
+    std::string key;
+    appendChoiceMemoKey(key, rt, nullptr, /*resolve=*/false);
+    key += '|';
+    if (env) appendChoiceMemoKey(key, rt, env, /*resolve=*/true);
+    return key;
+}
+
 // §35.4 (v0.200, #2045; env-threaded v0.226, #2183): the classification core.
 // `choiceSeen` is the shared CHOICE PATH guard (also threaded through the
 // record walk for the §9.7 record↔choice mutual recursion, #2159). `env` is the
@@ -2028,7 +2325,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, sema::SemaContext& ctx,
     const RecordSubstEnv* env,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
-    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo) {
+    ChoiceClassMemo* memo) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return std::nullopt;
     if (rt->declaration->kind != ast::TypeDeclKind::Choice)
@@ -2045,9 +2342,19 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     // cached, so a re-entry from a NEW path that hits the cache gets the
     // RIGHT answer, not the cycle-edge's conservative stand-in. // per
     // §35.1, §35.4, §28.1, v0.298
+    //
+    // fix #6166 (§35.11, v0.338): keyed on the instantiation, not the
+    // `TypeRef*` (`ChoiceClassMemo`). The pointer key answered a DECLARED
+    // payload type (`x: InnerU<T>`, one TypeRef for every instantiation of
+    // its choice) with whichever env's verdict was stored first — `W<int>`
+    // (payload `InnerU<InnerU<T>>`) borrow-bearing off the env-less entry, a
+    // choice holding `Two<int>` and `Two<Res>` value-like off the `T := int`
+    // entry — and never recognised a substituted payload at all.
+    std::string memoKey;
     if (memo) {
-        auto it = memo->find(rt);
-        if (it != memo->end()) return it->second;
+        memoKey = choiceClassMemoKey(rt, env);
+        auto it = memo->byInstantiation.find(memoKey);
+        if (it != memo->byInstantiation.end()) return it->second;
     }
     const sema::TypeSymbol* decl = rt->declaration;
     const std::vector<const sema::ChoiceCaseSymbol*> cases =
@@ -2135,9 +2442,19 @@ std::optional<ChoiceClassification> classifyChoiceCore(
             for (const auto& pf : ccs->caseDecl->payload) {
                 if (!pf.type) continue;
                 if (pf.modifier == "owned") {
+                    const sema::TypeRef* ownedTy =
+                        substitutedChoicePayloadType(pf, decl, rt, ctx);
+                    // fix #6166: same instantiation-keyed path lookup as the
+                    // unmarked payload below.
+                    const ChoicePathEdge ownedEdge =
+                        choicePayloadPathEdge(ownedTy, ctx, choiceSeen);
+                    if (ownedEdge == ChoicePathEdge::Limit) {
+                        reportChoiceClassificationLimit(ownedTy, ctx);
+                        return ChoiceClassification::Owning;
+                    }
+                    if (ownedEdge == ChoicePathEdge::Cycle) continue;
                     if (ownedMarkerActiveOnInstantiatedTypeImpl(
-                            substitutedChoicePayloadType(pf, decl, rt, ctx),
-                            ctx, choiceSeen, memo))
+                            ownedTy, ctx, choiceSeen, memo))
                         return ChoiceClassification::Owning;
                     continue;  // erased → a value / runtime-managed slot.
                 }
@@ -2148,23 +2465,18 @@ std::optional<ChoiceClassification> classifyChoiceCore(
                 // reads conservatively (owning), so `W<int>` came out Owning
                 // though `Inner<int>` is value-like.
                 //
-                // The substitution allocates a FRESH TypeRef per call, so the
-                // `choiceSeen` pointer guard cannot see a value cycle
-                // (`A<T> X(b: B<T>)` / `B<T> Y(a: A<T>)`, rejected by §35.1
-                // but classified first): a payload whose choice DECLARATION is
-                // already on the current path keeps the unsubstituted
-                // declaration-site reading, which terminates on the pointer
-                // guard.
+                // fix #6166: the substituted payload is then looked up on the
+                // path BY INSTANTIATION (`choicePayloadPathEdge` above), never
+                // by declaration.
                 const sema::TypeRef* payloadTy =
                     substitutedChoicePayloadType(pf, decl, rt, ctx);
-                if (payloadTy && payloadTy->kind == sema::TypeRef::Kind::Named &&
-                    payloadTy->declaration) {
-                    for (const sema::TypeRef* onPath : choiceSeen)
-                        if (onPath->declaration == payloadTy->declaration) {
-                            payloadTy = ctx.resolvedType(*pf.type);
-                            break;
-                        }
+                const ChoicePathEdge edge =
+                    choicePayloadPathEdge(payloadTy, ctx, choiceSeen);
+                if (edge == ChoicePathEdge::Limit) {
+                    reportChoiceClassificationLimit(payloadTy, ctx);
+                    return ChoiceClassification::Owning;
                 }
+                if (edge == ChoicePathEdge::Cycle) continue;
                 if (payloadFieldTypeIsMoveOnly(payloadTy, ctx, owningSeen,
                                                choiceSeen, memo))
                     return ChoiceClassification::Owning;
@@ -2193,7 +2505,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
     // THIS call return the cached answer instead of re-walking cases. The
     // cycle guard's `ValueLike` is intentionally NOT cached (handled above,
     // before this cache write). // per §35.1, §35.4, §28.1, v0.298
-    if (memo) (*memo)[rt] = verdict;
+    if (memo) memo->byInstantiation[memoKey] = verdict;
     return verdict;
 }
 
@@ -2214,7 +2526,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& choiceSeen,
-    std::unordered_map<const sema::TypeRef*, ChoiceClassification>* memo) {
+    ChoiceClassMemo* memo) {
     if (!ft) return true;  // unknown → conservative (owning)
     switch (ft->kind) {
         case sema::TypeRef::Kind::InlineArray:
@@ -2370,7 +2682,7 @@ std::optional<ChoiceClassification> classifyChoiceType(
     // type). The memo lives in stack storage; no static/global state.
     // // per §35.1, §35.4, §28.1, v0.298
     std::unordered_set<const sema::TypeRef*> choiceSeen;
-    std::unordered_map<const sema::TypeRef*, ChoiceClassification> memo;
+    ChoiceClassMemo memo;
     return classifyChoiceCore(rt, ctx, env, choiceSeen, &memo);
 }
 
