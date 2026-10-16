@@ -585,3 +585,144 @@ choice E<T> X(v: D<E<Inner<T>>>), N; end E;
         r, "requires `E` instantiated at a growing argument, whose "
            "instantiation closure has no bound (§14.6, #3271)"));
 }
+
+namespace {
+
+// (12) Run-side representatives of the value-like instantiations a generic
+// choice's DECLARED payload now classifies at. On staging r30-c1 (7ff64583)
+// each of these programs is rejected; the change that admits them is #6048
+// (substituting a declared generic payload at the enclosing instantiation),
+// which this file's guard builds on, and they are pinned here because the
+// differential matrix over #6048..#6232 reports them as its rejected→clean
+// column. `WI<T>` declares `v: Inner<T>`, whose `owned v: T` marker is erased
+// at `T = int` (§35.11: "a choice with `Ok(owned value: T)` is value-like at
+// `T = int` (marker erased, payload an admissible value)"), so `WI<int>` is
+// value-like (§35.4 rule 3: "A value-like choice is an ordinary copyable value
+// type"); `WU<T>` declares `v: InnerU<T>`, which carries no borrow at `int`
+// and is value-like too, so it may be a class field (§35.4's holds-borrows
+// field ban does not reach it). `Step` returns the payloads it reads, so the
+// printed total checks that every copy carries the value.
+const char* const kValueLikeDecls = R"(choice WI<T> Ok(v: Inner<T>), No; end WI;
+choice WU<T> Ok(v: InnerU<T>), No; end WU;
+)";
+
+// `extraDecls` + `Peek` / `Echo` over `wTy` + a `Step(k)` whose body is
+// `stepBody` and which returns `n`; prints `<sum of n> drops=<destructor runs>`.
+std::string programSumming(const std::string& extraDecls,
+                           const std::string& wTy,
+                           const std::string& stepBody) {
+    return std::string(kPrelude) + kValueLikeDecls + extraDecls +
+           "class Program\n"
+           "  static method Peek(w: " + wTy + "): int\n"
+           "    var n := 0;\n"
+           "    case w of\n"
+           "      Ok(var i) => do case i of Has(var x) => do n := x; end, "
+           "No => do n := 0; end end case; end,\n"
+           "      No => do n := 0; end\n"
+           "    end case;\n"
+           "    return n;\n"
+           "  end Peek;\n"
+           "  static method Echo(w: " + wTy + "): " + wTy + " return w; end Echo;\n"
+           "  static method Step(k: int): int\n"
+           "    var n := 0;\n" + stepBody + "\n"
+           "    return n;\n"
+           "  end Step;\n"
+           "  public static method Main(): int\n"
+           "    var total := 0;\n"
+           "    for var k in 0..<200 do total := total + Program.Step(k); end;\n"
+           "    Console.WriteLine(total.ToString() + \" drops=\" + "
+           "Stats.Drops.ToString());\n"
+           "    return 0;\n"
+           "  end Main;\n"
+           "end Program;\n";
+}
+
+}  // namespace
+
+// (12) Copied twice: 3 x (0 + 1 + ... + 199) = 59700.
+BEZEL_TEST(generic_choice_instantiation_guard_6166,
+           declared_owned_marked_payload_at_int_copied_twice_runs_spec_35_11) {
+    JitResult r = runAotChecked(programSumming("", "WI<int>",
+        R"(    var a := WI<int>.Ok(Inner<int>.Has(k));
+    var b := a; var c := a;
+    n := Program.Peek(a) + Program.Peek(b) + Program.Peek(c);)"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("59700 drops=0\n"));
+}
+
+// (12) Reassigned from a binding already copied out of.
+BEZEL_TEST(generic_choice_instantiation_guard_6166,
+           declared_owned_marked_payload_at_int_reassigned_runs_spec_35_11) {
+    JitResult r = runAotChecked(programSumming("", "WI<int>",
+        R"(    var a := WI<int>.Ok(Inner<int>.Has(k));
+    var b := a; b := a; var c := b; b := c;
+    n := Program.Peek(b) + Program.Peek(c) + Program.Peek(a);)"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("59700 drops=0\n"));
+}
+
+// (12) Passed by value and returned, then read again at the caller.
+BEZEL_TEST(generic_choice_instantiation_guard_6166,
+           declared_owned_marked_payload_at_int_passed_and_returned_runs_spec_35_11) {
+    JitResult r = runAotChecked(programSumming("", "WI<int>",
+        R"(    var a := WI<int>.Ok(Inner<int>.Has(k));
+    var b := Program.Echo(a);
+    n := Program.Peek(a) + Program.Peek(b);)"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("39800 drops=0\n"));
+}
+
+// (12) A record field (§9.7 admits a value-like choice field), the record
+// copied.
+BEZEL_TEST(generic_choice_instantiation_guard_6166,
+           declared_owned_marked_payload_at_int_record_field_runs_spec_35_11) {
+    JitResult r = runAotChecked(programSumming(
+        "record Holder(V: WI<int>, M: int);\n", "WI<int>",
+        R"(    var a := WI<int>.Ok(Inner<int>.Has(k));
+    var h := new Holder(a, 1); var h2 := h;
+    n := Program.Peek(h.V) + Program.Peek(h2.V) + Program.Peek(a);)"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("59700 drops=0\n"));
+}
+
+// (12) Stored in two class instances' fields.
+BEZEL_TEST(generic_choice_instantiation_guard_6166,
+           declared_owned_marked_payload_at_int_class_field_stored_twice_runs_spec_35_11) {
+    JitResult r = runAotChecked(programSumming(
+        "class Bx public V: WI<int>; public constructor(v: WI<int>) V := v; "
+        "end constructor; end Bx;\n",
+        "WI<int>",
+        R"(    var a := WI<int>.Ok(Inner<int>.Has(k));
+    var x1 := new Bx(a); var x2 := new Bx(a);
+    n := Program.Peek(x1.V) + Program.Peek(x2.V);)"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("39800 drops=0\n"));
+}
+
+// (12) The unmarked payload `v: InnerU<T>` at `int` in two class fields.
+// Rejected on 7ff64583 as "a borrow-bearing choice may not be stored in an
+// instance field of a class".
+BEZEL_TEST(generic_choice_instantiation_guard_6166,
+           declared_unmarked_payload_at_int_class_field_stored_twice_runs_spec_35_11) {
+    JitResult r = runAotChecked(programSumming(
+        "class Bx public V: WU<int>; public constructor(v: WU<int>) V := v; "
+        "end constructor; end Bx;\n",
+        "WU<int>",
+        R"(    var a := WU<int>.Ok(InnerU<int>.Has(k));
+    var x1 := new Bx(a); var x2 := new Bx(a);
+    n := Program.Peek(x1.V) + Program.Peek(x2.V);)"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("39800 drops=0\n"));
+}
