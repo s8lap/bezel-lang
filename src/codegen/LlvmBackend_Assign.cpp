@@ -15790,9 +15790,42 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             v->getType()->isPointerTy() &&
             !llvm::isa<llvm::ConstantPointerNull>(v)) {
             const sema::TypeRef* at = ctx_.exprType(*av);
-            bool isClassInstance = at &&
-                at->kind == sema::TypeRef::Kind::Named && at->declaration &&
-                at->declaration->kind == ast::TypeDeclKind::Class;
+            // fix #6311 / §28.3 *Unbound owned temporaries* + *A callee that
+            // stores a plain argument* (v0.338): the class test must also admit
+            // the §31.4 BUILT-IN EXCEPTION classes, which carry NO user
+            // TypeSymbol (`TypeRef::declaration == nullptr`) yet are ordinary
+            // owned heap class instances — `setupBuiltinExceptions` mints each
+            // one a real vtable whose slot 2 is `bz$exDisposeMsg`, exactly what
+            // `dynamicDispose` dispatches through below, and
+            // `isBuiltinExceptionTypeRef` is the named recognizer the
+            // owned-field / using-var auto-dispose paths already use for this
+            // same population. Reading the kind off `->declaration` alone
+            // answered "not a class" for every `new IOException("a")` /
+            // `new Exception("a")` argument, so NO disposal was registered and
+            // the temporary leaked: MEASURED on 389ca74b,
+            // `q.Nop(new IOException("a"))` at a plain `Exception` parameter
+            // leaked 40 B per call — `SUMMARY: AddressSanitizer: 36000
+            // byte(s) leaked in 900 allocation(s)` over 300 iterations x 3
+            // arguments. §28.3 states the obligation for a built-in exception
+            // exactly as for any other class in the same position ("A
+            // non-`owned` argument position is a borrowing use whatever the
+            // callee's body does with the parameter, and the temporary's
+            // disposal at its boundary does not depend on that body"), so the
+            // twin is admitted, not a new rule.
+            //
+            // SCOPE — deliberately narrow, and it is the same predicate the
+            // sibling auto-dispose sites gate on, so no other head is swept in:
+            // `isBuiltinExceptionTypeRef` requires a declaration-less Named
+            // TypeRef whose astNode NAME resolves in `builtinVtable_`, i.e.
+            // exactly the §31.4 hierarchy. A vtable-less built-in (a
+            // collection, a Task, a `FileStream` — `isVtableLessBuiltinClass-
+            // Name`) is NOT in `builtinVtable_` and stays excluded, which is
+            // what keeps the word-0-as-vtable read away from a plain C struct.
+            bool isClassInstance =
+                at && at->kind == sema::TypeRef::Kind::Named &&
+                ((at->declaration &&
+                  at->declaration->kind == ast::TypeDeclKind::Class) ||
+                 isBuiltinExceptionTypeRef(at));
             if (isClassInstance) {
                 llvm::AllocaInst* tslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, tslot);
