@@ -14,6 +14,8 @@
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 #include "sema/SubstArgs.hpp"       // sema::substituteGenericArgs — generic class IComparable check
+#include "sema/GenericParams.hpp"   // sema::hasVariantGenericParam — §12.9 variance read from BOTH
+                                   // sources (#3143; an AST-only read answers invariant for an import)
 
 // fix #4724 / #4801 (§4.4, §5.2, §6.4, v0.307): the compile-time float and
 // decimal folds reuse the runtime's decimal entry points — the SAME ops codegen
@@ -3457,71 +3459,53 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // `checkAssignable` has no declaration to compare against for a
     // declaration-less `Array<T>` and lets it through.
     //
-    // THE FIX is not a new applicability predicate — it is to hand this call
-    // the check `checkCallArity` already runs, with the SUBSTITUTED signature.
-    // `checkArgsAgainstParams` is that function, and #6312 already calls it
-    // with an `explicitSubst` map for the one shape where the sole survivor
-    // was left unjudged (an EXPLICIT type-argument list, `soleSurvivor`'s
-    // `explicitListSoleSurvivor_`); §14.5 phase-1 inference produces a map
-    // of exactly the same type, so the inferred case is the same call with
-    // the other substitution. That reuse is deliberate: a hand-rolled
-    // predicate here has to re-derive §5.1, and the one available
-    // (`definitelyInapplicable`, #6312/#6322) is NOT sound on this path —
-    // MEASURED, it reports `Array<int>` → `IEnumerable<int>` as certainly
-    // inapplicable (its cross-declaration arm asks `hasNamedAncestor`, which
-    // does not resolve the stdlib borrowing hierarchy for a declaration-less
-    // `Array<T>`), and a fix built on it rejected a valid
-    // `S<V>(x: IEnumerable<V>)` called with an `Array<int>`.
+    // THE FIX is §22.6 stage 3 applied to the one shape that reaches it with
+    // nothing decided. A sole candidate is checked here only when §14.5
+    // inference bound NOTHING and the parameter and the argument are then
+    // DECIDABLY unrelated — the check is not a new applicability predicate, it
+    // is §22.6's own "when none of the candidates applies, the call is an
+    // error" for the case where "none applies" is certain.
+    //
+    // It is deliberately NOT keyed on "inference bound nothing". That map is
+    // empty for shapes that ARE applicable: `unifyArgSubst` binds only on a
+    // structural head match and never through a §12 subtype step, so it also
+    // leaves the map empty for `string` and for a user
+    // `class Str: IEnumerable<char>` against `S<V>(x: IEnumerable<V>)`. Both
+    // are valid and both compile today, and
+    // `explicit_type_arg_list_overload_6312.
+    // string_to_ienumerable_char_runs_spec_4_6` PINS the first. A fix keyed
+    // on the empty map breaks it; a fix keyed on `definitelyInapplicable` (#6312/#6322)
+    // breaks it differently, MEASURED — that reports the VALID
+    // `Array<int>` → `IEnumerable<int>` as certainly inapplicable, because its
+    // cross-declaration arm asks `hasNamedAncestor`, which does not resolve the
+    // stdlib borrowing hierarchy for a declaration-less `Array<T>`. Both
+    // broader readings were built, measured, and rejected; see `unrelatedUserHead`
+    // below for the subset that needs no ruling.
     //
     // Gated on:
-    //   * no EXPLICIT type-argument list — `checkCallArity` substitutes
-    //     `explicitSubst` before its own `checkAssignable`, and #6312's block
-    //     in the `Undecidable` arm owns that shape with its own §14.5
-    //     diagnostic; checking it here too would double-report and replace a
-    //     §14.5 message with a §5.1 one;
-    //   * an AST `MethodDecl` on the candidate — `checkArgsAgainstParams`
-    //     takes the declared parameter list, and an IMPORTED generic candidate
-    //     carries none (the same SEAM-DEBT `phase1Subst` itself records: phase-1
-    //     substitution is same-module only, so `phase1Subst` is empty across
-    //     the boundary and this block does not run);
-    //   * a NON-EMPTY `phase1Subst` — with nothing inferred there is no
-    //     substitution to supply, the candidate is not generic, and
-    //     `checkCallArity`'s existing single-overload arm already checks it
-    //     against its concrete formal;
-    //   * and no discard argument, which the bail below owns.
-    // Every row a §14.5 inference failure leaves behind is skipped for the
-    // same reason: `phase1Subst` empty there is not evidence of a match.
-    if (getenv("BEZEL_DBG_6334"))
-        fprintf(stderr, "[6334] SKIP\n");
-    // The two §14.5 outcomes a sole candidate can reach, both of which the
+    //   * no EXPLICIT type-argument list — #6312's block in the `Undecidable`
+    //     arm owns that shape with its own §14.5 diagnostic, and checking it
+    //     here too would double-report and replace a §14.5 message with a §5.1
+    //     one;
+    //   * and no discard argument (`out _`), which the bail below owns.
+    //
+    // It reads NO AST. An earlier revision of this block gated on
+    // `dynamic_cast<const ast::MethodDecl*>(cands[0]->decl)` to reach
+    // `checkArgsAgainstParams`, which takes the declared parameter list — and
+    // that cast is null for EVERY imported method, so the check was silently
+    // absent across a module boundary (umbrella #3152 class-3 seam; caught by
+    // `scripts/check_imported_symbol_reads.py`). The bound branch it guarded
+    // is gone, and what remains needs only `cands[0]->genericParams` (a
+    // `MethodSymbol` field, populated on both sides) and the already-computed
+    // substituted rows, so an imported lone generic callee is checked too.
+    //
+    // The two §22.6 outcomes a sole candidate can reach, both of which the
     // short-circuit below used to pass through unjudged.
     if (cands.size() == 1 && !(callTypeArgs && !callTypeArgs->empty())) {
-        const auto* loneMd =
-            dynamic_cast<const ast::MethodDecl*>(cands[0]->decl);
         bool hasDiscard = false;
         for (const auto& a : ce.args)
             if (a.isDiscard) hasDiscard = true;
-        if (loneMd && !hasDiscard) {
-            if (!phase1Subst[0].empty()) {
-                // Inference BOUND the signature. §22.6: "surviving candidates
-                // enter the ranking below with their substituted signatures."
-                // There is no ranking for a sole candidate, so hand the call
-                // the check `checkCallArity` gives a non-generic one — with
-                // the substitution, which is what makes it the substituted
-                // signature rather than the bare `V`. This is the same call
-                // #6312 makes for an EXPLICIT list (`explicitListSoleSurvivor_`,
-                // its map likewise of this type), so one §5.1 checker decides
-                // both. It is a CHECK, not a new verdict rule: a call this
-                // admits is one `checkAssignable` admits, which is why
-                // `Array<int>` still reaches `IEnumerable<V>` (stdlib §4.1)
-                // and `Box<int>` still reaches `Box<V>`.
-                checkArgsAgainstParams(
-                    loneMd->params, ce.args, ce.span.begin,
-                    std::string("call to `") + std::string(initial->name) +
-                        "`",
-                    recvTarget, cands[0]->parent, loneMd,
-                    /*extBinding=*/nullptr, &phase1Subst[0]);
-            } else {
+        if (!hasDiscard) {
                 // Inference BOUND NOTHING, so every row still names the
                 // candidate's own method type parameters. §14.5: "a candidate
                 // whose inference fails is inapplicable and drops out" — with
@@ -3580,13 +3564,14 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                     // A declared `in`/`out` type parameter makes the pair
                     // §12.9 VARIANT, which `isSubtype` over declarations does
                     // not model; leave those alone rather than guess.
-                    bool variant = false;
-                    for (Symbol* gp : pt->declaration->genericParams) {
-                        auto* g = dynamic_cast<const GenericParamSymbol*>(gp);
-                        if (g && (g->variance == "in" || g->variance == "out"))
-                            variant = true;
-                    }
-                    if (variant) continue;
+                    // `sema::hasVariantGenericParam`, NOT a hand-rolled walk
+                    // of `declaration->genericParams`: that reads the AST, so
+                    // for an IMPORTED `Box<out V>` it answers "" (invariant)
+                    // and this check would reject a call §12.9 admits.
+                    // GenericParams.hpp is the ONE accessor for this fact
+                    // (umbrella #3152, family #3143).
+                    if (sema::hasVariantGenericParam(pt->declaration))
+                        continue;
                     if (!reaches(at, pt) && !reaches(pt, at))
                         unrelatedUserHead = true;
                 }
@@ -3599,7 +3584,6 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                             "argument binds this argument to the candidate's "
                             "parameter, and the two are unrelated (§5.1, "
                             "§14.5, §22.6)");
-            }
         }
     }
     if (cands.size() == 1) return soleSurvivor(cands[0]);
