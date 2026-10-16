@@ -18566,7 +18566,19 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // virtual generic method whose override is `=> $"..."` (an expression body)
     // produces a callable standalone function for dispatch-by-descriptor.
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
-        llvm::Value* rv = lowerExpr(*ci.exprBody);
+        llvm::Value* rv = nullptr;
+        // fix #6325 (§15.4 *Collection literals*, v0.338): the generic-
+        // specialisation arrow-body face's twin of emitMethodBody's new arm.
+        // §15.4 admits `return [1, 2, 3]` when the enclosing method's return
+        // type determines the target type, and `lowerExpr` returns null for a
+        // `CollectionLiteralExpr`, so a specialised `=> [a, b, c]` degraded to
+        // a zero/null return. One shared implementation, so this face and
+        // emitMethodBody's cannot drift.
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                ci.exprBody))
+            rv = lowerReturnCollectionLiteral(
+                cl, ci.returnType ? ctx_.resolvedType(*ci.returnType) : nullptr);
+        if (!rv) rv = lowerExpr(*ci.exprBody);
         // Mirror emitMethodBody's `=> expr` handling: a diverging expr (e.g.
         // `=> throw E`) already terminated the block; otherwise box a value-typed
         // result returned through an Object/interface return type (§8.6).

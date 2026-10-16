@@ -11507,7 +11507,24 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
 
     bool terminated = false;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
-        llvm::Value* v = lowerExpr(*ci.exprBody);
+        llvm::Value* v = nullptr;
+        // fix #6325 (§15.4 *Collection literals*, v0.338): an arrow body whose
+        // whole expression is a collection literal lowers against the
+        // DECLARED return type. §15.4 admits "`return [1, 2, 3]` … when the
+        // enclosing method's return type determines the target type", and an
+        // arrow body IS that method's return — but `lowerExpr` returns null
+        // for a `CollectionLiteralExpr` (it is not a general expression), so
+        // `v` stayed null, `emitReturn`'s `v ? v : null` substituted a
+        // zero/null return, and #2491's note printed while the caller read
+        // Count 0 off the null. The statement face has carried this arm since
+        // #465/#781; `lowerReturnCollectionLiteral` is that arm, now shared.
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                ci.exprBody))
+            v = lowerReturnCollectionLiteral(
+                cl, currentReturnTypeNode_
+                        ? ctx_.resolvedType(*currentReturnTypeNode_)
+                        : nullptr);
+        if (!v) v = lowerExpr(*ci.exprBody);
         // CG40 / §17.12: an expression body whose whole expression diverges
         // (`=> throw E`, or any expr that branches to the unwind/propagate
         // target) has already terminated the current block — lowerExpr returns
@@ -44819,6 +44836,66 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
 // materializeHeapCollectionLiteral (which itself dispatches Set and LinkedList).
 // Returns a `ptr` to the constructed heap collection, or null when `collTy` is
 // not a recognised heap-collection target (caller declines without miscompiling).
+llvm::Value* Emitter::lowerReturnCollectionLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* targetTy) {
+    if (!cl || !targetTy) return nullptr;
+    // §15.3 (#781): a literal whose declared return type is an INLINE array
+    // (`[N owned]T?` / `[N]T`) builds the `[N x elem]` aggregate and returns it
+    // BY VALUE. The heap materializers below only make a `ptr` (the wrong type
+    // for an inline return), so this arm must precede them.
+    if (targetTy->kind == sema::TypeRef::Kind::InlineArray && !cl->isDict) {
+        auto* aty = llvm::dyn_cast<llvm::ArrayType>(lowerTypeRef(targetTy));
+        if (!aty) return nullptr;
+        llvm::Type* elemTy = aty->getElementType();
+        llvm::AllocaInst* tmp = entryAlloca(aty);
+        for (std::size_t i = 0; i < cl->elements.size(); ++i) {
+            if (!cl->elements[i]) continue;
+            llvm::Value* ev = lowerExpr(*cl->elements[i]);
+            if (!ev) {
+                // fix #3712 (§3.2 / §15.1 / §17.11, v0.286): a UNIT-typed
+                // element is not a lowering failure — see
+                // lowerCollectionLiteralElementOrUnitNull (#3528's local-decl
+                // guard, hoisted).
+                ev = lowerCollectionLiteralElementOrUnitNull(*cl->elements[i],
+                                                             elemTy);
+                if (!ev) {
+                    // #1386: ICE — lowerExpr returned null for an inline-array
+                    // return element.
+                    ctx_.diagnostics().report(
+                        Severity::Error, cl->elements[i]->span.begin,
+                        "internal: lowerExpr returned null for inline-array "
+                        "return element — #1386");
+                    continue;
+                }
+            }
+            if (ev->getType() != elemTy && ev->getType()->isIntegerTy() &&
+                elemTy->isIntegerTy()) {
+                unsigned eb = ev->getType()->getIntegerBitWidth();
+                unsigned db = elemTy->getIntegerBitWidth();
+                ev = db > eb ? builder_.CreateSExt(ev, elemTy)
+                             : builder_.CreateTrunc(ev, elemTy);
+            }
+            // fix #4317 (§15.1 / §8.6, v0.298): box a value-typed (record)
+            // element into its box representation before the store — the
+            // derivation is at the IndexExpr arm in lowerStmt.
+            ev = boxForTarget(ev, targetTy->arrayElement,
+                              cl->elements[i].get());
+            llvm::Value* gep = builder_.CreateGEP(
+                aty, tmp,
+                {builder_.getInt32(0), builder_.getInt32((int)i)});
+            builder_.CreateStore(ev, gep);
+        }
+        return builder_.CreateLoad(aty, tmp, "ret.inlarr");
+    }
+    // §15.4 heap-collection targets. `isDict || isDictTypeName` is the routing
+    // #534 established for the argument path, so an EMPTY `[]` against a dict
+    // target reaches the dict materializer rather than the sequence one.
+    if (cl->isDict || isDictTypeName(targetTy))
+        return cl->keys.empty() ? nullptr : materializeHeapDictLiteral(cl,
+                                                                       targetTy);
+    return materializeHeapCollectionLiteral(cl, targetTy);
+}
+
 llvm::Value* Emitter::materializeCollectionLiteralForArg(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
     if (!cl || !collTy) return nullptr;

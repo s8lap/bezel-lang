@@ -20543,6 +20543,29 @@ private:
     // (a `class MyC: IReadOnlyList<T>` does NOT go through this path).
     const sema::TypeRef* listInterfaceTypeOfLocal(const ast::LocalDecl* ld);
 
+    // fix #6325 (§15.4 *Collection literals*, v0.338): lower the collection
+    // literal `cl` against the RETURN-target type `targetTy`, the way the
+    // `return [e1, …]` statement path does. §15.4: "`return [1, 2, 3]` is
+    // admitted when the enclosing method's return type determines the target
+    // type", and `lowerExpr` returns null for a `CollectionLiteralExpr` (it
+    // is not a general expression — every position that can demand a value
+    // from one must name a target type and call a materializer). Returns
+    // null when `targetTy` is null or names no collection shape, so the
+    // caller keeps its own decline path.
+    //
+    // This is the ONE implementation of the return-position literal build:
+    // the `return [e1, …];` STATEMENT face (LlvmBackend_Stmts.cpp) and both
+    // arrow-body faces (`=> [e1, …]`, LlvmBackend_Setup.cpp's emitMethodBody
+    // and LlvmBackend_Calls2.cpp's generic-specialisation face) call it, so
+    // the three cannot drift — #2924's four-way-mirror finding about the
+    // #2491 diagnostic is the same failure mode this shape prevents. Before
+    // it existed, only the statement face had the arms: an arrow body
+    // produced no value, `emitReturn`'s `v ? v : null` fallback substituted
+    // a zero/null return, and #2491 printed the "failed to lower to a value"
+    // note while the caller read Count 0 off the null.
+    llvm::Value* lowerReturnCollectionLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* targetTy);
+
     // #465 / §15.4 / stdlib §4.4–§4.5: materialize a sequence collection literal
     // `[e1, e2, …]` into a freshly-allocated heap collection (Array<T> /
     // OwningArray<T> / Stack / Queue and their owning variants), reusing the exact

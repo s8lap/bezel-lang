@@ -2957,81 +2957,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 else if (const ast::Type* rn = returnReprTypeNode())
                     retTargetTy = ctx_.resolvedType(*rn);
                 if (const sema::TypeRef* rrt = retTargetTy) {
-                    // §15.3 (#781): a `return [e1, …]` whose declared return
-                    // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
-                    // the `[N x elem]` aggregate and returns it BY VALUE.
-                    // lowerExpr returns null for a CollectionLiteralExpr, and
-                    // materializeHeapCollectionLiteral only makes a heap
-                    // bz_array_t* (a `ptr`, the wrong type for an inline
-                    // return) — so without this the method returned an
-                    // undef/zero array and the caller's `var a := Make()`
-                    // materialized as all-null. Mirrors the inline-array
-                    // local-decl build (lowerLocalDecl).
-                    if (rrt->kind == sema::TypeRef::Kind::InlineArray &&
-                        !cl->isDict) {
-                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
-                                lowerTypeRef(rrt))) {
-                            llvm::Type* elemTy = aty->getElementType();
-                            llvm::AllocaInst* tmp = entryAlloca(aty);
-                            for (std::size_t i = 0; i < cl->elements.size();
-                                 ++i) {
-                                if (!cl->elements[i]) continue;
-                                llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                                if (!ev) {
-                                    // fix #3712 (§3.2 / §15.1 / §17.11,
-                                    // v0.286): a UNIT-typed element is not a
-                                    // lowering failure — see
-                                    // lowerCollectionLiteralElementOrUnitNull
-                                    // (hoisted from fix #3528's local-decl
-                                    // guard; LlvmBackend_Setup.cpp).
-                                    ev = lowerCollectionLiteralElementOrUnitNull(
-                                        *cl->elements[i], elemTy);
-                                    if (!ev) {
-                                        // #1386: ICE — lowerExpr returned
-                                        // null for an inline-array return
-                                        // element.
-                                        ctx_.diagnostics().report(
-                                            Severity::Error,
-                                            cl->elements[i]->span.begin,
-                                            "internal: lowerExpr returned "
-                                            "null for inline-array return "
-                                            "element — #1386");
-                                        continue;
-                                    }
-                                }
-                                if (ev->getType() != elemTy &&
-                                    ev->getType()->isIntegerTy() &&
-                                    elemTy->isIntegerTy()) {
-                                    unsigned eb =
-                                        ev->getType()->getIntegerBitWidth();
-                                    unsigned db =
-                                        elemTy->getIntegerBitWidth();
-                                    ev = db > eb
-                                             ? builder_.CreateSExt(ev, elemTy)
-                                             : builder_.CreateTrunc(ev,
-                                                                    elemTy);
-                                }
-                                // fix #4317 (§15.1 / §8.6, v0.298): box a
-                                // value-typed (record) element into its box
-                                // representation before the store — see the
-                                // detailed derivation at the sibling
-                                // IndexExpr-arm fix earlier in this function.
-                                // No-op for a class element (already a bare
-                                // pointer) or a non-Object/interface element.
-                                ev = boxForTarget(ev, rrt->arrayElement,
-                                                  cl->elements[i].get());
-                                llvm::Value* gep = builder_.CreateGEP(
-                                    aty, tmp,
-                                    {builder_.getInt32(0),
-                                     builder_.getInt32((int)i)});
-                                builder_.CreateStore(ev, gep);
-                            }
-                            v = builder_.CreateLoad(aty, tmp, "ret.inlarr");
-                        }
-                    } else if (!cl->isDict)
-                        v = materializeHeapCollectionLiteral(cl, rrt);
-                    else if (!cl->keys.empty())
-                        v = materializeHeapDictLiteral(cl, rrt);
+                    // fix #6325 (§15.4, v0.338): the inline-array (§15.3 /
+                    // #781), heap-collection and dictionary arms moved into
+                    // `lowerReturnCollectionLiteral` so the two arrow-body
+                    // faces share this one implementation — the four-way
+                    // mirror #2924 recorded about the #2491 diagnostic is the
+                    // same shape, and the arrow faces had NO arms at all.
+                    // The §15.3 rationale (an inline return needs the `[N x
+                    // elem]` aggregate BY VALUE; the heap materializers make a
+                    // `ptr`, the wrong type) and the #3712 / #4317 / #1386
+                    // element handling are unchanged, verbatim, beside it.
+                    v = lowerReturnCollectionLiteral(cl, rrt);
                 }
             }
             if (!v) v = lowerExpr(*rs->value);
