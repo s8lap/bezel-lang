@@ -993,3 +993,73 @@ class Program public static method Main(): int return 0; end Main; end Program;
     BEZEL_EXPECT_TRUE(hasHashObligationDiagAt(r, "declaring `Equals(W)`", 6, 3));
     BEZEL_EXPECT_FALSE(r.ran);
 }
+
+// §8.3 (v0.338, #6048): `W<T>` carries a plain payload `v: Inner<T>` and
+// `Inner<T>` is `Has(owned v: T)`. The nested payload is classified at the
+// enclosing instantiation (§35.4, §35.11): `Inner<int>` is value-like (marker
+// erased), so `W<int>` is value-like and its owning-ness is only at a class
+// instantiation. §8.3 requires "owning at every instantiation" for the
+// exemption, so the plain own-typed `Equals` keeps its obligation and is
+// rejected at its declaration (line 5, column 3). Base accepted (the nested
+// `Inner<T>` was read conservatively, owning at every instantiation).
+BEZEL_TEST(value_kind_own_typed_equals_5955,
+           nested_generic_choice_payload_owning_only_at_some_instantiations_keeps_obligation_spec_8_3) {
+    auto r = runAot(R"(
+module M;
+choice Inner<T> Has(owned v: T), No; end Inner;
+choice W<T> Ok(v: Inner<T>), No;
+  public method Equals(o: W<T>): bool => true;
+end W;
+class Program public static method Main(): int return 0; end Main; end Program;
+)");
+    BEZEL_EXPECT_TRUE(hasHashObligationDiagAt(r, "declaring `Equals(W)`", 5, 3));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §35.4, §35.11 (v0.338, #6048): `W<int>` over a nested generic choice payload
+// is value-like, so it copies freely: a second and third read of the local are
+// accepted (no "already moved out", §28.3). Base rejected this at 8:12.
+BEZEL_TEST(value_kind_own_typed_equals_5955,
+           nested_generic_choice_payload_at_int_is_value_like_copyable_spec_35_11) {
+    auto r = runAot(R"(
+module M;
+choice Inner<T> Has(owned v: T), No; end Inner;
+choice W<T> Ok(v: Inner<T>), No;
+end W;
+class Program public static method Main(): int
+  var a := W<int>.Ok(Inner<int>.Has(7));
+  var b := a;
+  var c := a;
+  Console.WriteLine("copied");
+  return 0;
+end Main; end Program;
+)");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("copied\n"));
+}
+
+// §35.4, §35.11 (v0.338, #6048) control: at a class instantiation the nested
+// `Inner<R>` is owning (the marker is active on a class), so `W<R>` stays
+// owning and a second read of the local is still rejected (§28.3).
+BEZEL_TEST(value_kind_own_typed_equals_5955,
+           nested_generic_choice_payload_at_class_stays_owning_spec_35_11) {
+    auto r = runAot(R"(
+module M;
+class R public V: int := 0; destructor end destructor; end R;
+choice Inner<T> Has(owned v: T), No; end Inner;
+choice W<T> Ok(v: Inner<T>), No;
+end W;
+class Program public static method Main(): int
+  var a := W<R>.No;
+  var b := a;
+  var c := a;
+  return 0;
+end Main; end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("already moved out") != std::string::npos)
+            found = true;
+    BEZEL_EXPECT_TRUE(found);
+}

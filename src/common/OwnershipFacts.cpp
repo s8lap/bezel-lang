@@ -2141,8 +2141,32 @@ std::optional<ChoiceClassification> classifyChoiceCore(
                         return ChoiceClassification::Owning;
                     continue;  // erased → a value / runtime-managed slot.
                 }
-                if (payloadFieldTypeIsMoveOnly(ctx.resolvedType(*pf.type), ctx,
-                                               owningSeen, choiceSeen, memo))
+                // fix #6048 (§35.4, §35.11, v0.338): an unmarked payload that is
+                // itself a generic choice (`v: Inner<T>`) is classified AT THIS
+                // instantiation. The unsubstituted `Inner<T>` carries the bare
+                // parameter as its argument, which the §28.1 erasure oracle
+                // reads conservatively (owning), so `W<int>` came out Owning
+                // though `Inner<int>` is value-like.
+                //
+                // The substitution allocates a FRESH TypeRef per call, so the
+                // `choiceSeen` pointer guard cannot see a value cycle
+                // (`A<T> X(b: B<T>)` / `B<T> Y(a: A<T>)`, rejected by §35.1
+                // but classified first): a payload whose choice DECLARATION is
+                // already on the current path keeps the unsubstituted
+                // declaration-site reading, which terminates on the pointer
+                // guard.
+                const sema::TypeRef* payloadTy =
+                    substitutedChoicePayloadType(pf, decl, rt, ctx);
+                if (payloadTy && payloadTy->kind == sema::TypeRef::Kind::Named &&
+                    payloadTy->declaration) {
+                    for (const sema::TypeRef* onPath : choiceSeen)
+                        if (onPath->declaration == payloadTy->declaration) {
+                            payloadTy = ctx.resolvedType(*pf.type);
+                            break;
+                        }
+                }
+                if (payloadFieldTypeIsMoveOnly(payloadTy, ctx, owningSeen,
+                                               choiceSeen, memo))
                     return ChoiceClassification::Owning;
             }
         }
