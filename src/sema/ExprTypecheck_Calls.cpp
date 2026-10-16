@@ -3222,6 +3222,132 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             if (argIdxRows[c][i] != argIdxRows[0][i]) return arityFallback();
     }
 
+    // fix #6292 (§22.6 "Generic candidates", v0.338): two GENERIC candidates
+    // whose SUBSTITUTED signatures coincide are subject to the ordinary
+    // ambiguity rule — "Two generic candidates remain subject to the ordinary
+    // ambiguity rule." The #6001 block above already drops a candidate spelled
+    // with the TYPE's own parameter when a concrete declaration coincides with
+    // it, but it keys on `spelledWithTypeParam`, which is set only by the
+    // receiver substitution — a METHOD type parameter bound by §14.5 inference
+    // or by an explicit list never sets it. So `S<V>(x: Array<V>)` and
+    // `S<V>(x: Array<Array<V>>)` called as `U.S(b)` with `b: Array<Array<int>>`
+    // both substitute to `(Array<Array<int>>)`, both are graded Exact at the
+    // one position, and neither is better than the other. §22.6's ranking has
+    // no tie-break left (neither is non-generic, neither fills a default), so
+    // the call must be ambiguous.
+    //
+    // MEASURED on 389ca74b (staging tip): `U.S(b)` printed `10` — the
+    // first-declared candidate — and with the two declarations REVERSED it
+    // printed `20`. The verdict was decided by declaration order, which §22.6
+    // never permits. Both orders now report the same ambiguity.
+    //
+    // Scope, deliberately narrow — the check fires only on evidence that is
+    // CERTAIN, so it can only convert a silent first-declared pick into the
+    // ambiguity the spec requires (a REJECT-ward change, never a new accept):
+    //   * at least two candidates, all of them GENERIC (a non-generic
+    //     candidate present means §22.6's non-generic preference, the LAST
+    //     tie-break, decides — that is the #6312 `sv` shape and it must keep
+    //     its selection);
+    //   * neither candidate fills a default (§22.6 stage 5 would otherwise
+    //     separate them, and its remedy is the "supply the omitted optional
+    //     argument" note);
+    //   * pairwise-identical bound-parameter shapes (same length, same
+    //     `argIdxRows`) — a differing shape is the arity-fallback case the
+    //     loop above already deferred;
+    //   * every candidate FULLY substituted: no ranked row may still mention
+    //     one of its own method type parameters (§14.5 "a candidate whose
+    //     inference fails is inapplicable and drops out" — an unsubstituted
+    //     row is not a coinciding signature, it is a failed candidate);
+    //   * and the coincidence is by `typeRefEqual`, i.e. the two substituted
+    //     signatures are the SAME type, not merely ranked equally.
+    {
+        bool allGeneric = !cands.empty();
+        for (std::size_t c = 0; c < cands.size(); ++c)
+            if (cands[c]->genericParams.empty()) allGeneric = false;
+        if (allGeneric) {
+            bool uniform = true;
+            bool anyDefault = false;
+            for (std::size_t c = 0; c < cands.size() && uniform; ++c) {
+                if (paramTypes[c].size() != paramTypes[0].size() ||
+                    argIdxRows[c] != argIdxRows[0])
+                    uniform = false;
+                if (fillsDefault[c]) anyDefault = true;
+            }
+            // Every ranked row must be fully substituted: a row still naming
+            // its own method type parameter is a §14.5 inference failure, which
+            // drops that candidate from the ranking rather than tying it.
+            bool fullySubstituted = uniform && !anyDefault;
+            for (std::size_t c = 0; c < cands.size() && fullySubstituted; ++c) {
+                std::unordered_set<std::string_view> gp;
+                for (Symbol* g : cands[c]->genericParams)
+                    if (g) gp.insert(g->name);
+                if (gp.empty()) continue;
+                for (const TypeRef* pt : paramTypes[c])
+                    if (containsMethodTypeParam(pt, gp))
+                        fullySubstituted = false;
+            }
+            if (fullySubstituted && cands.size() > 1) {
+                // `typeRefEqual` decides a `Named` pair by DECLARATION-POINTER
+                // identity (TypeResolution_Checks.cpp's `typeRefEqualImpl`), so
+                // two declaration-less Named refs are EQUAL whatever they are
+                // spelled. §2.3/§31.4 make the built-in class family
+                // (`Exception` and its descendants) always-available with no
+                // user TypeSymbol, so `Exception` and `ArgumentException`
+                // compare equal here — and `Log<T>(x: T, e: Exception)` beside
+                // `Log<T>(x: T, e: ArgumentException)` would be reported as a
+                // coinciding pair, wrongly rejecting a call §22.6 resolves to
+                // the `ArgumentException` overload (MEASURED: this fired on
+                // sema_overload_builtin_class_distinct_5862.
+                // generic_method_overloads_spec_22_6_11_3). `Resolver::
+                // typeRefEqualSameScope` exists for exactly this case, but it
+                // is scoped to a CLASS type parameter's scope, which does not
+                // apply here; the declaration-less head spelling is the
+                // identity, so require it to agree. `typeRefEqual` alone is
+                // retained for every ref that HAS a declaration, so nothing
+                // else about the comparison changes.
+                auto sameSubstitutedType = [](const TypeRef* x,
+                                              const TypeRef* y) {
+                    if (!typeRefEqual(x, y)) return false;
+                    if (x->kind != TypeRef::Kind::Named || y->kind !=
+                            TypeRef::Kind::Named)
+                        return true;
+                    if (x->declaration || y->declaration) return true;
+                    return x->headName() == y->headName();
+                };
+                // Do all candidates coincide with candidate 0? A single
+                // coinciding PAIR is not enough: a third candidate that does
+                // NOT coincide is a possible unique winner, and reporting
+                // ambiguity would reject a call §22.6 resolves.
+                bool allCoincide = true;
+                for (std::size_t d = 1; d < cands.size() && allCoincide; ++d) {
+                    for (std::size_t i = 0; i < paramTypes[d].size(); ++i) {
+                        if (!paramTypes[0][i] || !paramTypes[d][i] ||
+                            !sameSubstitutedType(paramTypes[0][i],
+                                                 paramTypes[d][i])) {
+                            allCoincide = false;
+                            break;
+                        }
+                    }
+                }
+                if (allCoincide) {
+                    std::string msg =
+                        "ambiguous call to `" + std::string(initial->name) +
+                        "`: the candidates' substituted signatures are "
+                        "identical (§22.6) and neither is unambiguously better; "
+                        "candidates:";
+                    for (std::size_t c = 0; c < cands.size(); ++c) {
+                        msg += "\n  ";
+                        msg += (c < candNames.size() ? candNames[c]
+                                                     : std::string("(overload)"));
+                    }
+                    ctx_.diagnostics().report(Severity::Error, ce.span.begin,
+                                              msg);
+                    return arityFallback();
+                }
+            }
+        }
+    }
+
     // §26.5 step 1 (v0.183): for a dot-call (`x.Foo(...)`) whose callee
     // resolved to an instance member by name, note whether a same-named
     // extension also matches the receiver — it was never considered (step 1
