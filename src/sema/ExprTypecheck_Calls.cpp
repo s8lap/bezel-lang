@@ -2904,12 +2904,19 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             explicitListSoleSurvivor_[&ce] = m;
         return m;
     };
-    if (cands.size() == 1) return soleSurvivor(cands[0]);
-
-    // A discard argument (`out _`) is outside the value-conversion ranking of
-    // §22.6's worked examples; fall back to arity/first-bind.
-    for (const auto& a : ce.args)
-        if (a.isDiscard) return arityFallback();
+    // fix #6334 (§22.6 stage 3, v0.338): the lone-candidate short-circuit
+    // (`cands.size() == 1`) and the discard-argument bail used to sit HERE,
+    // above the §14.5 phase-1 substitution and the substituted parameter rows.
+    // A sole candidate therefore returned before anything had substituted its
+    // signature, so nothing downstream ever saw the type its parameter
+    // actually has for this call. Both are moved down, as a PAIR and in the
+    // same order, to just after the rows are built: the short-circuit must
+    // still precede the discard bail, because a lone candidate carrying a
+    // discard argument resolved through `soleSurvivor` and must keep doing so.
+    // Nothing between here and the new site mutates `cands` except the #6001
+    // coincidence drop, which makes the #6334 check MORE accurate (it reads
+    // the survivor that drop leaves); the shape-uniformity loop and the #6292
+    // coincidence check above are both no-ops at `cands.size() == 1`.
 
     // fix #5101 (§14.5 phase 1 / §22.6, v0.307): compute each GENERIC
     // candidate's phase-1 argument-driven-unification substitution BEFORE
@@ -2948,6 +2955,9 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // it is a separate concern.
     std::vector<std::unordered_map<std::string_view, TypeRef*>> phase1Subst(
         cands.size());
+    // fix #6334: did phase-1 unification fail by DISAGREEMENT (§14.1
+    // "Agreement", reported by `typeCall`) rather than by matching nothing?
+    std::vector<bool> phase1Conflicted(cands.size(), false);
     // fix #6228 (§22.6 "Generic candidates" / §14.5, v0.338): a call that
     // writes its method type arguments (`c.S<int>(b)`) has no inference to
     // run: each generic candidate with the same count of type parameters
@@ -3045,6 +3055,12 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                           phase1Subst[c], &conflicts);
         }
         if (!conflicts.empty()) phase1Subst[c].clear();
+        // fix #6334: record WHICH kind of empty this is. An empty map from a
+        // §14.1 "Agreement" conflict is already reported by `typeCall`'s
+        // #896 diagnostic, so the #6334 check must not add a second message
+        // for it; an empty map because unification simply matched nothing is
+        // the inference FAILURE §22.6 stage 3 then rejects.
+        phase1Conflicted[c] = !conflicts.empty();
     }
 
     // §22.6 ranks the bound argument positions. For each candidate, build
@@ -3417,6 +3433,181 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             }
         }
     }
+
+    // fix #6334 (§22.6 stage 3, §5.1, §14.5, v0.338): a LONE candidate is
+    // never re-checked. With one candidate there is no ranking to run, so the
+    // short-circuit returned it as soon as the §22.5 arity bind succeeded —
+    // and an ARITY match is not applicability. §22.6 stage 3 says "when none
+    // of the candidates applies, the call is an error", and for the commonest
+    // argument type in Bezel that stage never got consulted: `checkCallArity`'s
+    // per-argument `checkAssignable` compares each argument against the
+    // candidate's UNSUBSTITUTED formal (a bare `V`), and a §5.1 check against
+    // an unbound type parameter defers.
+    //
+    // MEASURED on this tree before the fix: `U.S(a)` with `a: Array<int>`
+    // against a lone `S<V>(x: Box<V>)` compiled and RAN, reading `x.V` — the
+    // `Box<V>` field slot — off an `Array<int>`. Compiled with
+    // `--sanitize=address` the dispatch through that slot faults:
+    // "AddressSanitizer: SEGV on unknown address 0x000000000000 ... The
+    // signal is caused by a READ memory access ... pc points to the zero
+    // page". The identical hole is on the `c.S(a)` instance spelling (a lone
+    // instance `S<V>(x: Box<V>)` on `c: C` likewise printed its body), and it
+    // is not specific to a generic parameter: a lone NON-generic
+    // `S(x: Box<int>)` against the same `Array<int>` accepted too — §5.1's own
+    // `checkAssignable` has no declaration to compare against for a
+    // declaration-less `Array<T>` and lets it through.
+    //
+    // THE FIX is not a new applicability predicate — it is to hand this call
+    // the check `checkCallArity` already runs, with the SUBSTITUTED signature.
+    // `checkArgsAgainstParams` is that function, and #6312 already calls it
+    // with an `explicitSubst` map for the one shape where the sole survivor
+    // was left unjudged (an EXPLICIT type-argument list, `soleSurvivor`'s
+    // `explicitListSoleSurvivor_`); §14.5 phase-1 inference produces a map
+    // of exactly the same type, so the inferred case is the same call with
+    // the other substitution. That reuse is deliberate: a hand-rolled
+    // predicate here has to re-derive §5.1, and the one available
+    // (`definitelyInapplicable`, #6312/#6322) is NOT sound on this path —
+    // MEASURED, it reports `Array<int>` → `IEnumerable<int>` as certainly
+    // inapplicable (its cross-declaration arm asks `hasNamedAncestor`, which
+    // does not resolve the stdlib borrowing hierarchy for a declaration-less
+    // `Array<T>`), and a fix built on it rejected a valid
+    // `S<V>(x: IEnumerable<V>)` called with an `Array<int>`.
+    //
+    // Gated on:
+    //   * no EXPLICIT type-argument list — `checkCallArity` substitutes
+    //     `explicitSubst` before its own `checkAssignable`, and #6312's block
+    //     in the `Undecidable` arm owns that shape with its own §14.5
+    //     diagnostic; checking it here too would double-report and replace a
+    //     §14.5 message with a §5.1 one;
+    //   * an AST `MethodDecl` on the candidate — `checkArgsAgainstParams`
+    //     takes the declared parameter list, and an IMPORTED generic candidate
+    //     carries none (the same SEAM-DEBT `phase1Subst` itself records: phase-1
+    //     substitution is same-module only, so `phase1Subst` is empty across
+    //     the boundary and this block does not run);
+    //   * a NON-EMPTY `phase1Subst` — with nothing inferred there is no
+    //     substitution to supply, the candidate is not generic, and
+    //     `checkCallArity`'s existing single-overload arm already checks it
+    //     against its concrete formal;
+    //   * and no discard argument, which the bail below owns.
+    // Every row a §14.5 inference failure leaves behind is skipped for the
+    // same reason: `phase1Subst` empty there is not evidence of a match.
+    if (getenv("BEZEL_DBG_6334"))
+        fprintf(stderr, "[6334] SKIP\n");
+    // The two §14.5 outcomes a sole candidate can reach, both of which the
+    // short-circuit below used to pass through unjudged.
+    if (cands.size() == 1 && !(callTypeArgs && !callTypeArgs->empty())) {
+        const auto* loneMd =
+            dynamic_cast<const ast::MethodDecl*>(cands[0]->decl);
+        bool hasDiscard = false;
+        for (const auto& a : ce.args)
+            if (a.isDiscard) hasDiscard = true;
+        if (loneMd && !hasDiscard) {
+            if (!phase1Subst[0].empty()) {
+                // Inference BOUND the signature. §22.6: "surviving candidates
+                // enter the ranking below with their substituted signatures."
+                // There is no ranking for a sole candidate, so hand the call
+                // the check `checkCallArity` gives a non-generic one — with
+                // the substitution, which is what makes it the substituted
+                // signature rather than the bare `V`. This is the same call
+                // #6312 makes for an EXPLICIT list (`explicitListSoleSurvivor_`,
+                // its map likewise of this type), so one §5.1 checker decides
+                // both. It is a CHECK, not a new verdict rule: a call this
+                // admits is one `checkAssignable` admits, which is why
+                // `Array<int>` still reaches `IEnumerable<V>` (stdlib §4.1)
+                // and `Box<int>` still reaches `Box<V>`.
+                checkArgsAgainstParams(
+                    loneMd->params, ce.args, ce.span.begin,
+                    std::string("call to `") + std::string(initial->name) +
+                        "`",
+                    recvTarget, cands[0]->parent, loneMd,
+                    /*extBinding=*/nullptr, &phase1Subst[0]);
+            } else {
+                // Inference BOUND NOTHING, so every row still names the
+                // candidate's own method type parameters. §14.5: "a candidate
+                // whose inference fails is inapplicable and drops out" — with
+                // one candidate, none survives, so §22.6 stage 3 makes the
+                // call an error. That is the rule; what it must NOT do is
+                // fire wherever the map happens to be empty, because an empty
+                // map is NOT by itself evidence of a failed match.
+                //
+                // MEASURED: `S<V>(x: IEnumerable<V>)` leaves the map empty
+                // for BOTH `Array<int>`... no — for `string` and for a user
+                // `class Str: IEnumerable<char>`, because `unifyArgSubst`
+                // binds only on a structural head match and never through a
+                // §12 subtype step. Both calls are valid and both compile
+                // today, and
+                // `explicit_type_arg_list_overload_6312.
+                // string_to_ienumerable_char_runs_spec_4_6` PINS the first.
+                // Rejecting on "the map is empty" therefore breaks a
+                // deliberately-accepted shape; this is filed as a
+                // `spec-question` (does §14.5 inference see through §12
+                // subtyping?), and the check below is confined to the subset
+                // that needs no such ruling.
+                //
+                // That subset: the parameter's HEAD is a user-declared class
+                // or record (§3.1 kind), and the argument reaches it in
+                // neither direction. §5.1's named-to-named conversions are
+                // identity, a §12 subtype→supertype step, or (from a
+                // primitive) boxing — boxing is out with both sides named.
+                // A stdlib built-in collection type cannot be a declared base
+                // of, nor declare a base of, a user's own class, so for a
+                // USER-declared parameter head the subtype step is decidable
+                // by declaration identity alone and neither direction can
+                // hold. That is what makes this certain where the
+                // `IEnumerable<V>` case is not.
+                auto userClassHead = [](const TypeRef* pt) {
+                    if (!pt || pt->kind != TypeRef::Kind::Named ||
+                        !pt->declaration)
+                        return false;
+                    return pt->declaration->kind == ast::TypeDeclKind::Class ||
+                           pt->declaration->kind ==
+                               ast::TypeDeclKind::Record;
+                };
+                auto reaches = [&](const TypeRef* from, const TypeRef* to) {
+                    if (from->declaration && to->declaration)
+                        return isSubtype(from->declaration, to->declaration);
+                    return hasNamedAncestor(const_cast<TypeRef*>(from),
+                                            to->headName());
+                };
+                bool unrelatedUserHead = false;
+                for (std::size_t i = 0;
+                     i < paramTypes[0].size() && !unrelatedUserHead; ++i) {
+                    const TypeRef* at = argTypeRows[0][i];
+                    const TypeRef* pt = paramTypes[0][i];
+                    if (!at || !pt) continue;
+                    if (!userClassHead(pt) || at->nullable || pt->nullable)
+                        continue;
+                    // A declared `in`/`out` type parameter makes the pair
+                    // §12.9 VARIANT, which `isSubtype` over declarations does
+                    // not model; leave those alone rather than guess.
+                    bool variant = false;
+                    for (Symbol* gp : pt->declaration->genericParams) {
+                        auto* g = dynamic_cast<const GenericParamSymbol*>(gp);
+                        if (g && (g->variance == "in" || g->variance == "out"))
+                            variant = true;
+                    }
+                    if (variant) continue;
+                    if (!reaches(at, pt) && !reaches(pt, at))
+                        unrelatedUserHead = true;
+                }
+                if (unrelatedUserHead && !cands[0]->genericParams.empty() &&
+                    !phase1Conflicted[0])
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "no overload of `" + std::string(initial->name) +
+                            "` is applicable to these arguments; no type "
+                            "argument binds this argument to the candidate's "
+                            "parameter, and the two are unrelated (§5.1, "
+                            "§14.5, §22.6)");
+            }
+        }
+    }
+    if (cands.size() == 1) return soleSurvivor(cands[0]);
+
+    // A discard argument (`out _`) is outside the value-conversion ranking of
+    // §22.6's worked examples; fall back to arity/first-bind.
+    for (const auto& a : ce.args)
+        if (a.isDiscard) return arityFallback();
 
     // §26.5 step 1 (v0.183): for a dot-call (`x.Foo(...)`) whose callee
     // resolved to an instance member by name, note whether a same-named
