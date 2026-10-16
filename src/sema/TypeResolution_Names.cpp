@@ -4853,7 +4853,27 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     }
                 }
                 TypeRef* underlying = nullptr;
+                // fix #6324 (§27.8, v0.338): a nullable alias body (`type Nl<T>
+                // := T?`) is NOT the "body is EXACTLY a bare generic param"
+                // shape this fast path was written for. The `?` is carried on
+                // `ast::Type::nullable`, not inside `name->parts`, so a `T?`
+                // body satisfies every condition below and the fast path used
+                // to hand the concrete argument back verbatim — dropping the
+                // `?` on the floor, because the substitution that preserves it
+                // (SubstArgs.cpp's `applyBareParamSubst`, `T? -> int?`) is
+                // exactly what returning early skips. The result was a
+                // REJECT-to-ACCEPT-grade divergence from the §27.8 synonym
+                // rule: `Nl<int>` resolved as bare `int`, so `var m: Nl<int>
+                // := null;` was rejected "the initializer for `m` is nullable
+                // but the target type is non-nullable (§7)" while the
+                // control `var m: int? := null;` compiles. Fall through to the
+                // general resolve + substituteAliasGenericArgs path for a
+                // nullable body, which re-reads the `?` off the alias body and
+                // applies it to the concrete type — §27.8: "Each instantiation
+                // of the alias is interchangeable with the corresponding
+                // instantiation of the aliased type", so `Nl<int>` IS `int?`.
                 if (aliasDecl->aliasedType &&
+                    !aliasDecl->aliasedType->nullable &&
                     aliasDecl->aliasedType->kind == ast::TypeKind::Named &&
                     aliasDecl->aliasedType->name &&
                     aliasDecl->aliasedType->name->parts.size() == 1 &&
