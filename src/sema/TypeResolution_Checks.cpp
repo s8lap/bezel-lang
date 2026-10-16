@@ -3215,6 +3215,33 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
     }
 }
 
+// #6316 / §27.8 (v0.338): an alias is a pure synonym, but an alias expansion
+// (`type Id<T> := T`) keeps the alias declaration's head, not the use-site
+// class parameter's, so spelling is no evidence inside one. True when the
+// type tree names an alias expansion (marker `aliasResolvedHead`, walked
+// through args, arrays, function types).
+static bool typeTreeHasAliasExpansion(const TypeRef* t) {
+    if (!t) return false;
+    if (!t->aliasResolvedHead.empty()) return true;
+    for (const TypeRef* g : t->genericArgs)
+        if (typeTreeHasAliasExpansion(g)) return true;
+    if (typeTreeHasAliasExpansion(t->arrayElement)) return true;
+    for (const auto& fp : t->funcParams)
+        if (typeTreeHasAliasExpansion(fp.type)) return true;
+    return typeTreeHasAliasExpansion(t->funcReturn);
+}
+
+// #6316: the spelling compare only where neither tree can hide an alias
+// expansion and neither side comes from an imported declaration (the marker
+// is lost on import); otherwise the blind compare, as before #6316.
+static bool typeRefEqualScopedUnlessAlias(const TypeRef* a, const TypeRef* b,
+                                          bool anyImported) {
+    if (anyImported || typeTreeHasAliasExpansion(a) ||
+        typeTreeHasAliasExpansion(b))
+        return Resolver::typeRefEqual(a, b);
+    return Resolver::typeRefEqualSameScope(a, b);
+}
+
 bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
     return typeRefEqualImpl(a, b, /*sameScope=*/false);
 }
@@ -7340,7 +7367,15 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         TypeRef* dTy =
             dDecl->type ? ctx_.resolvedType(*dDecl->type) : nullptr;
         TypeRef* bTySubst = applyGenericSubst(bTy, genericSubst);
-        if (!typeRefEqual(dTy, bTySubst)) {
+        // #6316 / §12.1, §11.2 (v0.338): `dTy` is in the derived class's
+        // scope and `bTySubst` was read into it through the chain-composed
+        // `genericSubst`, so a class type parameter compares by spelling
+        // (`[i: P]: P` does not implement `B2<P, Q>`'s `[i: K]: W`).
+        // An alias in either tree, or an imported base, stays blind (the
+        // alias-spelled shapes keep their pre-#6316 accept-everything gap).
+        if (!typeRefEqualScopedUnlessAlias(
+                dTy, bTySubst,
+                !bDecl || typeTreeHasAliasExpansion(bTy))) {
             err("property type");
         }
 
