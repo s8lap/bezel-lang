@@ -9589,6 +9589,33 @@ private:
         const SlotSubst* msSubst = nullptr;
         for (const SlotChainLevel& lv : levels)
             if (lv.type == ms->parent) { msSubst = &lv.subst; break; }
+        // fix #6301 (§12.1 / §11.2, v0.338): an INTERFACE method is read
+        // through the level that names the interface (`B<T> : I<T>`): the
+        // interface's own frame (its parameters -> the arguments written in
+        // that level's scope), then that level's chain frames.
+        SlotSubst ifaceSubst;
+        // Only for a NON-generic `cls`: a generic implementer's per-
+        // instantiation descriptors are not enumerated by the interface
+        // dispatch (#1843), so it keeps the unsubstituted comparison (see
+        // the issue filed with #6301).
+        if (!msSubst && ms->parent && cls->genericParams.empty() &&
+            ms->parent->kind == ast::TypeDeclKind::Interface) {
+            const std::vector<std::string_view> names =
+                sema::genericParamNames(ms->parent);
+            for (const SlotChainLevel& lv : levels) {
+                const sema::TypeRef* ref = baseTypeRefOf(lv.type, ms->parent);
+                if (!ref || ref->genericArgs.size() != names.size()) continue;
+                SlotSubst::Frame f;
+                f.names = names;
+                for (const sema::TypeRef* a : ref->genericArgs)
+                    f.args.push_back(a);
+                ifaceSubst.frames.push_back(std::move(f));
+                for (const SlotSubst::Frame& fr : lv.subst.frames)
+                    ifaceSubst.frames.push_back(fr);
+                msSubst = &ifaceSubst;
+                break;
+            }
+        }
         sema::MethodSymbol* nameOnly = nullptr;
         for (const sema::TypeSymbol* t = cls; t;) {
             const SlotSubst* candSubst = nullptr;
