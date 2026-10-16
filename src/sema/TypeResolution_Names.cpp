@@ -4853,6 +4853,9 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     }
                 }
                 TypeRef* underlying = nullptr;
+// Two guards on this fast path, both exclusions of the same
+                // shape (a body that is NOT "EXACTLY a bare generic param").
+                //
                 // fix #6324 (§27.8, v0.338): a nullable alias body (`type Nl<T>
                 // := T?`) is NOT the "body is EXACTLY a bare generic param"
                 // shape this fast path was written for. The `?` is carried on
@@ -4872,10 +4875,28 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // applies it to the concrete type — §27.8: "Each instantiation
                 // of the alias is interchangeable with the corresponding
                 // instantiation of the aliased type", so `Nl<int>` IS `int?`.
+                //
+                // fix #6340 (§2.2, §2.7 rule 2, §27.8, v0.338): a body reached
+                // by a QUALIFIED spelling names its target regardless of a
+                // same-named parameter. `type W<Exception> := System.Exception;`
+                // declares a parameter named `Exception` that the body does
+                // NOT mention -- §2.2 states the always-available built-in "is
+                // reached by ... its module's qualified name (`System.Exception`)"
+                // and §2.7 rule 2 reaches a dotted name by matching its prefix
+                // against a module, which a bare type parameter cannot be. So
+                // `W<int>` is `System.Exception`, not `int`. #4698 stamps
+                // `aliasQualifiedBuiltin` when it strips such a qualifier, and
+                // the bare-parameter lookup below is by NAME alone -- it cannot
+                // tell this from `type Id<T> := T`. Excluding the stamped shape
+                // sends the body down the general resolveNamed path, which
+                // resolves the qualifier correctly. This is #4698's own
+                // exclusion, the one `paramHead` (SubstArgs.cpp) already
+                // applies on the substitution path.
                 if (aliasDecl->aliasedType &&
                     !aliasDecl->aliasedType->nullable &&
                     aliasDecl->aliasedType->kind == ast::TypeKind::Named &&
                     aliasDecl->aliasedType->name &&
+                    !aliasDecl->aliasedType->aliasQualifiedBuiltin &&
                     aliasDecl->aliasedType->name->parts.size() == 1 &&
                     aliasDecl->aliasedType->genericArgs.empty()) {
                     auto it = aliasSubst.find(
