@@ -3516,17 +3516,34 @@ static std::string_view builtinExceptionName(const TypeRef* t) {
 //    `typeRefEqualSameScope` already applies to `Array<V>` with `Array<W>`
 //    (#6315), so both paths agree.
 //
-//  * §27.8 (v0.338) makes a type alias transparent for identity. An aliased
-//    TypeRef has had its UNDERLYING payload copied in (with the use-site
-//    astNode restored), so its structure is already the aliased type's and
-//    only its name-bearing fields are the use-site alias name — comparing
-//    `headName()` there would compare `Id<V>`'s alias spelling `Id` against a
-//    bare `V` and wrongly separate two spellings of one type. A ref that
-//    arrived through an alias keeps the blind declaration compare.
+//  * §27.8 (v0.338) makes a type alias transparent for identity, and its
+//    closing sentence is SYMMETRIC: "Type aliases — generic or not — see
+//    through to the aliased type for identity, equality, method dispatch,
+//    and overload resolution." An aliased TypeRef has had its UNDERLYING
+//    payload copied in (with the use-site astNode restored), and the
+//    underlying head is carried on the ref itself in `aliasResolvedHead`.
+//    `headName()` reads `aliasResolvedHead` FIRST, so the head compare
+//    below already sees through an alias on BOTH sides: `Id<V>` (whose
+//    `aliasResolvedHead` is `V`) compares as `V`, which is what makes it
+//    one type with a bare `V` and the two spellings still clash.
+//
+//    This is fix #6344. The guard that used to sit here read
+//    `!a->aliasResolvedHead.empty()` and, when it fired, SKIPPED the head
+//    compare entirely -- consulting the alias-resolved head on ONE side
+//    only. That made the verdict depend on argument order: `Take(x: Id<V>)`
+//    beside `Take(x: W)` was reported indistinguishable while the mirror
+//    `Take(x: W)` beside `Take(x: Id<V>)` was accepted, though §27.8's
+//    see-through is symmetric and the two spellings name one type either
+//    way round. The comment above it justified the skip by claiming
+//    `headName()` "would compare `Id<V>`'s alias spelling `Id`", which is
+//    false -- `headName()` returns `aliasResolvedHead`, never the alias
+//    spelling. Dropping the guard therefore changes a verdict ONLY where
+//    `aliasResolvedHead` is non-empty, i.e. exactly where `headName()`
+//    was already returning the underlying head.
 //
 // A ref with NO readable head (neither astNode, importedName nor an alias
-// head) also keeps the blind compare: an unknown head is not evidence of a
-// difference.
+// head) still keeps the blind compare, through the `ha.empty() || hb.empty()`
+// arm below: an unknown head is not evidence of a difference.
 static bool overloadSigTypeRefEqual(const TypeRef* a, const TypeRef* b,
                                     const std::vector<Symbol*>& aTPs,
                                     const std::vector<Symbol*>& bTPs) {
@@ -3542,9 +3559,7 @@ static bool overloadSigTypeRefEqual(const TypeRef* a, const TypeRef* b,
             return a->primitive == b->primitive;
         case TypeRef::Kind::Named: {
             if (a->declaration != b->declaration) return false;
-            if (!a->declaration && !a->aliasResolvedHead.empty()) {
-                // §27.8: arrived through an alias — see the note above.
-            } else if (!a->declaration) {
+            if (!a->declaration) {
                 // §11.3 positional correspondence for a bare type parameter
                 // of the DECLARING METHOD's own list.
                 auto indexOf = [](const TypeRef* t,
