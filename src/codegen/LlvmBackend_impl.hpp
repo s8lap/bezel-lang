@@ -21012,8 +21012,27 @@ private:
     // The zero-store core both forms above reach. `targetLd == nullptr` means
     // "no target local" (the call-argument form), which skips only the
     // self-assignment exclusion. // per §15.3, §28.7
+    //
+    // fix #6182 (§20 *Ownership*, v0.338): `guard`, when non-null, is an `i1`
+    // that is true exactly on the path where `srcExpr` was the value the
+    // consuming position took — the SELECTED branch of an if-expression. A
+    // null guard is the unconditional mark every earlier caller asks for.
     void markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
-                                       const ast::Expr* srcExpr);
+                                       const ast::Expr* srcExpr,
+                                       llvm::Value* guard = nullptr);
+    // fix #6182 (§20 *Ownership*, v0.338): which branch an if-expression of
+    // owning-choice type selected, as an entry-block `i1` flag written by
+    // `lowerConditional` — "the **selected** branch's value moves", so the
+    // moved-from mark of a branch that names a binding must follow the
+    // selection at run time. Keyed by the expression; the function is carried
+    // beside the flag so a flag recorded while lowering another function body
+    // is never read.
+    struct SelectedBranchFlag {
+        llvm::Function* fn = nullptr;
+        llvm::AllocaInst* flag = nullptr;
+    };
+    std::unordered_map<const ast::ConditionalExpr*, SelectedBranchFlag>
+        owningChoiceConditionalSelected_;
     // fix #5436 (§15.3 *Parameter passing*, v0.315): the call-argument sweep —
     // every argument whose bound FORMAL is a by-value-move parameter of an
     // owning-classified choice. Driven off the formal, not the argument (§22.6).

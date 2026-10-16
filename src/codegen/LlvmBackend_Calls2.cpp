@@ -7034,6 +7034,32 @@ static bool importedMemberTypeAdmitsClosureDispatch(
 // heap-use-after-free ... READ of size 8` under `--sanitize=address`.
 void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call) {
     if (!call.callee) return;
+    // fix #6182 (§35.3 + §15.3 *Parameter passing*, v0.338): a CASE
+    // CONSTRUCTION is a parameter passing too. §35.3: "a move-only value
+    // payload argument transfers by value-move (§15.3, K3.12), the argument
+    // expression moved-from after the construction". The callee of
+    // `NG.Has(w0)` resolves to a `ChoiceCaseSymbol`, not a `MethodSymbol`, so
+    // the formal walk below never ran for it and the source kept its
+    // scope-end active-case pass while the constructed value took one too.
+    //
+    // There is no formal modifier to consult here: a payload field is never
+    // `ref` / `out` / `scoped` (§35.1), so every payload argument is a
+    // by-value position, and the core's own gate — the source is a bare
+    // identifier naming a plain local whose DECLARED type classifies owning —
+    // is exactly "a move-only value payload argument". A value-like or
+    // borrow-bearing argument is declined there and stays a copy.
+    //
+    // MEASURED at r30-c1 (8cb5f314) on
+    //   choice Own Held(owned r: Disp), Empty; end Own;
+    //   choice NG Has(v: Own), No; end NG;
+    //   var w0 := Own.Held(new Disp(k)); var w1 := NG.Has(w0);
+    // `AddressSanitizer: heap-use-after-free` (READ of size 8), and SIGSEGV
+    // without the sanitizer: `w1`'s pass disposed the `Disp`, then `w0`'s did.
+    if (dynamic_cast<sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*call.callee))) {
+        for (const ast::CallArgument& a : call.args)
+            if (a.value) markOwningChoiceArgMovedFrom(a.value.get());
+        return;
+    }
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
     if (!ms || ms->params.empty()) return;
     for (std::size_t i = 0; i < call.args.size(); ++i) {
@@ -7077,6 +7103,15 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call) {
         // same source shape the local-to-local mark takes. A `b.f`, `b[i]` or
         // `b.M()` borrows, and a fresh producer owns nothing to give up;
         // `markOwningChoiceMovedFromCore` declines both.
+        //
+        // An if-expression argument is NOT marked at a METHOD formal, though
+        // §20 makes its selected branch a move here as well: a method does
+        // not yet dispose a by-value-move choice parameter it leaves
+        // unconsumed (#6168 — the bare-identifier argument above already
+        // leaks through such a callee), so marking would turn today's
+        // caller-side disposal of `Take((if c then w else E))` into that
+        // leak. It follows #6168's callee half.
+        if (dynamic_cast<const ast::ConditionalExpr*>(a.value.get())) continue;
         markOwningChoiceArgMovedFrom(a.value.get());
     }
 }

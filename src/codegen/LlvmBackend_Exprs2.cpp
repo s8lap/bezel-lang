@@ -15979,6 +15979,29 @@ llvm::Value* Emitter::lowerConditional(const ast::ConditionalExpr& c) {
     // lane.
     cond = unwrapNarrowedNullableOperand(cond, c.condition.get());
 
+    // fix #6182 (§20 *Ownership* + §15.3 *Parameter passing*, v0.338): when
+    // the branches are of a move-only value type, "in an owned-consuming
+    // position — a binding, an assignment, a plain or `owned` argument, a
+    // `return`, an owning slot — the **selected** branch's value moves". The
+    // consuming position marks the source binding moved-from AFTER it has
+    // taken the value (`markOwningChoiceMovedFromCore`), by which point the
+    // branch blocks are closed and — for a nested if-expression — `cond` no
+    // longer dominates. So the selection is kept in an entry-block flag the
+    // mark can load from anywhere in the function. Only an owning-choice
+    // result records one: no other type has a mark that reads it.
+    if (cond->getType() == i1()) {
+        const sema::TypeRef* ct = resolveTypeParamRef(ctx_.exprType(c));
+        if (ct && ct->kind == sema::TypeRef::Kind::Named && ct->declaration &&
+            ct->declaration->kind == ast::TypeDeclKind::Choice) {
+            auto verdict = common::classifyChoiceType(ct, ctx_);
+            if (verdict && *verdict == common::ChoiceClassification::Owning) {
+                llvm::AllocaInst* flag = entryAlloca(i1());
+                builder_.CreateStore(cond, flag);
+                owningChoiceConditionalSelected_[&c] = {currentFn_, flag};
+            }
+        }
+    }
+
     // §20 / §5.1: the conditional's result type is the §20 common type of
     // its branches, which sema records on the expression. The branches may
     // have different (but common-typed) source types — e.g. `5 if c else

@@ -32981,6 +32981,59 @@ bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
     // so self-assignment `h._o := h._o` is skipped — the switch arm's no-op
     // coverage is only for choice cases with no owned payloads, not for the
     // self-assignment double-dispose path.
+    //
+    // fix #6182 (§35.4 rule 1 + §15.3 *Whole-value reassignment*, v0.338): the
+    // identity half compares EVERY leaf of the two values, not "payload field
+    // 0 of the first case as a pointer". A payload field of a move-only value
+    // type makes the choice owning as much as an `owned` class payload does
+    // (§35.4 rule 1: "or a payload field of a move-only value type (§15.3 — an
+    // owning inline array or another owning choice, transitively)"), and
+    // there field 0 is a nested choice STRUCT: `icmp eq %choice.Own ...` is
+    // not an instruction ("Invalid operand types for ICmp instruction",
+    // `IR verification failed`) — MEASURED at r30-c1 (8cb5f314) on
+    // `class Holder public F: NG; ... F := NG.Has(x);` with
+    // `choice NG Has(v: Own), No;`. Self-assignment (§15.3: "self-assignment
+    // ... is a no-op") reads the new value out of the very location being
+    // stored to, so it is leaf-for-leaf identical; and a value that is
+    // leaf-for-leaf identical to the displaced one holds the same owned
+    // pointers, so there is nothing the store displaces. Any genuinely new
+    // value differs in at least the owned pointer of its active case.
+    std::function<llvm::Value*(llvm::Value*, llvm::Value*)> leavesEqual =
+        [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
+        llvm::Type* ty = a->getType();
+        if (ty != b->getType()) return llvm::ConstantInt::getFalse(llvm_);
+        // A freshly constructed value's INACTIVE case payloads were never
+        // written (#5460's "poison read"); `freeze` pins each such leaf to
+        // some value, so the conjunction is decided by the leaves that were.
+        if (!ty->isAggregateType()) {
+            a = builder_.CreateFreeze(a);
+            b = builder_.CreateFreeze(b);
+        }
+        unsigned n = 0;
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(ty))
+            n = st->getNumElements();
+        else if (auto* at = llvm::dyn_cast<llvm::ArrayType>(ty))
+            n = static_cast<unsigned>(at->getNumElements());
+        else if (ty->isIntOrPtrTy())
+            return builder_.CreateICmpEQ(a, b, "ocfs.leafSame");
+        else if (ty->isFloatingPointTy()) {
+            // Bit identity, not `==`: a NaN payload is identical to itself.
+            llvm::Type* bits = llvm::IntegerType::get(
+                llvm_, static_cast<unsigned>(ty->getPrimitiveSizeInBits()));
+            return builder_.CreateICmpEQ(builder_.CreateBitCast(a, bits),
+                                         builder_.CreateBitCast(b, bits),
+                                         "ocfs.leafSame");
+        } else
+            return llvm::ConstantInt::getFalse(llvm_);
+        llvm::Value* all = llvm::ConstantInt::getTrue(llvm_);
+        for (unsigned i = 0; i < n; ++i)
+            all = builder_.CreateAnd(
+                all,
+                leavesEqual(builder_.CreateExtractValue(a, {i}),
+                            builder_.CreateExtractValue(b, {i})),
+                "ocfs.leavesSame");
+        return all;
+    };
     llvm::Value* doDispose = nullptr;
     if (res->nullable) {
         // For nullable: hv != 0 (null guard) AND identity check (same hv, same tag,
@@ -33003,11 +33056,8 @@ bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
         // Payload pointer comparison: only valid when tags match (same case).
         // Extract field 1 (payload) from inner, then field 0 (the owned ptr).
         // For an owning choice case, the payload at field 1 is always a {ptr} struct.
-        llvm::Value* payloadOld = builder_.CreateExtractValue(innerOld, {1u}, "ocfs.payloadOld");
-        llvm::Value* payloadNew = builder_.CreateExtractValue(innerNew, {1u}, "ocfs.payloadNew");
-        llvm::Value* ptrOld = builder_.CreateExtractValue(payloadOld, {0u}, "ocfs.ptrOld");
-        llvm::Value* ptrNew = builder_.CreateExtractValue(payloadNew, {0u}, "ocfs.ptrNew");
-        llvm::Value* ptrSame = builder_.CreateICmpEQ(ptrOld, ptrNew, "ocfs.ptrSame");
+        // fix #6182: every leaf of the inner choice value (see `leavesEqual`).
+        llvm::Value* ptrSame = leavesEqual(innerOld, innerNew);
         llvm::Value* identitySame = builder_.CreateAnd(
             builder_.CreateAnd(hvSame, tagSame, "ocfs.hvTagSame"), ptrSame, "ocfs.identitySame");
         // Dispose: old is non-null AND NOT identity-same.
@@ -33055,11 +33105,8 @@ bool Emitter::lowerOwnedChoiceFieldStore(const ast::Expr& target,
         builder_.CreateCondBr(hasPayload, owningBB, nonOwningBB);
         // owning arm: both cases have payloads; compare payload pointers.
         builder_.SetInsertPoint(owningBB);
-        llvm::Value* payloadOld = builder_.CreateExtractValue(oldVal, {1u}, "ocfs.payloadOld");
-        llvm::Value* payloadNew = builder_.CreateExtractValue(newVal, {1u}, "ocfs.payloadNew");
-        llvm::Value* ptrOld = builder_.CreateExtractValue(payloadOld, {0u}, "ocfs.ptrOld");
-        llvm::Value* ptrNew = builder_.CreateExtractValue(payloadNew, {0u}, "ocfs.ptrNew");
-        llvm::Value* ptrSame = builder_.CreateICmpEQ(ptrOld, ptrNew, "ocfs.ptrSame");
+        // fix #6182: every leaf of the choice value (see `leavesEqual`).
+        llvm::Value* ptrSame = leavesEqual(oldVal, newVal);
         llvm::Value* sameOwning = builder_.CreateAnd(tagSame, ptrSame, "ocfs.same.owning");
         builder_.CreateBr(mergeBB);
         // non-owning arm: no payload to dispose; identity is tag-only.

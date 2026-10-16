@@ -7373,9 +7373,42 @@ void Emitter::markOwningChoiceArgMovedFrom(const ast::Expr* srcExpr) {
 }
 
 void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
-                                            const ast::Expr* srcExpr) {
+                                            const ast::Expr* srcExpr,
+                                            llvm::Value* guard) {
     if (!srcExpr) return;
     if (emittingDisposerBody_) return;  // disposer locals: field pass owns them
+    // fix #6182 (§20 *Ownership*, v0.338): an if-expression in this position.
+    // "a branch naming such a binding classifies by the **position the whole
+    // expression occupies**, exactly as a bare read of the binding does ...
+    // in an owned-consuming position ... the **selected** branch's value
+    // moves ..., the binding joining per-path consumed after the construct".
+    // Every caller of this core IS an owned-consuming position, so each
+    // branch is marked under the selection `lowerConditional` recorded: the
+    // then-branch where the flag is set, the else-branch where it is clear,
+    // and a nested if-expression under the conjunction along its path.
+    //
+    // MEASURED at r30-c1 (8cb5f314) on
+    //   var w0 := Own.Held(new Disp(k));
+    //   var w1: Own := (if k >= 0 then w0 else Own.Empty);
+    // heap-use-after-free under `--sanitize=address`: both `w0` and `w1`
+    // disposed the one `Disp`. An unconditional mark of both branches would
+    // trade that for a leak on the path where the OTHER branch was selected.
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(srcExpr)) {
+        auto fit = owningChoiceConditionalSelected_.find(ce);
+        if (fit == owningChoiceConditionalSelected_.end() ||
+            fit->second.fn != currentFn_ || !fit->second.flag)
+            return;  // not lowered by `lowerConditional` in this body
+        llvm::Value* sel =
+            builder_.CreateLoad(i1(), fit->second.flag, "ocmv.sel");
+        llvm::Value* notSel = builder_.CreateNot(sel, "ocmv.notsel");
+        llvm::Value* thenGuard =
+            guard ? builder_.CreateAnd(guard, sel, "ocmv.then") : sel;
+        llvm::Value* elseGuard =
+            guard ? builder_.CreateAnd(guard, notSel, "ocmv.else") : notSel;
+        markOwningChoiceMovedFromCore(targetLd, ce->thenValue.get(), thenGuard);
+        markOwningChoiceMovedFromCore(targetLd, ce->elseValue.get(), elseGuard);
+        return;
+    }
     // THE SOURCE must be a bare identifier naming a DIFFERENT local. A bare
     // identifier is the only shape §15.3 bullet 1 moves; `b.f`, `b[i]` and
     // `b.M()` are borrows of `b` (the same reading `MoveOnlyArrayTransfer
@@ -7473,7 +7506,14 @@ void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
     // the conservative answer if it ever does (the pre-fix double free, never
     // a fresh corruption).
     if (slot->getAllocatedType() != want) return;
-    builder_.CreateStore(llvm::Constant::getNullValue(want), slot);
+    llvm::Value* zero = llvm::Constant::getNullValue(want);
+    if (guard) {
+        // The guarded form (an if-expression branch, above): the slot keeps
+        // its value on the path where the other branch was selected.
+        llvm::Value* cur = builder_.CreateLoad(want, slot, "ocmv.cur");
+        zero = builder_.CreateSelect(guard, zero, cur, "ocmv.next");
+    }
+    builder_.CreateStore(zero, slot);
 }
 
 

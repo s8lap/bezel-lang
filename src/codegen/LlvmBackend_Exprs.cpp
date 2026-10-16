@@ -2447,7 +2447,61 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         return lowerCall(*call);
     }
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
-        return lowerNew(*ne);
+        llvm::Value* made = lowerNew(*ne);
+        // fix #6182 (§15.3 *Parameter passing*, v0.338): a constructor call is
+        // a parameter passing like any other — "for a move-only V, it is by
+        // value-move (transfer ownership). The caller's argument expression is
+        // in moved-from state after the call." `lowerCall` marks a METHOD
+        // call's arguments (#5436); a `new C(w)` never reaches it, so the
+        // caller's `w` kept its scope-end active-case pass while the
+        // constructor's `V := v;` handed the same payload to the field, which
+        // the instance's destructor disposes too. The ownership pass already
+        // reads `w` as moved-from here (#5436's constructor-call twin of
+        // `recordMovesInArgs`); this is the runtime half of that verdict.
+        //
+        // MEASURED at r30-c1 (8cb5f314) on
+        //   class Bx public V: Own; public constructor(v: Own) V := v; ...
+        //   var w := Own.Held(new Disp(k)); using var x1 := new Bx(w);
+        // `AddressSanitizer: heap-use-after-free`.
+        //
+        // Emitted AFTER `lowerNew`, for `lowerCall`'s reason: the value the
+        // construction read out of each argument slot is already in the
+        // constructor's frame. A `ref` / `out` / `scoped` formal lends rather
+        // than takes (§22.3) and is skipped, as there; the core declines
+        // everything that is not a plain local of owning-choice type.
+        const sema::TypeRef* nt = resolveTypeParamRef(
+            ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(*ne));
+        if (nt && nt->kind == sema::TypeRef::Kind::Named && nt->declaration &&
+            nt->declaration->kind == ast::TypeDeclKind::Class) {
+            const sema::ConstructorSymbol* cs =
+                ne->args.empty() ? nullptr
+                                 : ctorForArgs(nt->declaration, ne->args);
+            for (std::size_t i = 0; i < ne->args.size(); ++i) {
+                const ast::CallArgument& a = ne->args[i];
+                if (!a.value) continue;
+                if (cs) {
+                    std::size_t pi = cs->params.size();
+                    if (a.name.empty()) {
+                        pi = i;
+                    } else {
+                        for (std::size_t j = 0; j < cs->params.size(); ++j)
+                            if (cs->params[j] && cs->params[j]->name == a.name) {
+                                pi = j;
+                                break;
+                            }
+                    }
+                    if (pi < cs->params.size())
+                        if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                                cs->params[pi]))
+                            if (ps->modifier == "ref" || ps->modifier == "out" ||
+                                ps->modifier == "out owned" ||
+                                ps->modifier == "scoped")
+                                continue;
+                }
+                markOwningChoiceArgMovedFrom(a.value.get());
+            }
+        }
+        return made;
     }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (!ix->target || ix->indices.empty() || !ix->indices[0].value)
