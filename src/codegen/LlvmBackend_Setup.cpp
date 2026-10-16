@@ -24208,7 +24208,37 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             return;
         }
     }
-    if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
+    // fix #6337 / §28.3 *Unbound owned temporaries* + §28.8, §31.4 (v0.338):
+    // this is the CALLEE-side mirror of the caller-side gate #6311 widened in
+    // `buildOrderedArgs`. `isClassOrInterfaceRef` reads the kind off
+    // `->declaration`, and a §31.4 language-built-in exception carries NO user
+    // TypeSymbol (`TypeRef::declaration == nullptr`), so the function returned
+    // here for EVERY `owned x: Exception` / `owned e: IOException` parameter:
+    // no `Disposal` entry was ever pushed onto `disposeStack_.front()`, and the
+    // owned value the callee holds at entry — which §28.8 makes the callee
+    // responsible for disposing exactly once — was never released on either the
+    // normal or the unwind edge. MEASURED: `Take(new IOException("a"))` into
+    // `Take(owned x: Exception)` leaked 40 B per call —
+    // `SUMMARY: AddressSanitizer: 19960 byte(s) leaked in 499 allocation(s)`
+    // over 500 iterations. §31.1 makes a built-in exception an ordinary owned
+    // heap class instance and §28.3 states the obligation for it exactly as for
+    // any other class in the same position, so the twin is admitted, not a new
+    // rule; the caller-side admission is #6311's, and this is where the value
+    // the callee is GIVEN is discharged.
+    //
+    // SCOPE — deliberately narrow, and it is the same named recognizer the
+    // owned-field / using-var auto-dispose paths and #6311's caller-side gate
+    // already use for this same population: `isBuiltinExceptionTypeRef`
+    // requires a declaration-less Named TypeRef whose astNode NAME resolves in
+    // `builtinVtable_`, i.e. exactly the §31.4 hierarchy. A vtable-less built-in
+    // (a collection, a Task, a `FileStream`) is NOT in `builtinVtable_` and
+    // stays excluded, which is what keeps the word-0-as-vtable read in
+    // `dynamicDispose` away from a plain C struct. The `resolveTypeParamRef(rt)`
+    // twin is widened identically, so a generic parameter bound to a built-in
+    // exception is admitted too.
+    const sema::TypeRef* resolvedRt = resolveTypeParamRef(rt);
+    if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolvedRt) &&
+        !isBuiltinExceptionTypeRef(rt) && !isBuiltinExceptionTypeRef(resolvedRt))
         return;
     Disposal d{slot, nullptr};
     if (ps->autoDropAtScopeEnd) {
