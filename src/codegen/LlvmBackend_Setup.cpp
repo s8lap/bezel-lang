@@ -39174,6 +39174,22 @@ struct BoxEscapeWalker {
     // an otherwise-safe-read position (`cap is T` / `cap as T` / `cap = null`).
     // See the String walker for the full rationale.
     bool inLambda = false;
+    // fix #6309 / §5.1 / §8.6 / §28.9 (v0.338): the per-candidate verdict map
+    // for the box ALIAS relaxation. Keyed by the candidate node; the value is
+    // `true` for a candidate that (a) does not escape and (b) is not itself
+    // release-eligible — i.e. a binding into it is provably a same-lifetime
+    // BORROW that adds no owner and no release of its own. Computed by
+    // `collectBoxReleaseEligible`'s FIRST pass, over every candidate, BEFORE
+    // any arming, so the LocalDecl arm below can read it. Null (the default)
+    // leaves the pre-#6309 conservative behaviour in place for every other
+    // reuse of this walker (none of them is a box candidate collector).
+    //
+    // The map is keyed on the conservative pass-1 verdict on purpose: pass 2
+    // (the arming walk) is strictly MORE permissive than pass 1 — its only
+    // added admission is this very relaxation — so `pass1[d] == true` implies
+    // `pass2[d] == true`, and reading the conservative answer can only keep
+    // the map on the leak side of the line, never the over-release side.
+    const std::unordered_map<const void*, bool>* boxAliasBorrowTargets = nullptr;
 
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -39716,10 +39732,100 @@ struct BoxEscapeWalker {
                     }
                 }
             }
+            // fix #6309 / §5.1 / §8.6 / §28.3 / §28.9 (v0.338): the box ALIAS
+            // relaxation — `var oj: Object := oi;` is a BORROW of `oi`'s box,
+            // not an escape of it.
+            //
+            // §8.6 makes a boxed value an "immutable shared reference" and
+            // §28.9 makes it runtime-managed, "exempt from manual disposal",
+            // with its lifecycle left to the runtime. What the RUNTIME needs
+            // is that the box be released exactly once: `boxValue` initializes
+            // the cell's rc to 1 — the producer's single reference — and no
+            // bind-time retain is emitted for an Object-slot alias (only for a
+            // lambda capture and a class-field store). So `oi` and `oj` hold
+            // ONE reference between them, and `oi`'s own scope-end
+            // `bz_box_release` is the single correct discharge — provided `oj`
+            // cannot outlive it.
+            //
+            // Before this arm the walker taint-ED `oi` on the binding, `oi`
+            // never joined `boxReleaseEligible_`, `oj` is not a +1 producer so
+            // it never joins either, and the box leaked with no owner at all.
+            // MEASURED on 389ca74b, the plainest spelling in the language —
+            // §5.1's IDENTITY conversion `Object → Object`, nothing to do with
+            // any implicit-conversion residual: `var oi: Object := k; var oj:
+            // Object := oi; return oj.GetHashCode();` in a 200-iteration loop
+            // leaked `SUMMARY: AddressSanitizer: 4800 byte(s) leaked in 200
+            // allocation(s).` The single-binding form is clean, and a
+            // three-link chain `oi -> oj -> ol` leaks exactly one box too —
+            // so this is the alias, not the length.
+            //
+            // SOUND CONDITION — the same one fix #3729 states for the record
+            // field twin ("`r2` may be treated as a BORROW of `r` ... iff `r2`
+            // is itself PROVABLY non-escaping ... re-running this SAME
+            // conservative walk, keyed on `r2`'s own LocalDecl, over the WHOLE
+            // enclosing function body"). `boxAliasBorrowTargets` is that
+            // verdict map, computed by `collectBoxReleaseEligible`'s first
+            // pass over the whole body for every candidate. It requires BOTH
+            // that the destination does not escape AND that it is not itself
+            // release-eligible — the second half is load-bearing: a `var`
+            // destination that later receives a fresh box (`oj := <box>`) arms
+            // its own `bz_box_release` on reassignment, and releasing `oi` as
+            // well would be a double free on one rc. §28.3 currently REJECTS
+            // that spelling outright ("owned value in `oj` would be dropped
+            // here without disposal", MEASURED), so the half is defence in
+            // depth rather than a reachable path today — kept anyway, because
+            // the map is the single predicate and a future §28.3 admission
+            // must not silently make it load-bearing.
+            //
+            // Restricted to a destination that is itself an Object/interface
+            // boxing target — a consequence of the pre-existing candidate scan
+            // (`isObjectOrInterfaceTarget(targetTy)`), not an inline check, so
+            // a lookup miss keeps the conservative escape. The
+            // `var b: [3]int := oi;` payload-copy shape is the `narrowedRead`
+            // arm above and an unnarrowed non-boxing destination stays an
+            // escape. Also restricted to a BARE identifier initializer
+            // (`isTargetIdent`) and out of a lambda body (a capture lives in an
+            // env that outlives the scope). Withholding the relaxation is the
+            // safe direction: the box keeps leaking, it is never double-freed.
+            if (!narrowedRead && !inLambda && boxAliasBorrowTargets &&
+                isTargetIdent(ld->initializer.get())) {
+                auto ait = boxAliasBorrowTargets->find(
+                    static_cast<const void*>(ld));
+                if (ait != boxAliasBorrowTargets->end() && ait->second) {
+                    expr(ld->initializer.get(), /*safeRead=*/true);
+                    return;
+                }
+            }
             expr(ld->initializer.get(), /*safeRead=*/narrowedRead);
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            // fix #6309 / §5.1 / §8.6 / §21.1 / §28.9 (v0.338): the §21.1
+            // `const` SPELLING of the box alias relaxation added to the
+            // LocalDecl arm above — the same mirror #3417 made when it admitted
+            // a `const` to the box candidate scan in the first place, and the
+            // one #3416 made for the string borrow set. `const oj: Object :=
+            // oi;` is the same borrow of the same box; MEASURED that without
+            // this arm it leaked 24 bytes per execution, the same defect as
+            // the `var` twin.
+            //
+            // §21.1 makes it STRONGER than the `var` form on the soundness
+            // side: a runtime `const` is "not an assignable location", so the
+            // destination can never later receive a fresh box — the one way a
+            // `var` alias could have become release-eligible itself after the
+            // map was built. The map's "not release-eligible" half is therefore
+            // automatically satisfied for a `const` destination, and it is
+            // still consulted rather than assumed, so both paths answer from
+            // one predicate.
+            if (!inLambda && boxAliasBorrowTargets &&
+                isTargetIdent(lc->value.get())) {
+                auto ait = boxAliasBorrowTargets->find(
+                    static_cast<const void*>(lc));
+                if (ait != boxAliasBorrowTargets->end() && ait->second) {
+                    expr(lc->value.get(), /*safeRead=*/true);
+                    return;
+                }
+            }
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
@@ -39961,6 +40067,73 @@ void Emitter::collectBoxReleaseEligible(
             pureBoxBindings_.insert(static_cast<const void*>(ld));
     }
 
+    // fix #6309 (§5.1 / §8.6 / §28.3 / §28.9, v0.338): PASS 1 of 2. The
+    // alias relaxation the BoxEscapeWalker LocalDecl arm reads
+    // (`boxAliasBorrowTargets`) needs the SAME conservative verdict for a
+    // destination that may be declared LATER in the body than the source it
+    // aliases — so every candidate's verdict is computed here, over the whole
+    // body, BEFORE any candidate is armed. The value stored is "non-escaping
+    // AND not itself release-eligible", the #3729 sound condition; see the
+    // LocalDecl arm for why both halves are load-bearing.
+    //
+    // The verdicts here do not depend on each other *directly*: a candidate's
+    // walk only taints on an occurrence of ITS OWN identifier, and an aliasing
+    // binding names the SOURCE, not the destination — so `escaped(oj)` never
+    // reads `escaped(oi)`. It depends on it INDIRECTLY, once per link of an
+    // alias chain: for `oi -> oj -> ol`, `oj`'s verdict needs to know whether
+    // `ol` can outlive it before `oi`'s verdict can be decided. So this is a
+    // bounded fixpoint rather than a single sweep — the map only ever grows
+    // (`escaped` is monotone decreasing in the map, since the relaxation is
+    // the sole addition), so it converges, and each round settles one more link.
+    //
+    // The cap is `min(candidates, 8)`: a chain deeper than the cap keeps its
+    // box leaking, which is the safe direction (the map entry stays false, so
+    // the source keeps being tainted) and never over-releases. MEASURED: an
+    // ELEVEN-link `oi -> oj -> ... -> ow` chain still leaks `4800 byte(s) in
+    // 200 allocation(s)` with the cap in place — exactly the documented
+    // bound, not a soundness failure.
+    std::unordered_map<const void*, bool> boxAliasBorrowTargets;
+    const std::size_t aliasRounds =
+        std::min<std::size_t>(candidates.size(), 8u);
+    for (std::size_t round = 0; round < aliasRounds; ++round) {
+        std::unordered_map<const void*, bool> next;
+        for (const ast::Node* ld : candidates) {  // fix #3417: LocalDecl or LocalConstDecl
+            BoxEscapeWalker w{
+                ctx_, static_cast<const void*>(ld),
+                [this](const ast::Expr* value) {
+                    return boxLocalAssignmentSourceKind(value);
+                },
+                [this](const ast::Expr* r) {       // fix #3447
+                    return knownBoxReceiverShape(r, /*allowPureBinding=*/true);
+                }};
+            w.methodRefRetainsBox =                  // fix #6057
+                [this](const ast::MemberAccessExpr* m) {
+                    return methodRefRetainsBoxReceiver(*m,
+                                                       /*allowPureBinding=*/true);
+                };
+            w.isSynthesizedEqualsCallee =            // fix #5068
+                [this](const sema::MethodSymbol* ms, const ast::Expr* r) {
+                    const sema::TypeRef* rt = r ? ctx_.exprType(*r) : nullptr;
+                    return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                           isSynthesizedIEquatableEquals(ms, rt->declaration);
+                };
+            // Round 0 reads an EMPTY map, which disables the relaxation
+            // everywhere and reproduces the pre-#6309 verdicts exactly; later
+            // rounds read the previous round's.
+            w.boxAliasBorrowTargets = &boxAliasBorrowTargets;
+            for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+            const bool hasManagedBox =
+                isPlusOneBoxProducer(ld) || w.sawBoxAssignment;
+            const bool suspendLive = w.sawManagedAssignment &&
+                                     smLocalFields_.count(ld) != 0;
+            next[static_cast<const void*>(ld)] =
+                !w.escaped && !hasManagedBox && !suspendLive;
+        }
+        if (next == boxAliasBorrowTargets) break;   // fixpoint reached
+        boxAliasBorrowTargets.swap(next);
+    }
+
+    // PASS 2 — the arming walk, now with the alias relaxation armed.
     for (const ast::Node* ld : candidates) {   // fix #3417: LocalDecl or LocalConstDecl
         BoxEscapeWalker w{
             ctx_, static_cast<const void*>(ld),
@@ -39981,6 +40154,7 @@ void Emitter::collectBoxReleaseEligible(
                 return rt && rt->kind == sema::TypeRef::Kind::Named &&
                        isSynthesizedIEquatableEquals(ms, rt->declaration);
             };
+        w.boxAliasBorrowTargets = &boxAliasBorrowTargets;   // fix #6309
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         bool hasManagedBox =
             isPlusOneBoxProducer(ld) || w.sawBoxAssignment;
