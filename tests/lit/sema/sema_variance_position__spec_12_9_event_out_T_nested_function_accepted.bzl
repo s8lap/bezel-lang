@@ -4,8 +4,9 @@
 // §12.9: IEvent<out T> canonical example from the spec. T appears inside
 // the parameter of a function type `(T) -> ()` which is itself a parameter of
 // Subscribe — contravariant-of-contravariant = covariant position overall.
-// This composed position check is deferred (nested), so it must be ACCEPTED
-// (no false positive).
+// fix #6348 implements that composition, so this row is no longer a
+// "deferred check must not false-positive" control but a POSITIVE row on the
+// composition itself: it must still be ACCEPTED.
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
 //

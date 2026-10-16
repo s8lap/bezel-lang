@@ -13772,10 +13772,23 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
 //   in T (contravariant)  → allowed only in INPUT positions:
 //                              ordinary method parameters (not `out`-params).
 //
-// Nested positions (T inside a function-type parameter, T inside another
-// generic's type arguments) are NOT checked here — position composition is
-// deferred to a later slice. This keeps the check sound (no false positives)
-// while eliminating the most common unsound declarations (direct param misuse).
+// fix #6348 (v0.338): the position is COMPOSED, not merely read at the bare
+// `T`. §12.9: "Position is composed across nested type constructors. A type
+// parameter inside another generic type inherits position from that wrapper's
+// variance… Function types are themselves variant (covariant in return,
+// contravariant in parameter, see below), and the same composition rule
+// applies." The check used to test only a bare `T` and skip every nested
+// occurrence — a documented deferral (see the lit row
+// `sema_variance_position__spec_12_9_event_out_T_nested_function_accepted`),
+// which left `method Put(xs: Array<T>)` and `method Get(): Array<T>` on an
+// `out T` silently accepted. The base list is composed the same way: "The
+// extending interface instantiates the base's variant parameter with its own
+// type parameter, holding the deriving interface's variance."
+//
+// A wrapper whose OWN variance cannot be established — a head this pass does
+// not resolve, e.g. an interface imported from another module — yields
+// `Unknown` and is skipped rather than guessed, so the check stays free of
+// false positives.
 //
 // The check is purely over the raw AST (`ast::Type` nodes), because TypeRefs
 // for generic param references carry no name (declaration == nullptr), and
@@ -13785,44 +13798,208 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
 
 namespace {
 
+// The composed position of one occurrence of a variant type parameter,
+// expressed as seen from OUTSIDE the type that holds the occurrence (§12.9).
+enum class VariancePos {
+    CoVariant,     // an `out T` position
+    ContraVariant, // an `in T` position
+    Invariant,     // no marker can be honoured through this occurrence
+    Absent,        // the parameter does not occur here
+    Unknown,       // a wrapper's own variance could not be established
+};
+
+VariancePos flipVariancePos(VariancePos p) {
+    switch (p) {
+    case VariancePos::CoVariant: return VariancePos::ContraVariant;
+    case VariancePos::ContraVariant: return VariancePos::CoVariant;
+    default: return p;  // Invariant / Absent / Unknown pass through unchanged
+    }
+}
+
+// The polarity, seen from OUTSIDE the wrapper, of a slot the wrapper holds at
+// variance `wrapperVar` while the wrapper itself sits at polarity `slot`: a
+// covariant slot keeps the outer polarity, a contravariant one flips it, an
+// invariant one erases it (§12.9's composition rule).
+VariancePos slotPolarity(VariancePos slot, VariancePos wrapperVar) {
+    if (wrapperVar == VariancePos::Unknown || slot == VariancePos::Unknown)
+        return VariancePos::Unknown;
+    if (wrapperVar == VariancePos::Invariant || slot == VariancePos::Invariant)
+        return VariancePos::Invariant;
+    return wrapperVar == VariancePos::CoVariant ? slot : flipVariancePos(slot);
+}
+
+// Fold a second occurrence into an accumulator. Two occurrences that land in
+// DIFFERENT positions cannot both be honoured by one marker, so the fold is
+// Invariant — which rejects under either marker, the sound answer.
+VariancePos mergeVariancePos(VariancePos acc, VariancePos next) {
+    if (acc == VariancePos::Absent) return next;
+    if (next == VariancePos::Absent) return acc;
+    if (acc == VariancePos::Unknown || next == VariancePos::Unknown)
+        return VariancePos::Unknown;
+    if (acc == next) return acc;
+    return VariancePos::Invariant;
+}
+
 // Return true iff the ast::Type `t` is a bare reference to the generic
 // parameter named `paramName` — a single-part QualifiedName with no generic
-// args, not nullable (nullable doesn't affect the position check, but the
-// bare-name test is sufficient to isolate direct occurrences).
-//
-// This deliberately does NOT recurse into function-type params, return
-// types, or generic type arguments — those compose positions in ways this
-// check defers (see comment above).
-bool isDirectParamRef(const ast::Type& t, std::string_view paramName) {
+// args. Nullability is irrelevant to the position (a `T?` sits wherever a `T`
+// does), so it is not tested here.
+bool isBareParamRef(const ast::Type& t, std::string_view paramName) {
     if (t.kind != ast::TypeKind::Named) return false;
     if (!t.name || t.name->parts.size() != 1) return false;
     if (!t.genericArgs.empty()) return false;  // e.g. T<U> — not a bare param ref
     return t.name->parts.front() == paramName;
 }
 
-// Check whether `t` contains a direct reference to `paramName` AND that
-// reference is in an invalid position given the declared variance.
+// The nine COVARIANT generic interfaces of the standard library (v0.338
+// stdlib §4.1/§4.12, §6.5 — every `out T` in `Bezel_Standard_Library.md`).
+// They are compiler built-ins with no TypeSymbol, so their marker cannot be
+// read off a `GenericParamSymbol` and is listed here instead. Each declares
+// exactly ONE type parameter, at index 0. Every other built-in generic head is
+// a class or an invariant interface, and §12.9 makes those "always invariant"
+// whatever their arity.
+bool builtinHeadIsCovariantAtZero(std::string_view head) {
+    static constexpr std::array<std::string_view, 9> kCovariant = {
+        "IEnumerable", "IEnumerator", "IAsyncEnumerable", "IAsyncEnumerator",
+        "IReadOnlyCollection", "IReadOnlyList",
+        "IEvent", "IAsyncEvent", "ISharedEvent",
+    };
+    return std::find(kCovariant.begin(), kCovariant.end(), head) !=
+           kCovariant.end();
+}
+
+// §12.9: "A type parameter inside another generic type inherits position from
+// that wrapper's variance" — so argument `argIndex` of the head spelled by
+// `head` sits in the head's own slot at that index.
+//
+// `localTypes` is the current module's declared types; a head found there
+// reads its `GenericParamSymbol::variance` (#3143: populated on both the local
+// and the imported side). A built-in head (the authoritative table
+// `Resolver::builtinTypeArity`, via `isBuiltinTypeName`) is covariant only if
+// it is one of the nine listed above. Anything else is `Unknown` — the caller
+// skips rather than guesses.
+VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
+                                 const std::vector<TypeSymbol*>& localTypes) {
+    if (!head.name || head.name->parts.empty()) return VariancePos::Unknown;
+    const std::string_view h = head.name->parts.back();
+    for (const TypeSymbol* ts : localTypes) {
+        if (ts->name != h) continue;
+        // A class, record, enum or choice is always invariant (§12.9), and it
+        // may in any case carry no marker at all.
+        if (ts->kind != ast::TypeDeclKind::Interface) return VariancePos::Invariant;
+        if (argIndex >= ts->genericParams.size()) return VariancePos::Invariant;
+        const auto* gps = dynamic_cast<GenericParamSymbol*>(ts->genericParams[argIndex]);
+        if (!gps) return VariancePos::Invariant;
+        if (gps->variance == "out") return VariancePos::CoVariant;
+        if (gps->variance == "in") return VariancePos::ContraVariant;
+        return VariancePos::Invariant;
+    }
+    if (!isBuiltinTypeName(h)) return VariancePos::Unknown;
+    if (argIndex == 0 && builtinHeadIsCovariantAtZero(h)) return VariancePos::CoVariant;
+    return VariancePos::Invariant;
+}
+
+// The composed position of `paramName` inside `t`, given that `t` itself
+// occupies a slot of polarity `outer`.
+VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName,
+                                  VariancePos outer,
+                                  const std::vector<TypeSymbol*>& localTypes) {
+    switch (t.kind) {
+    case ast::TypeKind::Named: {
+        if (t.genericArgs.empty())
+            return isBareParamRef(t, paramName) ? outer : VariancePos::Absent;
+        VariancePos acc = VariancePos::Absent;
+        for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+            // §12.9: "A type parameter inside another generic type inherits
+            // position from that wrapper's variance" — argument `i` occupies
+            // the head's own slot at index `i`, so the head's variance is
+            // applied to the slot the whole type occupies here.
+            const VariancePos argSlot =
+                slotPolarity(outer, namedHeadArgVariance(t, i, localTypes));
+            if (argSlot == VariancePos::Absent) continue;
+            acc = mergeVariancePos(
+                acc, composedParamPosition(*t.genericArgs[i], paramName,
+                                           argSlot, localTypes));
+        }
+        return acc;
+    }
+    case ast::TypeKind::Function: {
+        // §12.9: "Function types are themselves variant — covariant in return
+        // type, contravariant in parameter types." An `out` parameter of the
+        // function type is an output slot for the same reason a method's is.
+        VariancePos acc = VariancePos::Absent;
+        if (t.funcReturn)
+            acc = mergeVariancePos(
+                acc, composedParamPosition(*t.funcReturn, paramName, outer, localTypes));
+        for (const auto& fp : t.funcParams) {
+            if (!fp.type) continue;
+            const bool isOut = fp.modifier == "out" || fp.modifier == "out owned";
+            acc = mergeVariancePos(
+                acc, composedParamPosition(*fp.type, paramName,
+                                           isOut ? outer : flipVariancePos(outer),
+                                           localTypes));
+        }
+        return acc;
+    }
+    case ast::TypeKind::InlineArray: {
+        // An inline array's element slot is both read and written by value, so
+        // no marker survives it (the value-type half of §12.9's invariance).
+        if (!t.arrayElement) return VariancePos::Absent;
+        return composedParamPosition(*t.arrayElement, paramName,
+                                     VariancePos::Invariant, localTypes);
+    }
+    default:
+        return VariancePos::Absent;
+    }
+}
+
+// Check whether `t` places `paramName` in a position the declared variance
+// cannot honour.
 //
 // `paramVariance`  — "out" (covariant) or "in" (contravariant).
-// `isOutputPos`    — true when `t` occurs in an output position (method
+// `isOutputPos`    — true when `t` itself sits in an output position (method
 //                    return, readonly property, `out` parameter).
 //
-// Returns true iff a violation was detected at this direct level.
-// (Nested positions inside function types or generic args are skipped.)
-bool directVarianceViolation(const ast::Type& t,
-                              std::string_view paramVariance,
-                              bool isOutputPos,
-                              std::string_view paramName) {
-    if (!isDirectParamRef(t, paramName)) return false;
-    if (paramVariance == "out" && !isOutputPos) return true;   // out T in input
-    if (paramVariance == "in"  &&  isOutputPos) return true;   // in T in output
-    return false;
+// Returns true iff a violation was detected, setting `*composed` when the
+// offending occurrence was reached THROUGH a nested type constructor rather
+// than being a bare `T` in the member's own slot. An `Unknown` composed
+// position — some wrapper whose own variance this pass could not establish —
+// reports no violation (no false positives).
+bool composedVarianceViolation(const ast::Type& t,
+                               std::string_view paramVariance,
+                               bool isOutputPos,
+                               std::string_view paramName,
+                               const std::vector<TypeSymbol*>& localTypes,
+                               bool* composed = nullptr) {
+    const VariancePos pos = composedParamPosition(
+        t, paramName,
+        isOutputPos ? VariancePos::CoVariant : VariancePos::ContraVariant,
+        localTypes);
+    if (pos == VariancePos::Unknown || pos == VariancePos::Absent) return false;
+    const bool bad = paramVariance == "out" ? pos != VariancePos::CoVariant
+                                            : pos != VariancePos::ContraVariant;
+    if (bad && composed) *composed = !isBareParamRef(t, paramName);
+    return bad;
+}
+
+// The trailing clause a diagnostic appends when the offending occurrence was
+// reached through a nested type constructor rather than sitting bare in the
+// member's own slot. Empty for the direct case, so every pre-existing
+// diagnostic text is unchanged.
+std::string varianceComposedClause(bool composed) {
+    return composed ? " (composed through a nested type constructor)" : "";
 }
 
 }  // anonymous namespace
 
 void Resolver::checkVariancePositions() {
     if (!ctx_.module()) return;
+    // fix #6348: the composed walk resolves each generic HEAD it steps through
+    // against the module's own declared types, so collect them once up front.
+    std::vector<TypeSymbol*> localTypes;
+    for (Symbol* child : ctx_.module()->children) {
+        if (auto* ts = dynamic_cast<TypeSymbol*>(child)) localTypes.push_back(ts);
+    }
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Interface) continue;
@@ -13841,15 +14018,47 @@ void Resolver::checkVariancePositions() {
             auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
             if (!td) continue;
 
+            // fix #6348 (§12.9): "The extending interface instantiates the
+            // base's variant parameter with its own type parameter, holding
+            // the deriving interface's variance" — the base list is composed
+            // exactly like a member return type (an output position).
+            for (const auto& bt : td->baseTypes) {
+                if (!bt) continue;
+                bool baseComposed = false;
+                if (!composedVarianceViolation(*bt, variance,
+                                               /*isOutputPos=*/true, paramName,
+                                               localTypes, &baseComposed))
+                    continue;
+                const std::string head =
+                    (bt->name && !bt->name->parts.empty())
+                        ? std::string(bt->name->parts.back())
+                        : std::string("<base>");
+                ctx_.diagnostics().report(
+                    Severity::Error, bt->span.begin,
+                    std::string("type parameter `") + std::string(paramName) +
+                    "` is " +
+                    (variance == "out" ? "covariant (`out`)"
+                                       : "contravariant (`in`)") +
+                    " but appears in base type `" + head +
+                    "`, whose own parameter variance cannot honour that "
+                    "position" + varianceComposedClause(baseComposed) +
+                    " (§12.9)");
+            }
+
             for (const auto& mem : td->members) {
                 if (!mem) continue;
+                // fix #6348: set when the offending occurrence was reached
+                // through a nested type constructor rather than sitting bare
+                // in the member's own slot.
+                bool composed = false;
 
                 // --- MethodDecl ---
                 if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem.get())) {
                     // Return type is an output position.
                     if (md->returnType &&
-                        directVarianceViolation(*md->returnType, variance,
-                                                /*isOutputPos=*/true, paramName)) {
+                        composedVarianceViolation(*md->returnType, variance,
+                                                /*isOutputPos=*/true, paramName,
+                                                localTypes, &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, md->returnType->span.begin,
                             std::string("type parameter `") +
@@ -13857,7 +14066,8 @@ void Resolver::checkVariancePositions() {
                             (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
                             " but appears in an " +
                             (variance == "out" ? "input (parameter)" : "output (return)") +
-                            " position in method `" + std::string(md->name) +
+                            " position" + varianceComposedClause(composed) +
+                            " in method `" + std::string(md->name) +
                             "` (§12.9)");
                     }
                     // Each parameter: check modifier for out-param vs. input.
@@ -13866,8 +14076,10 @@ void Resolver::checkVariancePositions() {
                         // `out` and `out owned` parameters are output positions.
                         bool paramIsOutput = (p.modifier == "out" ||
                                               p.modifier == "out owned");
-                        if (directVarianceViolation(*p.type, variance,
-                                                    paramIsOutput, paramName)) {
+                        composed = false;
+                        if (composedVarianceViolation(*p.type, variance,
+                                                    paramIsOutput, paramName,
+                                                    localTypes, &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, p.type->span.begin,
                                 std::string("type parameter `") +
@@ -13875,7 +14087,8 @@ void Resolver::checkVariancePositions() {
                                 (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
                                 " but appears in an " +
                                 (paramIsOutput ? "output (out-param)" : "input (parameter)") +
-                                " position in parameter `" + std::string(p.name) +
+                                " position" + varianceComposedClause(composed) +
+                                " in parameter `" + std::string(p.name) +
                                 "` of method `" + std::string(md->name) +
                                 "` (§12.9)");
                         }
@@ -13903,33 +14116,39 @@ void Resolver::checkVariancePositions() {
                     if (!isReadonly) {
                         // Read-write: setter is an input position — `out T` is unsafe.
                         if (variance == "out" &&
-                            directVarianceViolation(*pd->type, variance,
-                                                    /*isOutputPos=*/false, paramName)) {
+                            composedVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/false, paramName,
+                                                    localTypes, &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
                                 std::string(paramName) +
                                 "` is covariant (`out`) but appears in a "
                                 "read-write property `" + std::string(pd->name) +
-                                "`, which has a setter (input position) (§12.9)");
+                                "`, which has a setter (input position)" +
+                                varianceComposedClause(composed) + " (§12.9)");
                         }
                         // `in T` in read-write property: the getter is an
                         // output position — flag as violation.
                         if (variance == "in" &&
-                            directVarianceViolation(*pd->type, variance,
-                                                    /*isOutputPos=*/true, paramName)) {
+                            composedVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/true, paramName,
+                                                    localTypes, &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
                                 std::string(paramName) +
                                 "` is contravariant (`in`) but appears in a "
                                 "read-write property `" + std::string(pd->name) +
-                                "`, which has a getter (output position) (§12.9)");
+                                "`, which has a getter (output position)" +
+                                varianceComposedClause(composed) + " (§12.9)");
                         }
                     } else {
                         // Readonly property: pure output.
-                        if (directVarianceViolation(*pd->type, variance,
-                                                    /*isOutputPos=*/true, paramName)) {
+                        composed = false;
+                        if (composedVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/true, paramName,
+                                                    localTypes, &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
@@ -13937,7 +14156,8 @@ void Resolver::checkVariancePositions() {
                                 (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
                                 " but appears in a readonly property `" +
                                 std::string(pd->name) +
-                                "` — readonly properties are output positions (§12.9)");
+                                "` — readonly properties are output positions" +
+                                varianceComposedClause(composed) + " (§12.9)");
                         }
                     }
                     continue;
@@ -13953,27 +14173,32 @@ void Resolver::checkVariancePositions() {
                     // A field is both readable and writable → both input and output.
                     // `out T` in an input context is a violation.
                     if (variance == "out" &&
-                        directVarianceViolation(*fd->type, variance,
-                                                /*isOutputPos=*/false, paramName)) {
+                        composedVarianceViolation(*fd->type, variance,
+                                                /*isOutputPos=*/false, paramName,
+                                                localTypes, &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, fd->type->span.begin,
                             std::string("type parameter `") +
                             std::string(paramName) +
                             "` is covariant (`out`) but appears in field `" +
                             std::string(fd->name) +
-                            "` (invariant position — §12.9)");
+                            "` (invariant position" + varianceComposedClause(composed) +
+                            " — §12.9)");
                     }
                     // `in T` in an output context is a violation.
+                    composed = false;
                     if (variance == "in" &&
-                        directVarianceViolation(*fd->type, variance,
-                                                /*isOutputPos=*/true, paramName)) {
+                        composedVarianceViolation(*fd->type, variance,
+                                                /*isOutputPos=*/true, paramName,
+                                                localTypes, &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, fd->type->span.begin,
                             std::string("type parameter `") +
                             std::string(paramName) +
                             "` is contravariant (`in`) but appears in field `" +
                             std::string(fd->name) +
-                            "` (invariant position — §12.9)");
+                            "` (invariant position" + varianceComposedClause(composed) +
+                            " — §12.9)");
                     }
                     continue;
                 }
