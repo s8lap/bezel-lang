@@ -10524,7 +10524,14 @@ void Resolver::checkAbstractImplementations() {
                     if (!ctype) continue;
                     if (itype->kind == TypeRef::Kind::Error ||
                         ctype->kind == TypeRef::Kind::Error) continue;
-                    if (!typeRefEqual(itype, ctype)) {
+                    // #6316 / §11.2: `itype` names no class type parameter
+                    // (non-generic interface) and `ctype` was read into the
+                    // implementing class's scope above, so a type parameter
+                    // compares by spelling (`Box<Exception>` is not `Box<U>`).
+                    if (!typeRefEqualScopedUnlessAlias(
+                            itype, ctype,
+                            ctx_.isImported(ips) ||
+                                ctx_.isImported(cit->second))) {
                         ctx_.diagnostics().report(
                             Severity::Error, cit->second->declLoc,
                             std::string("property `") + std::string(name) +
@@ -10550,7 +10557,10 @@ void Resolver::checkAbstractImplementations() {
                 if (!itype || !ctype) continue;
                 if (itype->kind == TypeRef::Kind::Error ||
                     ctype->kind == TypeRef::Kind::Error) continue;
-                if (!typeRefEqual(itype, ctype)) {
+                // #6316 / §9.1, §11.2: the positional field's declared type
+                // is in `t`'s own scope; same spelling compare as above.
+                if (!typeRefEqualScopedUnlessAlias(
+                        itype, ctype, ctx_.isImported(ips))) {
                     ctx_.diagnostics().report(
                         Severity::Error, t->declLoc,
                         std::string("property `") + std::string(name) +

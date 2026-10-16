@@ -198,6 +198,107 @@ end Program;
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
+BEZEL_TEST(type_param_identity_6316, iface_property_nonnull_generic_arg_other_parameter_rejected_spec_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public class E<U>: N
+  public constructor() end constructor;
+  public property Val: Box<U>? => null;
+end E;
+public class Program
+  public static method Main(): int
+
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kIfaceMsg));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+BEZEL_TEST(type_param_identity_6316, iface_property_bare_builtin_vs_parameter_rejected_spec_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public interface N
+  readonly property Val: Exception?;
+end N;
+public class E<U>: N
+  public constructor() end constructor;
+  public property Val: U? => null;
+end E;
+public class Program
+  public static method Main(): int
+
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kIfaceMsg));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+BEZEL_TEST(type_param_identity_6316, iface_property_positional_field_other_parameter_rejected_spec_9_1) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public record R<U>(Val: Box<U>?): N end R;
+public class Program
+  public static method Main(): int
+
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kIfaceMsg));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+BEZEL_TEST(type_param_identity_6316, iface_property_inherited_generic_base_rejected_spec_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public class Bs<T>
+  public constructor() end constructor;
+  public property Val: Box<T>? => null;
+end Bs;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public class K<U>: Bs<U>, N
+  public constructor() end constructor;
+end K;
+public class Program
+  public static method Main(): int
+
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kIfaceMsg));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
 BEZEL_TEST(type_param_identity_6316, abstract_property_builtin_arg_vs_parameter_rejected_spec_12_1) {
     auto r = runAot(R"BZ(
 module M;
@@ -221,6 +322,38 @@ end Program;
 )BZ");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorContaining(r, kOverrideMsg));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+BEZEL_TEST(type_param_identity_6316, iface_property_two_level_generic_base_rejected_spec_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public class Bs<T>
+  public constructor() end constructor;
+  public property Val: Box<T>? => null;
+end Bs;
+public class Mid<V>: Bs<V>
+  public constructor() end constructor;
+end Mid;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public class K<U>: Mid<U>, N
+  public constructor() end constructor;
+end K;
+public class Program
+  public static method Main(): int
+
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kIfaceMsg));
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_FALSE(r.ran);
 }
@@ -518,6 +651,111 @@ end Program;
     BEZEL_EXPECT_EQ(r.stdoutText, "27\n");
 }
 
+BEZEL_TEST(type_param_identity_6316, accepted_a31_spec_12_1_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public class E<U>: N
+  public constructor() end constructor;
+  public property Val: Box<Exception>? => null;
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<int>();
+    Console.WriteLine(41);
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "41\n");
+}
+
+BEZEL_TEST(type_param_identity_6316, accepted_a32_spec_12_1_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public interface N
+  readonly property Val: Exception?;
+end N;
+public class E<U>: N
+  public constructor() end constructor;
+  public property Val: Exception? => null;
+end E;
+public class Program
+  public static method Main(): int
+    var e := new E<int>();
+    Console.WriteLine(42);
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "42\n");
+}
+
+BEZEL_TEST(type_param_identity_6316, accepted_a33_spec_12_1_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public record R(Val: Box<Exception>?): N end R;
+public class Program
+  public static method Main(): int
+    var r := new R(null);
+    Console.WriteLine(43);
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "43\n");
+}
+
+BEZEL_TEST(type_param_identity_6316, accepted_a34_spec_12_1_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public class Bs<T>
+  public constructor() end constructor;
+  public property Val: Box<T>? => null;
+end Bs;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public class K: Bs<Exception>, N
+  public constructor() end constructor;
+end K;
+public class Program
+  public static method Main(): int
+    var e := new K();
+    Console.WriteLine(44);
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "44\n");
+}
+
 BEZEL_TEST(type_param_identity_6316, accepted_a35_spec_12_1_11_2) {
     auto r = runAot(R"BZ(
 module M;
@@ -544,6 +782,72 @@ end Program;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "45\n");
+}
+
+BEZEL_TEST(type_param_identity_6316, accepted_a38_spec_12_1_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public class Bs<T>
+  public constructor() end constructor;
+  public property Val: Box<T>? => null;
+end Bs;
+public class Mid: Bs<Exception>
+  public constructor() end constructor;
+end Mid;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public class K: Mid, N
+  public constructor() end constructor;
+end K;
+public class Program
+  public static method Main(): int
+    var e := new K();
+    Console.WriteLine(48);
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "48\n");
+}
+
+BEZEL_TEST(type_param_identity_6316, accepted_a39_spec_12_1_11_2) {
+    auto r = runAot(R"BZ(
+module M;
+public class Box<Z>
+  public constructor() end constructor;
+end Box;
+public class Bs<T>
+  public constructor() end constructor;
+  public property Val: Box<T>? => null;
+end Bs;
+public class Mid<V>: Bs<V>
+  public constructor() end constructor;
+end Mid;
+public interface N
+  readonly property Val: Box<Exception>?;
+end N;
+public class K<U>: Mid<Exception>, N
+  public constructor() end constructor;
+end K;
+public class Program
+  public static method Main(): int
+    var e := new K<int>();
+    Console.WriteLine(49);
+    return 0;
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "49\n");
 }
 
 BEZEL_TEST(type_param_identity_6316, accepted_a40_spec_12_1_11_2) {
@@ -603,4 +907,3 @@ end Program;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "51\n");
 }
-
