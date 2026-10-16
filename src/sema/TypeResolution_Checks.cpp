@@ -7394,7 +7394,30 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // makes an alias a pure synonym, and the spelling read sees through
         // it — so only an IMPORTED base (where the marker is lost) stays on
         // the blind compare.
-        if (!typeRefEqualScopedUnlessAlias(dTy, bTySubst, !bDecl)) {
+        //
+        // fix #6328 (§12.1, §11.2, §27.8, v0.338): for an IMPORTED base that
+        // blind compare cannot stay: `bDecl` is null (the artifact interface
+        // carries no AST, §2.8.2/§2.8.3), so `bTy` arrives through
+        // ctx_.importedMemberType, and a class type parameter crossing the
+        // artifact boundary is exactly a declaration-less Named ref whose head
+        // is its name — the shape the blind `typeRefEqual` equates with every
+        // other declaration-less Named ref. `B2<P, Q>`'s `V: Q` was therefore
+        // "implemented" by `V: P` across a module boundary while the identical
+        // one-unit program is rejected.
+        //
+        // `overrideSpellingDiffers` is the same walk the method-return and
+        // method-parameter sites already run on an IMPORTED base
+        // (checkOverrideSignatureMatch, above), so this adds no new failure
+        // mode: it compares a base class parameter against its substituted
+        // argument in the derived scope, is alias-transparent by construction
+        // (`declLessNamedSpelling` reads `aliasResolvedHead` first), and leaves
+        // every other spelling to `typeRefEqual`. A base type that is NOT a
+        // class parameter — a builtin, a user class — is not a substitution
+        // site, so the walk declines it exactly as it declines one for a
+        // local base.
+        const auto valueScope = makeOverrideTParamScope(derived, base, genericSubst);
+        if (!typeRefEqualScopedUnlessAlias(dTy, bTySubst, !bDecl) ||
+            overrideSpellingDiffers(dTy, bTy, valueScope, false)) {
             err("property type");
         }
 
