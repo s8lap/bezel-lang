@@ -3486,6 +3486,125 @@ static std::string_view builtinExceptionName(const TypeRef* t) {
     return common::isBuiltinExceptionName(n) ? n : std::string_view{};
 }
 
+// fix #6335 / §22.6, §11.3, §12.9 (v0.338): a parameter type in the
+// §22.6/§11.3 clash predicate. `typeRefEqual` decides a `Named` pair by
+// declaration-POINTER identity, and every ref that names a built-in class or
+// interface (`Array`, `IEnumerable`, `IList`, `ICollection`, `Set`, `Object`,
+// `Exception`, `Task`, ...) or a CLASS type parameter carries
+// `declaration == nullptr` — the always-available built-ins have no user
+// TypeSymbol (§31.4). The blind compare therefore calls `Array<V>` and
+// `IEnumerable<V>` the same type, and two overloads differing only in which
+// stdlib instantiation they name are reported as indistinguishable: a pair
+// that §22.6 admits and §12.9 separates (collection vs interface). The same
+// blindness is what `typeRefEqualSameScope` fixes on the override path
+// (#6315); this is the declaration-side half, the twin of #6292's call-side
+// half.
+//
+// Two guards keep the name compare from over-reaching:
+//
+//  * §11.3 "Generic methods" (v0.338): "Two methods declaring the same number
+//    of type parameters of their own compare their parameter types with those
+//    type parameters corresponding by position, not by name ... So `M<T>(x: T)`
+//    and `M<U>(x: U)` clash ... Neither type-parameter names nor `where`
+//    constraints distinguish members." A bare type parameter is therefore
+//    compared by its POSITION in the declaring method's own list, never by
+//    spelling — and a type parameter is never the same type as a non-type-
+//    parameter (`M<T>(x: int)` beside `M<U>(x: U)` are distinguishable).
+//    CLASS type parameters are not covered by that clause, which speaks of
+//    "type parameters of their own", so `V` and `W` are compared by spelling
+//    like any other declaration-less Named ref — the same reading
+//    `typeRefEqualSameScope` already applies to `Array<V>` with `Array<W>`
+//    (#6315), so both paths agree.
+//
+//  * §27.8 (v0.338) makes a type alias transparent for identity. An aliased
+//    TypeRef has had its UNDERLYING payload copied in (with the use-site
+//    astNode restored), so its structure is already the aliased type's and
+//    only its name-bearing fields are the use-site alias name — comparing
+//    `headName()` there would compare `Id<V>`'s alias spelling `Id` against a
+//    bare `V` and wrongly separate two spellings of one type. A ref that
+//    arrived through an alias keeps the blind declaration compare.
+//
+// A ref with NO readable head (neither astNode, importedName nor an alias
+// head) also keeps the blind compare: an unknown head is not evidence of a
+// difference.
+static bool overloadSigTypeRefEqual(const TypeRef* a, const TypeRef* b,
+                                    const std::vector<Symbol*>& aTPs,
+                                    const std::vector<Symbol*>& bTPs) {
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->nullable != b->nullable) return false;
+    switch (a->kind) {
+        case TypeRef::Kind::Error:
+            return false;
+        case TypeRef::Kind::Unit:
+            return true;
+        case TypeRef::Kind::Primitive:
+            return a->primitive == b->primitive;
+        case TypeRef::Kind::Named: {
+            if (a->declaration != b->declaration) return false;
+            if (!a->declaration && !a->aliasResolvedHead.empty()) {
+                // §27.8: arrived through an alias — see the note above.
+            } else if (!a->declaration) {
+                // §11.3 positional correspondence for a bare type parameter
+                // of the DECLARING METHOD's own list.
+                auto indexOf = [](const TypeRef* t,
+                                  const std::vector<Symbol*>& tps) -> int {
+                    if (!t->genericArgs.empty()) return -1;
+                    std::string_view n = t->headName();
+                    for (std::size_t k = 0; k < tps.size(); ++k) {
+                        if (auto* gps =
+                                dynamic_cast<GenericParamSymbol*>(tps[k])) {
+                            if (gps->name == n) return static_cast<int>(k);
+                        }
+                    }
+                    return -1;
+                };
+                const int ia = indexOf(a, aTPs);
+                const int ib = indexOf(b, bTPs);
+                if (ia >= 0 && ib >= 0) return ia == ib;
+                if (ia >= 0 || ib >= 0) return false;
+                const std::string_view ha = a->headName();
+                const std::string_view hb = b->headName();
+                if (ha.empty() || hb.empty() || ha == hb) {
+                    // equal heads, or an unreadable head: fall through to the
+                    // structural compare below.
+                } else {
+                    return false;
+                }
+            }
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
+                if (!overloadSigTypeRefEqual(a->genericArgs[i],
+                                             b->genericArgs[i], aTPs, bTPs))
+                    return false;
+            }
+            return true;
+        }
+        case TypeRef::Kind::InlineArray:
+            if (a->arrayOwned != b->arrayOwned) return false;
+            if (a->arraySizeValue >= 0 && b->arraySizeValue >= 0 &&
+                a->arraySizeValue != b->arraySizeValue)
+                return false;
+            return overloadSigTypeRefEqual(a->arrayElement, b->arrayElement,
+                                          aTPs, bTPs);
+        case TypeRef::Kind::Function: {
+            if (a->funcParams.size() != b->funcParams.size()) return false;
+            for (std::size_t i = 0; i < a->funcParams.size(); ++i) {
+                if (a->funcParams[i].modifier != b->funcParams[i].modifier)
+                    return false;
+                if (!overloadSigTypeRefEqual(a->funcParams[i].type,
+                                             b->funcParams[i].type, aTPs,
+                                             bTPs))
+                    return false;
+            }
+            return a->funcReturnOwned == b->funcReturnOwned &&
+                   overloadSigTypeRefEqual(a->funcReturn, b->funcReturn, aTPs,
+                                           bTPs);
+        }
+    }
+    return false;
+}
+
 bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                            const std::vector<Symbol*>& b,
                                            const std::vector<Symbol*>& aGenericParams,
@@ -3559,7 +3678,8 @@ bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                    : nullptr;
         TypeRef* tb = pb->declType ? ctx_.resolvedType(*pb->declType)
                                    : nullptr;
-        if (!typeRefEqual(ta, tb)) return false;
+        if (!overloadSigTypeRefEqual(ta, tb, aGenericParams, bGenericParams))
+            return false;
         {
             // fix #5862: two different built-in exception classes.
             std::string_view na = builtinExceptionName(ta);
