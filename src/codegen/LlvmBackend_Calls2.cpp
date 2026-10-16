@@ -20785,6 +20785,12 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         const std::vector<int> formalToArg = importedFormalToArg(*ms, call.args);
         std::vector<llvm::Value*> ordered(formalToArg.size(), nullptr);
         std::vector<const ast::Expr*> orderedExprs(formalToArg.size(), nullptr);
+        // fix #6336 (§28.3 #993): the `?.` twin of the `.`-form `argTempSlots`
+        // — the spill slots whose unwind-only entries must be erased below once
+        // every argument (and every omitted default) has evaluated without
+        // throwing, so the normal path never double-disposes a value the callee
+        // has taken ownership of.
+        std::vector<llvm::AllocaInst*> argTempSlots;
         std::vector<int> argToFormal(call.args.size(), -1);
         for (std::size_t j = 0; j < formalToArg.size(); ++j)
             if (formalToArg[j] >= 0)
@@ -20918,6 +20924,125 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             }
             ordered[pi] = v;
             orderedExprs[pi] = a.value.get();
+            // fix #6336 / §28.3 *Unbound owned temporaries* + *A callee that
+            // stores a plain argument*, §7.5, §31.4 (v0.338): the `?.`
+            // twin of the `.`-form registration just above (the `.` form's own
+            // comment says this whole block "rewrites the ordered args by hand
+            // (no `buildOrderedArgs` call)" — the two hand-rolled loops drifted
+            // apart, and this one had NO argument-temporary registration at
+            // all). Because §7.5 places the whole argument-evaluation loop
+            // inside `callBB`, reached only on the non-null arm, a `new C()`
+            // temporary passed to an imported borrow parameter through `?.`
+            // leaked on EVERY call — MEASURED, 16 B/object for a user class
+            // and 40 B/object for a built-in exception, 200 iterations each.
+            //
+            // The registration is the SAME call the `.` form makes
+            // (`registerImportedBorrowedFreshClassTempArg`, #5268/#6311/#6336),
+            // so the two loops cannot drift again on the predicate or the
+            // disposal kind. It is placed AFTER the `?.`-specific coercions
+            // above rather than beside the `v = lowerExpr(...)`, because those
+            // coercions can REPLACE `v` (nullable lift-widen, §5.1), and the
+            // disposal must act on the value the callee actually receives.
+            //
+            // §7.5 placement is also what makes this correct on the null arm:
+            // this code only runs when the receiver was non-null, so a null
+            // receiver still evaluates no argument and registers nothing —
+            // "nothing to its right in the chain is evaluated" holds as-is,
+            // with no special-casing. An argument temporary cannot outlive the
+            // `callBB` block it is registered in: `disposeStack_.back()` is
+            // this block's own scope, discharged on both the normal exit and
+            // the unwind edge out of `callBB`, which is the §28.3 boundary for
+            // a full expression that is itself a conditional.
+            if (!byRef && a.modifier != "owned" && formalMod != "owned")
+                registerImportedBorrowedFreshClassTempArg(
+                    *a.value, v, /*conditionallyReached=*/true);
+            // fix #6336 / §28.3 (#993): the `?.` twin of the `.`-form #5293
+            // block. An `owned` formal at an IMPORTED callee takes ownership of
+            // a fresh owned temporary (`new` / `move` / owned operator /
+            // owned-returning call) on the normal path, so the caller keeps only
+            // an UNWIND-only entry: it fires when a LATER argument throws, the
+            // case where the temporary was produced but the callee never runs
+            // to take it. The `.` form registers the identical entry; this loop
+            // registered neither kind, and without this one the second half of
+            // the shape leaked: MEASURED, `s?.Eat(new Item(), Fire())` with
+            // `Fire()` throwing on every iteration leaked
+            // `SUMMARY: AddressSanitizer: 3200 byte(s) leaked in 200
+            // allocation(s).`
+            //
+            // ref/out formals are excluded (not owned sinks) and the
+            // borrow-formal case above already registered the callee-disposal
+            // variant, so the two cannot both fire for one argument. Both gates
+            // fail closed: a shape this misreads leaks, which is the safe
+            // direction next to a double free.
+            if (!byRef && formalMod == "owned" && !disposeStack_.empty() &&
+                v && v->getType()->isPointerTy() &&
+                !llvm::isa<llvm::ConstantPointerNull>(v)) {
+                const ast::Expr* av = a.value.get();
+                bool isOwnedTempArg = false;
+                if (dynamic_cast<const ast::NewExpr*>(av)) {
+                    isOwnedTempArg = true;
+                } else if (auto* un =
+                               dynamic_cast<const ast::UnaryExpr*>(av)) {
+                    if (un->op == "move") isOwnedTempArg = true;
+                } else if (auto* be =
+                               dynamic_cast<const ast::BinaryExpr*>(av)) {
+                    if (auto* osym = ctx_.exprSymbol(*be))
+                        if (auto* oms =
+                                dynamic_cast<sema::MethodSymbol*>(osym))
+                            isOwnedTempArg =
+                                oms->isOperator &&
+                                sema::methodReturnsOwned(*oms, ctx_);
+                } else if (auto* ce =
+                               dynamic_cast<const ast::CallExpr*>(av)) {
+                    isOwnedTempArg =
+                        common::calleeReturnsOwned(*ce, ctx_);
+                }
+                if (isOwnedTempArg) {
+                    const sema::TypeRef* at = ctx_.exprType(*av);
+                    bool isClassInstance =
+                        at && at->kind == sema::TypeRef::Kind::Named &&
+                        ((at->declaration &&
+                          at->declaration->kind == ast::TypeDeclKind::Class) ||
+                         isBuiltinExceptionTypeRef(at));
+                    if (isClassInstance) {
+                        // fix #6336 / §7.5 (v0.338): the SAME #2733
+                        // null-init the borrow registration above needs —
+                        // §7.5 puts this loop inside the non-null `callBB`, so
+                        // the unwind-only entry registered below is also live
+                        // on the null-receiver path, where this store never
+                        // ran. A bare alloca would hand that pass an undef
+                        // pointer. The entry-block null store dominates both
+                        // arms; the non-null arm overwrites it below.
+                        llvm::AllocaInst* tslot;
+                        {
+                            llvm::BasicBlock& entry =
+                                currentFn_->getEntryBlock();
+                            llvm::IRBuilder<> tmp(&entry, entry.begin());
+                            tslot = tmp.CreateAlloca(v->getType());
+                            // `calloc` in `allocBB` zeroes the frame-spill
+                            // struct and a promoted GEP does not dominate an
+                            // entry-block store (#2754) — the split
+                            // `entryAllocaNullPtr` documents.
+                            if (!smStateStruct_)
+                                tmp.CreateStore(
+                                    llvm::ConstantPointerNull::get(
+                                        llvm::cast<llvm::PointerType>(
+                                            v->getType())),
+                                    tslot);
+                        }
+                        builder_.CreateStore(v, tslot);
+                        if (smStateStruct_)
+                            asyncHandlerSpillSlots_.push_back(tslot);
+                        Disposal d{tslot, nullptr};
+                        // fires ONLY on throw: the callee owns the value on the
+                        // normal path and is the sole disposer there.
+                        d.unwindOnly = true;
+                        d.dynamicDispose = false;
+                        disposeStack_.back().push_back(d);
+                        argTempSlots.push_back(tslot);
+                    }
+                }
+            }
         }
         for (std::size_t j = 0; j < ordered.size(); ++j) {
             if (!ordered[j]) ordered[j] = importedDefaultArgValue(*ms, j);
@@ -20927,6 +21052,35 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             }
             args.push_back(ordered[j]);
             argExprs.push_back(orderedExprs[j]);
+        }
+        // fix #6336 / §28.3 (#993): the `?.` twin of the `.`-form discharge.
+        // Every argument evaluated without throwing, so the callee is about to
+        // run and takes ownership of each transferred owned temporary; erase
+        // exactly the unwind-only entries recorded above (matched by their spill
+        // slots) so the normal edge never disposes a value the callee now owns.
+        // They were `unwindOnly`, so they never fired on a normal exit; a later
+        // argument that threw already unwound through them. Other disposals
+        // pushed during argument evaluation (a borrow temporary's own entry) are
+        // NOT removed — those must survive the call.
+        //
+        // Gated on `!diverged_`, exactly as the `.` form gates its own: a `throw`
+        // argument above branched the current BB to `unwindBB_`, and a slot from
+        // an earlier argument is still live ON THAT EDGE — erasing it here would
+        // leak precisely the value the unwind edge exists to release. (`?.`'s
+        // enclosing `callBB` is itself non-vacuous, so the disposal lands in
+        // this block's own scope and runs when the block is left.)
+        if (!diverged_ && !argTempSlots.empty() && !disposeStack_.empty()) {
+            auto& scope = disposeStack_.back();
+            scope.erase(
+                std::remove_if(
+                    scope.begin(), scope.end(),
+                    [&](const Disposal& d) {
+                        return d.unwindOnly &&
+                               std::find(argTempSlots.begin(),
+                                         argTempSlots.end(),
+                                         d.slot) != argTempSlots.end();
+                    }),
+                scope.end());
         }
     }
     // per §14.1/§14.2 + §7.5 (issue #1278): install the method-level generic
@@ -21751,7 +21905,7 @@ llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
 // non-null; registered for scope-end dispose on BOTH edges via vtable Dispose.
 // The caller excludes ref/out/`owned` formals (an `owned` formal consumes it).
 void Emitter::registerImportedBorrowedFreshClassTempArg(
-    const ast::Expr& argExpr, llvm::Value* v) {
+    const ast::Expr& argExpr, llvm::Value* v, bool conditionallyReached) {
     if (disposeStack_.empty() || !v || !v->getType()->isPointerTy() ||
         llvm::isa<llvm::ConstantPointerNull>(v))
         return;
@@ -21771,10 +21925,76 @@ void Emitter::registerImportedBorrowedFreshClassTempArg(
     }
     if (!freshTemp) return;
     const sema::TypeRef* at = ctx_.exprType(*av);
-    if (!at || at->kind != sema::TypeRef::Kind::Named || !at->declaration ||
-        at->declaration->kind != ast::TypeDeclKind::Class)
+    // fix #6336 / §28.3 *Unbound owned temporaries* + *A callee that stores a
+    // plain argument*, §31.4 (v0.338): the class test must also admit the §31.4
+    // BUILT-IN EXCEPTION classes. They carry NO user TypeSymbol
+    // (`TypeRef::declaration == nullptr`), so `!at->declaration` answered "not a
+    // class" for every `new IOException("a")` / `new Exception("a")` argument to
+    // an IMPORTED callee, and the temporary — owned by no name and by nothing
+    // else — leaked on every call. §31.1 makes a built-in exception an ordinary
+    // owned heap class instance and §28.3 states the obligation for it exactly
+    // as for any other class in the same position ("a non-`owned` argument
+    // position is a borrowing use whatever the callee's body does with the
+    // parameter, and the temporary's disposal at its boundary does not depend on
+    // that body"), so the twin is admitted, not a new rule.
+    //
+    // This is the CROSS-MODULE sibling of the two widenings #6311 and #6337
+    // made, and all three are the same one-line predicate over the same
+    // declaration-less population — the single-module `buildOrderedArgs` caller
+    // arm, the single-module `registerUnwindOwnedParam` callee arm, and here the
+    // imported caller's arm, which exists because #1221 leaves an imported
+    // callee with no reconstructed `ast::MethodDecl` for `buildOrderedArgs` to
+    // run against.
+    //
+    // SCOPE — deliberately narrow, and it is the same recognizer all the sibling
+    // auto-dispose sites gate on: `isBuiltinExceptionTypeRef` requires a
+    // declaration-less Named TypeRef whose astNode NAME resolves in
+    // `builtinVtable_`, i.e. exactly the §31.4 hierarchy. A vtable-less built-in
+    // (a collection, a Task, a `FileStream` — `isVtableLessBuiltinClassName`)
+    // is NOT in `builtinVtable_` and stays excluded, which is what keeps the
+    // `dynamicDispose` vtable read below away from a plain C struct.
+    if (!at || at->kind != sema::TypeRef::Kind::Named)
         return;
-    llvm::AllocaInst* tslot = entryAlloca(v->getType());
+    if (!((at->declaration &&
+           at->declaration->kind == ast::TypeDeclKind::Class) ||
+          isBuiltinExceptionTypeRef(at)))
+        return;
+    // fix #6336 / §7.5 (v0.338): `conditionallyReached` is the `?.` caller's
+    // shape. §7.5 puts the whole argument-evaluation loop inside the non-null
+    // `callBB`, so a disposal registered here is ALSO live on the null-receiver
+    // path — where the production store below never ran. A bare `entryAlloca`
+    // hands that pass an UNDEF pointer to dispose: MEASURED, the first draft of
+    // this fix turned the previously-clean `s?.Nop(new Item())` on a null
+    // receiver into `AddressSanitizer: SEGV ... READ memory access` /
+    // `caused by a dereference of a high value address`, where the pre-fix
+    // compiler returned 42. This is precisely #2733's recorded reason for
+    // `entryAllocaNullPtr` ("a disposal pass can be reached on a path that never
+    // executed the production store ... a bare alloca would hand it an undef
+    // pointer to free"), reached here through a new path.
+    //
+    // The null store goes in the FUNCTION ENTRY block, which dominates both arms
+    // of the `?.` branch, so the null arm reads null and the null-guarded
+    // `dynamicDispose` below is a no-op there while the non-null arm overwrites
+    // it with the live pointer. The `.`-form and constructor callers pass the
+    // default `false`: their argument loop always runs, so every reader of the
+    // slot is dominated by its store and the bare alloca stays correct (and
+    // keeps the cheaper IR).
+    llvm::AllocaInst* tslot;
+    if (conditionallyReached) {
+        llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> tmp(&entry, entry.begin());
+        tslot = tmp.CreateAlloca(v->getType());
+        // `calloc` in `allocBB` already zeroes the frame-spill struct, and a
+        // promoted GEP does not dominate an entry-block store (#2754) — the
+        // same split `entryAllocaNullPtr` documents.
+        if (!smStateStruct_)
+            tmp.CreateStore(
+                llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(v->getType())),
+                tslot);
+    } else {
+        tslot = entryAlloca(v->getType());
+    }
     builder_.CreateStore(v, tslot);
     // fix #5286 / §28.3 *Deferred-activation callees*, §30.1 (v0.313): as in
     // the local arm, a suspension between this store and the disposal (`s :=

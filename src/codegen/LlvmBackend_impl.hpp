@@ -21894,8 +21894,16 @@ private:
     // of a fresh owned class temporary (`new C()`, `move x`, owned operator /
     // call result) through this one helper. `v` is the lowered argument; the
     // caller has already excluded ref/out/`owned` formals.
-    void registerImportedBorrowedFreshClassTempArg(const ast::Expr& argExpr,
-                                                   llvm::Value* v);
+    //
+    // `conditionallyReached` (fix #6336, §7.5, v0.338) is true for the `?.`
+    // caller, whose argument loop sits inside the non-null `callBB`: there the
+    // disposal is live on the null-receiver path too, where the production
+    // store never ran, so the slot must be null-INITIALISED in the function
+    // entry block (the #2733 rule). The `.`-form and constructor callers leave
+    // it false — their loop always runs, so a bare alloca is already correct.
+    void registerImportedBorrowedFreshClassTempArg(
+        const ast::Expr& argExpr, llvm::Value* v,
+        bool conditionallyReached = false);
 
     // CG6/CG9: a call whose callee resolves to a known method → direct
     // LLVM call with lowered positional arguments. An instance method
