@@ -4718,6 +4718,44 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     const ast::TypeAlias* decl;
                     ~AliasStackGuard() { stack.erase(decl); }
                 } aliasStackGuard{aliasResolutionStack_, aliasDecl};
+                // fix #6329 (§27.8, v0.338): the on-stack guard above tracks
+                // aliases whose BODY is being expanded. This reference site's
+                // own type arguments are NOT part of that expansion — they
+                // are a sibling subtree — so `Id<Id<int>>` at a use site
+                // re-entered the guarded arm for the inner `Id<int>` while
+                // the OUTER `Id` was still on the stack and was rejected as
+                // "type alias `Id` is recursive". §27.8 bans self-reference
+                // "in its aliased type or in its `where` clause": it
+                // constrains the DECLARATION, and `Id<Id<int>>` names `Id`
+                // only in an argument position, expanding to `int`, with no
+                // cycle. This guard pops the alias for the duration of
+                // argument resolution and restores it on exit.
+                //
+                // Soundness: a cycle is only reachable through an alias
+                // BODY. Popping for a finite argument subtree cannot hide
+                // one — every alias reached inside that subtree is pushed
+                // again on entry, so a cycle closing back on this alias is
+                // caught at the NEXT push, and the argument subtree itself
+                // is finite, so resolution still terminates.
+                //
+                // Deliberately NOT applied to the `where`-clause constraint
+                // validation below: `type Sorted<T> := Array<T> where T:
+                // Sorted<T>;` is a compile error §27.8 states explicitly
+                // ("or in its `where` clause"), and
+                // `recursive_type_alias_diag_4784.where_clause_self_bound_
+                // current_wording_pinned` pins that rejection. Popping there
+                // would silently ACCEPT a shape the spec bans.
+                struct AliasArgsGuard {
+                    std::unordered_set<const ast::TypeAlias*>& stack;
+                    const ast::TypeAlias* decl;
+                    bool popped;
+                    AliasArgsGuard(std::unordered_set<const ast::TypeAlias*>& s,
+                                   const ast::TypeAlias* d)
+                        : stack(s), decl(d), popped(s.erase(d) != 0) {}
+                    ~AliasArgsGuard() {
+                        if (popped) stack.insert(decl);
+                    }
+                };
                 // fix #4167 (§27.8, v0.298): a reference to a GENERIC alias
                 // that does not supply exactly the alias's own declared
                 // number of type arguments has no sound resolution — this
@@ -4799,15 +4837,20 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // (single-part Named with no generic args and no declaration),
                 // look it up in aliasSubst and use the concrete type directly.
                 std::unordered_map<std::string_view, TypeRef*> aliasSubst;
-                for (std::size_t gi = 0;
-                     gi < aliasDecl->genericParams.size() &&
-                     gi < t.genericArgs.size(); ++gi) {
-                    if (!t.genericArgs[gi]) continue;
-                    TypeRef* concreteArg =
-                        resolveType(*t.genericArgs[gi], scope);
-                    if (!concreteArg) continue;
-                    aliasSubst[aliasDecl->genericParams[gi].name] =
-                        concreteArg;
+                {   // fix #6329: pop the alias off the cycle guard while
+                    // resolving THIS reference site's own arguments.
+                    AliasArgsGuard aliasArgsGuard{aliasResolutionStack_,
+                                                  aliasDecl};
+                    for (std::size_t gi = 0;
+                         gi < aliasDecl->genericParams.size() &&
+                         gi < t.genericArgs.size(); ++gi) {
+                        if (!t.genericArgs[gi]) continue;
+                        TypeRef* concreteArg =
+                            resolveType(*t.genericArgs[gi], scope);
+                        if (!concreteArg) continue;
+                        aliasSubst[aliasDecl->genericParams[gi].name] =
+                            concreteArg;
+                    }
                 }
                 TypeRef* underlying = nullptr;
                 if (aliasDecl->aliasedType &&
@@ -4851,15 +4894,22 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     // template — an IR-verifier failure (call parameter type
                     // vs. the concrete argument's specialized struct type).
                     std::unordered_map<std::string_view, TypeRef*> aliasSubst;
-                    for (std::size_t gi = 0;
-                         gi < aliasDecl->genericParams.size() &&
-                         gi < t.genericArgs.size(); ++gi) {
-                        if (!t.genericArgs[gi]) continue;
-                        TypeRef* concreteArg =
-                            resolveType(*t.genericArgs[gi], scope);
-                        if (!concreteArg) continue;
-                        aliasSubst[aliasDecl->genericParams[gi].name] =
-                            concreteArg;
+                    {   // fix #6329: same argument guard as the first
+                        // substitution map above — this second map re-
+                        // resolves the same reference site's arguments, so
+                        // it needs the same pop.
+                        AliasArgsGuard aliasArgsGuard{aliasResolutionStack_,
+                                                      aliasDecl};
+                        for (std::size_t gi = 0;
+                             gi < aliasDecl->genericParams.size() &&
+                             gi < t.genericArgs.size(); ++gi) {
+                            if (!t.genericArgs[gi]) continue;
+                            TypeRef* concreteArg =
+                                resolveType(*t.genericArgs[gi], scope);
+                            if (!concreteArg) continue;
+                            aliasSubst[aliasDecl->genericParams[gi].name] =
+                                concreteArg;
+                        }
                     }
                     underlying =
                         substituteAliasGenericArgs(underlying, aliasSubst,

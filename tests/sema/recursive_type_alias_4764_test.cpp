@@ -158,3 +158,122 @@ BEZEL_TEST(recursive_type_alias_4764,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
+
+// ---------------------------------------------------------------------------
+// fix #6329 (§27.8, v0.338): the on-stack cycle guard must not fire on a
+// NESTED INSTANTIATION of a legitimate alias at a USE site.
+//
+// §27.8 scopes the self-reference ban to the DECLARATION: "An alias may not
+// reference itself, directly or through other aliases, in its aliased type or
+// in its `where` clause" (and, for generics, "A generic alias is subject to
+// the self-reference rule above"). The rule constrains what a `type`
+// declaration may name — it is NOT a use-site rule, and it is not a
+// same-name-mention rule. `type Id<T> := T;` mentions `Id` nowhere in its
+// aliased type, so `Id` is a well-formed alias; at a use site, `Id<Id<int>>`
+// names `Id` only in an ARGUMENT position, and expands to `int` with no
+// cycle — §27.8's "each instantiation of the alias is interchangeable with
+// the corresponding instantiation of the aliased type" makes it a synonym
+// for `int`.
+//
+// The guard added by #4764 pushed `aliasDecl` on entry to the
+// alias-transparency arm and popped it on exit, but the arm ALSO resolves
+// this reference site's own generic arguments while `aliasDecl` is still
+// pushed — so the inner `Id<int>` of `Id<Id<int>>` re-entered the guarded
+// arm, found `Id` already on the stack, and was rejected as
+// "type alias `Id` is recursive (§27.8)" (issue #6329's repro, verbatim).
+// Argument resolution is a SIBLING subtree, not an expansion of the alias
+// body, so the fix pops the alias for its duration and restores it on exit.
+// A cycle is only reachable through an alias BODY, so this cannot hide one:
+// every alias reached inside the (finite) argument subtree is pushed again on
+// entry, and a cycle closing back on this alias is caught at the next push.
+//
+// Deliberately NOT changed: the `where`-clause self-bound, which §27.8 bans
+// explicitly ("or in its `where` clause") and which
+// `recursive_type_alias_diag_4784.where_clause_self_bound_current_wording_
+// pinned` already pins. The constraint-validation path keeps the alias on the
+// stack.
+// ---------------------------------------------------------------------------
+
+// The issue's own repro, verbatim: `Id<Id<int>>` in a local's declared type.
+BEZEL_TEST(recursive_type_alias_4764, nested_generic_use_site_accepted_6329) {
+    auto r = runAot(
+        "module M; "
+        "type Id6329a<T> := T; "
+        "public static class Program6329a "
+        "  public static method Main(): int "
+        "    var v: Id6329a<Id6329a<int>> := 3; "
+        "    Console.WriteLine(v); "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "3\n");
+}
+
+// The same nested instantiation three deep: each level re-enters the guarded
+// arm once more, so this row is the one that would still fail if the fix
+// popped the alias only one level deep.
+BEZEL_TEST(recursive_type_alias_4764, triple_nested_generic_use_accepted_6329) {
+    auto r = runAot(
+        "module M; "
+        "type Id6329b<T> := T; "
+        "public static class Program6329b "
+        "  public static method Main(): int "
+        "    var v: Id6329b<Id6329b<Id6329b<int>>> := 3; "
+        "    Console.WriteLine(v); "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "3\n");
+}
+
+// The nested instantiation is not special to a local's declared type: it must
+// also resolve in a method RETURN type, in a PARAMETER type, and nested
+// inside another generic's argument list — three different reference contexts
+// that each re-enter the alias-transparency arm through a different path.
+BEZEL_TEST(recursive_type_alias_4764, nested_generic_use_contexts_accepted_6329) {
+    auto r = runAot(
+        "module M; "
+        "type Id6329c<T> := T; "
+        "public static class Program6329c "
+        "  public static method R(): Id6329c<Id6329c<int>> => 3; "
+        "  public static method Take(x: Id6329c<Id6329c<int>>): int => x; "
+        "  public static method Main(): int "
+        "    var a: Array<Id6329c<Id6329c<int>>> := [R()]; "
+        "    Console.WriteLine(Take(a[0])); "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "3\n");
+}
+
+// The other side of the fix: popping the alias for argument resolution must
+// not ACCEPT a real cycle that is still reachable through an alias BODY. This
+// row puts a legitimate nested instantiation AND a self-referential body in
+// ONE program — so it also pins that the new accept path does not mask the
+// §27.8 rejection in a file that exercises both.
+BEZEL_TEST(recursive_type_alias_4764, cycle_still_rejected_beside_nested_use_6329) {
+    auto r = runAot(
+        "module M; "
+        "type Id6329d<T> := T; "
+        "type Loop6329d<T> := Loop6329d<T>; "
+        "public static class Program6329d "
+        "  public static method Main(): int "
+        "    var v: Id6329d<Id6329d<int>> := 3; "
+        "    var w: Loop6329d<int> := 1; "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r,
+                                                "type alias `Loop6329d` is recursive"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "27.8"));
+}
