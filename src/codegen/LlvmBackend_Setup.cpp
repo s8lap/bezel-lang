@@ -41047,6 +41047,16 @@ void Emitter::collectCellFreeEligible(
             if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
                 if (as->target) walkExpr(ctx, as->target.get(), out);
                 if (as->value) walkExpr(ctx, as->value.get(), out); return; }
+            // fix #6313 (§27.5 / §17.6, v0.338): `n++` / `n--` is an
+            // `IncrementStmt`, a sibling of `AssignmentStmt` whose `target`
+            // is the captured local. With no arm here a lambda whose only
+            // reference to a captured `var` was an increment contributed no
+            // symbol, so `collectLambdaCaptures` never classified the
+            // already-boxed cell and `cellFreeEligible_` never armed: 4 B
+            // leaked per call. Symmetric with the AssignmentStmt arm.
+            if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+                if (inc->target) walkExpr(ctx, inc->target.get(), out);
+                return; }
             if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
                 if (rs->value) walkExpr(ctx, rs->value.get(), out); return; }
             if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
