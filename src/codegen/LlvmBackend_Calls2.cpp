@@ -9794,7 +9794,56 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         llvm::Value* wrapped = wrapUserClassAsIEnumerable(
                             src, recvTy->declaration, resultTy,
                             /*ownsSrc=*/!srcIsNamedOwner);
-                        if (wrapped) return wrapped;
+                        // fix #6326 (§29.11 / §11.2 / §12.1, v0.338):
+                        // `wrapUserClassAsIEnumerable` DECLINES by returning `src`
+                        // UNCHANGED — every one of its decline paths does
+                        // (`if (!getEnumSym) return src;`, `if (!enumTyRef)
+                        // return src;`, `if (!enumTs) return src;`, `if
+                        // (!moveNextSym) return src;`, `if (mnIt ==
+                        // methodFns_.end()) return src;`, and the unwrappable-
+                        // Current paths after it). The old `if (wrapped)
+                        // return wrapped;` could not tell a WRAP from a
+                        // DECLINE, so a decline handed the RECEIVER (`Bag`
+                        // itself) back as the call's result — the caller then
+                        // drove `Bag` through the §29.11 iterator vtable, and
+                        // since `Bag` declares no `MoveNext`/`Current` the slot-2
+                        // dispatch read whatever followed its type-descriptor
+                        // header.
+                        //
+                        // MEASURED on r31-c1, the shape the issue reports:
+                        //
+                        //   public class Bag
+                        //     private _a: Array<int> := [1, 2, 3];
+                        //     public method GetEnumerator(): owned IEnumerator<int>
+                        //       => _a.GetEnumerator();
+                        //   end Bag;
+                        //
+                        // `enumTs` is null here (the declared return is the
+                        // builtin `IEnumerator<T>` sentinel, and `structurally-
+                        // IsEnumerator(Bag)` is false — no MoveNext, no Current),
+                        // so the scan finds no concrete enumerator class and the
+                        // function returns `src`. The enumerator was built
+                        // CORRECTLY inside the callee (instrumented: the callee
+                        // `ret`s a valid iterator-vtable `ptr`; consuming the
+                        // same `_a.GetEnumerator()` expression LOCALLY in the
+                        // same class yields all 3 elements) — it was the RETURN
+                        // that was replaced by `Bag`. The caller printed 0 and
+                        // then SEGV'd at exit.
+                        //
+                        // THE FIX: a decline is not a result. When the wrap
+                        // declines, fall through to the ordinary `ms`-based call
+                        // path below, which actually INVOKES the user's
+                        // `GetEnumerator` and hands back what it returns — the
+                        // correct enumerator. `src == wrapped` is the decline
+                        // test; it cannot be a false positive because a real
+                        // wrap allocates a fresh wrapper struct, so it can never
+                        // alias the receiver.
+                        //
+                        // This does not change any shape that wraps today: those
+                        // return a distinct `wrapped != src` and still return
+                        // here. It only gives the previously-silent decline path a
+                        // correct answer.
+                        if (wrapped && wrapped != src) return wrapped;
                     }
                 }
             }
