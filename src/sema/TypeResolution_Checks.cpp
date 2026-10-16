@@ -3215,29 +3215,22 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
     }
 }
 
-// #6316 / §27.8 (v0.338): an alias is a pure synonym, but an alias expansion
-// (`type Id<T> := T`) keeps the alias declaration's head, not the use-site
-// class parameter's, so spelling is no evidence inside one. True when the
-// type tree names an alias expansion (marker `aliasResolvedHead`, walked
-// through args, arrays, function types).
-static bool typeTreeHasAliasExpansion(const TypeRef* t) {
-    if (!t) return false;
-    if (!t->aliasResolvedHead.empty()) return true;
-    for (const TypeRef* g : t->genericArgs)
-        if (typeTreeHasAliasExpansion(g)) return true;
-    if (typeTreeHasAliasExpansion(t->arrayElement)) return true;
-    for (const auto& fp : t->funcParams)
-        if (typeTreeHasAliasExpansion(fp.type)) return true;
-    return typeTreeHasAliasExpansion(t->funcReturn);
-}
-
-// #6316: the spelling compare only where neither tree can hide an alias
-// expansion and neither side comes from an imported declaration (the marker
-// is lost on import); otherwise the blind compare, as before #6316.
+// fix #6327 / §27.8, §12.1, §11.2 (v0.338): the spelling compare, alias
+// expansion or not. An alias expansion is ALREADY alias-transparent to it: a
+// declaration-less Named pair is compared through `TypeRef::headName()`
+// (`TypeRef.hpp`), which reads `aliasResolvedHead` — the UNDERLYING head the
+// expansion carries — before the use-site one, so `Id<Q>` on one side and `Q`
+// on the other are the same head and the same type, exactly as §27.8's "pure
+// synonym" requires. #6316 instead gave up on the spelling the moment an alias
+// marker appeared anywhere in either tree and fell back to the blind
+// `typeRefEqual`, which cannot tell two class type parameters apart at all
+// (`P` with `Q` compared equal): a plainly wrong override whose pair merely
+// MENTIONS an alias was accepted. The only remaining blind case is an
+// IMPORTED declaration, where the marker does not survive the artifact
+// boundary and a spelling read would compare the alias name, not the type.
 static bool typeRefEqualScopedUnlessAlias(const TypeRef* a, const TypeRef* b,
                                           bool anyImported) {
-    if (anyImported || typeTreeHasAliasExpansion(a) ||
-        typeTreeHasAliasExpansion(b))
+    if (anyImported)
         return Resolver::typeRefEqual(a, b);
     return Resolver::typeRefEqualSameScope(a, b);
 }
@@ -6340,6 +6333,28 @@ TypeRef* Resolver::applyGenericSubst(
         tr, sema::SubstArgs{ctx_, genericSubst, {}, false, true});
 }
 
+// fix #6327 (§27.8, §12.1, §11.2, v0.338): the same walk for a BASE member's
+// declared type, which may itself BE an alias expansion over the base class's
+// own type parameter (`property V: Id<W>` in `B2<K, W>`). §27.8 makes an alias
+// a pure synonym, so `Id<W>` IS `W` and the chain substitution must reach
+// through it. `applyGenericSubst` looks a bare-parameter leaf up by its
+// SYNTACTIC head (`SubstArgs.cpp` `paramHead`), and an alias expansion carries
+// the alias's use site in `astNode` (`Id`), so `W` was missed and the base
+// type kept its unsubstituted `W`. The walker's `aliasChainParams` mode — the
+// one #6321 added for exactly this shape — retries the lookup by
+// `aliasResolvedHead` (the underlying parameter's name), so it substitutes
+// `Id<W>` -> `Q` and leaves every other spelling exactly as `applyGenericSubst`
+// leaves it (the retry is skipped for a built-in underlying head, which is
+// never a parameter).
+static TypeRef* applyBaseMemberSubst(
+        SemaContext& ctx, TypeRef* tr,
+        const std::unordered_map<std::string_view, TypeRef*>& genericSubst) {
+    return sema::substituteGenericArgs(
+        tr, sema::SubstArgs{ctx, genericSubst, SourceLocation{},
+                            /*validateNestedInlineArrays=*/false,
+                            /*aliasChainParams=*/true});
+}
+
 // §12.1 (#6299): the positions, in each class's `baseTypes`, of the base-type
 // path from `from` down to `target` (depth-first, first path found). Returns
 // false when `target` is not reachable through `baseTypes`.
@@ -7366,16 +7381,20 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // parameter, which are inputs).
         TypeRef* dTy =
             dDecl->type ? ctx_.resolvedType(*dDecl->type) : nullptr;
-        TypeRef* bTySubst = applyGenericSubst(bTy, genericSubst);
-        // #6316 / §12.1, §11.2 (v0.338): `dTy` is in the derived class's
+        // #6327 (§27.8, v0.338): the base's OWN declared type may be an alias
+        // over the base class's type parameter (`property V: Id<W>`), so the
+        // chain substitution must reach through the alias expansion — hence
+        // applyBaseMemberSubst, not applyGenericSubst.
+        TypeRef* bTySubst = applyBaseMemberSubst(ctx_, bTy, genericSubst);
+        // #6316 / #12.1, §11.2 (v0.338): `dTy` is in the derived class's
         // scope and `bTySubst` was read into it through the chain-composed
         // `genericSubst`, so a class type parameter compares by spelling
         // (`[i: P]: P` does not implement `B2<P, Q>`'s `[i: K]: W`).
-        // An alias in either tree, or an imported base, stays blind (the
-        // alias-spelled shapes keep their pre-#6316 accept-everything gap).
-        if (!typeRefEqualScopedUnlessAlias(
-                dTy, bTySubst,
-                !bDecl || typeTreeHasAliasExpansion(bTy))) {
+        // #6327: an alias expansion no longer makes the compare blind — §27.8
+        // makes an alias a pure synonym, and the spelling read sees through
+        // it — so only an IMPORTED base (where the marker is lost) stays on
+        // the blind compare.
+        if (!typeRefEqualScopedUnlessAlias(dTy, bTySubst, !bDecl)) {
             err("property type");
         }
 
