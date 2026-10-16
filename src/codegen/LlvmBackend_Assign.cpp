@@ -14074,6 +14074,186 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             b.CreateRet(clone);
         });
 
+    // fix #6343 (§29.1 / §29.11, v0.338): the RE-DISPATCH half of the wrapper
+    // family, selected per-INSTANCE at step 10 below.
+    //
+    // `enumTs` above is resolved by a STRUCTURAL GUESS: when the source class
+    // does not itself implement the enumerator protocol, the scan picks some
+    // other compiled class that exposes MoveNext + Current. The guess is
+    // correct for the two-class idiom (`IntRange.GetEnumerator()` really does
+    // `return new IntRangeEnum(...)`) and WRONG for a source whose
+    // `GetEnumerator` DELEGATES — `return other.GetEnumerator();` or
+    // `return _arr.GetEnumerator();`. There the eagerly fetched `enumPtr`
+    // (step 9) is not an `enumTs` instance at all: it is an `IEnumerator<T>`-
+    // FORMAT value the callee already built (another §29.11 wrapper struct, or
+    // a builtin collection's enumerator struct). Driving it through
+    // `moveNextFn` / `currentFn` / `enumDisposeFn` — which are typed against
+    // `enumTs`'s field layout — is a TYPE CONFUSION.
+    //
+    // MEASURED (the issue's own repro, `Bag.GetEnumerator(): owned
+    // IEnumerator<int> { var c := new Counter(); return c.GetEnumerator(); }`
+    // with an unrelated `Counter` class in the module, so the scan picks
+    // `Counter`): `bz$userenumenum$Bag$Counter$MoveNext` emits
+    //   call i1 @bz$Counter$MoveNext(ptr %enumPtr)
+    // where `%enumPtr` is a `{ptr vtable, ptr enumerator, ptr source, i1}`
+    // wrapper, and `Counter`'s object layout is `{ptr vtable, i8 disposed,
+    // i32 _cur}`. `_cur` is read at byte 12 — i.e. BITS 32..47 of the
+    // wrapper's `enumerator` POINTER. The program therefore prints
+    //   plain oracle: 9   (glibc heap addresses have bits 32..47 == 0, so the
+    //                       counter restarts from 0 and accidentally works)
+    //   ASan oracle:  0   (ASan's allocator region prefix is 0x7b7e, read
+    //                       back as the counter's starting value)
+    // with NO AddressSanitizer report at all — every byte read is in bounds of
+    // a live heap block. Inserting one `int` field ahead of `_cur` moves the
+    // read to byte 16 and BOTH oracles then agree on a different wrong answer
+    // (and on a variant whose bound is 3 000 000, the ASan leg throws
+    // `OverflowException` while the plain leg exits 0) — so the divergence is
+    // a value that depends only on WHERE the object lands, which is what makes
+    // it invisible to both oracles rather than merely wrong on one.
+    //
+    // THE FIX. The contract for `enumPtr` is not "an instance of the guessed
+    // class" — it is §29.11's own: a `GetEnumerator()` whose declared return is
+    // the `IEnumerator<T>` / `IOwningEnumerator<T>` head produces an
+    // `IEnumerator<T>`-FORMAT value, i.e. a pointer whose slot 0 is a 5-slot
+    // iterator vtable ([0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current,
+    // [4]=GetEnumerator). So when slot 0 is not `enumTs`'s own class vtable,
+    // the value is ALREADY in the format the caller consumes, and the correct
+    // lowering is to DRIVE IT THROUGH ITS OWN VTABLE rather than through the
+    // guessed class's methods. A single runtime identity test
+    // (`enumPtr->vtable == vtable$(enumTs)`) picks between the two families,
+    // so no static guess is trusted and the delegating shape is correct on
+    // every allocator and under both oracles.
+    //
+    // The three `$ad` functions below are that second family. `wrapGetEnumFn`
+    // (slot 4) is SHARED: it copies slot 0 verbatim, so a re-iteration clone of
+    // an `$ad` wrapper stays in the `$ad` family, and its fresh inner
+    // enumerator comes from another `srcGetEnumFn(srcObj)` call — a fresh
+    // adapter, which is exactly what §29.11's "each GetEnumerator() call
+    // produces an independent enumerator" requires.
+    //
+    // The `$ad` Dispose hands slot 1's reclamation to the inner wrapper's own
+    // Dispose (which owns it and frees itself), so — unlike the direct family —
+    // it must NOT `free(enumPtr)` again; that is also what closes the leak the
+    // direct family had here (its `enumDisposeFn(enumPtr)` ran the guessed
+    // class's disposer over an adapter and then reclaimed the adapter without
+    // ever disposing the enumerator inside it).
+    //
+    // The §29.11 vtable-slot load, in the same shape as the canonical dispatch
+    // every other vtable consumer uses (LlvmBackend_Disposal.cpp's CG35-itable
+    // slot-2 dispose): load slot 0 (the vtable), GEP to the slot, load the
+    // function pointer.
+    auto loadIterSlotFn = [&](llvm::IRBuilder<>& b, llvm::Value* enumObj,
+                              unsigned slot) -> llvm::Value* {
+        llvm::Value* vt = b.CreateLoad(ptrTy(), enumObj);
+        llvm::Value* addr = b.CreateGEP(ptrTy(), vt, {b.getInt32(slot)});
+        return b.CreateLoad(ptrTy(), addr);
+    };
+
+    llvm::Function* wrapDisposeAdFn = getOrCreate(prefix + "Dispose$ad",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* enumF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* enumPtr2 = b.CreateLoad(ptrTy(), enumF);
+            llvm::Value* srcF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* srcObj = b.CreateLoad(ptrTy(), srcF);
+            auto* freeFnCallee = module_->getOrInsertFunction(
+                "free", llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+            auto* freeFnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+            // Dispatch slot 1 (Dispose) of the INNER value's own vtable. A null
+            // inner enumerator has nothing to dispose; the direct family has
+            // no such guard, but this path is new code and must not turn a
+            // null into a wild indirect call.
+            auto* dispBB = llvm::BasicBlock::Create(llvm_, "wrapdisposead.disp", f);
+            auto* afterBB = llvm::BasicBlock::Create(llvm_, "wrapdisposead.after", f);
+            b.CreateCondBr(b.CreateIsNotNull(enumPtr2), dispBB, afterBB);
+            b.SetInsertPoint(dispBB);
+            b.CreateCall(freeFnTy, loadIterSlotFn(b, enumPtr2, 1), {enumPtr2});
+            b.CreateBr(afterBB);
+            b.SetInsertPoint(afterBB);
+            // The ownSrc half is structurally identical to the direct family's
+            // (comments there): `srcObj` is reclaimed here only when THIS
+            // instance owns it, and its §28.2 disposer is dispatched only when
+            // the inner adapter did not already do it (aliasesSrc).
+            llvm::Value* aliasesSrc =
+                b.CreateICmpEQ(enumPtr2, srcObj, "wrapdisposead.enum_is_src");
+            llvm::Value* ownsF = b.CreateStructGEP(stTy, self, 3);
+            llvm::Value* ownsSrcVal = b.CreateLoad(b.getInt1Ty(), ownsF);
+            auto* ownSrcBB =
+                llvm::BasicBlock::Create(llvm_, "wrapdisposead.ownsrc", f);
+            auto* afterSrcBB =
+                llvm::BasicBlock::Create(llvm_, "wrapdisposead.aftersrc", f);
+            b.CreateCondBr(ownsSrcVal, ownSrcBB, afterSrcBB);
+            b.SetInsertPoint(ownSrcBB);
+            {
+                auto* dispatchSrcBB = llvm::BasicBlock::Create(
+                    llvm_, "wrapdisposead.srcdispatch", f);
+                auto* reclaimSrcBB = llvm::BasicBlock::Create(
+                    llvm_, "wrapdisposead.srcreclaim", f);
+                b.CreateCondBr(aliasesSrc, reclaimSrcBB, dispatchSrcBB);
+                b.SetInsertPoint(dispatchSrcBB);
+                if (srcDisposeFn)
+                    b.CreateCall(srcDisposeFn->getFunctionType(),
+                                 srcDisposeFn, {srcObj});
+                b.CreateBr(reclaimSrcBB);
+                b.SetInsertPoint(reclaimSrcBB);
+                b.CreateCall(freeFnTy, freeFnCallee, {srcObj});
+                b.CreateBr(afterSrcBB);
+            }
+            b.SetInsertPoint(afterSrcBB);
+            b.CreateCall(freeFnTy, freeFnCallee, {self});
+            b.CreateRetVoid();
+        });
+
+    llvm::Function* wrapMoveNextAdFn = getOrCreate(prefix + "MoveNext$ad",
+        llvm::FunctionType::get(i1(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* enumF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* enumPtr2 = b.CreateLoad(ptrTy(), enumF);
+            auto* liveBB = llvm::BasicBlock::Create(llvm_, "wrapmnad.live", f);
+            auto* deadBB = llvm::BasicBlock::Create(llvm_, "wrapmnad.dead", f);
+            b.CreateCondBr(b.CreateIsNotNull(enumPtr2), liveBB, deadBB);
+            b.SetInsertPoint(deadBB);
+            b.CreateRet(b.getFalse());
+            b.SetInsertPoint(liveBB);
+            llvm::Value* r = b.CreateCall(llvm::FunctionType::get(
+                    b.getInt1Ty(), {ptrTy()}, false),
+                loadIterSlotFn(b, enumPtr2, 2), {enumPtr2});
+            if (r->getType() != b.getInt1Ty())
+                r = b.CreateTrunc(r, b.getInt1Ty());
+            b.CreateRet(r);
+        });
+
+    llvm::Function* wrapCurrentAdFn = getOrCreate(prefix + "Current$ad",
+        llvm::FunctionType::get(elemTy, {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* enumF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* enumPtr2 = b.CreateLoad(ptrTy(), enumF);
+            auto* liveBB = llvm::BasicBlock::Create(llvm_, "wrapcurad.live", f);
+            auto* deadBB = llvm::BasicBlock::Create(llvm_, "wrapcurad.dead", f);
+            b.CreateCondBr(b.CreateIsNotNull(enumPtr2), liveBB, deadBB);
+            b.SetInsertPoint(deadBB);
+            b.CreateRet(llvm::Constant::getNullValue(elemTy));
+            b.SetInsertPoint(liveBB);
+            llvm::Value* r = b.CreateCall(llvm::FunctionType::get(elemTy,
+                    {ptrTy()}, false),
+                loadIterSlotFn(b, enumPtr2, 3), {enumPtr2});
+            if (r->getType() != elemTy && elemTy->isIntegerTy() &&
+                r->getType()->isIntegerTy())
+                r = b.CreateTrunc(r, elemTy);
+            b.CreateRet(r);
+        });
+
     // 8. Build vtable global (§29.11 #943: 5 slots — slot 4 = GetEnumerator).
     std::string vtName = prefix + "vtable";
     // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
@@ -14095,10 +14275,62 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
     }
 
+    // fix #6343 (§29.1 / §29.11, v0.338): the `$ad` twin of the vtable global
+    // — same 5 slots, same slot-4 `wrapGetEnumFn`, but slot 1/2/3 re-dispatch
+    // through the inner enumerator's own vtable instead of the guessed class's
+    // methods. Selected PER INSTANCE at step 10 by the identity test below.
+    // It is deliberately a separate global rather than a per-instance flag so
+    // that every wrapper that does not need it keeps byte-identical generated
+    // code.
+    std::string vtAdName = prefix + "vtable$ad";
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtAdGV = module_->getNamedGlobal(vtAdName);
+    if (!vtAdGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: filled below
+            wrapDisposeAdFn,
+            wrapMoveNextAdFn,
+            wrapCurrentAdFn,
+            wrapGetEnumFn
+        };
+        vtAdGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtAdName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtAdGV, ptrTy());
+        vtAdGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
     // 9. Eagerly call GetEnumerator() on the source to get the enumerator ptr.
     std::vector<llvm::Value*> geArgs = {src};
     llvm::Value* enumPtr = emitMethodCall(getEnumSym, geArgs, /*baseQualified=*/false);
     if (!enumPtr) return src;
+
+    // fix #6343 (§29.1 / §29.11, v0.338): does the fetched enumerator really
+    // have the layout `enumTs` was guessed to have?  A runtime identity test
+    // against `enumTs`'s own class vtable — the only check that does not trust
+    // the structural scan. `enumPtr` is either an `enumTs` instance (the
+    // two-class and self-returning idioms: the direct family is correct) or a
+    // value the callee already put in §29.11 iterator-vtable format (a
+    // delegating `GetEnumerator`): the `$ad` family is correct there.
+    //
+    // A null `enumPtr` is reported as "not an enumTs" and therefore takes the
+    // `$ad` family, whose MoveNext/Current/Dispose each null-guard — a null
+    // here is a callee that returned no enumerator, and the direct family
+    // would have turned it into an indirect call through address zero.
+    //
+    // `vtableOf` returns null for an IMPORTED `enumTs` (imports have no local
+    // vtable global, LlvmBackend_Setup.cpp ~L5096); the test is then skipped
+    // entirely and the pre-existing direct lowering stands, unchanged.
+    llvm::Value* useAdFamily = nullptr;
+    if (llvm::GlobalVariable* enumClassVt = vtableOf(enumTs)) {
+        llvm::Value* enumVt = builder_.CreateLoad(ptrTy(), enumPtr);
+        llvm::Value* isEnumTs = builder_.CreateICmpEQ(enumVt, enumClassVt);
+        useAdFamily = builder_.CreateAnd(
+            builder_.CreateNot(builder_.CreateIsNull(enumPtr)),
+            builder_.CreateNot(isEnumTs));
+    }
 
     // 10. Allocate wrapper struct and fill fields (vtable, enumerator, source,
     // ownsSrc).
@@ -14106,7 +14338,13 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
     llvm::Value* wrap = builder_.CreateCall(callocFn2,
         {builder_.getInt64(1), builder_.getInt64(stSz)}, "userenumenum");
-    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, wrap, 0));
+    builder_.CreateStore(
+        useAdFamily
+            ? builder_.CreateSelect(useAdFamily,
+                                   static_cast<llvm::Value*>(vtAdGV),
+                                   static_cast<llvm::Value*>(vtGV))
+            : static_cast<llvm::Value*>(vtGV),
+        builder_.CreateStructGEP(stTy, wrap, 0));
     builder_.CreateStore(enumPtr, builder_.CreateStructGEP(stTy, wrap, 1));
     builder_.CreateStore(src, builder_.CreateStructGEP(stTy, wrap, 2));
     // fix #2424: only THIS original instance's `ownsSrc` reflects the

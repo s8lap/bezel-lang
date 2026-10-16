@@ -188,6 +188,20 @@ const char* kSideBySide =
 // catch the `wrapped != src` decline test wrongly rejecting a legitimate wrap.
 // The `n + e.Current + 1` accumulator over a 1..3 enumerator yields 9, same as
 // the issue's repro — what differs is WHICH code path produced the enumerator.
+//
+// fix #6343 (§29.1 / §29.11, v0.338): the `Counter` is held in an `owned`
+// FIELD of `Bag` rather than in an owned LOCAL of `Bag.GetEnumerator`. Both
+// spellings take the same wrap path and both produce the value 9, but the local
+// spelling embeds a SECOND, unrelated and still-unfiled defect: `var c := new
+// Counter();` is an owned local disposed at `GetEnumerator`'s own scope end
+// while the returned enumerator still aliases `c`, so it dangles (a
+// heap-use-after-free, which #6343's fix EXPOSES by making the wrapper drive
+// the real object instead of reading bits 32..47 of a wrapper pointer — see the
+// note on the row below). Holding `c` in an `owned` field gives `c` Bag's
+// lifetime instead of the method's, which isolates this row's stated purpose —
+// "the wrap is still reached and still drives" — from that lifetime question.
+// The local spelling is filed with its measured repro; no row here pins a value
+// for it.
 const char* kSelfImplementingControl =
     "module M6326Self; "
     "public class Counter "
@@ -201,9 +215,9 @@ const char* kSelfImplementingControl =
     "  public property Current: int get => _cur; end Current; "
     "end Counter; "
     "public class Bag "
+    "  private owned _c: Counter := new Counter(); "
     "  public method GetEnumerator(): owned IEnumerator<int> "
-    "    var c := new Counter(); "
-    "    return c.GetEnumerator(); "
+    "    return _c.GetEnumerator(); "
     "  end GetEnumerator; "
     "end Bag; "
     "public class M "
@@ -300,17 +314,31 @@ BEZEL_TEST(codegen_user_getenumerator_return_decline_6326,
 // designed for. If the `wrapped != src` decline test were rejecting a real
 // wrap, this row would break: the wrapper is still built and still drives.
 //
-// VALUE NOT ASSERTED, ON PURPOSE. This program prints 9 on the plain oracle and
-// 0 on the ASan oracle — MEASURED, and identically on unmodified r31-c1 with
-// this fix reverted, so it is not a #6326 regression. Pinning `9` would turn
-// the mandatory ASan gate leg red for a defect this issue does not own;
-// pinning `0` would bless a wrong answer. The divergence is filed as #6343.
-// This row therefore pins what is TRUE ON BOTH ORACLES — that the wrap is
-// reached and the program runs to completion without crashing or tripping the
-// sanitizer — which is exactly the property this fix must not break. (`ran` +
+// VALUE NOT ASSERTED, ON PURPOSE. This program printed 9 on the plain oracle
+// and 0 on the ASan oracle when this row was written — MEASURED, and
+// identically on unmodified r31-c1 with this fix reverted, so it was never a
+// #6326 regression. Pinning `9` would have turned the mandatory ASan gate leg
+// red for a defect this issue does not own; pinning `0` would have blessed a
+// wrong answer. That divergence is #6343, and it is now FIXED: the cause was a
+// type confusion in `wrapUserClassAsIEnumerable` (a class picked by its
+// structural scan was used to type a value of a different layout), so both
+// oracles now agree on 9. The VALUE assertions for this shape live in
+// tests/codegen/user_enumerator_delegating_wrapper_6343_test.cpp, where the
+// ASan leg is the oracle that proves it; this row keeps the narrower property
+// #6326 is about — that the `wrapped != src` decline test does not reject a
+// legitimate wrap, so the wrap is still reached and still drives. (`ran` +
 // `exitCode == 0` is the full no-crash/no-timeout oracle available on
 // JitResult; it has no `timedOut` field.) The companion value assertion for the
 // ordinary path is row (A), which is green on both oracles.
+//
+// NOTE on the program's spelling: `kSelfImplementingControl` holds its `Counter`
+// in an `owned` FIELD of `Bag`. It originally held it in an owned LOCAL of
+// `Bag.GetEnumerator`, which additionally embedded a dangling-enumerator
+// lifetime defect (the local is disposed at the method's scope end while the
+// returned enumerator aliases it). #6343's fix exposed that as a loud
+// heap-use-after-free — correctly, since it is a real use-after-free — so the
+// field spelling isolates this row's purpose. The local spelling is filed with
+// its measured repro; see the note on `kSelfImplementingControl` above.
 // ---------------------------------------------------------------------
 BEZEL_TEST(codegen_user_getenumerator_return_decline_6326,
            self_implementing_enumerator_still_wrapped_spec_29_11) {
