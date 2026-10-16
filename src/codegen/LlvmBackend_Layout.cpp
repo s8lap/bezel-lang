@@ -2779,6 +2779,72 @@ Emitter::RecordSubstGuard::~RecordSubstGuard() {
 }
 
 
+// fix #6319 (§23.4 / §14.1, v0.338): the kind-agnostic twin of
+// RecordSubstGuard immediately above — same param<->arg binding, minus the
+// Record/Choice gate, so a generic CLASS receiver (`VB<Array<int>>`) installs
+// its own substitution too. See the struct's declaration in
+// LlvmBackend_impl.hpp for the dispatch defect it fixes.
+Emitter::GenericRecvSubstGuard::GenericRecvSubstGuard(Emitter* em,
+                                                      const sema::TypeRef* rt,
+                                                      const sema::TypeSymbol* decl)
+    : e(em) {
+    // A value/record/choice receiver is what RecordSubstGuard already covers;
+    // this guard exists for the CLASS and INTERFACE kinds §23.4 dispatches
+    // through.
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    // §14.1: the SAME `sema::genericParamNames` source RecordSubstGuard reads
+    // (the AST decl for a local class/interface, TypeSymbol::genericParams
+    // from ModuleLoader::convertGenericParams for an imported one), so an
+    // imported generic base's key substitutes exactly as a local one does.
+    // Keep the arity guard — a bare `VB` TypeRef (no genericArgs) carries no
+    // binding and must keep the declared lowering.
+    const std::vector<std::string_view> gpNames =
+        sema::genericParamNames(rt->declaration);
+    if (!gpNames.empty() && gpNames.size() == rt->genericArgs.size()) {
+        savedSubst = e->genericSubst_;
+        savedSemaTy = e->genericSubstSemaTy_;
+        std::unordered_map<std::string_view, llvm::Type*> newSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+        for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+            // Lower/resolve each argument under the OUTER substitution (both
+            // honor it), so a nested instantiation `VB<Box<int>>` binds T to
+            // the specialized `Box<int>` rather than to an `int` placeholder.
+            newSubst[gpNames[gi]] = e->lowerTypeRef(rt->genericArgs[gi]);
+            newSema[gpNames[gi]] = e->resolveTypeParamRef(rt->genericArgs[gi]);
+        }
+        e->genericSubst_ = std::move(newSubst);
+        e->genericSubstSemaTy_ = std::move(newSema);
+        active = true;
+    }
+    // The ANCESTOR half (§14.1 through a base chain): the receiver's own
+    // binding above must already be installed, so the chain walk's
+    // `lowerTypeRef(Array<U>)` resolves `U`. `computeAncestorGenericSubst`
+    // refuses a chain it cannot pin every link of, and a refusal here leaves
+    // the pre-fix (declared) lowering in place rather than guessing.
+    if (decl && decl != rt->declaration && !decl->genericParams.empty()) {
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (em->computeAncestorGenericSubst(rt, decl, ancSubst, ancSema)) {
+            if (!active) {
+                savedSubst = e->genericSubst_;
+                savedSemaTy = e->genericSubstSemaTy_;
+            }
+            for (const auto& kv : ancSubst) e->genericSubst_[kv.first] = kv.second;
+            for (const auto& kv : ancSema)
+                e->genericSubstSemaTy_[kv.first] = kv.second;
+            active = true;
+        }
+    }
+}
+
+Emitter::GenericRecvSubstGuard::~GenericRecvSubstGuard() {
+    if (!active) return;
+    e->genericSubst_ = std::move(savedSubst);
+    e->genericSubstSemaTy_ = std::move(savedSemaTy);
+}
+
+
 // issue #462 / §14.1: resolve a record storage member's declared type through the
 // active generic substitution. A bare type-parameter declared type (`T` — a
 // single-part Named with no `declaration`) bound by `genericSubstSemaTy_` maps to

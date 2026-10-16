@@ -2438,13 +2438,31 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (recvDecl->kind == ast::TypeDeclKind::Class && !indexTargetIsBase(ix)) {
         auto gsIt = propGetSlot_.find(ps);
         if (gsIt != propGetSlot_.end()) {
-            llvm::Type* retTy = lowerType(pd->type.get());
-            if (!retTy) retTy = i32();
+            // fix #6319 (§23.4 / §14.1, v0.338): build the dispatched
+            // accessor's signature under the RECEIVER's own substitution. The
+            // slot holds the OVERRIDE's getter (`[i: Array<U>]` → ptr), so on
+            // a `VB<Array<int>>` receiver the declared `[i: T]` must read as
+            // its §14.1 binding `Array<int>` — reading it as the declared `T`
+            // yields the i32 erasure placeholder and the call passes a pointer
+            // against an i32 prototype (LLVM verify failure). Same for the
+            // generic ELEMENT type, where the mismatch is silent instead.
+            // No-op for a non-generic receiver (see GenericRecvSubstGuard).
+            // Scoped to the signature build ALONE: the receiver and index
+            // expressions below are lowered in the ENCLOSING scope, where the
+            // receiver's own parameter names are not in scope and a same-named
+            // outer type parameter must still resolve to its own binding.
+            llvm::Type* retTy = nullptr;
             std::vector<llvm::Type*> paramTys;
-            paramTys.push_back(ptrTy());
-            for (const auto& p : pd->indexerParams) {
-                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
-                paramTys.push_back(pt ? pt : i32());
+            {
+                GenericRecvSubstGuard recvSubst(this, ctx_.exprType(*ix.target),
+                                                     ps->parent);
+                retTy = lowerType(pd->type.get());
+                if (!retTy) retTy = i32();
+                paramTys.push_back(ptrTy());
+                for (const auto& p : pd->indexerParams) {
+                    llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                    paramTys.push_back(pt ? pt : i32());
+                }
             }
             auto* gFnTy = llvm::FunctionType::get(retTy, paramTys, false);
             llvm::Value* obj = lowerExpr(*ix.target);
@@ -3435,13 +3453,22 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     if (recvDecl->kind == ast::TypeDeclKind::Class && !indexTargetIsBase(ix)) {
         auto ssIt = propSetSlot_.find(ps);
         if (ssIt != propSetSlot_.end()) {
-            llvm::Type* valTy = lowerType(pd->type.get());
-            if (!valTy) valTy = i32();
+            // fix #6319 (§23.4 / §14.1, v0.338): the setter twin of the
+            // getter's signature guard — same receiver substitution, same
+            // reason (the slot holds the OVERRIDE's setter), scoped to the
+            // signature build alone.
+            llvm::Type* valTy = nullptr;
             std::vector<llvm::Type*> paramTys;
-            paramTys.push_back(ptrTy());
-            for (const auto& p : pd->indexerParams) {
-                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
-                paramTys.push_back(pt ? pt : i32());
+            {
+                GenericRecvSubstGuard recvSubst(this, ctx_.exprType(*ix.target),
+                                                     ps->parent);
+                valTy = lowerType(pd->type.get());
+                if (!valTy) valTy = i32();
+                paramTys.push_back(ptrTy());
+                for (const auto& p : pd->indexerParams) {
+                    llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                    paramTys.push_back(pt ? pt : i32());
+                }
             }
             paramTys.push_back(valTy);
             auto* sFnTy = llvm::FunctionType::get(
@@ -4313,13 +4340,22 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         auto gsIt = propGetSlot_.find(ps);
         auto ssIt = propSetSlot_.find(ps);
         if (gsIt != propGetSlot_.end() && ssIt != propSetSlot_.end()) {
-            llvm::Type* elemTy = lowerType(pd->type.get());
-            if (!elemTy) elemTy = i32();
+            // fix #6319 (§23.4 / §14.1, v0.338): the compound-assign twin of
+            // the getter's and setter's signature guards — both slots here hold
+            // the OVERRIDE's accessors, so both signatures are built under the
+            // receiver's §14.1 substitution, scoped to the build alone.
+            llvm::Type* elemTy = nullptr;
             std::vector<llvm::Type*> paramTys;
-            paramTys.push_back(ptrTy());
-            for (const auto& p : pd->indexerParams) {
-                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
-                paramTys.push_back(pt ? pt : i32());
+            {
+                GenericRecvSubstGuard recvSubst(this, ctx_.exprType(*ix->target),
+                                                     ps->parent);
+                elemTy = lowerType(pd->type.get());
+                if (!elemTy) elemTy = i32();
+                paramTys.push_back(ptrTy());
+                for (const auto& p : pd->indexerParams) {
+                    llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                    paramTys.push_back(pt ? pt : i32());
+                }
             }
             auto* gFnTy = llvm::FunctionType::get(elemTy, paramTys, false);
             std::vector<llvm::Type*> setParamTys(paramTys);

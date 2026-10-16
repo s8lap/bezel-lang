@@ -8129,6 +8129,55 @@ private:
         RecordSubstGuard& operator=(const RecordSubstGuard&) = delete;
     };
 
+    // fix #6319 (§23.4 / §14.1, v0.338): the KIND-AGNOSTIC twin of
+    // RecordSubstGuard. RecordSubstGuard gates on a Record/Choice receiver,
+    // which is right for its callers (a record's layout, field types and
+    // disposal) but excludes a generic CLASS receiver — and §23.4's indexer
+    // dispatch lowers a CLASS-typed receiver's accessor signature through it.
+    //
+    // §14.1 binds a generic class's declared type parameters to the type
+    // ARGUMENTS at the use site, so a call dispatched on `VB<Array<int>>`
+    // must build the callee's signature from the SUBSTITUTED declaration
+    // (`[i: T]` with T := Array<int>), not from the bare declared `T`. Reading
+    // the declared `T` yields the non-null i32 generic-erasure placeholder,
+    // which is the same lock the interface branch's #2528 comment records for
+    // the return type — and for a class-typed key it is not even the erased
+    // ABI but a flat wrong signature: the vtable slot holds the OVERRIDE's
+    // getter (`Array<U>` → ptr), so the call passes a pointer where the emitted
+    // prototype says i32 and LLVM's verifier aborts ("Call parameter type does
+    // not match function signature"). With a non-pointer placeholder (the
+    // generic ELEMENT type, `T := string` where the erased T is i32) there is
+    // no verifier error at all — the call simply returns garbage.
+    //
+    // A no-op for a non-generic receiver or a TypeRef whose genericArgs do not
+    // match the declared parameter count, so every caller with no receiver
+    // instantiation to install keeps the declared (erased) lowering it has
+    // today. The OUTER substitution is saved and restored, so it chains inside
+    // a monomorphized generic body. RAII, so every early return restores.
+    //
+    // `decl` names the class that DECLARED the signature being lowered — the
+    // PropertySymbol's parent, which is the receiver's own class for a direct
+    // access but an ANCESTOR for one through an intermediate (`Root<T>` reached
+    // through `Mid<int>`, `Mid<U>: Root<Array<U>>`). The ancestor's parameters
+    // are bound by `computeAncestorGenericSubst`, which walks the base chain
+    // from the receiver and composes `T := Array<U>` with the receiver's own
+    // `U := int`; it must run AFTER this guard's own receiver binding so
+    // `lowerTypeRef(Array<U>)` inside it sees `U` already bound. A chain it
+    // cannot prove is left uninstalled (its own discipline — never install a
+    // substitution we cannot prove), which keeps the pre-fix lowering rather
+    // than a guessed one.
+    struct GenericRecvSubstGuard {
+        Emitter* e;
+        std::unordered_map<std::string_view, llvm::Type*> savedSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> savedSemaTy;
+        bool active = false;
+        GenericRecvSubstGuard(Emitter* em, const sema::TypeRef* rt,
+                              const sema::TypeSymbol* decl = nullptr);
+        ~GenericRecvSubstGuard();
+        GenericRecvSubstGuard(const GenericRecvSubstGuard&) = delete;
+        GenericRecvSubstGuard& operator=(const GenericRecvSubstGuard&) = delete;
+    };
+
     // §33: the entry-point method's LLVM function is named `main`; every
     // other static method gets a mangled, collision-free name.
     std::string functionName(sema::MethodSymbol* ms);
