@@ -8760,6 +8760,63 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     !ce.args.empty() && ce.args[0].value) {
                     const TypeRef* argTy =
                         ctx_.exprType(*ce.args[0].value);
+                    // fix #6276 (§7.4, v0.338): the sugar is DEFINED as the
+                    // instance call on the first argument (`Array.Sort(a)` ↔
+                    // `a.Sort()`), so §7.4's member-access rule reaches it
+                    // unchanged: the argument IS the receiver, and a receiver
+                    // read off an un-narrowed `Array<T>?` is the same
+                    // un-narrowed read. The guard below tested only the
+                    // head name and arity, never nullability, so
+                    // `var n: Array<int>? := [3, 1]; Array.Sort(n)` compiled
+                    // (MEASURED at 389ca74b, rc 0) while the identical
+                    // instance form `n.Sort()` was rejected with "member
+                    // access `.Sort` on a nullable value requires narrowing it
+                    // to non-null first (§7.4)" — the sugar accepted a program
+                    // its own definition rejects.
+                    //
+                    // The test is `isNarrowedNonNullRead`, NOT `!nullable`:
+                    // `exprType` keeps `nullable = true` on a §7.4-NARROWED
+                    // identifier too, so a `!argTy->nullable` guard would
+                    // wrongly reject the valid
+                    // `if n <> null then Array.Sort(n); end` (and, found while
+                    // reviewing #6265, that is the shape a naive guard breaks).
+                    // §7.4's own predicate is the single source of truth for
+                    // "this read is non-null here", and it covers the `!`
+                    // force-unwrap as well as the guard.
+                    //
+                    // Gated on the argument naming the SAME collection family,
+                    // because §7.4 only governs a receiver that IS one. A bare
+                    // `null` literal is typed as the nullable-`Object` sentinel
+                    // (no head name, never narrowable — §14.5's "a bare `null`
+                    // literal argument is not self-determined"), and a
+                    // non-collection argument is not this member's receiver at
+                    // all; both belong to the #6265 §3.4 diagnostic that
+                    // follows, which says what is actually wrong ("'Array' has
+                    // no static method or property 'Sort'"). Without the gate
+                    // this guard pre-empted it for `Array.Sort(null)` and
+                    // `Array.Sort("s")` — MEASURED: it broke
+                    // array_sort_static_call_3345.
+                    // static_call_wrong_shape_rejected_not_crash, which pins the
+                    // §3.4 needle for both.
+                    if (argTy && argTy->nullable &&
+                        argTy->kind == TypeRef::Kind::Named &&
+                        argTy->headName() == colName &&
+                        !isNarrowedNonNullRead(ce.args[0].value.get())) {
+                        ctx_.diagnostics().report(
+                            Severity::Error,
+                            ce.args[0].value->span.begin,
+                            "the `" + std::string(colName) + "." +
+                                std::string(m) + "(" +
+                                "` argument is the receiver of the equivalent "
+                                "instance call (`" + std::string(m) +
+                                "()` on it), and it is read at type `" +
+                                std::string(argTy->headName()) +
+                                "?` — a nullable value requires narrowing it "
+                                "to non-null first (§7.4): guard with `if x <> "
+                                "null`, force-unwrap with `x!, or use the "
+                                "null-conditional `x?." + std::string(m) + "`");
+                        return;
+                    }
                     if (argTy &&
                         argTy->kind == TypeRef::Kind::Named &&
                         !argTy->declaration && argTy->astNode &&
