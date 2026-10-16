@@ -141,6 +141,35 @@ BEZEL_TEST(variance_position_composed_6348, out_t_in_covariant_base_list_accepte
         "end IROut; ");
 }
 
+// The base list DEFERS an ambiguity rather than picking a reading (narrow
+// #6348; spec-question #6355). §12.9 opens the case with "A generic interface
+// may extend a generic base whose variance is different from its own" and works
+// it as `IList<T>` — invariant — extending `IReadOnlyList<out T>`, and closes
+// with "The inheritance relation only fixes the type argument substituted into
+// the base — it does not alter what positions T may legally appear in within
+// the derived interface". Read together those withdraw the base list from the
+// position check. Against them C# rejects the shape (CS1961), so the constraint
+// reading has precedent and the text is not beyond doubt; #6355 records both.
+//
+// An INVARIANT base is the case deferred HERE — the spec's own blessed example
+// is an invariant head, so it is evidence for acceptance, but a soundness
+// argument survives and the text does not settle it. It yields `Unknown` and is
+// skipped. These two rows pin the deferral: the shapes compile. If #6355 closes
+// the other way they flip to `expectRejected` with the needle "whose own
+// parameter variance cannot honour that position".
+BEZEL_TEST(variance_position_composed_6348, base_invariant_head_deferred_spec_12_9) {
+    expectAccepted(
+        "interface IInv<T> method Put(x: T); end IInv; "
+        "interface D<out T>: IInv<T> end D; ");
+}
+
+BEZEL_TEST(variance_position_composed_6348,
+           base_invariant_head_deferred_contravariant_spec_12_9) {
+    expectAccepted(
+        "interface IInv<T> method Put(x: T); end IInv; "
+        "interface D<in T>: IInv<T> end D; ");
+}
+
 // --- the direct, non-composed positions are unchanged (no false positives) --
 
 BEZEL_TEST(variance_position_composed_6348, direct_out_return_still_accepted) {

@@ -13808,6 +13808,41 @@ enum class VariancePos {
     Unknown,       // a wrapper's own variance could not be established
 };
 
+// Where the occurrence sits. The two differ in exactly one case, and only in a
+// base list — see `invariantOrDefer` (#6355).
+enum class VarianceSite {
+    Member,   // an ordinary member signature (method, property, field)
+    BaseList, // a `: Base<...>` entry of the interface itself
+};
+
+// narrow #6348 / spec-question #6355 (§12.9, v0.338). An INVARIANT wrapper
+// means two different things by site.
+//
+// In a MEMBER slot it is settled: §12.9 makes classes, records and unmarked
+// heads "always invariant", so no marker survives one — `out T` with
+// `method Put(xs: Array<T>)` is a real soundness hole and stays rejected.
+//
+// In a BASE LIST it is disputed, and #6348 shipped a reading of the dispute it
+// had no issue for. §12.9 says "A generic interface may extend a generic base
+// whose variance is different from its own", and its worked example is
+// `IList<T>` — invariant — extending `IReadOnlyList<out T>`. The spec also
+// closes with "The inheritance relation only fixes the type argument
+// substituted into the base — it does not alter what positions T may legally
+// appear in within the derived interface", which on its face withdraws the base
+// list from the position check ENTIRELY, mismatched markers included. Against
+// that, C# rejects the shape (CS1961), so the constraint reading has precedent
+// and the sentence is not free of doubt. #6355 records both.
+//
+// This narrowing defers the invariant case only, because that is the case both
+// readings agree cannot be settled from the text alone (the spec's blessed
+// example IS an invariant head reached through an invariant deriving marker, so
+// it is evidence FOR acceptance, and the soundness argument is not). The two
+// mismatched-MARKER rejections stay pending the same ruling — see #6355.
+VariancePos invariantOrDefer(VarianceSite site) {
+    return site == VarianceSite::BaseList ? VariancePos::Unknown
+                                          : VariancePos::Invariant;
+}
+
 VariancePos flipVariancePos(VariancePos p) {
     switch (p) {
     case VariancePos::CoVariant: return VariancePos::ContraVariant;
@@ -13879,31 +13914,33 @@ bool builtinHeadIsCovariantAtZero(std::string_view head) {
 // it is one of the nine listed above. Anything else is `Unknown` — the caller
 // skips rather than guesses.
 VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
-                                 const std::vector<TypeSymbol*>& localTypes) {
+                                 const std::vector<TypeSymbol*>& localTypes,
+                                 VarianceSite site) {
     if (!head.name || head.name->parts.empty()) return VariancePos::Unknown;
     const std::string_view h = head.name->parts.back();
     for (const TypeSymbol* ts : localTypes) {
         if (ts->name != h) continue;
         // A class, record, enum or choice is always invariant (§12.9), and it
         // may in any case carry no marker at all.
-        if (ts->kind != ast::TypeDeclKind::Interface) return VariancePos::Invariant;
-        if (argIndex >= ts->genericParams.size()) return VariancePos::Invariant;
+        if (ts->kind != ast::TypeDeclKind::Interface) return invariantOrDefer(site);
+        if (argIndex >= ts->genericParams.size()) return invariantOrDefer(site);
         const auto* gps = dynamic_cast<GenericParamSymbol*>(ts->genericParams[argIndex]);
-        if (!gps) return VariancePos::Invariant;
+        if (!gps) return invariantOrDefer(site);
         if (gps->variance == "out") return VariancePos::CoVariant;
         if (gps->variance == "in") return VariancePos::ContraVariant;
-        return VariancePos::Invariant;
+        return invariantOrDefer(site);
     }
     if (!isBuiltinTypeName(h)) return VariancePos::Unknown;
     if (argIndex == 0 && builtinHeadIsCovariantAtZero(h)) return VariancePos::CoVariant;
-    return VariancePos::Invariant;
+    return invariantOrDefer(site);
 }
 
 // The composed position of `paramName` inside `t`, given that `t` itself
 // occupies a slot of polarity `outer`.
 VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName,
                                   VariancePos outer,
-                                  const std::vector<TypeSymbol*>& localTypes) {
+                                  const std::vector<TypeSymbol*>& localTypes,
+                                  VarianceSite site) {
     switch (t.kind) {
     case ast::TypeKind::Named: {
         if (t.genericArgs.empty())
@@ -13915,11 +13952,11 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
             // the head's own slot at index `i`, so the head's variance is
             // applied to the slot the whole type occupies here.
             const VariancePos argSlot =
-                slotPolarity(outer, namedHeadArgVariance(t, i, localTypes));
+                slotPolarity(outer, namedHeadArgVariance(t, i, localTypes, site));
             if (argSlot == VariancePos::Absent) continue;
             acc = mergeVariancePos(
                 acc, composedParamPosition(*t.genericArgs[i], paramName,
-                                           argSlot, localTypes));
+                                           argSlot, localTypes, site));
         }
         return acc;
     }
@@ -13930,14 +13967,15 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
         VariancePos acc = VariancePos::Absent;
         if (t.funcReturn)
             acc = mergeVariancePos(
-                acc, composedParamPosition(*t.funcReturn, paramName, outer, localTypes));
+                acc, composedParamPosition(*t.funcReturn, paramName, outer,
+                                           localTypes, site));
         for (const auto& fp : t.funcParams) {
             if (!fp.type) continue;
             const bool isOut = fp.modifier == "out" || fp.modifier == "out owned";
             acc = mergeVariancePos(
                 acc, composedParamPosition(*fp.type, paramName,
                                            isOut ? outer : flipVariancePos(outer),
-                                           localTypes));
+                                           localTypes, site));
         }
         return acc;
     }
@@ -13946,7 +13984,7 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
         // no marker survives it (the value-type half of §12.9's invariance).
         if (!t.arrayElement) return VariancePos::Absent;
         return composedParamPosition(*t.arrayElement, paramName,
-                                     VariancePos::Invariant, localTypes);
+                                     VariancePos::Invariant, localTypes, site);
     }
     default:
         return VariancePos::Absent;
@@ -13970,11 +14008,12 @@ bool composedVarianceViolation(const ast::Type& t,
                                bool isOutputPos,
                                std::string_view paramName,
                                const std::vector<TypeSymbol*>& localTypes,
-                               bool* composed = nullptr) {
+                               bool* composed = nullptr,
+                               VarianceSite site = VarianceSite::Member) {
     const VariancePos pos = composedParamPosition(
         t, paramName,
         isOutputPos ? VariancePos::CoVariant : VariancePos::ContraVariant,
-        localTypes);
+        localTypes, site);
     if (pos == VariancePos::Unknown || pos == VariancePos::Absent) return false;
     const bool bad = paramVariance == "out" ? pos != VariancePos::CoVariant
                                             : pos != VariancePos::ContraVariant;
@@ -14027,7 +14066,8 @@ void Resolver::checkVariancePositions() {
                 bool baseComposed = false;
                 if (!composedVarianceViolation(*bt, variance,
                                                /*isOutputPos=*/true, paramName,
-                                               localTypes, &baseComposed))
+                                               localTypes, &baseComposed,
+                                               VarianceSite::BaseList))
                     continue;
                 const std::string head =
                     (bt->name && !bt->name->parts.empty())
