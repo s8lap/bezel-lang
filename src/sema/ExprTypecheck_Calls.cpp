@@ -3839,6 +3839,83 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 }
                 if (best != cands.size() && !contested) return cands[best];
             }
+            // fix #6332 (§22.6 "Generic candidates", §14.5, v0.338): §22.6's
+            // LAST tie-break before ambiguity is "When a non-generic
+            // candidate and a generic candidate are both applicable, and
+            // neither the ranking nor the defaulted-arity tie-break separates
+            // them, the non-generic candidate is selected."
+            // `resolveOverload` implements exactly that comparison
+            // (`unambiguouslyBetter`'s last clause, at its last `return`), but
+            // `Undecidable` returns EARLY, above it — so on this path the rule
+            // never runs.
+            //
+            // MEASURED on the issue's repro: `Pick<V>(x: V)` declared first and
+            // `Pick(x: Array<int>)` declared second, called as `U.Pick(a)` with
+            // `a: Array<int>`, printed 10 (the generic); with the two
+            // declarations SWAPPED it printed 5. The verdict is decided by
+            // declaration order.
+            //
+            // WHY the #5859 tie-break above cannot see it: `a: Array<int>` is
+            // a declaration-less `Named`, which `judgeable` rejects, so every
+            // candidate arrives marked inapplicable and both loops below this
+            // point (they gate on `r.applicable[c]`) select nothing. What
+            // `builtinRefPrefers` then compares is the generic candidate's
+            // SUBSTITUTED row, `V := Array<int>`, against the non-generic
+            // candidate's `Array<int>` — identical, so neither is strictly
+            // better and the strict-ordering block declines to decide. That
+            // is the one case §22.6's non-generic preference exists for.
+            //
+            // GUARDED to be additive in the same sense as #5859's: no
+            // diagnostic is emitted here, so nothing that compiles today can
+            // start failing; the block returns only when exactly ONE
+            // non-generic candidate of the right arity exists, and only
+            // after `implicitlyConvertible` confirms §5.1 admits the
+            // argument at every bound position (so a non-generic candidate
+            // the arguments plainly cannot reach never wins). Every other
+            // undecidable shape — including the genuine tie with two
+            // non-generic candidates, and any call with no non-generic
+            // candidate at all — falls through unchanged.
+            {
+                std::size_t pick = cands.size();
+                bool ambiguousNonGeneric = false;
+                for (std::size_t c = 0; c < cands.size(); ++c) {
+                    if (!cands[c]->genericParams.empty()) continue;
+                    if (sema::formalParamCount(*cands[c]) != ce.args.size())
+                        continue;
+                    bool admits = true;
+                    for (std::size_t i = 0; i < argTypes.size(); ++i) {
+                        const TypeRef* at = argTypeRows[c][i];
+                        const TypeRef* pt = paramTypes[c][i];
+                        if (!at || !pt) continue;
+                        // §5.1 admissibility, using the SAME grade
+                        // `builtinRefPrefers` applies two blocks above:
+                        // identity, else a §12 ancestor step, and a nullable
+                        // source does not reach a non-nullable target. This
+                        // is NOT `implicitlyConvertible` — MEASURED on these
+                        // exact rows it returns false for `Array<int>` into
+                        // `Array<int>`, including the case where the two
+                        // `TypeRef`s are the same pointer, so it cannot serve
+                        // as the admissibility test for a built-in class
+                        // reference at all.
+                        if (typeRefEqual(at, pt)) continue;
+                        if (at->nullable && !pt->nullable) {
+                            admits = false;
+                            break;
+                        }
+                        if (!hasNamedAncestor(const_cast<TypeRef*>(at),
+                                              namedRefSimpleName(pt)))
+                            admits = false;
+                    }
+                    if (!admits) continue;
+                    if (pick != cands.size()) {
+                        ambiguousNonGeneric = true;
+                        break;
+                    }
+                    pick = c;
+                }
+                if (pick != cands.size() && !ambiguousNonGeneric)
+                    return cands[pick];
+            }
             if (!hasNamed) {
                 for (std::size_t c = 0; c < cands.size(); ++c) {
                     if (sema::formalParamCount(*cands[c]) == ce.args.size() &&
