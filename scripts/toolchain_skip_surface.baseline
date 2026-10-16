@@ -26,5 +26,5 @@
 #                   from checked_calls only when a file moves into
 #                   or out of tests/support/.
 absorbing_sites = 1018
-checked_calls   = 2980
-support_calls   = 2996
+checked_calls   = 2983
+support_calls   = 2999
