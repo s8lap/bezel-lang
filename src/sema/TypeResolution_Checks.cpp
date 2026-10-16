@@ -6295,7 +6295,7 @@ TypeRef* Resolver::applyGenericSubst(
         TypeRef* tr,
         const std::unordered_map<std::string_view, TypeRef*>& genericSubst) {
     return sema::substituteGenericArgs(
-        tr, sema::SubstArgs{ctx_, genericSubst});
+        tr, sema::SubstArgs{ctx_, genericSubst, {}, false, true});
 }
 
 // §12.1 (#6299): the positions, in each class's `baseTypes`, of the base-type
