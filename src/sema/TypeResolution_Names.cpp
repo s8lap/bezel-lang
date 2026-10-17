@@ -2461,8 +2461,8 @@ static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name,
 //
 // Accessibility (§2.7 "an ACCESSIBLE member"), under §13's levels: inside the
 // OWNING type's own body every level is reachable, so nothing is filtered
-// there. For an OUTER enclosing type, `private` (§13.2 — reachable only
-// within the declaring type) and `protected` (§13.2 — reachable only within
+// there. For an OUTER enclosing type, `private` (§13.1 — reachable only
+// within the declaring type) and `protected` (§13.1 — reachable only within
 // the declaring type and types deriving from it; a nested type is not one) are
 // not accessible from this body and must not stop the search. `internal`
 // (§13.4) is access within the declaring module, which is the only module the

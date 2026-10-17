@@ -63,14 +63,14 @@
 //     type-name search. Row 11 pins that; row 12 pins that the spelling resolves
 //     there (so row 11's acceptance is a resolution, not a silent
 //     non-diagnostic).
-//   * 13/14/15— ACCESSIBILITY (§13.2), as a triple. A `private` member of an
+//   * 13/14/15— ACCESSIBILITY (§13.1), as a triple. A `private` member of an
 //     OUTER enclosing type is not accessible from the nested body, and neither is
 //     a `protected` one (a nested type does not derive from the type that
 //     encloses it), so neither may end the search — rows 13/15. Row 14 is the
 //     same member made `public`, which does. Together they say accessibility is
 //     what separates them, not the member's mere existence.
 //   * 16      — the `ownBody` half of that filter: a `private` member of the type
-//     whose OWN body names it IS accessible there (§13.2 — `private` is
+//     whose OWN body names it IS accessible there (§13.1 — `private` is
 //     reachable within the declaring type), so it does end the search. Row 14's
 //     `private` twin would be a false rejection.
 //   * 17      — the RESOLVER/§12.9-CHECK COUPLING; see its own comment.
@@ -336,7 +336,7 @@ BEZEL_TEST(enclosing_member_bare_type_name,
 // --- 18. THE `ownBody` HALF OF THAT FILTER -------------------------------
 //
 // A `private` member of the type whose OWN body names it is reachable there
-// (§13.2 — `private` is visible within the declaring type), so it does end the
+// (§13.1 — `private` is visible within the declaring type), so it does end the
 // search. Filtering `private` unconditionally would reject this and would be
 // wrong.
 BEZEL_TEST(enclosing_member_bare_type_name,

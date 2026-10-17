@@ -24885,7 +24885,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // (module loaded with no exported types or the loader could
                 // not find it) or because the for-loop above did not match.
                 // Both share the same diagnostic wording and exemption
-                // (neutral form: §13.2 — top-level types default to private
+                // (neutral form: §13.2 — a top-level type is module-internal
                 // unless declared public; §2.7 — only the named module's
                 // exported types are reachable through a module prefix).
                 const std::string partialMember5025c(ma.member);

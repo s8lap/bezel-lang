@@ -1,4 +1,4 @@
-// fix #6383 follow-up (§2.7 "Through nesting", §2.7 warning row, §12.9, §13.2,
+// fix #6383 follow-up (§2.7 "Through nesting", §2.7 warning row, §12.9, §13.1,
 // v0.338): §2.7's enclosing-member STOP ends §12.9's nested-head composition too.
 //
 // THE DEFECT. #6383 (`7b1b972f`) added `enclosingMemberBareName` to
@@ -234,9 +234,9 @@ BEZEL_TEST(enclosing_member_bare_name_variance_stop,
     expectBothCompose(stopAndWitness("public property Bad: Bad<int>? := null; "));
 }
 
-// --- 5. ACCESSIBILITY (§13.2) ---------------------------------------------
+// --- 5. ACCESSIBILITY (§13.1) ---------------------------------------------
 //
-// `private` is reachable only within the DECLARING type (§13.2), and `H` is
+// `private` is reachable only within the DECLARING type (§13.1), and `H` is
 // nested inside `Stop`, not inside it — so the member is not accessible from
 // `H`'s body, does not end the search there, and the walk reaches `Outer`'s
 // nested head for `H` exactly as it does for `W`.
