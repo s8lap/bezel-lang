@@ -3882,7 +3882,24 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "Count" && call.args.empty()) {
         auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
         llvm::Value* cnt = builder_.CreateCall(fn, {recv}, "ll.cnt");
-        return builder_.CreateTrunc(cnt, i32(), "ll.cnt.i32");
+        llvm::Value* cnt32 = builder_.CreateTrunc(cnt, i32(), "ll.cnt.i32");
+        // fix #6341 (§28.3, §28.9, stdlib §4.6/§4.7, v0.338): the NO-ARG CALL
+        // twin of the `.Count` PROPERTY arm's new reclaim in
+        // LlvmBackend_Exprs.cpp. The `Array` `.Length`/`.Count` arm
+        // (LlvmBackend_Calls.cpp) reaches the same helper through its
+        // `freeFreshInputTemp()` lambda, and #6352 gave the Set/Dictionary
+        // `.Count` arms the explicit call — but this arm had neither, so
+        // `MakeLlist().Count()` returned straight out of the runtime call and
+        // leaked the whole list. MEASURED on this fix's parent: 5,600 B in 100
+        // allocations over a 100-iteration loop (`bz_llist_alloc`,
+        // bezel_runtime_collections.cpp:1897), against clean `Array<T>` and
+        // clean `Dictionary<K,V>` twins.
+        // No-op for a bound / aliased / `move`d receiver (not this call shape)
+        // and for the OWNING family (`isPlainBuiltinCollectionHead` excludes
+        // `OwningLinkedList`), so no UAF / double-free; the count is fully read
+        // into `cnt32` before the backing is released.
+        freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+        return cnt32;
     }
     // --- Clear() --- disposes all elements (OwningLinkedList) and frees all
     // nodes, then re-allocates an empty list. Simplest: remove all from front.

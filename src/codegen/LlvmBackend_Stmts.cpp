@@ -7539,6 +7539,24 @@ bool Emitter::lowerLinkedListFor(const ast::ForStmt& fs) {
     builder_.CreateStore(builder_.CreateCall(nextFn, {nodeC}), nodeSlot);
     builder_.CreateBr(condBB);
     builder_.SetInsertPoint(endBB);
+    // fix #6341 (§28.3, §28.9, §29.2, stdlib §4.6/§4.7, v0.338): the LinkedList
+    // twin of the array for-in path's reclaim (the `freeUnboundOwnedBorrowingArrayTemp`
+    // call at lowerArrayFor's `endBB`, #1055). A fresh `owned LinkedList<T>`
+    // iterated directly as the source (`for var s in MakeLlist() do … end`) is
+    // owned by nothing once the loop ends, and this function — unlike
+    // lowerArrayFor — reached no disposal at all, so the list AND every node it
+    // still held leaked. MEASURED on this fix's parent: 5,600 B in 100
+    // allocations over a 100-iteration loop (`bz_llist_alloc`,
+    // bezel_runtime_collections.cpp:1897), against clean `Array<T>` and
+    // clean `Dictionary<K,V>` twins.
+    // Placed at `endBB`, which BOTH normal completion and `break` reach (a
+    // `return` inside the body diverges before this point — the source leaks,
+    // the same safe direction and the same limitation the array path documents).
+    // `listObj` is not read again below this point, so releasing it here is
+    // sound. No-op unless the iterable is exactly a fresh unbound owned-producing
+    // call, so a bound / `using var` / aliased iterable is never freed twice —
+    // its own owner does that.
+    freeUnboundOwnedBorrowingArrayTemp(fs.iterable.get(), listObj, iterTy);
     return true;
 }
 

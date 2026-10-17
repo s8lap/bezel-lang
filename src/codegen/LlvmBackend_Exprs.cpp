@@ -5384,7 +5384,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (obj) {
                     auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
                     llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
-                    return builder_.CreateTrunc(cnt64, i32(), "ll.cnt");
+                    llvm::Value* cnt = builder_.CreateTrunc(cnt64, i32(), "ll.cnt");
+                    // fix #6341 (§28.3, §28.9, stdlib §4.6/§4.7, v0.338): this
+                    // arm returned straight from `bz_llist_count`, UPSTREAM of the
+                    // `freeUnboundOwnedBorrowingArrayTemp` call the array-backed
+                    // `.Length`/`.Count` arm below makes — so #6352's `freeIsLlist`
+                    // arm, added to that helper precisely for this collection, was
+                    // LIVE but never reached from this face.
+                    // `LinkedList<T>` is in `isPlainBuiltinCollectionHead`, so the
+                    // helper already dispatches it to `bz_llist_free`; this face
+                    // simply never called it. The count is fully read into `cnt`
+                    // above FIRST, so the backing is dead from here on.
+                    // MEASURED on this fix's parent: a 100-iteration
+                    // `MakeLlist().Count` loop leaked 5,600 B in 100 allocations
+                    // (`bz_llist_alloc`, bezel_runtime_collections.cpp:1897),
+                    // against a clean `Array<T>` twin and a clean `Dictionary<K,V>`
+                    // twin of the identical loop.
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), obj, tt);
+                    return cnt;
                 }
             }
             // issue #545: Buffer<T>.Length → i64 header field load.
