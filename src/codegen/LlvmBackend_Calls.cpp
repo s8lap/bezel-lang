@@ -2753,23 +2753,52 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // preceding lazy operator keeps `lazyTerminal == false`, so it reaches the
     // terminal DIRECTLY — no `bz_lazy_t*` is ever built, #6380's
     // `bz_lazy_own_source` transfer has nothing to act on, and `freeLazyTemp` is
-    // inert. On that path `freeFreshInputTemp` is the ONLY reclaim, so every
-    // terminal return site in the `isArr` block below must call it.
+    // inert. On that path `freeFreshInputTemp` is the ONLY reclaim, so a
+    // terminal return site in the `isArr` block below that neither hands a
+    // borrow of a receiver slot to its caller nor omits it for another stated
+    // reason is leaking a whole container per evaluation.
     //
-    // Until this lane, only five did: `.Length`/`.Count` (no-arg), `.Sum` (the
-    // int/long accumulator arm), and the three copy-forms `.Reversed()` /
-    // `.Sorted()` / the third — which is why those terminals were leak-free and
-    // their siblings were not. MEASURED on the parent (staging a3065a15), over
-    // 101-iteration loops under ASan, with the receiver an `owned`-returning
-    // user method consumed only in receiver position (`f.Make().Terminal()`,
-    // `Make(): owned Array<int>` / `owned Stack<int>` / `owned Array<decimal>`):
-    // 12,120 B leaked per shape at 14 terminals (Any, All, Contains, First,
-    // Single, Last, Min, Max, Average, Aggregate, ElementAt, FirstOrNull,
-    // LastOrNull, SingleOrNull) x {Array, Stack}, plus IndexOf on Array and the
-    // decimal `.Sum` arm — 30 shapes, each a full container per evaluation,
+    // The set is NOT "every terminal return site". MEASURED leftovers, each
+    // byte-identical before and after the fix that filled the 28 gaps, and each
+    // deliberately out of this change's scope: `Set<T>.Add` / `.Contains` /
+    // `.Remove` / `.Clear` / `.UnionWith` and `Dictionary`/`Set` `.Count`
+    // inside the same block still carry no reclaim (43,228 B / 606 allocs for
+    // `MakeSet().Contains(2)`, 43,632 / 707 for `.Add(9)`, 42,824 / 505 for
+    // `.Remove(2)`, 42,016 / 303 for `.Clear()`, 86,860 / 1313 for
+    // `.UnionWith(...)`, 42,420 / 505 for `MakeDict().Count`). §28.3 closes
+    // the question of why a name-keyed list is the wrong shape here — "the
+    // `owned` return qualifier is the single signal that drives the reclaim;
+    // there is no special-cased list of method names" — so they belong to the
+    // Set-family arms, not to a list written here. This change does not touch
+    // them; they are reported, not fixed.
+    //
+    // Before this lane only five terminal return sites called it: `.Length` /
+    // `.Count` (no-arg), `.Sum` (the int/long accumulator arm), and the three
+    // copy-forms `.Reversed()` / `.Sorted()` / `.Sorted(comparer)` — which is
+    // why those terminals were leak-free and their siblings were not. MEASURED
+    // on the parent (staging a3065a15), over 101-iteration loops under ASan,
+    // with the receiver an `owned`-returning user method consumed only in
+    // receiver position (`f.Make().Terminal()`, `Make(): owned Array<int>` /
+    // `owned Stack<int>` / `owned Array<decimal>`): 12,120 B leaked per shape
+    // at 14 terminals (Any, All, Contains, First, Single, Last, Min, Max,
+    // Average, Aggregate, ElementAt, FirstOrNull, LastOrNull, SingleOrNull) x
+    // {Array, Stack}, plus IndexOf on Array and the decimal `.Sum` arm — 30
+    // operator-position-0 shapes, each a full container per evaluation,
     // byte-identical to the `_ := f.Make();` binding, which is the asymmetry
-    // that identifies the defect. Every one of the 14 is the same mechanism: the
-    // terminal reads `recv` to exhaustion and then returns without reclaiming it.
+    // that identifies the defect. Every one of the 14 is the same mechanism:
+    // the terminal reads `recv` to exhaustion and then returns without
+    // reclaiming it.
+    //
+    // THE COUNTS ARE PER-ARTIFACT, and deliberately not reconciled to one
+    // number, because each artifact counts a different slice of the author's
+    // matrix: the 30 above is the OPERATOR-POSITION-0 two-family subset this
+    // comment is about; the commit body's 52 is the FULL matrix (that subset
+    // plus operator positions 1 and 2, plus a one-element producer); the test
+    // file's table row quotes the per-family halves of the full matrix
+    // (`Array<T>` 30 / `Stack<T>` 14) because that is how it lays the matrix
+    // out. The number that is PINNED, and the only one a reader should count,
+    // is the regression-row count in
+    // `tests/codegen/eager_terminal_unbound_owned_reclaim_test.cpp`.
     //
     // The gate is UNCHANGED (`isFreshOwnerlessArrayMaterializerExpr` /
     // `isUnboundOwnedBorrowingArrayCallExpr`), so this adds no new population
@@ -2795,6 +2824,77 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // at end-of-full-expression. A bound/`move`d/returned/owned-arg receiver is
         // not a chained-receiver CallExpr of this shape → not freed → no UAF.
         freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+    };
+
+    // §28.11 (element slot policy), RuntimeManaged row: a `string` element slot
+    // in a BORROWING collection is a SHARED REFERENCE, and the indexer-get row
+    // reads "reference out" — the caller receives a reference, not the
+    // collection's own. `freeUnboundOwnedBorrowingArrayTemp` honours that by
+    // handing `bz_array_free` the string-release element disposer, so reclaiming
+    // an `Array<string>` receiver releases the +1 the array co-owns per element.
+    // That is a correct disposal of the ARRAY; it is fatal only where the value
+    // this call RETURNS is one of those slots.
+    //
+    // Where it is fatal: a terminal that returns an element lowers to
+    // `bz_array_get` + `CreateLoad` and hands the CALLER the bare slot pointer.
+    // The caller's own +1 is minted by the CONSUMER's binding lowering — and
+    // that runs AFTER this function returns. MEASURED in the emitted code for
+    // `var s := "…".Split(",").First();`, in exactly this order:
+    //
+    //     bz_array_get
+    //     bz_array_free(recv, bz$strElemRelease)     <-- the reclaim, here
+    //     bz_string_retain                          <-- the consumer's +1, too late
+    //
+    // so the reclaim drops the last +1 and the reference the caller receives
+    // aliases a released `bz_string*`. MEASURED heap-use-after-free in
+    // `bz_string_to_utf8z` (bezel_runtime_strings.cpp:1250) on
+    // `"alpha,beta,gamma".Split(",").First()` and on every sibling with the
+    // same lowering — `.Last()`, `.ElementAt(1)`, `.FirstOrNull()`,
+    // `.LastOrNull()`, `.First(lambda…)`, `.Last(lambda…)`, `.Min()`,
+    // `.MinOrNull()` — while the scalar terminals over the same receiver
+    // (`.Contains("beta")`, `.Count()`) are clean on both sides, because nothing
+    // they return aliases the backing.
+    //
+    // So on an ELEMENT-RETURNING terminal the reclaim is DECLINED for a
+    // `string`-element receiver and the temporary leaks — the direction §28.3
+    // tolerates ("else it leaks (the safe direction)") and exactly the state
+    // before this fix. Deleting the reclaim outright is NOT the alternative
+    // being taken: every other terminal keeps it, and the 52 int/decimal shapes
+    // it fixes stay fixed.
+    //
+    // THE SOUND REMEDY IS NOT THIS ONE, and is not taken here because it is not
+    // a one-site change: mint the +1 HERE, before the free, and suppress the
+    // consumer's mint so the reference is not double-counted — which means
+    // teaching `isPlusOneStringProducer` that a LINQ element terminal is a +1
+    // producer, a predicate every consumer (bind, return, argument, field store,
+    // the nullable `*OrNull` arms) then reads. An unconditional retain here
+    // instead would double-count: the consumer's own retain plus a local's
+    // scope-end release would leave one unreleased +1 per evaluation, trading a
+    // use-after-free for a leak. That decision, and the `Aggregate`-aliases-an-
+    // element case it must also answer, are #6393.
+    //
+    // `recvElemIsString` is derived with the SAME three conjuncts
+    // `freeUnboundOwnedBorrowingArrayTemp` uses for its `elemIsString`
+    // (Setup.cpp), deliberately spelled the same way so the two cannot drift:
+    // a non-nullable `string` primitive in generic slot 0. It is a property of
+    // the RECEIVER, not of a method name — §28.3's "there is no special-cased
+    // list of method names" is about the reclaim's trigger, and this narrows
+    // where a borrow escapes rather than naming a second trigger.
+    const sema::TypeRef* recvEl =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                : nullptr;
+    const bool recvElemIsString = recvEl && !recvEl->nullable &&
+        recvEl->kind == sema::TypeRef::Kind::Primitive &&
+        recvEl->primitive == sema::PrimitiveType::String;
+
+    // The element-returning sibling of `freeFreshInputTemp`. Every terminal
+    // return site in the `isArr` block whose RESULT may be one of `recv`'s own
+    // slots calls THIS; the sites whose result is a scalar (bool / int / double /
+    // decimal) call `freeFreshInputTemp` directly, because nothing they hand
+    // back aliases the backing.
+    auto freeFreshInputTempUnlessStringElementEscapes = [&]() {
+        if (recvElemIsString) return;  // §28.11 — the result borrows a slot; see above
+        freeFreshInputTemp();
     };
 
     // -----------------------------------------------------------------------
@@ -3838,7 +3938,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(foldCl);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return builder_.CreateLoad(accTy, accSlot, "agg.r");
         }
         // per §5/§5.1 LINQ: .Average(fn: (T)->numeric): double  /  .Average(): double
@@ -4082,7 +4182,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateBr(condBB);
                 builder_.SetInsertPoint(endBB);
                 freeLazyTemp();
-                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
 
@@ -4148,7 +4248,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(endBB);
                 if (relClMM) emitClosureRelease(closure);
                 freeLazyTemp();
-                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
 
@@ -4290,7 +4390,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateBr(condBB);
                     builder_.SetInsertPoint(endBB);
                     freeLazyTemp();
-                    freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+                    freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
                 }
                 // fix #2770: a REFERENCE element (class or interface — both
@@ -4500,7 +4600,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.SetInsertPoint(endBB);
                     if (relCl) emitClosureRelease(closureP);  // #422 inline-lambda
                     freeLazyTemp();
-                    freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+                    freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
                 }
             }
@@ -4635,7 +4735,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return builder_.CreateLoad(accLLTy, accSlot, "mm.r");
         }
         // fix #2783 (stdlib §5.1, v0.240): .MinOrNull() / .MaxOrNull() —
@@ -4881,7 +4981,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ptrPhi->addIncoming(exitVal, condBB);
                 ptrPhi->addIncoming(nullResult, emptyBB);
                 freeLazyTemp();
-                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 resultV = ptrPhi;
             }
             return resultV;
@@ -4933,7 +5033,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notFound, "InvalidOperationException");
             llvm::Value* fstv = builder_.CreateLoad(elemTy, resultSlot, "fst.r");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return fstv;
         }
         // per §5 LINQ (#789): .Last(pred: (T)->bool): T — the LAST element
@@ -4981,7 +5081,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notFound, "InvalidOperationException");
             llvm::Value* lstv = builder_.CreateLoad(elemTy, resultSlot, "lstp.r");
             freeLazyTemp();
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return lstv;
         }
         // per §5 LINQ (#789): .Single(pred): T — the sole element satisfying the
@@ -5042,7 +5142,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notOne, "InvalidOperationException");
             llvm::Value* sglv = builder_.CreateLoad(elemTy, resultSlot, "sgl.r");
             freeLazyTemp();
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return sglv;
         }
         // per §5 LINQ (#789): .LastOrNull(pred): T? — the LAST element satisfying
@@ -5130,7 +5230,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Constant::getNullValue(elemTy), loadedV, "lon.ptr");
             }
             freeLazyTemp();
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return resultV;
         }
         // per §5 LINQ element access (no-predicate forms): First()/Single()
@@ -5167,7 +5267,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // #1930: over a bare GroupBy this returns a live grouping — keep it,
             // free its siblings + the array spine (else free the borrow snapshot).
             freeLazyTemp(keepGroupByGrouping ? fstv : nullptr);
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return fstv;
         }
         if (m == "Last" && call.args.empty()) {
@@ -5184,7 +5284,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
             llvm::Value* lstv = builder_.CreateLoad(retTy, out, "lst.r");
             freeLazyTemp(keepGroupByGrouping ? lstv : nullptr);  // #1930: keep the returned grouping
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return lstv;
         }
         if (m == "ElementAt" && call.args.size() == 1 && call.args[0].value) {
@@ -5205,7 +5305,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
             llvm::Value* eav = builder_.CreateLoad(retTy, out, "elemat.r");
             freeLazyTemp(keepGroupByGrouping ? eav : nullptr);  // #1930: keep the returned grouping
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return eav;
         }
         // stdlib §5: FirstOrNull() / FirstOrNull(predicate): return the first
@@ -5308,7 +5408,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // free its siblings + the array spine; a runtime-null ptrPhi (empty)
                 // makes _except free all (correct, nothing is returned).
                 freeLazyTemp(keepGroupByGrouping ? ptrPhi : nullptr);  // Free AFTER the PHI node.
-                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 resultV = ptrPhi;
             }
             return resultV;
@@ -5409,7 +5509,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "fon.ptr");
             }
             freeLazyTemp();
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return resultV;
         }
         // stdlib §5 (#661): SingleOrNull(predicate: (T)->bool): T? — return the
@@ -5533,7 +5633,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "son.ptr");
             }
             freeLazyTemp();
-            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return resultV;
         }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
