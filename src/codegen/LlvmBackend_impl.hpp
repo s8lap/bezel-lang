@@ -10645,6 +10645,79 @@ private:
 
     llvm::GlobalVariable* vtableOf(const sema::TypeSymbol* t);
 
+    // fix #6381 (§29.2, v0.338): THE slot-0 self-reference discriminator, in
+    // ONE definition. It was transcribed three times —
+    // `lowerIEnumerableFor`'s `useOwnVtable` (LlvmBackend_Stmts.cpp), the
+    // `iterEnumOrClassDispose` arm (LlvmBackend_Disposal.cpp), and
+    // `wrapUserClassAsIEnumerable`'s `$ad` family selection
+    // (LlvmBackend_Assign.cpp) — and the copies drifted silently.
+    //
+    // WHY THE DRIFT IS DANGEROUS, and why no test could have caught it: a
+    // drift that makes the predicate FALSE for an ITERATOR falls through to
+    // the class arm, which calls slot 2 (`MoveNext`) instead of slot 1
+    // (`Dispose`). The wrapper is still reclaimed, so the program exits 0,
+    // does not crash, and leaks what the wrapper held. The reverse drift
+    // (predicate TRUE for a class) calls slot 1 of a CLASS vtable, which is
+    // `itmap` — a wild jump. There is no test that would catch a one-sided
+    // edit to one of the three transcriptions.
+    //
+    // WHY IT IS POSITIVE, and why the obvious negative spelling is wrong.
+    // Every §29.11 iterator vtable this compiler emits puts ITSELF in slot 0
+    // (`elems[0] = getPointerCast(<the vtable global itself>)`), while every
+    // CLASS vtable puts its type descriptor there (`td$…`). So
+    // `vtable[0] == vtable` is TRUE for the iterator format and FALSE for
+    // every class instance — INCLUDING a subclass, whose vtable is a different
+    // global with a different `[0]`. The negative spelling
+    // (`vtable[0] != vtable$Base`) is satisfied by every subclass and so cannot
+    // exclude inheritance; #6361's first attempt used it and was rejected for
+    // exactly that.
+    //
+    // WHAT IS DELIBERATELY NOT IN HERE. The null guard stays at each call
+    // site: two of the three fold it into an `and` whose value feeds a branch
+    // or a `select`, while the third uses it as a separate branch into its own
+    // basic block. Folding it in would change the emitted IR. For the same
+    // reason `name` is a parameter — the disposal arm names its `icmp`
+    // `ien.selfref` and the other two leave it unnamed, and that difference is
+    // visible in the IR text. The default is `""` and NOT `nullptr`:
+    // `llvm::Twine`'s `const char*` constructor reads `Str[0]`, so forwarding
+    // a null name dereferences null inside the constructor — MEASURED as a
+    // SIGSEGV in `Twine::Twine`, reached from here on the FIRST program whose
+    // `wrapUserClassAsIEnumerable` runs. An empty string builds an empty
+    // Twine, which `Value::setName` ignores, so it is the same as passing no
+    // name at all.
+    //
+    // WHAT THIS DOES AND DOES NOT CHANGE IN THE EMITTED IR. MEASURED, over one
+    // program that reaches all three sites, by diffing `BEZEL_DUMP_IR` output
+    // against the same program compiled at the parent commit. The emitted IR is
+    // SEMANTICALLY identical but NOT byte-identical, and byte-identity is not
+    // reachable while the definition stays bundled:
+    //
+    //   * The disposal arm (LlvmBackend_Disposal.cpp) is byte-identical: the
+    //     helper is a standalone statement there, so nothing interleaves.
+    //   * The two `and`-folding arms cannot be. Their transcriptions built the two
+    //     loads as statements and built BOTH the null guard and the comparison
+    //     inside `CreateAnd`'s argument list, so the emitted order was
+    //     load, load, `icmp null`, `xor`, `icmp eq`, `and`. Bundling
+    //     load+load+cmp into one call makes those three contiguous and moves
+    //     the comparison ahead of the guard; no arrangement of the guard puts
+    //     it back between the second load and the comparison. The measured
+    //     difference is SSA renumbering of three instructions inside the block
+    //     and nothing else: the same instructions, the same `and` operand
+    //     order, all reading the same pointer with no store in between.
+    //
+    // The null guard is therefore left at each call site rather than folded in
+    // here — folding it in would also have moved it, and the disposal arm's is
+    // a separate branch that its own basic-block graph depends on.
+    llvm::Value* isIterVtableSelfReferenced(llvm::Value* obj,
+                                            const char* name = "") {
+        // `obj` IS word 0, so the first load is already the vtable and the
+        // second load is that vtable's slot-0 self-reference — `obj` is never
+        // dereferenced twice.
+        llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+        llvm::Value* selfRef = builder_.CreateLoad(ptrTy(), vt);
+        return builder_.CreateICmpEQ(selfRef, vt, name);
+    }
+
     // CG22: the §31.4 built-in exception hierarchy (child → parent).
     static const std::vector<std::pair<const char*, const char*>>&
     builtinExceptionHierarchy();

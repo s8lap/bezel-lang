@@ -10498,8 +10498,11 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
         // freeing the wrapper without disposing it. `iterEnumOrClassDispose`
         // picks the family from the value's own vtable at disposal time
         // (§29.2's slot-0 self-reference), the same discriminator
-        // `useOwnVtable` uses below to drive MoveNext / Current, so the three
-        // sites cannot disagree about which family this value is in.
+        // `useOwnVtable` uses below to drive MoveNext / Current. As of #6381
+        // both now call the ONE definition, `isIterVtableSelfReferenced`
+        // (LlvmBackend_impl.hpp), which `wrapUserClassAsIEnumerable`'s `$ad`
+        // family selection calls too, so the three sites cannot drift apart
+        // about which family this value is in.
         // MEASURED on this fix's parent: `Direct leak of 24 byte(s)` in
         // `bz$D1.Rng$GetEnumerator`; the identical manual-driven program is
         // LSan-clean.
@@ -10574,6 +10577,8 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     };
 
     // THE DISCRIMINATOR, AND WHY IT IS NOT AN IDENTITY TEST AGAINST `enumTs`.
+    // (The predicate itself is `isIterVtableSelfReferenced`, defined ONCE in
+    // LlvmBackend_impl.hpp since #6381; this comment is the rationale for it.)
     //
     // The first attempt at this fix (#6361 `6ac6fabf`) used #6343's predicate —
     // "the receiver's slot-0 vtable is not `vt$(enumTs)`, therefore the receiver
@@ -10604,14 +10609,26 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     //   SELF-REF bz$userenumenum$Counter$Counter$vtable$ad (fix #6343's family)
     //   NOT-SELF bz$exc$vtable$table                      (a real class-family table)
     auto useOwnVtable = [&](llvm::Value* obj) -> llvm::Value* {
-        llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
-        // The §29.11 slot-0 self-reference, read WITHOUT dereferencing `obj`
-        // twice: `obj` itself is slot 0, so `vt` is already the vtable and
-        // `vt[0]` is its self-reference.
-        llvm::Value* selfRef = builder_.CreateLoad(ptrTy(), vt);
+        // The §29.11 slot-0 self-reference — ONE definition, shared with the
+        // disposal arm and the `$ad` family selection (fix #6381), so the
+        // three sites cannot disagree about which family a value is in. The
+        // null guard is this site's own: `for`-in nulls the enumerator slot and
+        // the guard rides in the `and` the branch consumes.
+        //
+        // The comparison is bound to a local rather than inlined into
+        // `CreateAnd`'s argument list, deliberately: C++ does not fix the order
+        // in which a call's arguments are evaluated, and that order IS the
+        // emitted instruction order, so inlining would make it unspecified.
+        //
+        // The emitted IR is NOT byte-identical to what the transcription
+        // produced, and provably cannot be — see the note on the helper. The
+        // difference is SSA renumbering of three instructions inside this
+        // block and nothing else: same instructions, same `and` operand order,
+        // and all of them read `obj` with no store in between.
+        llvm::Value* isSelfRef = isIterVtableSelfReferenced(obj);
         return builder_.CreateAnd(
-            builder_.CreateNot(builder_.CreateIsNull(obj)),
-            builder_.CreateICmpEQ(selfRef, vt), "ien.useownvt");
+            builder_.CreateNot(builder_.CreateIsNull(obj)), isSelfRef,
+            "ien.useownvt");
     };
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);

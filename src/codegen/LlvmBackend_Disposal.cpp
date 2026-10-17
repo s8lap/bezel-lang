@@ -9891,14 +9891,16 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 llvm::BasicBlock::Create(llvm_, "ien.disposal.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, famBB);
             builder_.SetInsertPoint(famBB);
-            // §29.2 slot-0 self-reference. `obj` IS word 0, so `vt` is already
-            // the vtable and `vt[0]` is its self-reference — the same two
-            // instructions `lowerIEnumerableFor`'s `useOwnVtable` emits, kept
-            // in its own block so this arm's basic blocks stay readable.
-            llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
-            llvm::Value* selfRef = builder_.CreateLoad(ptrTy(), vt);
+            // §29.2 slot-0 self-reference, from the ONE definition shared with
+            // `lowerIEnumerableFor`'s `useOwnVtable` and with
+            // `wrapUserClassAsIEnumerable`'s `$ad` family selection (fix #6381),
+            // so the three sites cannot disagree about which family this value
+            // is in. The null guard above is this site's own — a separate
+            // branch into `contBB`, which is why the helper carries only the
+            // comparison. `ien.selfref` is this site's own name for the `icmp`,
+            // passed through so the IR is unchanged.
             llvm::Value* isIteratorFormat =
-                builder_.CreateICmpEQ(selfRef, vt, "ien.selfref");
+                isIterVtableSelfReferenced(obj, "ien.selfref");
             builder_.CreateCondBr(isIteratorFormat, iterBB, clsBB);
 
             // Iterator arm: Dispose is slot 1 (§29.2), and — unlike the class

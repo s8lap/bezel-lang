@@ -14561,11 +14561,25 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     // Dropping `vtableOf(enumTs)` also drops its IMPORTED-`enumTs` skip, which
     // had left a delegating imported enumerator on the direct family. The new
     // test needs no `enumTs` vtable, so it applies uniformly.
-    llvm::Value* enumVt = builder_.CreateLoad(ptrTy(), enumPtr);
-    llvm::Value* enumSelfRef = builder_.CreateLoad(ptrTy(), enumVt);
+    // §29.2 slot-0 self-reference, from the ONE definition shared with
+    // `lowerIEnumerableFor`'s `useOwnVtable` and the `iterEnumOrClassDispose`
+    // disposal arm (fix #6381). The null guard is this site's own — it rides in
+    // the `and` whose value the `select` below consumes.
+    //
+    // The comparison is bound to a local rather than inlined into
+    // `CreateAnd`'s argument list, deliberately: C++ does not fix the order in
+    // which a call's arguments are evaluated, and that order IS the emitted
+    // instruction order, so inlining would make it unspecified.
+    //
+    // The emitted IR is NOT byte-identical to what the transcription produced,
+    // and provably cannot be — see the note on the helper. The difference is
+    // SSA renumbering of three instructions inside this block and nothing
+    // else: same instructions, same `and` operand order, and all of them read
+    // `enumPtr` with no store in between.
+    llvm::Value* enumIsSelfRef = isIterVtableSelfReferenced(enumPtr);
     llvm::Value* useAdFamily = builder_.CreateAnd(
-        builder_.CreateNot(builder_.CreateIsNull(enumPtr)),
-        builder_.CreateICmpEQ(enumSelfRef, enumVt), "enum.usead");
+        builder_.CreateNot(builder_.CreateIsNull(enumPtr)), enumIsSelfRef,
+        "enum.usead");
 
     // 10. Allocate wrapper struct and fill fields (vtable, enumerator, source,
     // ownsSrc).
