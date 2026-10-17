@@ -1084,6 +1084,12 @@ public:
         // with no caller substitution active, re-point the erased itable slots
         // of a non-generic class over a concrete generic base.
         patchConcreteDerivedGenericBaseItables();
+        // fix #6377 (§14.1 / §12.1 / §23.4, v0.338): the CLASS-VTABLE twin —
+        // #4933 above repairs the ITABLE slots, which its repro could only
+        // reach through an interface; a virtual member inherited from a
+        // generic base also dispatches through the class's OWN vtable, and
+        // that slot was left on the erased template.
+        patchConcreteDerivedGenericBaseVtableAccessors();
         {
             std::vector<std::pair<sema::ConstructorSymbol*, llvm::Function*>>
                 sorted(ctorFns_.begin(), ctorFns_.end());
@@ -7948,6 +7954,43 @@ private:
     // 8-byte string handle back as an i32 and printed "". Runs once, after
     // every method body is emitted; see the definition (LlvmBackend_Layout.cpp).
     void patchConcreteDerivedGenericBaseItables();
+
+    // fix #6377 (§14.1 / §12.1 / §23.4 / §2.8.3 rule 4, v0.338): the
+    // CLASS-VTABLE twin of `patchConcreteDerivedGenericBaseItables` (#4933 /
+    // #4950), for the ACCESSOR slots of a NON-GENERIC class that inherits a
+    // virtual property or indexer from a GENERIC base instantiated at concrete
+    // arguments (`class E1: B<Array<int>>`, `B<T>` declaring
+    // `virtual property [i: int]: T`).
+    //
+    // #4933's repro needed an INTERFACE for the inherited member to be
+    // dispatchable through, so the repair it installed is keyed on `itables_`
+    // and the class-vtable face was left on the erased template. §12.1 makes a
+    // virtual member dispatchable through the CLASS vtable too, so `E1`'s own
+    // objects dispatched into it — measured on this fix's parent: one
+    // `define internal i32 @"bz$indexer$get"` GEPing the erased `%class.B`, in
+    // the vtables of `B`, `E1` AND `E2`, called through a vtable slot as if it
+    // returned a pointer. It reads the 4 bytes of PADDING before the
+    // instantiation's `ptr` field, which `lowerNew`'s calloc makes
+    // deterministically zero, so the program compiles, links, runs and exits 0
+    // reading 0 where 3 and 9 are expected — no diagnostic, no verifier abort
+    // (the mistyped call is indirect), no sanitizer report.
+    //
+    // `specializedVtableFor` cannot repair it: it is reached only under an
+    // active substitution, and a non-generic `E1` has none at `new E1()`
+    // (instrumented on the parent — `specializedVtableFor(E1) subst=0`).
+    // Runs immediately after the itable pass, for the same #2759 reason.
+    void patchConcreteDerivedGenericBaseVtableAccessors();
+
+    // fix #6377 (§14.1, v0.338): install into the ACTIVE substitution the
+    // bindings `ts`'s OWN base clause induces on the GENERIC ancestor `anc`,
+    // computed by `computeAncestorGenericSubst` with a synthesized bare
+    // receiver. FALSE (substitution untouched) is the refusal — no ancestor, a
+    // non-generic `anc`, or a chain the walk declines to resolve; the "never
+    // install a substitution we cannot prove" discipline of #2840/#2860/#2873/
+    // #2882. The caller owns save/restore of genericSubst_/genericSubstSemaTy_.
+    // Shared by the two passes above so the twins cannot drift.
+    bool installAncestorGenericSubstFor(const sema::TypeSymbol* ts,
+                                         const sema::TypeSymbol* anc);
 
     // fix #2889: install what `ancestorGenericSubstAdditions` proves into the
     // ACTIVE substitution, for callers that hold a substitution for `t` across
