@@ -4050,8 +4050,47 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (!diverged_ && v) emitStringRelease(v);
             return diverged_;
         }
-        if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
-        return diverged_;  // CG40: a throw-expression terminated the block
+        // fix #6366 (§28.3 K8 *Unbound owned temporaries*, §28.9, §17.13, stdlib
+        // §4.6/§4.7/§4.8, v0.338): a BARE COLLECTION-producer statement
+        // (`f.Make();`, where `Make(): owned Array<int>` /
+        // `owned LinkedList<int>`) leaks its whole collection. §28.3 K8 puts
+        // the boundary at "end of the full expression", which for an expression
+        // statement coincides with end of statement (§21.9) — the same
+        // sentence #2655's arm above cites for the Class-typed case.
+        //
+        // Why a SEPARATE arm rather than a widening of #2655's: that arm's
+        // `disposeOwnedValue` is set only for §21.9's `ownedProduced` set,
+        // which requires kind == Class, and a builtin collection is not a
+        // Class — so the arm above has already returned by the time a
+        // collection reaches here. Reusing it would mean editing sema's
+        // `ownedProduced` walk, which would then need the *class* dispose
+        // convention for values that have no class vtable at all.
+        //
+        // The reclaim itself is the SAME helper the `_ := expr;` DiscardStmt
+        // arm uses for a fresh collection materializer (#1015, a few hundred
+        // lines below), so this adds no new free logic and no new name list:
+        // `freeUnboundOwnedBorrowingArrayTemp` already dispatches llist /
+        // dict / array (#6352 added its `freeIsLlist` arm, #6341 made the
+        // LinkedList faces reach it at all). It is a NO-OP for any receiver
+        // that is not exactly a fresh unbound owned-producing call, so a bare
+        // statement that consumes someone ELSE's collection is untouched.
+        //
+        // MEASURED on this fix's parent over 101 iterations: 12,120 B for the
+        // `owned Array<int>` producer and 14,140 B for the
+        // `owned LinkedList<int>` twin — against 0 for the byte-identical
+        // `_ := f.Make();` binding, which is the asymmetry that identifies
+        // this defect (the reclaim fires when the temporary is CONSUMED, and
+        // not when it is discarded entirely).
+        {
+            if (es->expr) {
+                llvm::Value* v = lowerExpr(*es->expr);
+                if (!diverged_ && v) {
+                    freeUnboundOwnedBorrowingArrayTemp(
+                        es->expr.get(), v, ctx_.exprType(*es->expr));
+                }
+            }
+            return diverged_;  // CG40: a throw-expression terminated the block
+        }
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
