@@ -7637,6 +7637,39 @@ void ExprTC::checkAssignable(
             from->kind == TypeRef::Kind::Named && !from->declaration &&
             from->genericArgs.empty() && !fromIsTypeVar &&
             isBuiltinClassHead(fromName);
+        // fix #6347 (§5.1 "Reference conversions", v0.338): the SAME
+        // predicate WITHOUT the `from->genericArgs.empty()` restriction —
+        // i.e. it also answers true for a GENERIC built-in class such as
+        // `Array<int>`, `LinkedList<int>`, `Set<int>`, `OwningArray<int>`,
+        // `Dictionary<K,V>`. The `genericArgs.empty()` restriction on
+        // `fromBuiltinClass` exists (see the block comment ABOVE this
+        // predicate, which states the exclusion set and its reasons) only so
+        // that a built-in→built-in VARIANCE pair (`Array<T>` → `IEnumerable<T>`,
+        // stdlib §4.4/§29) falls through to the §12.9 variance arm, which is
+        // keyed on a NULL-DECLARATION target. A USER class target has a
+        // declaration, so the variance arm never sees that pair, and the
+        // `genericArgs.empty()` source predicate made the whole Repro-A gate
+        // below unreachable for every generic built-in: `var b: Box<int> := a;`
+        // over `a: Array<int>` was silently ACCEPTED, compiled, and read
+        // `Box<int>`'s field `V` out of the ARRAY's first word (printed `0`,
+        // never the `5` the program expects). `OwningArray<int>` was rejected
+        // for an UNRELATED reason (§4.2/#1327 takes its owning shape first),
+        // not by this arm — every one of these names is in the same
+        // `kHeapPointerReferenceBuiltins` row and none is a built-in
+        // interface head, so `isBuiltinClassHead` cannot separate them.
+        // §5.1's list of implicit reference conversions is CLOSED ("The
+        // following conversions are implicit") — identity, class-to-base,
+        // anything-to-`Object`, type-to-an-interface-it-conforms-to,
+        // interface-to-extended-interface, type-parameter-to-its-bound, and
+        // §12.9 variance. An unrelated user class is none of those, and
+        // §5.1 defines a reference conversion as "representation-preserving
+        // — the same reference viewed at a WIDER static type"; `Box<int>` is
+        // not wider than `Array<int>`, it is a different type. Used ONLY for
+        // the `toUserClass` pair below, where `to` carrying a declaration
+        // already rules out every legitimate built-in target.
+        bool fromBuiltinClassAnyArgs =
+            from->kind == TypeRef::Kind::Named && !from->declaration &&
+            !fromIsTypeVar && isBuiltinClassHead(fromName);
         bool toBuiltinClass =
             to->kind == TypeRef::Kind::Named && !to->declaration &&
             to->genericArgs.empty() && !toIsTypeVar &&
@@ -7728,13 +7761,13 @@ void ExprTC::checkAssignable(
         // target or a class derived from it is on record — the same two
         // shapes, on the same terms, as for a built-in exception target
         // (see ExprTypecheck_impl.hpp).
-        if (fromBuiltinClass && toUserClass &&
+        if (fromBuiltinClassAnyArgs && toUserClass &&
             !hasNamedAncestor(from, to->declaration->name) &&
             pendingTypeFactAdmits(fromExpr, to)) {
             if (from->nullable && !to->nullable) reportNullable();
             return;
         }
-        if (fromBuiltinClass && toUserClass &&
+        if (fromBuiltinClassAnyArgs && toUserClass &&
             !hasNamedAncestor(from, to->declaration->name)) {
             const std::string toN(to->declaration->name);
             // Distinguish EXCEPTION sources (kept under #4644's old
