@@ -14084,101 +14084,176 @@ struct VarianceHeads {
     const std::unordered_set<std::string>* moduleNames = nullptr;
 };
 
-// fix #6351 (second attempt; the first was REJECTed for a false resolve):
-// the head `head` names among the imported types, or null.
+// fix #6373 (§2.2, §2.7 rule 1, §2.7 rule 2, §11.3, §11.6, v0.338): what the
+// QUALIFIER of a dotted head selects — decided ONCE, and read by every arm of
+// the composed walk, so no two arms can disagree about what a spelling names.
 //
-// THE RULE: this function may only ever hand back a type the NAME RESOLVER
-// would bind to that spelling. It enforces that by deciding what the QUALIFIER
-// binds FIRST, and refusing to look at any imported type unless the qualifier
-// provably names a module:
+// A head's path is `Qualifier . Rest`. §2.7 rule 1 resolves the leftmost
+// segment as a bare name (local scope, then the enclosing type's members, then
+// the current module's declarations, then unambiguous imported bare names, then
+// import aliases); only if it binds to a TYPE does the rest of the chain resolve
+// against that type (nested type, §11.6), and only if it binds to a MODULE does
+// the rest name a member of that module (§2.7 rule 2, `Module.Type`).
 //
-//   * qualifier is a LOCAL top-level type  -> the spelling is §11.6's
-//     enclosing-type path and binds inside that LOCAL type (or nowhere).
-//     Return null. This is the hole the reviewer's P9 found: a local
-//     `class Outer { interface Inner<out T> }` beside an imported
-//     `Outer.Inner<in T>` made the first attempt match the IMPORTED head by
-//     `qualifiedTypeName()`, read the wrong marker off a type the name
-//     resolver never bound, and REJECT a program that must compile. §2.2 — a
-//     local declaration shadows an import — is what makes that the answer, and
-//     returning null keeps the pre-#6351 behaviour (skip) rather than
-//     inventing a nested-local resolution this pass cannot do correctly.
-//   * qualifier is an import ALIAS        -> search the module it names.
-//   * qualifier is a MODULE name          -> search that module (§2.7's
-//     `Module.Type` spelling; `moduleNames` is what makes this reachable — the
-//     first attempt reached only two of the three legal spellings because
-//     `qualifiedTypeName()` is the SIMPLE name for a top-level type, so its
-//     byte-for-byte test could never match `Lib.IThing`).
-//   * anything else                       -> null. Never guess.
-//
-// A BARE name (no qualifier) searches every imported module and yields null on
-// a second match, which §2.2 already rejects as ambiguous. Null means
-// `Unknown` upstream: a skip, the pre-#6351 behaviour, and the safe direction —
-// a false skip can only miss a rejection, while a false resolve produces one.
-//
-// The qualifier test above is what keeps the resolver from reading a variance
-// off a type the NAME RESOLVER would not bind. It does NOT make resolution
-// exact: once a module qualifier is established, the FINAL path component is
-// matched by simple name with no check on the enclosing path — see the
-// KNOWN LIMITATION at the match loop, and #6373.
-const TypeSymbol* resolveImportedHead(const ast::Type& head,
-                                      const VarianceHeads& heads,
-                                      const std::vector<TypeSymbol*>& localTypes) {
-    if (!head.name || head.name->parts.empty() || !heads.imported) return nullptr;
-    const std::string_view h = head.name->parts.back();
-    const bool qualified = head.name->parts.size() > 1;
+//   LocalTopLevel — a local top-level TYPE. §2.2: a local declaration shadows an
+//       import, so the spelling is an enclosing-type path and binds INSIDE that
+//       local type (or nowhere). This pass cannot resolve a nested LOCAL head,
+//       so it answers nothing — the skip, and never a guess. #6351's P9.
+//   LocalAlias    — a local `type X := ...`. §27.8 declares aliases at module
+//       level, so an alias has no enclosing type and `Alias.Member` names
+//       nothing at all. #6351's guard scanned `localTypes`, which holds
+//       `TypeSymbol`s only, so a same-named ALIAS slipped past it and the
+//       module's exports were read for a spelling the name resolver had already
+//       bound to the alias. Same verdict as LocalTopLevel: nothing.
+//   ImportedModule — an import ALIAS, or a MODULE name this file wrote an
+//       `import` for. `module` carries the DOTTED name and `partsConsumed` how
+//       many path segments that name took, which is what distinguishes `Lib.Box`
+//       from `Com.Sub.Box` under `import Com.Sub;` (§2.2/§2.5 allow a dotted
+//       module name, and `sourceImports_` is keyed by the full dotted name, so a
+//       `parts.front()`-only test never finds it).
+//   None          — a bare name, or a qualifier naming nothing at all. A bare
+//       name is answered by the bare-name tables; a qualifier that names nothing
+//       makes the WHOLE spelling unresolvable, so no bare-name table may answer
+//       for it.
+struct HeadQualifier {
+    enum class Kind { Bare, LocalTopLevel, LocalAlias, ImportedModule, None };
+    Kind kind = Kind::Bare;
+    std::string module;              // ImportedModule: the DOTTED name
+    std::size_t partsConsumed = 0;   // ImportedModule: segments it spelled
+};
 
-    // Which module (if any) the qualifier names. Empty means "not a module",
-    // and every such case returns null below.
-    std::string targetModule;
-    if (qualified) {
-        const std::string qualifier(head.name->parts.front());
-        // §2.2 — a LOCAL top-level declaration shadows an import of the same
-        // name. `localTypes` is exactly the module's own top-level types, so
-        // this is the same test the name resolver applies; it must be consulted
-        // BEFORE either module spelling, or a local `Outer` would be mistaken
-        // for a module prefix and the enclosing path read off an import.
-        bool namesLocalTopLevel = false;
-        for (const TypeSymbol* ts : localTypes)
-            if (ts && ts->name == qualifier) { namesLocalTopLevel = true; break; }
-        if (namesLocalTopLevel) return nullptr;
-
-        if (heads.aliases) {
-            const auto it = heads.aliases->find(qualifier);
-            if (it != heads.aliases->end()) targetModule = it->second;
+// fix #6373 (§11.6, v0.338): the §11.6 nested-type walk — `parts[from ..]` off
+// `ts`, one `NestedTypeSymbol` per component, null at the first one that is
+// absent. This is `resolveNamed`'s own qualified walk, so the two agree on what
+// a nested spelling names.
+//
+// SEAM-ACCESSOR: `ts` is reached off `heads.imported`, so on the import path it
+// is an IMPORTED `TypeSymbol` reconstructed by `ModuleLoader` with no AST and no
+// `decl`. This walk reads only `members` and `NestedTypeSymbol::name`/`type`,
+// which the loader does populate, and never `decl`.
+const TypeSymbol* walkNestedTypePath(const TypeSymbol* ts,
+                                     const std::vector<std::string_view>& parts,
+                                     std::size_t from) {
+    for (std::size_t i = from; i < parts.size(); ++i) {
+        const TypeSymbol* inner = nullptr;
+        for (Symbol* m : ts->members) {
+            const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
+            if (nt && nt->name == parts[i] && nt->type) { inner = nt->type; break; }
         }
-        if (targetModule.empty() && heads.moduleNames &&
-            heads.moduleNames->count(qualifier))
-            targetModule = qualifier;
-        if (targetModule.empty()) return nullptr;
+        if (!inner) return nullptr;
+        ts = inner;
     }
+    return ts;
+}
 
-    // Match the FINAL path component against `targetModule`'s exports by
-    // SIMPLE name. The qualifier has been established to be a module, so the
-    // module is the right scope; the enclosing path is NOT verified.
-    //
-    // KNOWN LIMITATION (#6373, filed by the non-author review of this commit;
-    // deliberately left as-is here so the behaviour is not changed silently).
-    // A three-or-more-part spelling resolves on its last component alone, so
-    // the resolver cannot tell these two apart:
-    //
-    //   `Lib.Outer.Box<T>` where `Lib` exports a TOP-LEVEL `Box<in T>` but no
-    //     `Outer` at all -> the §2.7 "no public type `Outer`" diagnostic fires
-    //     (correctly), and this pass ALSO contributes a spurious §12.9 error
-    //     read off `Lib.Box`, a type the spelling never names.
-    //   `LibQ.Outer.Box<T>` where `LibQ` exports a genuinely NESTED
-    //     `Outer.Box<in T>` -> the §12.9 error is CORRECT and intended.
-    //
-    // The two spellings are textually identical here and resolve to the same
-    // symbol, so the first is a false resolve. It stays below the rejection
-    // bar because the program is rejected by §2.7 regardless — it is a
-    // spurious SECOND diagnostic, not a legal program turned into an error.
-    // The suggested remedy (require exactly two path parts) is a real
-    // behavioural trade — it would narrow the correct `LibQ.Outer.Box` case
-    // from REJECT to skip — so it is #6373's decision to make, not this
-    // commit's.
+HeadQualifier classifyHeadQualifier(
+    const ast::Type& head, const std::vector<TypeSymbol*>& localTypes,
+    const std::vector<TypeAliasSymbol*>& localAliases, const VarianceHeads& heads) {
+    HeadQualifier q;
+    const auto& parts = head.name->parts;
+    if (parts.size() < 2) return q;  // Bare
+    const std::string qualifier(parts.front());
+    // §2.2 — a LOCAL declaration shadows an import of the same name, and the
+    // name resolver consults the module scope — every top-level type AND every
+    // top-level alias, `TypeResolution::run` populating it from
+    // `ctx_.module()->children` — BEFORE its alias and module arms. Both local
+    // kinds therefore outrank both module spellings, and both leave the spelling
+    // naming nothing this pass can resolve.
+    for (const TypeSymbol* ts : localTypes)
+        if (ts && ts->name == qualifier) {
+            q.kind = HeadQualifier::Kind::LocalTopLevel;
+            return q;
+        }
+    for (const TypeAliasSymbol* as : localAliases)
+        if (as && as->name == qualifier) {
+            q.kind = HeadQualifier::Kind::LocalAlias;
+            return q;
+        }
+    if (heads.aliases) {
+        const auto it = heads.aliases->find(qualifier);
+        if (it != heads.aliases->end()) {
+            q.kind = HeadQualifier::Kind::ImportedModule;
+            q.module = it->second;
+            q.partsConsumed = 1;
+            return q;
+        }
+    }
+    // §2.7 rule 2 — try each PREFIX of the dotted name, LONGEST FIRST, against
+    // the modules this file imported. This is `resolveNamed`'s own loop, and it
+    // is what makes a MULTI-SEGMENT module name reachable: under
+    // `import Com.Sub;` the spelling `Com.Sub.Box<T>` consumes two segments
+    // before `Box` is read, where a `parts.front()`-only test looked up `Com` —
+    // not an imported module name — and silently skipped a real §12.9 violation.
+    if (heads.moduleNames) {
+        for (std::size_t n = parts.size() - 1; n >= 1; --n) {
+            std::string prefix;
+            for (std::size_t k = 0; k < n; ++k) {
+                if (k > 0) prefix += '.';
+                prefix += std::string(parts[k]);
+            }
+            if (!heads.moduleNames->count(prefix)) continue;
+            q.kind = HeadQualifier::Kind::ImportedModule;
+            q.module = prefix;
+            q.partsConsumed = n;
+            return q;
+        }
+    }
+    q.kind = HeadQualifier::Kind::None;
+    return q;
+}
+
+// fix #6351 (second attempt; the first was REJECTed for a false resolve), as
+// completed by fix #6373: the head `head` names among the imported types, or
+// null.
+//
+// THE RULE: this function may only ever hand back a type the NAME RESOLVER would
+// bind to that spelling. It enforces that by deciding what the QUALIFIER binds
+// FIRST (`classifyHeadQualifier`) and then following the REST of the path the
+// way `resolveNamed` follows it — the module's export at `parts[consumed]`, then
+// §11.6 nested types. No component is ever matched on `parts.back()` alone.
+//
+//   * LocalTopLevel / LocalAlias -> null (see the enum's own comment). #6351's
+//     P9 hole and #6373's second one, closed by one test.
+//   * ImportedModule  -> the module's export at `parts[partsConsumed]`, then the
+//     remaining components as nested types. A component that does not exist
+//     yields null, so `Lib.Outer.Box<T>` against a module exporting only a
+//     top-level `Box<in T>` no longer reads `Lib.Box`'s marker — while
+//     `Lib.Outer.Box<in T>` against a module that really exports that nested
+//     type still resolves and still rejects, which a "require exactly two path
+//     parts" rule would have thrown away.
+//   * None            -> null. Never guess.
+//   * Bare            -> every imported module, null on a second match, which
+//     §2.2 already rejects as ambiguous.
+//
+// Null means `Unknown` upstream: a skip, the pre-#6351 behaviour, and the safe
+// direction — a false skip can only miss a rejection, while a false resolve
+// produces one.
+const TypeSymbol* resolveImportedHead(
+    const ast::Type& head, const VarianceHeads& heads,
+    const std::vector<TypeSymbol*>& localTypes,
+    const std::vector<TypeAliasSymbol*>& localAliases) {
+    if (!head.name || head.name->parts.empty() || !heads.imported) return nullptr;
+    const auto& parts = head.name->parts;
+
+    const HeadQualifier q =
+        classifyHeadQualifier(head, localTypes, localAliases, heads);
+
+    if (q.kind == HeadQualifier::Kind::ImportedModule) {
+        const auto mod = heads.imported->find(q.module);
+        if (mod == heads.imported->end()) return nullptr;
+        const std::string_view typeName = parts[q.partsConsumed];
+        const TypeSymbol* top = nullptr;
+        for (const TypeSymbol* ts : mod->second)
+            if (ts && ts->name == typeName) { top = ts; break; }
+        if (!top) return nullptr;
+        return walkNestedTypePath(top, parts, q.partsConsumed + 1);
+    }
+    if (q.kind != HeadQualifier::Kind::Bare) return nullptr;
+
+    // A BARE name: every imported module, and null on a second match.
+    const std::string_view h = parts.back();
     const TypeSymbol* found = nullptr;
     for (const auto& entry : *heads.imported) {
-        if (!targetModule.empty() && entry.first != targetModule) continue;
         for (const TypeSymbol* ts : entry.second) {
             if (!ts || ts->name != h) continue;
             if (found) return nullptr;  // ambiguous bare name — skip
@@ -14215,17 +14290,40 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
                                  VarianceSite site, int depth) {
     if (!head.name || head.name->parts.empty()) return VariancePos::Unknown;
     const std::string_view h = head.name->parts.back();
-    for (const TypeSymbol* ts : localTypes) {
-        if (ts->name != h) continue;
-        // A class, record, enum or choice is always invariant (§12.9), and it
-        // may in any case carry no marker at all.
-        if (ts->kind != ast::TypeDeclKind::Interface) return invariantOrDefer(site);
-        if (argIndex >= ts->genericParams.size()) return invariantOrDefer(site);
-        const auto* gps = dynamic_cast<GenericParamSymbol*>(ts->genericParams[argIndex]);
-        if (!gps) return invariantOrDefer(site);
-        if (gps->variance == "out") return VariancePos::CoVariant;
-        if (gps->variance == "in") return VariancePos::ContraVariant;
-        return invariantOrDefer(site);
+    // fix #6373 (§2.2, §2.7 rule 1, v0.338): the qualifier decides which scope
+    // answers, so this local-top-level table answers BARE NAMES ONLY.
+    //
+    // The walk below used to compare `parts.back()` — the spelling's LAST
+    // segment — with no test on whether the spelling was qualified at all, so
+    // `Lib.Box<T>` was answered off a LOCAL top-level `Box` whenever the file
+    // happened to declare one. §2.7 rule 1 resolves the leftmost segment first
+    // and resolves the rest against whatever THAT binds to; a module-qualified
+    // spelling therefore never consults the local table, and §2.2's shadowing
+    // rule is about a BARE name (`Box<T>`), which is the one this arm keeps.
+    //
+    // MEASURED both ways on the base, with a local `Box` and a same-named
+    // `Lib.Box` carrying OPPOSITE markers, so the two spellings cannot be
+    // confused:
+    //   local `in T`, `Lib.Box` `out T`, spelled `Lib.Box<T>` -> REJECTED, and
+    //     it must COMPILE (§2.7 rule 2 binds `Lib.Box`, covariant);
+    //   local `out T`, `Lib.Box` `in T`, spelled `Lib.Box<T>` -> ACCEPTED, and
+    //     it must be REJECTED (a real §12.9 violation, silently skipped).
+    // That is a false resolve in the shape #6351's first attempt was REJECTed
+    // for: it turns a legal program into an error.
+    const bool qualifiedSpelling = head.name->parts.size() > 1;
+    if (!qualifiedSpelling) {
+        for (const TypeSymbol* ts : localTypes) {
+            if (ts->name != h) continue;
+            // A class, record, enum or choice is always invariant (§12.9), and it
+            // may in any case carry no marker at all.
+            if (ts->kind != ast::TypeDeclKind::Interface) return invariantOrDefer(site);
+            if (argIndex >= ts->genericParams.size()) return invariantOrDefer(site);
+            const auto* gps = dynamic_cast<GenericParamSymbol*>(ts->genericParams[argIndex]);
+            if (!gps) return invariantOrDefer(site);
+            if (gps->variance == "out") return VariancePos::CoVariant;
+            if (gps->variance == "in") return VariancePos::ContraVariant;
+            return invariantOrDefer(site);
+        }
     }
     // fix #6354 (§27.8, §12.9): a LOCAL GENERIC ALIAS head. §12.9 forbids a
     // marker on an alias parameter ("the variance markers are interface-only
@@ -14285,9 +14383,13 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
     // all and searches the module `L` names instead.
     //
     // `resolveImportedHead` enforces the same rule from the other side: it
-    // returns null outright when the qualifier is a local top-level type, and
-    // only searches a module when the qualifier provably names one.
-    if (const TypeSymbol* its = resolveImportedHead(head, heads, localTypes)) {
+    // returns null outright when the qualifier is a local top-level type or a
+    // local alias, searches a module only when the qualifier provably names one
+    // (#6373 — and it follows the rest of the path as nested types, so a
+    // three-segment spelling whose middle segment does not exist resolves to
+    // nothing rather than to the last component).
+    if (const TypeSymbol* its =
+            resolveImportedHead(head, heads, localTypes, localAliases)) {
         // The same reading rules as the local-type walk above, deliberately:
         // a class, record, enum or choice is always invariant (§12.9), and a
         // head with no marker at `argIndex` defers through `invariantOrDefer`
@@ -14302,6 +14404,20 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
         if (gps->variance == "in") return VariancePos::ContraVariant;
         return invariantOrDefer(site);
     }
+    // fix #6373 (§2.3, §2.7 rule 1, v0.338): the built-in table answers BARE
+    // NAMES ONLY, for the same reason the local-top-level table above now does.
+    // §2.3's built-ins are "use without import" — they are reachable as bare
+    // names, and a qualified spelling reaches one ONLY through its home
+    // module's qualified name, which `resolveNamed` REWRITES to the bare name
+    // in the AST (fix #4698 / #6040) before this pass reads it. So a qualified
+    // spelling arriving here names nothing this table can answer.
+    //
+    // MEASURED on the base: with `import LibX;` where `LibX` exports no
+    // `Array`, `method Put(x: LibX.Array<T>)` under `out T` was rejected TWICE —
+    // once correctly, by "module `LibX` has no public type `Array` (§2.7)", and
+    // once by a §12.9 diagnostic byte-identical to the one the bare `Array<T>`
+    // spelling legitimately earns. The spelling never named the built-in.
+    if (qualifiedSpelling) return VariancePos::Unknown;
     if (!isBuiltinTypeName(h)) return VariancePos::Unknown;
     if (argIndex == 0 && builtinHeadIsCovariantAtZero(h)) return VariancePos::CoVariant;
     return invariantOrDefer(site);
