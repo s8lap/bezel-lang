@@ -23424,10 +23424,27 @@ private:
     // element pointer AFTER the materialize-and-dispose (First/Aggregate over a
     // snapshot) — owning there would double-free / UAF respectively. Ignored for
     // non-GroupBy receivers.
+    //
+    // #6380 (§28.3 *unbound owned temporaries*, §28.9, stdlib §4.4–§4.11 /
+    // §4.17–§4.18, v0.338): when the receiver is itself an UNBOUND fresh `owned`
+    // collection temporary — an `owned`-returning producer call, or a fresh
+    // materializer call, used DIRECTLY as a LINQ receiver, the same population
+    // freeUnboundOwnedBorrowingArrayTemp gates on — the lazy source built here
+    // OWNS it (bz_lazy_own_source) and reclaims it at dispose. Default TRUE,
+    // because that is the only correct answer for a terminal consumer: the
+    // source value exists ONLY inside this callee, so a consumer that reclaims
+    // it afterwards cannot name it, and the one consumer that could
+    // (ToDictionary, via `outRecvArr`) opts out by passing FALSE. Set false
+    // ONLY from a site that reclaims the source itself through `outRecvArr`;
+    // two frees of one temporary is a double free. Ignored for receivers the
+    // unbound-temporary gate does not admit (a named local, a field, a
+    // parameter, a `move`, a non-collection source) — those keep the borrowing
+    // wrap their own owner discharges.
     llvm::Value* lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                        sema::TypeRef*& elemRef,
                                        bool ownFreshGroupings = false,
-                                       llvm::Value** outRecvArr = nullptr);
+                                       llvm::Value** outRecvArr = nullptr,
+                                       bool ownSourceTemp = true);
 
     // stdlib §5 (#651/#752): materialize a `GroupBy(keySelector)` call into an
     // owned `Array<IGrouping<TKey, T>>` (a bz_array_t* of bz_grouping_t*

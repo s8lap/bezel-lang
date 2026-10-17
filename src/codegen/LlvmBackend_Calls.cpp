@@ -3697,12 +3697,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // `_ := f.Make();` binding, which is the asymmetry that identifies
             // this defect.
             //
-            // NARROW: the `lazyTerminal` receiver path is NOT fixed here, and it
-            // is NOT a `LinkedList<T>`-specific residue — see the corrected
+            // NARROW: the `lazyTerminal` receiver path was NOT fixed here, and
+            // it is NOT a `LinkedList<T>`-specific residue — see the corrected
             // scoping in the commit body and in
             // tests/codegen/unbound_owned_collection_temp_reclaim_6366_test.cpp.
             // A receiver that takes the `lazyTerminal` MATERIALIZATION path
-            // leaks, whatever its family. MEASURED at this fix's tip over 101
+            // leaked, whatever its family. MEASURED at this fix's tip over 101
             // iterations (`bezelc --sanitize=address`):
             //
             //   f.Make().Sum()             Array<int>        CLEAN (this arm)
@@ -3711,20 +3711,33 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             //   f.Make().Where(..).Sum()   Array<int>        12,120 B
             //
             // `LinkedList<T>` is never array-backed, so EVERY terminal on it
-            // materializes and every one leaks; an `Array<T>` receiver
+            // materializes and every one leaked; an `Array<T>` receiver
             // materializes only when the terminal is a LINQ one (`ToArray`) or
             // when a lazy operator precedes it (`Where(...).Sum()`). Scoping a
-            // follow-up to `LinkedList` would leave both Array faces behind.
+            // follow-up to `LinkedList` would have left both Array faces
+            // behind.
             //
-            // WHY it leaks: `lowerToLazyEnumerator(*ma->target, …)` lowers the
+            // WHY it leaked: `lowerToLazyEnumerator(*ma->target, …)` lowers the
             // receiver expression ITSELF, so by the time `recv` is rebound to
             // the `bz_lazy_to_array` snapshot the source value exists only
             // inside that callee — `freeFreshInputTemp` returns early
             // (lazyTempArr is set, correctly: the snapshot is `recv`), and the
-            // source is left unreclaimed. Closing it needs an out-param for the
-            // wrapped source on `lowerToLazyEnumerator`, i.e. a change to that
-            // function's interface for every LINQ terminal, which is its own
-            // change rather than a line on this return.
+            // source is left unreclaimed.
+            //
+            // fix #6380 (§28.3 K8, §28.9, stdlib §4.4–§4.11/§4.17–§4.18,
+            // v0.338) closed that path — NOT by threading the source out to
+            // each consumer, but by having `lowerToLazyEnumerator` TRANSFER
+            // ownership of an unbound fresh `owned` source to the lazy it
+            // builds (`bz_lazy_own_source`), so `bz_lazy_dispose` reclaims it
+            // whichever consumer drains the pipeline. Every shape named above
+            // measures 0 after #6380, over 101 iterations:
+            //
+            //   f.Make().Sum()             LinkedList<int>   0 B
+            //   f.Make().ToArray()         Array<int>        0 B
+            //   f.Make().Where(..).Sum()   Array<int>        0 B
+            //
+            // Rows for those live in
+            // tests/codegen/lazy_terminal_unbound_owned_source_reclaim_6380_test.cpp.
             //
             // No-op unless the receiver is exactly that shape, so
             // a bound / `using var` / aliased / `move`d receiver is freed by

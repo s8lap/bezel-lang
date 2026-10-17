@@ -2386,6 +2386,22 @@ struct bz_lazy_t {
     // bz_lazy_from_owned_array / bz_lazy_from_owned_grouping_array paths)
     // leaves the slots untouched. Disjoint from arr_is_groupings.
     int32_t arr_str_keys;
+    // #6380 (§28.3 *unbound owned temporaries*, §28.9, stdlib §4.4–§4.11 /
+    // §4.17–§4.18, v0.338): the SOURCE this lazy wraps when that source is an
+    // UNBOUND fresh `owned` collection temporary — an `owned`-returning producer
+    // (or a fresh materializer call) used directly as a LINQ receiver, which no
+    // name, field or parameter owns and which therefore nothing else will free.
+    // `own_src_kind` is 0 (no owned source), 1 `bz_array_t*`, 2 `bz_llist_t*`,
+    // 3 `bz_dict_t*` — the SAME three-way backing classification
+    // freeUnboundOwnedBorrowingArrayTemp dispatches on, so one unwritten
+    // temporary is reclaimed by exactly one runtime free no matter which LINQ
+    // consumer drains the pipeline. DISJOINT from `own_arr` (the SNAPSHOT this
+    // source built and owns, freed with a null element disposer above); a
+    // `bz_lazy_t` may hold both — a Dictionary receiver owns both its own table
+    // and the entry array materialized from it. Set only by bz_lazy_own_source,
+    // which codegen calls under the unbound-temporary gate.
+    int32_t own_src_kind;
+    void*   owned_src;
 };
 
 // Advance the upstream enumerator and return a pointer to its current element,
@@ -2452,6 +2468,33 @@ static void    bz_lazy_dispose(bz_lazy_t* e) {
         if (e->arr_is_groupings) bz_groupby_free_groups(e->arr);
         if (e->arr_str_keys) bz_lazy_release_str_dict_keys(e->arr, e->esz);
         bz_array_free(e->arr, nullptr);
+    }
+    // #6380 (§28.3 K8, §28.9): reclaim the UNBOUND fresh `owned` collection
+    // temporary this source WRAPS, if codegen marked it owned
+    // (bz_lazy_own_source). Nothing else holds that value — it was produced by a
+    // call and consumed directly as a receiver — so leaving it to dispose is the
+    // only place it can be freed. Disposal runs exactly once per enumerator
+    // (every consumer drains then disposes: bz_lazy_to_array / bz_lazy_to_dict /
+    // the for-loop), so this is a single release, never a double free.
+    //
+    // NULL element disposer, and that is the SAFE direction rather than a
+    // shortcut: this source's ELEMENTS are borrows (every family named here is a
+    // borrowing collection, stdlib §3/§5 — the producer owns its elements, not
+    // this receiver), so releasing them here would be a use-after-free for any
+    // result that aliased a slot. The cost is that an `Array<string>` source
+    // leaves its per-element co-owned +1 unreleased — a bounded per-element leak
+    // on a shape that leaked the whole array before this path existed.
+    //
+    // Free AFTER the `own_arr` snapshot above: a Dictionary receiver owns both
+    // its own table and the entry array materialized from it, and the entry
+    // array's slots are COPIES of the table's key/value bytes, so releasing the
+    // copy first cannot dangle the table (which the runtime free below owns).
+    if (e->own_src_kind && e->owned_src) {
+        if (e->own_src_kind == 2)      bz_llist_free(e->owned_src, nullptr);
+        else if (e->own_src_kind == 3) bz_dict_free(e->owned_src, nullptr);
+        else                           bz_array_free(e->owned_src, nullptr);
+        e->owned_src = nullptr;
+        e->own_src_kind = 0;
     }
     // #422 / §28.9 / §28.3: release the operator's closure ONLY when it was an
     // inline lambda we own (own_closure set by codegen). The closure BORROWS its
@@ -2595,10 +2638,30 @@ extern "C" void* bz_lazy_from_set(void* set, int64_t esz) {
     return e;
 }
 
+// #6380 (§28.3 K8 / §28.9 / stdlib §4.4–§4.11 / §4.17–§4.18, v0.338): mark the
+// SOURCE this lazy enumerator wraps as OWNED, so bz_lazy_dispose reclaims it.
+// Codegen calls this only for a source no name owns — an `owned`-returning
+// producer call, or a fresh materializer call, used DIRECTLY as a LINQ receiver
+// (the same population freeUnboundOwnedBorrowingArrayTemp gates on) — so the
+// transfer is sound: nothing else holds the value, and the lazy's lifetime is
+// exactly the enumeration that still reads it.
+//
+// `kind` names the source's backing (1 `bz_array_t*`, 2 `bz_llist_t*`,
+// 3 `bz_dict_t*`) so dispose can pick the matching runtime free. A second call
+// on an already-owned source is a no-op rather than an overwrite: two different
+// frees of one temporary is exactly the double free this path must not create.
+// Returns `lazy` so the caller can inline it into the wrap expression.
+extern "C" void* bz_lazy_own_source(void* lazy, void* src, int32_t kind) {
+    auto* e = (bz_lazy_t*)lazy;
+    if (!e || !src) return lazy;
+    if (kind < 1 || kind > 3) return lazy;
+    if (e->own_src_kind) return lazy;
+    e->owned_src = src;
+    e->own_src_kind = kind;
+    return lazy;
+}
+
 // per §4.6/§4.7 + §5 fix #450: wrap a bz_llist_t* as a lazy source that walks
-// nodes head-to-tail. `arr` holds the bz_llist_t*; `inner` is reused (distinct
-// kind, no SELECTMANY overlap) to store the current bz_llist_node_t*.
-// On first MoveNext `inner` is null → initialized to head. Does not own the list.
 extern "C" void* bz_lazy_from_llist(void* llist, int64_t esz) {
     auto* e = bz_lazy_new(BZ_LAZY_LLIST, esz);
     e->arr = llist;     // bz_llist_t*
