@@ -1,7 +1,7 @@
 //! case: s3_2_0003
 //! doc: spec
 //! section: 3.2
-//! title: a record this inserted into an Array is an independent copy
+//! title: a record this stored into an Array element reads back its field values
 //! rule: A **value type** is copied on assignment; each variable holds an independent value.
 //! cites: 3.2, 28.11
 //! expect: run

@@ -1,7 +1,7 @@
 //! case: s3_2_0004
 //! doc: spec
 //! section: 3.2
-//! title: a record this stored through an indexer set is an independent copy
+//! title: a record this passed to an indexer set reads back its field values
 //! rule: A **value type** is copied on assignment; each variable holds an independent value.
 //! cites: 3.2, 28.11
 //! expect: run
