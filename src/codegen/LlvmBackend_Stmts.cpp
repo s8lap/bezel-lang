@@ -10377,6 +10377,57 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // null-guards each slot itself, so passing a possibly-null entry is safe.
     registerForLoopSpillSlots(fs, {enumSlot, srcDisposeSlot, varSlot});  // #747 R42
 
+    // fix #6361 / §29.1 / §29.11 (v0.338): does the enumerator `GetEnumerator()`
+    // actually returned have the layout `enumTs` was guessed to have?
+    //
+    // `enumTs` above was picked by a STRUCTURAL scan (MoveNext + Current), the
+    // same guess `wrapUserClassAsIEnumerable` makes — correct for the two-class
+    // idiom (`return new IntRangeEnum(...)`) and the self-returning one
+    // (`return this`), WRONG when `GetEnumerator` DELEGATES
+    // (`return _c.GetEnumerator();`). On the delegating shape the value is not
+    // an `enumTs` instance: §29.11 says a `GetEnumerator` whose declared return
+    // is the `IEnumerator<T>` head produces a value ALREADY in iterator-vtable
+    // format (slot 0 = a 5-slot iterator vtable, [1]=Dispose, [2]=MoveNext,
+    // [3]=Current, [4]=GetEnumerator). Driving it with the guessed class's
+    // methods then reads `_cur` at the byte offset `_cur` occupies in a real
+    // `Counter` ({ptr, i8, i32} — byte 12) out of a
+    // `userenumenum.Counter$Counter` wrapper ({ptr, ptr, ptr, i1}) — i.e. bits
+    // 32..47 of the wrapper's own `enumerator` POINTER. Confirmed in the IR as
+    // a SEGV in `bz$P9.Counter$MoveNext` with `rdi = <heap ptr> + 0xc`.
+    //
+    // A single runtime identity test against `enumTs`'s OWN class vtable picks
+    // between the two families, so no static guess is trusted — exactly the
+    // discriminator fix #6343 added to `wrapUserClassAsIEnumerable`. That fix
+    // covers the manual `while e.MoveNext()` driver; THIS is the `for`-in
+    // driver, which reaches the same confused value through its own copy of
+    // the guess and ran no adapter at all.
+    //
+    // `vtableOf` returns null for an IMPORTED `enumTs` (imports have no local
+    // vtable global, LlvmBackend_Setup.cpp ~L5096). The test is then skipped
+    // and the pre-existing direct lowering stands, unchanged — that hole is
+    // filed separately and is deliberately NOT widened into here.
+    llvm::GlobalVariable* enumClassVt = vtableOf(enumTs);
+    auto iterSlotFn = [&](llvm::Value* obj, unsigned slot) -> llvm::Value* {
+        llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+        llvm::Value* addr = builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(slot)});
+        return builder_.CreateLoad(ptrTy(), addr);
+    };
+    // Non-null only when the test can actually run; a null return means
+    // "keep the direct family", which is what an imported `enumTs` gets.
+    // Slot 0 IS the vtable pointer — a bare load, NOT `iterSlotFn(obj, 0)`,
+    // which would deref once more and yield the type descriptor (a class
+    // vtable's `[0]` is `td$…`; only the §29.11 wrapper globals self-reference
+    // in slot 0, so the extra deref happens to be right for exactly the wrong
+    // value). Same shape as fix #6343's test in `wrapUserClassAsIEnumerable`.
+    auto useOwnVtable = [&](llvm::Value* obj) -> llvm::Value* {
+        if (!enumClassVt) return nullptr;
+        llvm::Value* enumVt = builder_.CreateLoad(ptrTy(), obj);
+        llvm::Value* isEnumTs = builder_.CreateICmpEQ(enumVt, enumClassVt);
+        return builder_.CreateAnd(
+            builder_.CreateNot(builder_.CreateIsNull(obj)),
+            builder_.CreateNot(isEnumTs), "ien.useownvt");
+    };
+
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ien.body", currentFn_);
     auto* endBB  = llvm::BasicBlock::Create(llvm_, "ien.end",  currentFn_);
@@ -10385,11 +10436,46 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // cond: __enum.MoveNext() → bool.
     builder_.SetInsertPoint(condBB);
     llvm::Value* enumObj = builder_.CreateLoad(ptrTy(), enumSlot);
-    std::vector<llvm::Value*> mnArgs = {enumObj};
-    llvm::Value* moved = emitMethodCall(moveNextSym, mnArgs, false);
-    if (!moved) {
-        // If MoveNext can't be resolved via vtable, fall back to false.
-        moved = builder_.getFalse();
+    llvm::Value* moved = nullptr;
+    if (llvm::Value* useOwn = useOwnVtable(enumObj)) {
+        // fix #6361: the delegating shape — re-dispatch through the value's OWN
+        // iterator vtable (slot 2). The direct path is kept in its own block so
+        // its IR stays byte-identical for the two-class and self-returning
+        // idioms, which is what `emitMethodCall`'s class-virtual handling (and
+        // its null fallback) depends on.
+        auto* adBB    = llvm::BasicBlock::Create(llvm_, "ien.mnown",  currentFn_);
+        auto* directBB= llvm::BasicBlock::Create(llvm_, "ien.mndirect",currentFn_);
+        auto* mergeBB = llvm::BasicBlock::Create(llvm_, "ien.mnmerge", currentFn_);
+        builder_.CreateCondBr(useOwn, adBB, directBB);
+
+        builder_.SetInsertPoint(adBB);
+        llvm::Value* adMoved = builder_.CreateCall(
+            llvm::FunctionType::get(i1(), {ptrTy()}, false),
+            iterSlotFn(enumObj, 2), {enumObj}, "ien.mnown");
+        builder_.CreateBr(mergeBB);
+
+        builder_.SetInsertPoint(directBB);
+        std::vector<llvm::Value*> mnArgs2 = {enumObj};
+        llvm::Value* directMoved = emitMethodCall(moveNextSym, mnArgs2, false);
+        if (!directMoved) directMoved = builder_.getFalse();
+        // `emitMethodCall` may emit its own exception-check continuation, so the
+        // block that actually reaches `mergeBB` is wherever it left the insert
+        // point — naming `directBB` would give the phi a non-predecessor.
+        auto* directEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(mergeBB);
+
+        builder_.SetInsertPoint(mergeBB);
+        auto* movedPhi = builder_.CreatePHI(i1(), 2, "ien.moved");
+        movedPhi->addIncoming(adMoved, adBB);
+        movedPhi->addIncoming(directMoved, directEnd);
+        moved = movedPhi;
+    } else {
+        std::vector<llvm::Value*> mnArgs = {enumObj};
+        moved = emitMethodCall(moveNextSym, mnArgs, false);
+        if (!moved) {
+            // If MoveNext can't be resolved via vtable, fall back to false.
+            moved = builder_.getFalse();
+        }
     }
     builder_.CreateCondBr(moved, bodyBB, endBB);
 
@@ -10397,6 +10483,12 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     builder_.SetInsertPoint(bodyBB);
     {
         llvm::Value* enumObj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+        // The guessed-class read of `Current`, in all three of its spellings
+        // (method, local property accessor, imported `$propget` stub). Lifted
+        // into a lambda so fix #6361's adapter branch below can keep it in its
+        // OWN basic block, leaving its emitted IR byte-identical on the path
+        // that still takes it.
+        auto emitDirectCurrent = [&](llvm::Value* enumObj2) -> llvm::Value* {
         llvm::Value* curVal = nullptr;
         if (currentSym) {
             // Method-form Current.
@@ -10517,6 +10609,43 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                 curVal = builder_.CreateTrunc(curVal, elemTy);
             if (curVal->getType() == elemTy)
                 builder_.CreateStore(curVal, varSlot);
+        }
+        return curVal;
+        };
+
+        // fix #6361 (§29.1 / §29.11, v0.338): the `Current` half of the same
+        // discriminator, reading the value's OWN iterator-vtable slot 3 on the
+        // delegating shape. `varSlot` is the join point (both arms store into
+        // it), so no phi is needed and neither arm has to materialize a value
+        // the other does not produce.
+        auto storeCurrent = [&](llvm::Value* v) {
+            if (!v) return;
+            if (v->getType() != elemTy && elemTy->isIntegerTy() &&
+                v->getType()->isIntegerTy())
+                v = builder_.CreateTrunc(v, elemTy);
+            if (v->getType() == elemTy)
+                builder_.CreateStore(v, varSlot);
+        };
+
+        if (llvm::Value* useOwn = useOwnVtable(enumObj2)) {
+            auto* adBB     = llvm::BasicBlock::Create(llvm_, "ien.curad",     currentFn_);
+            auto* directBB = llvm::BasicBlock::Create(llvm_, "ien.curdirect", currentFn_);
+            auto* contBB   = llvm::BasicBlock::Create(llvm_, "ien.curcont",   currentFn_);
+            builder_.CreateCondBr(useOwn, adBB, directBB);
+
+            builder_.SetInsertPoint(adBB);
+            storeCurrent(builder_.CreateCall(
+                llvm::FunctionType::get(elemTy, {ptrTy()}, false),
+                iterSlotFn(enumObj2, 3), {enumObj2}, "ien.curad"));
+            builder_.CreateBr(contBB);
+
+            builder_.SetInsertPoint(directBB);
+            emitDirectCurrent(enumObj2);
+            builder_.CreateBr(contBB);
+
+            builder_.SetInsertPoint(contBB);
+        } else {
+            emitDirectCurrent(enumObj2);
         }
     }
 
