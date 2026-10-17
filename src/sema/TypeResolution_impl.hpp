@@ -1184,6 +1184,21 @@ private:
 
     Symbol* lookupName(std::string_view name, Scope* scope);
 
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): `lookupName`, plus
+    // §2.7's rule that a bare type name's search ENDS at the first enclosing
+    // type that has the name. Returns exactly what `lookupName` returns, and
+    // writes the enclosing type whose body DECLARES a member of that name (and
+    // so ended the search without supplying one) to `*stoppedAt`, or null when
+    // the search ran to completion. See the definition for why a body scope
+    // alone cannot express this.
+    Symbol* lookupBareTypeName(std::string_view name, Scope* scope,
+                               TypeSymbol** stoppedAt);
+
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): does `owning`
+    // declare an ACCESSIBLE member called `name` that is not a nested type?
+    bool enclosingTypeMemberBlocksBareName(const TypeSymbol* owning,
+                                           std::string_view name);
+
     // Slice 3d: walk a method/ctor body and resolve every type
     // ascription on LocalDecl / catch arm. Recurses through control-
     // flow constructs. Locals themselves are not registered here (that
@@ -1601,6 +1616,20 @@ private:
     // resolveTypeDecl). Null at module scope. Used to attribute a deferred
     // generic-param argument to the type parameter / owner it belongs to.
     TypeSymbol* currentOuterType_ = nullptr;
+
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): the body scopes
+    // of the enclosing types, innermost LAST, as (Scope*, owning TypeSymbol*)
+    // pairs — pushed beside `currentOuterType_` in resolveTypeDecl and popped
+    // with it. The type SCOPE CHAIN is already the §2.7 enclosing chain (a
+    // nested type's body scope parents to the outer type's body scope), but a
+    // body scope registers only the type's GENERIC PARAMETERS and NESTED TYPES
+    // (§11.3/#482), never its fields, methods, properties or events — so the
+    // chain silently SKIPS every enclosing member, which is the §2.7 defect
+    // `lookupBareTypeName` exists to close. Pairing each body scope with its
+    // owner is what lets that walk tell "this scope carried the name" from
+    // "the type whose body this scope belongs to DECLARES a member of that
+    // name" — a distinction the bare scope map cannot express.
+    std::vector<std::pair<const Scope*, TypeSymbol*>> typeBodyScopes_;
 
     // §28.1 (v0.196, #1817): the generic constraints of the method/operator
     // whose signature is currently being resolved (set at the top of

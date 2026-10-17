@@ -1417,6 +1417,12 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     // restores its enclosing type's value on exit.
     TypeSymbol* savedOuter = currentOuterType_;
     if (tsym) currentOuterType_ = tsym;
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): pair this body's
+    // scope with the type that owns it, so `lookupBareTypeName` can tell a
+    // scope that CARRIED a name from a type that DECLARES one. Pushed and
+    // popped with `currentOuterType_`, and `typeBodyScopes_` is exactly
+    // innermost-LAST, the order §2.7's paragraph gives.
+    if (tsym) typeBodyScopes_.emplace_back(&typeScope, tsym);
     // Slice S10: a class has at most one class-kind base; the
     // rest must be interfaces. Records and enums don't take
     // base classes (we don't enforce here — that's a separate
@@ -1817,6 +1823,11 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     // Enum constants don't carry types syntactically (their `:= value`
     // is a Const expression; types come from the underlying-int).
     currentOuterType_ = savedOuter;  // §14.2: restore enclosing-type context
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): `resolveTypeDecl`
+    // has a single exit (verified: every `return` between the body-scope push
+    // above and here belongs to a lambda or a switch arm), so this pop is
+    // unconditional.
+    if (tsym) typeBodyScopes_.pop_back();
 }
 
 void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
@@ -2252,6 +2263,205 @@ Symbol* Resolver::lookupName(std::string_view name, Scope* scope) {
     for (Scope* s = scope; s; s = s->parent) {
         auto it = s->names.find(name);
         if (it != s->names.end()) return it->second;
+    }
+    return nullptr;
+}
+
+// fix #6383 follow-up (§2.7, warning row, v0.338): does `m` DECLARE its own
+// name as its declared type — §2.7's `property Color: Color` and
+// `property Buffer: Buffer<int>` idioms?
+//
+// §2.7's warning row is explicit that these two are a CARVE-OUT: "warn,
+// unless the member's declared type is the resolved type (or an instantiation
+// of the resolved generic) — the `property Color: Color` idiom; qualify `this.`
+// to reach the member", and the prose repeats it ("the `property Color: Color`
+// and `property Buffer: Buffer<int>` idioms are its carve-out"). The carve-out
+// is stated where §2.7 states the member-vs-type contest generally, so it
+// governs the stop rule too: a member that spells the colliding name in its own
+// declared type is not a blocker.
+//
+// It has to be a carve-out, not a coincidence. A stop that read such a member
+// as a blocker would make the member UN-DECLARABLE — `property Color: Color`
+// would stop its own type's resolution. MEASURED: without this, a nested
+// `record Inner`'s `constructor(c: Color)` inside a `record Outer` declaring
+// `public property Color: Color` is rejected, where on the base it resolves to
+// the module-level `choice Color`. The same idiom in a TOP-LEVEL record is the
+// pinned accept `tests/codegen/choice_body_record_ctor_store_2097_test.cpp`
+// `spec_2_7_dotted_head_member_typed_as_colliding_type_accepted`.
+//
+// The test is SPELLING, not resolved-type identity, and is a conservative
+// approximation of §2.7's "the member's declared type is the resolved type":
+// it asks whether the declared type's HEAD is the colliding name, which is
+// what makes the idiom spellable at all. The direction it can err in is the
+// one that accepts rather than rejects — a declared type of `Color.Something`
+// under a colliding name `Color` also unblocks — and there the name resolves to
+// the very `Color` the declared type's head names, which is what the spelling
+// asked for.
+static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name) {
+    if (!m || !m->decl) return false;
+    const ast::Type* ty = nullptr;
+    if (const auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+        ty = pd->type.get();
+    else if (const auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+        ty = fd->type.get();
+    else if (const auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl))
+        ty = md->returnType.get();
+    else if (const auto* od = dynamic_cast<const ast::OperatorDecl*>(m->decl))
+        ty = od->returnType.get();
+    else if (const auto* ed = dynamic_cast<const ast::EventDecl*>(m->decl))
+        ty = ed->type.get();
+    else if (const auto* cd = dynamic_cast<const ast::ConstDecl*>(m->decl))
+        ty = cd->type.get();
+    if (!ty || !ty->name || ty->name->parts.empty()) return false;
+    return ty->name->parts.front() == name;
+}
+
+// fix #6383 follow-up (§2.7 "Through nesting", v0.338): does `owning` declare
+// an ACCESSIBLE member called `name` that is NOT a nested type — i.e. does the
+// bare-name search stop at `owning` without a type to hand back?
+//
+// §2.7's stop rule is about the NAME, not about a type of that name: "Ending
+// the search at the first type that HAS THE NAME, even when the member cannot
+// be used there". So a method, property, field, event or const of that name
+// stops the search exactly as a nested type does — there is simply nothing a
+// TYPE position can use at the end of it.
+//
+// A NESTED TYPE does not block: §2.7 says "Nested types of an enclosing type,
+// generic or not, are reached by bare name, since a nested type is one type and
+// needs no instantiation", and that name is already registered in this type's
+// own body scope (`resolveTypeDecl`'s §11.3/#482 loop), so `lookupName` finds
+// it in this very scope and never asks.
+//
+// Accessibility (§2.7 "an ACCESSIBLE member"), under §13's levels: inside the
+// OWNING type's own body every level is reachable, so nothing is filtered
+// there. For an OUTER enclosing type, `private` (§13.2 — reachable only
+// within the declaring type) and `protected` (§13.2 — reachable only within
+// the declaring type and types deriving from it; a nested type is not one) are
+// not accessible from this body and must not stop the search. `internal`
+// (§13.4) is access within the declaring module, which is the only module the
+// enclosing chain can come from.
+bool Resolver::enclosingTypeMemberBlocksBareName(
+    const TypeSymbol* owning, std::string_view name) {
+    if (!owning) return false;
+    // §2.7 "Through nesting" is scoped to a NESTED type's bodies — see the
+    // scope note above the caller. A top-level type's own body is rule 1
+    // alone, whose table has no type-position row.
+    if (!currentOuterType_ || currentOuterType_->enclosingTypePath.empty())
+        return false;
+    const bool ownBody = owning == currentOuterType_;
+    for (const Symbol* m : owning->members) {
+        if (!m || m->name != name) continue;
+        // A nested type is admitted by bare name (§2.7 "Through nesting").
+        if (dynamic_cast<const NestedTypeSymbol*>(m)) continue;
+        if (memberDeclaresCollidingName(m, name)) continue;  // §2.7 carve-out
+        const auto* member = dynamic_cast<const MemberSymbol*>(m);
+        if (member && !ownBody &&
+            (member->visibility == ast::Visibility::Private ||
+             member->visibility == ast::Visibility::Protected))
+            continue;
+        return true;
+    }
+    return false;
+}
+
+// fix #6383 follow-up (§2.7 "Through nesting", v0.338) — the §2.7 rule
+// `lookupName` structurally cannot express.
+//
+// §2.7, "Through nesting": "In a nested type's bodies, the enclosing-type
+// lookup visits the nested type and then each type enclosing it, innermost
+// first, at the rank the table gives its members; THE FIRST TYPE THAT HAS AN
+// ACCESSIBLE MEMBER OF THAT NAME ENDS THE SEARCH. … Ending the search at the
+// first type that HAS THE NAME, even when the member CANNOT BE USED THERE,
+// keeps a bare name from passing over an enclosing member and silently
+// resolving to a same-named module declaration or import."
+//
+// The scope chain IS that chain — `resolveTypeDecl` registers a nested type's
+// body scope with the ENCLOSING type's body scope as its parent — but a body
+// scope registers only the type's GENERIC PARAMETERS and NESTED TYPES
+// (`resolveTypeDecl`'s §11.3/#482 loop). A field, method, property, event or
+// const is never in it, so `lookupName` walks straight over an enclosing
+// member of the name and reaches the module declaration further out.
+//
+// MEASURED on base c5930d59 (bezelc built in this worktree):
+//   module R;
+//   public interface Box<in X> method Put(x: X); end Box;
+//   public class Holder
+//     public method Box(): int return 1; end Box;
+//     public method M(): Box<int> return null; end M;
+//   end Holder;
+// compiled and bound `Box<int>` to the top-level `Box` — while deleting the
+// `method Box` gives `unresolved type name `Box``. Same shape with a
+// `readonly property Box: int`.
+//
+// The walk below pairs each body scope with its owning TypeSymbol
+// (`typeBodyScopes_`), which is what separates "this scope carried the name"
+// from "the type whose body this scope belongs to DECLARES a member of that
+// name". The latter ends the search and yields no type; `stoppedAt` reports
+// which type, so the caller can name §2.7.
+//
+// SCOPE OF THE STOP, and it is narrow on purpose. §2.7's paragraph stating the
+// stop rule opens "**Through nesting.** IN A NESTED TYPE'S BODIES (§11.6), the
+// enclosing-type lookup visits the nested type and then each type enclosing it"
+// — the sentence quoted above is scoped to a nested type's bodies, and carries
+// its host paragraph's scope with it.
+//
+// Outside that scope, a TOP-LEVEL type's own body is rule 1 alone, and rule 1's
+// normative table has NO row for a type position: its rows are a chain head, a
+// bare value read, an assignment target, a bare callee, a head continued by
+// `?.`/`!`, and the warning row. Every one is a position at which a NAME is
+// read; §2.7 never places the enclosing type's members in a bare TYPE-name
+// lookup, so there is no rank for them to occupy and nothing to end the search.
+//
+// That is not a loophole — it is what makes §2.7's own `property Color: Color`
+// idiom spellable, and a test pins it (MEASURED, `tests/codegen/
+// choice_body_record_ctor_store_2097_test.cpp`,
+// `spec_2_7_dotted_head_member_typed_as_colliding_type_accepted`): in a
+// top-level `record Wrap`, `public property Color: Color;` and
+// `public constructor(c: Color)` name a module-level `choice Color`, and §2.7's
+// warning row names that idiom as a CARVE-OUT — "warn, unless the member's
+// declared type is the resolved type … the `property Color: Color` idiom".
+// A stop that read a property's own declared type as a blocker would make that
+// member un-declarable. So the stop fires in a NESTED type's body and nowhere
+// else; a top-level type's own member of the name does not stop the search.
+//
+// Two further axes are NOT covered, both declared rather than assumed:
+//   * BASE types. §2.7's rule-1 ranking paragraph says "the enclosing type's
+//     accessible members (inherited included)", but §2.7's "Through nesting"
+//     paragraph — the one stating the stop rule quoted above — enumerates the
+//     chain as "the nested type and then each type enclosing it", with no base
+//     types in it, and inheritance is a separate axis with its own accessor
+//     (`baseTypes`). Widening to base types is a strictly larger change with a
+//     much larger blast radius, and is filed separately rather than smuggled in.
+//   * §21.10 LOCAL types, whose bodies have no `resolveTypeDecl` body scope of
+//     their own (§21.10 has its own sentence on the enclosing order, and its
+//     own member-signature prohibition, already enforced above in
+//     `resolveNamed`). The test below reads the nearest `resolveTypeDecl` body,
+// which for a local type's members is the type that DECLARED the local type.
+//
+// The stop is placed so it can only ADD a rejection, never remove one: the
+// symbol `lookupName` would have returned is returned unchanged, and
+// `*stoppedAt` is a separate answer the caller decides about.
+Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
+                                     TypeSymbol** stoppedAt) {
+    if (stoppedAt) *stoppedAt = nullptr;
+    for (Scope* s = scope; s; s = s->parent) {
+        // §2.7 rule 1 ranks local scope ABOVE the enclosing type's members, so
+        // a name carried by this scope (a local, a parameter, a generic-
+        // parameter marker, or a nested type of the enclosing type itself) is
+        // the answer and no enclosing type is passed over. Only a scope that
+        // carries nothing can end the search below.
+        auto it = s->names.find(name);
+        if (it != s->names.end()) return it->second;
+        if (stoppedAt) {
+            for (const auto& entry : typeBodyScopes_) {
+                if (entry.first != s) continue;
+                if (enclosingTypeMemberBlocksBareName(entry.second, name)) {
+                    *stoppedAt = entry.second;
+                    break;
+                }
+            }
+            if (*stoppedAt) return nullptr;
+        }
     }
     return nullptr;
 }
@@ -3272,7 +3482,41 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         }
     }
     // Look up the first part.
-    Symbol* sym = qualifiedBuiltin ? nullptr : lookupName(first, scope);
+    Symbol* sym = nullptr;
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): §2.7's stop rule,
+    // applied to the one shape it is stated for — a BARE name. A chain head
+    // (`Box.Red`) is a different row of §2.7's normative table, where the
+    // enclosing type's members rank "last, after aliases"; stopping the search
+    // there would invert that row, so the stop is not applied to a multi-part
+    // spelling.
+    TypeSymbol* stoppedAt = nullptr;
+    if (qualifiedBuiltin) {
+        sym = nullptr;
+    } else if (t.name->parts.size() == 1) {
+        sym = lookupBareTypeName(first, scope, &stoppedAt);
+        if (stoppedAt) {
+            // §2.7 "Through nesting": the search ended at an enclosing type
+            // that HAS the name, and the member it has cannot be used in a
+            // TYPE position — so no type is bound and the spelling is
+            // unresolved, exactly as it is when the enclosing chain has no
+            // such member at all (the control shape). Same rule, same
+            // diagnostic text, one §2.7-naming hint added.
+            std::string msg = std::string("unresolved type name `") +
+                              std::string(first) + "`";
+            const std::string hint = owningRenameHint(first);
+            if (!hint.empty()) msg += "; " + hint;
+            msg += std::string("; `") + std::string(first) + "` is a member of the enclosing type `" +
+                   std::string(stoppedAt->name) +
+                   "` — a bare name's search ends at the first enclosing type "
+                   "that has it, whatever kind of member that is (§2.7 "
+                   "Through nesting); qualify the type, or rename the member";
+            ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
+            ref.kind = TypeRef::Kind::Error;
+            return;
+        }
+    } else {
+        sym = lookupName(first, scope);
+    }
     if (!sym) {
         // Unknown — but a null lookup may also mean "name is in scope as
         // a generic-param marker" (we used nullptr to indicate that).
