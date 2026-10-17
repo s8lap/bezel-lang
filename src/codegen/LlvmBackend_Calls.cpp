@@ -3058,6 +3058,59 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     elemTy->kind == sema::TypeRef::Kind::Primitive &&
                     elemTy->primitive == sema::PrimitiveType::String &&
                     !elemTy->nullable;
+                // fix #6394 (§28.3 *Unbound owned temporaries*, §28.9, stdlib
+                // §4.10, v0.338): reclaim an UNBOUND `owned`-producing Set
+                // receiver at the end of the full expression, in every arm of
+                // this block whose result is not one of the receiver's own
+                // element slots. #6352 gave `.Count`/`.IsEmpty` this call; its
+                // siblings below carried none at all, so an
+                // `owned Set<T>`-producing call consumed only in receiver
+                // position (`f.MakeSet().Terminal()`) leaked its whole table.
+                // MEASURED on this fix's parent at 101 iterations
+                // (`bezelc --sanitize=address`):
+                //
+                //   f.MakeSet().Contains(2)    43,228 B / 606 allocs
+                //   f.MakeSet().Add(9)         43,632 B /  707
+                //   f.MakeSet().Remove(2)      42,824 B /  505
+                //   f.MakeSet().Clear()        41,600 B /  300
+                //   f.MakeSet().UnionWith(f.Other())  86,860 B / 1313
+                //
+                // against 0 for the byte-identical `var s := f.MakeSet();` twin
+                // of each, which is the asymmetry that identifies the defect: a
+                // BOUND receiver is discharged by its own owner, and these arms
+                // reached no discharge at all.
+                //
+                // The gate is the SAME `freeUnboundOwnedBorrowingArrayTemp` /
+                // same population the `.Count` arm two arms down already calls —
+                // an unbound `owned`-returning call consumed only as this
+                // member's receiver. A named local, a `using var`, an alias, a
+                // `move` and a `new` receiver are not that CallExpr shape, so
+                // they stay discharged by their own owner: no double-free, no
+                // UAF (MEASURED: every bound twin of the table above is clean).
+                //
+                // PLACEMENT, not the trigger, is what each arm differs on. §28.3
+                // discharges the temporary "after every use of it within that
+                // expression has completed", so the call sits AFTER the
+                // operation that consumes the receiver — after `bz_dict_set_gen`
+                // for `.Add`, after `bz_dict_clear*` for `.Clear` (whose return
+                // is `unit`, so its obligation is at the end of the full
+                // expression and not at any return site), after the algebra fold
+                // for `.UnionWith`/`.ExceptWith`/`.IntersectWith`/
+                // `.IsSubsetOf`/`.IsSupersetOf`. Nothing any of those arms
+                // returns aliases the backing (a bool, a unit, or — for the
+                // algebra family — a bool), so no arm needs the
+                // `UnlessStringElementEscapes` discipline its element-returning
+                // sibling `SortedSet.First`/`.Last` carries below.
+                //
+                // §28.3 also closes the shape question: "The `owned` return
+                // qualifier is the single signal that drives the reclaim; there
+                // is no special-cased list of method names" — so this is one
+                // helper call per existing arm, gated on that one signal, and
+                // NOT a method-name list written a second time here.
+                auto freeUnboundSetReceiver = [&]() {
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                        recvTy);
+                };
                 // .Add(item) — insert (idempotent by content; §4.10 dedup).
                 if (m == "Add" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
@@ -3071,6 +3124,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* fn = declareC("bz_dict_set_gen",
                         llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
                     builder_.CreateCall(fn, {recv, elemPtr(item), sentinel});
+                    // fix #6394: the insert is the last read of `recv`; reclaim
+                    // the unbound receiver here (§28.3's end-of-full-expression
+                    // boundary, which for this arm is its own return).
+                    freeUnboundSetReceiver();
                     return llvm::ConstantInt::get(i32(), 0);
                 }
                 // fix #522 / §4.10: .TryAdd(item): bool — inserts iff not
@@ -3103,6 +3160,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateCall(setFn, {recv, ep, sentinel});
                     builder_.CreateBr(afterBB);
                     builder_.SetInsertPoint(afterBB);
+                    // fix #6394: afterBB is the join of both arms (inserted and
+                    // already-present), so it is the one point at which `recv` is
+                    // provably no longer read on either edge — the reclaim goes
+                    // here, not in `insertBB`, which would free the table on only
+                    // one path to this return.
+                    freeUnboundSetReceiver();
                     // Return true iff newly inserted (i.e. was not present).
                     return notPresent;
                 }
@@ -3112,7 +3175,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     if (!item) return nullptr;
                     auto* fn = declareC("bz_dict_contains_gen", i1(),
                                         {ptrTy(), ptrTy()});
-                    return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.has");
+                    llvm::Value* has =
+                        builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.has");
+                    // fix #6394: the membership query is a PURE BORROW of the
+                    // argument (`item`), never of the receiver, so the bool this
+                    // arm returns aliases nothing and the reclaim is safe here.
+                    freeUnboundSetReceiver();
+                    return has;
                 }
                 // .Remove(item): bool
                 // #429 / §28.9 / §4.10: for a Set<string>, use the releasing
@@ -3123,14 +3192,18 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
                     if (!item) return nullptr;
-                    if (isStrSet) {
-                        auto* fn = declareC("bz_dict_remove_set_string", i1(),
-                                            {ptrTy(), ptrTy()});
-                        return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.rm");
-                    }
-                    auto* fn = declareC("bz_dict_remove_gen", i1(),
-                                        {ptrTy(), ptrTy()});
-                    return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.rm");
+                    auto* rmFn = declareC(isStrSet ? "bz_dict_remove_set_string"
+                                                   : "bz_dict_remove_gen",
+                                          i1(), {ptrTy(), ptrTy()});
+                    llvm::Value* removed =
+                        builder_.CreateCall(rmFn, {recv, elemPtr(item)}, "set.rm");
+                    // fix #6394: reclaim AFTER the unlink, so the removal has
+                    // already resolved the one element's ownership and the
+                    // receiver's own release pass cannot discharge it twice —
+                    // `bz_dict_remove_set_string` frees that entry's key slot, so
+                    // `bz_set_string_keys_release` below finds nothing left in it.
+                    freeUnboundSetReceiver();
+                    return removed;
                 }
                 // .Count: int
                 if (m == "Count" && call.args.empty()) {
@@ -3186,6 +3259,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.CreateCall(fn,
                             {recv, llvm::ConstantPointerNull::get(ptrTy())});
                     }
+                    // fix #6394: `.Clear()` returns `unit`, so its §28.3
+                    // obligation cannot sit at a return site at all — the
+                    // boundary is the end of the full expression, and this arm's
+                    // return IS that boundary. The clear itself has already
+                    // emptied the table (`bz_dict_clear_set_strings` memsets the
+                    // buckets and zeroes `count`), so the reclaim's own string
+                    // pass below finds no live key to release a second time.
+                    freeUnboundSetReceiver();
                     return llvm::ConstantInt::get(i32(), 0);  // unit result
                 }
                 // per §4.10 (#351/#389): set-algebra ops over a dict-backed Set.
@@ -3203,8 +3284,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     // `elemTy` here is the self element's TypeRef (the binding
                     // from genericBackingType above); the helper lowers it.
                     if (llvm::Value* res = tryLowerSetAlgebra(
-                            m, recv, *call.args[0].value, elemTy, elemIsRecord))
+                            m, recv, *call.args[0].value, elemTy, elemIsRecord)) {
+                        // fix #6394: reclaim AFTER the fold — `UnionWith` /
+                        // `IntersectWith` mutate the receiver and `ExceptWith`
+                        // / the two `Is*Of` predicates read it, so the fold is
+                        // the last use of `recv`. `tryLowerSetAlgebra` returning
+                        // null means it deferred (element-type mismatch), and
+                        // then this arm falls out to the next handler, which
+                        // discharges the same unbound population at
+                        // LlvmBackend_Calls3.cpp's fall-through reclaim — so the
+                        // reclaim is taken only on the arm that consumed `recv`.
+                        freeUnboundSetReceiver();
                         return res;
+                    }
                     // other element type mismatched self → defer (fall out).
                 }
                 // fix #1426 / stdlib §4.18: SortedSet<T>.First (least) and
@@ -3286,6 +3378,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* freeFn = declareC("free",
                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
                     builder_.CreateCall(freeFn, {keyPtr});
+                    // fix #6394: this arm is the ONE element-returning member of
+                    // the dict-backed Set block, so it takes the sibling
+                    // `freeFreshInputTempUnlessStringElementEscapes` discipline
+                    // rather than the unconditional reclaim its neighbours take.
+                    // `bz_dict_min_key_gen`/`_max_key_gen` hand back a COPY of the
+                    // key BYTES, so freeing `keyPtr` disposes the copy — but the
+                    // pointer loaded OUT of that copy is the element itself. For a
+                    // `SortedSet<string>` that is a §28.11 shared-reference slot,
+                    // whose indexer-get row reads "reference out": reclaiming the
+                    // set would release the very reference this arm returns, and
+                    // the caller's +1 is minted by its own binding lowering, which
+                    // runs after this function returns (#6393's face). For a
+                    // value / class / record element the loaded value is a copy or
+                    // a borrow of storage the table does not own, so the reclaim is
+                    // free.
+                    if (!recvElemIsString) freeUnboundSetReceiver();
                     return elemVal;
                 }
                 return nullptr;  // remaining ops scoped out for dict-backed sets
