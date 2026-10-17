@@ -2740,6 +2740,46 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // null for value/class element borrows. Call AFTER the copy is built and
     // (for the comparer form) BEFORE any closure release, mirroring the copy's
     // own retain. Idempotent guards mean a non-materializer receiver is a no-op.
+    //
+    // THE EAGER-TERMINAL TWIN OF `freeLazyTemp`, and the WHOLE of the reclaim on
+    // an eager receiver. `freeLazyTemp` (above) opens `if (!lazyTempArr) return;`
+    // — a no-op exactly when the receiver was NOT materialized out of a lazy
+    // source — and `freeFreshInputTemp` opens `if (lazyTempArr) return;`, so the
+    // two are complementary on one flag and can never both fire.
+    //
+    // A LINQ source is materialized into `lazyTempArr` only when `lazyTerminal`
+    // (Call.cpp:2497) holds: a lazy / LinkedList / Range / vtable-IEnumerable /
+    // string / Set receiver. An `Array<T>` or `Stack<T>` receiver with NO
+    // preceding lazy operator keeps `lazyTerminal == false`, so it reaches the
+    // terminal DIRECTLY — no `bz_lazy_t*` is ever built, #6380's
+    // `bz_lazy_own_source` transfer has nothing to act on, and `freeLazyTemp` is
+    // inert. On that path `freeFreshInputTemp` is the ONLY reclaim, so every
+    // terminal return site in the `isArr` block below must call it.
+    //
+    // Until this lane, only five did: `.Length`/`.Count` (no-arg), `.Sum` (the
+    // int/long accumulator arm), and the three copy-forms `.Reversed()` /
+    // `.Sorted()` / the third — which is why those terminals were leak-free and
+    // their siblings were not. MEASURED on the parent (staging a3065a15), over
+    // 101-iteration loops under ASan, with the receiver an `owned`-returning
+    // user method consumed only in receiver position (`f.Make().Terminal()`,
+    // `Make(): owned Array<int>` / `owned Stack<int>` / `owned Array<decimal>`):
+    // 12,120 B leaked per shape at 14 terminals (Any, All, Contains, First,
+    // Single, Last, Min, Max, Average, Aggregate, ElementAt, FirstOrNull,
+    // LastOrNull, SingleOrNull) x {Array, Stack}, plus IndexOf on Array and the
+    // decimal `.Sum` arm — 30 shapes, each a full container per evaluation,
+    // byte-identical to the `_ := f.Make();` binding, which is the asymmetry
+    // that identifies the defect. Every one of the 14 is the same mechanism: the
+    // terminal reads `recv` to exhaustion and then returns without reclaiming it.
+    //
+    // The gate is UNCHANGED (`isFreshOwnerlessArrayMaterializerExpr` /
+    // `isUnboundOwnedBorrowingArrayCallExpr`), so this adds no new population
+    // that could be over-freed: a bound / `using var` / aliased / `move`d /
+    // returned receiver is not that CallExpr shape and is still freed by its own
+    // owner — no UAF, no double-free. Per §28.3 (unbound owned temporaries) the
+    // obligation is discharged "at the end of the full expression in which it is
+    // produced", and on this path that boundary is the terminal's own return;
+    // §28.9's runtime-managed tier is EXHAUSTIVE and names no collection, so the
+    // obligation is a real disposal, not an optimization.
     auto freeFreshInputTemp = [&]() {
         if (lazyTempArr) return;  // the lazy-terminal path frees via freeLazyTemp
         // stdlib §5 (#755): `recv` is an IGrouping's element array — the GROUPING
@@ -3318,6 +3358,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phi->addIncoming(builder_.getTrue(), bodyBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return phi;
         }
 
@@ -3328,6 +3369,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* nonEmpty =
                 builder_.CreateICmpSGT(len, builder_.getInt64(0), "any0.r");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return nonEmpty;
         }
 
@@ -3365,6 +3407,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phi->addIncoming(builder_.getFalse(), bodyBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return phi;
         }
 
@@ -3406,6 +3449,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
         }
 
@@ -3525,6 +3569,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(endBB);
                 if (relCl && closure) emitClosureRelease(closure);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 return builder_.CreateLoad(decTy, accSlot, "sum.r");
             }
 
@@ -3793,6 +3838,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(foldCl);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return builder_.CreateLoad(accTy, accSlot, "agg.r");
         }
         // per §5/§5.1 LINQ: .Average(fn: (T)->numeric): double  /  .Average(): double
@@ -3895,6 +3941,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 emitPendingCheck();
                 if (relCl && closure) emitClosureRelease(closure);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 return builder_.CreateLoad(decTy, divSlot, "avg.r");
             }
 
@@ -3961,6 +4008,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* cnt = builder_.CreateSIToFP(len, dblTy, "avg.cnt");
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return builder_.CreateFDiv(total, cnt, "avg.r");
         }
         // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
@@ -4034,6 +4082,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateBr(condBB);
                 builder_.SetInsertPoint(endBB);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
 
@@ -4099,6 +4148,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(endBB);
                 if (relClMM) emitClosureRelease(closure);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
 
@@ -4240,6 +4290,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateBr(condBB);
                     builder_.SetInsertPoint(endBB);
                     freeLazyTemp();
+                    freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
                 }
                 // fix #2770: a REFERENCE element (class or interface — both
@@ -4449,6 +4500,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.SetInsertPoint(endBB);
                     if (relCl) emitClosureRelease(closureP);  // #422 inline-lambda
                     freeLazyTemp();
+                    freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
                 }
             }
@@ -4583,6 +4635,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return builder_.CreateLoad(accLLTy, accSlot, "mm.r");
         }
         // fix #2783 (stdlib §5.1, v0.240): .MinOrNull() / .MaxOrNull() —
@@ -4818,6 +4871,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
                     emptyBB);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 llvm::Value* res = builder_.CreateInsertValue(
                     llvm::UndefValue::get(nst), hvPhi, {0u});
                 resultV = builder_.CreateInsertValue(
@@ -4827,6 +4881,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ptrPhi->addIncoming(exitVal, condBB);
                 ptrPhi->addIncoming(nullResult, emptyBB);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 resultV = ptrPhi;
             }
             return resultV;
@@ -4878,6 +4933,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notFound, "InvalidOperationException");
             llvm::Value* fstv = builder_.CreateLoad(elemTy, resultSlot, "fst.r");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return fstv;
         }
         // per §5 LINQ (#789): .Last(pred: (T)->bool): T — the LAST element
@@ -4925,6 +4981,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notFound, "InvalidOperationException");
             llvm::Value* lstv = builder_.CreateLoad(elemTy, resultSlot, "lstp.r");
             freeLazyTemp();
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return lstv;
         }
         // per §5 LINQ (#789): .Single(pred): T — the sole element satisfying the
@@ -4985,6 +5042,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notOne, "InvalidOperationException");
             llvm::Value* sglv = builder_.CreateLoad(elemTy, resultSlot, "sgl.r");
             freeLazyTemp();
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return sglv;
         }
         // per §5 LINQ (#789): .LastOrNull(pred): T? — the LAST element satisfying
@@ -5072,6 +5130,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Constant::getNullValue(elemTy), loadedV, "lon.ptr");
             }
             freeLazyTemp();
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return resultV;
         }
         // per §5 LINQ element access (no-predicate forms): First()/Single()
@@ -5108,6 +5167,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // #1930: over a bare GroupBy this returns a live grouping — keep it,
             // free its siblings + the array spine (else free the borrow snapshot).
             freeLazyTemp(keepGroupByGrouping ? fstv : nullptr);
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return fstv;
         }
         if (m == "Last" && call.args.empty()) {
@@ -5124,6 +5184,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
             llvm::Value* lstv = builder_.CreateLoad(retTy, out, "lst.r");
             freeLazyTemp(keepGroupByGrouping ? lstv : nullptr);  // #1930: keep the returned grouping
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return lstv;
         }
         if (m == "ElementAt" && call.args.size() == 1 && call.args[0].value) {
@@ -5144,6 +5205,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
             llvm::Value* eav = builder_.CreateLoad(retTy, out, "elemat.r");
             freeLazyTemp(keepGroupByGrouping ? eav : nullptr);  // #1930: keep the returned grouping
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return eav;
         }
         // stdlib §5: FirstOrNull() / FirstOrNull(predicate): return the first
@@ -5232,6 +5294,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 0), preBB);
                 // Free AFTER the PHI nodes.
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 llvm::Value* res = builder_.CreateInsertValue(
                     llvm::UndefValue::get(nst), hvPhi, {0u});
                 resultV = builder_.CreateInsertValue(res, valPhi, {1u});
@@ -5245,6 +5308,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // free its siblings + the array spine; a runtime-null ptrPhi (empty)
                 // makes _except free all (correct, nothing is returned).
                 freeLazyTemp(keepGroupByGrouping ? ptrPhi : nullptr);  // Free AFTER the PHI node.
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 resultV = ptrPhi;
             }
             return resultV;
@@ -5345,6 +5409,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "fon.ptr");
             }
             freeLazyTemp();
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return resultV;
         }
         // stdlib §5 (#661): SingleOrNull(predicate: (T)->bool): T? — return the
@@ -5468,6 +5533,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "son.ptr");
             }
             freeLazyTemp();
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return resultV;
         }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
@@ -6135,6 +6201,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phiIdx->addIncoming(builder_.getInt64(-1), condBB);
             llvm::Value* iofv = builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return iofv;
         }
         // per §5 LINQ: .Distinct() is LAZY — see tryLowerLazyLinqCall.
@@ -7862,6 +7929,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phiCon->addIncoming(builder_.getTrue(), foundBB);
             phiCon->addIncoming(builder_.getFalse(), condBB);
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return phiCon;
         }
 
