@@ -506,4 +506,127 @@ BEZEL_TEST(variance_imported_head_6351,
     BEZEL_EXPECT_TRUE(r.err.find("(§12.9)") == std::string::npos);
 }
 
+// --- ARM ORDER: a local alias SHADOWS an imported type of the same name ----
+//
+// #6354 resolves a LOCAL generic alias between the local-type walk and the
+// built-in table; #6351 adds the imported arm after it. The order is §2.2's,
+// not a preference: "a local declaration shadows an import", so for a name
+// that is BOTH an imported type and a local alias the ALIAS must win — that
+// is the type the name resolver binds, and this pass reads the marker off
+// whatever the name resolver binds. Reachability of the import arm here is
+// the discriminator: `Foo<T>` is spelled BARE, and a bare name is exactly the
+// spelling `resolveImportedHead` searches every imported module for.
+//
+// The verdict is discriminating, which is the point. `Foo` is an imported
+// `out T` interface (an ALIAS-resolved reading makes it invariant, because
+// `type Foo<T> := Array<T>` names an invariant class), so:
+//   import-arm-first  -> covariant  -> ACCEPTED   (wrong: reads a marker off
+//                                                 a type the name resolver
+//                                                 never bound for this module)
+//   alias-arm-first   -> invariant  -> REJECTED   (§12.9)
+// The row asserts REJECT, so putting the import arm first makes it fail.
+
+BEZEL_TEST(variance_imported_head_6351,
+           local_alias_shadows_imported_type_of_the_same_name_rejected) {
+    expectRejected(
+        libWith("public interface Foo<out T> method Get(): T; end Foo; "),
+        app("import Lib6351; ",
+            "type Foo<T> := Array<T>; "
+            "public interface I<out T> method Get(): Foo<T>; end I; "),
+        "out");
+}
+
+// The qualified mirror. `resolveLocalAliasHead` matches only a single-part
+// name — `TypeAliasDecl` is a `TopDecl` (A.2) and §27.8 declares aliases at
+// module level, so a qualified spelling cannot name one — so `L.Foo<T>` skips
+// the alias arm entirely and reads the imported `in T`, which under `out T` is
+// CONTRAVARIANT and rejected. Same library, same local alias, opposite
+// spelling, and the two must not agree: the alias is not a rename of the
+// import (that is §2.2's rule for an IMPORT ALIAS, which
+// `out_t_under_imported_contravariant_head_alias_rejected` already pins).
+
+BEZEL_TEST(variance_imported_head_6351,
+           qualified_import_spelling_bypasses_the_local_alias_rejected) {
+    expectRejected(
+        libWith("public interface Foo<in T> method Put(x: T); end Foo; "),
+        app("import Lib6351; ",
+            "type Foo<T> := Array<T>; "
+            "public interface I<out T> method Get(): Lib6351.Foo<T>; end I; "),
+        "out");
+}
+
+// --- THREE SPELLINGS, ONE ANSWER (direct / alias / imported) --------------
+//
+// §27.8: "Type aliases — generic or not — see through to the aliased type for
+// identity, equality, method dispatch, and overload resolution. They are a
+// naming convenience, not a separate type kind." §12.9's composition rule
+// names no module boundary and no alias carve-out. So a head spelled three
+// ways must compose to the SAME position, or one of the three spellings is a
+// hole — which is the whole of #6354 (alias) and #6351 (import) respectively.
+// These rows are the cross-check: each spelling is paired with the two it
+// must agree with, so a merge that dropped either arm shows up as a
+// disagreement rather than as a row quietly passing on the other arm.
+//
+// `in`-mirror of `out` for the trio. All three REJECT, because every reading
+// of `CThing<in T>` is CONTRAVARIANT at a return slot, which `out T` cannot
+// honour: the DIRECT local spelling (#6348), the local ALIAS spelling
+// (#6354 — the alias body `CThing<T>` composed at `CoVariant` reads `CThing`'s
+// own `in`), and the IMPORTED spelling (#6351).
+
+BEZEL_TEST(variance_imported_head_6351, direct_local_spelling_rejected) {
+    expectRejected(
+        libWith("public interface Unused<T> method Put(x: T); end Unused; "),
+        app("import Lib6351; ",
+            "public interface CThing<in T> method Put(x: T); end CThing; "
+            "public interface I<out T> method Get(): CThing<T>; end I; "),
+        "out");
+}
+
+BEZEL_TEST(variance_imported_head_6351, local_alias_spelling_agrees_rejected) {
+    expectRejected(
+        libWith("public interface Unused<T> method Put(x: T); end Unused; "),
+        app("import Lib6351; ",
+            "public interface CThing<in T> method Put(x: T); end CThing; "
+            "type AThing<T> := CThing<T>; "
+            "public interface I<out T> method Get(): AThing<T>; end I; "),
+        "out");
+}
+
+BEZEL_TEST(variance_imported_head_6351, imported_spelling_agrees_rejected) {
+    expectRejected(
+        libWith("public interface CThing<in T> method Put(x: T); end CThing; "),
+        app("import Lib6351; ",
+            "public interface I<out T> method Get(): CThing<T>; end I; "),
+        "out");
+}
+
+// The accept-side trio. A COVARIANT head at an output slot is COVARIANT under
+// all three spellings, so all three must COMPILE — the rows that keep the fix
+// from being a blanket rejection, and the reason the trio above is a real
+// agreement check rather than "everything rejects".
+
+BEZEL_TEST(variance_imported_head_6351, direct_local_covariant_accepted) {
+    expectAccepted(
+        libWith("public interface Unused<T> method Put(x: T); end Unused; "),
+        app("import Lib6351; ",
+            "public interface GThing<out T> method Get(): T; end GThing; "
+            "public interface I<out T> method Get(): GThing<T>; end I; "));
+}
+
+BEZEL_TEST(variance_imported_head_6351, local_alias_covariant_agrees_accepted) {
+    expectAccepted(
+        libWith("public interface Unused<T> method Put(x: T); end Unused; "),
+        app("import Lib6351; ",
+            "public interface GThing<out T> method Get(): T; end GThing; "
+            "type AGThing<T> := GThing<T>; "
+            "public interface I<out T> method Get(): AGThing<T>; end I; "));
+}
+
+BEZEL_TEST(variance_imported_head_6351, imported_covariant_agrees_accepted) {
+    expectAccepted(
+        libWith("public interface GThing<out T> method Get(): T; end GThing; "),
+        app("import Lib6351; ",
+            "public interface I<out T> method Get(): GThing<T>; end I; "));
+}
+
 }  // namespace bezel::module
