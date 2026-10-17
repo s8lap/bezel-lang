@@ -1547,7 +1547,18 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
         }
     }
+    // fix #6402 (§8.1 / §28.4 / §28.5): a skip target for the LIST-INTERFACE
+    // dispose below. When the slot holds a vtable-bearing user class, that arm
+    // must NOT run the array code that follows it, so it branches here instead;
+    // the block is entered at the top of the NEXT iteration (every exit from
+    // this loop body is a `continue`) or, after the last iteration, right here —
+    // whichever comes first — so it always acquires a terminator.
+    llvm::BasicBlock* collifSkipBB = nullptr;
     for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
+        if (collifSkipBB) {
+            builder_.SetInsertPoint(collifSkipBB);
+            collifSkipBB = nullptr;
+        }
         llvm::StructType* st = classStruct(ts);
         unsigned idx = fieldIndex_[it->fs];
         llvm::Value* addr = builder_.CreateStructGEP(st, currentThis_, idx);
@@ -1556,6 +1567,123 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // cascades disposal into its class elements (for an owning collection).
         // bz_array_free / bz_llist_free are null-safe, so no field null-check needed.
         if (it->collTy) {
+            // fix #6402 (§8.1 / §28.5 / §28.9 / §28.11 / §12.4, v0.338): a LIST
+            // INTERFACE HEAD field is the ONE `owned` collection field whose
+            // runtime kind the declared type does NOT determine. Every other
+            // `it->collTy` is a CONCRETE built-in name, and those are sealed —
+            // `class MyL: Array<int>` is rejected with `cannot inherit from
+            // compiler-known class 'Array' … (§12.4, §31.4)`, MEASURED — so a
+            // concrete-typed slot can only ever hold the header-less C struct
+            // the bz_*_free family expects. The list heads are different: §8.1
+            // makes `class MyL: IList<int>` legal, `kBuiltinInterfaceHeads`
+            // (#2921 / #2923, BuiltinRegistry.cpp) records IList / IOwningList /
+            // IReadOnlyList as EXACTLY the reserved names whose runtime value may
+            // be a user class — the precise COMPLEMENT of
+            // `isVtableLessBuiltinClassName` — and sema accepts the assignment
+            // with no diagnostic.
+            //
+            // Everything below this point assumed a bz_array_t / bz_llist_t /
+            // bz_dict_t, which made a vtable-bearing value a WILD FREE, not a
+            // leak: on a user class word 0 is a vtable pointer, so `arr->data`,
+            // `arr->count` and `arr->elem_disposer` are all read OFF THE VTABLE.
+            // That is why neither `bz_array_free_dynamic` nor the #3026
+            // `kind`-tag probe (`bz_runtime_dispose`, which reads offset 48/88)
+            // helps — #3026's tag lives inside the very struct the value does
+            // not have, so probing it is an out-of-bounds read of a user object
+            // that is smaller than the offset.
+            //
+            // MEASURED on this tree's base, `bezelc` + `--sanitize=address`,
+            // 500 constructions, ALL FOUR heads × a user class SEGV
+            // (`AddressSanitizer: SEGV … in __asan::Allocator::Deallocate`,
+            // and `Segmentation fault (core dumped)` / exit 139 plain):
+            //
+            //   owned _f: IList<int>          <- new MyL()  bz_array_free_dynamic
+            //   owned _f: IList<string>       <- new MyL()  bz_array_free   (elemDisp)
+            //   owned _f: IOwningList<Cell>   <- new MyL()  bz_array_free   (owning elem)
+            //   owned _f: IReadOnlyList<int>  <- new MyL()  bz_array_free_dynamic
+            //   class Holder(owned v: IList<int>)  <- new MyL()  bz_array_free_dynamic
+            //
+            // The last row is this same emission site: `ownedCollectionFieldType`'s
+            // `fs->posParam` arm admits the list heads too, so a captured primary-
+            // -ctor parameter lands here with the same `it->collTy` and is fixed by
+            // the same branch. The three listed array rows are the discriminator's
+            // must-not-regress half.
+            //
+            // THE DISCRIMINATOR is `bz_obj_is_string(val, vtableTablePtr())` —
+            // the same helper and the same emitted vtable table #417 uses to tell
+            // an `Object` slot's string from its class instance, and the same one
+            // the IEquatable<string> / IComparable<string> site uses
+            // (LlvmBackend_Calls2.cpp, the "Discriminate at run time" block). Its
+            // contract is a whitelist NEGATION, so it is only sound where the
+            // slot admits a closed population — which is exactly this one, and by
+            // the same argument #417's own site records: in an `IList<int>` slot the
+            // only values admitted are (a) a concrete built-in collection, whose
+            // word 0 is `arr->data` — a heap pointer, never a listed vtable (and
+            // NULL for an empty backing, which the null-terminator loop stops at,
+            // so it answers "string", i.e. the array arm) — and (b) a user class
+            // declaring the head, whose vtable IS registered (user and imported
+            // classes alike; see LlvmBackend_Setup.cpp's registration, and #1843's
+            // finalizeVtableTable for the lazily-created specialized vtables).
+            // There is no `Object`-typed escape hatch here: an interface head is
+            // not the root type, so the #417 "receiver reachability is NOT
+            // determined by what the object declares" caveat does not apply.
+            // A value whose word 0 is an UNREGISTERED vtable (an iterator or
+            // collection-adapter vtable, a lazy pipeline) still answers "string"
+            // and takes the array arm — but such a value was already wild-freed
+            // before this change, so this makes no previously-correct program
+            // incorrect, which is the same bar #417's site sets for itself.
+            //
+            // The vtable branch is `emitDisposeAndReclaim(val)` + null-after —
+            // LITERALLY the class-instance arm at the bottom of this loop, which
+            // is what a user class in an `owned` slot gets everywhere else. So the
+            // user class is freed exactly once, its own `owned` fields are
+            // discharged by its destructor, and the field is nulled for a
+            // re-entrant pass. The array arm below is UNCHANGED: every existing
+            // branch (the #2608 dynamic free, the #6270 Set free, the llist/dict
+            // switch, the plain `bz_array_free(val, disp)`) still emits, and still
+            // `continue`s out of the loop. No existing test flips.
+            llvm::BasicBlock* arrBB = nullptr;
+            if (isListInterfaceName(it->collTy)) {
+                auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* isStr = builder_.CreateCall(
+                    isStrFn, {val, vtableTablePtr()}, "collif.isstr");
+                // bz_obj_is_string answers "not a string" (== 0) exactly when
+                // word 0 is a registered vtable, i.e. a user class instance.
+                llvm::Value* isVtable =
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                llvm::Value* live = builder_.CreateICmpNE(
+                    val, llvm::ConstantPointerNull::get(ptrTy()));
+                llvm::Value* isUserClass =
+                    builder_.CreateAnd(isVtable, live, "collif.userclass");
+                auto* objBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.collif.obj", currentFn_);
+                arrBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.collif.arr", currentFn_);
+                collifSkipBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.collif.skip", currentFn_);
+                builder_.CreateCondBr(isUserClass, objBB, arrBB);
+                builder_.SetInsertPoint(objBB);
+                // §28.4 step 2 / §28.5: the same `emitDisposeAndReclaim` +
+                // null-after pair the class-instance arm at the bottom of this
+                // loop uses — a user class in an `owned` slot is freed exactly
+                // once, its own `owned` fields are discharged by its destructor
+                // (so MyL's `owned _a: Array<int>` is freed through MyL's own
+                // field arm, not by reinterpreting it as an array), and the slot
+                // is nulled so a re-entrant pass finds null and skips.
+                emitDisposeAndReclaim(val);
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     addr);
+                // Skip the array code below rather than falling into it. This
+                // MUST be a real branch: null-poisoning the `val` local instead
+                // was MEASURED wrong, because `val` is one C++ variable used by
+                // BOTH arms — poisoning it hands the null to the array arm too,
+                // so the array-backed spelling stopped freeing its backing
+                // (`owned _f: IList<int> := new Array<int>(3)` went from
+                // LSan-clean to `34000 byte(s) leaked in 1000 allocation(s)`).
+                builder_.CreateBr(collifSkipBB);
+            }
+            if (arrBB) builder_.SetInsertPoint(arrBB);
             // #602 / §28.11 v0.135: derive element disposer directly from
             // elementPolicyFor (covering class, interface, Shared/Weak elements).
             // A borrowing Array/Stack/Queue<string> co-owns a +1 per element
@@ -1653,6 +1781,10 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 auto* dynFn = declareC("bz_array_free_dynamic",
                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(dynFn, {val});
+                if (collifSkipBB) {
+                    builder_.CreateBr(collifSkipBB);
+                    builder_.SetInsertPoint(collifSkipBB);
+                }
                 continue;
             }
             // fix #6270 (§28.5 / §28.11, v0.338): a borrowing `Set<T>` whose
@@ -1681,6 +1813,10 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                                      {ptrTy(), ptrTy()});
                 builder_.CreateCall(
                     dfn, {val, llvm::ConstantPointerNull::get(ptrTy())});
+                if (collifSkipBB) {
+                    builder_.CreateBr(collifSkipBB);
+                    builder_.SetInsertPoint(collifSkipBB);
+                }
                 continue;
             }
             const char* freeName = isLL   ? "bz_llist_free"
@@ -1689,6 +1825,10 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {val, disp});
+            if (collifSkipBB) {
+                builder_.CreateBr(collifSkipBB);
+                builder_.SetInsertPoint(collifSkipBB);
+            }
             continue;
         }
         // §28.5/§24 (#879): owned Subscription (or Subscription?) field —
@@ -1903,6 +2043,12 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
     }
+    // fix #6402: if the LAST owned field took the list-interface user-class
+    // arm, its `owned.collif.skip` block is still empty and would reach
+    // verification without a terminator. Continue the rest of the function from
+    // there — which both terminates it and keeps the post-loop code reachable
+    // from both the skip path and the ordinary path.
+    if (collifSkipBB) builder_.SetInsertPoint(collifSkipBB);
 
     // §15.1.1 line 1957 / §15.3 (#747): a move-only OWNING inline-array FIELD
     // ([N owned]T? / [N owned]T) — "for class fields, the enclosing class's
