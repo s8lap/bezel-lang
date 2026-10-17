@@ -6416,6 +6416,52 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // failure is the SAFE residual: unlike the inlined read this
                 // shape never silently produced a wrong value.
                 v = boxForTarget(v, retTyRef, getterExpr);
+                // fix #6399 (§29.2 / §29.1 / §23.2; v0.338): the VTABLE /
+                // ITABLE face of the EXPRESSION-BODIED getter's §29.2
+                // enumerable wrap — the missing `wrapPropertyArrayAsIEnumerable`
+                // of the #2815 / #2777 / #3355 family, and the accessor-function
+                // twin of the `boxForTarget` line above.
+                //
+                // THE GAP, MEASURED on this file's parent. `property E:
+                // IEnumerable<int> get => _e;` was wrapped on exactly ONE of
+                // its three faces:
+                //   * INLINED read (LlvmBackend_Exprs.cpp, the #2815 call) —
+                //     WRAPPED. This is the only face a CONCRETE receiver takes.
+                //   * BLOCK-bodied getter, this emitter's `blockGet` arm — the
+                //     body lowers through `emitReturn`, whose RETURN-edge
+                //     `wrapAsIEnumerableForTarget` (#2703) wraps. WRAPPED.
+                //   * EXPRESSION-bodied getter, THIS arm — NOT WRAPPED, because
+                //     an arrow body has no RETURN edge and the only wrap on this
+                //     face was the inline-read one. The `v` returned here is the
+                //     raw source descriptor.
+                //
+                // A VIRTUAL / INTERFACE read is exactly the face that reaches
+                // this arm (it must have an addressable slot function; the
+                // concrete read inlines and never builds one), so the raw
+                // descriptor escaped to a caller that drives §29.2 vtable
+                // dispatch on it. MEASURED on this file's parent, `seq.E` over
+                // a user-class `IEnumerable<int>` source and the same over an
+                // `Array<int>` source BOTH `SIGSEGV` — the array form at
+                // `pc 0x0`, the user-class form reading offset 0x10 of a null
+                // receiver — while the identical program read through a
+                // CONCRETE receiver prints the right answer and exits 0, and
+                // the BLOCK-bodied twin of the same interface program is clean
+                // under ASan. One site, two spellings of the source family
+                // (user-class and array), two dispatch faces (itable and
+                // vtable) — measured, not inferred.
+                //
+                // Why the getter and not the read site: the block-bodied twin
+                // already established that the §29.2 wrap for this shape lives
+                // in the ACCESSOR, and the reader-side reclamation was built
+                // against that placement (#2779's `registerIterableSourceDisposal`
+                // widening and `isInterfaceDispatchedIteratorRead`, both in this
+                // file). Moving it to the dispatching read site would mint a
+                // SECOND frame for a reader that already has one. `readExpr` is
+                // NULL because a getter has no read expression of its own —
+                // `propReadIterWrappedExprs_` is the INLINE read site's report
+                // and must not be written from here.
+                v = wrapPropertyArrayAsIEnumerable(v, retTyRef, getterExpr,
+                                                   /*readExpr=*/nullptr);
                 // #2491 (twin of #2434): the property getter body's return
                 // expression failed to lower — this site bypasses emitReturn
                 // (calls CreateRet directly), so the `v ? v : null` fallback
