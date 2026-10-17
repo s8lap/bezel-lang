@@ -14100,14 +14100,77 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             // source's GetEnumerator() returned into slot 1.
             llvm::Value* srcF = b.CreateStructGEP(stTy, self, 2);
             llvm::Value* srcObj = b.CreateLoad(ptrTy(), srcF);
+            // fix #2389: does slot 1 (the retained inner enumerator) alias slot 2
+            // (the retained source)? HOISTED above the dispatch block by fix
+            // #6382 so that every arm below — the Dispose dispatch, the
+            // reclaim of `enumPtr`, the reclaim of `srcObj` — is decided from
+            // the SAME pair of runtime compares rather than re-deriving them.
+            llvm::Value* aliasesSrc =
+                b.CreateICmpEQ(enumPtr, srcObj, "wrapdispose.enum_is_src");
+            // fix #2424 (slot 3, `ownsSrc`): true only on the ORIGINAL
+            // wrapper bound to an unnamed temporary source; every
+            // re-iteration clone `wrapGetEnumFn` mints stores `false`. HOISTED
+            // above the dispatch block by fix #6382, which is what makes the
+            // per-INSTANCE ownership question readable by the per-PAIR
+            // dispatch below. The full #2424 rationale stays at the reclaim
+            // that consumes this value.
+            llvm::Value* ownsF = b.CreateStructGEP(stTy, self, 3);
+            llvm::Value* ownsSrcVal = b.CreateLoad(b.getInt1Ty(), ownsF);
             if (enumDisposeFn) {
                 if (srcIsOwnEnumerator) {
                     // srcDisposeFn == enumDisposeFn here; dispatch on srcObj so the
                     // Dispose layout assumption is satisfied regardless of what
                     // GetEnumerator() returned.
+                    //
+                    // fix #6382 (§28.2, §28.6, §29.11, v0.338): that
+                    // dispatch is correct for the ORIGINAL wrapper and WRONG for
+                    // a re-iteration clone, and nothing above said which instance
+                    // it was. `srcTs == enumTs` is a fact about the (srcTs,
+                    // enumTs) PAIR, and `wrapDisposeFn` is cached per pair
+                    // (the key is `srcTs$enumTs`, above) and shared by every
+                    // wrapper instance of it; `ownsSrc` is a fact about the
+                    // INSTANCE. `wrapGetEnumFn` stores `ownsSrc = false` on every
+                    // clone precisely because the clone does not own `srcObj`
+                    // — the original does — so dispatching `srcDisposeFn(srcObj)`
+                    // for it unconditionally disposed a FOREIGN object, in
+                    // violation of §28.2's rule that a class instance is
+                    // reclaimed at its holder's release point "and nowhere else".
+                    // Reading the flag the same function already reads to decide
+                    // the reclaim is what closes it:
+                    //   ownsSrc (the original)  -> srcDisposeFn(srcObj),
+                    //                              byte-for-byte #5203;
+                    //   clone, enumPtr == srcObj -> nothing: slot 1 IS the
+                    //                              source, and it is the
+                    //                              original's to dispose;
+                    //   clone, distinct          -> the clone's OWN inner
+                    //                              enumerator, which nothing
+                    //                              else disposes.
+                    auto* ownsBB = llvm::BasicBlock::Create(
+                        llvm_, "wrapdispose.owns", f);
+                    auto* cloneBB = llvm::BasicBlock::Create(
+                        llvm_, "wrapdispose.clone", f);
+                    b.CreateCondBr(ownsSrcVal, ownsBB, cloneBB);
+                    b.SetInsertPoint(ownsBB);
                     b.CreateCall(srcDisposeFn->getFunctionType(), srcDisposeFn,
                                  {srcObj});
+                    b.CreateBr(cloneBB);
+                    b.SetInsertPoint(cloneBB);
+                    auto* cloneEnumBB = llvm::BasicBlock::Create(
+                        llvm_, "wrapdispose.cloneenum", f);
+                    auto* afterCloneBB = llvm::BasicBlock::Create(
+                        llvm_, "wrapdispose.afterclone", f);
+                    b.CreateCondBr(aliasesSrc, afterCloneBB, cloneEnumBB);
+                    b.SetInsertPoint(cloneEnumBB);
+                    b.CreateCall(enumDisposeFn->getFunctionType(), enumDisposeFn,
+                                 {enumPtr});
+                    b.CreateBr(afterCloneBB);
+                    b.SetInsertPoint(afterCloneBB);
                 } else {
+                    // UNCHANGED by #6382 (§28.2, §28.6, §29.11): the
+                    // two-class idiom, where slot 1 holds a genuinely distinct
+                    // `enumTs` instance and `enumDisposeFn(enumPtr)` is the
+                    // correct dispatch on every instance of the pair, clone or
+                    // not. #6382 gates the OTHER arm only.
                     b.CreateCall(enumDisposeFn->getFunctionType(), enumDisposeFn,
                                  {enumPtr});
                 }
@@ -14119,9 +14182,7 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
             // fix #2389: reclaim enumPtr's block unless it aliases the
             // retained source (slot 2) — see the block comment above.
-            // (srcObj was loaded earlier; srcIsOwnEnumerator dispatched on it.)
-            llvm::Value* aliasesSrc =
-                b.CreateICmpEQ(enumPtr, srcObj, "wrapdispose.enum_is_src");
+            // (`aliasesSrc` was computed above the dispatch block, fix #6382.)
             auto* freeEnumBB =
                 llvm::BasicBlock::Create(llvm_, "wrapdispose.freeenum", f);
             auto* afterEnumBB =
@@ -14146,9 +14207,8 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             //   * !aliasesSrc (two-class idiom): `srcObj` is a genuinely
             //     distinct object whose Dispose was never dispatched by
             //     anything above — dispatch `srcDisposeFn` (srcTs's own
-            //     §28.2 Dispose) here, then reclaim.
-            llvm::Value* ownsF = b.CreateStructGEP(stTy, self, 3);
-            llvm::Value* ownsSrcVal = b.CreateLoad(b.getInt1Ty(), ownsF);
+            //     §28.2 Dispose) here, then reclaim. (`ownsSrcVal` was loaded
+            // above the dispatch block, fix #6382.)
             auto* ownSrcBB =
                 llvm::BasicBlock::Create(llvm_, "wrapdispose.ownsrc", f);
             auto* afterSrcBB =
