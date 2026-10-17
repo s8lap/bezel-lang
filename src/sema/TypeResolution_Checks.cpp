@@ -14077,12 +14077,74 @@ constexpr int kMaxAliasSeeThroughDepth = 32;
 // (§2.7's `Module.Type` spelling) is distinguishable from one that is an
 // enclosing-type path (§11.6's `Outer.Box`). That distinction is what stops a
 // local `Outer` from being read as a module prefix — see `resolveImportedHead`.
+// `enclosingChain` is the chain of types enclosing the use site, INNERMOST
+// FIRST and INCLUDING the type whose own body the site sits in — the interface
+// `checkVariancePositions` is currently walking. It answers a BARE name that
+// names a §11.6 nested type of one of them, per §2.7 rule 1's "then the
+// enclosing type's accessible members" step and §2.7's "Through nesting"
+// paragraph ("the enclosing-type lookup visits the nested type and then each
+// type enclosing it, innermost first") — see `enclosingMemberBareName`.
 struct VarianceHeads {
     const std::unordered_map<std::string, std::vector<TypeSymbol*>>* imported =
         nullptr;
     const std::unordered_map<std::string, std::string>* aliases = nullptr;
     const std::unordered_set<std::string>* moduleNames = nullptr;
+    std::vector<const TypeSymbol*> enclosingChain;
 };
+
+// fix #6383 (§2.7 rule 1, §2.7 Through nesting, §11.6, v0.338): the §2.7 rule 1 step this pass
+// was missing — "Resolve the leftmost segment `A` as a bare name: local scope,
+// THEN THE ENCLOSING TYPE'S ACCESSIBLE MEMBERS, then the current module's
+// declarations, then unambiguous imported bare names, then import aliases".
+//
+// §2.7's "Through nesting" paragraph says what that step admits for a TYPE:
+// "Nested types of an enclosing type, generic or not, are reached by bare name,
+// since a nested type is one type and needs no instantiation." Only a nested
+// type is read here, and the chain walk STOPS at the first enclosing type that
+// has a nested type of that name — §2.7's own order, "the enclosing-type lookup
+// visits the nested type and then each type enclosing it, innermost first".
+//
+// ⚠ DIVERGENCE FROM THE NAME RESOLVER, DELIBERATE AND MEASURED. §2.7's rule is
+// wider: "the first type that has an ACCESSIBLE MEMBER of that name ends the
+// search … even when the member cannot be used there". So a METHOD or PROPERTY
+// of the inner enclosing type, named like the outer one's nested type, should
+// stop the walk. MEASURED: it does not — `Holder` declaring `method Box(): int`
+// does NOT stop a bare `Box<T>` in `Holder`'s body from binding to `Outer`'s
+// nested `Box` (the name resolver makes the same choice, so the two AGREE today
+// and the program is not mis-checked). This function therefore matches the
+// resolver rather than §2.7, and MUST be changed with it: when the resolver is
+// fixed to end the search, this must end it too, or the two will disagree. The
+// defect is in `TypeResolution_Names.cpp` and is NOT fixed here — filed for the
+// coordinator, not by this commit.
+//
+// Before this, a body-position bare `Box<T>` matched nothing at all:
+// `localTypes` holds the MODULE's top-level declarations and `heads.imported`
+// a module's EXPORTS, and neither can hold a nested type — so the two arms a
+// bare name reached both missed it, the composition was `Unknown`, and §12.9
+// SKIPPED the spelling.
+//
+// Returning null leaves the two arms below exactly as they were: this function
+// only ever ADDS an answer, and never takes one away.
+//
+// SEAM-ACCESSOR: reads only `members` and `NestedTypeSymbol::type`, which symbol
+// collection populates for a type the name resolver can also see. `decl` and
+// `TypeDeclKind` are never touched here — the caller reads the kind.
+const TypeSymbol* enclosingMemberBareName(
+    const std::vector<const TypeSymbol*>& chain, std::string_view h) {
+    for (const TypeSymbol* enclosing : chain) {
+        if (!enclosing) continue;
+        const TypeSymbol* nested = nullptr;
+        for (Symbol* m : enclosing->members) {
+            if (!m || m->name != h) continue;
+            const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
+            if (!nt || !nt->type) continue;  // not a nested type / not yet built
+            if (nested && nested != nt->type) return nullptr;  // two of one name
+            nested = nt->type;
+        }
+        if (nested) return nested;
+    }
+    return nullptr;
+}
 
 // fix #6373 (§2.2, §2.7 rule 1, §2.7 rule 2, §11.3, §11.6, v0.338): what the
 // QUALIFIER of a dotted head selects — decided ONCE, and read by every arm of
@@ -14360,6 +14422,49 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
     // for: it turns a legal program into an error.
     const bool qualifiedSpelling = head.name->parts.size() > 1;
     if (!qualifiedSpelling) {
+        // fix #6383 (§2.7 rule 1, §2.7 Through nesting, §11.6, §12.9, v0.338): a
+        // bare name in a type body that names an enclosing type's NESTED type.
+        //
+        // §2.7 rule 1 ranks "the enclosing type's accessible members" ABOVE
+        // "the current module's declarations" and above imports, and §2.7's
+        // "Through nesting" paragraph says why with a rule of its own: "Nested
+        // types of an enclosing type, generic or not, are reached by bare name,
+        // since a nested type is one type and needs no instantiation."
+        //
+        // So this arm sits FIRST in the bare-name branch, ahead of the top-level
+        // table below: with both a nested `Box` and a top-level `Box` in scope,
+        // the enclosing-type step is the earlier one in §2.7 rule 1's order and
+        // so is the binding — answering off the top-level one instead would
+        // read a marker off a type the spelling does not name, #6373's false
+        // resolve in mirror image. That precedence is PINNED, in both
+        // directions, by the two `shadowed_by_top_level` rows of
+        // `nested_type_bare_name_body_variance_6383`; a reviewer-planted mutant
+        // that puts the top-level table first SURVIVED without them.
+        //
+        // MEASURED before this fix (base `5df02d87`): `out T` in a RETURN slot
+        // against a body-position bare contravariant `Box<in T>` compiled, ran
+        // and exited 0. The composition is `Unknown` because `localTypes` holds
+        // the module's TOP-LEVEL declarations only, so neither this table nor
+        // `resolveImportedHead`'s bare arm — the two arms a bare name reaches —
+        // could see a nested type at all.
+        if (const TypeSymbol* body =
+                enclosingMemberBareName(heads.enclosingChain, h)) {
+            // The same reading rules as the two arms below, deliberately: a
+            // class, record, enum or choice is always invariant (§12.9), and a
+            // head with no marker at `argIndex` defers through
+            // `invariantOrDefer` (#6355) rather than guessing. The marker read
+            // is the NESTED type's own.
+            if (body->kind != ast::TypeDeclKind::Interface)
+                return invariantOrDefer(site);
+            if (argIndex >= body->genericParams.size())
+                return invariantOrDefer(site);
+            const auto* gps =
+                dynamic_cast<GenericParamSymbol*>(body->genericParams[argIndex]);
+            if (!gps) return invariantOrDefer(site);
+            if (gps->variance == "out") return VariancePos::CoVariant;
+            if (gps->variance == "in") return VariancePos::ContraVariant;
+            return invariantOrDefer(site);
+        }
         for (const TypeSymbol* ts : localTypes) {
             if (ts->name != h) continue;
             // A class, record, enum or choice is always invariant (§12.9), and it
@@ -14653,10 +14758,94 @@ void Resolver::checkVariancePositions() {
         if (const std::vector<TypeSymbol*>* exported = ctx_.importedTypesOf(mod))
             importedTypes[mod] = *exported;
     }
-    const VarianceHeads heads{&importedTypes, &importAliases_, &sourceImports_};
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t || t->kind != ast::TypeDeclKind::Interface) continue;
+    // fix #6383 (§2.7, §11.6, §12.9, v0.338): the interfaces this pass checks,
+    // each with the chain of types enclosing its own body, innermost first and
+    // INCLUDING itself. That chain is what `heads.enclosingChain` carries and
+    // what `enclosingMemberBareName` walks, so a bare name in a type body can
+    // reach a §11.6 nested type of that type or of any type enclosing it
+    // (§2.7 "Through nesting").
+    //
+    // The traversal now DESCENDS into §11.6 nested types, which it did not:
+    // the loop below used to read `ctx_.module()->children` only, so a nested
+    // interface's body was never checked at all. That omission is exactly why
+    // this issue's shape was unreachable before — the bare name could not name
+    // anything, and the enclosing scope that would name it was never walked. A
+    // nested interface is an interface, and §12.9's rule states no nesting
+    // exemption: a body-position bare `Box<T>` resolving to an enclosing type's
+    // nested `Box<in T>` under an `out T` return slot is a violation whether or
+    // not the interface declaring the slot is itself nested.
+    //
+    // The enclosing type that carries the nested head is NEVER the interface
+    // carrying the slot, which is why the two fixes are required together.
+    // MEASURED: §11.8 admits no nested type in an interface body
+    // (`interface I<out T> interface Box<in X> … end Box; end I;` →
+    // `expected 'method', 'property', 'event', or 'static method'/'static
+    // operator' (§11.8) in interface body`), and §11.6's nested types live in a
+    // CLASS body ("A class body may declare nested classes, records, enums, and
+    // interfaces") or a RECORD body ("Nested types in records are permitted but
+    // uncommon") or a §21.10 local record ("A local record's own body may itself
+    // contain §11.6 nested member types") — never an interface's. So the
+    // enclosing member step could never fire for a body the old loop visited,
+    // and the new arm would have been dead code without this traversal.
+    //
+    // Only INTERFACES are COLLECTED, for the same reason the old loop followed
+    // only interfaces: §12.9's `in`/`out` are interface-only syntax, so a class,
+    // record or local type in the chain contributes members but is never itself
+    // checked. Those three families are still WALKED, though — they are where
+    // the enclosing member step finds its nested type.
+    //
+    // ⚠ A §21.10 method-local type therefore IS reached, through the enclosing
+    // type's `NestedTypeSymbol` members. MEASURED: a local `record Local` holding
+    // `interface Bad<in X>` + `interface H<out T>.Get(): Bad<T>` — the BARE
+    // spelling this arm serves — is silent on the base and REJECTED §12.9 here,
+    // while the name resolver rejects that same spelling with `unresolved type
+    // name 'Bad'`, emitted ALONGSIDE the §12.9. So on the bare spelling this
+    // checker gets FURTHER than the resolver, which is the direction the fix
+    // intends: it answers a spelling the resolver cannot yet bind. Not a defect
+    // this arm introduces.
+    //
+    // The GENUINE pre-existing divergence is on the QUALIFIED spelling
+    // `Local.Bad<T>`, and it is not this commit's. MEASURED by discriminator:
+    // with this arm neutered the qualified spelling still emits §12.9 — it is
+    // served by #6369's `resolveLocalNestedHead`, already on base — while the
+    // bare spelling loses its §12.9 entirely. `enclosingMemberBareName` gates on
+    // `parts.size() == 1` and is never entered for a two-part path. So that §12.9
+    // composes a position for a type the resolver does not bind, which is a
+    // name-resolution defect in `TypeResolution_Names.cpp`; it is NOT fixed here,
+    // and is reported to the coordinator so the resolver fix carries
+    // `enclosingMemberBareName` with it.
+    //
+    // SEAM-ACCESSOR: `members` and `NestedTypeSymbol::type`, as
+    // `walkNestedTypePath` already reads them; `decl` is untouched here.
+    std::vector<std::pair<const TypeSymbol*, std::vector<const TypeSymbol*>>>
+        varianceSites;
+    {
+        // Depth-capped so a malformed symbol graph cannot recurse without end.
+        // A nested type is declared inside a type body, so the chain is as
+        // deep as the declaration nesting; 64 is far past any real program.
+        constexpr std::size_t kMaxTypeNestingDepth = 64;
+        std::vector<const TypeSymbol*> stack;  // outermost-first working chain
+        auto visit = [&](auto&& self, const TypeSymbol* t, std::size_t depth) -> void {
+            if (!t || depth > kMaxTypeNestingDepth) return;
+            stack.push_back(t);
+            if (t->kind == ast::TypeDeclKind::Interface)
+                varianceSites.emplace_back(
+                    t, std::vector<const TypeSymbol*>(stack.rbegin(),
+                                                      stack.rend()));
+            for (Symbol* m : t->members) {
+                const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
+                if (nt && nt->type) self(self, nt->type, depth + 1);
+            }
+            stack.pop_back();
+        };
+        for (Symbol* child : ctx_.module()->children)
+            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) visit(visit, ts, 0);
+    }
+    // Not `const` because of that per-iteration assignment; it is read only
+    // through the `const VarianceHeads&` every callee takes.
+    VarianceHeads heads{&importedTypes, &importAliases_, &sourceImports_};
+    for (const auto& [t, chain] : varianceSites) {
+        heads.enclosingChain = chain;
         // Collect variant generic params (those with "in" or "out").
         // For each, perform the member-by-member position check.
         for (Symbol* gp : t->genericParams) {
@@ -14666,9 +14855,9 @@ void Resolver::checkVariancePositions() {
             const std::string_view variance  = gps->variance;  // "in" or "out"
 
             // Walk each member of the interface.
-            // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children`
-            // (checkVariancePositions's own loop) — never an imported type
-            // (#3152).
+            // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children` and
+            // its `NestedTypeSymbol` members (checkVariancePositions's own
+            // `varianceSites` walk) — never an imported type (#3152).
             auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
             if (!td) continue;
 
