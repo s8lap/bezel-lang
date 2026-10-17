@@ -15002,21 +15002,55 @@ void Resolver::checkVariancePositions() {
     std::vector<std::pair<const TypeSymbol*, std::vector<const TypeSymbol*>>>
         varianceSites;
     {
-        // Depth-capped so a malformed symbol graph cannot recurse without end.
-        // A nested type is declared inside a type body, so the chain is as
-        // deep as the declaration nesting; 64 is far past any real program.
+        // ⚠ fix #6391 (§12.9, §11.6, Appendix C.1, v0.338): this walk used to
+        // stop at `kMaxTypeNestingDepth = 64`, which was a bound on THIS
+        // COMPILER rather than on this language, and it stopped SILENTLY: a
+        // type nested 65 or more levels deep was never visited, so a §12.9
+        // violation on it compiled, ran and exited 0. MEASURED on the base at
+        // `da1ec4d5`, the same program rejects at depth 64 and compiles clean
+        // at depth 65.
         //
-        // ⚠ MEASURED and it is a SILENT ACCEPTANCE, filed as #6391: the cap is
-        // not a bound on this language but a bound on this compiler, and a type
-        // nested 65 or more levels deep is never visited — so a real §12.9
-        // violation on it compiles, runs and exits 0. #6391 quotes the sweep and
-        // the exact first-accepted depth. Do not RAISE the constant without
-        // pinning the new boundary: an unpinned cap that moves is an unpinned
-        // soundness hole.
-        constexpr std::size_t kMaxTypeNestingDepth = 64;
+        // WHY THERE IS NO CAP HERE AT ALL, which is the whole fix. §12.9 states
+        // the position rule with no depth qualifier — "Position is composed
+        // across nested type constructors", one rule for every interface — and
+        // Appendix C.1 lists it as a compiler-enforced invariant without one
+        // ("Variant generic parameters (`in`, `out`) appear only in the
+        // appropriate position"). §11.6 puts nested types in a type body and
+        // states no limit on how deep that nesting goes, so a violation nested
+        // 65 deep is the SAME violation as one nested 1 deep. A cap therefore
+        // buys nothing the language offers and costs a silent acceptance of a
+        // soundness rule — the "practical consequence" §12.9 leans on being
+        // unavailable at that depth.
+        //
+        // The alternative — keeping a cap and DIAGNOSING the program as too
+        // deeply nested to check — was considered and rejected. It would reject
+        // a program §12.9 admits, for a reason the spec nowhere states:
+        // Appendix C is "the invariants the compiler enforces" and no such
+        // entry exists, and §11.6 states no depth limit, so a deeply nested but
+        // LEGAL declaration would become un-compilable. Inventing that
+        // rejection is a spec ruling, not an implementation fix.
+        //
+        // THE BOUND THAT REMAINS is a CYCLE guard, which is a different thing
+        // and is the right instrument for the hazard the cap was reaching for.
+        // A declaration cannot contain itself, so on any program the checker
+        // ACCEPTS `onChain` never fires: it exists so a malformed SYMBOL graph
+        // terminates instead of recursing until the stack is exhausted. It
+        // rejects nothing and skips nothing that a well-formed program can
+        // spell — unlike a depth bound, which skips exactly the declarations
+        // whose depth happens to exceed a literal.
+        //
+        // THE RECURSION IS NOT NEW and is bounded by something the PARSER has
+        // already spent. `visit` recurses once per level of §11.6 nesting, and
+        // the parser must have recursed through the same nesting to build the
+        // AST this walk reads. MEASURED on the base: a 2000-level chain
+        // compiles clean (10 s, 430 MB RSS) and the parser is what runs out of
+        // stack at 5000 (SIGSEGV, unchanged by this commit), so the walk is not
+        // the binding constraint at any depth this compiler accepts.
+        std::unordered_set<const TypeSymbol*> onChain;  // cycle guard
         std::vector<const TypeSymbol*> stack;  // outermost-first working chain
-        auto visit = [&](auto&& self, const TypeSymbol* t, std::size_t depth) -> void {
-            if (!t || depth > kMaxTypeNestingDepth) return;
+        auto visit = [&](auto&& self, const TypeSymbol* t) -> void {
+            if (!t || !onChain.insert(t).second) return;  // cycle: never on a
+                                                        // well-formed program
             stack.push_back(t);
             if (t->kind == ast::TypeDeclKind::Interface)
                 varianceSites.emplace_back(
@@ -15024,12 +15058,15 @@ void Resolver::checkVariancePositions() {
                                                       stack.rend()));
             for (Symbol* m : t->members) {
                 const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
-                if (nt && nt->type) self(self, nt->type, depth + 1);
+                if (nt && nt->type) self(self, nt->type);
             }
             stack.pop_back();
+            onChain.erase(t);  // the chain, not "seen": a type is walked once
+                               // per ENCLOSING PATH, so a graph that reaches it
+                               // twice is checked on both, as it was before.
         };
         for (Symbol* child : ctx_.module()->children)
-            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) visit(visit, ts, 0);
+            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) visit(visit, ts);
     }
     // Not `const` because of that per-iteration assignment; it is read only
     // through the `const VarianceHeads&` every callee takes.
