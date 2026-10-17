@@ -10282,8 +10282,10 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // disposal and must still fire.
     //
     // The `enumPtr == srcPtr` test is a RUNTIME compare, mirroring
-    // `lowerAwaitFor`'s `afor.enown` guard (#1268/#2356): `enumTs == ts` is
-    // only a STRUCTURAL fact (the class exposes MoveNext + Current), not a
+    // `lowerAwaitFor`'s `afor.enown` guard (#1268/#2356): the guard's static
+    // condition (whether exact or, since #6376, ancestor-widened) is only a
+    // STRUCTURAL fact (the class exposes MoveNext + Current, and is the
+    // source's own type or a base of it), not a
     // proof that this particular `GetEnumerator()` body returns `this` — a
     // self-implementing class could instead construct and return a fresh
     // instance of its own type, in which case the two pointers differ and the
@@ -10302,8 +10304,56 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             sourceIsNamedOwner = sema::isAutoPropertyStorageSymbol(ps, ctx_);
         }
     }
+    // fix #6376 (§28.9, §29.1, §29.11, v0.338): could the enumerator BE the
+    // source object? The question this guard exists to answer is a question
+    // about the VALUE, so it must be asked of the value's TYPE RELATIONSHIP,
+    // not of two symbols the structural scan happened to pick.
+    //
+    // `enumTs` is the output of a scan ("some class in this module exposing
+    // MoveNext + Current", lines 10163-10227), so for a self-returning class
+    // INHERITED by the source's actual type the scan picks the BASE and
+    // `enumTs == ts` is FALSE even though `enumPtr == srcPtr` holds: the object
+    // IS its own enumerator. The guard then does not fire, the loop reclaims
+    // the receiver, and the source's own scope reclaims it again — a genuine
+    // double free. MEASURED, on the repro in this commit's test file:
+    //
+    //   heap-use-after-free READ of size 8 on the 24-byte enumerator region,
+    //   freed by the loop-end disposal (from the enumerator slot) and read
+    //   back by main after the source's own disposal — with the CORRECT
+    //   enumeration printed first (`selfsub=6`) and only the exit-time
+    //   reclamation faulting. Plain leg exit 139, ASan leg heap-use-after-free.
+    //
+    // So the condition is "is `enumTs` `ts` or a CLASS ANCESTOR of `ts`", which
+    // covers the inherited self-returning idiom. `classBaseOf` mirrors the
+    // existing one in LlvmBackend_Layout.cpp:2932 (`baseTypes` carries
+    // interfaces too; only a CLASS base participates in the class chain).
+    //
+    // This is a strictly WIDENING of a safety guard — the extra cases are ones
+    // where the loop would otherwise reclaim an object it does not own. It is
+    // NOT a widening of the §29.11 independent-enumerator semantics: the
+    // runtime `enumPtr == srcPtr` compare below still decides whether the two
+    // pointers actually alias, so a self-implementing class that constructs
+    // and returns a FRESH instance of its own type keeps the ordinary
+    // distinct-object disposal (that argument is #2384's and is unchanged).
+    auto classBaseOf = [](const sema::TypeSymbol* t) -> const sema::TypeSymbol* {
+        if (!t) return nullptr;
+        for (const sema::TypeSymbol* b : t->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) return b;
+        return nullptr;
+    };
+    // Bounded by the visited set so a cyclic base list cannot spin. Only a
+    // CLASS chain is walked: an interface base carries no vtable, so it can
+    // never be the type whose instance `enumPtr` holds.
+    bool enumIsTsOrBase = false;
+    {
+        std::set<const sema::TypeSymbol*> seen6376;
+        for (const sema::TypeSymbol* cur = ts; cur; cur = classBaseOf(cur)) {
+            if (cur == enumTs) { enumIsTsOrBase = true; break; }
+            if (!seen6376.insert(cur).second) break;
+        }
+    }
     llvm::AllocaInst* enumDisposeSlot = enumSlot;
-    if (enumTs == ts && sourceIsNamedOwner) {
+    if (enumIsTsOrBase && sourceIsNamedOwner) {
         llvm::Value* enumIsSrc =
             builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.selfen");
         enumDisposeSlot = entryAlloca(ptrTy());
@@ -10320,8 +10370,9 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // independent disposer in the program; this loop is its SOLE owner and
     // must dispose it too, exactly as it already disposes the enumerator it
     // constructs. Only the TWO-CLASS idiom needs a SEPARATE registration
-    // here (`enumTs != ts`): `srcPtr` is then a genuinely distinct object
-    // from `enumPtr`. The self-returning idiom (`enumTs == ts`) needs no
+    // here (`!enumIsTsOrBase`, widened from `enumTs != ts` by #6376):
+    // `srcPtr` is then a genuinely distinct object
+    // from `enumPtr`. The self-returning idiom (`enumIsTsOrBase`) needs no
     // separate entry — `enumPtr == srcPtr` at runtime, and the
     // `enumDisposeSlot` registration just below (identity-guarded to null
     // when `sourceIsNamedOwner`, or the plain `enumSlot` otherwise) already
@@ -10334,11 +10385,15 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // ... is owned by this loop"). Pushed BEFORE the enumerator's own entry
     // so LIFO scope-end disposal (`emitDisposals` iterates in reverse) frees
     // the enumerator first, the source second — the natural reverse of their
-    // construction order; the two never alias here (`enumTs != ts` is
+    // construction order; the two never alias here (`!enumIsTsOrBase` is
     // exactly this branch's guard) so the order has no correctness
     // consequence, only readability.
     llvm::AllocaInst* srcDisposeSlot = nullptr;
-    if (!sourceIsNamedOwner && enumTs != ts && disposerFns_.count(ts)) {
+    // fix #6376: this must be the NEGATION of the guard above. Registering the
+    // source as a separate disposer is only correct when the enumerator is NOT
+    // the source object, so the condition has to be widened in lockstep or the
+    // two sites disagree and one of them reclaims a shared object.
+    if (!sourceIsNamedOwner && !enumIsTsOrBase && disposerFns_.count(ts)) {
         srcDisposeSlot = entryAlloca(ptrTy());
         builder_.CreateStore(srcPtr, srcDisposeSlot);
         disposeStack_.back().push_back({srcDisposeSlot, ts});
