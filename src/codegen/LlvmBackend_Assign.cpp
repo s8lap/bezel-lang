@@ -14489,30 +14489,83 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     llvm::Value* enumPtr = emitMethodCall(getEnumSym, geArgs, /*baseQualified=*/false);
     if (!enumPtr) return src;
 
-    // fix #6343 (§29.1 / §29.11, v0.338): does the fetched enumerator really
-    // have the layout `enumTs` was guessed to have?  A runtime identity test
-    // against `enumTs`'s own class vtable — the only check that does not trust
-    // the structural scan. `enumPtr` is either an `enumTs` instance (the
-    // two-class and self-returning idioms: the direct family is correct) or a
-    // value the callee already put in §29.11 iterator-vtable format (a
-    // delegating `GetEnumerator`): the `$ad` family is correct there.
+    // fix #6375 (§29.1 / §29.11, v0.338): is the fetched enumerator already in
+    // §29.11 iterator-vtable format (a delegating `GetEnumerator`, where the
+    // `$ad` family re-dispatches correctly), or is it an ordinary class
+    // instance (the two-class and self-returning idioms, where the direct
+    // family is correct)?
     //
-    // A null `enumPtr` is reported as "not an enumTs" and therefore takes the
-    // `$ad` family, whose MoveNext/Current/Dispose each null-guard — a null
-    // here is a callee that returned no enumerator, and the direct family
-    // would have turned it into an indirect call through address zero.
+    // #6343 asked this with `enumPtr->vtable != vt$(enumTs)`. That is unsound:
+    // `enumTs` comes from a STRUCTURAL scan (any class exposing `MoveNext` +
+    // `Current`), so an instance of a SUBCLASS of the guessed class carries a
+    // DIFFERENT vtable while still being an ordinary class instance. The `$ad`
+    // family then re-dispatches through it, where slot 2 is `Dispose`, not
+    // `MoveNext` — measured in `vt$MSUB.Derived` below, invoking a void
+    // function through an `i1` slot.
     //
-    // `vtableOf` returns null for an IMPORTED `enumTs` (imports have no local
-    // vtable global, LlvmBackend_Setup.cpp ~L5096); the test is then skipped
-    // entirely and the pre-existing direct lowering stands, unchanged.
-    llvm::Value* useAdFamily = nullptr;
-    if (llvm::GlobalVariable* enumClassVt = vtableOf(enumTs)) {
-        llvm::Value* enumVt = builder_.CreateLoad(ptrTy(), enumPtr);
-        llvm::Value* isEnumTs = builder_.CreateICmpEQ(enumVt, enumClassVt);
-        useAdFamily = builder_.CreateAnd(
-            builder_.CreateNot(builder_.CreateIsNull(enumPtr)),
-            builder_.CreateNot(isEnumTs));
-    }
+    // The replacement is §29.2's own vtable shape. Every §29.11 iterator vtable
+    // emits `elems[0] = getPointerCast(vtGV)` and so SELF-REFERENCES in slot 0,
+    // while every class vtable carries its type descriptor there (`td$…`,
+    // `bz$exc$vtable$table`). Testing slot 0 against the vtable's own address
+    // asks the value what format it is in, and inheritance cannot answer it
+    // falsely: a subclass's vtable is a different global with a different [0].
+    //
+    // ENUMERATION OF THE VTABLE BUILD SITES, and a correction. An earlier
+    // revision of this comment counted `setInitializer(ConstantArray…)` sites
+    // and reported "31 sites, 18 self-referencing, 10 class vtables". That
+    // method CANNOT see class vtables: they are built with the
+    // `GlobalVariable` CONSTRUCTOR form (LlvmBackend_Setup.cpp:5907, `init`
+    // passed in the ctor), so they never call `setInitializer`. The corrected
+    // count, by the discriminator this fix actually uses:
+    //
+    //   §29.11 ITERATOR vtables — 17 GLOBALS, identified by slot 0 being
+    //     `getPointerCast(<the vtable global itself>)`. All 17 self-reference:
+    //     14 in LlvmBackend_Assign.cpp, plus LlvmBackend_Iterators.cpp's `vtGV`
+    //     and `cloneVtGV`, plus LlvmBackend_Async.cpp's async `vtGV`. (17, not
+    //     the 18 previously claimed: that count included a COMMENT line
+    //     restating the idiom, in LlvmBackend_Stmts.cpp.)
+    //
+    //   CLASS vtables — built by the ctor form, and every one puts a type
+    //     descriptor in slot 0 (`td$…`, or `instDesc` for a monomorphization),
+    //     which is what makes the self-reference test read false for them.
+    //     Verified on emitted IR rather than read off the builder:
+    //       @"vt$M6375A.Derived" = constant [8 x ptr]
+    //         [ptr @"td$M6375A.Derived", ptr @"itmap$…", ptr @"bz$M6375A.Derived$Dispose", …]
+    //     Box vtables (`bvt$box$…`, Setup.cpp:5159) are declared with a null
+    //     initializer on the import side and are not §29.11 iterator vtables;
+    //     they are not part of this count.
+    //
+    // #6343's own wording claimed only the 14 in LlvmBackend_Assign.cpp were
+    // covered; that understatement is corrected here too.
+    //
+    // A null `enumPtr` reads as "not §29.11 format" and takes the direct family,
+    // matching #6343's behaviour for a null. (The unconditional slot-0 load
+    // below means a null `enumPtr` faults there first; that is pre-existing and
+    // unchanged by this commit.)
+    //
+    // KNOWN LIMITATION — the null-`enumPtr` load is now REACHABLE for an
+    // IMPORTED `enumTs`. #6343 skipped the whole test when `vtableOf(enumTs)`
+    // returned null, which is what an imported class does (no local vtable
+    // global, LlvmBackend_Setup.cpp:5114-5123), so an imported enumerator never
+    // reached a load. Dropping the skip means a delegating IMPORTED enumerator
+    // now routes through this test, and if its `GetEnumerator` returned null the
+    // unconditional slot-0 load faults rather than falling through to the
+    // `$ad` family's null-guards. This path has NO automated coverage — the
+    // codegen harness (runAot/runAotChecked) is single-module and the
+    // two-module machinery lives in tests/module with no shared helper. Hand
+    // measurement (bezelc -c + --import) found the imported delegating shape
+    // gives the same answer before and after, but hand measurement establishes
+    // UNAFFECTEDNESS, which CI cannot distinguish from untested. Structural gap
+    // tracked as #6379.
+    //
+    // Dropping `vtableOf(enumTs)` also drops its IMPORTED-`enumTs` skip, which
+    // had left a delegating imported enumerator on the direct family. The new
+    // test needs no `enumTs` vtable, so it applies uniformly.
+    llvm::Value* enumVt = builder_.CreateLoad(ptrTy(), enumPtr);
+    llvm::Value* enumSelfRef = builder_.CreateLoad(ptrTy(), enumVt);
+    llvm::Value* useAdFamily = builder_.CreateAnd(
+        builder_.CreateNot(builder_.CreateIsNull(enumPtr)),
+        builder_.CreateICmpEQ(enumSelfRef, enumVt), "enum.usead");
 
     // 10. Allocate wrapper struct and fill fields (vtable, enumerator, source,
     // ownsSrc).
