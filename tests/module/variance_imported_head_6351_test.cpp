@@ -433,21 +433,25 @@ BEZEL_TEST(variance_imported_head_6351,
 // that would have been benign. A resolver that shadowed wrongly (reading the
 // imported covariant head) would ACCEPT here.
 //
-// HONESTY NOTE, added after the non-author review: this row does NOT pin
-// anything about #6351. It passes on the base, on both #6351 commits, AND
-// under the guard-disabled mutation — the pre-existing #6348 gap (a nested
-// LOCAL head is invisible to this pass's simple-name local lookup, filed
-// separately by the coordinator as P8e) swallows the case before the shadowing
-// guard is ever consulted. It is kept as documentation of the direction, not
-// as evidence.
+// BEHAVIOUR FLIP (fix #6369, §11.6, §12.9): this row was ACCEPTED and is now
+// REJECTED with §12.9. It had been pinned as documentation of the direction
+// only — the non-author review measured it passing on the base, on both #6351
+// commits AND under the guard-disabled mutation, because the pre-existing gap
+// (a nested LOCAL head resolved by no arm of the composed walk, filed as P8e
+// and then as **#6369**) swallowed the case before the shadowing guard was ever
+// consulted. Fix #6369 closes that gap, so this is now the row that pins the
+// direction it always described: the LOCAL nested head is the one that answers,
+// so its CONTRAVARIANT marker is read and `out T` in a return slot is rejected
+// — the imported, benign `Outer.Inner<out T>` beside it is correctly not
+// consulted.
 //
-// The row that DOES pin the guard is
+// The row that pins the SHADOWING GUARD itself is still
 // `local_type_shadowing_imported_module_name_skips_variance`, which fails when
 // `namesLocalTopLevel` is disabled.
 
 BEZEL_TEST(variance_imported_head_6351,
-           local_nested_head_skip_unchanged_by_shadowing_guard) {
-    expectAccepted(
+           local_nested_head_reads_local_marker_not_imported) {
+    expectRejected(
         libWith("public class Outer "
                 "  public interface Inner<out T> "
                 "    method Get(): T; "
@@ -459,7 +463,8 @@ BEZEL_TEST(variance_imported_head_6351,
             "    method Put(x: T); "
             "  end Inner; "
             "end Outer; "
-            "public interface I<out T> method Get(): Outer.Inner<T>; end I; "));
+            "public interface I<out T> method Get(): Outer.Inner<T>; end I; "),
+        "out");
 }
 
 // --- the local-shadow guard's OWN load-bearing case -----------------------

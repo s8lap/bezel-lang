@@ -14202,6 +14202,54 @@ HeadQualifier classifyHeadQualifier(
     return q;
 }
 
+// fix #6369 (§11.6, §2.7 rule 1, §12.9, v0.338): the LOCAL half of the §11.6
+// nested-type walk — the head `head` names among the enclosing types this module
+// DECLARES, or null.
+//
+// §11.6: "a nested type … is referenced from outside as `Outer.Nested`" — so
+// the qualified spelling is the ordinary spelling for a nested head, and §12.9's
+// composed position check must read its marker like any other head's. Before
+// this the local side of the walk stopped at `parts.size() == 1`
+// (`namedHeadArgVariance`'s local-top-level table) and `resolveImportedHead`
+// deliberately returns null for a `LocalTopLevel` qualifier, so a LOCAL
+// `Outer.Inner<T>` resolved by NO arm: `Unknown`, and §12.9 SKIPPED it. Under
+// `out T` in a return slot against a contravariant `Outer.Inner<in T>` that is
+// a real violation the compiler accepted, ran and exited 0 on — a silent
+// acceptance, the same class as #6373's Finding 2.
+//
+// SAME WALK AS THE IMPORT ARM, AND THAT IS THE POINT. `walkNestedTypePath` is
+// `resolveNamed`'s own qualified descent (`TypeResolution_Names.cpp`: "descend
+// through the looked-up symbol's nested types for each subsequent part"), so
+// this arm and the imported one cannot disagree about what a dotted spelling
+// names: both look up the qualifying type, then take one `NestedTypeSymbol`
+// per remaining segment. What decides which of the two answers a spelling is
+// #6373's `classifyHeadQualifier`, decided ONCE — `LocalTopLevel` here,
+// `ImportedModule` there — and the caller reaches this function only on the
+// former. There is no third reading of a qualified spelling to get wrong.
+//
+// Two non-answers, neither a guess:
+//   * no local type, or MORE THAN ONE, of the qualifier's name. §21.10 admits
+//     same-named local types in disjoint blocks, and picking one of them would
+//     read a marker off a type the use site may not name; null is the same
+//     "ambiguous — skip" rule `resolveImportedHead`'s bare-name arm applies.
+//   * a qualifying type that has no such nested type. `resolveNamed` reports
+//     that spelling (§11.3, "type `Outer` has no nested type named `Nope`"),
+//     so the program is rejected on its own account and this pass must add
+//     nothing — see `nested_local_head_missing_member_adds_no_variance`.
+const TypeSymbol* resolveLocalNestedHead(
+    const ast::Type& head, const std::vector<TypeSymbol*>& localTypes) {
+    if (!head.name || head.name->parts.size() < 2) return nullptr;
+    const std::string_view qualifier = head.name->parts.front();
+    const TypeSymbol* top = nullptr;
+    for (const TypeSymbol* ts : localTypes) {
+        if (!ts || ts->name != qualifier) continue;
+        if (top) return nullptr;  // two declarations of one name — never guess
+        top = ts;
+    }
+    if (!top) return nullptr;
+    return walkNestedTypePath(top, head.name->parts, 1);
+}
+
 // fix #6351 (second attempt; the first was REJECTed for a false resolve), as
 // completed by fix #6373: the head `head` names among the imported types, or
 // null.
@@ -14319,6 +14367,43 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
             if (ts->kind != ast::TypeDeclKind::Interface) return invariantOrDefer(site);
             if (argIndex >= ts->genericParams.size()) return invariantOrDefer(site);
             const auto* gps = dynamic_cast<GenericParamSymbol*>(ts->genericParams[argIndex]);
+            if (!gps) return invariantOrDefer(site);
+            if (gps->variance == "out") return VariancePos::CoVariant;
+            if (gps->variance == "in") return VariancePos::ContraVariant;
+            return invariantOrDefer(site);
+        }
+    }
+    // fix #6369 (§11.6, §2.7 rule 1, §12.9, v0.338): a NESTED LOCAL head.
+    // §11.6 makes `Outer.Inner` the ordinary spelling of a nested type, and
+    // §2.7 rule 1 resolves the leftmost segment first — to a local type here,
+    // so the REST of the path names a member of that type rather than of a
+    // module. Nothing answered that spelling before: the table above answers
+    // BARE names only (#6373), and `resolveImportedHead` returns null for a
+    // `LocalTopLevel` qualifier by design, so the composed walk yielded
+    // `Unknown` and §12.9 SKIPPED a real violation.
+    //
+    // The qualifier is classified rather than merely tested, so this arm and
+    // the imported one below are the SAME rule read off ONE verdict
+    // (#6373's `classifyHeadQualifier`): `LocalTopLevel` walks the module's
+    // own declarations, `ImportedModule` walks a module's exports, and no
+    // spelling is answered by both or by neither.
+    if (qualifiedSpelling &&
+        classifyHeadQualifier(head, localTypes, localAliases, heads).kind ==
+            HeadQualifier::Kind::LocalTopLevel) {
+        if (const TypeSymbol* nested =
+                resolveLocalNestedHead(head, localTypes)) {
+            // The same reading rules as the two walks above, deliberately: a
+            // class, record, enum or choice is always invariant (§12.9), and a
+            // head with no marker at `argIndex` defers through
+            // `invariantOrDefer` (#6355) rather than guessing. The marker is
+            // the NESTED type's own — `resolveLocalNestedHead` returns what
+            // `walkNestedTypePath` landed on, never the enclosing class.
+            if (nested->kind != ast::TypeDeclKind::Interface)
+                return invariantOrDefer(site);
+            if (argIndex >= nested->genericParams.size())
+                return invariantOrDefer(site);
+            const auto* gps =
+                dynamic_cast<GenericParamSymbol*>(nested->genericParams[argIndex]);
             if (!gps) return invariantOrDefer(site);
             if (gps->variance == "out") return VariancePos::CoVariant;
             if (gps->variance == "in") return VariancePos::ContraVariant;
