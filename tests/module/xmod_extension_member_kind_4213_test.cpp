@@ -18,61 +18,124 @@
 // needs to prove the SAME rejection survives the `compileObject` cross-
 // module entry point sema tests never exercise.
 
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <string>
-#include <sys/wait.h>
-#include <vector>
 
-#include "driver/Driver.hpp"
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
-#include "support/unique_stem.hpp"
 
+// ── PORT NOTE (#6386, round 2) ───────────────────────────────────────────────
+//
+// Both rows were hand-rolled: their own `TempFile4213` / `write4213`, their own
+// `Dependency` vector, and `std::system` + `WIFEXITED` + `WEXITSTATUS` to decode
+// a run. They now call `test::runAotModules`.
+//
+// ⚠ THIS FILE ALSO LOSES THREE ABSORBING GUARDS, WHICH IS A STRENGTHENING.
+//
+//   * `if (!std::ifstream(aObj.path).good()) return;`  (the ACCEPT row)
+//   * `if (!appResult.success) return;`                  (the ACCEPT row)
+//   * `if (status != -1 && WIFEXITED(status))` wrapping the ONE value
+//     assertion, so the exit code was checked ONLY on the leg where the run had
+//     already succeeded.
+//
+// Under those guards a build failure produced exactly ONE failure line and a
+// signal produced ZERO value assertions. Each row now asserts `r.ran` FIRST and
+// UNCONDITIONALLY, then runs every value assertion. No assertion was removed; the
+// guards become unreachable by construction because `r.ran` is false in every
+// case they caught, and `r.exitCode` carries the value the old wrapper guarded.
+//
+// ⚠ THE REJECT ROW IS NOW MEASURED FOR ITS REASON, NOT JUST ITS VERDICT. The old
+// row asserted only `success == false`, which is the vacuous-oracle shape the
+// review contract calls out: ANY error in the library module — including a parse
+// error in the extension syntax, an unrelated name collision, a missing
+// import — would have turned this row GREEN without the §26.3 per-member check
+// ever running. The port adds an assertion on the diagnostic text, so the row
+// fails unless the rejection names the forbidden member kind. (The
+// `didNotCrash`-equivalent here is `r.ran == false`, asserted via
+// `BEZEL_EXPECT_FALSE(r.ran)`.)
+//
+// The ACCEPT row's control value is unchanged: `w.DoIt()` is `41 + 1`.
+//
+// TEST NAMES ARE UNCHANGED (#6386 rule 5). No row was added.
+//
+// Spec: §26.3, A.4 (`ExtensionMember` grammar), §2.5, §2.6, v0.298, v0.338.
+
+namespace bezel::module {
 namespace {
 
-struct TempFile4213 {
-    std::string path;
-    explicit TempFile4213(std::string p) : path(std::move(p)) {}
-    ~TempFile4213() { std::remove(path.c_str()); }
-};
+// The two library modules, verbatim. `Lib4213Const` declares the forbidden
+// `const` member; `Lib4213Ok` is the same class with it removed.
+const char* kLibConst4213 =
+    "module Lib4213Const; "
+    "public class WidgetXC4213 "
+    "  public X: int; "
+    "end WidgetXC4213; "
+    "public extension WidgetXC4213 "
+    "  public static const K4213x: int := 42; "
+    "  public method DoIt(): int => this.X; "
+    "end extension;";
 
-void write4213(const std::string& path, const std::string& src) {
-    std::ofstream out(path);
-    out << src;
-}
+const char* kLibOk4213 =
+    "module Lib4213Ok; "
+    "public class WidgetXOk4213 "
+    "  public X: int; "
+    "  public constructor(x: int) "
+    "    X := x; "
+    "  end constructor; "
+    "end WidgetXOk4213; "
+    "public extension WidgetXOk4213 "
+    "  public method DoIt(): int => this.X + 1; "
+    "end extension;";
 
-}  // namespace
+// The importer for the ACCEPT row, verbatim.
+const char* kAppOk4213 =
+    "module App4213; "
+    "import Lib4213Ok; "
+    "class C4213xok public static method Main(): int "
+    "  var w := new WidgetXOk4213(41); "
+    "  return w.DoIt(); "
+    "end Main; end C4213xok;";
 
 // REJECT — a LIBRARY module (never imported here) whose `public extension`
-// declares a `const` member must fail at its own `compileObject`, exactly
+// declares a `const` member must fail at its own compile, exactly
 // as `bezelc -c` alone does for the same source (the issue's own repro).
 // Before the fix this call returned `success == true` with zero
 // diagnostics and a real `.o` on disk.
+//
+// `kLibConst4213` is supplied as the ENTRY module (nothing imports it), which is
+// the point of the row: the rejection must fire from the library's own
+// compilation unit, with no importer in the program at all.
 BEZEL_TEST(xmod_extension_member_kind_4213,
            library_module_const_in_extension_rejected_at_own_compile_26_3) {
-    namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path();
-    std::string stem = unique_stem("bz4213_xmod_const_");
-    TempFile4213 aSrc((dir / (stem + "_a.bzl")).string());
-    TempFile4213 aObj((dir / (stem + "_a.o")).string());
+    auto r = test::runAotModules({{"Lib4213Const", kLibConst4213}},
+                                 "Lib4213Const");
 
-    write4213(aSrc.path,
-        "module Lib4213Const; "
-        "public class WidgetXC4213 "
-        "  public X: int; "
-        "end WidgetXC4213; "
-        "public extension WidgetXC4213 "
-        "  public static const K4213x: int := 42; "
-        "  public method DoIt(): int => this.X; "
-        "end extension;");
+    // The verdict: the program must NOT have run. `ran == false` also covers the
+    // old row's "no `.o` on disk" assertion — a rejected entry module never
+    // reaches the link, so no object exists to import.
+    BEZEL_EXPECT_FALSE(r.ran);
 
-    bezel::Driver driver;
-    auto result = driver.compileObject(aSrc.path, aObj.path);
-    BEZEL_EXPECT_FALSE(result.success);
-    // No object should have been produced from a failed library compile.
-    BEZEL_EXPECT_FALSE(std::ifstream(aObj.path).good());
+    // ⚠ THE REASON, NOT JUST THE VERDICT. The old row asserted only
+    // `success == false`, which is the vacuous-oracle shape: ANY error in this
+    // library — including an unrelated one, or a parse failure in the extension
+    // syntax — would have turned the row GREEN without the §26.3 per-member
+    // check ever running. Both needles below are asserted.
+    //
+    // The `const` needle is the one that pins the KIND: src/sema/ExprTypecheck.cpp
+    // builds the message as "an extension block may not declare " + article +
+    // " `" + kind + "` member", and the `ConstDecl` arm sets kind = "const".
+    //
+    // The §26.3 needle is what rules out the PRE-EMPTING CHECK. The extension
+    // arm has an EARLIER rule — "extension blocks may not declare `static`
+    // members" — which reads `MethodDecl` and `PropertyDecl` modifiers only.
+    // The offending member here is `public static const K4213x`, so if that
+    // earlier rule had been widened to `ConstDecl` it would fire first and this
+    // row would be green for the wrong reason. Asserting the `const` needle is
+    // what makes the row fail loudly in that case.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "an extension block may not declare a `const` member"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§26.3"));
 }
 
 // ACCEPT (control) — the SAME library module with the forbidden `const`
@@ -82,50 +145,14 @@ BEZEL_TEST(xmod_extension_member_kind_4213,
 // compilation or `public extension` in general.
 BEZEL_TEST(xmod_extension_member_kind_4213,
            library_module_without_const_accepted_and_importable_26_3) {
-    namespace fs = std::filesystem;
-    auto dir = fs::temp_directory_path();
-    std::string stem = unique_stem("bz4213_xmod_ok_");
-    TempFile4213 aSrc((dir / (stem + "_a.bzl")).string());
-    TempFile4213 aObj((dir / (stem + "_a.o")).string());
+    auto r = test::runAotModules({
+        {"Lib4213Ok", kLibOk4213},
+        {"App4213", kAppOk4213},
+    }, "App4213");
 
-    write4213(aSrc.path,
-        "module Lib4213Ok; "
-        "public class WidgetXOk4213 "
-        "  public X: int; "
-        "  public constructor(x: int) "
-        "    X := x; "
-        "  end constructor; "
-        "end WidgetXOk4213; "
-        "public extension WidgetXOk4213 "
-        "  public method DoIt(): int => this.X + 1; "
-        "end extension;");
-
-    bezel::Driver driver;
-    auto libResult = driver.compileObject(aSrc.path, aObj.path);
-    BEZEL_EXPECT_TRUE(libResult.success);
-    if (!std::ifstream(aObj.path).good()) return;
-
-    TempFile4213 bSrc((dir / (stem + "_b.bzl")).string());
-    TempFile4213 bExe((dir / (stem + "_b")).string());
-    write4213(bSrc.path,
-        "module App4213; "
-        "import Lib4213Ok; "
-        "class C4213xok public static method Main(): int "
-        "  var w := new WidgetXOk4213(41); "
-        "  return w.DoIt(); "
-        "end Main; end C4213xok;");
-
-    std::vector<bezel::Dependency> deps;
-    bezel::Dependency d;
-    d.metadataPath = aObj.path;
-    d.objectPath = aObj.path;
-    deps.push_back(d);
-    auto appResult = driver.compileFile(bSrc.path, bExe.path, deps);
-    BEZEL_EXPECT_TRUE(appResult.success);
-    if (!appResult.success) return;
-    int status = std::system(bExe.path.c_str());
-    BEZEL_EXPECT_TRUE(status != -1 && WIFEXITED(status));
-    if (status != -1 && WIFEXITED(status))
-        BEZEL_EXPECT_EQ(WEXITSTATUS(status), 42);
-    std::remove(bExe.path.c_str());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
+
+}  // namespace
+}  // namespace bezel::module
