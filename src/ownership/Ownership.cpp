@@ -16882,7 +16882,15 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                     mo.checkGetterFreshOwnedReturn(*acc.exprBody);
                 } else if (acc.bodyKind ==
                            ast::PropertyAccessorBodyKind::Block) {
-                    mo.scanGetterReturns(acc.stmts);
+                    // fix #6404 (§28.6, v0.338): the mint-announcing carve is
+                    // keyed on the getter's OWN declared return type — the
+                    // property's `type` — per §28.3's "The classification stays
+                    // by declared return type". `pd->type` is null for an
+                    // untyped property; a null return type is never
+                    // mint-announcing, so the carve simply does not apply.
+                    mo.scanGetterReturns(
+                        acc.stmts,
+                        pd->type ? ctx.resolvedType(*pd->type) : nullptr);
                 }
                 // fix #5621 (§28.3, v0.326): for block-bodied getters, scan
                 // return statements and check that any returned function value

@@ -16919,24 +16919,27 @@ void MethodOwnership::checkAutoPropertyInitializer(
                "returning `owned T` (§28.6)");
 }
 
-void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s) {
+void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s,
+                                            const sema::TypeRef* getterReturnType) {
     if (!s) return;
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
         if (rs->value) checkGetterFreshOwnedReturn(*rs->value);
     } else if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
-        scanGetterReturns(is->ifBranch.body);
-        for (const auto& eb : is->elifBranches) scanGetterReturns(eb.body);
-        if (is->hasElse) scanGetterReturns(is->elseBody);
+        scanGetterReturns(is->ifBranch.body, getterReturnType);
+        for (const auto& eb : is->elifBranches)
+            scanGetterReturns(eb.body, getterReturnType);
+        if (is->hasElse) scanGetterReturns(is->elseBody, getterReturnType);
     } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
-        scanGetterReturns(ws->body);
+        scanGetterReturns(ws->body, getterReturnType);
     } else if (auto* fr = dynamic_cast<const ast::ForStmt*>(s)) {
-        scanGetterReturns(fr->body);
+        scanGetterReturns(fr->body, getterReturnType);
     } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
-        scanGetterReturns(ts->body);
-        for (const auto& c : ts->catches) scanGetterReturnsStmt(c.body.get());
-        if (ts->hasFinally) scanGetterReturns(ts->finallyBody);
+        scanGetterReturns(ts->body, getterReturnType);
+        for (const auto& c : ts->catches)
+            scanGetterReturnsStmt(c.body.get(), getterReturnType);
+        if (ts->hasFinally) scanGetterReturns(ts->finallyBody, getterReturnType);
     } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s)) {
-        scanGetterReturns(db->body);
+        scanGetterReturns(db->body, getterReturnType);
     }
 }
 
@@ -16953,9 +16956,46 @@ void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s) {
 // §28.3's producers note says the same of the family — the iterator
 // convention's caller-owned deferred-activation frame.
 //
-// The three registry families are the compiler's existing spelling of "Task and
-// iterable" (BuiltinRegistry's isTaskFamilyHead / isIterableInterfaceHead /
-// isOwningTypeHead); this carve deliberately does NOT introduce a new name list.
+// THE ADMITTED SET IS §28.6's OWN PHRASE, AND IT IS A UNION OF TWO FAMILIES.
+// §28.6 bullet 2's parenthetical names them exactly — "For the mint-announcing
+// families — `Task` and iterable — …" — and the §28.3 *announcement table*
+// (spec v0.338, line 6491, the table's **row 2**, "mint-announcing, unmarked")
+// is the section that STATES the set normatively:
+//
+//   | 2 | **mint-announcing, unmarked** — a `Task`-family type (`Task`,
+//       `Task<T>`, `OwningTask<T>`) or an iterable-family type: one of the eight
+//       §29.3/§30.7 iterable/enumerator interface heads, or a **lazy query** … |
+//
+// So the admitted set is `Task` ∪ iterable — TWO families. §28.3's
+// *Returning a deferred-activation frame* adds the load-bearing constraint that
+// makes the carve sound: "The classification stays by declared return type",
+// which is why the argument here is the GETTER'S DECLARED RETURN TYPE and not
+// the type of any expression in its body (#6404 review: keying the carve on
+// `ctx_.exprType(*cur)` let one local — a binding the spec does not read —
+// decide the verdict, so one expression-typed test could be made to pass or
+// fail by a laundering binding alone).
+//
+// The two registry predicates are the compiler's existing spelling of those two
+// families and nothing wider: `isTaskFamilyHead` = {`Task`, `OwningTask`} and
+// `isIterableInterfaceHead` = the eight §29.3/§30.7 iterable/enumerator
+// interface heads (`IEnumerable`, `IEnumerator`, `IAsyncEnumerable`,
+// `IAsyncEnumerator`, `IOwningEnumerable`, `IOwningEnumerator`,
+// `IOwningAsyncEnumerable`, `IOwningAsyncEnumerator`). No new name list.
+// `isOwningTypeHead` is DELIBERATELY NOT consulted (#6404 review): it is a
+// SUPERSET of the two families that also carries the six concrete owning
+// COLLECTIONS (`OwningArray`, `OwningDictionary`, `OwningSet`, `OwningStack`,
+// `OwningQueue`, `OwningLinkedList`) plus `Shared` / `Weak` /
+// `ChannelSender` / `CancellationTokenSource`, and none of those is
+// mint-announcing under §28.3 row 2 — a concrete owning collection is row 4's
+// ordinary borrowed reference, which is exactly what §28.6 bullet 2's own
+// worked example rejects (`method LeakTransactions(): OwningArray<Transaction>
+// return new OwningArray<Transaction>(); // ERROR`, v0.338). Admitting
+// `OwningArray` here would have let `property Items: OwningArray<Item> get =>
+// do var a := new OwningArray<Item>(); return a; end;` through — the concrete
+// spelling of the very escape §28.6 exists to catch. The lazy-query arm of
+// row 2 is compiler-known rather than head-keyed (§29.4 / §29.11); a lazy
+// query's declared type is one of the eight heads in practice, so the head test
+// above covers what a getter can be DECLARED at.
 //
 // ⚠ THE DIRECT SPELLING OF THIS SHAPE IS STILL REJECTED TODAY (measured at
 // #6404): `property Items: IOwningEnumerable<Item> get => do return new
@@ -16965,13 +17005,14 @@ void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s) {
 // reject, laundered accept — and this carve keeps the laundered side where the
 // codebase's own pinned rows (#3355's block-bodied `IOwningEnumerable` getter,
 // whose caller discharges the elements with `using var y := owned x;`) put it.
-// Closing the direct-side gap is a separate behaviour flip and is NOT this
-// fix's job; it is reported, not silently taken. // per §28.6, §28.3, K6.2
+// Closing the direct-side gap would DELETE a rejection, which is the one
+// direction this fix may not travel; it is reported, not taken.
+// // per §28.6, §28.3 (announcement table row 2), §28.3 "Returning a
+// // deferred-activation frame", K6.2, v0.338
 static bool getterEscapeIsMintAnnouncingFrame(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     return common::isTaskFamilyHead(rt->headName()) ||
-           common::isIterableInterfaceHead(rt->headName()) ||
-           common::isOwningTypeHead(rt->headName());
+           common::isIterableInterfaceHead(rt->headName());
 }
 
 // fix #6404 (§28.6, v0.338): the returned-BINDING provenance peel.
@@ -17010,53 +17051,134 @@ static bool getterEscapeIsMintAnnouncingFrame(const sema::TypeRef* rt) {
 //     drop-on-overwrite discharges the displaced fresh value at the store, so
 //     `var t: Cell? := new Cell(); t := _c; return t;` returns a borrow of a
 //     field and is legal; following the declaration alone would reject it.
-//   * A producer of a MINT-ANNOUNCING family (Task / iterable — the three
-//     BuiltinRegistry sets) ends the walk: §28.6 bullet 2's parenthetical carve
-//     makes the unmarked return type itself announce the transfer for those
-//     families, so a fresh frame there is not the A4 escape. See
-//     getterEscapeIsMintAnnouncingFrame above, including the note that the
-//     DIRECT spelling of that same shape is still rejected today.
+//     The SELF-ASSIGNMENT `t := t;` is NOT a discharge and is excluded from
+//     that stop (#6404 review, part 3) — see `isSelfAssignment` below.
+//   * A producer reached under a GETTER WHOSE DECLARED RETURN TYPE IS
+//     MINT-ANNOUNCING ends the walk: §28.6 bullet 2's parenthetical carve
+//     makes the unmarked return type itself announce the transfer for the
+//     `Task` and iterable families, so a fresh frame there is not the A4
+//     escape. The key is the getter's declared return type — see
+//     getterEscapeIsMintAnnouncingFrame above.
 //   * A local with no initializer, a PARAMETER, a `this`/field symbol, or any
 //     symbol that is not a LocalSymbol ends the walk. A getter accessor has no
 //     parameter of its own, so that arm is the defensive half of the same rule.
 //
+// THE LOCAL SPELLINGS, ENUMERATED (#6404 review, part 3). §21.1/A.6 give a
+// getter body exactly three ways to bind a name to a fresh owned value, and
+// the peel handles all three rather than only the one the first test used:
+//   * `var t := new Cell();`            — `ast::LocalDecl`, `initializer`.
+//     (A.6 `LocalDecl` also carries the `using var` / `await using var` forms,
+//     `isUsing` / `isAwaitUsing`; §28.1 admits no `owned`-declared LOCAL other
+//     than `using var`, so that spelling IS the owned-local case.)
+//   * `var t: Cell?; t := new Cell();`  — a `LocalDecl` with a NULL
+//     initializer. NOT followed (see the residual below).
+//   * `const t := new Cell();`          — `ast::LocalConstDecl` (§21.1
+//     *Runtime `const` locals*, A.6), a DIFFERENT node with its initializer in
+//     `value` rather than `initializer`. Followed, so
+//     `const t := new Cell(); return t;` rejects. A runtime `const` is
+//     single-assignment (§21.1: "A `const` local of either classification is
+//     not an assignable location"), so the §28.7 reassignment discharge can
+//     never apply to one and there is no spelling that retires its fresh
+//     value. ⚠ MEASURED RESIDUAL, REPORTED NOT FIXED: §21.1's OWN rule — "The
+//     initializer of a runtime `const` must not be an owned production …
+//     Rejected, with a diagnostic naming this rule and the `using var`
+//     remedy: a fresh `new`, an `owned`-returning call, a `Task`-family or
+//     iterable-family call … a `move` … and a move-only value" (v0.338) — is
+//     UNENFORCED for a local `const`: `const t := new Cell();` compiles clean
+//     outside any getter too (measured at #6404 review). That is a wider
+//     defect than this fix's position and would need its own diagnostic naming
+//     §21.1; this peel only closes the getter-facing half of it, and rejects a
+//     program §21.1 forbids either way.
+//   * a BINDING-ATOM clause (§17.15) — peeled through the `BindExpr` arm.
+//
 // `return move t;` needs no new arm: producerState already classifies a `move`
 // of a class-typed local Owned, so the expression-form rule above has always
-// rejected it (measured at #6404). `using var t := new Cell(); return t;` —
-// §28.1 admits no `owned`-declared LOCAL other than the `using var` form — is
-// covered by the same walk: its LocalDecl initializer is the `new`.
+// rejected it (measured at #6404).
 void MethodOwnership::scanGetterReturns(
-        const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+        const sema::TypeRef* getterReturnType) {
     // The two per-body sets the peel above needs. Collected over this body's
     // WHOLE statement tree with the single-source-of-truth walker
     // (StmtWalker.hpp, #3656) so a declaration or a store nested in an `if` /
     // `while` / `for` / `try` / `case` body is seen from the enclosing walk too.
-    std::vector<const ast::LocalDecl*> declared;
-    std::vector<const ast::LocalDecl*> reassigned;
+    // Keyed on `const ast::Node*` (the `Symbol::decl` static type) because the
+    // set spans TWO declaration nodes — `ast::LocalDecl` (A.6 `var` / `using
+    // var` / `await using var`) and `ast::LocalConstDecl` (A.6 `const`, §21.1).
+    std::vector<const ast::Node*> declared;
+    std::vector<const ast::Node*> reassigned;
+    // The one initializer accessor for both declaration spellings (A.6):
+    // `LocalDecl::initializer` and `LocalConstDecl::value`. Null for a
+    // `var x;` with no initializer.
+    auto declInitializer = [](const ast::Node* d) -> const ast::Expr* {
+        if (const auto* ld = dynamic_cast<const ast::LocalDecl*>(d))
+            return ld->initializer.get();
+        if (const auto* cd = dynamic_cast<const ast::LocalConstDecl*>(d))
+            return cd->value.get();
+        return nullptr;
+    };
     // Node-pointer identity, not name: two bodies may bind the same name.
-    auto noteOnce = [](std::vector<const ast::LocalDecl*>& v,
-                       const ast::LocalDecl* ld) {
+    auto noteOnce = [](std::vector<const ast::Node*>& v, const ast::Node* ld) {
         if (ld && std::find(v.begin(), v.end(), ld) == v.end()) v.push_back(ld);
     };
-    auto noteStore = [&](const ast::Expr* target) {
+    // A SELF-ASSIGNMENT — `t := t;` — is not a §28.7 discharge and must not end
+    // the walk. §28.7's rule disposes "the previous value" when the RHS is
+    // something else; here the RHS IS the previous value, so nothing is
+    // retired and the local still holds whatever it held. The self-assignment
+    // no-op the spec states is §15.3's, and it is scoped there to whole-value
+    // reassignment of a MOVE-ONLY value type ("Whole-value reassignment
+    // `arr := newValue;` on a move-only local or instance field … A
+    // reassignment whose RHS consumes the LHS — self-assignment `arr := arr;` …
+    // self-assignment is therefore a no-op", v0.338) — not to a plain-`var`
+    // owning-classified local. The compiler already implements it as a no-op
+    // for such a local, in both passes and independently of this rule:
+    // ownership's `recollectAliasBorrowSourceOnReassign` header calls
+    // self-assignment a no-op that "touches nothing", and every
+    // drop-on-overwrite site in codegen retains before releasing precisely so
+    // "`b := b;` is admitted today and lowers to a" no-op (LlvmBackend_Disposal
+    // .cpp "self-assigned"; LlvmBackend_Assign.cpp retain-before-release). So
+    // `var t: Cell? := new Cell(); t := t; return t;` returns the fresh value
+    // and must reject — same verdict as the spelling without the self-store.
+    // Measured: ACCEPTED before this clause, REJECTED with it.
+    // per §28.7, §15.3, §28.3, v0.338
+    auto isSelfAssignment = [&](const ast::AssignmentStmt* as) -> bool {
+        if (!as || !as->target || !as->value) return false;
+        if (as->op != ":=") return false;
+        // Symbol identity, not name: two locals may share a name across bodies,
+        // and a `const`/binding clause can shadow an outer local's spelling.
+        const auto* lhs = ctx_.exprSymbol(*as->target);
+        if (!lhs) return false;
+        const ast::Expr* rhs = lookThroughForceUnwrap(as->value.get());
+        return rhs && ctx_.exprSymbol(*rhs) == lhs;
+    };
+    auto noteStore = [&](const ast::AssignmentStmt* as) {
+        if (!as || !as->target) return;
+        if (isSelfAssignment(as)) return;  // a no-op retires nothing (§28.7)
+        auto* ls =
+            dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*as->target));
+        if (!ls) return;
+        noteOnce(reassigned, ls->decl);
+    };
+    auto noteTarget = [&](const ast::Expr* target) {
         if (!target) return;
         auto* ls =
             dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*target));
         if (!ls) return;
-        noteOnce(reassigned, dynamic_cast<const ast::LocalDecl*>(ls->decl));
+        noteOnce(reassigned, ls->decl);
     };
     for (const auto& s : stmts) {
         if (!s) continue;
         forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
-            if (const auto* ld =
-                    dynamic_cast<const ast::LocalDecl*>(&inner)) {
-                noteOnce(declared, ld);
+            if (dynamic_cast<const ast::LocalDecl*>(&inner) ||
+                // §21.1 *Runtime `const` locals* / A.6 — the third and only
+                // other local-binding node a getter body can carry.
+                dynamic_cast<const ast::LocalConstDecl*>(&inner)) {
+                noteOnce(declared, &inner);
             } else if (const auto* as =
                            dynamic_cast<const ast::AssignmentStmt*>(&inner)) {
-                noteStore(as->target.get());   // `t := …` and every compound form
+                noteStore(as);   // `t := …` and every compound form
             } else if (const auto* is =
                            dynamic_cast<const ast::IncrementStmt*>(&inner)) {
-                noteStore(is->target.get());   // `t++` / `t--`
+                noteTarget(is->target.get());   // `t++` / `t--`
             }
         });
     }
@@ -17065,7 +17187,7 @@ void MethodOwnership::scanGetterReturns(
     // reaches a fresh owned producer — an escape the getter cannot own.
     auto escapesFreshOwned = [&](const ast::Expr& ret) -> bool {
         const ast::Expr* cur = lookThroughForceUnwrap(&ret);
-        std::vector<const ast::LocalDecl*> seen;
+        std::vector<const ast::Node*> seen;
         // A getter body is finite; the bound only makes a malformed cyclic
         // initializer chain terminate instead of spinning.
         for (int step = 0; step < 32 && cur; ++step) {
@@ -17077,9 +17199,12 @@ void MethodOwnership::scanGetterReturns(
             // producerState is the single home for "freshly-produced owned
             // value" (§28.6's producer list); nothing here re-implements it.
             if (producerState(*cur) == OwnershipState::Owned) {
-                // …except the mint-announcing families, whose unmarked return
-                // type announces the transfer (see the carve above).
-                if (getterEscapeIsMintAnnouncingFrame(ctx_.exprType(*cur)))
+                // …except the mint-announcing families, whose UNMARKED RETURN
+                // TYPE announces the transfer. The key is the getter's own
+                // declared return type, NOT the producer expression's type
+                // (#6404 review) — §28.3's "Returning a deferred-activation
+                // frame": "The classification stays by declared return type".
+                if (getterEscapeIsMintAnnouncingFrame(getterReturnType))
                     return false;
                 return true;
             }
@@ -17087,8 +17212,16 @@ void MethodOwnership::scanGetterReturns(
             if (!id) return false;
             auto* ls = dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
             if (!ls) return false;
-            auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-            if (!ld || !ld->initializer) return false;
+            auto* ld = ls->decl;
+            if (!ld) return false;
+            const ast::Expr* init = declInitializer(ld);
+            // A `var x;` with no initializer is a residual, NOT followed here:
+            // its producer arrives by a STORE (`var t: Cell?; t := new Cell();
+            // return t;`, measured ACCEPTED and left ACCEPTED), and picking
+            // that up needs the store's position relative to the `return` plus
+            // the explicit-discharge form `t := new Cell(); t.Dispose();` —
+            // real dataflow, with an over-rejection blast. Reported, not taken.
+            if (!init) return false;
             if (std::find(declared.begin(), declared.end(), ld) ==
                 declared.end())
                 return false;
@@ -17098,13 +17231,13 @@ void MethodOwnership::scanGetterReturns(
             if (std::find(seen.begin(), seen.end(), ld) != seen.end())
                 return false;
             seen.push_back(ld);
-            cur = lookThroughForceUnwrap(ld->initializer.get());
+            cur = lookThroughForceUnwrap(init);
         }
         return false;
     };
 
     // The expression-form rule, unchanged (#926).
-    for (const auto& s : stmts) scanGetterReturnsStmt(s.get());
+    for (const auto& s : stmts) scanGetterReturnsStmt(s.get(), getterReturnType);
 
     // The binding-form rule (#6404). Suppressed when the expression-form rule
     // already reported at this `return`, so one escape never prints twice.

@@ -458,8 +458,15 @@ public:
     // in if/while/for/try/do). These run a NARROW check only (not the full
     // ownership pass), so accessor bodies surface no other new diagnostics.
     void checkGetterFreshOwnedReturn(const ast::Expr& e);
-    void scanGetterReturns(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
-    void scanGetterReturnsStmt(const ast::Stmt* s);
+    // fix #6404 (§28.6, v0.338): `getterReturnType` is the GETTER'S OWN declared
+    // return type — the §28.6 bullet-2 mint-announcing carve keys on it, per
+    // §28.3's "The classification stays by declared return type". Threaded (not
+    // a member) so a nested walk can never read a different accessor's type.
+    void scanGetterReturns(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+        const sema::TypeRef* getterReturnType);
+    void scanGetterReturnsStmt(const ast::Stmt* s,
+                               const sema::TypeRef* getterReturnType);
 
     // #1484 / #2168 / §23.1 / §28.6: declaration initializers that store a
     // freshly-produced owned value (producerState == Owned) into NON-`owned`

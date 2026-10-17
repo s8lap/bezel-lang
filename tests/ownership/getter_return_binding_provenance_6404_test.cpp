@@ -26,7 +26,26 @@
 // `owned_task_field_through_local_accepted` pins §28.3's stored-frame
 // re-exposure face — `producerState` classifies a READ of task-typed storage as
 // a Borrow ("storage lends"), so the peel must stop there too.
-// per §28.6, §28.3, §28.7, K9.1, #6404
+//
+// THE MINT-ANNOUNCING CARVE, ITS KEY, AND THE LOCAL SPELLINGS (review of the
+// first attempt, which was rejected for keying the carve on an EXPRESSION's
+// type). §28.6's rule is about the VALUE a getter returns, so the carve §28.6
+// bullet 2 carves for the mint-announcing families has to be read off the
+// getter's own DECLARED RETURN TYPE — §28.3's "Returning a deferred-activation
+// frame": "The classification stays by declared return type". The admitted set
+// is that section's announcement-table ROW 2 (v0.338): a `Task`-family type or
+// an iterable-family type (one of the eight §29.3/§30.7 heads, or a lazy
+// query). `concrete_owning_collection_head_frame_rejected` and
+// `owning_collection_frame_getter_accepted` are the byte-identical-bodies
+// discriminator pair for that key; `task_family_frame_getter_accepted` and
+// `plain_iterable_frame_getter_accepted` cover the other two arms.
+// `const_local_laundering_rejected` / `const_local_chain_rejected` cover
+// `ast::LocalConstDecl` (§21.1 *Runtime `const` locals*), the declaration node
+// the first attempt's `declared` set could not see, and
+// `self_assignment_is_not_a_discharge_rejected` covers `t := t;`, which is a
+// no-op and not the §28.7 discharge `reassigned_local_discharged_accepted`
+// relies on.
+// per §28.6, §28.3, §28.7, §21.1, §15.3, K6.2, K9.1, #6404
 
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -282,6 +301,222 @@ class C
   end Items;
 end C;
 class Main public static method Main(): int return 0; end Main; end Main;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ── the carve's KEY, and the set it admits (#6404 review, parts 1 and 2) ─────
+
+// The carve is keyed on the GETTER'S OWN DECLARED RETURN TYPE, and the admitted
+// set is §28.6's stated union — `Task` ∪ iterable, which §28.3's announcement
+// table ROW 2 states normatively (v0.338): "a `Task`-family type … or an
+// iterable-family type: one of the eight §29.3/§30.7 iterable/enumerator
+// interface heads, or a lazy query".
+//
+// This row is the DISCRIMINATOR that keeps the key honest. The BODY is
+// byte-identical to `owning_collection_frame_getter_accepted` — same `new
+// OwningArray<Item>()` producer, same local, same single-hop peel. The ONLY
+// difference is the declared return type: `IOwningEnumerable<Item>` (in the
+// carve) here, `OwningArray<Item>` (NOT in the carve) in the twin below. If
+// the carve were keyed on anything about the BODY — on the producer
+// expression's type, which is `OwningArray<Item>` in BOTH programs — it would
+// accept both. One local would then decide the verdict, which is exactly the
+// defect the review named.
+//
+// The rejection is §28.6's own verdict for this spelling, and the spec writes
+// it out: "a freshly-produced owning value (`return new OwningArray<T>(...)`)
+// returned through a non-`owned` return is likewise an error", illustrated by
+// `method LeakTransactions(): OwningArray<Transaction> return new
+// OwningArray<Transaction>(); // ERROR`. A concrete owning collection is §28.3
+// announcement-table row 4 — an ordinary borrowed reference, never row 2's
+// mint-announcing frame — so §28.6 bullet 2's parenthetical does not reach it.
+// per §28.6, §28.3 (announcement table rows 2 and 4), v0.338
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           concrete_owning_collection_head_frame_rejected) {
+    auto r = parseAndCheckOwnership(R"(
+module M;
+class Item
+  public V: int;
+  public constructor(v: int) V := v; end constructor;
+end Item;
+class C
+  public property Items: OwningArray<Item>
+    get => do
+      var a := new OwningArray<Item>();
+      a.Add(new Item(5));
+      return a;
+    end;
+  end Items;
+end C;
+class Main public static method Main(): int return 0; end Main; end Main;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kGetterEscape));
+}
+
+// The Task half of the union, on its own. `isTaskFamilyHead` is the `Task`
+// family of §28.3 announcement-table row 2, and `OwningTask` sits in BOTH
+// registry sets — so this row and the `OwningTask` twin below are what keep the
+// `isTaskFamilyHead` arm non-vacuous independently of the iterable arm.
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           task_family_frame_getter_accepted) {
+    auto r = parseAndCheckOwnership(R"(
+module M;
+class C
+  public property T: Task<int>
+    get => do
+      var a := Task.FromResult<int>(3);
+      return a;
+    end;
+  end T;
+end C;
+class Main public static method Main(): int return 0; end Main; end Main;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// `IEnumerable<Item>` — the plain (non-owning) member of the eight iterable
+// heads. Its twin above is one of the four OWNING iterable heads, which live in
+// `isIterableInterfaceHead` AND (before this fix) in `isOwningTypeHead`; this
+// row is the one that stays green only because the key is the HEAD and not the
+// owning/borrowing distinction.
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           plain_iterable_frame_getter_accepted) {
+    auto r = parseAndCheckOwnership(R"(
+module M;
+class Item
+  public V: int;
+  public constructor(v: int) V := v; end constructor;
+end Item;
+class C
+  public property Items: IEnumerable<Item>
+    get => do
+      var a := new OwningArray<Item>();
+      a.Add(new Item(5));
+      return a;
+    end;
+  end Items;
+end C;
+class Main public static method Main(): int return 0; end Main; end Main;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ── the local spellings, enumerated (#6404 review, part 3) ──────────────────
+
+// A `const` local (§21.1 *Runtime `const` locals*, A.6 `LocalConstDecl`) is a
+// DIFFERENT AST node from `ast::LocalDecl` and holds its initializer in `value`,
+// not `initializer`. A peel that collected only `LocalDecl` never saw it, so
+// this shape laundered. Measured ACCEPTED before this row.
+//
+// A runtime `const` is single-assignment — §21.1: "A `const` local of either
+// classification is not an assignable location: assignment, compound
+// assignment, `++`/`--`, and binding to a `ref` or `out` parameter are compile
+// errors naming the declaration" — so the §28.7 reassignment discharge the
+// `var` rows rely on can never apply to one: there is no spelling that retires
+// the fresh value.
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           const_local_laundering_rejected) {
+    auto r = parseAndCheckOwnership(std::string(kPreamble) + R"(
+  public property Item: Cell?
+    get => do
+      const t := new Cell();
+      return t;
+    end;
+  end Item;
+end Factory;
+class C public static method Main(): int return 0; end Main; end C;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kGetterEscape));
+}
+
+// The same `const` spelling through a CHAIN, and with the written `: Type`
+// annotation (A.6 admits `const Identifier (":" Type)? ":=" ConstExpr ";"`) —
+// so the initializer is reached through both shapes of `LocalConstDecl`.
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           const_local_chain_rejected) {
+    auto r = parseAndCheckOwnership(std::string(kPreamble) + R"(
+  public property Item: Cell?
+    get => do
+      const t: Cell? := new Cell();
+      const u := t;
+      return u;
+    end;
+  end Item;
+end Factory;
+class C public static method Main(): int return 0; end Main; end C;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kGetterEscape));
+}
+
+// `t := t;` is a NO-OP, not a §28.7 discharge. §28.7 disposes "the previous
+// value" when the RHS is a DIFFERENT value; here the RHS IS the previous
+// value, so nothing is retired and the local still holds the fresh `new` at the
+// `return`. The spec's stated self-assignment no-op is §15.3's, and it is
+// scoped there to whole-value reassignment of a MOVE-ONLY value type — not to
+// a plain-`var` owning-classified local. The compiler already implements it as
+// a no-op for such a local (ownership's `recollectAliasBorrowSourceOnReassign`
+// header; codegen's retain-before-release at every drop-on-overwrite site), so
+// accepting this would be accepting a fresh-value escape. Measured ACCEPTED
+// before this row.
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           self_assignment_is_not_a_discharge_rejected) {
+    auto r = parseAndCheckOwnership(std::string(kPreamble) + R"(
+  public property Item: Cell?
+    get => do
+      var t: Cell? := new Cell();
+      t := t;
+      return t;
+    end;
+  end Item;
+end Factory;
+class C public static method Main(): int return 0; end Main; end C;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kGetterEscape));
+}
+
+// The self-assignment exclusion must NOT swallow §21.1's own const rule. Here
+// `t := t` on a `const` local is still the const-assignment error §21.1 states
+// (measured on the fixed compiler), NOT the §28.6 getter diagnostic — the two
+// positions are distinct rules and each must fire as itself.
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           const_local_self_assignment_names_21_1) {
+    auto r = parseAndCheckOwnership(std::string(kPreamble) + R"(
+  public property Item: Cell?
+    get => do
+      const t := new Cell();
+      t := t;
+      return t;
+    end;
+  end Item;
+end Factory;
+class C public static method Main(): int return 0; end Main; end C;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "cannot assign to const local"));
+}
+
+// The ACCEPT control for the self-assignment clause: a self-store is a no-op,
+// so it can neither CREATE an escape nor be read as one. The same spelling over
+// a local minted from a FIELD READ stays legal — the peel stops at the field
+// (§28.6 bullet 1 / K9.1 lending read) exactly as it does without the
+// self-store, so the clause adds a rejection only where a fresh producer is
+// actually reachable.
+BEZEL_TEST(getter_return_binding_provenance_6404,
+           self_assignment_over_a_borrow_stays_accepted) {
+    auto r = parseAndCheckOwnership(std::string(kPreamble) + R"(
+  public property Item: Cell?
+    get => do
+      var t: Cell? := _cell;
+      t := t;
+      return t;
+    end;
+  end Item;
+end Factory;
+class C public static method Main(): int return 0; end Main; end C;
 )");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
