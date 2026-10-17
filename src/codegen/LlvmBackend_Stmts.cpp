@@ -10364,7 +10364,7 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     //
     // So the condition is "is `enumTs` `ts` or a CLASS ANCESTOR of `ts`", which
     // covers the inherited self-returning idiom. `classBaseOf` mirrors the
-    // existing one in LlvmBackend_Layout.cpp:2932 (`baseTypes` carries
+    // existing one at LlvmBackend_Layout.cpp:233 (`baseTypes` carries
     // interfaces too; only a CLASS base participates in the class chain).
     //
     // This is a strictly WIDENING of a safety guard — the extra cases are ones
