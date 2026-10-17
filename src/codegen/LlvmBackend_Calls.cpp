@@ -2995,15 +2995,39 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // .Count: int
                 if (m == "Count" && call.args.empty()) {
                     auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
-                    return builder_.CreateTrunc(
+                    llvm::Value* cnt = builder_.CreateTrunc(
                         builder_.CreateCall(fn, {recv}), i32(), "set.cnt");
+                    // fix #6352 (§28.3 *Unbound owned temporaries*, §28.9,
+                    // stdlib §4.10, v0.338): the DICT-backed Set twin of the
+                    // Dictionary `.Count` arm's #1013 reclaim and of the Array
+                    // `.Length`/`.Count` arm's #1006(b) one. The count is read
+                    // from the set FIRST, then an UNBOUND owned-producing
+                    // receiver is reclaimed via `bz_dict_free` (inside the
+                    // helper) — a no-op for a bound/aliased/`move`d/`new`
+                    // receiver, which is not this call shape and so is freed by
+                    // its own owner (no double-free, no UAF). Pre-fix this arm
+                    // returned straight from the runtime call, so an
+                    // `owned Set<T>`-producing call consumed as a receiver here
+                    // leaked its whole table: MEASURED 70,752 B / 402 allocs over
+                    // a 200-iteration `MakeSet().Count` loop, against a clean
+                    // `Array<T>` twin of the same loop.
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                        recvTy);
+                    return cnt;
                 }
                 // .IsEmpty(): bool
                 if (m == "IsEmpty" && call.args.empty()) {
                     auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
-                    return builder_.CreateICmpEQ(
+                    llvm::Value* empty = builder_.CreateICmpEQ(
                         builder_.CreateCall(fn, {recv}),
                         builder_.getInt64(0), "set.empty");
+                    // fix #6352: the same unbound-temporary reclaim the `.Count`
+                    // arm directly above carries — `MakeSet().IsEmpty` is the
+                    // identical shape (an `owned Set<T>` producer consumed only
+                    // as this member's receiver) and leaked identically.
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                        recvTy);
+                    return empty;
                 }
                 // per §4.10 (#351): .Clear() empties the backing table. The
                 // table stays allocated for reuse; Count is 0 afterward.

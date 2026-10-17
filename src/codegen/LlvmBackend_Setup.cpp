@@ -37577,12 +37577,43 @@ bool Emitter::isFreshOwnerlessDictMaterializerExpr(const ast::Expr* e) const {
 //   `Array<string>` whose materializer retained a +1/element.
 bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
     if (!e) return false;
-    // Result type must be a builtin borrowing `Array<T>` (name-head "Array",
-    // declaration-less) — not Owned*, not a dict-/llist-backed family.
+    // Result type must be a builtin borrowing COLLECTION (name-head in the
+    // stdlib §4.4–§4.11 / §4.17–§4.18 borrowing family, declaration-less) — not
+    // an Owning* type, not a Task, not a user class.
+    //
+    // fix #6352 (§28.3 *Unbound owned temporaries*, §28.9, stdlib §4.8/§4.10,
+    // v0.338): this gate was `builtinTypeName(rt) != "Array"` — `Array` ONLY,
+    // because that is the one head whose backing `freeUnboundOwnedBorrowingArrayTemp`
+    // knew how to release. Every OTHER borrowing collection head was declined
+    // here, so an `owned`-returning call producing one of them and consumed
+    // unbound (`MakeSet().Count`, `MakeDict().Count`) reached no disposal at
+    // all and leaked the whole container. MEASURED on this fix's parent: a
+    // 200-iteration `MakeSet().Count` loop leaked 70,752 B in 402 allocations
+    // (`bz_dict_alloc` + `bz_dict_alloc_generic` per iteration), byte-identical
+    // for `Dictionary<K,V>`, while the `Array<T>` twin of the same loop was
+    // clean (`bz_array_free` emitted). §28.9's runtime-managed tier is EXHAUSTIVE
+    // and names no collection — `Set<T>`/`Dictionary<K,V>` are ordinary
+    // `public class` declarations in stdlib §4.10/§4.8 with a `public
+    // constructor()` — so the obligation is a real §28.3 disposal and the
+    // temporary is owed one; this was a MISSING DISPOSAL CALL, not a wrong
+    // ownership classification, and the fix belongs on the disposal path (which
+    // is where this predicate is).
+    //
+    // The widened head set is `isPlainBuiltinCollectionHead` — the ONE registry
+    // that already names this exact population (the eight BORROWING collection
+    // classes: Array/Dictionary/Set/Stack/Queue/LinkedList/SortedDictionary/
+    // SortedSet), so no name list is spelled a second time here and the owning
+    // families (`isOwningPrefixedName` / `isOwningCollectionHead`) stay excluded
+    // by construction — an owning container owes an element CASCADE, not a bare
+    // backing free, and is freed by `freeUnboundOwnedOwningCollectionTemp`
+    // instead (#1909). `LinkedList` is in the head set and is `bz_llist_t`-backed
+    // rather than array-backed; `freeUnboundOwnedBorrowingArrayTemp` dispatches
+    // on that shape, exactly as its two pre-existing arms already do.
     const sema::TypeRef* rt = ctx_.exprType(*e);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
-    if (builtinTypeName(rt) != "Array") return false;
+    if (!common::isPlainBuiltinCollectionHead(builtinTypeName(rt)))
+        return false;
     // The expression must be a CALL whose resolved callee is a user MethodSymbol
     // declared with an `owned` return (the authority that the call owns its
     // result). The callee symbol is keyed on the CallExpr's `callee` node.
@@ -37628,20 +37659,91 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
     }
     if (!isFreshOwnerlessArrayMaterializerExpr(recvExpr) &&
         !isUnboundOwnedBorrowingArrayCallExpr(recvExpr)) return;
+    // fix #6352 (§28.3, §28.9, stdlib §4.6/§4.8/§4.10, v0.338): pick the runtime
+    // free by the RECEIVER'S OWN backing, now that
+    // `isUnboundOwnedBorrowingArrayCallExpr` admits the whole borrowing
+    // collection family rather than `Array` alone. `LinkedList` is
+    // `bz_llist_t`-backed and a generic-keyed `Set`/`SortedSet` is
+    // `bz_dict_t`-backed (`genericBackingType(..., isSet=true)` — the same
+    // predicate the Set member arms read, LlvmBackend_Calls.cpp); everything
+    // else in the family is `bz_array_t`-backed. This is the SAME three-way
+    // `isLL / isDict / else` shape `freeUnboundOwnedOwningCollectionTemp` below
+    // and `buildCollectionTempDisposal` both dispatch on, so the three
+    // collection-free sites in the backend now name one classification.
+    bool freeIsLlist = isLinkedListTypeName(recvTy);
+    // The set-family half: `Set`/`OwningSet`/`SortedSet`, the triple the Set
+    // member arms already name (LlvmBackend_Calls.cpp:2445). Held as its own
+    // fact because TWO later decisions need it — which runtime free to call
+    // (`SortedSet` is deliberately NOT in `kDictionaryNames` even though
+    // BuiltinRegistry.cpp:210-212 documents that it "shares the generic-key
+    // hash table", so `isDictTypeName` alone would free a `SortedSet<string>`
+    // through `bz_array_free` — a wrong-free, not a missed free), and whether
+    // `bz_set_string_keys_release`'s "read the string pointer from each key
+    // slot" is a valid read (it is exactly where the ELEMENT is the KEY).
+    bool isSetFamilyHead = recvTy &&
+        (recvTy->headName() == "Set" || recvTy->headName() == "OwningSet" ||
+         recvTy->headName() == "SortedSet");
+    bool freeIsDict = !freeIsLlist &&
+        (isDictTypeName(recvTy) ||
+         (isSetFamilyHead &&
+          genericBackingType(recvTy, 0, /*isSet=*/true, nullptr) != nullptr));
     // Per-element disposer: release the `Array<string>` co-owned +1 that the
     // materializer/snapshot added; null for value/class element borrows (stdlib
     // §3/§5: the caller owns the array, not its elements).
+    //
+    // fix #6352: this argument is DISPOSES-THE-ELEMENT, and the two backings
+    // spell that differently, so the dict arm must not take the array arm's
+    // disposer. `bz_array_free` walks the element array (the element IS the
+    // slot's value); `bz_dict_free(d, dispose_val)` applies `dispose_val` to
+    // `e.val` — the VALUE column — which for a set-family head is not where the
+    // element lives at all (the element is the KEY slot, and `e.val` is unset).
+    // Measured on a first draft of this arm that fell through with the array
+    // disposer still in `elemDisp`: ASan SEGV, `bz_string_release` on address
+    // 0x19 via `bz$strElemRelease` called from `bz_dict_free`
+    // (bezel_runtime_collections.cpp:868) — a wild pointer read, i.e. the
+    // disposer was aimed at the wrong column. The dict arm therefore keeps
+    // `elemDisp` NULL, which is what the two pre-existing dict arms in this
+    // function already pass for exactly this reason.
     llvm::Value* elemDisp = llvm::ConstantPointerNull::get(ptrTy());
     const sema::TypeRef* el = (recvTy && !recvTy->genericArgs.empty())
         ? recvTy->genericArgs[0] : nullptr;
-    if (el && !el->nullable &&
-            el->kind == sema::TypeRef::Kind::Primitive &&
-            el->primitive == sema::PrimitiveType::String) {
+    const bool elemIsString = el && !el->nullable &&
+        el->kind == sema::TypeRef::Kind::Primitive &&
+        el->primitive == sema::PrimitiveType::String;
+    if (elemIsString && freeIsDict) {
+        // fix #6352: a dict-backed collection's string ELEMENT (a set-family
+        // head stores each element as a `bz_string*` in the generic-key table's
+        // KEY slot) carries a co-owned +1 that `bz_dict_free` does NOT release —
+        // it only `free(e.key)`. #429 records exactly this and ships the helper
+        // for it: `bz_set_string_keys_release` "releases every live element's
+        // +1 by reading the string pointer from each key slot. Call BEFORE
+        // bz_dict_free." Call it, then free the table.
+        //
+        // The set-family gate (`isSetFamilyHead`, computed above) is load-bearing
+        // in BOTH directions: the helper reads the key slot AS a `bz_string*`,
+        // which is valid exactly where the element IS the key, and the
+        // `Dictionary<string, V>` key column needs a release contract that does
+        // not exist for the table as a whole (#429 shipped only the two
+        // set-specific entry points). A string-keyed `Dictionary` therefore
+        // DECLINES, leaving its (bounded, per-key) string leak standing — this
+        // function's standing safe direction, and declining rather than guessing
+        // at a release contract. The follow-up is recorded in the handback.
+        if (!isSetFamilyHead) return;
+        auto* relFn = declareC("bz_set_string_keys_release",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(relFn, {recvVal});
+        // `elemDisp` stays null: `bz_dict_free`'s second argument is the VALUE
+        // column's disposer, and the value column of a set-family table is not
+        // where its elements live.
+    } else if (elemIsString) {
         ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
         if (ep.cat == ElementPolicy::Category::RuntimeManaged)
             elemDisp = stringElementReleaseThunk();
     }
-    auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+    const char* freeName = freeIsLlist ? "bz_llist_free"
+                              : freeIsDict ? "bz_dict_free"
+                                           : "bz_array_free";
+    auto* fn = declareC(freeName, llvm::Type::getVoidTy(llvm_),
                         {ptrTy(), ptrTy()});
     builder_.CreateCall(fn, {recvVal, elemDisp});
 }
