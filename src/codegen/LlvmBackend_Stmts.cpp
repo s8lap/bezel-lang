@@ -10391,52 +10391,103 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             if (!seen6376.insert(cur).second) break;
         }
     }
+    // Whether the SOURCE and the ENUMERATOR are the same OBJECT is a question
+    // about the VALUE, and it is answered ONCE here, at runtime, as
+    // `enumPtr == srcPtr` (#2384's compare, whose argument is unchanged by
+    // #6376's widening of the STRUCTURAL precondition). Which of the two
+    // entries the aliasing test should guard depends only on who owns the
+    // source — never on `enumIsTsOrBase`, which is a fact about two SYMBOLS the
+    // structural scan picked.
+    //
+    // fix #6378 (§28.3, §28.9, §29.1, §29.11, v0.338): before this, the
+    // source's own disposal registration was gated on `!enumIsTsOrBase` — a
+    // STATIC type guess that conflates "the enumerator's static type is a
+    // class related to the source's" with "the enumerator IS the source
+    // object". For a self-implementing class whose `GetEnumerator` returns a
+    // FRESH instance of its OWN type (`return new FreshSelf(lo, hi);`) the
+    // two pointers DIFFER, so the guess suppressed the only disposal the
+    // unowned temporary source would ever get and the source leaked. That is
+    // exactly the case #2384's own comment says must take "the ordinary
+    // distinct-object disposal": the guard's static condition is only a
+    // STRUCTURAL fact (the class exposes MoveNext + Current, and is the
+    // source's own type or a base of it), not a proof that this particular
+    // `GetEnumerator()` body returns `this`.
+    //
+    //   MEASURED at this fix's parent (r30-c1 @ 95c1e290), `bezelc
+    //   --sanitize=address`, 301 passes of `for var x in new FreshSelf(1, 3)`:
+    //
+    //     1806
+    //     Direct leak of 7224 byte(s) in 301 object(s)
+    //     SUMMARY: AddressSanitizer: 7224 byte(s) leaked in 301 allocation(s)
+    //
+    //   7224/301 = 24 B per pass — one `FreshSelf`. Read off the IR (not
+    //   inferred): the loop's `%12` is the `new FreshSelf` of the `for`-in head
+    //   and `%36` is the separate `calloc` inside `bz$M.FreshSelf$GetEnumerator`,
+    //   and the loop-end disposal reaches only `%5` (the enumerator slot) —
+    //   there is no second entry. The issue reported the leak as the
+    //   ENUMERATOR's; it is the SOURCE's. Confirmed by control: binding the
+    //   same object to a name (`var f := new FreshSelf(1, 3); for var x in f`)
+    //   is LSan-CLEAN, because a named source is disposed at its own scope end
+    //   and never needed this registration.
+    //
+    // So the runtime compare is now the only authority, asked in the direction
+    // the ownership requires: a NAMED source is disposed by its OWN scope, so
+    // the ENUMERATOR entry is the one that must be suppressed when the two
+    // alias; an UNNAMED source has no other owner, so the SOURCE entry is the
+    // one that must be suppressed. In both directions exactly one disposal
+    // survives the aliasing case, and a genuinely distinct source is now
+    // disposed in both.
     llvm::AllocaInst* enumDisposeSlot = enumSlot;
-    if (enumIsTsOrBase && sourceIsNamedOwner) {
-        llvm::Value* enumIsSrc =
-            builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.selfen");
-        enumDisposeSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(
-            builder_.CreateSelect(enumIsSrc,
-                                  llvm::ConstantPointerNull::get(ptrTy()),
-                                  enumPtr, "ien.enown"),
-            enumDisposeSlot);
+    llvm::AllocaInst* srcDisposeSlot = nullptr;
+    if (sourceIsNamedOwner) {
+        // §28.9: the source owns itself; this loop must not reclaim it.
+        if (enumIsTsOrBase) {
+            llvm::Value* enumIsSrc =
+                builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.selfen");
+            enumDisposeSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(
+                builder_.CreateSelect(enumIsSrc,
+                                      llvm::ConstantPointerNull::get(ptrTy()),
+                                      enumPtr, "ien.enown"),
+                enumDisposeSlot);
+        }
+    } else if (disposerFns_.count(ts)) {
+        // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): the loop is the
+        // temporary source's SOLE owner and must dispose it exactly once.
+        // When the enumerator IS that same object the enumerator's own entry
+        // does it, so this slot is nulled; when it is a DISTINCT object (#6378)
+        // this entry is what disposes it.
+        //
+        // The nulling is conditional on the enumerator's entry actually being
+        // registered: if `enumTs` has no disposer there is no entry to do the
+        // disposal, and nulling the source would turn a leak into a bigger one.
+        if (disposerFns_.count(enumTs)) {
+            llvm::Value* srcIsEnum =
+                builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.srcisenum");
+            srcDisposeSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(
+                builder_.CreateSelect(srcIsEnum,
+                                      llvm::ConstantPointerNull::get(ptrTy()),
+                                      srcPtr, "ien.srconly"),
+                srcDisposeSlot);
+        } else {
+            srcDisposeSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(srcPtr, srcDisposeSlot);
+        }
     }
     disposeStack_.emplace_back();
-    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): a genuinely UNOWNED
-    // temporary iterable source (`for var x in new IntRange(...) do ... end`
-    // — the `new` result is bound to no other name anywhere) has no
-    // independent disposer in the program; this loop is its SOLE owner and
-    // must dispose it too, exactly as it already disposes the enumerator it
-    // constructs. Only the TWO-CLASS idiom needs a SEPARATE registration
-    // here (`!enumIsTsOrBase`, widened from `enumTs != ts` by #6376):
-    // `srcPtr` is then a genuinely distinct object
-    // from `enumPtr`. The self-returning idiom (`enumIsTsOrBase`) needs no
-    // separate entry — `enumPtr == srcPtr` at runtime, and the
-    // `enumDisposeSlot` registration just below (identity-guarded to null
-    // when `sourceIsNamedOwner`, or the plain `enumSlot` otherwise) already
-    // disposes that single shared object exactly once. A NAMED source
-    // (`sourceIsNamedOwner`) is disposed at ITS OWN scope end by the
-    // ordinary local/param/field disposal machinery — registering it again
-    // here would double-free. Mirrors `lowerIEnumerableBuiltinFor`'s
-    // identical `!sourceIsNamedLocal` gate for the array/collection sibling
-    // path (§29.2: "a freshly produced source value with no owning binding
-    // ... is owned by this loop"). Pushed BEFORE the enumerator's own entry
-    // so LIFO scope-end disposal (`emitDisposals` iterates in reverse) frees
-    // the enumerator first, the source second — the natural reverse of their
-    // construction order; the two never alias here (`!enumIsTsOrBase` is
-    // exactly this branch's guard) so the order has no correctness
-    // consequence, only readability.
-    llvm::AllocaInst* srcDisposeSlot = nullptr;
-    // fix #6376: this must be the NEGATION of the guard above. Registering the
-    // source as a separate disposer is only correct when the enumerator is NOT
-    // the source object, so the condition has to be widened in lockstep or the
-    // two sites disagree and one of them reclaims a shared object.
-    if (!sourceIsNamedOwner && !enumIsTsOrBase && disposerFns_.count(ts)) {
-        srcDisposeSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(srcPtr, srcDisposeSlot);
+    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): the source's slot was
+    // built ABOVE (where the aliasing compare lives, since both entries must
+    // be able to see `enumPtr` and `srcPtr` before the scope is popped).
+    // Pushed BEFORE the enumerator's own entry so LIFO scope-end disposal
+    // (`emitDisposals` iterates in reverse) frees the enumerator first, the
+    // source second — the natural reverse of their construction order; the
+    // aliasing compare above makes the order correct either way.
+    // Mirrors `lowerIEnumerableBuiltinFor`'s identical `!sourceIsNamedLocal`
+    // gate for the array/collection sibling path (§29.2: "a freshly produced
+    // source value with no owning binding ... is owned by this loop").
+    if (srcDisposeSlot)
         disposeStack_.back().push_back({srcDisposeSlot, ts});
-    }
     if (disposerFns_.count(enumTs)) {
         Disposal d{enumDisposeSlot, enumTs};
         // fix #6372 (§28.2 / §29.2 / §29.11, v0.338): `enumTs` is a STRUCTURAL
