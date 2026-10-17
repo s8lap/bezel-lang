@@ -6032,6 +6032,72 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         // unchecked.
         Resolver::Scope typeScope;
         typeScope.parent = scope;
+        // fix #6411 (§11.3 + §21.10, v0.338): register the LOCAL type's own
+        // nested types in its body scope, exactly as `resolveTypeDecl`'s
+        // §11.3/#482 loop does for a module-level or §11.6 nested type.
+        //
+        // THE DEFECT, and why it is this loop's absence. §11.3's registration
+        // loop lives in `resolveTypeDecl`, and a §21.10 local type never enters
+        // `resolveTypeDecl` — this arm is where a local type's body is walked.
+        // So a nested type declared inside a local record was entered into NO
+        // symbol table at all: its name neither RESOLVED nor BLOCKED inside the
+        // local record's body, and a bare `Box` there bound the module-level
+        // `Box` instead. MEASURED (bezelc in this lane worktree at
+        // 863d6c6b): a local `record Inner` carrying `public record Box(W:
+        // int);` and `public method Get(): Box` reported "no member `W` on type
+        // `Box` (§11.3, §12.1)" — pointing at the module-level declaration the
+        // user never wrote and never referred to, which sends the reader
+        // looking at the wrong type entirely. A §11.6 nested type's own nested
+        // type binds correctly, so the member-kind cross product was missing a
+        // local-type row, not the rule.
+        //
+        // §11.3 puts the loop where it is, and §21.10 does not exempt a local
+        // type from it. §21.10 "Scope and name discipline": "Inside the local
+        // type's OWN MEMBER BODIES, a bare name reaches the static members AND
+        // NESTED TYPES of the type whose body declares it …". That sentence is
+        // about the chain a local type's body sees, but the nested types the
+        // sentence names are a local type's own members, and §11.3 is what
+        // makes a type's nested types members of it — so a local type's nested
+        // types are reachable by bare name in exactly the way §11.6's are.
+        //
+        // ORDER, and it is load-bearing. This loop runs BEFORE the member walk
+        // below, as `resolveTypeDecl` runs it before that type's member walk —
+        // so a nested type declared BELOW the member that names it is still
+        // visible, which is what makes the local type order-independent the way
+        // a §11.6 nested type already is. Running it after would leave
+        // `record Box(W: int)` BELOW `method Get(): Box` resolving to the
+        // module-level `Box` and nothing else.
+        //
+        // It must be the SAME registration `resolveTypeDecl` performs: the real
+        // `NestedTypeSymbol*`, not the nullptr marker. Storing nullptr collides
+        // with the generic-parameter marker, and `resolveNamed` then reads a
+        // single-part reference as "generic param" with `declaration = nullptr`
+        // — an unspecialized layout shared by every instantiation (#3584's
+        // class of defect).
+        for (const auto& m : localType->decl->members) {
+            const auto* nt =
+                dynamic_cast<const ast::NestedTypeMember*>(m.get());
+            if (!nt || !nt->decl) continue;
+            NestedTypeSymbol* nts = nullptr;
+            if (tsym) {
+                for (Symbol* ms : tsym->members) {
+                    auto* candidate =
+                        dynamic_cast<NestedTypeSymbol*>(ms);
+                    if (candidate && candidate->name == nt->decl->name) {
+                        nts = candidate;
+                        break;
+                    }
+                }
+            }
+            if (nts) typeScope.names[nt->decl->name] = nts;
+            // No `NestedTypeSymbol` to find is not silently dropped: the nested
+            // type is still reachable by its QUALIFIED path, and the nullptr
+            // marker is what `resolveTypeDecl`'s own loop falls back to in the
+            // same situation (its "(should not happen)" note). Registering the
+            // marker keeps the name VISIBLE, which is strictly more than
+            // leaving the scope empty.
+            else typeScope.names[nt->decl->name] = nullptr;
+        }
         // fix #6401 (§21.10 + §2.7 "Through nesting", v0.338): pair this body
         // scope with the local type it belongs to, exactly as `resolveTypeDecl`
         // does for a module-level or nested type. Without the pairing the local
@@ -6044,31 +6110,34 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         // that type's enclosing types, by §2.7's Through nesting"), so the
         // local type is the innermost link and the declaring type the next one.
         //
-        // The scope itself carries no names, and that is not what this pairing
-        // is for: `lookupBareTypeName` asks "did the TYPE whose body this scope
-        // belongs to DECLARE a member of that name", not "did this scope carry
-        // the name". A local type registers nothing here — it declares no
-        // generic parameters (§21.10 Restrictions (v1)) and its own nested
-        // types are collected by their own `resolveTypeDecl`, not added to this
-        // scope.
+        // The scope itself carries no GENERIC-PARAMETER names, and that is not
+        // what this pairing is for: `lookupBareTypeName` asks "did the TYPE
+        // whose body this scope belongs to DECLARE a member of that name", not
+        // "did this scope carry the name". A local type registers no generic
+        // parameters here — it declares none (§21.10 Restrictions (v1)) — and
+        // since fix #6411 it DOES register its own nested types, above. The two
+        // are independent: a name in this scope is the ANSWER and short-circuits
+        // the walk; a name on the paired TypeSymbol is a BLOCKER the walk
+        // consults. Registering nested types here adds answers, not blockers.
         //
-        // ⚠ WHAT THE PAIRING DOES *NOT* FIX, so nothing above may claim it
-        // does. A `NestedTypeSymbol` link does not block the search (§2.7
+        // ⚠ WHAT THE PAIRING ITSELF DOES *NOT* FIX, so nothing above may claim
+        // it does. A `NestedTypeSymbol` link does not block the search (§2.7
         // admits a nested type by bare name), so pairing the local type
-        // cannot make a nested type of the name an error here. But a nested
-        // type declared INSIDE a local record is a SEPARATE, PRE-EXISTING
-        // defect: §11.3's registration loop runs in `resolveTypeDecl`, which a
-        // local type never enters, so that nested type is registered neither
-        // in the local type's body scope nor as a member link. MEASURED: one
-        // spelling REJECTS (`no member W on type Box`) and another COMPILES
-        // CLEAN while silently binding a module-level `Box`, ignoring
-        // `Inner.Box` entirely; a §11.6 nested type's own nested type binds
-        // correctly, so the member-kind cross product has a local-type row
-        // missing, not a rule that needs restating. Filed as its own issue
-        // rather than fixed here: it is pre-existing on the base (this pairing
-        // neither adds nor removes it), and its correct outcome is a spec
-        // question about whether a local type's nested types are members of it
-        // at all.
+        // cannot make a nested type of the name an error here. Whether a nested
+        // type declared INSIDE a local record is reachable by bare name is a
+        // SEPARATE question, and it was a separate, pre-existing defect: §11.3's
+        // registration loop runs in `resolveTypeDecl`, which a local type never
+        // enters, so that nested type was registered neither in the local type's
+        // body scope nor as a member link. MEASURED then: one spelling REJECTED
+        // (`no member W on type Box`) and another COMPILED CLEAN while silently
+        // binding a module-level `Box`, ignoring `Inner.Box` entirely; a §11.6
+        // nested type's own nested type bound correctly, so the member-kind
+        // cross product had a local-type row missing, not a rule that needed
+        // restating. That defect was #6411, and it is fixed by the registration
+        // loop above — which is REGISTRATION, a different rule from this
+        // PAIRING. #6425 (the local-type comment about nested member types
+        // "following their own rules") is a separate comment-correction item and
+        // is not addressed here.
         //
         // ⚠ `typeScope` is a STACK object: the push below must be popped before
         // this block returns, or the vector keeps a dangling pointer and every
