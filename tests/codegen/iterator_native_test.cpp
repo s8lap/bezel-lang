@@ -350,6 +350,23 @@ BEZEL_TEST(iter_native_c_437, iterator_as_ienumerable_param) {
 // ---------------------------------------------------------------------------
 
 // §29.2 (#552-A): user class passed to IEnumerable<T> param; sum 1..5 = 15.
+//
+// NOT A LEAK ORACLE — this row pins the WRAP'S DISPATCH (that the callee's
+// for-in reads the 29.2 vtable rather than misreading a class object's
+// layout, slot 2 = Dispose / slot 3 = ToString), and `compileAndRun` is
+// exactly right for that. It cannot see a LEAK, for two independently
+// sufficient reasons, and both must be true for a leak to hide here:
+//   (1) `compileAndRun` is a bare `driver.compileFile` + `system()` — the
+//       generated code is NOT ASan-instrumented and NO leak detection runs;
+//   (2) it makes the call ONCE, so the 29.2 wrapper frame this shape mints —
+//       32 B, one per call — is a single 32-byte allocation.
+// A 32 B one-shot leak is invisible on both counts. The leak oracle for this
+// exact shape is `wrap_user_class_argument_frame_leak_6406` in
+// tests/codegen/wrap_user_class_argument_frame_leak_6406_test.cpp: same
+// callee, same formal, same user-class receiver, 300 iterations, runAotChecked
+// (ALWAYS ASan) with `BEZEL_AOT_DETECT_LEAKS=strict` armed per row — because
+// `runAotChecked` passes `detect_leaks=0` by DEFAULT, so even an instrumented
+// row that forgot the knob would exit 0 on a leaking tree.
 BEZEL_TEST(iter_native_552, user_class_as_ienumerable_param) {
     BEZEL_EXPECT_EQ(compileAndRun(
         std::string("module M;") + kIntRangeBase +
