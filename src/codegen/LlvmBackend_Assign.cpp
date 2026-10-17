@@ -14137,14 +14137,41 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                     // reclaimed at its holder's release point "and nowhere else".
                     // Reading the flag the same function already reads to decide
                     // the reclaim is what closes it:
-                    //   ownsSrc (the original)  -> srcDisposeFn(srcObj),
-                    //                              byte-for-byte #5203;
-                    //   clone, enumPtr == srcObj -> nothing: slot 1 IS the
-                    //                              source, and it is the
-                    //                              original's to dispose;
-                    //   clone, distinct          -> the clone's OWN inner
-                    //                              enumerator, which nothing
-                    //                              else disposes.
+                    //   ownsSrc (the original) -> srcDisposeFn(srcObj),
+                    //                             byte-for-byte #5203;
+                    //   clone                  -> nothing.
+                    //
+                    // The clone dispatches NOTHING, and that is the whole point of
+                    // the third outcome being absent. A prior form of this fix
+                    // added, for the clone, `enumDisposeFn(enumPtr)` — the clone's
+                    // "own inner enumerator, which nothing else disposes". That is
+                    // a type confusion, and it is the very hazard the #5203 comment
+                    // above documents: `srcTs == enumTs` is what makes this the
+                    // OWN-ENUMERATOR arm, so `enumDisposeFn` IS `srcDisposeFn`
+                    // here, and slot 1 is whatever `GetEnumerator()` returned —
+                    // for a class that is its own enumerator that is NOT
+                    // necessarily a `srcTs`. MEASURED: a `GetEnumerator()`
+                    // returning a fresh instance of a different user class went
+                    // from exit 0 / ASan clean at the base to
+                    //   heap-buffer-overflow ... READ of size 8 in
+                    //   SelfSeq$DisposeCore, 0 bytes after a 16-byte region
+                    //   allocated in SelfSeq$GetEnumerator
+                    // — a green program turned into a memory-safety error. A
+                    // clone must not reclaim the source, and it must not reclaim a
+                    // foreign enumerator either; it owns neither.
+                    //
+                    // What the clone DOES still do is free the slot-1 block, in the
+                    // shared tail below, under the `aliasesSrc` guard. If slot 1 is
+                    // the source itself the block is the original's to free; if it
+                    // is a distinct object the block is freed without its Dispose
+                    // having run, which is the same pre-existing gap the
+                    // `!srcIsOwnEnumerator` arm has always had (that arm frees
+                    // enumPtr unconditionally and is untouched by this fix).
+                    // Closing that gap needs to know slot 1's dynamic type, which
+                    // this per-(srcTs,enumTs) shared function does not have.
+                    //
+                    // `aliasesSrc` is hoisted above this block because the shared
+                    // tail below consumes it, and it must be computed once.
                     auto* ownsBB = llvm::BasicBlock::Create(
                         llvm_, "wrapdispose.owns", f);
                     auto* cloneBB = llvm::BasicBlock::Create(
@@ -14155,16 +14182,6 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                                  {srcObj});
                     b.CreateBr(cloneBB);
                     b.SetInsertPoint(cloneBB);
-                    auto* cloneEnumBB = llvm::BasicBlock::Create(
-                        llvm_, "wrapdispose.cloneenum", f);
-                    auto* afterCloneBB = llvm::BasicBlock::Create(
-                        llvm_, "wrapdispose.afterclone", f);
-                    b.CreateCondBr(aliasesSrc, afterCloneBB, cloneEnumBB);
-                    b.SetInsertPoint(cloneEnumBB);
-                    b.CreateCall(enumDisposeFn->getFunctionType(), enumDisposeFn,
-                                 {enumPtr});
-                    b.CreateBr(afterCloneBB);
-                    b.SetInsertPoint(afterCloneBB);
                 } else {
                     // UNCHANGED by #6382 (§28.2, §28.6, §29.11): the
                     // two-class idiom, where slot 1 holds a genuinely distinct

@@ -125,6 +125,42 @@ const char* kFreshSelf =
     "  public property Current: int get => cur; end Current; "
     "end FreshSelf; ";
 
+// The FOREIGN-INNER shape, added by fix-forward #6382. `OuterEnum` DECLARES the
+// enumerator protocol itself, so the structural scan still picks
+// `enumTs == srcTs` and `wrapDisposeFn` still resolves
+// `enumDisposeFn == srcDisposeFn == OuterEnum$Dispose` — but its
+// `GetEnumerator` returns a FRESH instance of a DIFFERENT user class,
+// `ForeignInner`. Slot 1 is therefore an object that is emphatically NOT an
+// `OuterEnum`.
+//
+// This is the shape the #5203 block comment in `wrapUserClassAsIEnumerable`
+// already warns about, and the three rows below are the only thing in the
+// suite that reaches it: no `forin` / `ienumerable` / `iter_` / `enumerable`
+// / `enumerator` / `getenumerator` / `wrapper` / `user_class` row combines
+// `srcIsOwnEnumerator` with a foreign inner.
+//
+// `ForeignInner` carries ONE `int` field and `OuterEnum` carries an `owned`
+// `Array<int>` beyond its int, so the layout that
+// `OuterEnum$DisposeCore`'s `bz_array_free(*(void**)(self+0x10))` assumes is
+// read from PAST the end of the 16-byte `ForeignInner` block. That is what makes
+// the type confusion observable under ASan rather than merely wrong.
+const char* kForeignInner =
+    "public class ForeignInner: IEnumerator<int> "
+    "  private cur: int := 0; "
+    "  public constructor() end constructor; "
+    "  public method MoveNext(): bool cur := cur + 1; return cur <= 3; end MoveNext; "
+    "  public property Current: int get => cur; end Current; "
+    "end ForeignInner; "
+    "public class OuterEnum: IEnumerable<int>, IEnumerator<int> "
+    "  private cur: int := 0; private owned _a: Array<int>; "
+    "  public constructor() _a := new Array<int>(1); end constructor; "
+    "  public method GetEnumerator(): IEnumerator<int> "
+    "    return new ForeignInner(); "
+    "  end GetEnumerator; "
+    "  public method MoveNext(): bool cur := cur + 1; return cur <= 3; end MoveNext; "
+    "  public property Current: int get => cur; end Current; "
+    "end OuterEnum; ";
+
 // The two-class idiom: `enumTs != srcTs`, so slot 1 holds a GENUINELY distinct
 // enumerator class instance. MUST STAY GREEN ON BOTH SIDES. A fix that moved
 // the `enumDisposeFn(enumPtr)` arm — rather than gating the
@@ -207,8 +243,14 @@ BEZEL_TEST(wrap_clone_disposes_foreign_source_6382,
 // `GetEnumerator` returns a FRESH instance of its own type, so `enumPtr !=
 // srcObj`. This is what rules out the issue's "`enumPtr == srcPtr`" reading as
 // the trigger, and it is what a fix written against the ALIAS (rather than
-// against ownership) would leave red. It is also the row that shows the clone's
-// OWN enumerator must still be disposed — see the comment on the fix.
+// against ownership) would leave red.
+//
+// (A prior form of this fix read this row as showing "the clone's OWN
+// enumerator must still be disposed" and added an `enumDisposeFn(enumPtr)`
+// call for the clone. That claim was FALSE and the call was a type confusion;
+// see the `kForeignInner` note and the three rows below. Here the fresh
+// enumerator happens to be the same CLASS as the source, so the call is merely
+// redundant — which is exactly why no row in this file caught it.)
 BEZEL_TEST(wrap_clone_disposes_foreign_source_6382,
            fresh_getenumerator_clone_owns_only_its_own_enumerator_spec_28_9) {
     JitResult r = checked(
@@ -244,6 +286,114 @@ BEZEL_TEST(wrap_clone_disposes_foreign_source_6382,
         "    return 0; "
         "  end Main; "
         "end M6382CImpl;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("s=6") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// THE FOREIGN-INNER ROWS — added by the fix-forward for #6382, after a
+// non-author review REJECTED a prior form of this fix for turning a green
+// program into a heap-buffer-overflow.
+//
+// In this shape `enumTs == srcTs` (the source declares the enumerator protocol
+// itself) but `GetEnumerator` returns a fresh instance of a DIFFERENT class.
+// The prior form added, for the re-iteration clone, `enumDisposeFn(enumPtr)`
+// on the strength of "the clone's own inner enumerator, which nothing else
+// disposes". In THIS arm `enumDisposeFn` IS `srcDisposeFn` — that is what
+// `srcTs == enumTs` means — so that call ran `OuterEnum$Dispose` on a
+// `ForeignInner`. The clone owns neither object, and the clone must reclaim
+// neither.
+//
+// Three spellings, each with a measured job:
+//
+//   row                                     | at base | prior fix | here
+//   ----------------------------------------|--------|-----------|------
+//   unnamed source (this row)              | RED    | RED       | GREEN
+//   named source (`named_source` below)    | GREEN  | RED       | GREEN
+//   `using var` source (`using_var` below) | GREEN  | RED       | GREEN
+// ---------------------------------------------------------------------------
+
+// THE PINNING FOREIGN-INNER ROW. Same unnamed-source spelling as the issue's
+// MIRROR1, so it is red at the base for the SAME reason — the clone reclaimed
+// the source it does not own — and it stays red under the prior form of the
+// fix, with the signature changed from a read-of-freed-memory to a
+// read-past-the-end-of-a-live-object:
+//
+//   base 4b9dc87c: heap-use-after-free, READ of size 1 in
+//                  bz$M.OuterEnum$Dispose, 8 bytes inside a 24-byte region
+//                  freed by bz$userenumenum$OuterEnum$OuterEnum$Dispose
+//   prior fix:     heap-buffer-overflow, READ of size 8 in
+//                  bz$M.OuterEnum$DisposeCore, 0 bytes after a 16-byte region
+//                  allocated in bz$M.OuterEnum$GetEnumerator
+//
+// This row is therefore the load-bearing one: it is red on BOTH wrong forms
+// and green only when the clone dispatches nothing. MEASURED with
+// `scripts/agent_check.sh --probe --asan` on the same program, and again as a
+// `runAotChecked` row.
+BEZEL_TEST(wrap_clone_disposes_foreign_source_6382,
+           foreign_inner_unnamed_source_reclone_dispatches_nothing_spec_28_2) {
+    JitResult r = checked(
+        "module M6382I; " + std::string(kForeignInner) +
+        "public class M6382IImpl "
+        "  public static method MakeA(): IEnumerable<int> return new OuterEnum(); end MakeA; "
+        "  public static method Main(): int "
+        "    var s := 0; "
+        "    for var x in MakeA() do s := s + x; end; "
+        "    Console.WriteLine($\"s={s}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end M6382IImpl;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("s=6") != std::string::npos);
+}
+
+// THE NAMED-SOURCE FOREIGN-INNER ROW — the ORDERING BOUNDARY crossed with a
+// foreign inner. Binding the source to a name inverts the LIFO unwind, so at
+// the base the clone ran FIRST and the source was still LIVE: the ownership
+// violation existed but was benign, and this spelling measured GREEN. That is
+// precisely why it is worth a row — it is a program that was green before any
+// fix and must be green after this one, and the prior form of the fix broke it
+// (RED: heap-buffer-overflow in `bz$M.OuterEnum$DisposeCore`). The
+// self-returning `named_source_control` above cannot catch that, because its
+// `GetEnumerator` returns `this` and `enumPtr == srcObj`.
+BEZEL_TEST(wrap_clone_disposes_foreign_source_6382,
+           foreign_inner_named_source_stays_green_spec_28_2) {
+    JitResult r = checked(
+        "module M6382J; " + std::string(kForeignInner) +
+        "public class M6382JImpl "
+        "  public static method MakeA(): IEnumerable<int> return new OuterEnum(); end MakeA; "
+        "  public static method Main(): int "
+        "    var s := 0; "
+        "    var e := MakeA(); "
+        "    for var x in e do s := s + x; end; "
+        "    Console.WriteLine($\"s={s}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end M6382JImpl;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("s=6") != std::string::npos);
+}
+
+// THE `using var` FOREIGN-INNER ROW — the same ordering boundary by a second,
+// independent spelling, so the pair cannot both be spelling accidents. GREEN at
+// the base, RED under the prior form of the fix.
+BEZEL_TEST(wrap_clone_disposes_foreign_source_6382,
+           foreign_inner_using_var_source_stays_green_spec_28_2) {
+    JitResult r = checked(
+        "module M6382K; " + std::string(kForeignInner) +
+        "public class M6382KImpl "
+        "  public static method MakeA(): IEnumerable<int> return new OuterEnum(); end MakeA; "
+        "  public static method Main(): int "
+        "    var s := 0; "
+        "    using var e := MakeA(); "
+        "    for var x in e do s := s + x; end; "
+        "    Console.WriteLine($\"s={s}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end M6382KImpl;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("s=6") != std::string::npos);
