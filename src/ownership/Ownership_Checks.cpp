@@ -15559,13 +15559,29 @@ bool MethodOwnership::methodReturnsOnlyReceiverSourcedBorrows(
 }
 
 // §28.10 / §28.3 / §28.6 (#2137, #2137-residual). See the header for the
-// full contract. §28.6 guarantees a USER getter is a borrow-producing
-// position ("a property or indexer getter may not return a freshly-produced
-// owned value — a getter is a borrow-producing position"); this guarantee is
-// SIGNATURE-LEVEL, independent of body shape. The pre-residual body-scan
-// predicate (#2137 fix #1) carved a positive allow-list of get-body forms
-// the scan can prove — a bare field read, a chain of fields, a
-// `recv.Drain()` builtin alias, a block whose every return is
+// full contract. §28.6 is a borrow-producing-position rule: a USER getter may
+// not return a freshly-produced owned value.
+//
+// fix #6404 (§28.6, v0.338) closed the largest gap in that enforcement. The
+// check classified the RETURNED EXPRESSION, and an `IdentifierExpr` reads
+// Borrowed, so one local — `var t := new SelfA(3); return t;`, measured
+// ACCEPTED before the fix — laundered the escape; `checkGetterFreshOwnedReturn`
+// now also follows a returned BINDING back through the chain of locals the
+// getter body declared. What is left is a NARROW residual, NOT a
+// signature-level proof, and this relaxation must not be read as one: a
+// returned COMPOUND expression that wraps the producer — `return t ?? _c;`
+// (measured still admitted at #6404) and a conditional expression in the same
+// position — is a shape neither the expression-form rule nor the binding peel
+// classifies, and neither is a lambda nested in a getter body (checked for
+// ESCAPE by checkGetterReturnClosureEscapes / -FieldCaptures, not for §28.6
+// minting), and §28.6 bullet 2's mint-announcing carve leaves the DIRECT
+// spelling of a fresh Task-/iterable-family frame still rejected (measured at
+// #6404 — see getterEscapeIsMintAnnouncingFrame below). Relaxing here is sound
+// for every shape the §28.6 check reaches and rests on a residual outside it.
+//
+// The pre-residual body-scan predicate (#2137 fix #1) carved a positive
+// allow-list of get-body forms the scan can prove — a bare field read, a chain
+// of fields, a `recv.Drain()` builtin alias, a block whose every return is
 // receiver-sourced — but the space of expressions a getter can hold is
 // open-ended (a `??`, a conditional expression, a chained call, a method
 // invocation, a constructor call). Every unproven shape kept its using-var
@@ -15573,7 +15589,8 @@ bool MethodOwnership::methodReturnsOnlyReceiverSourcedBorrows(
 // the #2137 family).
 //
 // Relaxation: a non-abstract, non-indexer, non-Task-family user-declared
-// getter is unconditionally a borrow-pin (§28.6 signature-level). Task-
+// getter is unconditionally a borrow-pin (§28.6, modulo the compound-expression
+// residual named in the paragraph above — #6404). Task-
 // family returns stay body-scanned because §28.3 "Task-family calls produce
 // owned frames" — the task container itself transfers under mint rules;
 // pinning a Task-family mint would lose the task to a double-free of the
@@ -15596,7 +15613,7 @@ bool MethodOwnership::propertyGetterIsRecognizedBorrow(
     }
     if (propertyReturnTypeIsTaskFamily(pd))
         return propertyGetterBodyScan(pd);
-    return true;  // §28.6 signature-level borrow-pin
+    return true;  // §28.6 borrow-pin (see the compound-expression residual, #6404)
 }
 
 // §28.10 / §28.3 / §28.6 / #2137-residual: body-level predicate called
@@ -16561,15 +16578,25 @@ bool MethodOwnership::targetIsMoveOnlyValueField(
     return common::isMoveOnlyValueType(ctx_.exprType(target), ctx_, kind);
 }
 
+// fix #6404 (§28.6, v0.338): the ONE wording of the getter-fresh-owned escape
+// diagnostic, shared by the EXPRESSION-form rule below and by the returned-
+// BINDING provenance peel in scanGetterReturns, so the two positions of the
+// same §28.6 rule cannot drift apart. A change to this text orphans every
+// `getter_returns_fresh_owned_926__*` lit needle and the `s28_6_0004` corpus
+// expectation — grep both tracks before renaming anything here. // per §28.6
+static const char* getterFreshOwnedEscapeDiagnostic() {
+    return "a property or indexer getter may not return a freshly-produced "
+           "owned value — a getter is a borrow-producing position "
+           "(properties and indexers do not carry `owned`), so the value "
+           "would escape with no owner and leak; expose the factory as a "
+           "method returning `owned T` (§28.6)";
+}
+
 // #926 / §28.6 (v0.153): a getter may not return a fresh owned value. See header.
 void MethodOwnership::checkGetterFreshOwnedReturn(const ast::Expr& e) {
     if (producerState(e) == OwnershipState::Owned) {
         report(Severity::Error, e.span.begin,
-               "a property or indexer getter may not return a freshly-produced "
-               "owned value — a getter is a borrow-producing position "
-               "(properties and indexers do not carry `owned`), so the value "
-               "would escape with no owner and leak; expose the factory as a "
-               "method returning `owned T` (§28.6)");
+               getterFreshOwnedEscapeDiagnostic());
     }
 }
 
@@ -16913,9 +16940,185 @@ void MethodOwnership::scanGetterReturnsStmt(const ast::Stmt* s) {
     }
 }
 
+// fix #6404 (§28.6, v0.338): the MINT-ANNOUNCING carve for the binding peel.
+//
+// §28.6 bullet 2 carries one parenthetical carve to the fresh-value rule: "(For
+// the mint-announcing families — `Task` and iterable — the unmarked return type
+// itself announces the transfer — type-announced, K6.2 — so a fresh **or
+// owned** frame, a field's value of such a type taken in that shape included,
+// is returnable, indeed required, through an unmarked mint-announcing return;
+// §28.3 producers.)" For those families "unmarked" does NOT mean
+// "borrow-producing": the return type itself announces the transfer, so a fresh
+// frame leaving a getter typed at one of those heads is not the A4 escape.
+// §28.3's producers note says the same of the family — the iterator
+// convention's caller-owned deferred-activation frame.
+//
+// The three registry families are the compiler's existing spelling of "Task and
+// iterable" (BuiltinRegistry's isTaskFamilyHead / isIterableInterfaceHead /
+// isOwningTypeHead); this carve deliberately does NOT introduce a new name list.
+//
+// ⚠ THE DIRECT SPELLING OF THIS SHAPE IS STILL REJECTED TODAY (measured at
+// #6404): `property Items: IOwningEnumerable<Item> get => do return new
+// OwningArray<Item>(); end; end Items;` draws the §28.6 getter diagnostic,
+// because checkGetterFreshOwnedReturn has never carried this carve. So for the
+// mint-announcing families the compiler is INTERNALLY INCONSISTENT — direct
+// reject, laundered accept — and this carve keeps the laundered side where the
+// codebase's own pinned rows (#3355's block-bodied `IOwningEnumerable` getter,
+// whose caller discharges the elements with `using var y := owned x;`) put it.
+// Closing the direct-side gap is a separate behaviour flip and is NOT this
+// fix's job; it is reported, not silently taken. // per §28.6, §28.3, K6.2
+static bool getterEscapeIsMintAnnouncingFrame(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    return common::isTaskFamilyHead(rt->headName()) ||
+           common::isIterableInterfaceHead(rt->headName()) ||
+           common::isOwningTypeHead(rt->headName());
+}
+
+// fix #6404 (§28.6, v0.338): the returned-BINDING provenance peel.
+//
+// §28.6's rule is about the VALUE a getter returns, and it names its producers
+// — "a `new` expression, a call returning `owned T`, a `move` expression, or an
+// owned operator result". checkGetterFreshOwnedReturn asks producerState() of
+// the returned EXPRESSION, and an `IdentifierExpr` reads Borrowed — so the
+// measured program
+//
+//     public property Seq: SelfA
+//       get => do var t := new SelfA(3); return t; end;      // ACCEPTED at #6404
+//     end Seq;
+//
+// laundered a fresh owned value past the check with one local. The peel below
+// follows the returned binding back to the producer it was minted from, across
+// as many locals as the chain has, and reports the SAME §28.6 diagnostic.
+//
+// SCOPE — what stops the walk, and why each stop is the conservative side:
+//   * A `BindExpr` (§17.15) is peeled: a binding atom's classification is its
+//     body's, so `var t := …` is followed to the initializer, not read as the
+//     atom.
+//   * A returned non-identifier (a field read, a call, an index read, a `??`
+//     or a conditional wrapping a binding) ENDS the walk. A field read is a
+//     borrow and stays legal; the compound-expression forms are a residual
+//     hole #6404 measured (`return t ?? _c;` still accepted) but closing them
+//     is an expression-shape widening with its own blast radius, deliberately
+//     left out of this fix.
+//   * A local NOT declared by THIS getter body ends the walk. A return nested
+//     in an inner body therefore cannot follow a local the enclosing body
+//     declared — which is exactly right: such a local's declaration and every
+//     assignment to it live together in one body (lexical scoping), so the
+//     `declared`/`reassigned` pair below is complete for whatever this walk
+//     follows.
+//   * A local REASSIGNED anywhere in this body ends the walk. §28.7's
+//     drop-on-overwrite discharges the displaced fresh value at the store, so
+//     `var t: Cell? := new Cell(); t := _c; return t;` returns a borrow of a
+//     field and is legal; following the declaration alone would reject it.
+//   * A producer of a MINT-ANNOUNCING family (Task / iterable — the three
+//     BuiltinRegistry sets) ends the walk: §28.6 bullet 2's parenthetical carve
+//     makes the unmarked return type itself announce the transfer for those
+//     families, so a fresh frame there is not the A4 escape. See
+//     getterEscapeIsMintAnnouncingFrame above, including the note that the
+//     DIRECT spelling of that same shape is still rejected today.
+//   * A local with no initializer, a PARAMETER, a `this`/field symbol, or any
+//     symbol that is not a LocalSymbol ends the walk. A getter accessor has no
+//     parameter of its own, so that arm is the defensive half of the same rule.
+//
+// `return move t;` needs no new arm: producerState already classifies a `move`
+// of a class-typed local Owned, so the expression-form rule above has always
+// rejected it (measured at #6404). `using var t := new Cell(); return t;` —
+// §28.1 admits no `owned`-declared LOCAL other than the `using var` form — is
+// covered by the same walk: its LocalDecl initializer is the `new`.
 void MethodOwnership::scanGetterReturns(
         const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+    // The two per-body sets the peel above needs. Collected over this body's
+    // WHOLE statement tree with the single-source-of-truth walker
+    // (StmtWalker.hpp, #3656) so a declaration or a store nested in an `if` /
+    // `while` / `for` / `try` / `case` body is seen from the enclosing walk too.
+    std::vector<const ast::LocalDecl*> declared;
+    std::vector<const ast::LocalDecl*> reassigned;
+    // Node-pointer identity, not name: two bodies may bind the same name.
+    auto noteOnce = [](std::vector<const ast::LocalDecl*>& v,
+                       const ast::LocalDecl* ld) {
+        if (ld && std::find(v.begin(), v.end(), ld) == v.end()) v.push_back(ld);
+    };
+    auto noteStore = [&](const ast::Expr* target) {
+        if (!target) return;
+        auto* ls =
+            dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*target));
+        if (!ls) return;
+        noteOnce(reassigned, dynamic_cast<const ast::LocalDecl*>(ls->decl));
+    };
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
+            if (const auto* ld =
+                    dynamic_cast<const ast::LocalDecl*>(&inner)) {
+                noteOnce(declared, ld);
+            } else if (const auto* as =
+                           dynamic_cast<const ast::AssignmentStmt*>(&inner)) {
+                noteStore(as->target.get());   // `t := …` and every compound form
+            } else if (const auto* is =
+                           dynamic_cast<const ast::IncrementStmt*>(&inner)) {
+                noteStore(is->target.get());   // `t++` / `t--`
+            }
+        });
+    }
+
+    // The returned binding's provenance. Returns true when following the chain
+    // reaches a fresh owned producer — an escape the getter cannot own.
+    auto escapesFreshOwned = [&](const ast::Expr& ret) -> bool {
+        const ast::Expr* cur = lookThroughForceUnwrap(&ret);
+        std::vector<const ast::LocalDecl*> seen;
+        // A getter body is finite; the bound only makes a malformed cyclic
+        // initializer chain terminate instead of spinning.
+        for (int step = 0; step < 32 && cur; ++step) {
+            if (const auto* bx = dynamic_cast<const ast::BindExpr*>(cur)) {
+                if (!bx->body) return false;
+                cur = lookThroughForceUnwrap(bx->body.get());
+                continue;
+            }
+            // producerState is the single home for "freshly-produced owned
+            // value" (§28.6's producer list); nothing here re-implements it.
+            if (producerState(*cur) == OwnershipState::Owned) {
+                // …except the mint-announcing families, whose unmarked return
+                // type announces the transfer (see the carve above).
+                if (getterEscapeIsMintAnnouncingFrame(ctx_.exprType(*cur)))
+                    return false;
+                return true;
+            }
+            const auto* id = dynamic_cast<const ast::IdentifierExpr*>(cur);
+            if (!id) return false;
+            auto* ls = dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+            if (!ls) return false;
+            auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+            if (!ld || !ld->initializer) return false;
+            if (std::find(declared.begin(), declared.end(), ld) ==
+                declared.end())
+                return false;
+            if (std::find(reassigned.begin(), reassigned.end(), ld) !=
+                reassigned.end())
+                return false;
+            if (std::find(seen.begin(), seen.end(), ld) != seen.end())
+                return false;
+            seen.push_back(ld);
+            cur = lookThroughForceUnwrap(ld->initializer.get());
+        }
+        return false;
+    };
+
+    // The expression-form rule, unchanged (#926).
     for (const auto& s : stmts) scanGetterReturnsStmt(s.get());
+
+    // The binding-form rule (#6404). Suppressed when the expression-form rule
+    // already reported at this `return`, so one escape never prints twice.
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
+            const auto* rs = dynamic_cast<const ast::ReturnStmt*>(&inner);
+            if (!rs || !rs->value) return;
+            if (producerState(*rs->value) == OwnershipState::Owned) return;
+            if (escapesFreshOwned(*rs->value))
+                report(Severity::Error, rs->value->span.begin,
+                       getterFreshOwnedEscapeDiagnostic());
+        });
+    }
 }
 
 // #1066 / §9.7 (v0.153): a borrow-carrying field type. Used ONLY by
