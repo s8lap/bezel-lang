@@ -37,10 +37,15 @@
 // recommends, and — critically — IDENTICAL for `Array<T>` and `OwningArray<T>`.
 //
 // WHAT IS DELIBERATELY NOT PINNED. A local re-assigned to `null` after its
-// narrowing was established is ALSO admitted today, for both families, which is
-// a real §7.4 gap and is filed as #6346. It has no row here: pinning it would
-// enshrine the defect as intended behaviour. #6346 adds that row when it
-// fixes it.
+// narrowing was established was filed as #6346 as this file's "residual that IS
+// real". #6346 has since been MEASURED and is REFUTED: its repro wrote
+// `n = null;`, and `=` is §8.4's EQUALITY operator, not an assignment — it
+// stores nothing, so the narrowing it appeared to leave stale was never stale.
+// The assignment spelling `n := null;` (and `n ??= null;`) DOES invalidate the
+// narrowing, and the member call after it is refused for both families. The
+// measured rule, and the runtime proof that `=` does not assign, are pinned in
+// tests/sema/reassignment_of_null_refuted_6346_test.cpp — so the row this
+// paragraph originally deferred belongs THERE, not here.
 #include <string>
 
 #include "support/aot_result_asserts.hpp"
