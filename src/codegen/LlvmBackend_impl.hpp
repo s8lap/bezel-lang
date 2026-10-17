@@ -2519,6 +2519,26 @@ private:
         // vtable[1](self) then free the frame.  Distinct from `dynamicDispose`
         // which dispatches through slot 2 of the class vtable.
         bool iterEnumDispose = false;
+        // fix #6372 (§28.2 / §29.2 / §29.11, v0.338): the `for`-in loop-end
+        // disposal of an enumerator whose STATIC class (`enumTs`) was picked by
+        // a structural scan and is therefore only a GUESS — the two-class idiom
+        // (`return new RngEnum(lo,hi)`) and the self-returning one (`return
+        // this`) yield a real class instance, whose Dispose is at vtable slot 2
+        // (§28.2), while a DELEGATING `GetEnumerator` (`return _r.GetEnumerator()`)
+        // yields a value already in §29.11 iterator-vtable format, whose Dispose
+        // is at slot 1 (§29.2). The static type cannot tell the two apart, so
+        // this arm asks the VALUE at disposal time, using §29.2's own positive
+        // discriminator — the iterator vtable's slot-0 SELF-REFERENCE, true for
+        // every §29.11 table this compiler emits and false for every class
+        // vtable (whose [0] is a type descriptor), so it cannot be satisfied by
+        // inheritance the way #6361's rejected identity-against-`enumTs` test
+        // could. On the iterator arm it calls slot 1 and does NOT reclaim the
+        // block itself (that Dispose frees its own frame); on the class arm it
+        // runs the ordinary §28.2 `emitDisposeAndReclaim`. Registered ONLY by
+        // `lowerIEnumerableFor` for the loop-end enumerator entry, where
+        // `enumDisposeSlot` is the single object the loop owns; every other
+        // registration keeps the plain `cls` / `iterEnumDispose` arms.
+        bool iterEnumOrClassDispose = false;
         // #429 / §27.5: a boxed capture cell (the shared heap alloc from
         // boxLocalSlot) whose owning lambda is proven non-escaping.  `slot`
         // is the ptr-alloca (newSlot) whose current value is the cell ptr.

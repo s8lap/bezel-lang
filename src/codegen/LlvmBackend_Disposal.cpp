@@ -9845,6 +9845,88 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.SetInsertPoint(contBB);
             continue;
         }
+        // fix #6372 (§28.2 / §29.2 / §29.11, v0.338): the `for`-in loop-end
+        // disposal of an enumerator whose static class was GUESSED. The guess
+        // (`enumTs`, picked by the structural MoveNext+Current scan in
+        // `lowerIEnumerableFor`) is right for the two-class and self-returning
+        // idioms and wrong for a DELEGATING `GetEnumerator`, whose result is
+        // already in §29.11 iterator-vtable format. The class convention below
+        // therefore called slot 2 — `MoveNext` — on an iterator vtable, freeing
+        // the wrapper without ever disposing it.
+        //
+        // MEASURED on this fix's parent (r31-c1 @ 7201a5bc), `bezelc
+        // --sanitize=address` on the delegating `for`-in repro: `Direct leak of
+        // 24 byte(s)` in `bz$D1.Rng$GetEnumerator` — the wrapper (a 32-byte
+        // heap block) was reclaimed, so the block release ran, but the slot-2
+        // call it made first was `MoveNext`, not `Dispose`, so the 24-byte
+        // `RngEnum` the wrapper held was never disposed. The identical program
+        // driven manually (`using var e := b.GetEnumerator(); while
+        // e.MoveNext()`) is LSan-clean, because #6343's `$ad` family there
+        // runs slot 1 — the discriminator in the IR shows the two drivers
+        // reaching the same wrapper through different vtable conventions.
+        //
+        // WHICH SLOT is a RUNTIME question, answered here by §29.2's own
+        // positive shape test rather than by any static guess: every §29.11
+        // iterator vtable this compiler emits puts ITSELF in slot 0, while every
+        // CLASS vtable puts a type descriptor there. `vtable[0] == vtable` is
+        // true for the iterator format and false for every class instance
+        // INCLUDING a subclass — which is precisely what #6361's rejected
+        // "not vt$(enumTs)" identity test could not exclude.
+        if (it->iterEnumOrClassDispose) {
+            // §27.5: a captured ("boxed") local lives inside a shared heap
+            // cell — ask `boxedStorage`, the single authority for "given a
+            // disposal slot, where does the object live?", exactly as the
+            // `iterEnumDispose` and `cls` arms of this same loop do.
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* famBB = llvm::BasicBlock::Create(llvm_, "ien.fam", currentFn_);
+            auto* iterBB =
+                llvm::BasicBlock::Create(llvm_, "ien.iter.dispose", currentFn_);
+            auto* clsBB =
+                llvm::BasicBlock::Create(llvm_, "ien.cls.dispose", currentFn_);
+            auto* contBB =
+                llvm::BasicBlock::Create(llvm_, "ien.disposal.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, famBB);
+            builder_.SetInsertPoint(famBB);
+            // §29.2 slot-0 self-reference. `obj` IS word 0, so `vt` is already
+            // the vtable and `vt[0]` is its self-reference — the same two
+            // instructions `lowerIEnumerableFor`'s `useOwnVtable` emits, kept
+            // in its own block so this arm's basic blocks stay readable.
+            llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+            llvm::Value* selfRef = builder_.CreateLoad(ptrTy(), vt);
+            llvm::Value* isIteratorFormat =
+                builder_.CreateICmpEQ(selfRef, vt, "ien.selfref");
+            builder_.CreateCondBr(isIteratorFormat, iterBB, clsBB);
+
+            // Iterator arm: Dispose is slot 1 (§29.2), and — unlike the class
+            // arm — it frees its OWN frame, so there is no block release here.
+            // Frees the inner enumerator too: a compiler-minted wrapper's
+            // slot-1 Dispose disposes and reclaims the delegate it holds.
+            builder_.SetInsertPoint(iterBB);
+            llvm::Value* vtI = builder_.CreateLoad(ptrTy(), obj);
+            llvm::Value* dispSlotI =
+                builder_.CreateGEP(ptrTy(), vtI, {builder_.getInt32(1)});
+            llvm::Value* dispFnI = builder_.CreateLoad(ptrTy(), dispSlotI);
+            builder_.CreateCall(
+                llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()},
+                                        false),
+                dispFnI, {obj});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+
+            // Class arm: the ordinary §28.2 convention, unchanged — Dispose at
+            // slot 2 through the object's own vtable, then the block release.
+            builder_.SetInsertPoint(clsBB);
+            emitDisposeAndReclaim(obj, cdFreeEligibleSlots_.count(it->slot) != 0);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         // #383 / §28: a `using var` owning a class/interface object whose
         // concrete class is not statically known here (interface-typed slot,
         // call returning `owned T`, or `move x.f`). Dispose dynamically through

@@ -10437,8 +10437,24 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
         builder_.CreateStore(srcPtr, srcDisposeSlot);
         disposeStack_.back().push_back({srcDisposeSlot, ts});
     }
-    if (disposerFns_.count(enumTs))
-        disposeStack_.back().push_back({enumDisposeSlot, enumTs});
+    if (disposerFns_.count(enumTs)) {
+        Disposal d{enumDisposeSlot, enumTs};
+        // fix #6372 (§28.2 / §29.2 / §29.11, v0.338): `enumTs` is a STRUCTURAL
+        // GUESS, so the enumerator's disposal SLOT is a runtime question. This
+        // entry used the plain class convention (Dispose at slot 2), which on a
+        // DELEGATING `GetEnumerator` — whose result is already in §29.11
+        // iterator-vtable format — called `MoveNext` instead of `Dispose`,
+        // freeing the wrapper without disposing it. `iterEnumOrClassDispose`
+        // picks the family from the value's own vtable at disposal time
+        // (§29.2's slot-0 self-reference), the same discriminator
+        // `useOwnVtable` uses below to drive MoveNext / Current, so the three
+        // sites cannot disagree about which family this value is in.
+        // MEASURED on this fix's parent: `Direct leak of 24 byte(s)` in
+        // `bz$D1.Rng$GetEnumerator`; the identical manual-driven program is
+        // LSan-clean.
+        d.iterEnumOrClassDispose = true;
+        disposeStack_.back().push_back(d);
+    }
 
     // Determine the loop variable's element type.
     llvm::Type* elemTy = ptrTy();  // default: reference type
