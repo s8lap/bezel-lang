@@ -24062,6 +24062,33 @@ private:
         std::unordered_map<std::string_view, llvm::Type*>& outSubst,
         std::unordered_map<std::string_view, const sema::TypeRef*>& outSema);
 
+    // fix #6349 (§14.1 / §23.4 / §12.1, v0.338): the substitution that a class
+    // `t`'s OWN base clause induces on its generic ancestors, with no receiver
+    // type in hand. `computeAncestorGenericSubst` needs a receiver TypeRef; at
+    // module level the accessor emitters have only `t` (the class whose
+    // vtable/itable slot is being filled), so this synthesizes the bare
+    // receiver `instanceStorageTypes`' Phase 1 already uses and asks the SAME
+    // helper, level by level, for every generic ancestor of `t`. Most-derived
+    // wins on a name collision — one flat name-keyed map cannot hold two
+    // bindings of one spelling.
+    //
+    // REFUSES when no ancestor resolves: the "never install a substitution we
+    // cannot prove" discipline of #2840/#2860/#2873/#2882, unchanged. Note it
+    // does NOT refuse when `t` is itself generic — see the callers' REPLACE
+    // note and the commit body for the mutation evidence behind that.
+    //
+    // The callers REPLACE `genericSubst_` with the result rather than merging
+    // into it. Merging was implemented, measured, and REVERTED: the ambient
+    // binding that won the collision belonged to a *foreign* lexically
+    // enclosing class, and the ancestor clause's binding is the one the
+    // accessor body actually needs. Do not "restore" the merge on the strength
+    // of `ancestorGenericSubstAdditions` — that sibling's ambient-wins rule is
+    // stated over `t`'s OWN parameters and does not generalise here.
+    bool accessorAncestorGenericSubst(
+        const sema::TypeSymbol* t,
+        std::unordered_map<std::string_view, llvm::Type*>& outSubst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& outSema);
+
     // fix #3353 (§14.1 / §22.7 / §23.3 / §23.4, v0.240): emit a per-call-site
     // InternalLinkage wrapper that reads the inherited-base indexer's body
     // slot at the SUBSTITUTED offset, replacing the wrong-layout

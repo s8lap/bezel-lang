@@ -7027,6 +7027,60 @@ llvm::Function* Emitter::importedVirtualAccessorSlotFn(
 }
 
 
+// fix #6349 (§14.1 / §23.4 / §12.1, v0.338): the substitution a class's OWN
+// base clause induces on its generic ancestors, with no receiver type in hand.
+// See the declaration in LlvmBackend_impl.hpp for the gate discipline and for
+// why the callers REPLACE rather than merge.
+//
+// WHY THE CALLERS REPLACE, AND WHY THE MERGE WAS REVERTED. An earlier version
+// of this commit installed with `installAccessorAncestorGenericSubst`, which
+// MERGED the base-clause map over the ambient `genericSubst_` and let the
+// ambient binding win a name collision, citing
+// `ancestorGenericSubstAdditions` (LlvmBackend_Layout.cpp:1793) as precedent.
+// That was wrong, and measurably so. `ancestorGenericSubstAdditions`'s
+// ambient-wins rule is stated over `t`'s OWN parameters ("a name already bound
+// ... is never overwritten. That keeps `t`'s own parameters meaning `t`'s own
+// type arguments for `t`'s own fields") — it does NOT generalise to a FOREIGN
+// same-named variable, which is exactly what the accessor path admits.
+//
+// MEASURED: an ambient class `G<T>` (instantiated `T := int`) lexically
+// enclosing a `new E()` where `E: B<Array<int>>` and `E` declares
+// `override property [i: int]: Array<int> => _a;`. The ambient `T` and `B`'s
+// `T` collide by name. Under MERGE the accessor body lowered with `T := int`
+// while its signature said `Array<int>` → verifier abort. Under REPLACE the
+// program compiles and returns 3. The control that isolates the variable:
+// renaming the ambient parameter to `V` so nothing collides, both versions
+// return 3. REPLACE is kept.
+bool Emitter::accessorAncestorGenericSubst(
+        const sema::TypeSymbol* t,
+        std::unordered_map<std::string_view, llvm::Type*>& outSubst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& outSema) {
+    if (!t) return false;
+    // The same synthesized bare receiver `instanceStorageTypes` Phase 1 builds
+    // (LlvmBackend_Layout.cpp): a Named TypeRef carrying only `t`, which is
+    // what `computeAncestorGenericSubst` walks FROM. It re-derives every level
+    // positionally from the base clause, so no argument list is needed here.
+    sema::TypeRef synth;
+    synth.kind = sema::TypeRef::Kind::Named;
+    synth.declaration = const_cast<sema::TypeSymbol*>(t);
+    for (const sema::TypeSymbol* anc = baseClassOf(t); anc;
+         anc = baseClassOf(anc)) {
+        if (anc->genericParams.empty()) continue;
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (!computeAncestorGenericSubst(&synth, anc, ancSubst, ancSema))
+            continue;  // a chain we cannot prove — leave that level alone
+        for (const auto& kv : ancSubst) {
+            if (outSubst.count(kv.first)) continue;  // nearest ancestor wins
+            outSubst[kv.first] = kv.second;
+            auto sit = ancSema.find(kv.first);
+            if (sit != ancSema.end()) outSema[kv.first] = sit->second;
+        }
+    }
+    return !outSubst.empty();
+}
+
+
 // #730 / §23.4 / §13: emit a standalone `T get(ptr this, idx...)` for a class's
 // concrete indexer getter, used to fill the itable slot for interface-typed
 // indexer dispatch. Block-bodied getters reuse ensureIndexerBlockGetter (same
@@ -7034,7 +7088,6 @@ llvm::Function* Emitter::importedVirtualAccessorSlotFn(
 // PropertySymbol.
 llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
                                                const sema::PropertySymbol* ps) {
-    (void)cls;
     // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
     // the shared/erased template every ordinary caller wants.
     auto idxKey = std::make_pair(ps, accessorSpecTagNow());
@@ -7071,10 +7124,67 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
             break;
         }
     }
+    // fix #6349 (§14.1 / §23.4 / §12.1, v0.338): the BODY of an indexer
+    // accessor that a non-generic class declares over a GENERIC base was
+    // lowered against the base's ERASED layout, so a body that reads an
+    // inherited `T`-typed field GEP'd `%class.B` and loaded the i32 erasure
+    // placeholder while the accessor is declared with the CONCRETE
+    // substituted element. Measured on the issue's repro (`E: B<Array<int>>`,
+    // `override property [i: int]: Array<int> => _a`): the emitter produced
+    // `define internal ptr @"bz$indexer$get.2" … load i32 … ret i32 %4` and the
+    // module verifier aborted with "Function return type does not match
+    // operand type of return inst!".
+    //
+    // WHY HERE. This is the PRODUCER half — the function that goes INTO the
+    // vtable slot. #6319 fixed the CONSUMER half (the signature used to CALL
+    // it) and #6353 the cross-module wrapper; neither installs a substitution
+    // for the body built here. The signature below is built from
+    // `lowerType(pd->type)`, the OVERRIDE's own concrete spelling, so it is
+    // already correct — only the body needs the substitution.
+    //
+    // The `ps->parent == cls` gate is what makes this memo-safe: `idxKey`
+    // partitions by `ps`, so an accessor the class declares ITSELF gets one
+    // function per class and baking that class's base-clause substitution in
+    // is sound. An accessor INHERITED unchanged (`ps->parent != cls`) is one
+    // shared PropertySymbol that every instantiating class reaches under the
+    // same key — installing the FIRST class's substitution would bind all the
+    // others to it. That face stays on the erased shared template; see the
+    // issue's "local, non-imported inherited accessor has no wrapper" note.
+    //
+    // `accessorAncestorGenericSubst` REPLACES the ambient substitution rather
+    // than merging into it. See the REPLACE note at the definition for why:
+    // the ambient `T` that won the collision belonged to a FOREIGN
+    // lexically-enclosing class, while the base clause's `T` is the binding the
+    // accessor body actually needs.
+    std::unordered_map<std::string_view, llvm::Type*> idxAccessorSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> idxAccessorSema;
+    // `idxOwnAccessor` is the gate AND the "there is something to install"
+    // answer in one: if no substitution is derivable the block below must not
+    // run at all, because it moves `genericSubst_` out and would otherwise
+    // hand `ensureIndexerBlockGetter` a MOVED-FROM map instead of the ambient
+    // one it had on entry.
+    const bool idxOwnAccessor =
+        cls && ps->parent == cls &&
+        accessorAncestorGenericSubst(cls, idxAccessorSubst, idxAccessorSema);
+
     // Block-bodied: reuse the existing standalone-function emitter (identical
-    // `T get(ptr this, idx...)` signature) — no duplicate emission.
+    // `T get(ptr this, idx...)` signature) — no duplicate emission. The same
+    // substitution covers this path: `ensureIndexerBlockGetter` builds its own
+    // signature from `lowerType(pd->type)` (already concrete) and lowers the
+    // body under the ACTIVE substitution, which is what was missing.
     if (getterBlock) {
-        llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
+        llvm::Function* fn = nullptr;
+        if (idxOwnAccessor) {
+            auto savedIdxSubst  = std::move(genericSubst_);
+            auto savedIdxSemaTy = std::move(genericSubstSemaTy_);
+            genericSubst_       = std::move(idxAccessorSubst);
+            genericSubstSemaTy_ = std::move(idxAccessorSema);
+            fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
+            genericSubst_       = std::move(savedIdxSubst);
+            genericSubstSemaTy_ = std::move(savedIdxSemaTy);
+        } else {
+            fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
+        }
         indexerGetterFns_[idxKey] = fn;
         return fn;
     }
@@ -7120,6 +7230,18 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     auto  savedUD       = unwindScopeDepth_;
     auto  savedDiv      = diverged_;
     auto  savedGSubst   = genericSubst_;
+    // fix #6349 (§14.1 / §23.4 / §12.1, v0.338): install the class's own
+    // base-clause substitution for the BODY emission, restoring both maps at
+    // the bottom with `savedGSubst` (this function already saves/restores
+    // `genericSubst_`; `genericSubstSemaTy_` needs its own pair because the
+    // existing inventory does not carry one). See the block-bodied twin above
+    // for why the signature needs nothing and why the gate is `ps->parent ==
+    // cls`.
+    auto  savedGSemaTy  = genericSubstSemaTy_;
+    if (idxOwnAccessor) {
+        genericSubst_       = std::move(idxAccessorSubst);
+        genericSubstSemaTy_ = std::move(idxAccessorSema);
+    }
     // fix #2748 (§23.4 / §23.2, v0.240): the vtable/itable slot for an
     // expression-bodied INDEXER GETTER sits on the same memoised-standalone-
     // function face as `ensurePropertyBlockGetter` / `ensureIndexerBlockGetter`
@@ -7202,6 +7324,7 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     unwindScopeDepth_ = savedUD;
     diverged_         = savedDiv;
     genericSubst_     = std::move(savedGSubst);
+    genericSubstSemaTy_ = std::move(savedGSemaTy);  // fix #6349
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
     return fn;
 }
@@ -7214,7 +7337,22 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
 // no setter.
 llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
                                                const sema::PropertySymbol* ps) {
-    (void)cls;
+    // fix #6349 (§14.1 / §23.4 / §12.1, v0.338): the SETTER twin of the
+    // install in `ensureIndexerGetterFn` above, installed for the same reason
+    // and under the same `ps->parent == cls` gate — a setter body that writes
+    // an inherited `T`-typed field stored into the ERASED `%class.B` slot.
+    // Measured on this tree with the issue's shape turned into a setter: the
+    // same "Function return type does not match operand type of return inst!"
+    // abort, from the same `_a` read in the paired getter.
+    // `accessorAncestorGenericSubst` REPLACES the ambient substitution
+    // rather than merging into it; see the getter twin above.
+    std::unordered_map<std::string_view, llvm::Type*> setAccessorSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> setAccessorSema;
+    // Gate AND "something to install" in one — see the getter twin for why the
+    // two must not be separated.
+    const bool setOwnAccessor =
+        cls && ps->parent == cls &&
+        accessorAncestorGenericSubst(cls, setAccessorSubst, setAccessorSema);
     // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
     // the shared/erased template every ordinary caller wants.
     auto idxKey = std::make_pair(ps, accessorSpecTagNow());
@@ -7284,6 +7422,12 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
     auto  savedUD       = unwindScopeDepth_;
     auto  savedDiv      = diverged_;
     auto  savedGSubst   = genericSubst_;
+    // fix #6349: the setter's own install/restore pair; see the getter twin.
+    auto  savedGSemaTy  = genericSubstSemaTy_;
+    if (setOwnAccessor) {
+        genericSubst_       = std::move(setAccessorSubst);
+        genericSubstSemaTy_ = std::move(setAccessorSema);
+    }
     // fix #2748 (§23.4 / §23.2, v0.240): the SETTER twin of the indexer getter
     // just above — the vtable/itable slot for an expression-bodied INDEXER
     // SETTER was also unwrapped. The setter returns void and may legitimately
@@ -7347,6 +7491,7 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
     unwindScopeDepth_ = savedUD;
     diverged_         = savedDiv;
     genericSubst_     = std::move(savedGSubst);
+    genericSubstSemaTy_ = std::move(savedGSemaTy);  // fix #6349
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
     return fn;
 }
