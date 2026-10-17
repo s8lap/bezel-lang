@@ -287,3 +287,59 @@ BEZEL_TEST(codegen_user_class_forin_delegating_enumerator_6361,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("6") != std::string::npos);
 }
+// CONTROL — a SUBCLASS of the guessed enumerator class takes the DIRECT family.
+// This row exists because the FIRST attempt at this fix (#6361 `6ac6fabf`,
+// REJECTed) used #6343's predicate — "the receiver's vtable is not
+// vt$(enumTs)" — and that predicate is unsound. `enumTs` comes from a
+// STRUCTURAL scan, so an instance of any SUBCLASS has a different vtable while
+// being an ordinary class instance; the adapter arm then read slot 2 of a
+// CLASS vtable, which is `Dispose`, not `MoveNext`:
+//
+//   vt$MS3.Base3   = [td, itmap, Dispose, tostr, eq, hash, MoveNext, Current$propget]
+//   vt$MS3.Derived3 = [td, itmap, Dispose, tostr, eq, hash, MoveNext, Current$propget]
+//
+// slot 2 is `Dispose` in both. MEASURED on this exact program:
+// base `59219b73` prints 6, `6ac6fabf` prints 0. A negative predicate cannot
+// exclude a subclass; only a positive one can.
+//
+// NOTHING HERE INVOLVES A WRAPPER OR DELEGATION: `grep -c userenumenum` on this
+// program's IR is 0. The receiver is a plain `Derived3` and the guess is
+// `Base3`. The discriminator the fix now uses is §29.2's own vtable shape — an
+// ITERATOR vtable puts ITSELF in slot 0 while a CLASS vtable puts its type
+// descriptor there — which inheritance cannot satisfy, because a subclass's
+// vtable is a different global whose [0] is a different global.
+//
+// `Src3.GetEnumerator` mints a FRESH `Derived3` per call so the loop is its
+// only owner; the plain self-returning subclass shape (`for var x in new
+// SelfDerived(3)`) additionally trips the #2424 aliasing guard, whose test is
+// `enumTs == ts` and is therefore also defeated by a subclass — that is a
+// separate pre-existing double-free, filed separately, and is why this row uses
+// the minting shape. 1 + 2 + 3 = 6.
+BEZEL_TEST(codegen_user_class_forin_delegating_enumerator_6361,
+           subclass_of_enumerator_takes_the_direct_family_spec_29_11) {
+    JitResult r = checked(
+        "module M6361H; "
+        "public class Base3: IEnumerator<int> "
+        "  protected _c: int := 0; "
+        "  public constructor() _c := 0; end constructor; "
+        "  public method MoveNext(): bool _c := _c + 1; return _c <= 3; end MoveNext; "
+        "  public virtual property Current: int get => _c; end Current; "
+        "end Base3; "
+        "public class Derived3: Base3 "
+        "  public constructor() end constructor; "
+        "end Derived3; "
+        "public class Src3 "
+        "  public method GetEnumerator(): IEnumerator<int> return new Derived3(); end GetEnumerator; "
+        "end Src3; "
+        "public class M "
+        "  public static method Main(): int "
+        "    var s := new Src3(); "
+        "    var t := 0; "
+        "    for var x in s do t := t + x; end; "
+        "    Console.WriteLine($\"{t}\"); "
+        "    return 0; "
+        "  end Main; end M;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("6") != std::string::npos);
+}

@@ -10395,37 +10395,62 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // 32..47 of the wrapper's own `enumerator` POINTER. Confirmed in the IR as
     // a SEGV in `bz$P9.Counter$MoveNext` with `rdi = <heap ptr> + 0xc`.
     //
-    // A single runtime identity test against `enumTs`'s OWN class vtable picks
-    // between the two families, so no static guess is trusted — exactly the
-    // discriminator fix #6343 added to `wrapUserClassAsIEnumerable`. That fix
-    // covers the manual `while e.MoveNext()` driver; THIS is the `for`-in
-    // driver, which reaches the same confused value through its own copy of
-    // the guess and ran no adapter at all.
+    // A single runtime test picks between the two families, so no static guess
+    // is trusted. Fix #6343 added the same idea to `wrapUserClassAsIEnumerable`
+    // for the manual `while e.MoveNext()` driver; THIS is the `for`-in driver,
+    // which reaches the same confused value through its own copy of the guess
+    // and ran no adapter at all.
     //
     // `vtableOf` returns null for an IMPORTED `enumTs` (imports have no local
-    // vtable global, LlvmBackend_Setup.cpp ~L5096). The test is then skipped
-    // and the pre-existing direct lowering stands, unchanged — that hole is
-    // filed separately and is deliberately NOT widened into here.
-    llvm::GlobalVariable* enumClassVt = vtableOf(enumTs);
+    // vtable global, LlvmBackend_Setup.cpp ~L5096), so an IDENTITY test against
+    // `vt$(enumTs)` could not be built for it at all. The test below does not
+    // name `enumTs` and does not consult `vtableOf`, so that gap does not arise
+    // here.
     auto iterSlotFn = [&](llvm::Value* obj, unsigned slot) -> llvm::Value* {
         llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
         llvm::Value* addr = builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(slot)});
         return builder_.CreateLoad(ptrTy(), addr);
     };
-    // Non-null only when the test can actually run; a null return means
-    // "keep the direct family", which is what an imported `enumTs` gets.
-    // Slot 0 IS the vtable pointer — a bare load, NOT `iterSlotFn(obj, 0)`,
-    // which would deref once more and yield the type descriptor (a class
-    // vtable's `[0]` is `td$…`; only the §29.11 wrapper globals self-reference
-    // in slot 0, so the extra deref happens to be right for exactly the wrong
-    // value). Same shape as fix #6343's test in `wrapUserClassAsIEnumerable`.
+
+    // THE DISCRIMINATOR, AND WHY IT IS NOT AN IDENTITY TEST AGAINST `enumTs`.
+    //
+    // The first attempt at this fix (#6361 `6ac6fabf`) used #6343's predicate —
+    // "the receiver's slot-0 vtable is not `vt$(enumTs)`, therefore the receiver
+    // is in §29.11 iterator-vtable format". That is unsound: `enumTs` is picked
+    // by a STRUCTURAL scan, so an instance of any SUBCLASS of the guessed class
+    // has a different vtable while being an ordinary class instance, and the
+    // adapter arm then read slot 2 of a CLASS vtable — which is `Dispose`, not
+    // `MoveNext` (`vt$C.SelfBase = [td, itmap, Dispose, tostr, eq, hash,
+    // MoveNext, Current$propget]`). MEASURED: `for var x in new SelfDerived(3)`
+    // printed 6 at base and 0 with `6ac6fabf`. A negative predicate cannot
+    // exclude a subclass; only a POSITIVE one can.
+    //
+    // The positive discriminator is §29.2's own vtable shape. Every §29.11
+    // iterator vtable this compiler emits puts ITSELF in slot 0 —
+    // `elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy())` at all 14
+    // build sites in LlvmBackend_Assign.cpp, so the global reads
+    //   [0]=<itself>, [1]=Dispose, [2]=MoveNext, [3]=Current, [4]=GetEnumerator
+    // while every CLASS vtable puts its type descriptor there:
+    //   [0]=td$…, [1]=itmap, [2]=Dispose, [3]=tostr, …, [6]=MoveNext
+    // So `load(obj)->vtable[0] == vtable` is TRUE for a §29.11 value and FALSE
+    // for every class instance including subclasses. It cannot be satisfied by
+    // inheritance, because a subclass's vtable is a different global whose `[0]`
+    // is a different global.
+    //
+    // MEASURED on both sides of the distinction (BEZEL_DUMP_IR):
+    //   SELF-REF bz$arrenum$i32$vtable                     (builtin enumerator)
+    //   SELF-REF bz$userenumenum$Counter$Counter$vtable    (compiler wrapper)
+    //   SELF-REF bz$userenumenum$Counter$Counter$vtable$ad (fix #6343's family)
+    //   NOT-SELF bz$exc$vtable$table                      (a real class-family table)
     auto useOwnVtable = [&](llvm::Value* obj) -> llvm::Value* {
-        if (!enumClassVt) return nullptr;
-        llvm::Value* enumVt = builder_.CreateLoad(ptrTy(), obj);
-        llvm::Value* isEnumTs = builder_.CreateICmpEQ(enumVt, enumClassVt);
+        llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+        // The §29.11 slot-0 self-reference, read WITHOUT dereferencing `obj`
+        // twice: `obj` itself is slot 0, so `vt` is already the vtable and
+        // `vt[0]` is its self-reference.
+        llvm::Value* selfRef = builder_.CreateLoad(ptrTy(), vt);
         return builder_.CreateAnd(
             builder_.CreateNot(builder_.CreateIsNull(obj)),
-            builder_.CreateNot(isEnumTs), "ien.useownvt");
+            builder_.CreateICmpEQ(selfRef, vt), "ien.useownvt");
     };
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);
