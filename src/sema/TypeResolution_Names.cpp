@@ -2379,24 +2379,26 @@ Symbol* Resolver::lookupName(std::string_view name, Scope* scope) {
 // this file rather than assumed. `enclosingTypeMemberBlocksBareName` — this
 // predicate's only caller (itself called once, from the `typeBodyScopes_` walk
 // at the end of `lookupBareTypeName`) — reaches members only through
-// `Resolver::typeBodyScopes_`, which has exactly one push site, this file's
-// `resolveTypeDecl` (line 1425; the matching pop is line 1830), and
-// `resolveTypeDecl` has exactly two call sites, both in this file and both
-// driven by the local AST (line 1164's module walk, and line 2258's §11.3
-// nested-type loop, which is itself inside that walk). `ModuleLoader` never
-// calls it: it populates `importedByModule_` and reconstructs an imported
+// `Resolver::typeBodyScopes_`, whose push sites are BOTH in this file and BOTH
+// driven by the local AST: `resolveTypeDecl` (line 1425; the matching pop is
+// line 1830), which has exactly two call sites of its own (line 1164's module
+// walk, and line 2258's §11.3 nested-type loop, which is itself inside that
+// walk), and — since fix #6401 — `resolveNamed`'s §21.10 arm, which pairs a
+// LOCAL type's body scope with the `TypeSymbol` `collectTypeDecl` just built
+// for it (the matching pop is in the same arm). `ModuleLoader` never calls
+// either: it populates `importedByModule_` and reconstructs an imported
 // type's `enclosingTypePath` directly (`ModuleLoader.cpp:799` and `:6220`), so
 // an imported type never acquires a `typeBodyScopes_` entry and never reaches
 // this predicate. Every member consulted here is therefore locally collected
 // and carries a `decl`.
 //
 // ⚠ THAT PREMISE HAS NOTHING GUARDING IT. There is no invariant check, no
-// assertion and no test behind "one push site": a second `typeBodyScopes_`
+// assertion and no test behind the two push sites: a `typeBodyScopes_`
 // push reachable for a reconstructed/imported type, or a
 // `ModuleLoader`-side `resolveTypeDecl` call, would make the fallback reachable
 // and this comment's reachability claim false with nothing turning red. It is
 // stated here rather than assumed precisely because this commit is the one
-// adding the fallback those two sites would be exercising. That is also the
+// adding the fallback those sites would be exercising. That is also the
 // reason this predicate is deliberately NOT registered in
 // `check_seam_accessor_conformance.py`: a registered accessor owes a
 // `tests/module/` cross-module row, and with the reachability above no
@@ -2470,9 +2472,61 @@ static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name,
 bool Resolver::enclosingTypeMemberBlocksBareName(
     const TypeSymbol* owning, std::string_view name) {
     if (!owning) return false;
-    // §2.7 "Through nesting" is scoped to a NESTED type's bodies — see the
-    // scope note above the caller. A top-level type's own body is rule 1
-    // alone, whose table has no type-position row.
+    // fix #6401 (§21.10 "Local type declarations" + §2.7 "Through nesting",
+    // v0.338): a §21.10 LOCAL type's body is a Through-nesting body, and the
+    // local type is its OWN innermost link — so the guard below (which turns
+    // the whole stop off for a body that is not a nested type's) must not
+    // apply, and `ownBody` must be decided by "is this link the local type?"
+    // rather than by "is this link `currentOuterType_`?".
+    //
+    // §21.10 says so in its own words, and it is the reason this is a
+    // silent-acceptance fix rather than a widening: "Inside the local type's
+    // OWN MEMBER BODIES, a bare name reaches the static members and nested
+    // types of the type whose body declares it, and of that type's enclosing
+    // types, by §2.7's Through nesting." §2.7's own scope sentence is "IN A
+    // NESTED TYPE'S BODIES (§11.6), the enclosing-type lookup visits the
+    // nested type and then each type enclosing it, innermost first"; §21.10
+    // extends that chain to a body-local type, so the chain a local type's
+    // members see is Inner, then the type whose body declares it, then that
+    // type's enclosing types.
+    //
+    // `inLocalTypeMembers_` is the existing, already save/restored flag that
+    // marks exactly this window (`resolveNamed`'s §21.10 arm wraps the local
+    // type's positional fields, generic constraints and members in it, and
+    // restores it on the way out — including for a local type declared inside
+    // another local type's method). It is read here rather than a new field
+    // so this change touches no header. `owning->isLocalType` is the link
+    // test: `ownBody` asks "is this link the body being resolved?", and inside
+    // the local type's OWN members that is the local type and never the type
+    // whose body declares it — `currentOuterType_` is the DECLARING type at
+    // that point, because a local type never opens a `resolveTypeDecl`.
+    //
+    // ⚠ AND THE DECLARING TYPE'S `private` MEMBERS STILL END THE SEARCH. §2.7
+    // (v0.338), local-type sentence, in its own words: "Accessibility there is
+    // that of the body declaring the local type, so the `private` members of
+    // the type declaring it count as accessible." So the declaring type is NOT
+    // own-body here (`ownBody` stays false for it — the body being resolved is
+    // the local type's, not the declaring type's), and yet its `private`
+    // members are visible at this site, so `privateVisibleViaDeclaringBody`
+    // below keeps them out of the §13.1 reachability filter. Reading that
+    // filter as governing here instead is what turns this shape into a SILENT
+    // ACCEPTANCE: with the declaring type's `private` member filtered away,
+    // `lookupBareTypeName` walks past it, reaches a same-named module
+    // declaration, and binds that — the outcome §2.7's harm sentence names by
+    // name ("keeps a bare name from passing over an enclosing member and
+    // silently resolving to a same-named module declaration or import").
+    // MEASURED, `private` and `protected` twins, a `private`/`protected
+    // method Box` on a nested declaring type `Mid`, a local `record Inner` in
+    // `Mid`'s body with `Get(): Box`, and a module-level `record Box(V: int)`:
+    // with `privateVisibleViaDeclaringBody` REJECTED naming `Mid` (measured
+    // here, both twins, and again as the base's own outcome); WITHOUT it a clean
+    // compile that silently binds the module-level `Box` (QUOTED from review,
+    // which built the program rather than reading it — the base itself does NOT
+    // show this, so do not re-derive it from the base).
+    //
+    // §2.7 "Through nesting" is otherwise scoped to a NESTED type's bodies —
+    // see the scope note above the caller. A top-level type's own body is
+    // rule 1 alone, whose table has no type-position row.
     //
     // ⚠ THIS GUARD IS LOAD-BEARING FOR FOUR PINNED ROWS, NOT TWO. An earlier
     // record of this commit under-reported it as two; the reviewer re-ran the
@@ -2489,16 +2543,36 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
     // the guard — the measurement refutes that: the GUARD, not the carve-out,
     // is what holds them up. That materially weakens the withdrawn reason (b)
     // above, and it is why the guard must not move before #6390 is ruled.
-    if (!currentOuterType_ || currentOuterType_->enclosingTypePath.empty())
-        return false;
-    const bool ownBody = owning == currentOuterType_;
+    bool ownBody;
+    // Whether this link's `private`/`protected` members are visible at the site
+    // being resolved for a reason OTHER than being its own body. §2.7
+    // (v0.338): inside a local type's bodies "accessibility … is that of the
+    // body declaring the local type, so the `private` members of the type
+    // declaring it count as accessible" — so the DECLARING type's `private`
+    // members end the search even though the body being resolved is the local
+    // type's. False everywhere else, where §13.1's reachability governs.
+    bool privateVisibleViaDeclaringBody = false;
+    if (inLocalTypeMembers_) {
+        // fix #6401: a local type's body IS a Through-nesting body, so the
+        // guard does not apply here and every link of the chain is consulted.
+        // The innermost link is the LOCAL TYPE, which is the body being
+        // resolved; `currentOuterType_` is the declaring type here (a local
+        // type never opens a `resolveTypeDecl`), so it is NOT own-body.
+        ownBody = owning->isLocalType;
+        privateVisibleViaDeclaringBody =
+            currentOuterType_ != nullptr && owning == currentOuterType_;
+    } else {
+        if (!currentOuterType_ || currentOuterType_->enclosingTypePath.empty())
+            return false;
+        ownBody = owning == currentOuterType_;
+    }
     for (const Symbol* m : owning->members) {
         if (!m || m->name != name) continue;
         // A nested type is admitted by bare name (§2.7 "Through nesting").
         if (dynamic_cast<const NestedTypeSymbol*>(m)) continue;
         if (memberDeclaresCollidingName(m, name, ctx_)) continue;  // §2.7 carve-out
         const auto* member = dynamic_cast<const MemberSymbol*>(m);
-        if (member && !ownBody &&
+        if (member && !ownBody && !privateVisibleViaDeclaringBody &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Protected))
             continue;
@@ -2567,7 +2641,7 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
 // member un-declarable. So the stop fires in a NESTED type's body and nowhere
 // else; a top-level type's own member of the name does not stop the search.
 //
-// Two further axes are NOT covered, both declared rather than assumed:
+// One further axis is NOT covered, declared rather than assumed:
 //   * BASE types. §2.7's rule-1 ranking paragraph says "the enclosing type's
 //     accessible members (inherited included)", but §2.7's "Through nesting"
 //     paragraph — the one stating the stop rule quoted above — enumerates the
@@ -2575,11 +2649,29 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
 //     types in it, and inheritance is a separate axis with its own accessor
 //     (`baseTypes`). Widening to base types is a strictly larger change with a
 //     much larger blast radius, and is filed separately rather than smuggled in.
-//   * §21.10 LOCAL types, whose bodies have no `resolveTypeDecl` body scope of
-//     their own (§21.10 has its own sentence on the enclosing order, and its
-//     own member-signature prohibition, already enforced above in
-//     `resolveNamed`). The test below reads the nearest `resolveTypeDecl` body,
-// which for a local type's members is the type that DECLARED the local type.
+//
+// fix #6401 (§21.10 + §2.7 "Through nesting", v0.338): a §21.10 LOCAL type is
+// now a LINK of that chain. `resolveNamed`'s §21.10 arm pairs the local type's
+// body scope with its TypeSymbol exactly as `resolveTypeDecl` does, and
+// `enclosingTypeMemberBlocksBareName` reads the innermost link off
+// `inLocalTypeMembers_` + `isLocalType` rather than off `currentOuterType_`.
+// Two things follow that the nested-type path alone did not give, and both are
+// rows in `tests/sema/enclosing_member_bare_type_name_test.cpp`:
+//   * the LOCAL TYPE's own accessible member ends the search (§2.7's stop
+//     sentence names the first type that HAS the name, and the local type is
+//     the first link of the chain a body-local type's members see); and
+//   * the DECLARING type stays a link that ends the search, `private` and
+//     `protected` members included — §2.7 (v0.338), local-type sentence:
+//     "Accessibility there is that of the body declaring the local type, so
+//     the `private` members of the type declaring it count as accessible."
+//     That is the BASE's outcome for this link, arrived at without calling the
+//     declaring type own-body: the local type is the body being resolved, and
+//     `privateVisibleViaDeclaringBody` is what keeps the declaring type's
+//     `private` members out of the §13.1 reachability filter.
+//
+// §21.10: "Inside the local type's own member bodies, a bare name reaches the
+// static members and nested types of the type whose body declares it, and of
+// that type's enclosing types, by §2.7's Through nesting."
 //
 // The stop is placed so it can only ADD a rejection, never remove one: the
 // symbol `lookupName` would have returned is returned unchanged, and
@@ -5887,6 +5979,48 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         // unchecked.
         Resolver::Scope typeScope;
         typeScope.parent = scope;
+        // fix #6401 (§21.10 + §2.7 "Through nesting", v0.338): pair this body
+        // scope with the local type it belongs to, exactly as `resolveTypeDecl`
+        // does for a module-level or nested type. Without the pairing the local
+        // type is not a LINK of §2.7's enclosing chain at all, so a bare
+        // TYPE-name search started inside one of its member bodies sailed past
+        // its own members and reached a same-named module declaration — the
+        // silent acceptance §2.7's stop sentence exists to prevent. §21.10 puts
+        // this chain in scope explicitly ("a bare name reaches the static
+        // members and nested types of the type whose body declares it, and of
+        // that type's enclosing types, by §2.7's Through nesting"), so the
+        // local type is the innermost link and the declaring type the next one.
+        //
+        // The scope itself carries no names, and that is not what this pairing
+        // is for: `lookupBareTypeName` asks "did the TYPE whose body this scope
+        // belongs to DECLARE a member of that name", not "did this scope carry
+        // the name". A local type registers nothing here — it declares no
+        // generic parameters (§21.10 Restrictions (v1)) and its own nested
+        // types are collected by their own `resolveTypeDecl`, not added to this
+        // scope.
+        //
+        // ⚠ WHAT THE PAIRING DOES *NOT* FIX, so nothing above may claim it
+        // does. A `NestedTypeSymbol` link does not block the search (§2.7
+        // admits a nested type by bare name), so pairing the local type
+        // cannot make a nested type of the name an error here. But a nested
+        // type declared INSIDE a local record is a SEPARATE, PRE-EXISTING
+        // defect: §11.3's registration loop runs in `resolveTypeDecl`, which a
+        // local type never enters, so that nested type is registered neither
+        // in the local type's body scope nor as a member link. MEASURED: one
+        // spelling REJECTS (`no member W on type Box`) and another COMPILES
+        // CLEAN while silently binding a module-level `Box`, ignoring
+        // `Inner.Box` entirely; a §11.6 nested type's own nested type binds
+        // correctly, so the member-kind cross product has a local-type row
+        // missing, not a rule that needs restating. Filed as its own issue
+        // rather than fixed here: it is pre-existing on the base (this pairing
+        // neither adds nor removes it), and its correct outcome is a spec
+        // question about whether a local type's nested types are members of it
+        // at all.
+        //
+        // ⚠ `typeScope` is a STACK object: the push below must be popped before
+        // this block returns, or the vector keeps a dangling pointer and every
+        // later `lookupBareTypeName` compares scopes against freed memory.
+        typeBodyScopes_.emplace_back(&typeScope, tsym);
         const bool savedInLocal = inLocalTypeMembers_;
         inLocalTypeMembers_ = true;
         for (const auto& pf : localType->decl->positionalFields) {
@@ -5904,6 +6038,7 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
             resolveMember(*m, &typeScope);
         }
         inLocalTypeMembers_ = savedInLocal;
+        typeBodyScopes_.pop_back();
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
