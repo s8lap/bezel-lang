@@ -3519,13 +3519,70 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // is therefore the same wrap/dispose round trip the expression-bodied
         // sibling has always had, not a new ownership obligation.
         if (const ast::Type* rn = returnReprTypeNode())
-            if (v && rs->value)
+            if (v && rs->value) {
+                // fix #6397 (§28.9 / §29.2 / §23.3, v0.338): PUBLISH this
+                // edge's mint. The wrap above is the one a BLOCK-bodied
+                // getter's `return` makes (§23.3, #2703), and until this fix
+                // it published nothing at all — `propReadIterWrappedExprs_`
+                // has exactly two writers and both are inside
+                // `wrapPropertyArrayAsIEnumerable`, the EXPRESSION-bodied
+                // creator. So the for-in consumer classified every
+                // block-bodied getter's read as a lend and nobody reclaimed
+                // the frame: MEASURED, two of #6387's landed rows and #2769's
+                // direct-for-in row RED with `Direct leak of 6400 byte(s) in
+                // 200 object(s) allocated from bz$prop$Seq$get`.
+                //
+                // The key is the PROPERTY, not this `return`, because this
+                // statement lives in the accessor's own memoised function
+                // while the consumer keys on the CALLER's read node and, once
+                // the memo hits, cannot re-enter this emission. See
+                // `propBlockGetterReturnKinds_` in LlvmBackend_impl.hpp.
+                //
+                // The verdict is the wrap-creator's own `outWrapMade`, so
+                // CLAIM = MINT holds by construction, and the ERASE on a
+                // decline is load-bearing rather than tidiness: a block-bodied
+                // `property Seq: IEnumerable<int> get do return _seq; end
+                // get; end` over an `owned _seq: IEnumerable<int>` returns a
+                // value that ALREADY has the declared head, so the wrap
+                // declines, the holder keeps the field (§28.2), and a claim
+                // over an unminted frame would free it out from under the
+                // holder. `currentAccessorPropDecl_` is non-null only inside
+                // `ensurePropertyBlockGetter`'s body emission, so a METHOD's
+                // return edge — which reaches this same arm — publishes
+                // nothing and keeps its existing behaviour.
+                bool wrapMade6397 = false;
                 v = wrapAsIEnumerableForTarget(
                     v, ctx_.resolvedType(*rn), rs->value.get(),
                     /*ownLazyPipeline=*/true,
-                    /*outWrapMade=*/nullptr,
+                    /*outWrapMade=*/&wrapMade6397,
                     /*srcOwnedByCallee=*/
                     returnSourceIsCalleeOwnedCollection(rs->value.get()));
+                if (currentAccessorPropDecl_) {
+                    // fix #6397: publish BOTH verdicts the for-in consumer
+                    // reads. The field bit is decided from the SAME node this
+                    // arm already holds (`rs->value`), by the classification
+                    // the codebase already runs on that very expression —
+                    // `wrapAsIEnumerableForTarget`'s user-class arm asks
+                    // exactly `ctx_.exprSymbol(*srcExpr)` for its
+                    // `srcIsNamedOwner` (LlvmBackend_Assign.cpp). §28.2 is why
+                    // a field read is a lend whoever the holder is: "Every
+                    // class instance is reclaimed by compiler-inserted code at
+                    // its holder's release point … and nowhere else."
+                    bool returnsField6397 =
+                        dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*rs->value)) != nullptr;
+                    unsigned k = propBlockGetterReturnKinds_.count(
+                                     currentAccessorPropDecl_)
+                                     ? propBlockGetterReturnKinds_[
+                                           currentAccessorPropDecl_]
+                                     : 0u;
+                    k = (wrapMade6397 ? (k | kPropGetterReturnMint)
+                                      : (k & ~kPropGetterReturnMint));
+                    k = (returnsField6397 ? (k | kPropGetterReturnField)
+                                          : (k & ~kPropGetterReturnField));
+                    propBlockGetterReturnKinds_[currentAccessorPropDecl_] = k;
+                }
+            }
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the
@@ -9866,8 +9923,109 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedLocal = true;
-        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedLocal = sema::isAutoPropertyStorageSymbol(ps, ctx_);
+        } else if (auto* ps6397 =
+                       dynamic_cast<sema::PropertySymbol*>(sym)) {
+            // fix #6397 (§28.9, §28.2, §29.2, v0.338): a property READ is a
+            // LEND — "a getter never transfers a reclamation obligation to its
+            // reader" — so this loop must not reclaim the value the read
+            // produced. §28.2 keeps the holder's release point the only place
+            // that instance is reclaimed ("and nowhere else"). The arm this
+            // replaces asked `isAutoPropertyStorageSymbol`, which answers "does
+            // this property have compiler-generated backing storage?" — a
+            // DIFFERENT question, whose NO answer was read here as "this read
+            // produces a FRESH value the loop owns". MEASURED for a
+            // hand-written getter (`get => _a`): heap-use-after-free, READ of
+            // size 8 in `Holder$DisposeCore`, freed in `main` by the loop-end
+            // disposal, allocated in `Holder$ctor`.
+            //
+            // ⚠ BUT THE READ IS NOT ALWAYS THE VALUE IN `srcSlot`, so this is
+            // NOT an unconditional `true` — and MEASURED, an unconditional
+            // `true` here is a LEAK, not a fix. §29.2's wrap-creator
+            // (`wrapPropertyArrayAsIEnumerable`) fires at an iterator-format
+            // property read whose getter WIDENS its body expression to the
+            // declared type, and the frame it mints is held by NOBODY but this
+            // loop: `property Items: IEnumerable<int> get => _items;` over an
+            // `owned _items: Array<int>` is the ordinary case. An
+            // unconditional `true` leaks that frame — MEASURED 6400 B in 200
+            // objects, allocated in `bz$…$Seq$get` — and turns #6387's own two
+            // landed tests plus #2769 / #2815 / #3356 RED. Widening the
+            // predicate to "every property read is a named owner" is therefore
+            // the wrong half of this fix, not a conservative one.
+            //
+            // So the question is not "is a read a lend" but "did THIS read mint
+            // a frame", and that verdict is not re-derived here.
+            // `propReadIterWrappedExprs_` already records it, keyed on the read
+            // expression, INSERTED by the wrap helper on a mint and ERASED on a
+            // decline (see its declaration in LlvmBackend_impl.hpp, whose
+            // comment records that the hand-written name-list it replaced had
+            // already drifted once). `Setup.cpp`'s
+            // `registerIterableSourceDisposal` reads the same set for the same
+            // reason. The ordering holds: `fs.iterable` is lowered at the top of
+            // this function, well before this arm, so the mint is already
+            // recorded when it is read here. CLAIM = MINT by construction, the
+            // identity that comment states for the `Setup.cpp` reader.
+            // The FIRST key is the read node — the EXPRESSION-bodied creator
+            // (`wrapPropertyArrayAsIEnumerable`) mints inline, in THIS function,
+            // and is handed the read node. The SECOND is the BLOCK-bodied
+            // getter's twin, whose mint is made inside the accessor's own
+            // memoised function and therefore cannot be keyed on a node this
+            // side ever sees; `lowerReturn` publishes it against the property
+            // instead, and `ensurePropertyBlockGetter` guarantees that
+            // publication happened while `fs.iterable` was lowered above.
+            //
+            // ⚠ THE SECOND KEY IS NOT A WIDENING TO "ANY BLOCK-BODIED
+            // GETTER MINTS" — that is the over-claim #2769's local-decl arm
+            // makes and it is wrong in the UAF direction: a block-bodied
+            // `property Seq: IEnumerable<int> get do return _seq; end get;
+            // end` over an `owned _seq: IEnumerable<int>` declines the wrap
+            // (the returned value already HAS the declared head), so claiming
+            // its frame would free the holder's field at the loop's end.
+            // The verdict here is the wrap-creator's own, not a re-derivation.
+            //
+            // ⚠ AND "NO FRAME MINTED" IS NOT BY ITSELF THE ANSWER — a getter
+            // may hand back a value nobody else owns, with no §29.2 wrap
+            // anywhere. #1840's landed rows pin that: `public property Seq:
+            // IEnumerable<int> => C.Gen();` over a yielding `Gen()`, where the
+            // iterator `Gen()` allocates is the LOOP's to reclaim. A consumer
+            // keyed on the mint alone classifies that as a lend and
+            // `forin_computed_property_ienumerable_1840`'s member-access row
+            // goes RED with `Direct leak of 40 byte(s) in 1 object(s)
+            // allocated from bz$M.C$Gen`. So the answer is "is the value the
+            // receiver's own storage", and the two published verdicts cover
+            // both halves without re-deriving either: a minted frame is the
+            // reader's whatever the body is, and a getter that hands back a
+            // FIELD read hands back storage its holder already keeps alive
+            // (§28.2). Everything else keeps the classification it had.
+            const ast::PropertyDecl* pd6397 =
+                ps6397 && ps6397->decl
+                    ? dynamic_cast<const ast::PropertyDecl*>(ps6397->decl)
+                    : nullptr;
+            unsigned gk6397 = 0u;
+            if (pd6397 && propBlockGetterReturnKinds_.count(pd6397))
+                gk6397 = propBlockGetterReturnKinds_.at(pd6397);
+            bool minted6397 =
+                propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
+                (gk6397 & kPropGetterReturnMint) != 0 ||
+                // fix #6397 follow-up (§28.9 / §29.2, v0.338): the accessor
+                // BODY's own mint, for the face on which the getter is a
+                // separate slot function (`virtual` / interface dispatch) rather
+                // than inlined at this read. Without this term the consumer saw
+                // "no mint" on a frame the accessor really minted, took the
+                // field-lend branch and withdrew the loop's reclamation.
+                (gk6397 & kPropGetterBodyMint) != 0;
+            // The BLOCK-bodied getter reports its own return edges through the
+            // map; the EXPRESSION-bodied getter is inlined at the read site, so
+            // the same question is asked of its body expression directly. Both
+            // ask one thing: does the getter hand back a FIELD read?
+            bool fieldLend6397 = (gk6397 & kPropGetterReturnField) != 0;
+            if (!fieldLend6397)
+                if (const ast::Expr* eg6397 = computedGetterOf(ps6397))
+                    fieldLend6397 =
+                        dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*eg6397)) != nullptr;
+            sourceIsNamedLocal =
+                sema::isAutoPropertyStorageSymbol(ps6397, ctx_) ||
+                (fieldLend6397 && !minted6397);
         }
     }
     // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): an
@@ -10339,8 +10497,77 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedOwner = true;
-        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedOwner = sema::isAutoPropertyStorageSymbol(ps, ctx_);
+        } else if (auto* ps6397b =
+                       dynamic_cast<sema::PropertySymbol*>(sym)) {
+            // fix #6397 (§28.9, §28.2, §29.2, v0.338): the SECOND of the two
+            // same-file spellings, and the one that is NOT optional — this is
+            // the user-class path, reached when the source's declared type is a
+            // user class that implements IEnumerable<T> itself. A property READ
+            // is a LEND — "a getter never transfers a reclamation obligation to
+            // its reader" — so this loop must not reclaim it. The arm this
+            // replaces asked `isAutoPropertyStorageSymbol`, whose NO answer was
+            // read as "this read produces a FRESH value the loop owns":
+            // MEASURED heap-use-after-free, READ of size 8 in
+            // `Holder$DisposeCore`, freed in `main` by this loop's own
+            // source-slot disposal, allocated in `Holder$ctor`.
+            //
+            // MEASURED: patching ONLY the `lowerIEnumerableBuiltinFor` spelling
+            // above leaves the `SelfA`-typed repro red — the two functions are
+            // the two arms of the dispatch, selected by the source's DECLARED
+            // TYPE, so they govern different spellings and neither alone is a
+            // fix. See the commit body for the measured patch matrix.
+            //
+            // ⚠ AND IT IS NOT AN UNCONDITIONAL `true` EITHER — same reason as
+            // the sibling above, and for the same measured reason: this loop
+            // reaches the user-class arm even when the read minted a §29.2
+            // wrap frame (a getter declaring `IEnumerable<T>` over a user-class
+            // body expression), and that frame is held by nobody but this loop.
+            // An unconditional `true` leaks it — MEASURED 6400 B in 200
+            // objects — and turns #6387's two landed tests plus #2769 / #2815 /
+            // #3356 RED. So this arm reads the SAME authority as its sibling:
+            // `propReadIterWrappedExprs_`, which the wrap helper keys on the
+            // read expression and ERASES on a decline. `fs.iterable` is lowered
+            // at the top of this function, before this arm, so the mint is
+            // already recorded. CLAIM = MINT by construction.
+            //
+            // Plus the BLOCK-bodied getter's SECOND publisher, keyed on the
+            // property rather than the read — see the sibling above for why
+            // the two keys differ and why the property-keyed verdict is the
+            // wrap-creator's own (`outWrapMade`, published by `lowerReturn`)
+            // rather than "any block-bodied getter mints". That distinction is
+            // load-bearing HERE too: this arm is the USER-CLASS path, reached
+            // when the source's declared type is a class implementing
+            // IEnumerable<T>, and a block-bodied `property Seq: SelfA get do
+            // return _a; end get; end` mints NOTHING (the declared head is not
+            // an iterator-format head) — so the holder keeps `_a` and this loop
+            // must not touch it.
+            const ast::PropertyDecl* pd6397b =
+                ps6397b && ps6397b->decl
+                    ? dynamic_cast<const ast::PropertyDecl*>(ps6397b->decl)
+                    : nullptr;
+            unsigned gk6397b = 0u;
+            if (pd6397b && propBlockGetterReturnKinds_.count(pd6397b))
+                gk6397b = propBlockGetterReturnKinds_.at(pd6397b);
+            bool minted6397b =
+                propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
+                (gk6397b & kPropGetterReturnMint) != 0 ||
+                // fix #6397 follow-up (§28.9 / §29.2, v0.338): the accessor
+                // BODY's own mint — the same third term as the sibling arm
+                // above, and for the same reason.
+                (gk6397b & kPropGetterBodyMint) != 0;
+            // Same two verdicts as the sibling above, and the same reason for
+            // the field bit: §28.2 makes a getter's field read storage its
+            // holder already keeps alive, while a getter that PRODUCES a value
+            // (`=> C.Gen()`, #1840) hands the reader one nobody else owns.
+            bool fieldLend6397b = (gk6397b & kPropGetterReturnField) != 0;
+            if (!fieldLend6397b)
+                if (const ast::Expr* eg6397b = computedGetterOf(ps6397b))
+                    fieldLend6397b =
+                        dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*eg6397b)) != nullptr;
+            sourceIsNamedOwner =
+                sema::isAutoPropertyStorageSymbol(ps6397b, ctx_) ||
+                (fieldLend6397b && !minted6397b);
         }
     }
     // fix #6376 (§28.9, §29.1, §29.11, v0.338): could the enumerator BE the

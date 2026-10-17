@@ -5970,6 +5970,24 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     accessorReturnTypeNode_ = pd->type.get();
     accessorReturnTypeFn_   = fn;
 
+    // fix #6397 (§28.9 / §29.2 / §23.3, v0.338): name the property whose
+    // accessor body is about to be emitted, so `lowerReturn`'s §29.2
+    // return-edge wrap can attribute its mint to THIS property rather than to
+    // the `return` statement it is the only node that can actually see there.
+    // Without this channel the block-bodied getter's frame is minted with no
+    // publisher at all and the for-in consumer classifies the read as a lend
+    // — MEASURED, two of #6387's landed rows and #2769's direct-for-in row
+    // then go RED with `Direct leak of 6400 byte(s) in 200 object(s)
+    // allocated from bz$prop$Seq$get`. See
+    // `propBlockGetterReturnKinds_`'s declaration in
+    // LlvmBackend_impl.hpp for why the mint cannot be keyed on the read node.
+    // The INDEXER spelling (`ensureIndexerBlockGetter`, below in this file)
+    // has the same need and is deliberately NOT wired here: no measured
+    // consumer reads the verdict for that family yet, and leaving it unwired
+    // keeps the claim honest rather than half-claimed.
+    const ast::PropertyDecl* savedAccessorPropDecl = currentAccessorPropDecl_;
+    currentAccessorPropDecl_ = pd;
+
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
     if (!builder_.GetInsertBlock()->getTerminator())
@@ -5991,6 +6009,13 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
+    // fix #6397 (§28.9 / §29.2, v0.338): close the accessor-body attribution
+    // channel opened above. Deliberately in this explicit block and NOT in
+    // `NestedBodyScope`: the guard clears state a nested body must not
+    // INHERIT, whereas this channel must be live for the whole body emission
+    // (the mint happens deep inside `lowerScopedBlock`) and restored exactly
+    // like the accessor representation pair beside it.
+    currentAccessorPropDecl_ = savedAccessorPropDecl;
     // smKind_/smStateStruct_ (#2170), currentReturnTypeNode_/
     // currentLambdaReturnSemaTy_ (#2694) and the #2703 accessor-representation
     // pair are restored by ~NestedBodyScope.
@@ -6460,8 +6485,54 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // NULL because a getter has no read expression of its own —
                 // `propReadIterWrappedExprs_` is the INLINE read site's report
                 // and must not be written from here.
+                //
+                // fix #6397 follow-up (§28.9 / §29.2 / §28.2, v0.338): …WHICH
+                // IS EXACTLY WHY THE NULL READS ABOVE ALSO LEFT THIS FACE
+                // UNPUBLISHED. With no `readExpr` the helper's `report` is a
+                // no-op (its `if (readExpr)` guard), and an accessor body has
+                // no `return` edge for `lowerReturn` to report either — so the
+                // frame minted on the very line below was held by NOBODY and
+                // announced NOWHERE. The for-in consumer read "no mint", saw a
+                // field lend, and withdrew the loop's reclamation over a frame
+                // that really existed. MEASURED on the composed tree, a
+                // `virtual` iterator-format arrow property read through a
+                // `Base`-typed receiver by a bare `for var x in b.E` leaks
+                // `Direct leak of 6400 byte(s) in 200 object(s)`, 32 bytes —
+                // one wrapper frame — per read.
+                //
+                // The verdict is published against the PROPERTY, in
+                // `propBlockGetterReturnKinds_`, for the reason
+                // `propReadIterWrappedExprs_` cannot take it: that set is keyed
+                // on the caller's READ node, and inside a memoised accessor
+                // there is no caller node — the accessor does not see it, and
+                // once the memo hits, cannot be re-entered to see it. That is
+                // the same structural reason the block-bodied twin keys on the
+                // property (see the member's declaration).
+                //
+                // §28.9 is the rule that makes publishing mandatory rather than
+                // an optimisation: the arrow spelling and the block spelling
+                // are "semantically indistinguishable at every read site", so
+                // this face owes the reader the same verdict the block face
+                // publishes — and §29.2 puts the obligation on the `using var`
+                // that wraps the source, which for a frame nobody else owns is
+                // this loop.
+                //
+                // The observation is `v != before`, the same one the helper's
+                // own `report` uses: it DECLINES by returning its input
+                // unchanged, and a decline must publish nothing — claiming a
+                // frame that was never built is a free of the caller's own
+                // value, strictly worse than the leak this closes. That is the
+                // whole reason the verdict travels out of the wrap creator
+                // rather than being re-derived from "there is a getter here":
+                // a DECLINING arrow getter and a MINTING one are the same static
+                // shape — receiver type, declared type, body expression — and
+                // only the wrap creator's own return value tells them apart.
+                llvm::Value* unwrappedBeforeBodyWrap6397 = v;
                 v = wrapPropertyArrayAsIEnumerable(v, retTyRef, getterExpr,
                                                    /*readExpr=*/nullptr);
+                if (pd && v && unwrappedBeforeBodyWrap6397 &&
+                    v != unwrappedBeforeBodyWrap6397)
+                    propBlockGetterReturnKinds_[pd] |= kPropGetterBodyMint;
                 // #2491 (twin of #2434): the property getter body's return
                 // expression failed to lower — this site bypasses emitReturn
                 // (calls CreateRet directly), so the `v ? v : null` fallback
@@ -9809,8 +9880,29 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
                 srcIsNamedOwner = true;
             }
         }
-        return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy,
-                                          /*ownsSrc=*/!srcIsNamedOwner);
+        // fix #6397 (§28.9 / §29.2 / §23.3, v0.338): REPORT this family's
+        // mint. Every OTHER arm of this function sets `outWrapMade` before it
+        // returns; this one — a tail `return` — did not, so the out-parameter
+        // silently under-reported. It is not a cosmetic gap: the user-class
+        // family is precisely what a BLOCK-bodied getter's RETURN edge mints
+        // (`property Seq: IEnumerable<int> get do return Raw; end get; end`
+        // over a class implementing IEnumerable<T>), so with the flag stuck
+        // `false` the for-in consumer classified that read as a lend and NOBODY
+        // reclaimed the frame — MEASURED, #6387's two landed rows go RED with
+        // `Direct leak of 6400 byte(s) in 200 object(s) allocated from
+        // bz$prop$Seq$get`.
+        //
+        // The observation is `wrapped != v`, the same one
+        // `wrapPropertyArrayAsIEnumerable`'s `report` uses: that helper DECLINES
+        // by returning its input unchanged (no `GetEnumerator`, no concrete
+        // enumerator class, no vtable), and a decline must not publish a claim
+        // over a frame that was never minted — that is a free of the caller's
+        // own value, strictly worse than the leak this closes.
+        llvm::Value* wrapped = wrapUserClassAsIEnumerable(
+            v, actualTy->declaration, targetTy,
+            /*ownsSrc=*/!srcIsNamedOwner);
+        if (outWrapMade && wrapped && wrapped != v) *outWrapMade = true;
+        return wrapped;
     }
     return v;
 }

@@ -1489,6 +1489,103 @@ private:
     // was never minted is a double-free — strictly worse than the leak this
     // closes. CLAIM = MINT by construction, per #3384's shape.
     std::unordered_set<const ast::Node*> propReadIterWrappedExprs_;
+    // fix #6397 (§28.9 / §29.2 / §23.3, v0.338): the BLOCK-bodied
+    // property-getter twin of the set above, keyed on the `ast::PropertyDecl`
+    // whose accessor minted the frame.
+    //
+    // WHY IT CANNOT SHARE THE SET ABOVE. That set is keyed on the READ
+    // EXPRESSION, because its only writer — `wrapPropertyArrayAsIEnumerable`,
+    // LlvmBackend_Assign.cpp:9890 — runs INLINE at the read site, inside the
+    // reading function, and is handed the read node to key on. The block-bodied
+    // getter's mint is made somewhere else entirely: the accessor is emitted as
+    // a SEPARATE, MEMOISED function (`ensurePropertyBlockGetter`), and the wrap
+    // fires on its RETURN edge (`lowerReturn`, LlvmBackend_Stmts.cpp), so the
+    // node available there is the accessor's own `return` statement — not the
+    // caller's read node, which the accessor does not see and, once the memo
+    // hits, cannot see at all. MEASURED consequence of publishing nothing:
+    // with the read-expr-keyed consumer reading this site,
+    // `wrap_property_read_is_a_lend_6387`'s two landed rows go RED with
+    // `Direct leak of 6400 byte(s) in 200 object(s) allocated from
+    // bz$prop$Seq$get`, and `codegen_block_bodied_ienumerable_property_bound_
+    // disposal_2769`'s direct-for-in row goes RED the same way.
+    //
+    // WHY THE VERDICT IS STILL A MINT AND NOT A NAME-LIST. The writer is
+    // `wrapAsIEnumerableForTarget`'s own `outWrapMade` out-parameter, taken at
+    // the return edge, so CLAIM = MINT holds by construction and a DECLINE
+    // erases — the same identity the set above records. That erase is
+    // load-bearing in this direction too, and is the reason a block-bodied
+    // `property Seq: IEnumerable<int> get do return _seq; end get; end` over
+    // an `owned _seq: IEnumerable<int>` does NOT claim: there the wrap-creator
+    // declines (the returned value already HAS the declared head) and the
+    // holder's field keeps the reclamation obligation (§28.2).
+    //
+    // SECOND BIT, AND WHY IT IS NOT OPTIONAL. The mint alone does not decide
+    // the for-in consumer: a getter may also hand back a value NOBODY else
+    // owns, with no §29.2 wrap anywhere in the picture. #1840's landed rows
+    // pin exactly that — `public property Seq: IEnumerable<int> => C.Gen();`
+    // over a yielding `Gen()`, where the 40-byte iterator `Gen()` allocates is
+    // the LOOP's to reclaim ("the for-in iterates that fresh value and MUST
+    // dispose the source frame at loop end"). MEASURED: a consumer keyed on
+    // the mint alone classifies that read as a lend and
+    // `forin_computed_property_ienumerable_1840`'s member-access row goes RED
+    // with `Direct leak of 40 byte(s) in 1 object(s) allocated from
+    // bz$M.C$Gen`. So the classification the consumer needs is not "did a
+    // wrap fire" but "is the value the receiver's own storage", and the two
+    // bits below are what answers it without re-deriving either half:
+    //
+    //   kPropGetterReturnMint — a §29.2 wrapper frame was minted on a return
+    //     edge; nobody but the reader owns it, whatever the getter's body is.
+    //   kPropGetterReturnField — EVERY return edge of this accessor hands
+    //     back a FIELD read, i.e. storage its holder already keeps alive
+    //     (§28.2: "reclaimed … at its holder's release point … and nowhere
+    //     else"). A field of ANY holder counts, not only the receiver's: the
+    //     §28.2 rule does not care which holder, only that one exists.
+    //
+    // The converse case is deliberately left as the PRE-EXISTING claim rather
+    // than given a bit: a return edge whose expression is a PROPERTY read (a
+    // chain, `return _inner.Items;`) is neither directly provable as storage
+    // nor as a producer, and it already classifies as a claim today.
+    //
+    // Bit discipline: each edge SETS or CLEARS each bit (last edge wins, as
+    // `wrapPropertyArrayAsIEnumerable`'s `report` does), so a decline never
+    // leaves a stale WRAPPED verdict behind for a read lowered more than once.
+    static constexpr unsigned kPropGetterReturnMint  = 1u << 0;
+    static constexpr unsigned kPropGetterReturnField = 1u << 1;
+    // fix #6397 follow-up (§28.9 / §29.2, v0.338): the ACCESSOR-BODY writer's
+    // mint bit, the half of this map the block path above cannot reach. §28.9
+    // requires "the two accessor body spellings of §23.3 (`get => e` and
+    // `get => do … end`) [to be] semantically indistinguishable at every read
+    // site", so the face on which the arrow body is emitted as a SEPARATE
+    // function owes the reader exactly the verdict the block face publishes.
+    //
+    // WHY IT IS A SEPARATE BIT AND NOT `kPropGetterReturnMint`. The two bits
+    // carry OPPOSITE update discipline, which is the whole reason they cannot
+    // be one bit. The block bit is set-OR-CLEAR per return edge (last edge
+    // wins, as `wrapPropertyArrayAsIEnumerable`'s `report` does): a block getter
+    // has several edges and a declining one must erase a stale verdict. The
+    // body writer has ONE wrap site per accessor emission, and the accessor is
+    // emitted once per dispatch class and per specialisation tag — so a
+    // DECLINE in one emission must not erase a mint another emission really
+    // made. Erasing would move a genuine mint back to "no frame was minted",
+    // which is precisely the leak this bit exists to close. This bit is
+    // therefore SET-ONLY, and only ever by an OBSERVED mint, so it can never
+    // publish a claim over a frame that was not built — the safe direction.
+    //
+    // (The map's NAME is the block path's historical one; it is keyed on the
+    // property for every accessor face, which is what both writers share.)
+    static constexpr unsigned kPropGetterBodyMint    = 1u << 2;
+    std::unordered_map<const ast::Node*, unsigned> propBlockGetterReturnKinds_;
+    // fix #6397 (§28.9 / §29.2, v0.338): the `ast::PropertyDecl` whose
+    // accessor body is being emitted RIGHT NOW, published by
+    // `ensurePropertyBlockGetter` (LlvmBackend_Assign.cpp) around its
+    // `lowerScopedBlock` call so `lowerReturn` can attribute its mint to a
+    // property. Deliberately NOT a member of `NestedBodyScope` (which clears
+    // the accessor's own return-contract pair, #2703/#2694): that guard exists
+    // to stop a nested body INHERITING the caller's per-body state, whereas
+    // this channel must survive into the callee for the whole body emission
+    // and be restored by the same explicit save/restore block the accessor
+    // representation pair sits in.
+    const ast::PropertyDecl* currentAccessorPropDecl_ = nullptr;
     // §27.5 / #673: for boxed NON-FOR-VAR locals, maps each cell-holder alloca
     // (newSlot) to the ORIGINAL pre-boxing alloca (the variable's original
     // storage slot).  After boxing, the original slot is kept in sync on every
