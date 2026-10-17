@@ -2297,23 +2297,109 @@ Symbol* Resolver::lookupName(std::string_view name, Scope* scope) {
 // under a colliding name `Color` also unblocks — and there the name resolves to
 // the very `Color` the declared type's head names, which is what the spelling
 // asked for.
-static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name) {
-    if (!m || !m->decl) return false;
+//
+// ⚠ BOTH SOURCES (#4539) — and that is what each `SEAM-ACCESSOR` below is
+// claiming, so it has to be true of the whole predicate rather than of the
+// ladder alone. `check_imported_symbol_reads.py` CLASS 3 counts a
+// `dynamic_cast` on `Symbol::decl` because `ModuleLoader` leaves that null for
+// an IMPORTED member: the spelling-only form answered the substantive question
+// "is the colliding name this member's own declared type?" with a silent "no"
+// across a module boundary, which is exactly the wrong-but-quiet shape that
+// family exists to catch. So the declared type is resolved through the AST when
+// there is one and through the loader's OWN side tables when there is not —
+// `SemaContext::importedMemberType` / `importedReturnType`, the same two tables
+// `storageComponentType` and the §28.5 owning-element walk consult.
+//
+// WHY NOT ROUTE THROUGH AN EXISTING SANCTIONED ACCESSOR — this is the reason
+// each `SEAM-ACCESSOR` below carries, not only the marker. Four are available
+// (`storageComponentType`, `methodReturnResolvedType`, `eventPayloadResolvedType`,
+// `formalParamResolvedType`) and all four were rejected, for two separate
+// reasons. (a) COVERAGE: `storageComponentType` covers a `FieldSymbol` and a
+// `PropertySymbol` and returns null for every other member kind, so routing the
+// carve-out through it would narrow the predicate from six member kinds to two
+// and flip cases §2.7's warning row admits — a behaviour change smuggled in as a
+// plumbing fix, and row 10
+// (`spec_2_7_property_color_color_carve_out_in_a_top_level_body`) — and its
+// nested twin, row 9 — ARE that `property Color: Color` carve-out. The three
+// return/payload accessors do not cover fields, properties or consts at all.
+// (b) THE RESOLVED-TYPE TRAP, which is the one that would bite even if
+// coverage were fixed: all four answer the
+// RESOLVED type, whereas the head test below reads `TypeRef::headName()`, which
+// PREFERS `aliasResolvedHead` (`TypeRef.cpp:1462`). For a member declared as
+// `property Color: Alias` where `Alias` is a §27.8 alias of `Color`, the
+// accessors hand back the alias's resolved TARGET and the predicate would
+// compare that target's head instead of the declared spelling — silently
+// flipping the very `property Color: Color` carve-out §2.7's warning row
+// depends on. That is a predicate change, i.e. a behaviour flip, and it is the
+// reason the head test stays on `headName()` rather than on any resolved-type
+// reader.
+//
+// ⚠ THE IMPORTED FALLBACK IS CURRENTLY UNREACHABLE, and that is MEASURED on
+// this file rather than assumed. `enclosingTypeMemberBlocksBareName` — this
+// predicate's only caller (itself called once, from the `typeBodyScopes_` walk
+// at the end of `lookupBareTypeName`) — reaches members only through
+// `Resolver::typeBodyScopes_`, which has exactly one push site, this file's
+// `resolveTypeDecl` (line 1425; the matching pop is line 1830), and
+// `resolveTypeDecl` has exactly two call sites, both in this file and both
+// driven by the local AST (line 1164's module walk, and line 2258's §11.3
+// nested-type loop, which is itself inside that walk). `ModuleLoader` never
+// calls it: it populates `importedByModule_` and reconstructs an imported
+// type's `enclosingTypePath` directly (`ModuleLoader.cpp:799` and `:6220`), so
+// an imported type never acquires a `typeBodyScopes_` entry and never reaches
+// this predicate. Every member consulted here is therefore locally collected
+// and carries a `decl`.
+//
+// ⚠ THAT PREMISE HAS NOTHING GUARDING IT. There is no invariant check, no
+// assertion and no test behind "one push site": a second `typeBodyScopes_`
+// push reachable for a reconstructed/imported type, or a
+// `ModuleLoader`-side `resolveTypeDecl` call, would make the fallback reachable
+// and this comment's reachability claim false with nothing turning red. It is
+// stated here rather than assumed precisely because this commit is the one
+// adding the fallback those two sites would be exercising. That is also the
+// reason this predicate is deliberately NOT registered in
+// `check_seam_accessor_conformance.py`: a registered accessor owes a
+// `tests/module/` cross-module row, and with the reachability above no
+// reachable program could discharge it.
+static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name,
+                                        const SemaContext& ctx) {
+    if (!m) return false;
     const ast::Type* ty = nullptr;
-    if (const auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
-        ty = pd->type.get();
-    else if (const auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
-        ty = fd->type.get();
-    else if (const auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl))
-        ty = md->returnType.get();
-    else if (const auto* od = dynamic_cast<const ast::OperatorDecl*>(m->decl))
-        ty = od->returnType.get();
-    else if (const auto* ed = dynamic_cast<const ast::EventDecl*>(m->decl))
-        ty = ed->type.get();
-    else if (const auto* cd = dynamic_cast<const ast::ConstDecl*>(m->decl))
-        ty = cd->type.get();
-    if (!ty || !ty->name || ty->name->parts.empty()) return false;
-    return ty->name->parts.front() == name;
+    if (m->decl) {
+        // SEAM-ACCESSOR: the both-sources arm — a member's DECLARED type read
+        // off the local AST, with the imported-side tables at the end of this
+        // predicate as the second source (#4539). Exempting this read is only
+        // truthful because that second source exists; see the note above.
+        if (const auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+            ty = pd->type.get();
+        // SEAM-ACCESSOR: ditto — FieldDecl arm of the same both-sources read.
+        else if (const auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+            ty = fd->type.get();
+        // SEAM-ACCESSOR: ditto — MethodDecl arm; a return type is a declared type.
+        else if (const auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl))
+            ty = md->returnType.get();
+        // SEAM-ACCESSOR: ditto — OperatorDecl arm.
+        else if (const auto* od = dynamic_cast<const ast::OperatorDecl*>(m->decl))
+            ty = od->returnType.get();
+        // SEAM-ACCESSOR: ditto — EventDecl arm.
+        else if (const auto* ed = dynamic_cast<const ast::EventDecl*>(m->decl))
+            ty = ed->type.get();
+        // SEAM-ACCESSOR: ditto — ConstDecl arm.
+        else if (const auto* cd = dynamic_cast<const ast::ConstDecl*>(m->decl))
+            ty = cd->type.get();
+    }
+    const TypeRef* dt = ty ? ctx.resolvedType(*ty) : nullptr;
+    // The imported side, keyed by the member symbol rather than by an ast::Type
+    // node (there is none) — see the both-sources note above.
+    if (!dt) dt = ctx.importedMemberType(m);
+    if (!dt) dt = ctx.importedReturnType(m);
+    if (!dt) return false;
+    // `TypeRef::headName` is the ONE sanctioned reader for a Named TypeRef's
+    // head (#1462): the use-site head when there is an AST, the metadata
+    // `importedName` when there is not. Reading the raw `astNode->name` here
+    // instead — which is what this predicate did — is the same wrong-but-quiet
+    // shape one level down, and it is the only reader that would answer the
+    // carve-out differently across a module boundary.
+    return dt->headName() == name;
 }
 
 // fix #6383 follow-up (§2.7 "Through nesting", v0.338): does `owning` declare
@@ -2353,7 +2439,7 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
         if (!m || m->name != name) continue;
         // A nested type is admitted by bare name (§2.7 "Through nesting").
         if (dynamic_cast<const NestedTypeSymbol*>(m)) continue;
-        if (memberDeclaresCollidingName(m, name)) continue;  // §2.7 carve-out
+        if (memberDeclaresCollidingName(m, name, ctx_)) continue;  // §2.7 carve-out
         const auto* member = dynamic_cast<const MemberSymbol*>(m);
         if (member && !ownBody &&
             (member->visibility == ast::Visibility::Private ||

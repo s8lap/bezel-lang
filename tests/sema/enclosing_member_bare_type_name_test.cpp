@@ -63,23 +63,35 @@
 //     type-name search. Row 11 pins that; row 12 pins that the spelling resolves
 //     there (so row 11's acceptance is a resolution, not a silent
 //     non-diagnostic).
-//   * 13/14/17— ACCESSIBILITY (§13.2), as a triple. A `private` member of an
+//   * 13/14/15— ACCESSIBILITY (§13.2), as a triple. A `private` member of an
 //     OUTER enclosing type is not accessible from the nested body, and neither is
 //     a `protected` one (a nested type does not derive from the type that
-//     encloses it), so neither may end the search — rows 13/17. Row 14 is the
+//     encloses it), so neither may end the search — rows 13/15. Row 14 is the
 //     same member made `public`, which does. Together they say accessibility is
 //     what separates them, not the member's mere existence.
-//   * 18      — the `ownBody` half of that filter: a `private` member of the type
+//   * 16      — the `ownBody` half of that filter: a `private` member of the type
 //     whose OWN body names it IS accessible there (§13.2 — `private` is
 //     reachable within the declaring type), so it does end the search. Row 14's
 //     `private` twin would be a false rejection.
-//   * 19      — the RESOLVER/§12.9-CHECK COUPLING; see its own comment.
+//   * 17      — the RESOLVER/§12.9-CHECK COUPLING; see its own comment.
 //
 // A stop that fired without a member (row 2/12), fired on the wrong member kind
 // (rows 4/5/6), fired on an outer type before an inner one (rows 7/8), fired on
-// an inaccessible member (13/17), failed to fire on an accessible one (14/18),
+// an inaccessible member (13/15), failed to fire on an accessible one (14/16),
 // fired inside the carve-out (9/10), or reached past a nested body (11/12) is
 // caught by exactly one of these.
+//
+// NOT PINNED, AND DELIBERATELY SO — the two stop SOURCES the implementation
+// declines. Both are recorded as issues rather than asserted here, because a row
+// asserting the current behaviour would enshrine an acceptance §2.7 forbids and
+// a row asserting the correct behaviour is red; both need the ruling first.
+//   * BASE TYPES — a member INHERITED from a base of an enclosing type does not
+//     end the search (#6400, spec-question: rule 1's ranking paragraph says
+//     "inherited included", the stop paragraph enumerates only enclosing links).
+//   * §21.10 LOCAL TYPES — a local type gets no body scope of its own, so the
+//     stop cannot fire at the LOCAL TYPE itself, and a local type declared in a
+//     TOP-LEVEL body is stopped by neither link (#6401). §2.7's paragraph
+//     explicitly follows local-type bodies, so this is a silent acceptance.
 
 #include "support/aot_result_asserts.hpp"  // diagnosticMessageContains,
                                            // failedAtCompileTimeWithRealLocation
