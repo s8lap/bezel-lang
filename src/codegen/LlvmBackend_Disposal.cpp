@@ -926,6 +926,39 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
     // circuit the explicit-Dispose chain (#2969) — two established predicates,
     // brought together here so the frame path matches them.
     const sema::TypeRef* pt = paramTypeOf(p);
+    // fix #6367 (§28.3 / §28.8 / §14.1, v0.338): resolve the DECLARED type
+    // through the ACTIVE generic substitution before any arm reads it. This is
+    // the frame-side twin #6337 added to `registerUnwindOwnedParam` (the
+    // callee-side end) for the SAME population: an `owned t: T` parameter of a
+    // GENERIC method has `pt` = a bare type-parameter TypeRef
+    // (`declaration == nullptr`, head name `T`), so arm (3)'s
+    // `pt->declaration` test and `isBuiltinExceptionTypeRef(pt)` (which
+    // resolves the astNode NAME in `builtinVtable_`) both miss it and arm (5)
+    // fires. The two ends disagreed for the generic spelling: the callee twin
+    // substituted, the frame twin did not.
+    //
+    // #6337's own measured shape, carried to the frame end: `async method
+    // Take<Exception>(owned e: T)` called as `Take<Exception>(new
+    // IOException("abc"))` leaked 20,000 B / 500 allocs at 500 iterations, with
+    // the arm-(5) `internal:` warning raised FOUR times per declaration (the
+    // success edge, the fault edge, and the two state-machine emission paths
+    // that reach this routing decision).
+    //
+    // WHY IT IS SAFE HERE — the over-release hazard this twin carries. The
+    // substitution can bind `T` to a VALUE type (`Take<int>(5)`), where
+    // `resolveTypeParamRef` returns a PRIMITIVE TypeRef, not a Named one. Every
+    // arm below is gated on `TypeRef::Kind::Named` or on a builtin NAME, so a
+    // primitive substitution falls through all of them to arm (5) and is left
+    // un-reclaimed — which is CORRECT: there is nothing to reclaim. It cannot
+    // reach arm (2) (a primitive has no builtin class name), arm (3) (not
+    // Named), or arm (4) (not Named). `resolveTypeParamRef` is the SAME
+    // function `registerUnwindOwnedParam` already applies at this very
+    // population for this very reason, and it returns its argument unchanged
+    // when `genericSubstSemaTy_` is empty or the head is not bound, so a
+    // non-generic declaration is untouched. Pinned by
+    // `generic_owned_param_value_substitution_is_never_freed` in
+    // `async_owned_generic_param_frame_discharge_6367_test.cpp`.
+    pt = resolveTypeParamRef(pt);
     std::string_view bn = pt ? builtinTypeName(pt) : std::string_view{};
     if (!bn.empty() && common::isVtableLessBuiltinClassName(bn)) {
         if (emitVtablelessBuiltinRelease(bn, obj)) return;
