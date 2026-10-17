@@ -22767,6 +22767,30 @@ private:
     // already be null-checked by the caller (each loop's null guard is also its
     // runtime moved-from test); the caller nulls the slot afterwards.
     void emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj);
+    // fix #6368 (§28.11 / §28.3 / §30.1, v0.338): release an `owned` ASYNC
+    // CAPTURE whose declared type is a vtable-less built-in COLLECTION
+    // (`Array<T>` / `Dictionary<K,V>` / `LinkedList<T>` / `Set<T>` / `Stack<T>`
+    // / `Queue<T>` and their `Owning*` siblings).
+    // Returns false for every other declared type. The classification is
+    // `buildCollectionTempDisposal`'s — the same helper `registerUnwindOwnedParam`
+    // (#3033) and `registerUsingDisposal` use for the callee and `using var`
+    // spellings — so the frame end cannot drift from them; the element-slot
+    // disposer is a function of the element TYPE, which is why this is not a
+    // name-keyed `classifyVtablelessBuiltinRelease` arm. The admitted set is
+    // EXACTLY `registerUnwindOwnedParam`'s, so the frame is never WIDER than
+    // the callee end it mirrors.
+    //
+    // Deliberately EXCLUDES every built-in collection INTERFACE head — the
+    // non-list ones (`IEnumerable<T>` / `IReadOnlyCollection<T>` /
+    // `ICollection<T>` / `IOwningCollection<T>` / `IAsyncEnumerable<T>`) AND
+    // the list ones (`IList<T>` / `IReadOnlyList<T>` / `IOwningList<T>`): every
+    // one of them is in `kBuiltinInterfaceHeads` (#2921 / #2923), so a user
+    // class may implement it and the runtime value is then vtable-bearing.
+    // At this site the declared type does not determine the runtime kind, so no
+    // sound static release exists for any of them. See the definition's
+    // comment, which carries the measurements.
+    bool emitOwnedCaptureCollectionRelease(const sema::TypeRef* pt,
+                                           llvm::Value* obj);
     // §28.3 / §30.5 (#1905): dispose an already-evaluated owned Task-family
     // value with the complete protocol (fault object, unconsumed owned result,
     // then fire-and-forget/free). Used at an unbound task receiver's full-

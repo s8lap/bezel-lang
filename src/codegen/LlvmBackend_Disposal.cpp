@@ -897,6 +897,12 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
 //       vtable-less builtin has no arm there yet, an `internal:` warning is
 //       raised and the slot is left untouched — the same #2992 "leak before
 //       wild-jump" trade the `using var` chain makes, applied here too.
+//       (2a) fix #6368 — the vtable-less BUILT-IN COLLECTION family
+//       (`Array<T>` / `Dictionary<K,V>` / `LinkedList<T>` / `Set<T>` / …),
+//       which arm (2) reached but `classifyVtablelessBuiltinRelease` has no
+//       arm for. See the `ownedCaptureCollectionRelease` comment below for why
+//       the collection release is NOT a name-keyed `emitVtablelessBuiltinRelease`
+//       arm and is dispatched through `buildCollectionTempDisposal` instead.
 //   (3) Recognised class (user class / builtin exception / imported user
 //       class) — has a real vtable, vtable dispatch is correct
 //       (`emitDisposeAndReclaim`). NOTE (fix #6345): the comment here used to
@@ -913,6 +919,174 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
 // together enumerate the three shapes an `owned` capture's declared type can
 // take, so the negative list's silent-fail mode is gone; a future built-in
 // either enters (2) (after its arm lands) or hits the (2)-no-arm warning.
+// fix #6368 (§28.11 / §28.3 / §28.9 / §30.1, v0.338): release an `owned` ASYNC
+// CAPTURE whose declared type is a vtable-less BUILT-IN COLLECTION
+// (`Array<T>` / `Dictionary<K,V>` / `LinkedList<T>` / `Set<T>` / `Stack<T>` /
+// `Queue<T>` and their `Owning*` siblings). Returns false for every other
+// declared type, so the caller falls through to the arms below unchanged.
+//
+// THE DEFECT THIS CLOSES. `emitOwnedParamCaptureDispose`'s arm (2) routes every
+// `common::isVtableLessBuiltinClassName(bn)` receiver through
+// `emitVtablelessBuiltinRelease`, whose `classifyVtablelessBuiltinRelease` name
+// table covers 18 non-collection built-ins. A COLLECTION is vtable-less by the
+// same predicate and had no arm, so the compiler said so out loud and left the
+// backing un-reclaimed on every async-frame teardown:
+//
+//   internal: emitOwnedParamCaptureDispose: vtable-less built-in class 'Array'
+//   has no release arm; the slot is left un-reclaimed (a bounded leak)
+//   — extend emitVtablelessBuiltinRelease to reclaim it; #3157
+//
+// MEASURED on 85a3cb36: `async method Take(owned a: Array<int>)` called 500×
+// reported `SUMMARY: AddressSanitizer: 60000 byte(s) leaked in 1000
+// allocation(s)` (2 allocations × 60 B per call — the `bz_array_t` header and
+// its data buffer). The same shape on a `Dictionary<int, string>` reported
+// 210,000 B.
+//
+// WHY THIS IS NOT A NEW ARM IN `classifyVtablelessBuiltinRelease`. That
+// function's parameter is a NAME (`std::string_view bn`), chosen by
+// fix-forward #4185 so the classify/emit split has no IR side effects and both
+// consumers share one list. A collection's release is NOT name-keyed, though:
+// it is the runtime free function PLUS the §28.11 element-slot disposer, and the
+// latter is a function of the collection's ELEMENT TYPE, which the head name
+// does not carry. `Array<int>` (a §28.11 VALUE slot, null disposer) and
+// `Array<Cell>` (a BORROW slot, also null) and `Array<string>` (a runtime-
+// managed slot, the string-release thunk) are the SAME `bn`. Putting the
+// element-type read behind a name-only classifier would either widen that
+// function's parameter to a `TypeRef` — undoing #4185's stated design — or
+// smuggle a second, collection-only name table beside it, which is exactly the
+// two-lists-drift shape #4185 round 2 removed.
+//
+// So the classification is NOT re-derived here. It is `buildCollectionTempDisposal`
+// — the SAME (slot, TypeRef) → `Disposal` helper `registerUnwindOwnedParam`
+// already calls for a collection-typed `owned` PARAMETER on the callee side
+// (#3033), and the same one `registerUsingDisposal` calls for a named
+// `using var` collection local. It already picks the right runtime free
+// (`bz_array_free` / `bz_llist_free` / `bz_dict_free`), the right §28.11
+// element/value disposer via `elementPolicyFor`, the `Set<string>` string-key
+// release, the dict value-box freer, and the dict-backed-vs-array-backed `Set`
+// choice. Routing the frame capture through it is what keeps the three ends
+// (frame / callee / `using var`) from drifting.
+//
+// §28.11 ANSWERS "is `bz_array_free` the right release for `Array<T>`?" — yes,
+// with the disposer the element's CATEGORY requires and no other. stdlib §4.4:
+// "`Array<T>` stores borrows … The array's `Dispose()` is a no-op — `Array<T>` is
+// trivial-dispose (language spec §28.9): the backing storage is part of the
+// instance's single allocation, released with it by the compiler-inserted free
+// at the array's owner's release point — and the elements are not disposed."
+// That is the same shape the `StringBuilder` arm above uses `bz_array_free` for,
+// but NOT the same wiring: a `StringBuilder` OWNS a +1 per string part and
+// passes the string-release thunk, while a borrowing `Array<T>` owns nothing
+// per element and passes null (or, for the owning family, the §28.11
+// class-element cascade). `buildCollectionTempDisposal` derives which, from the
+// element type; this function adds no opinion of its own.
+//
+// WHY THE FRAME AND NOT THE CALLEE. #3033 already gave the SYNC spelling of
+// this exact defect a release: MEASURED on this tree, `static method
+// Take(owned a: Array<int>)` called 500× leaks NOTHING and exits with the
+// spec-computed value. An async method never reaches that callee edge at
+// teardown — the value lives in the FRAME, and the frame's terminal auto-dispose
+// is the only code that can reclaim it (§30.1: "`owned` parameters transfer into
+// the frame … any `owned` parameter never moved out is disposed by the frame
+// when the task reaches its terminal state"). #6337's own comment records the
+// identical split for the §31.4 exception population. So the two ends disagreed
+// and only the frame end was wrong.
+//
+// NO INTERFACE HEAD IS ADMITTED, and that is the load-bearing scope decision of
+// this function — for the enumeration heads AND for the LIST heads
+// (`IList<T>` / `IReadOnlyList<T>` / `IOwningList<T>`).
+//
+// At this site the declared type does not determine the runtime kind. The
+// registry says so directly: `isVtableLessBuiltinClassName(n)` is
+// `isReservedBuiltinTypeName(n) && !contains(kBuiltinInterfaceHeads, n)`
+// (BuiltinRegistry.cpp, #2921 / #2923), and `kBuiltinInterfaceHeads` holds
+// exactly `IList`, `IOwningList` and `IReadOnlyList` as the subset whose
+// runtime value MAY BE A USER CLASS — the exact COMPLEMENT of
+// `isVtableLessBuiltinClassName`. §8.1 makes such a user class legal and the
+// compiler accepts it with no diagnostic, so a `bz_array_t*`-backed `Array<T>`
+// and a vtable-bearing `class MyL: IList<int>` arrive at this same capture
+// under the same declared spelling.
+//
+// `IEnumerable<T>` and its siblings (`IEnumerator<T>`, `IReadOnlyCollection<T>`,
+// `ICollection<T>`, `IOwningCollection<T>`, `IAsyncEnumerable<T>`) fail for the
+// same reason, and admitting them would be a use-after-free rather than a fix.
+// Freeing the array-backed member needs `bz_array_free(arr, null)`; freeing the
+// user-class member needs vtable slot-2 dispatch, because the object's first
+// word is a vtable pointer and `bz_array_free` would read the vtable as a
+// length. MEASURED on 85a3cb36, the SAME `owned e: IEnumerable<int>` capture
+// receives both.
+//
+// An earlier revision of this function DID admit the two list heads
+// (`isBorrowingListInterfaceName` / `isOwningListInterfaceName`) on the
+// strength of a comment asserting "the compiler KNOWS those are array-backed".
+// MEASURED, that assertion is refuted by `kBuiltinInterfaceHeads` above, and
+// the admission converted a loud bounded leak into a WILD FREE: with
+// `async Take(owned x: IList<int>)` receiving `new MyL()` where
+// `class MyL: IList<int>`, ASan reported
+// `SEGV on unknown address in __asan::Allocator::Deallocate <- free <-
+// bz_array_free` (bezel_runtime_collections.cpp:351), and the SAME program
+// without `--sanitize=address` died `Segmentation fault (core dumped)` / exit
+// 139, where the un-fixed tree merely leaked 80 B / 5 allocs behind the arm-(5)
+// `internal:` warning. The same held for `IOwningList<Cell>`.
+//
+// The list heads were ALSO wider than the callee end this function mirrors:
+// `registerUnwindOwnedParam`'s collection branch admits only
+// `isLinkedListTypeName(rt) || isDictTypeName(rt) || isCollectionTypeName(rt)`
+// — never the list interfaces — so the frame widened PAST the callee in
+// precisely the unsound direction, defeating the "the three ends cannot drift"
+// argument above. Excluding the list heads restores exact frame/callee parity.
+//
+// The leak for the whole interface-head population therefore remains, and it
+// remains LOUD — arm (5) still raises its `internal:` warning rather than
+// freeing unsoundly, which is the deliberate #3157 trade and the whole point:
+// a leak the compiler announces beats a SEGV it does not. It is reported in the
+// commit body and tracked for a runtime kind tag (#6368), not coded around
+// here. The four rows in `async_owned_builtin_collection_param_6368_test.cpp`
+// that pass a user-class member, an array-backed member, and both list heads
+// through this same capture are what make that polymorphism an ASSERTED
+// property of this site rather than a claim in a comment.
+bool Emitter::emitOwnedCaptureCollectionRelease(const sema::TypeRef* pt,
+                                                llvm::Value* obj) {
+    // Only the CONCRETE array/llist/dict-backed built-in names — exactly the
+    // set `registerUnwindOwnedParam` admits at the callee end, so the frame
+    // end is no WIDER than the end it mirrors. Deliberately NOT
+    // `isCollectionInterfaceName` (the non-list heads) and deliberately NOT
+    // `isBorrowingListInterfaceName` / `isOwningListInterfaceName` (the list
+    // heads): every one of those sits in `kBuiltinInterfaceHeads` (#2921 /
+    // #2923), so a user class may implement it and the runtime value is then
+    // vtable-bearing, not array-backed. See the comment above.
+    if (!pt || pt->kind != sema::TypeRef::Kind::Named || pt->declaration)
+        return false;
+    if (!isCollectionTypeName(pt) && !isLinkedListTypeName(pt) &&
+        !isDictTypeName(pt))
+        return false;
+    if (!obj || !obj->getType()->isPointerTy()) return false;
+    // `buildCollectionTempDisposal` reads its `Disposal::slot` back through
+    // `emitDisposals` (`boxedStorage(it->slot, …)` then a load), so it needs a
+    // real alloca rather than the bare `llvm::Value*` the frame loop holds.
+    // The ALLOCA goes in the entry block (a mid-block alloca is legal LLVM but
+    // costs a stack frame the resume function's own layout does not account
+    // for); the STORE goes at the CURRENT insert point, because `obj` is
+    // defined here — storing it from the entry-block builder would reference a
+    // value that does not exist yet at that point (measured: `SEGV in
+    // bz_array_free` reading a garbage pointer, the load finding whatever the
+    // uninitialised slot held).
+    llvm::IRBuilder<> entryBuilder(
+        &*currentFn_->getEntryBlock().getFirstInsertionPt());
+    llvm::AllocaInst* slot = entryBuilder.CreateAlloca(
+        ptrTy(), nullptr, "opc.coll.slot");
+    builder_.CreateStore(obj, slot);
+    Disposal d = buildCollectionTempDisposal(slot, pt);
+    // No null-guard here: every caller of this function has already emitted one
+    // (`emitAsyncOwnedParamAutoDispose` / the async-iterator Dispose sweep test
+    // the capture slot against null before routing here), and `emitDisposals`'s
+    // collection / dict / linkedList arms each re-test the loaded value against
+    // null themselves, so a null capture is a no-op rather than a wild free.
+    std::vector<Disposal> one{d};
+    emitDisposals(one, /*isUnwind=*/false);
+    return true;
+}
+// per §28.11, §28.3, §30.1, v0.338, fix #6368
+
 // // per §29.8 / §30.1, fix #3157
 void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
     // (1) Task family — emitted by #3125.
@@ -959,6 +1133,13 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
     // `generic_owned_param_value_substitution_is_never_freed` in
     // `async_owned_generic_param_frame_discharge_6367_test.cpp`.
     pt = resolveTypeParamRef(pt);
+    // (2a) fix #6368 (§28.11 / §28.3 / §30.1, v0.338): the vtable-less BUILT-IN
+    // COLLECTION family. Dispatched HERE, before arm (2)'s name table, because
+    // a collection's release is not name-keyed — see
+    // `ownedCaptureCollectionRelease`'s comment for the full argument. Placed
+    // after #6367's `resolveTypeParamRef` on purpose: a `Take<Array<int>>`
+    // capture only reaches this arm once the substitution has resolved `T`.
+    if (pt && emitOwnedCaptureCollectionRelease(pt, obj)) return;
     std::string_view bn = pt ? builtinTypeName(pt) : std::string_view{};
     if (!bn.empty() && common::isVtableLessBuiltinClassName(bn)) {
         if (emitVtablelessBuiltinRelease(bn, obj)) return;
