@@ -15044,16 +15044,17 @@ void Resolver::checkVariancePositions() {
     //
     // The enclosing type that carries the nested head is NEVER the interface
     // carrying the slot, which is why the two fixes are required together.
-    // MEASURED: §11.8 admits no nested type in an interface body
+    // the diagnostic names §11.8: an interface body rejects a nested type
     // (`interface I<out T> interface Box<in X> … end Box; end I;` →
     // `expected 'method', 'property', 'event', or 'static method'/'static
-    // operator' (§11.8) in interface body`), and §11.6's nested types live in a
-    // CLASS body ("A class body may declare nested classes, records, enums, and
-    // interfaces") or a RECORD body ("Nested types in records are permitted but
-    // uncommon") or a §21.10 local record ("A local record's own body may itself
-    // contain §11.6 nested member types") — never an interface's. So the
-    // enclosing member step could never fire for a body the old loop visited,
-    // and the new arm would have been dead code without this traversal.
+    // operator' (§11.8) in interface body`). The spec does not state this
+    // prohibition explicitly; §11.2's examples show only methods/properties/events
+    // in an interface body, and §11.6 grants nested types to a CLASS body
+    // ("A class body may declare nested classes, records, enums, and interfaces")
+    // or a RECORD body ("Nested types in records are permitted but uncommon")
+    // or a §21.10 local record — never an interface's. So the enclosing member
+    // step could never fire for a body the old loop visited, and the new arm
+    // would have been dead code without this traversal.
     //
     // Only INTERFACES are COLLECTED, for the same reason the old loop followed
     // only interfaces: §12.9's `in`/`out` are interface-only syntax, so a class,
