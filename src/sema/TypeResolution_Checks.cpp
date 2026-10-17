@@ -14147,26 +14147,62 @@ struct VarianceHeads {
 // SEAM-ACCESSOR: `Symbol::decl` only, and only the declared TYPE of a
 // property/field/method/operator/event/const — no body, no initializer, no
 // `TypeDeclKind`.
+//
+// WHY THESE SIX READS ARE LOCAL-ONLY (the audit's ALREADY-CORRECT verdict,
+// #3152). `m` is drawn from `enclosing->members`, and every `enclosing` is an
+// element of `heads.enclosingChain`, which is built by exactly ONE walk: the
+// `varianceSites` collection below, rooted at `ctx_.module()->children`.
+// MEASURED: `module()->children` has exactly TWO writers in the tree —
+// `SymbolCollection.cpp:2603` (the module's own top-level declarations) and
+// `TypeResolution_Names.cpp:5484` (a §21.10 local type, itself locally
+// declared) — while `ModuleLoader` writes imported symbols into
+// `SemaContext::importedByModule_`, NEVER into the module being compiled's
+// children. Every element of the chain, and therefore every member read here,
+// is consequently a LOCAL declaration: `m->decl` IS the real local
+// `ast::*Decl`, and these casts cannot answer wrong for an import.
+//
+// NOT ROUTED THROUGH A BOTH-SOURCES ACCESSOR, deliberately. This is a test of
+// SPELLING, not of resolved-type identity. `TypeRef::headName()` prefers
+// `aliasResolvedHead` over the use-site syntactic head (see `TypeRef.hpp`'s
+// #1462 note), so a §27.8 alias — `type Color := SomethingElse` beside a member
+// spelled `Color: Color` — would compare the ALIAS TARGET's head and flip the
+// very carve-out §2.7's `property Color: Color` idiom depends on. The
+// sanctioned accessors (`storageComponentType`, `methodReturnResolvedType`,
+// `eventPayloadResolvedType`) all answer the RESOLVED type, so routing through
+// them would change the PREDICATE, not merely its provenance. A local read is
+// the correct instrument for a local-only question.
 static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name) {
     if (!m || !m->decl) return false;
     const ast::Type* ty = nullptr;
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a property's declared type.
     if (const auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
         ty = pd->type.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a field's declared type.
     else if (const auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
         ty = fd->type.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a method's return's declared type.
     else if (const auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl))
         ty = md->returnType.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — an operator's return's declared type.
     else if (const auto* od = dynamic_cast<const ast::OperatorDecl*>(m->decl))
         ty = od->returnType.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — an event's payload's declared type.
     else if (const auto* ed = dynamic_cast<const ast::EventDecl*>(m->decl))
         ty = ed->type.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a const's declared type.
     else if (const auto* cd = dynamic_cast<const ast::ConstDecl*>(m->decl))
         ty = cd->type.get();
     if (!ty || !ty->name || ty->name->parts.empty()) return false;
     return ty->name->parts.front() == name;
 }
 
-// fix #6383 follow-up (§2.7 "Through nesting", §13.2, v0.338): does `owning`
+// fix #6383 follow-up (§2.7 "Through nesting", §13.1, v0.338): does `owning`
 // declare an ACCESSIBLE member called `name` that is NOT a nested type — i.e.
 // does the bare-name search END at `owning` with no type to hand back?
 //
@@ -14182,13 +14218,15 @@ static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name) 
 // generic or not, are reached by bare name, since a nested type is one type and
 // needs no instantiation." The caller returns that type instead.
 //
-// Accessibility, under §13.2: inside the OWNING type's own body every level is
-// reachable, so nothing is filtered there. For an OUTER enclosing type,
-// `private` (reachable only within the declaring type) and `protected`
-// (reachable within the declaring type and types deriving from it — a nested
-// type is not one) are not accessible from this body and must not end the
-// search. `internal` (access within the declaring module) always is: the
-// enclosing chain can only come from the module being checked.
+// Accessibility, under §13.1 "Levels", whose four-row table reads `private` as
+// "The declaring class only", `protected` as "The declaring class and all
+// classes derived from it", and `internal` as "Code in the same module" —
+// exactly the three-way filter below. Inside the OWNING type's own body every
+// level is reachable, so nothing is filtered there. For an OUTER enclosing type,
+// `private` and `protected` are not accessible from this body (a nested type is
+// not a class deriving from the declaring one) and so must not end the search.
+// `internal` always is: the enclosing chain can only come from the module being
+// checked.
 //
 // SEAM-ACCESSOR: `Symbol::decl` (via `memberDeclaresCollidingName`),
 // `MemberSymbol::visibility`, and `NestedTypeSymbol` — all of them already read
@@ -14206,12 +14244,12 @@ static bool enclosingMemberEndsBareTypeSearch(const TypeSymbol* owning,
     if (member && !ownBody &&
         (member->visibility == ast::Visibility::Private ||
          member->visibility == ast::Visibility::Protected))
-        return false;  // §13.2 — not reachable from a nested body
+        return false;  // §13.1 — not reachable from a nested body
     return true;
 }
 
 // fix #6383 follow-up (§2.7 rule 1, §2.7 Through nesting, §2.7 warning row,
-// §11.6, §12.9, §13.2, v0.338): the same walk as #6383, with §2.7's STOP rule.
+// §11.6, §12.9, §13.1, v0.338): the same walk as #6383, with §2.7's STOP rule.
 //
 // #6383 landed this arm reading only `NestedTypeSymbol`, so a METHOD or PROPERTY
 // of the colliding name on an enclosing type did not end the walk, and #6383's
