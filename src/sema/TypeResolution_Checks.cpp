@@ -14049,15 +14049,66 @@ const TypeAliasSymbol* resolveLocalAliasHead(
     return found;
 }
 
-// How many `type A<T> := B<T>; type B<T> := C<T>; …` hops the see-through will
-// follow before giving up and yielding `Unknown`.
+// ⚠ fix #6408 (§12.9, §27.8, §11.6, Appendix C.1, v0.338): there is NO hop
+// bound on this see-through, and that is the whole fix. What stood here was
+// `kMaxAliasSeeThroughDepth = 32`, and the justification it carried ("§27.8 makes
+// a cycle a compile error … so on a program the checker accepts there is
+// nothing to hit this") covers CYCLES ONLY. A long NON-CYCLIC alias chain is
+// perfectly legal — §27.8 puts no limit on how many aliases one may chain
+// through, and §11.6 states no limit on type nesting — so the bound fired on
+// ordinary programs, and it fired SILENTLY: `composedParamPosition` returned
+// `Unknown`, which `composedVarianceViolation` treats as "no violation", so a
+// real §12.9 violation past the 32nd hop was never reported.
 //
-// §27.8 makes a cycle a compile error ("An alias may not reference itself,
-// directly or through other aliases … `type P := Q; type Q := P;`"), so on a
-// program the checker accepts there is nothing to hit this. It is a bound, not
-// a cycle detector: it exists so that a REJECTED cyclic program cannot recurse
-// until the stack is exhausted before the cycle diagnostic is reached.
-constexpr int kMaxAliasSeeThroughDepth = 32;
+// MEASURED on the base (`04d402b3`): the chain
+// `type A0<T> := A1<T>; … type A{n}<T> := Array<T>;` under
+// `Holder<out T>.Get(): A0<T>` rejects at n = 5 and n = 31 with
+// "(§12.9)" and COMPILES CLEAN (rc = 0) at n = 32, 33 and 40. The first
+// silently accepted chain is 32, one past the bound's boundary — the identical
+// shape and the identical off-by-one that #6391 measured for the sibling cap
+// in this same file, at 64.
+//
+// WHY THE BOUND IS REMOVED RATHER THAN RAISED. §12.9 states the position rule
+// with no depth qualifier — "Position is composed across nested type
+// constructors", one rule for every interface — and Appendix C.1:11596 lists
+// the invariant unconditionally ("Variant generic parameters (`in`, `out`)
+// appear only in the appropriate position"). So "the compiler cannot decide
+// this deep" is not a spec situation at all; it is this implementation
+// creating the ambiguity, and the depth at which it admits it is a property of
+// a literal in this file. A larger literal leaves the same hole one constant
+// higher. A cap that DIAGNOSED was also considered and rejected: it would make
+// a long-but-LEGAL alias chain un-compilable for a reason the spec nowhere
+// states, which is a spec ruling rather than an implementation fix (the same
+// argument, and the same refusal, as #6391 for `kMaxTypeNestingDepth`).
+//
+// WHAT REPLACES IT is a CYCLE guard — the instrument the deleted comment was
+// reaching for ("a bound, not a cycle detector"), and the right one for the
+// hazard a cap is good at. It is a PER-PATH set, not a global "seen": an alias
+// is walked once per chain that reaches it, so a DAG that reaches the same
+// alias by two routes is composed on both, exactly as before the bound.
+//
+// ON THE ORDERING RISK. A cycle guard can convert a REJECTED program into a
+// silently accepted one if it fires BEFORE §27.8's own diagnostic, which is
+// the defect class all over again. It cannot here, and the ordering is
+// structural rather than lucky: §27.8's diagnostic is emitted from
+// `Resolver::resolveNamed` (`TypeResolution_Names.cpp`, the "` alias is
+// recursive" report) during NAME RESOLUTION, which runs inside
+// `TypeResolution::run` long before `checkVariancePositions()` is reached at
+// `TypeResolution.cpp:747`. MEASURED, not assumed: `type A0<T> := A1<T>;
+// type A1<T> := A2<T>; type A2<T> := A0<T>;` reports "type alias `A1` is
+// recursive (§27.8) … may not reference itself, directly or through a chain of
+// other aliases" and exits 1 on BOTH legs. What this guard returns on a cycle
+// is `Unknown` — the same conservative non-answer every other unresolvable head
+// yields, which skips the §12.9 check rather than guessing — so even if the
+// order were reversed the cycle is still REJECTED, by §27.8, and this walk
+// merely declines to add a second opinion.
+//
+// THE RECURSION IS NOT A NEW COST, and here that needed MEASURING rather than
+// reasoning, because an alias chain is NOT nested in the source the way §11.6
+// type nesting is (#6391's argument, that the parser had already recursed
+// through the same structure, does NOT transfer: a 1000-alias chain is 1000
+// sibling top-level declarations). So the envelope was measured on both legs
+// — see the commit body and the test file's depth rows.
 
 // fix #6351 (§12.9, v0.338): the heads this pass may resolve a variance for.
 //
@@ -14559,7 +14610,9 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
                                   const std::vector<TypeSymbol*>& localTypes,
                                   const std::vector<TypeAliasSymbol*>& localAliases,
                                   const VarianceHeads& heads,
-                                  VarianceSite site, int depth);
+                                  VarianceSite site,
+                                  std::unordered_set<const TypeAliasSymbol*>&
+                                      aliasChain);
 
 // §12.9: "A type parameter inside another generic type inherits position from
 // that wrapper's variance" — so argument `argIndex` of the head spelled by
@@ -14578,7 +14631,9 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
                                  const std::vector<TypeSymbol*>& localTypes,
                                  const std::vector<TypeAliasSymbol*>& localAliases,
                                  const VarianceHeads& heads,
-                                 VarianceSite site, int depth) {
+                                 VarianceSite site,
+                                 std::unordered_set<const TypeAliasSymbol*>&
+                                     aliasChain) {
     if (!head.name || head.name->parts.empty()) return VariancePos::Unknown;
     const std::string_view h = head.name->parts.back();
     // fix #6373 (§2.2, §2.7 rule 1, v0.338): the qualifier decides which scope
@@ -14717,18 +14772,31 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
     // does not mention the parameter yields `Absent` (a phantom parameter
     // constrains no use site); an alias with no declaration, no body, or fewer
     // parameters than the use site supplies yields `Unknown`; and so does a
-    // `depth` past the cap.
+    // chain that has come back round to an alias it already holds on
+    // `aliasChain` (fix #6408 — a CYCLE, which §27.8 rejects on its own).
     if (const TypeAliasSymbol* as = resolveLocalAliasHead(head, localAliases)) {
         const auto* ad = dynamic_cast<const ast::TypeAlias*>(as->decl);
         if (!ad || !ad->aliasedType) return VariancePos::Unknown;
         if (argIndex >= as->genericParams.size()) return VariancePos::Unknown;
-        if (depth >= kMaxAliasSeeThroughDepth) return VariancePos::Unknown;
+        // fix #6408 (§12.9, §27.8, v0.338): the CYCLE guard that replaces
+        // `kMaxAliasSeeThroughDepth`. An alias is followed only if it is not
+        // already on the chain being composed, so a chain of any LENGTH is
+        // composed to its end and a cycle terminates. `Unknown` is the same
+        // conservative non-answer an unresolvable head yields, and §27.8 has
+        // already rejected the program by the time this runs — see the block
+        // comment where the constant was.
+        if (!aliasChain.insert(as).second) return VariancePos::Unknown;
+        struct ChainGuard {
+            std::unordered_set<const TypeAliasSymbol*>& set;
+            const TypeAliasSymbol* as;
+            ~ChainGuard() { set.erase(as); }
+        } chainGuard{aliasChain, as};
         const auto* aps =
             dynamic_cast<GenericParamSymbol*>(as->genericParams[argIndex]);
         if (!aps) return VariancePos::Unknown;
         return composedParamPosition(*ad->aliasedType, aps->name,
                                      VariancePos::CoVariant, localTypes,
-                                     localAliases, heads, site, depth + 1);
+                                     localAliases, heads, site, aliasChain);
     }
     // fix #6351 (§12.9, §2.2, §2.7, §13.2): a head IMPORTED from another
     // module. §12.9's rule names no module boundary — "Position is composed
@@ -14801,7 +14869,9 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
                                   const std::vector<TypeSymbol*>& localTypes,
                                   const std::vector<TypeAliasSymbol*>& localAliases,
                                   const VarianceHeads& heads,
-                                  VarianceSite site, int depth) {
+                                  VarianceSite site,
+                                  std::unordered_set<const TypeAliasSymbol*>&
+                                      aliasChain) {
     switch (t.kind) {
     case ast::TypeKind::Named: {
         if (t.genericArgs.empty())
@@ -14815,12 +14885,12 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
             const VariancePos argSlot = slotPolarity(
                 outer,
                 namedHeadArgVariance(t, i, localTypes, localAliases, heads,
-                                    site, depth));
+                                    site, aliasChain));
             if (argSlot == VariancePos::Absent) continue;
             acc = mergeVariancePos(
                 acc, composedParamPosition(*t.genericArgs[i], paramName, argSlot,
                                            localTypes, localAliases, heads,
-                                           site, depth));
+                                           site, aliasChain));
         }
         return acc;
     }
@@ -14833,7 +14903,7 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
             acc = mergeVariancePos(
                 acc, composedParamPosition(*t.funcReturn, paramName, outer,
                                            localTypes, localAliases, heads,
-                                           site, depth));
+                                           site, aliasChain));
         for (const auto& fp : t.funcParams) {
             if (!fp.type) continue;
             const bool isOut = fp.modifier == "out" || fp.modifier == "out owned";
@@ -14841,7 +14911,7 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
                 acc, composedParamPosition(*fp.type, paramName,
                                            isOut ? outer : flipVariancePos(outer),
                                            localTypes, localAliases, heads,
-                                           site, depth));
+                                           site, aliasChain));
         }
         return acc;
     }
@@ -14851,7 +14921,7 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
         if (!t.arrayElement) return VariancePos::Absent;
         return composedParamPosition(*t.arrayElement, paramName,
                                      VariancePos::Invariant, localTypes,
-                                     localAliases, heads, site, depth);
+                                     localAliases, heads, site, aliasChain);
     }
     default:
         return VariancePos::Absent;
@@ -14879,10 +14949,16 @@ bool composedVarianceViolation(const ast::Type& t,
                                const VarianceHeads& heads,
                                bool* composed = nullptr,
                                VarianceSite site = VarianceSite::Member) {
+    // fix #6408 (§12.9, §27.8, v0.338): the per-path alias chain the cycle
+    // guard cuts on. It starts EMPTY here, is pushed and popped by the alias
+    // arm of `namedHeadArgVariance` alone, and lives across the whole member
+    // walk rather than across members, so one member's chain never cuts
+    // another's. Empty at every entry point, so it can never be inherited.
+    std::unordered_set<const TypeAliasSymbol*> aliasChain;
     const VariancePos pos = composedParamPosition(
         t, paramName,
         isOutputPos ? VariancePos::CoVariant : VariancePos::ContraVariant,
-        localTypes, localAliases, heads, site, /*depth=*/0);
+        localTypes, localAliases, heads, site, aliasChain);
     if (pos == VariancePos::Unknown || pos == VariancePos::Absent) return false;
     const bool bad = paramVariance == "out" ? pos != VariancePos::CoVariant
                                             : pos != VariancePos::ContraVariant;
