@@ -899,7 +899,11 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
 //       wild-jump" trade the `using var` chain makes, applied here too.
 //   (3) Recognised class (user class / builtin exception / imported user
 //       class) — has a real vtable, vtable dispatch is correct
-//       (`emitDisposeAndReclaim`).
+//       (`emitDisposeAndReclaim`). NOTE (fix #6345): the comment here used to
+//       assert a builtin exception satisfies `pt->declaration`, which is what
+//       made the arm look complete; it carries NO declaration, so the arm
+//       needed the `isBuiltinExceptionTypeRef` twin. The discriminator is now
+//       "`declaration`, OR a precisely-recognised §31.4 built-in exception".
 //   (4) Anything else (a primitive, a borrow-only record, an alias into
 //       case (3), etc.) — `internal:` WARNING. Not the silent vtable jump.
 //
@@ -937,11 +941,53 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
         return;
     }
     // (3) Recognised class — has a vtable; `emitDisposeAndReclaim` is correct.
-    // Catches user classes (local and imported) AND built-in exceptions (whose
-    // `builtinVtable_` slot #3191 reads through). `pt->declaration` is set for
-    // all three populations and is deliberately the discriminator (the import
-    // alias / case (2) take the vtable-less path above, never this one).
-    if (pt && pt->kind == sema::TypeRef::Kind::Named && pt->declaration) {
+    // Catches user classes (local and imported) AND, since fix #6345, built-in
+    // exceptions (whose `builtinVtable_` slot #3191 reads through).
+    //
+    // fix #6345 (§28.3, §28.8, §31.4, v0.338): the discriminator used to be
+    // `pt->declaration` ALONE, and the comment here asserted that a §31.4
+    // language-built-in exception "sets" it. It does not — a built-in carries
+    // NO user TypeSymbol (`TypeRef::declaration == nullptr`), so EVERY
+    // `async method Take(owned e: Exception)` fell past case (3) AND case (4)
+    // (which requires a Named declaration-less head `IDisposable` /
+    // `IAsyncDisposable`) into case (5), where the slot is reported and left
+    // UN-RECLAIMED. MEASURED at a865fa56 on this tree's repro:
+    // `SUMMARY: AddressSanitizer: 2000 byte(s) leaked in 50 allocation(s)`
+    // (50 × the 40-byte `new IOException("a")`, 40 B per call), with
+    // `internal: emitOwnedParamCaptureDispose: unrecognised owned parameter
+    // type` raised TWICE for one declaration. The USER-class twin of the same
+    // shape (`async method Take(owned b: Boom)`, `Boom` a plain class) is CLEAN
+    // on the same binary — so this is in-family, and the predicate was the whole
+    // defect.
+    //
+    // This is the SAME declaration-blindness #6337 fixed in
+    // `registerUnwindOwnedParam`, at a DIFFERENT site: #6337 discharges the
+    // value on the callee's normal/unwind edge, and never reaches the async
+    // frame's terminal auto-dispose — the three `frame.captures` loops in
+    // LlvmBackend_Async.cpp (plain async, async-iterator Dispose) and
+    // LlvmBackend_Iterators.cpp (sync iterator). Those three all route here, so
+    // widening HERE closes all three populations at one site.
+    //
+    // SCOPE — the precise `isBuiltinExceptionTypeRef`, deliberately NOT the
+    // loose `isBuiltinExceptionType`. `Ref` requires a declaration-less Named
+    // TypeRef whose astNode NAME resolves in `builtinVtable_`, i.e. exactly the
+    // §31.4 hierarchy; the loose predicate would also admit every other
+    // declaration-less Named type (a collection, a `Task`) and sweep the
+    // vtable-less case (2) — and the Task family — in wrongly. Case (2) above
+    // still runs first and still owns the genuinely vtable-less built-ins, which
+    // are NOT in `builtinVtable_` and so cannot be matched here. It is the same
+    // named recognizer #6311's caller-side gate and #6337's callee-side gate
+    // already use for this same population, so the three ends agree.
+    //
+    // §31.1 makes a built-in exception an ordinary owned heap class instance and
+    // §28.3 states the auto-drop obligation for it exactly as for any other class
+    // in the same position; `setupBuiltinExceptions` mints every §31.4 member a
+    // real vtable whose slot 2 is `bz$exDisposeMsg`, which is precisely what the
+    // `dynamicDispose` this drives dispatches through. So the user-class arm
+    // above is not merely a close enough fit — it is the SAME code path, and the
+    // user-class control above proves that path is leak-free.
+    if (pt && pt->kind == sema::TypeRef::Kind::Named &&
+        (pt->declaration || isBuiltinExceptionTypeRef(pt))) {
         emitDisposeAndReclaim(obj);
         return;
     }
