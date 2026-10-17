@@ -529,15 +529,45 @@ def self_test():
         chk('--update ACCEPTS the drop',
             check(root, bpath, stale=False)[0])
 
-        # A move INTO tests/support/ moves support_calls WITHOUT moving
-        # checked_calls. That is not a violation.
+        # A move INTO tests/support/ moves checked_calls WITHOUT moving
+        # support_calls — that is the whole point of the unfiltered control,
+        # and it is NOT a violation in its own right.
+        #
+        # Issue #6385: this used to be ONE assertion and it was provably
+        # vacuous. It read
+        #     not good and any('support_calls' in m for m in msgs)
+        # *after* the e_test.cpp unlink above had already emitted a
+        # `support_calls ... STALE HEADROOM (-1)` message — the move emits
+        # no support_calls message at all, because the control has no file
+        # filter and cannot see a move. Deleting the move entirely left the
+        # predicate True (replayed and measured), so the assertion reported
+        # coverage of a detection it never exercised. Baseline the PRE-move
+        # tree here so every delta below is attributable to the move alone,
+        # and assert the control's actual defining property: it does NOT move.
+        pre = measure(root)
+        moved_calls = _count_checked_calls(
+            (root / 'tests/codegen/a_test.cpp').read_text())
+        write_baseline(pre[2], pre[0], pre[1], bpath)
         src = root / 'tests/codegen/a_test.cpp'
         dst = root / 'tests/support/a_test.cpp'
         import shutil
         shutil.move(str(src), str(dst))
         good, msgs = check(root, bpath, stale=True)
-        chk('a move into support/ is detected by support_calls',
-            not good and any('support_calls' in m for m in msgs))
+        post = measure(root)
+        chk("a move into support/ lowers checked_calls by exactly the moved "
+            "file's checked calls", post[0] == pre[0] - moved_calls)
+        chk('a move into support/ leaves the unfiltered control support_calls '
+            'unchanged', post[1] == pre[1])
+        # The support_calls half is load-bearing: it is the conjunct the
+        # pre-#6385 assertion got for free from the earlier unlink.
+        chk('the move is reported as a checked_calls STALE HEADROOM, never '
+            'as a support_calls one',
+            not good
+            and any(m.startswith('checked_calls baseline claims')
+                    for m in msgs)
+            and not any('support_calls' in m for m in msgs))
+        chk('a move into support/ alone raises nothing, so --update accepts '
+            'it', check(root, bpath, stale=False)[0])
 
         # A missing baseline must fail loudly, never pass by default.
         missing = root / 'no-such-baseline'
@@ -546,6 +576,101 @@ def self_test():
             chk('a missing baseline fails closed', False)
         except SystemExit as e:
             chk('a missing baseline fails closed', e.code == 2)
+
+        # ── --force: the flag a bank actually uses.
+        #
+        # Issue #6385: --force had ZERO coverage. Every assertion above that
+        # says "--update ..." calls check(root, bpath, stale=False) — the
+        # PREDICATE. `main()`'s `--update` branch is what reads --force, so
+        # nothing exercised the real CLI path: neither the refusal nor the
+        # escape hatch. This matters more than the average gap because a
+        # wrong --force fails SILENTLY — it accepts a count change it should
+        # question, and the baseline simply moves.
+        #
+        # Drive main() itself against a fixture tree + baseline. ROOT and
+        # BASELINE are module globals and both check() and write_baseline()
+        # bind their baseline default at def time, so redirect all four.
+        import contextlib
+        import io
+
+        def _drive_main(tree, baseline, argv):
+            g = globals()
+            real_check = g['check']
+            real_write = g['write_baseline']
+            saved = {k: g[k] for k in
+                     ('ROOT', 'BASELINE', 'check', 'write_baseline')}
+            saved_argv = sys.argv
+            buf = io.StringIO()
+
+            def _chk(root, baseline_path=None, stale=True):
+                return real_check(
+                    root,
+                    baseline if baseline_path is None else baseline_path,
+                    stale)
+
+            def _wr(absorbing, checked, support, path=None):
+                return real_write(
+                    absorbing, checked, support,
+                    baseline if path is None else path)
+
+            g['ROOT'], g['BASELINE'] = tree, baseline
+            g['check'], g['write_baseline'] = _chk, _wr
+            sys.argv = ['check_toolchain_skip_surface.py'] + list(argv)
+            try:
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(buf):
+                    rc = main()
+            finally:
+                for k, v in saved.items():
+                    g[k] = v
+                sys.argv = saved_argv
+            return rc, buf.getvalue()
+
+        # A green fixture, then a new ABSORBING site — the rise --force
+        # exists to override.
+        ff = root / 'force_fixture'
+        fb = ff / 'baseline'
+        _mk(ff, 'tests/codegen/plain_test.cpp',
+            'BEZEL_TEST(codegen_force, plain) {\n'
+            '  auto r = runAotChecked("module M;");\n'
+            '  BEZEL_EXPECT_FALSE(r.ran);\n'
+            '}\n')
+        write_baseline(0, 1, 1, fb)
+        chk('the --force fixture starts green',
+            check(ff, fb, stale=True)[0])
+        _mk(ff, 'tests/codegen/new_absorbing_test.cpp',
+            'namespace { bool wasSkipped(const JitResult& r) {\n'
+            '  if (r.ran) return false;\n'
+            '  for (const auto& d : r.diagnostics.diagnostics())\n'
+            '    if (d.message.find("SKIP") != std::string::npos) return true;\n'
+            '  return false;\n'
+            '} }\n'
+            'BEZEL_TEST(codegen_force, new_absorbing) {\n'
+            '  auto r = runAotChecked("module M;");\n'
+            '  if (wasSkipped(r)) return;\n'
+            '  BEZEL_EXPECT_FALSE(r.ran);\n'
+            '}\n')
+
+        # Without --force the CLI refuses — and refuses by RETURNING, having
+        # written nothing (the reviewer confirmed this is logical, not an
+        # EACCES on the baseline: main() returns before write_baseline).
+        # The byte-comparison is the half that matters: a refusal that still
+        # moved the baseline would bank the rise it just rejected.
+        pre_bytes = fb.read_bytes()
+        rc, out = _drive_main(ff, fb, ['--update'])
+        chk('--update REFUSES a rise in absorbing_sites at the CLI', rc == 1)
+        chk('the refused --update leaves the baseline byte-identical',
+            fb.read_bytes() == pre_bytes)
+        chk('the refusal names the --force escape hatch',
+            '--force' in out and 'absorbing_sites ROSE' in out)
+
+        # With --force the same rise is banked deliberately.
+        rc, out = _drive_main(ff, fb, ['--update', '--force'])
+        chk('--update --force banks the rise at the CLI', rc == 0)
+        chk('--force writes the risen absorbing_sites into the baseline',
+            read_baseline(fb)[0] == 1)
+        chk('the forced re-baseline leaves the tree green',
+            check(ff, fb, stale=True)[0])
 
     print('check_toolchain_skip_surface --self-test: ' +
           ('PASS' if ok else 'FAIL'))
