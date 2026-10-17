@@ -37,74 +37,54 @@
 // is compiler-provided rather than owned by any one artifact, so it is now
 // `linkonce_odr` — which is what §2.8.3 rule 5 actually asks for ("exactly one
 // static state and one runtime identity, regardless of link mode").
+//
+// ── HARNESS (test #6386) ───────────────────────────────────────────────────
+//
+// Every row here builds a TWO-module program (a `compileObject`'d library plus
+// an importer), which used to mean this file carried its own private runner —
+// `compileAndRunCrossModule`, four hand-rolled steps with its own
+// `TempFile`/`writeSource`/exit-code decoding.  It is now
+// `bezel::test::runAotModules` (tests/support/aot_support.hpp, added by
+// #6379), which is the SAME run half `runAot` uses (`aot_detail::runProgramFill`)
+// and the same forked compile half (`forkedCompileModule` /
+// `forkedCompileWithDeps`) `runAot`'s `cachedCompile` is built on.
+//
+// THE PORTED ORACLE IS STRICTLY STRONGER, and the difference is the point:
+//
+//   * the old runner returned -1 for BOTH a compile failure and a program that
+//     died from a signal, and the rows asserted only the exit code. A crash was
+//     therefore a *different wrong number*, never a crash report.
+//   * `runAotModules` returns the driver's own captured stderr in
+//     `r.diagnostics` and `ran == false` for a reject, a compiler crash, a
+//     runtime signal, a timeout and an ASan report — each carrying the literal
+//     that says WHICH. Each row asserts `r.ran` FIRST and unconditionally, so a
+//     row that cannot pass by accident is the requirement, not the outcome.
+//   * the compile half is now FORKED, so a driver crash in the library build is
+//     isolated and reported rather than taking the test process with it.
+//
+// ⚠ The old runner used `compileFileForTest`, which honours the #1822
+// whole-suite ASan sweep; `runAotModules` honours the same sweep through the
+// same predicate (`aot_detail::forceSanitizeAddress`), so the sweep still
+// reaches every row here. Under the sweep the run ENVIRONMENT differs by one
+// setting, and deliberately: the old `std::system(exe)` inherited the ambient
+// environment, which turns LeakSanitizer ON by default, whereas `runAot`
+// pins `detect_leaks=0` under the sweep because whole-suite leak detection is
+// too noisy and because §28.2 checked disposal leaks BY DESIGN (#4532 measured
+// the cost). MEASURED under `BEZEL_AOT_FORCE_SANITIZE=address`: every row below
+// is clean, so no row here was relying on that inherited leak detection.
 
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <string>
-#include <sys/wait.h>
 #include <vector>
 
-#include "driver/Driver.hpp"
-#include "support/driver_run_support.hpp"
-#include "support/scratch_dir.hpp"
-#include "support/unique_stem.hpp"
+#include "support/aot_support.hpp"
+#include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::JitResult;
+using bezel::test::ModuleSource;
+using bezel::test::runAotModules;
+
 namespace {
-namespace fs = std::filesystem;
-
-// Per-process unique working dir under the shared scratch base. The previous
-// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
-// race-prone: parallel shards overwrote each other's source/object files
-// mid-compile, garbling the in-flight child read. The atomic unique_stem
-// + /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class).
-const std::filesystem::path& wtDir2776() {
-    return wtScratchDir("wt-2776");
-}
-
-struct TempFile {
-    std::string path;
-    explicit TempFile(const std::string& p) : path(p) {}
-    ~TempFile() { std::remove(path.c_str()); }
-};
-
-void writeSource(const std::string& path, const std::string& src) {
-    std::ofstream out(path);
-    out << src;
-}
-
-// Compile lib → object, compile main importing lib → executable, run.
-// Returns the exit code, or -1 when either compile or the link fails — which is
-// itself meaningful here: the linkage half of this fix shows up as a -1.
-int compileAndRunCrossModule(const std::string& libSrc,
-                             const std::string& mainSrc) {
-    auto dir = wtDir2776();
-    std::string stem = unique_stem("bezel_xmod2776");
-    TempFile lSrc((dir / (stem + "_lib.bzl")).string());
-    TempFile lObj((dir / (stem + "_lib.o")).string());
-    TempFile mSrc((dir / (stem + "_main.bzl")).string());
-    TempFile mExe((dir / (stem + "_main")).string());
-
-    writeSource(lSrc.path, libSrc);
-    writeSource(mSrc.path, mainSrc);
-
-    bezel::Driver driver;
-    bezel::CompileResult rl = driver.compileObject(lSrc.path, lObj.path);
-    if (!rl.success) return -1;
-
-    bezel::Dependency dep;
-    dep.metadataPath = lObj.path;
-    dep.objectPath   = lObj.path;
-    std::vector<bezel::Dependency> deps{dep};
-
-    bezel::CompileResult rm = bezel::test::compileFileForTest(driver, mSrc.path, mExe.path, deps);
-    if (!rm.success) return -1;
-
-    int status = std::system(mExe.path.c_str());
-    if (status == -1 || !WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
-}
 
 // The dependency: a self-comparable interface and one implementor, ascending.
 const char* kLib =
@@ -124,58 +104,92 @@ std::string app(const std::string& body) {
            "  public static method Main(): int " + body +
            "  end Main; end C; ";
 }
+
+// The one entry point every row used to route through. `Lib` is always the
+// dependency and `App` always the entry; `runAotModules` derives the build
+// order from the two modules' own `import` declarations, so the pair is
+// supplied in one brace-init and the harness does the rest.
+JitResult compileAndRunCrossModule(const std::string& libSrc,
+                                   const std::string& mainSrc) {
+    return runAotModules({ModuleSource{"Lib", libSrc},
+                          ModuleSource{"App", mainSrc}},
+                         "App");
+}
+
 }  // namespace
 
 // #2776 / §14.2 rule 3 + §2.5 — `Min()` over an imported self-comparable
 // interface element.  Ranks 7 and 3: Min is 3.
+//
+// ⚠ ORDER MATTERS AND DID NOT CHANGE. Each old row was a single
+// `BEZEL_EXPECT_EQ(<exit code>, N)`. Each is now `ran` first, then that same
+// exit code: the value assertion is byte-for-byte the one it was and `ran` is
+// added on top. A row that passes now cannot have passed for a compile
+// failure, a signal, a timeout or an ASan report — each of which the old -1
+// could not distinguish from "the program returned some other number".
+
+// `Min()` — the sibling arm, so a fix that reached only one is caught.
 BEZEL_TEST(cross_module_comparable_iface_2776, min_over_imported_interface_element) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(kLib, app(
+    JitResult r = compileAndRunCrossModule(kLib, app(
         "    using var a := new RNode(7); "
         "    using var b := new RNode(3); "
         "    var arr: Array<IRank> := [a, b]; "
-        "    return arr.Min().Rank(); ")), 3);
+        "    return arr.Min().Rank(); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
 
 // `Max()` — the sibling arm, so a fix that reached only one is caught.
 BEZEL_TEST(cross_module_comparable_iface_2776, max_over_imported_interface_element) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(kLib, app(
+    JitResult r = compileAndRunCrossModule(kLib, app(
         "    using var a := new RNode(7); "
         "    using var b := new RNode(3); "
         "    var arr: Array<IRank> := [a, b]; "
-        "    return arr.Max().Rank(); ")), 7);
+        "    return arr.Max().Rank(); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
 
 // `Sort()` — a THIRD gate, and the one that reaches the itable comparator thunk.
 // 3,1,2 sorted ascending is 1,2,3, encoded base-4 (1*16 + 2*4 + 3 = 27) so the
 // 8-bit WEXITSTATUS mask is not involved.
 BEZEL_TEST(cross_module_comparable_iface_2776, sort_over_imported_interface_element) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(kLib, app(
+    JitResult r = compileAndRunCrossModule(kLib, app(
         "    using var a := new RNode(3); "
         "    using var b := new RNode(1); "
         "    using var c := new RNode(2); "
         "    var arr: Array<IRank> := [a, b, c]; "
         "    arr.Sort(); "
-        "    return arr[0].Rank() * 16 + arr[1].Rank() * 4 + arr[2].Rank(); ")),
-        27);
+        "    return arr[0].Rank() * 16 + arr[1].Rank() * 4 + arr[2].Rank(); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 27);
 }
 
 // `Math.Min` — the §2.2 gate, reached through the same shared predicate.  This
 // is what makes the case for #2787's factoring concrete: one loader change fixed
 // all four call sites at once.
 BEZEL_TEST(cross_module_comparable_iface_2776, math_min_over_imported_interface) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(kLib, app(
+    JitResult r = compileAndRunCrossModule(kLib, app(
         "    using var a := new RNode(7); "
         "    using var b := new RNode(3); "
         "    var x: IRank := a; "
         "    var y: IRank := b; "
-        "    return Math.Min(x, y).Rank() * 4 + Math.Max(x, y).Rank(); ")),
-        19);
+        "    return Math.Min(x, y).Rank() * 4 + Math.Max(x, y).Rank(); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 19);
 }
 
 // LINKAGE — two modules both naming the synthesized `IComparable` must LINK.
 // This is the case that caught the second half of the fix: before it, the
 // consumer's own `td$IComparable` collided with the dependency's ("multiple
 // definition of `td$IComparable'"), and a link failure surfaces here as -1.
+//
+// ⚠ THIS ROW IS WHERE `ran` BUYS SOMETHING SPECIFIC. Under the old runner a
+// link failure and a wrong value were both "some exit code"; the row survived
+// only because -1 differs from 5. On `runAotModules` the same link failure is
+// `ran == false` with clang's "multiple definition" line in `r.diagnostics`, so
+// a future re-break of §2.8.3 rule 5 reports WHAT broke rather than only that
+// a number was wrong.
 //
 // The body deliberately does NOT call `CompareTo` explicitly.  That path was
 // separately broken when this test was written — a written-out `CompareTo`
@@ -186,17 +200,21 @@ BEZEL_TEST(cross_module_comparable_iface_2776, math_min_over_imported_interface)
 // for a string); it is pinned by `xmod_imported_class_vtable_2792`, and this
 // case is left as-is so the linkage half stays isolated from it.
 BEZEL_TEST(cross_module_comparable_iface_2776, both_modules_naming_icomparable_link) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(kLib, app(
+    JitResult r = compileAndRunCrossModule(kLib, app(
         "    using var a := new RNode(7); "
         "    var x: IRank := a; "
-        "    return x.Rank() - 2; ")), 5);
+        "    return x.Rank() - 2; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
 
 // CONTROL — a LOCAL self-comparable interface is unchanged.  The loader change
 // must not perturb the same-module path that already worked.
 BEZEL_TEST(cross_module_comparable_iface_2776, control_local_interface_unchanged) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(kLib, app(
+    JitResult r = compileAndRunCrossModule(kLib, app(
         "    var arr: Array<int> := [3, 1, 2]; "
         "    arr.Sort(); "
-        "    return arr[0] * 16 + arr[1] * 4 + arr[2]; ")), 27);
+        "    return arr[0] * 16 + arr[1] * 4 + arr[2]; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 27);
 }
