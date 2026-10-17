@@ -21,8 +21,17 @@
 // `type A0<T> := A1<T>; … type A{n}<T> := Array<T>;` under
 // `Holder<out T>.Get(): A0<T>`, rejects at n = 5 and n = 31 with "(§12.9)"
 // and COMPILES CLEAN (rc = 0, not a skipped run) at n = 32, 33 and 40. The
-// first silently accepted chain is 32, one past the bound. The `n = 32` row is
-// the fail-without repro.
+// `n = 32` row is the fail-without repro.
+//
+// 32 IS the bound, not one past it. The guard read
+// `if (depth >= kMaxAliasSeeThroughDepth) return Unknown;`, tested BEFORE the
+// hop with the walk entering `A0` at `depth == 0`, so it stopped entering at
+// `depth == 32`: it declined `A32` and composed `A0..A31`. The sibling cap in
+// `TypeResolution_Checks.cpp` (#6391's `kMaxTypeNestingDepth = 64`) is the
+// same shape with a STRICT `>` rather than a `>=`, so it admits 64 and first
+// declines at 65 — one past ITS bound. The two differ by one comparison
+// operator, and that is why their boundaries land one value apart; neither is
+// an off-by-one.
 //
 // WHY THE BOUND WAS REMOVED RATHER THAN RAISED. §12.9 states the position
 // rule with no depth qualifier — "Position is composed across nested type
@@ -70,9 +79,9 @@
 // control against a fix that simply DELETED the alias arm.
 //
 // The cross product the axis is swept across: terminal element {array, set,
-// dict, iterable head, function, nested generic} x chain shape {linear,
-// branching} x variance {covariant, contravariant}. Each terminal has a
-// violating twin and a sound twin at EVERY depth, so a walk that mis-resolves
+// dict, queue, contravariant head, function} x chain shape {linear, two hops
+// per level, diamond} x variance {covariant, contravariant}. Each terminal has
+// a violating twin and a sound twin at EVERY depth, so a walk that mis-resolves
 // any single terminal is caught at the depth where it is decisive.
 
 #include "support/aot_result_asserts.hpp"  // diagnosticMessageContains, failedAtCompileTimeWithRealLocation
@@ -160,11 +169,14 @@ std::string program(std::size_t chainLength, const char* terminalBody) {
     return src + kMain;
 }
 
-// The BRANCHING shape: two alias hops per level, so a chain of `chainLength`
-// LEVELS is `2 * chainLength` hops. It exists to show the fix is not sensitive
-// to the chain being a single linear run — and it is also the row that dies
-// first if the removed bound were replaced by a cap HALF as large.
-std::string branchingProgram(std::size_t chainLength, const char* terminalBody) {
+// Two alias hops per LEVEL, so `chainLength` LEVELS is `2 * chainLength` hops.
+// This is still a LINEAR run — it is not a branching shape, and it is not
+// labelled one. What it buys is a different unit: a mutant that kept a bound
+// of 32 and counted LEVELS instead of HOPS would pass every other row here and
+// die on these, because 32 levels is 64 hops. The genuine DAG shape is
+// `diamondProgram` below.
+std::string twoHopsPerLevelProgram(std::size_t chainLength,
+                                   const char* terminalBody) {
     std::string src = "module M; import System;\n";
     src += kSupportDecls;
     std::size_t hops = chainLength * 2;
@@ -177,6 +189,48 @@ std::string branchingProgram(std::size_t chainLength, const char* terminalBody) 
     return src + kMain;
 }
 
+// A genuine DAG, and the only branching shape in this file: ONE root interface
+// reaches the terminal alias `Deep` through TWO distinct aliases. Two spines
+// of `chainLength` hops each — `S0 -> … -> S{n} -> Arm1` and
+// `T0 -> … -> T{n} -> Arm2` — and `Arm1` and `Arm2` both resolve to `Deep`,
+// which alone carries the terminal body. So `Deep` is composed TWICE, once
+// down each arm, within one program.
+//
+// BOTH spines are long on purpose. A first draft gave `Get2()` the short arm
+// (`Arm2` entered at depth 0, `Deep` two hops down), and MEASURED on the base
+// those rows went GREEN — the short route reached `Deep` without ever touching
+// the hop cap, so the program was rejected on the base for a reason that had
+// nothing to do with the fix. A diamond that does not report the hole is a
+// diamond that pins nothing. With both spines at `chainLength >= 32`, neither
+// route reaches `Deep` past the base's cap of 32, and the rows go red.
+//
+// What this pins: that a DAG is walked to its end, and that a node shared by
+// two routes is composed on both — `Deep` is pushed and popped per path, not
+// latched.
+//
+// What it deliberately does NOT claim: it cannot tell PER-PATH dedup from a
+// global `seen`. An alias has exactly ONE body, so composing it by two routes
+// yields the same position either way and no verdict here distinguishes the two
+// policies. Stating that is the point — a row that read as if it discriminated
+// them would be the same over-claim as the mislabelled section it replaced.
+std::string diamondProgram(std::size_t chainLength, const char* terminalBody) {
+    std::string src = "module M; import System;\n";
+    src += kSupportDecls;
+    for (std::size_t i = 0; i < chainLength; ++i) {
+        std::string n = std::to_string(i);
+        src += "type S" + n + "<T> := S" + std::to_string(i + 1) + "<T>;\n";
+        src += "type T" + n + "<T> := T" + std::to_string(i + 1) + "<T>;\n";
+    }
+    std::string n = std::to_string(chainLength);
+    src += "type S" + n + "<T> := Arm1<T>;\n";  // spine 1 ends on Arm1
+    src += "type T" + n + "<T> := Arm2<T>;\n";  // spine 2 ends on Arm2
+    src += "type Arm1<T> := Deep<T>;\n";
+    src += "type Arm2<T> := Deep<T>;\n";
+    src += "type Deep<T> := " + std::string(terminalBody) + ";\n";
+    src += "public interface Holder<out T> method Get(): S0<T>; "
+           "method Get2(): T0<T>; end Holder;\n";
+    return src + kMain;
+}
 // REJECT with §12.9, at the exact diagnostic this issue is about.
 void expectVariance129(std::size_t chainLength, const Terminal& t) {
     auto r = runAot(program(chainLength, t.violatingBody));
@@ -187,8 +241,8 @@ void expectVariance129(std::size_t chainLength, const Terminal& t) {
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kVariance129));
 }
 
-void expectVariance129Branching(std::size_t chainLength, const Terminal& t) {
-    auto r = runAot(branchingProgram(chainLength, t.violatingBody));
+void expectVariance129TwoHops(std::size_t chainLength, const Terminal& t) {
+    auto r = runAot(twoHopsPerLevelProgram(chainLength, t.violatingBody));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kOutInInput));
@@ -205,8 +259,22 @@ void expectAccepted(std::size_t chainLength, const Terminal& t) {
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
-void expectAcceptedBranching(std::size_t chainLength, const Terminal& t) {
-    auto r = runAot(branchingProgram(chainLength, t.soundBody));
+void expectAcceptedTwoHops(std::size_t chainLength, const Terminal& t) {
+    auto r = runAot(twoHopsPerLevelProgram(chainLength, t.soundBody));
+    BEZEL_EXPECT_TRUE(r.ran);
+}
+
+void expectVariance129Diamond(std::size_t chainLength, const Terminal& t) {
+    auto r = runAot(diamondProgram(chainLength, t.violatingBody));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kOutInInput));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kComposedClause));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kVariance129));
+}
+
+void expectAcceptedDiamond(std::size_t chainLength, const Terminal& t) {
+    auto r = runAot(diamondProgram(chainLength, t.soundBody));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -391,28 +459,57 @@ BEZEL_TEST(variance_alias_chain_total_6408, terminal_function_sound_accepted) {
     expectAccepted(64, kTerminals[5]);
 }
 
-// --- the BRANCHING chain shape: two alias hops per level -------------------
+// --- two alias hops per LEVEL (still linear — see the header at the helper) --
 //
 // 32 LEVELS here is 64 HOPS, so a mutant that kept the bound at 32 and merely
-// counted levels instead of hops would pass every linear row and die here.
-// 40 levels is 80 hops.
+// counted levels instead of hops would pass every other linear row and die
+// here. 40 levels is 80 hops.
 
-BEZEL_TEST(variance_alias_chain_total_6408, branching_depth_32_violation_rejected) {
-    expectVariance129Branching(32, kTerminals[0]);
+BEZEL_TEST(variance_alias_chain_total_6408,
+           two_hops_per_level_depth_32_violation_rejected) {
+    expectVariance129TwoHops(32, kTerminals[0]);
 }
 
 BEZEL_TEST(variance_alias_chain_total_6408,
-           branching_depth_32_sound_composition_accepted) {
-    expectAcceptedBranching(32, kTerminals[0]);
-}
-
-BEZEL_TEST(variance_alias_chain_total_6408, branching_depth_40_violation_rejected) {
-    expectVariance129Branching(40, kTerminals[0]);
+           two_hops_per_level_depth_32_sound_composition_accepted) {
+    expectAcceptedTwoHops(32, kTerminals[0]);
 }
 
 BEZEL_TEST(variance_alias_chain_total_6408,
-           branching_depth_40_sound_composition_accepted) {
-    expectAcceptedBranching(40, kTerminals[0]);
+           two_hops_per_level_depth_40_violation_rejected) {
+    expectVariance129TwoHops(40, kTerminals[0]);
+}
+
+BEZEL_TEST(variance_alias_chain_total_6408,
+           two_hops_per_level_depth_40_sound_composition_accepted) {
+    expectAcceptedTwoHops(40, kTerminals[0]);
+}
+
+// --- the DIAMOND shape: one root, two routes, one terminal alias -----------
+//
+// The only genuinely branching program in this file. `Deep` — the alias that
+// carries the terminal body — is reached down TWO distinct arms, each behind
+// its own full-length spine, so it is composed twice in one program. Both
+// spines clear the base's cap of 32 before `Deep` is reached at all, which is
+// what makes these four rows go RED on the base (MEASURED — the first draft
+// gave `Get2()` a short arm and these rows went GREEN there; see the helper).
+
+BEZEL_TEST(variance_alias_chain_total_6408, diamond_depth_32_violation_rejected) {
+    expectVariance129Diamond(32, kTerminals[0]);
+}
+
+BEZEL_TEST(variance_alias_chain_total_6408,
+           diamond_depth_32_sound_composition_accepted) {
+    expectAcceptedDiamond(32, kTerminals[0]);
+}
+
+BEZEL_TEST(variance_alias_chain_total_6408, diamond_depth_40_violation_rejected) {
+    expectVariance129Diamond(40, kTerminals[0]);
+}
+
+BEZEL_TEST(variance_alias_chain_total_6408,
+           diamond_depth_40_sound_composition_accepted) {
+    expectAcceptedDiamond(40, kTerminals[0]);
 }
 
 // --- a long chain whose composition is SOUND must still compile ------------

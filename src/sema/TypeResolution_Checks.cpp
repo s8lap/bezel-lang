@@ -14063,10 +14063,20 @@ const TypeAliasSymbol* resolveLocalAliasHead(
 // MEASURED on the base (`04d402b3`): the chain
 // `type A0<T> := A1<T>; … type A{n}<T> := Array<T>;` under
 // `Holder<out T>.Get(): A0<T>` rejects at n = 5 and n = 31 with
-// "(§12.9)" and COMPILES CLEAN (rc = 0) at n = 32, 33 and 40. The first
-// silently accepted chain is 32, one past the bound's boundary — the identical
-// shape and the identical off-by-one that #6391 measured for the sibling cap
-// in this same file, at 64.
+// "(§12.9)" and COMPILES CLEAN (rc = 0) at n = 32, 33 and 40.
+//
+// The first silently accepted chain is 32, and there is NO off-by-one here: 32
+// IS `kMaxAliasSeeThroughDepth`, and it is ALSO the first accepted length. The
+// guard read `if (depth >= kMaxAliasSeeThroughDepth) return Unknown;` and was
+// tested BEFORE the hop, with the walk entering `A0` at `depth == 0`, so it
+// stopped ENTERING at `depth == 32` — declined `A32` and composed `A0..A31`.
+//
+// The sibling cap in this same file (#6391's `kMaxTypeNestingDepth = 64`) is
+// the same shape but NOT the same boundary: its guard reads `depth >
+// kMaxTypeNestingDepth` — a STRICT `>`, not a `>=` — so it admits depth 64 and
+// first DECLINES at 65, one PAST its bound. Two caps, one comparison operator
+// apart. Neither is an off-by-one; record each as the operator it is, because
+// #6391's boundary does not transfer to a `>=` that does not have it.
 //
 // WHY THE BOUND IS REMOVED RATHER THAN RAISED. §12.9 states the position rule
 // with no depth qualifier — "Position is composed across nested type
