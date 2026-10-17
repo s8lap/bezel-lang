@@ -809,7 +809,7 @@ say "uninstrumented-emit phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_emitasan.log"))
 # source-side count without a contemporaneous drop in absorbing_sites
 # fails here, and a nonzero `checked_toolchain_skips` total at the
 # shard level fails inside tests/run_parallel.sh (which gate.sh already
-# consumes). The script's --self-test plants six fixtures in
+# consumes). The script's --self-test plants a fixture tree in
 # TemporaryDirectory() and asserts the detector's own behaviour; this
 # phase runs --self-test FIRST for the same reason every sibling phase
 # does — a green from a matcher that matched nothing is worth nothing.
