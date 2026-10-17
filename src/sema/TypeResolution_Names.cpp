@@ -2313,8 +2313,9 @@ Symbol* Resolver::lookupName(std::string_view name, Scope* scope) {
 // WHY NOT ROUTE THROUGH AN EXISTING SANCTIONED ACCESSOR — this is the reason
 // each `SEAM-ACCESSOR` below carries, not only the marker. Four are available
 // (`storageComponentType`, `methodReturnResolvedType`, `eventPayloadResolvedType`,
-// `formalParamResolvedType`) and all four were rejected, for two separate
-// reasons. (a) COVERAGE: `storageComponentType` covers a `FieldSymbol` and a
+// `formalParamResolvedType`) and all four were rejected, on ONE ground.
+// (a) COVERAGE, and it is independently sufficient: `storageComponentType`
+// covers a `FieldSymbol` and a
 // `PropertySymbol` and returns null for every other member kind, so routing the
 // carve-out through it would narrow the predicate from six member kinds to two
 // and flip cases §2.7's warning row admits — a behaviour change smuggled in as a
@@ -2322,17 +2323,57 @@ Symbol* Resolver::lookupName(std::string_view name, Scope* scope) {
 // (`spec_2_7_property_color_color_carve_out_in_a_top_level_body`) — and its
 // nested twin, row 9 — ARE that `property Color: Color` carve-out. The three
 // return/payload accessors do not cover fields, properties or consts at all.
-// (b) THE RESOLVED-TYPE TRAP, which is the one that would bite even if
-// coverage were fixed: all four answer the
-// RESOLVED type, whereas the head test below reads `TypeRef::headName()`, which
-// PREFERS `aliasResolvedHead` (`TypeRef.cpp:1462`). For a member declared as
-// `property Color: Alias` where `Alias` is a §27.8 alias of `Color`, the
-// accessors hand back the alias's resolved TARGET and the predicate would
-// compare that target's head instead of the declared spelling — silently
-// flipping the very `property Color: Color` carve-out §2.7's warning row
-// depends on. That is a predicate change, i.e. a behaviour flip, and it is the
-// reason the head test stays on `headName()` rather than on any resolved-type
-// reader.
+//
+// The former second reason, (b) "THE RESOLVED-TYPE TRAP", is WITHDRAWN. It
+// claimed the four accessors answer the RESOLVED type where `headName()` answers
+// the declared SPELLING, so routing through one would compare a different head
+// and silently flip the carve-out. Neither half survives contact with the code:
+//   * `headName()` is not a spelling reader. It returns `aliasResolvedHead`
+//     FIRST (`TypeRef.hpp:80-81`, the member at `:72`), and the alias-resolution
+//     path FILLS that field with the UNDERLYING head — for a concrete aliased
+//     type, `ref.aliasResolvedHead = underlying->headName()` at the bottom of
+//     this file — so `property Color: Alias` under `type Alias := Color` yields
+//     the head `Color`, i.e. the RESOLVED head. That is precisely what §2.7's
+//     warning row asks for: "warn, unless the member's declared type IS the
+//     resolved type …" (`Bezel_Language_Spec.md:209`). The old text here cited
+//     a line of a `TypeRef` translation unit that DOES NOT EXIST — `git ls-files`
+//     carries only `src/sema/TypeRef.hpp`, never a `.cpp` beside it — so its
+//     "1462" named nothing; the field it meant is at `TypeRef.hpp:72` and the
+//     preference is the first line of `headName()` at `TypeRef.hpp:81`.
+//   * Nor does an accessor change what the compare reads. Each hands back a
+//     `const TypeRef*` (the event one through an out-parameter), which this
+//     predicate would then read with the SAME `headName()` call the AST arm
+//     below already uses. A resolved-type route is not an alternative reading
+//     of this question; it is the same reading with a narrower KIND filter.
+//
+// (b) also mis-cited its row: it called row 11
+// (`spec_2_7_top_level_own_member_does_not_end_a_bare_type_search`) the
+// `property Color: Color` carve-out, which is rows 9/10 per this file's test
+// header — row 11 is the top-level residual, and the same sentence used "row
+// 11" a second time for the guard, in an incompatible sense.
+//
+// ⚠ A DIVERGENT TWIN OF THIS PREDICATE WILL EXIST IN ONE BINARY AFTER
+// COMPOSITION, AND THAT IS RECORDED HERE SO IT IS NOT DISCOVERED LATE.
+// `src/sema/TypeResolution_Checks.cpp` carries a second, 2-argument
+// `static memberDeclaresCollidingName` in `enclosingMemberBareName` (sibling
+// branch `1032140a`, `r31-p-couple`), AST-only and still reading the raw
+// `ty->name->parts.front()` rather than `headName()`. Once both land, §2.7's
+// carve-out is answered two different ways in one binary, and neither is
+// authoritative until they are unified. The Checks.cpp half must delete its
+// copy and share this one — or reach the same head read independently.
+//
+// ⚠ AND THAT HALF CANNOT LAND ON A MARKER ALONE. Its single
+// `// SEAM-ACCESSOR:` sits directly ABOVE THE FUNCTION SIGNATURE, and the
+// checker's `exempt_lines()` walks forward from a marker, skipping blanks and
+// `//` continuations, and BREAKS ON THE FIRST CODE LINE. The window therefore
+// exempts the marker and its comment continuations and the signature, and
+// covers NONE of the six `m->decl` reads at the cast arms below it — so with
+// that half alone `--strict` stays at exit 1 and the pair stays unpickable.
+// (QUOTED from the review's own reading of `exempt_lines()` in that tree;
+// this file's six markers are INSIDE the body, each immediately above the read
+// it exempts, which is the structural difference.) The fix for that lane is to
+// DELETE the inert marker and replace it with SIX effective ones, one per read;
+// a marker that exempts the signature instead of the reads changes no count.
 //
 // ⚠ THE IMPORTED FALLBACK IS CURRENTLY UNREACHABLE, and that is MEASURED on
 // this file rather than assumed. `enclosingTypeMemberBlocksBareName` — this
@@ -2432,6 +2473,22 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
     // §2.7 "Through nesting" is scoped to a NESTED type's bodies — see the
     // scope note above the caller. A top-level type's own body is rule 1
     // alone, whose table has no type-position row.
+    //
+    // ⚠ THIS GUARD IS LOAD-BEARING FOR FOUR PINNED ROWS, NOT TWO. An earlier
+    // record of this commit under-reported it as two; the reviewer re-ran the
+    // delete-the-guard experiment (real rebuild) and got FOUR red
+    // (QUOTED from that review, NOT re-derived here):
+    //   spec_2_7_dotted_head_member_typed_as_colliding_type_accepted
+    //     0p/1f  (tests/codegen/choice_body_record_ctor_store_2097_test.cpp:215)
+    //   spec_2_7_top_level_own_member_does_not_end_a_bare_type_search
+    //     0p/1f  (tests/sema/enclosing_member_bare_type_name_test.cpp:159)
+    //   spec_2_7_property_color_color_carve_out_in_a_top_level_body  0p/1f
+    //   spec_2_7_property_color_color_carve_out_in_a_nested_body     0p/1f
+    // The last two ARE the `property Color: Color` carve-out rows (9/10 in that
+    // header), which the reviewer's reading had predicted would be immune to
+    // the guard — the measurement refutes that: the GUARD, not the carve-out,
+    // is what holds them up. That materially weakens the withdrawn reason (b)
+    // above, and it is why the guard must not move before #6390 is ruled.
     if (!currentOuterType_ || currentOuterType_->enclosingTypePath.empty())
         return false;
     const bool ownBody = owning == currentOuterType_;
