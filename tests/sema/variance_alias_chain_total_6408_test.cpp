@@ -231,6 +231,7 @@ std::string diamondProgram(std::size_t chainLength, const char* terminalBody) {
            "method Get2(): T0<T>; end Holder;\n";
     return src + kMain;
 }
+
 // REJECT with §12.9, at the exact diagnostic this issue is about.
 void expectVariance129(std::size_t chainLength, const Terminal& t) {
     auto r = runAot(program(chainLength, t.violatingBody));
