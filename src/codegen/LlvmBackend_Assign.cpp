@@ -2284,6 +2284,20 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         llvm::Function* inhWrapper = nullptr;
         if (sema::TypeRef* recvTy = ctx_.exprType(*ix.target)) {
             inhWrapper = emitImportedIndexerGetterInheritedWrapper(ps, recvTy);
+            // fix #6353 (§23.4 / §14.1 / §12.1, v0.338): a VIRTUAL indexer on an
+            // IMPORTED GENERIC base is a different defect from #3353's — the
+            // dispatch is through the VTABLE slot, not the exported direct-call
+            // stub, and the slot holds the LOCAL override's accessor (emitted
+            // against the SUBSTITUTED element) while #2545's wrapper types the
+            // call from the ERASED reconstruction. Tried FIRST so it wins over
+            // `inhWrapper`: both are per-(ps, recvTy) InternalLinkage
+            // substitutes for `fn`, and this one is the correct answer for the
+            // virtual shape (it returns nullptr for every non-virtual one, where
+            // #3353's is the right helper).
+            if (llvm::Function* vsubst =
+                    emitImportedVirtualIndexerSubstWrapper(ps, recvTy,
+                                                           /*isSet=*/false))
+                inhWrapper = vsubst;
         }
         if (inhWrapper) fn = inhWrapper;
         // CRITICAL: fetch fnTy AFTER the wrapper swap. The wrapper has a
@@ -3154,6 +3168,14 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         llvm::Function* inhWrapper = nullptr;
         if (sema::TypeRef* recvTy = ctx_.exprType(*ix.target)) {
             inhWrapper = emitImportedIndexerSetterInheritedWrapper(ps, recvTy);
+            // fix #6353 (§23.4 / §14.1 / §12.1, v0.338): the setter twin of the
+            // getter's virtual-dispatch substitution above — same shape, same
+            // precedence rationale (a virtual indexer's dispatch is through the
+            // vtable slot, where #3353's direct-call-stub helper does not apply).
+            if (llvm::Function* vsubst =
+                    emitImportedVirtualIndexerSubstWrapper(ps, recvTy,
+                                                           /*isSet=*/true))
+                inhWrapper = vsubst;
         }
         if (inhWrapper) fn = inhWrapper;
         auto* fnTy = fn->getFunctionType();
@@ -3924,6 +3946,21 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             sit == importedIndexerSetterFns_.end()) return false;
         llvm::Function* getFn = git->second;
         llvm::Function* setFn = sit->second;
+        // fix #6353 (§23.4 / §14.1 / §12.1, v0.338): the compound-assign
+        // third face of the same defect — `b[i] += e` dispatches the SAME pair
+        // of vtable slots the plain get and set do, so both entry points are
+        // substituted here. The compound face needs BOTH: without the setter
+        // the write goes through an `i32` prototype (an LLVM verifier abort,
+        // measured: "Call parameter type does not match function signature! ptr
+        // @.bz.str"), and without the getter the read-back is the silent
+        // wrong-value case. Emitted before `obj` is resolved so the receiver is
+        // still evaluated exactly once below.
+        if (sema::TypeRef* recvTy = ctx_.exprType(*ix->target)) {
+            if (llvm::Function* g = emitImportedVirtualIndexerSubstWrapper(
+                    ps, recvTy, /*isSet=*/false)) getFn = g;
+            if (llvm::Function* s = emitImportedVirtualIndexerSubstWrapper(
+                    ps, recvTy, /*isSet=*/true)) setFn = s;
+        }
 
         // --- Resolve receiver storage ONCE. ---
         llvm::Value* obj = nullptr;

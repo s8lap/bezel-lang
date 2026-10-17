@@ -1318,6 +1318,168 @@ llvm::Function* Emitter::emitImportedIndexerGetterInheritedWrapper(
     return fn;
 }
 
+// fix #6353 (§23.4 / §14.1 / §12.1 / §2.8.3 rule 4, v0.338): the SUBSTITUTED
+// vtable-dispatch wrapper for a virtual indexer on an IMPORTED GENERIC base.
+// See the declaration in LlvmBackend_impl.hpp for the diagnosis and the gate;
+// this is the body.
+//
+// The signature is built under the receiver's §14.1 substitution, so the
+// dispatched accessor reads as its bound type (`T := string` → ptr) instead of
+// the declared parameter's i32 erasure placeholder. The BODY is #2545's dispatch
+// verbatim — `vptr = load(this); fn = load(vptr + slot); return fn(this, idx…)`
+// — so nothing about WHICH function runs changes; only the ABI it is called
+// through does. The vtable slot index is `propGetSlot_`/`propSetSlot_`, the
+// same index the caller and the pre-existing wrapper both GEP.
+llvm::Function* Emitter::emitImportedVirtualIndexerSubstWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy,
+        bool isSet) {
+    if (!ps || ps->decl || !ps->parent || !recvTy) return nullptr;
+    if (!isVirtualIndexer(ps)) return nullptr;
+    if (isStaticProperty(ps)) return nullptr;  // no `this`, no vtable slot
+    // The slot must exist, else this is NOT the virtual-dispatch path at all
+    // (#2414's `bz$<Class>$idxget$<arity>` direct-call ABI owns it).
+    auto& slotMap = isSet ? propSetSlot_ : propGetSlot_;
+    auto slotIt = slotMap.find(ps);
+    if (slotIt == slotMap.end()) return nullptr;
+    // Generic base only — a non-generic parent has no erasure to undo.
+    if (ps->parent->genericParams.empty()) return nullptr;
+    if (recvTy->kind != sema::TypeRef::Kind::Named || !recvTy->declaration)
+        return nullptr;
+    auto& cache = isSet ? importedVirtualIndexerSubstSetterWrappers_
+                        : importedVirtualIndexerSubstGetterWrappers_;
+    auto cacheKey = std::make_pair(ps, recvTy);
+    auto cached = cache.find(cacheKey);
+    if (cached != cache.end()) return cached->second;
+
+    // THE SUBSTITUTION. Two sources, in the same order `GenericRecvSubstGuard`
+    // (#6319) composes them: the receiver's OWN arguments bind the parameters of
+    // the receiver's own class (the accessor declared on `LIB.VB<T>` itself),
+    // which `computeAncestorGenericSubst` refuses by design (`cur == ancestor`);
+    // otherwise the base-chain walk supplies them for an accessor declared on an
+    // ANCESTOR (`class D: Mid<int>` reaching `Root<T>`). A chain it cannot pin
+    // every link of is REFUSED — the "never install a substitution we cannot
+    // prove" discipline — leaving the pre-fix (erased) wrapper in place.
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    bool installed = false;
+    std::unordered_map<std::string_view, llvm::Type*> recvSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> recvSema;
+    {
+        const std::vector<std::string_view> recvParams =
+            sema::genericParamNames(recvTy->declaration);
+        if (recvTy->declaration == ps->parent &&
+            !recvParams.empty() &&
+            recvParams.size() == recvTy->genericArgs.size()) {
+            for (std::size_t gi = 0; gi < recvParams.size(); ++gi) {
+                recvSema[recvParams[gi]] = recvTy->genericArgs[gi];
+            }
+        }
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (computeAncestorGenericSubst(recvTy, ps->parent, ancSubst, ancSema)) {
+            recvSubst = ancSubst;
+            recvSema = ancSema;
+        }
+        if (!recvSema.empty()) {
+            // Lower each argument under the OUTER substitution (both maps honor
+            // it), so a nested instantiation `VB<Box<int>>` binds T to the
+            // specialized `Box<int>` rather than to an `int` placeholder — the
+            // same two-step #6319's guard performs.
+            for (auto& [pname, pref] : recvSema) {
+                if (pref) recvSubst[pname] = lowerTypeRef(pref);
+            }
+            genericSubst_ = recvSubst;
+            genericSubstSemaTy_ = recvSema;
+            installed = true;
+        }
+    }
+
+    // The signature, under the substitution: the ELEMENT type from the
+    // reconstructed side table (an imported indexer has no `pd->type`; §23.4's
+    // get/set share the declared type) and each index parameter from its
+    // `ParameterSymbol`.
+    sema::TypeRef* memberRef = ctx_.importedMemberType(ps);
+    llvm::Type* elemTy = memberRef ? lowerTypeRef(memberRef) : nullptr;
+    std::vector<llvm::Type*> paramTys;
+    bool ok = elemTy != nullptr;
+    paramTys.push_back(ptrTy());  // `this`
+    for (sema::Symbol* p : ps->indexerParams) {
+        auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+        sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
+        llvm::Type* plt = pt ? lowerTypeRef(pt) : nullptr;
+        if (!plt) { ok = false; break; }
+        paramTys.push_back(plt);
+    }
+    if (isSet) paramTys.push_back(elemTy ? elemTy : i32());
+    // THE "ONLY WHERE IT MOVES" GATE. If nothing about the ABI differs from the
+    // erased form, the pre-existing wrapper is already correct and this one adds
+    // nothing — so decline and let the caller keep it. This is the same test
+    // #2955's sema gate applies (`substitutedArgMovesAbi`): a `VB<int>` receiver
+    // binds T to the same i32 the placeholder lowers to, and a `VB<string>`
+    // receiver does not. Comparing the substituted element against the ERASED
+    // one (the same `memberRef` lowered with the substitution removed) is the
+    // direct expression of it.
+    if (ok) {
+        genericSubst_ = savedSubst;
+        genericSubstSemaTy_ = savedSemaTy;
+        llvm::Type* erasedTy = memberRef ? lowerTypeRef(memberRef) : nullptr;
+        if (erasedTy && erasedTy == elemTy) ok = false;
+        if (installed) {
+            genericSubst_ = recvSubst;
+            genericSubstSemaTy_ = recvSema;
+        }
+    }
+    if (!ok || !elemTy) {
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        return nullptr;
+    }
+
+    auto* fnTy = llvm::FunctionType::get(
+        isSet ? llvm::Type::getVoidTy(llvm_) : elemTy, paramTys, false);
+    // fix #3548's naming discipline: derive the symbol from the §2.8.3 rule 3
+    // IDENTITIES (owner's mangled name + accessor name + the receiver type's
+    // mangling), never from a heap pointer value — an ASLR-fresh address in the
+    // name would make the object file differ between two runs of the same
+    // compiler on the same source. The `set` suffix keeps get/set distinct, which
+    // the slot index alone would not.
+    std::string wrapperName =
+        "bz$" + mangledTypeName(ps->parent) + "$vt$idx" + (isSet ? "set$" : "get$") +
+        mangleTypeRefForSymbol(recvTy) + "$" +
+        std::to_string(slotIt->second) + "$subst";
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, wrapperName, module_.get());
+    cache[cacheKey] = fn;
+
+    // The body — #2545's dispatch, emitted UNDER the substitution so the
+    // signature stays consistent for its whole body.
+    auto* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+    auto savedIP = savedInsert ? builder_.GetInsertPoint()
+                               : decltype(savedInsert->begin()){};
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    llvm::Value* thisPtr = &*fn->args().begin();
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), thisPtr, "subst.vptr");
+    llvm::Value* slotPtr = builder_.CreateGEP(
+        ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
+    llvm::Value* fnPtr =
+        builder_.CreateLoad(ptrTy(), slotPtr, isSet ? "subst.idxset" : "subst.idxget");
+    std::vector<llvm::Value*> callArgs;
+    for (auto& a : fn->args()) callArgs.push_back(&a);
+    llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, callArgs);
+    if (isSet) builder_.CreateRetVoid();
+    else builder_.CreateRet(r);
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert, savedIP);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    return fn;
+}
+
+
 // fix #3353 setter twin. Mirrors the getter wrapper but emits
 // `void set(ptr this, idx..., T value)` whose body is `GEP slot; store value`.
 // Same pre-conditions: imported, generic base, derived receiver with

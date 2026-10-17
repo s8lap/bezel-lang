@@ -3630,6 +3630,22 @@ private:
         std::pair<const sema::PropertySymbol*, const sema::TypeRef*>,
         llvm::Function*, PairPtrHash>
         importedIndexerSetterInheritedWrappers_;
+    // fix #6353 (§23.4 / §14.1 / §2.8.3 rule 4, v0.338): the per-(ps, recvTy)
+    // SUBSTITUTED vtable-dispatch wrappers for a virtual indexer on an IMPORTED
+    // GENERIC base. Same (PropertySymbol*, TypeRef*) key shape as the #3353 pair
+    // above and the same reason for it — the wrapper's ABI is a function of the
+    // receiver's static type — with the getter and setter held in the two maps
+    // rather than one map keyed by a flag, mirroring `importedIndexer{Getter,
+    // Setter}InheritedWrappers_` itself. See
+    // `emitImportedVirtualIndexerSubstWrapper`'s declaration.
+    std::unordered_map<
+        std::pair<const sema::PropertySymbol*, const sema::TypeRef*>,
+        llvm::Function*, PairPtrHash>
+        importedVirtualIndexerSubstGetterWrappers_;
+    std::unordered_map<
+        std::pair<const sema::PropertySymbol*, const sema::TypeRef*>,
+        llvm::Function*, PairPtrHash>
+        importedVirtualIndexerSubstSetterWrappers_;
     // ... and the named-property twins. Property reads (`g.P` where P is
     // declared on the generic base) have the same defect as the indexer
     // getter; property writes (`g.P := v`) likewise. The wrappers share the
@@ -24033,6 +24049,61 @@ private:
     llvm::Function* emitImportedPropSetterInheritedWrapper(
         const sema::PropertySymbol* ps,
         const sema::TypeRef* recvTy);
+
+    // fix #6353 (§23.4 / §14.1 / §12.1 / §2.8.3 rule 4, v0.338): the GENERIC-
+    // ELEMENT twin of `importedVirtualAccessorSlotFn`, for a VIRTUAL indexer on
+    // an IMPORTED GENERIC base read through a base-typed receiver
+    // (`var b: LIB.VB<string> := new E(); b[0]` where `LIB.VB<T>` declares
+    // `virtual property [i: int]: T`).
+    //
+    // #3190's thunk and #2545's `declareImportedIndexerGetters` dispatch
+    // wrapper both build their LLVM signature from the RECONSTRUCTED, ERASED
+    // member type (`ctx_.importedMemberType` / the indexer's `ParameterSymbol`
+    // types read the declared `T`, which lowers to the non-null i32 erasure
+    // placeholder). The vtable SLOT, however, holds the LOCAL override's
+    // accessor, emitted in the importer against the SUBSTITUTED element
+    // (`[i: int]: string` → ptr). So the wrapper calls a `ptr`-returning
+    // function through an `i32`-returning prototype — LLVM's verifier accepts
+    // it (a pointer and an i32 are both passed in registers, so nothing
+    // aborts) and the caller's pointer is read back as an i32: a silent wrong
+    // value, NO diagnostic, rc=0.
+    //
+    // MEASURED on this fix's parent, two-module `bezelc -c lib.bzl` then
+    // `bezelc --import lib.o app.bzl`: `b[0]` printed `2358800` (a heap
+    // pointer's low word) where `XMOD` was correct; the NON-GENERIC control
+    // (`class VB` with a concrete `[i: int]: string`) printed `XMOD`. #6319 had
+    // already fixed the CALL SITE — the trap this issue exists to record is
+    // that the call-site half was fixed and the defect LOOKED resolved while
+    // the callee half silently remained.
+    //
+    // This helper emits a per-(ps, recvTy, isSet) InternalLinkage wrapper whose
+    // signature is built UNDER the receiver's §14.1 substitution and whose body
+    // is #2545's dispatch verbatim (`vptr = load(this); fn = load(vptr + slot);
+    // return fn(this, idx...)`). Cached on the (ps, recvTy) pair plus the
+    // get/set flag, because different receivers instantiate the same accessor
+    // under different substitutions and therefore need different ABIs.
+    //
+    // Gated NARROWLY, returning nullptr — which keeps the pre-fix wrapper,
+    // CORRECT for every shape the erasure does not move — unless:
+    //   * the accessor is IMPORTED (`ps->decl == nullptr`, so there is no AST to
+    //     inline);
+    //   * it is a VIRTUAL indexer with a `propGetSlot_`/`propSetSlot_` entry
+    //     (the NON-virtual case is `bz$<Class>$idxget$<arity>`'s, owned by
+    //     `emitImportedIndexerGetterInheritedWrapper` / #3353);
+    //   * `ps->parent` is generic and the receiver carries a full, provable
+    //     substitution for it — `computeAncestorGenericSubst` when the accessor
+    //     is declared on an ANCESTOR, and the receiver's OWN arguments (what
+    //     `GenericRecvSubstGuard` binds) when it is declared on the receiver's
+    //     own class, since `computeAncestorGenericSubst` refuses that case by
+    //     design (`cur == ancestor`);
+    //   * and the SUBSTITUTED signature actually DIFFERS from the erased one —
+    //     the same "act only where the erasure moves the ABI" test #2955's
+    //     sema gate uses, so a `VB<int>` receiver (T → i32, identical to the
+    //     placeholder) is left on the existing, correct path.
+    llvm::Function* emitImportedVirtualIndexerSubstWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy,
+        bool isSet);
 
     // fix #2896 (§14.1 / §12 / §12.9, v0.240): one level of the descendant walk
     // — a class on the chain and the concrete TypeRef bound to each of ITS OWN
