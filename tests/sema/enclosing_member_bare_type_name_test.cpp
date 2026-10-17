@@ -687,15 +687,31 @@ BEZEL_TEST(enclosing_member_bare_type_name,
 // lookup, so no reordering inside the lookup can help: the answer is published
 // strictly after the question is asked.
 //
-// The asymmetry is the evidence. `d_toplevel_gen.bzl` (a top-level `record Wrap`
-// carrying `public property Bad: Bad<int>? := null;` against a module-level
-// `record Bad<T>(V: T)`) COMPILED; the IDENTICAL declaration one level in
-// (§11.6 nested `Outer.Wrap`) was REJECTED with "unresolved type name `Bad`;
-// `Bad` is a member of the enclosing type `Wrap`" — the §2.7 stop naming the
-// very member whose declared type is the type position being resolved. The
-// top-level twin escapes only because the stop is switched off there
+// The asymmetry is the evidence, and it is reproducible from this comment
+// alone — no external artifact, because the probe it came from was a scratch
+// file outside the repo and citing it by name pointed a reader at nothing
+// (`git log --all -- '*<name>*'` empty, and no checker inspects a filename in a
+// comment). The pair, verbatim:
+//
+//   public record Bad<T>(V: T);          // the module-level type of the name
+//   public record Wrap                   // TOP-LEVEL twin: COMPILED on base
+//     public property Bad: Bad<int>? := null;
+//   end Wrap;
+//
+//   public record Bad<T>(V: T);          // same module-level type
+//   public class Outer                   // §11.6 nested: REJECTED on base
+//     public record Wrap
+//       public property Bad: Bad<int>? := null;   // "unresolved type name
+//     end Wrap;                           //  `Bad`; `Bad` is a member of
+//   end Outer;                            //  the enclosing type `Wrap`"
+//
+// The IDENTICAL member declaration, one level in. The rejection names the very
+// member whose declared type is the type position being resolved. The top-level
+// twin escapes only because the stop is switched off there
 // (`enclosingTypeMemberBlocksBareName`'s `currentOuterType_->enclosingTypePath`
-// guard), NOT because the carve-out works.
+// guard), NOT because the carve-out works. The two halves of this pair are both
+// rows in this file — row 10 above (`..._in_a_top_level_body`) and row 34 below
+// (`..._in_a_nested_body`) — so neither half has to be taken on trust.
 //
 // MEASURED on the base (bezelc built in this lane worktree at 863d6c6b), rows
 // 34, 36 and 37 below REJECTED with that diagnostic and rows 35 and 38 did not
