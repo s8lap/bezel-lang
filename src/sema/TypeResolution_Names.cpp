@@ -2404,7 +2404,8 @@ Symbol* Resolver::lookupName(std::string_view name, Scope* scope) {
 // `tests/module/` cross-module row, and with the reachability above no
 // reachable program could discharge it.
 static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name,
-                                        const SemaContext& ctx) {
+                                        const SemaContext& ctx,
+                                        const ast::Type* resolving) {
     if (!m) return false;
     const ast::Type* ty = nullptr;
     if (m->decl) {
@@ -2430,6 +2431,44 @@ static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name,
         else if (const auto* cd = dynamic_cast<const ast::ConstDecl*>(m->decl))
             ty = cd->type.get();
     }
+    // fix #6410 (§2.7 "Through nesting", warning row, v0.338): the carve-out
+    // read BELOW answers "is this member's declared type the resolved type?",
+    // but `resolveType` publishes its `TypeRef` with `ctx_.setResolvedType`
+    // only AFTER `resolveNamed` has returned — and `resolveNamed` is what
+    // performs this lookup. So while the type being resolved IS a member's own
+    // declared type, `ctx.resolvedType(*ty)` is null and the carve-out cannot
+    // fire at all: `property Color: Color` inside a NESTED (§11.6) or LOCAL
+    // (§21.10) type blocks its own declaration and the type position is
+    // rejected, while the identical TOP-LEVEL declaration compiles — the stop
+    // is off there, not the carve-out working.
+    //
+    // The node-identity test below is ORDER-INDEPENDENT and needs no resolved
+    // type at all. It is exactly the same question: `m->name == name` is
+    // already established by the caller's filter, and `ty == resolving` says
+    // the member's declared type node IS the node whose head is `name`, which
+    // is what `dt->headName() == name` would report once resolution finishes.
+    // So this arm cannot answer for a member that does not declare its own
+    // name, and cannot answer differently from the resolved read for one that
+    // does — it only makes the answer available in the window where the
+    // resolved read is empty.
+    //
+    // §2.7, warning row, in its own words: "warn, unless the member's declared
+    // type is the resolved type (or an instantiation of the resolved generic) —
+    // the `property Color: Color` idiom; qualify `this.` to reach the member."
+    // The prose repeats it ("the `property Color: Color` and `property
+    // Buffer: Buffer<int>` idioms are its carve-out"), so a `property Buffer:
+    // Buffer<int>` is admitted here too: the node-identity test is on the NODE,
+    // and `dt->headName()` on the resolved read is on the HEAD, so the generic
+    // instantiation form needs no separate arm.
+    //
+    // MEASURED (bezelc in this lane worktree at 863d6c6b), the module-level
+    // `record Bad<T>(V: T)` twin accepted and the §11.6 nested
+    // `public record Wrap public property Bad: Bad<int>? := null;` was REJECTED
+    // with "unresolved type name `Bad`; `Bad` is a member of the enclosing type
+    // `Wrap`" — the §2.7 stop naming the very member whose declared type is
+    // being resolved. The §21.10 LOCAL twin (`property Box: Box` in a local
+    // `record Inner`) was rejected the same way (#6424).
+    if (ty && ty == resolving) return true;
     const TypeRef* dt = ty ? ctx.resolvedType(*ty) : nullptr;
     // The imported side, keyed by the member symbol rather than by an ast::Type
     // node (there is none) — see the both-sources note above.
@@ -2469,8 +2508,19 @@ static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name,
 // not accessible from this body and must not stop the search. `internal`
 // (§13.4) is access within the declaring module, which is the only module the
 // enclosing chain can come from.
+//
+// ⚠ THE LAST SENTENCE IS NOT THE WHOLE STORY SINCE fix #6401 (§21.10, v0.338),
+// and reading it as the whole story is what this paragraph used to say. §21.10
+// states the rule for a body-local type in its own words — "Accessibility there
+// is that of the body declaring the local type, so the `private` members of
+// the type declaring it count as accessible" — so in the §21.10 chain the
+// DECLARING type is an outer link that still ends the search, `private` and
+// `protected` included, via `privateVisibleViaDeclaringBody`. Read
+// `privateVisibleViaDeclaringBody` beside this paragraph; the §13.1 filter
+// itself is unchanged and still governs every other chain.
 bool Resolver::enclosingTypeMemberBlocksBareName(
-    const TypeSymbol* owning, std::string_view name) {
+    const TypeSymbol* owning, std::string_view name,
+    const ast::Type* resolving) {
     if (!owning) return false;
     // fix #6401 (§21.10 "Local type declarations" + §2.7 "Through nesting",
     // v0.338): a §21.10 LOCAL type's body is a Through-nesting body, and the
@@ -2570,7 +2620,8 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
         if (!m || m->name != name) continue;
         // A nested type is admitted by bare name (§2.7 "Through nesting").
         if (dynamic_cast<const NestedTypeSymbol*>(m)) continue;
-        if (memberDeclaresCollidingName(m, name, ctx_)) continue;  // §2.7 carve-out
+        if (memberDeclaresCollidingName(m, name, ctx_, resolving))
+            continue;  // §2.7 carve-out
         const auto* member = dynamic_cast<const MemberSymbol*>(m);
         if (member && !ownBody && !privateVisibleViaDeclaringBody &&
             (member->visibility == ast::Visibility::Private ||
@@ -2677,7 +2728,8 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
 // symbol `lookupName` would have returned is returned unchanged, and
 // `*stoppedAt` is a separate answer the caller decides about.
 Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
-                                     TypeSymbol** stoppedAt) {
+                                     TypeSymbol** stoppedAt,
+                                     const ast::Type* resolving) {
     if (stoppedAt) *stoppedAt = nullptr;
     for (Scope* s = scope; s; s = s->parent) {
         // §2.7 rule 1 ranks local scope ABOVE the enclosing type's members, so
@@ -2690,7 +2742,8 @@ Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
         if (stoppedAt) {
             for (const auto& entry : typeBodyScopes_) {
                 if (entry.first != s) continue;
-                if (enclosingTypeMemberBlocksBareName(entry.second, name)) {
+                if (enclosingTypeMemberBlocksBareName(entry.second, name,
+                                                     resolving)) {
                     *stoppedAt = entry.second;
                     break;
                 }
@@ -3728,7 +3781,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (qualifiedBuiltin) {
         sym = nullptr;
     } else if (t.name->parts.size() == 1) {
-        sym = lookupBareTypeName(first, scope, &stoppedAt);
+        sym = lookupBareTypeName(first, scope, &stoppedAt, &t);
         if (stoppedAt) {
             // §2.7 "Through nesting": the search ended at an enclosing type
             // that HAS the name, and the member it has cannot be used in a

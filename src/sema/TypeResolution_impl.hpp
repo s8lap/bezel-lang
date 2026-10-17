@@ -1191,13 +1191,24 @@ private:
     // so ended the search without supplying one) to `*stoppedAt`, or null when
     // the search ran to completion. See the definition for why a body scope
     // alone cannot express this.
+    //
+    // fix #6410 (§2.7 "Through nesting", warning row, v0.338): `resolving` is
+    // the `ast::Type` node the caller is resolving RIGHT NOW, or null. It is
+    // threaded only so §2.7's `property Color: Color` carve-out can ask "is
+    // this member's own declared type the type being resolved?" without waiting
+    // for `setResolvedType`, which `resolveType` writes only AFTER
+    // `resolveNamed` has returned — i.e. after this lookup. Without it the
+    // carve-out is unanswerable for the one member it exists to admit.
     Symbol* lookupBareTypeName(std::string_view name, Scope* scope,
-                               TypeSymbol** stoppedAt);
+                               TypeSymbol** stoppedAt,
+                               const ast::Type* resolving = nullptr);
 
     // fix #6383 follow-up (§2.7 "Through nesting", v0.338): does `owning`
     // declare an ACCESSIBLE member called `name` that is not a nested type?
+    // `resolving` is `lookupBareTypeName`'s, passed on unchanged; see there.
     bool enclosingTypeMemberBlocksBareName(const TypeSymbol* owning,
-                                           std::string_view name);
+                                           std::string_view name,
+                                           const ast::Type* resolving = nullptr);
 
     // Slice 3d: walk a method/ctor body and resolve every type
     // ascription on LocalDecl / catch arm. Recurses through control-

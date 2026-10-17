@@ -661,3 +661,129 @@ BEZEL_TEST(enclosing_member_bare_type_name,
         "end M; end Holder; ",
         "`Inner`");
 }
+
+// ===========================================================================
+// fix #6410 (§2.7 "Through nesting", warning row) — the carve-out asked
+// AFTER the answer it needed was written
+// ===========================================================================
+//
+// §2.7's warning row, in its own words: "warn, unless the member's declared
+// type is the resolved type (or an instantiation of the resolved generic) — the
+// `property Color: Color` idiom; qualify `this.` to reach the member."
+//
+// Rows 9/10 above pin that carve-out, but only in the shape where the member
+// of the name is declared BEFORE the type position that names it: `Outer`'s
+// `property Color: Color` is resolved (and its `TypeRef` published) before
+// `Inner`'s `constructor(c: Color)` is reached, so `ctx.resolvedType` can
+// answer. That shape works by DECLARATION ORDER, not by the carve-out firing.
+//
+// THE DEFECT (#6410). `memberDeclaresCollidingName` asks the carve-out through
+// `ctx.resolvedType(*memberDeclType)`, and `resolveType` publishes its TypeRef
+// with `ctx_.setResolvedType` only AFTER `resolveNamed` returns. So when the
+// type position being resolved IS the member's OWN declared type — the member
+// declaring its own name, which is the one member §2.7's carve-out exists to
+// admit — the query is made BEFORE the answer exists, returns null, and the
+// member blocks its own declaration. `resolveNamed` is what performs the
+// lookup, so no reordering inside the lookup can help: the answer is published
+// strictly after the question is asked.
+//
+// The asymmetry is the evidence. `d_toplevel_gen.bzl` (a top-level `record Wrap`
+// carrying `public property Bad: Bad<int>? := null;` against a module-level
+// `record Bad<T>(V: T)`) COMPILED; the IDENTICAL declaration one level in
+// (§11.6 nested `Outer.Wrap`) was REJECTED with "unresolved type name `Bad`;
+// `Bad` is a member of the enclosing type `Wrap`" — the §2.7 stop naming the
+// very member whose declared type is the type position being resolved. The
+// top-level twin escapes only because the stop is switched off there
+// (`enclosingTypeMemberBlocksBareName`'s `currentOuterType_->enclosingTypePath`
+// guard), NOT because the carve-out works.
+//
+// MEASURED on the base (bezelc built in this lane worktree at 863d6c6b), rows
+// 34, 36 and 37 below REJECTED with that diagnostic and rows 35 and 38 did not
+// exist. Row 38 is the DIAGNOSTIC flip, named explicitly: on the base the
+// no-such-type nested twin reported the §2.7 stop clause naming `Wrap`'s own
+// `property Bad`; after this fix it reports the plain `unresolved type name
+// `Bad``, because §2.7's carve-out admits that member and no type of the name
+// is declared anywhere. Both reject; only the explanation changed, and the new
+// one is the honest one.
+
+// --- 34. THE NESTED (§11.6) SPELLING OF THE CARVE-OUT ---------------------
+BEZEL_TEST(enclosing_member_bare_type_name,
+           spec_2_7_own_declared_type_carve_out_fires_in_a_nested_body) {
+    expectAccepted(
+        "public record Bad<T>(V: T); public class Outer public record Wrap "
+        "public property Bad: Bad<int>? := null; end Wrap; end Outer; ");
+}
+
+// --- 35. THE CONTROL: a member of the name that does NOT declare it -------
+//
+// The discriminator, and the direction that matters: the carve-out admits a
+// member that spells the colliding name in its OWN declared type, and nothing
+// else. `public readonly property Bad: int` is a member of the name whose
+// declared type is `int`, so §2.7's stop still ends the search and the type
+// position is unresolved. A fix that read the member's declared type WITHOUT
+// checking it is the one being resolved would satisfy row 34 and un-reject
+// this — the silent-acceptance direction, and the reason the carve-out is
+// keyed on node identity rather than on "some member of the name exists".
+BEZEL_TEST(enclosing_member_bare_type_name,
+           spec_2_7_member_of_the_name_declaring_another_type_still_stops) {
+    expectStoppedAtEnclosingMember(
+        "public record Bad<T>(V: T); public class Outer public record Wrap "
+        "public readonly property Bad: int := 0; "
+        "private M: Bad<int>? := null; end Wrap; end Outer; ",
+        "`Wrap`");
+}
+
+// --- 36. THE §21.10 LOCAL TWIN (#6424) -------------------------------------
+//
+// #6401 made a §21.10 local type a LINK of §2.7's chain, and so carried this
+// same defect into local types: `property Box: Box` inside a local `record
+// Inner` was newly rejected, where its top-level twin compiles. §21.10 puts
+// the name in scope inside the local type's own body ("The prohibition does
+// NOT reach the local type's OWN members … and the name IS in scope inside its
+// own body"). Row 22 is the local CONTROL — the same member of the name with
+// `int` as its declared type still stops the search — so this row is about the
+// carve-out and row 22 about the stop, in the same body.
+BEZEL_TEST(enclosing_member_bare_type_name,
+           spec_2_7_own_declared_type_carve_out_fires_in_a_local_type_body) {
+    expectAccepted(
+        "public record Box(A: int); public class Holder public method M(): "
+        "int record Inner public property Box: Box := new Box(1); end Inner; "
+        "var i := new Inner(); return i.Box.A; end M; end Holder; ");
+}
+
+// --- 37. A RETURN TYPE IS A DECLARED TYPE ---------------------------------
+//
+// The carve-out is stated over "the member's declared type", and `memberDeclares-
+// CollidingName` already reads a `MethodDecl`'s return type through the same
+// six-arm both-sources read. `method Bad(): Bad<int>` is that arm's instance of
+// the idiom: the return type names the member's own name, so it cannot be a
+// blocker or the method could not be declared. Without this row a fix that
+// handled only `PropertyDecl`/`FieldDecl` would leave the method form rejected.
+BEZEL_TEST(enclosing_member_bare_type_name,
+           spec_2_7_own_declared_return_type_carve_out_fires_too) {
+    expectAccepted(
+        "public record Bad<T>(V: T); public class Outer public record Wrap "
+        "public method Bad(): Bad<int> return new Bad<int>(1); end Bad; "
+        "end Wrap; end Outer; ");
+}
+
+// --- 38. THE CARVE-OUT ADMITS THE MEMBER EVEN WHERE IT CANNOT HELP -------
+//
+// The member no longer blocks, so with NO type of the name declared anywhere
+// the program is unresolved on §2.7's OWN terms — and the diagnostic says so
+// plainly instead of blaming `Wrap`'s `property Bad` as the reason. This is
+// the diagnostic-text FLIP named above: the base reported the §2.7 stop clause
+// here, and this row pins the plain form. Pinning it matters because a lit or
+// gtest needle on the stop clause would otherwise be a vacuous carry-over: the
+// clause is still asserted by rows 35 and the whole stop family, so its
+// absence here is about THIS member, not about the rule.
+BEZEL_TEST(enclosing_member_bare_type_name,
+           spec_2_7_carve_out_admits_the_member_and_leaves_the_name_unresolved) {
+    auto r = runAot(program(
+        "public class Outer public record Wrap "
+        "public property Bad: Bad<int>? := null; end Wrap; end Outer; "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kUnresolved));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, kStopClause));
+}
