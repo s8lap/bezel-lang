@@ -4,6 +4,7 @@
 //! title: a generic alias index parameter on the base is overridden by an indexer seen through a base receiver
 //! rule: Type aliases — generic or not — see through to the aliased type for identity, equality, method dispatch, and overload resolution.
 //! cites: 27.8, 12.1
+//! issue: 6323
 //! expect: run
 //! output: derived
 //!   derived

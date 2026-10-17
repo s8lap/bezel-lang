@@ -4,6 +4,7 @@
 //! title: an override whose parameter is spelled through a generic alias dispatches through a base receiver
 //! rule: Type aliases — generic or not — see through to the aliased type for identity, equality, method dispatch, and overload resolution.
 //! cites: 27.8, 12.1
+//! issue: 6323
 //! expect: run
 //! output: derived
 //!   derived
