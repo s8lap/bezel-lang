@@ -15039,13 +15039,22 @@ void Resolver::checkVariancePositions() {
         // spell — unlike a depth bound, which skips exactly the declarations
         // whose depth happens to exceed a literal.
         //
-        // THE RECURSION IS NOT NEW and is bounded by something the PARSER has
-        // already spent. `visit` recurses once per level of §11.6 nesting, and
-        // the parser must have recursed through the same nesting to build the
-        // AST this walk reads. MEASURED on the base: a 2000-level chain
-        // compiles clean (10 s, 430 MB RSS) and the parser is what runs out of
-        // stack at 5000 (SIGSEGV, unchanged by this commit), so the walk is not
-        // the binding constraint at any depth this compiler accepts.
+        // THE RECURSION IS NOT NEW and is not the binding constraint at any
+        // depth this compiler accepts. `visit` recurses once per level of §11.6
+        // nesting, and the parser must already have recursed through the same
+        // nesting to build the AST this walk reads. MEASURED, by the R31
+        // non-author review of this commit: a 2000-level chain compiles clean
+        // (10 s, 430 MB RSS), and the stack is exhausted at ~2150-2200 — not at
+        // 5000, and not in the parser. A backtrace on BOTH the base and this
+        // fix puts the faulting frame in the OWNERSHIP pass's nested-type member
+        // recursion, `bezel::ownership::(anonymous namespace)::checkMember` at
+        // Ownership.cpp:16554 / :16778, which runs AFTER this walk
+        // (Driver.cpp:236, after TypeResolution.cpp:747). Both legs fault at the
+        // same depth, so removing the cap here neither introduces nor removes an
+        // exhaustion: this walk is simply never the first pass to run out.
+        // (An earlier revision of this comment attributed the exhaustion to the
+        // parser at 5000. That was a guess about the mechanism; the measurement
+        // above is what the conclusion actually rests on, and it is unchanged.)
         std::unordered_set<const TypeSymbol*> onChain;  // cycle guard
         std::vector<const TypeSymbol*> stack;  // outermost-first working chain
         auto visit = [&](auto&& self, const TypeSymbol* t) -> void {
