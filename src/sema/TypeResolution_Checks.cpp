@@ -14059,10 +14059,140 @@ const TypeAliasSymbol* resolveLocalAliasHead(
 // until the stack is exhausted before the cycle diagnostic is reached.
 constexpr int kMaxAliasSeeThroughDepth = 32;
 
+// fix #6351 (§12.9, v0.338): the heads this pass may resolve a variance for.
+//
+// `imported` maps a module's §2.1 dotted name to that module's exported types,
+// gathered from the modules THIS FILE actually imported (`sourceImports_` x
+// `SemaContext::importedTypesOf` — the same pairing `TypeResolution::run` uses
+// to expose import-gated names, so the two can never disagree about what is in
+// scope). §13.2 puts only `public` top-level types in a module's metadata, so
+// every symbol here is one the importing file could legally name.
+//
+// `aliases` is `importAliases_` (§2.2: alias -> dotted module name), so a head
+// spelled through an alias — `L.IThing` — resolves against the ONE module `L`
+// names rather than by a machine-wide simple-name scan.
+//
+// `moduleNames` is `sourceImports_` as a set of the SAME dotted module names
+// `imported` is keyed by, so a qualifier that is a MODULE name with no alias
+// (§2.7's `Module.Type` spelling) is distinguishable from one that is an
+// enclosing-type path (§11.6's `Outer.Box`). That distinction is what stops a
+// local `Outer` from being read as a module prefix — see `resolveImportedHead`.
+struct VarianceHeads {
+    const std::unordered_map<std::string, std::vector<TypeSymbol*>>* imported =
+        nullptr;
+    const std::unordered_map<std::string, std::string>* aliases = nullptr;
+    const std::unordered_set<std::string>* moduleNames = nullptr;
+};
+
+// fix #6351 (second attempt; the first was REJECTed for a false resolve):
+// the head `head` names among the imported types, or null.
+//
+// THE RULE: this function may only ever hand back a type the NAME RESOLVER
+// would bind to that spelling. It enforces that by deciding what the QUALIFIER
+// binds FIRST, and refusing to look at any imported type unless the qualifier
+// provably names a module:
+//
+//   * qualifier is a LOCAL top-level type  -> the spelling is §11.6's
+//     enclosing-type path and binds inside that LOCAL type (or nowhere).
+//     Return null. This is the hole the reviewer's P9 found: a local
+//     `class Outer { interface Inner<out T> }` beside an imported
+//     `Outer.Inner<in T>` made the first attempt match the IMPORTED head by
+//     `qualifiedTypeName()`, read the wrong marker off a type the name
+//     resolver never bound, and REJECT a program that must compile. §2.2 — a
+//     local declaration shadows an import — is what makes that the answer, and
+//     returning null keeps the pre-#6351 behaviour (skip) rather than
+//     inventing a nested-local resolution this pass cannot do correctly.
+//   * qualifier is an import ALIAS        -> search the module it names.
+//   * qualifier is a MODULE name          -> search that module (§2.7's
+//     `Module.Type` spelling; `moduleNames` is what makes this reachable — the
+//     first attempt reached only two of the three legal spellings because
+//     `qualifiedTypeName()` is the SIMPLE name for a top-level type, so its
+//     byte-for-byte test could never match `Lib.IThing`).
+//   * anything else                       -> null. Never guess.
+//
+// A BARE name (no qualifier) searches every imported module and yields null on
+// a second match, which §2.2 already rejects as ambiguous. Null means
+// `Unknown` upstream: a skip, the pre-#6351 behaviour, and the safe direction —
+// a false skip can only miss a rejection, while a false resolve produces one.
+//
+// The qualifier test above is what keeps the resolver from reading a variance
+// off a type the NAME RESOLVER would not bind. It does NOT make resolution
+// exact: once a module qualifier is established, the FINAL path component is
+// matched by simple name with no check on the enclosing path — see the
+// KNOWN LIMITATION at the match loop, and #6373.
+const TypeSymbol* resolveImportedHead(const ast::Type& head,
+                                      const VarianceHeads& heads,
+                                      const std::vector<TypeSymbol*>& localTypes) {
+    if (!head.name || head.name->parts.empty() || !heads.imported) return nullptr;
+    const std::string_view h = head.name->parts.back();
+    const bool qualified = head.name->parts.size() > 1;
+
+    // Which module (if any) the qualifier names. Empty means "not a module",
+    // and every such case returns null below.
+    std::string targetModule;
+    if (qualified) {
+        const std::string qualifier(head.name->parts.front());
+        // §2.2 — a LOCAL top-level declaration shadows an import of the same
+        // name. `localTypes` is exactly the module's own top-level types, so
+        // this is the same test the name resolver applies; it must be consulted
+        // BEFORE either module spelling, or a local `Outer` would be mistaken
+        // for a module prefix and the enclosing path read off an import.
+        bool namesLocalTopLevel = false;
+        for (const TypeSymbol* ts : localTypes)
+            if (ts && ts->name == qualifier) { namesLocalTopLevel = true; break; }
+        if (namesLocalTopLevel) return nullptr;
+
+        if (heads.aliases) {
+            const auto it = heads.aliases->find(qualifier);
+            if (it != heads.aliases->end()) targetModule = it->second;
+        }
+        if (targetModule.empty() && heads.moduleNames &&
+            heads.moduleNames->count(qualifier))
+            targetModule = qualifier;
+        if (targetModule.empty()) return nullptr;
+    }
+
+    // Match the FINAL path component against `targetModule`'s exports by
+    // SIMPLE name. The qualifier has been established to be a module, so the
+    // module is the right scope; the enclosing path is NOT verified.
+    //
+    // KNOWN LIMITATION (#6373, filed by the non-author review of this commit;
+    // deliberately left as-is here so the behaviour is not changed silently).
+    // A three-or-more-part spelling resolves on its last component alone, so
+    // the resolver cannot tell these two apart:
+    //
+    //   `Lib.Outer.Box<T>` where `Lib` exports a TOP-LEVEL `Box<in T>` but no
+    //     `Outer` at all -> the §2.7 "no public type `Outer`" diagnostic fires
+    //     (correctly), and this pass ALSO contributes a spurious §12.9 error
+    //     read off `Lib.Box`, a type the spelling never names.
+    //   `LibQ.Outer.Box<T>` where `LibQ` exports a genuinely NESTED
+    //     `Outer.Box<in T>` -> the §12.9 error is CORRECT and intended.
+    //
+    // The two spellings are textually identical here and resolve to the same
+    // symbol, so the first is a false resolve. It stays below the rejection
+    // bar because the program is rejected by §2.7 regardless — it is a
+    // spurious SECOND diagnostic, not a legal program turned into an error.
+    // The suggested remedy (require exactly two path parts) is a real
+    // behavioural trade — it would narrow the correct `LibQ.Outer.Box` case
+    // from REJECT to skip — so it is #6373's decision to make, not this
+    // commit's.
+    const TypeSymbol* found = nullptr;
+    for (const auto& entry : *heads.imported) {
+        if (!targetModule.empty() && entry.first != targetModule) continue;
+        for (const TypeSymbol* ts : entry.second) {
+            if (!ts || ts->name != h) continue;
+            if (found) return nullptr;  // ambiguous bare name — skip
+            found = ts;
+        }
+    }
+    return found;
+}
+
 VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName,
                                   VariancePos outer,
                                   const std::vector<TypeSymbol*>& localTypes,
                                   const std::vector<TypeAliasSymbol*>& localAliases,
+                                  const VarianceHeads& heads,
                                   VarianceSite site, int depth);
 
 // §12.9: "A type parameter inside another generic type inherits position from
@@ -14081,6 +14211,7 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
 VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
                                  const std::vector<TypeSymbol*>& localTypes,
                                  const std::vector<TypeAliasSymbol*>& localAliases,
+                                 const VarianceHeads& heads,
                                  VarianceSite site, int depth) {
     if (!head.name || head.name->parts.empty()) return VariancePos::Unknown;
     const std::string_view h = head.name->parts.back();
@@ -14128,7 +14259,48 @@ VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
         if (!aps) return VariancePos::Unknown;
         return composedParamPosition(*ad->aliasedType, aps->name,
                                      VariancePos::CoVariant, localTypes,
-                                     localAliases, site, depth + 1);
+                                     localAliases, heads, site, depth + 1);
+    }
+    // fix #6351 (§12.9, §2.2, §2.7, §13.2): a head IMPORTED from another
+    // module. §12.9's rule names no module boundary — "Position is composed
+    // across nested type constructors. A type parameter inside another generic
+    // type inherits position from that wrapper's variance" — and #3143
+    // populates `GenericParamSymbol::variance` on the imported side too
+    // (`ModuleLoader::convertGenericParams`), so the marker is read from the
+    // same field either way and an imported head composes exactly as a local
+    // one does. Before this arm the only sources were `localTypes`, the local
+    // aliases, and the built-in table, so every imported head composed to
+    // `Unknown` and was SILENTLY SKIPPED.
+    //
+    // ARM ORDER — local first, imports second, and that order is §2.2's, not
+    // an arbitrary preference. Reaching this arm already means neither the
+    // local-type walk above nor the local alias above matched, so for a name
+    // that is BOTH an imported type and a local alias the ALIAS has won —
+    // which is the shadowing rule the name resolver itself applies (§2.2: "a
+    // local declaration shadows an import"), so the two can never disagree
+    // about which type the spelling names. It also resolves the qualified
+    // spelling correctly for free: `resolveLocalAliasHead` matches only a
+    // single-part name (§27.8 aliases are module-level, A.2 `TypeAliasDecl` is
+    // a `TopDecl`), so `L.Foo<T>` never reaches this arm through an alias at
+    // all and searches the module `L` names instead.
+    //
+    // `resolveImportedHead` enforces the same rule from the other side: it
+    // returns null outright when the qualifier is a local top-level type, and
+    // only searches a module when the qualifier provably names one.
+    if (const TypeSymbol* its = resolveImportedHead(head, heads, localTypes)) {
+        // The same reading rules as the local-type walk above, deliberately:
+        // a class, record, enum or choice is always invariant (§12.9), and a
+        // head with no marker at `argIndex` defers through `invariantOrDefer`
+        // (#6355) rather than guessing.
+        if (its->kind != ast::TypeDeclKind::Interface)
+            return invariantOrDefer(site);
+        if (argIndex >= its->genericParams.size()) return invariantOrDefer(site);
+        const auto* gps =
+            dynamic_cast<GenericParamSymbol*>(its->genericParams[argIndex]);
+        if (!gps) return invariantOrDefer(site);
+        if (gps->variance == "out") return VariancePos::CoVariant;
+        if (gps->variance == "in") return VariancePos::ContraVariant;
+        return invariantOrDefer(site);
     }
     if (!isBuiltinTypeName(h)) return VariancePos::Unknown;
     if (argIndex == 0 && builtinHeadIsCovariantAtZero(h)) return VariancePos::CoVariant;
@@ -14141,6 +14313,7 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
                                   VariancePos outer,
                                   const std::vector<TypeSymbol*>& localTypes,
                                   const std::vector<TypeAliasSymbol*>& localAliases,
+                                  const VarianceHeads& heads,
                                   VarianceSite site, int depth) {
     switch (t.kind) {
     case ast::TypeKind::Named: {
@@ -14154,11 +14327,13 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
             // applied to the slot the whole type occupies here.
             const VariancePos argSlot = slotPolarity(
                 outer,
-                namedHeadArgVariance(t, i, localTypes, localAliases, site, depth));
+                namedHeadArgVariance(t, i, localTypes, localAliases, heads,
+                                    site, depth));
             if (argSlot == VariancePos::Absent) continue;
             acc = mergeVariancePos(
                 acc, composedParamPosition(*t.genericArgs[i], paramName, argSlot,
-                                           localTypes, localAliases, site, depth));
+                                           localTypes, localAliases, heads,
+                                           site, depth));
         }
         return acc;
     }
@@ -14170,14 +14345,16 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
         if (t.funcReturn)
             acc = mergeVariancePos(
                 acc, composedParamPosition(*t.funcReturn, paramName, outer,
-                                           localTypes, localAliases, site, depth));
+                                           localTypes, localAliases, heads,
+                                           site, depth));
         for (const auto& fp : t.funcParams) {
             if (!fp.type) continue;
             const bool isOut = fp.modifier == "out" || fp.modifier == "out owned";
             acc = mergeVariancePos(
                 acc, composedParamPosition(*fp.type, paramName,
                                            isOut ? outer : flipVariancePos(outer),
-                                           localTypes, localAliases, site, depth));
+                                           localTypes, localAliases, heads,
+                                           site, depth));
         }
         return acc;
     }
@@ -14187,7 +14364,7 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
         if (!t.arrayElement) return VariancePos::Absent;
         return composedParamPosition(*t.arrayElement, paramName,
                                      VariancePos::Invariant, localTypes,
-                                     localAliases, site, depth);
+                                     localAliases, heads, site, depth);
     }
     default:
         return VariancePos::Absent;
@@ -14212,12 +14389,13 @@ bool composedVarianceViolation(const ast::Type& t,
                                std::string_view paramName,
                                const std::vector<TypeSymbol*>& localTypes,
                                const std::vector<TypeAliasSymbol*>& localAliases,
+                               const VarianceHeads& heads,
                                bool* composed = nullptr,
                                VarianceSite site = VarianceSite::Member) {
     const VariancePos pos = composedParamPosition(
         t, paramName,
         isOutputPos ? VariancePos::CoVariant : VariancePos::ContraVariant,
-        localTypes, localAliases, site, /*depth=*/0);
+        localTypes, localAliases, heads, site, /*depth=*/0);
     if (pos == VariancePos::Unknown || pos == VariancePos::Absent) return false;
     const bool bad = paramVariance == "out" ? pos != VariancePos::CoVariant
                                             : pos != VariancePos::ContraVariant;
@@ -14251,6 +14429,30 @@ void Resolver::checkVariancePositions() {
         if (auto* as = dynamic_cast<TypeAliasSymbol*>(child))
             localAliases.push_back(as);
     }
+    // fix #6351: the same, for the heads this file IMPORTED. §12.9's rule
+    // names no module boundary — "Position is composed across nested type
+    // constructors" — so an imported head composes exactly as a local one
+    // does, and before this the composed walk resolved `localTypes` only and
+    // yielded `Unknown` for every imported head, silently accepting `out T`
+    // with `method Get(): IThing<T>` against a contravariant `IThing<in T>`.
+    //
+    // Gated on `sourceImports_`, the set of modules THIS FILE wrote an
+    // `import` for — the same gate `TypeResolution::run` uses to expose
+    // import-gated names, so the variance check can never resolve a head the
+    // name resolver would not have bound. A head from a module that was merely
+    // loaded as a dependency (and never imported) stays `Unknown`.
+    //
+    // The bundle carries ONLY the import-side tables. The local types and
+    // aliases stay explicit parameters, so there is exactly one source of
+    // truth for each and no way for the import arm's `namesLocalTopLevel`
+    // test to read a different vector from the local-type walk it must agree
+    // with (§2.2 shadowing).
+    std::unordered_map<std::string, std::vector<TypeSymbol*>> importedTypes;
+    for (const std::string& mod : sourceImports_) {
+        if (const std::vector<TypeSymbol*>* exported = ctx_.importedTypesOf(mod))
+            importedTypes[mod] = *exported;
+    }
+    const VarianceHeads heads{&importedTypes, &importAliases_, &sourceImports_};
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Interface) continue;
@@ -14278,7 +14480,8 @@ void Resolver::checkVariancePositions() {
                 bool baseComposed = false;
                 if (!composedVarianceViolation(*bt, variance,
                                                /*isOutputPos=*/true, paramName,
-                                               localTypes, localAliases, &baseComposed,
+                                               localTypes, localAliases, heads,
+                                                 &baseComposed,
                                                VarianceSite::BaseList))
                     continue;
                 const std::string head =
@@ -14310,7 +14513,8 @@ void Resolver::checkVariancePositions() {
                     if (md->returnType &&
                         composedVarianceViolation(*md->returnType, variance,
                                                 /*isOutputPos=*/true, paramName,
-                                                localTypes, localAliases, &composed)) {
+                                                localTypes, localAliases, heads,
+                                                        &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, md->returnType->span.begin,
                             std::string("type parameter `") +
@@ -14331,7 +14535,8 @@ void Resolver::checkVariancePositions() {
                         composed = false;
                         if (composedVarianceViolation(*p.type, variance,
                                                     paramIsOutput, paramName,
-                                                    localTypes, localAliases, &composed)) {
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, p.type->span.begin,
                                 std::string("type parameter `") +
@@ -14370,7 +14575,8 @@ void Resolver::checkVariancePositions() {
                         if (variance == "out" &&
                             composedVarianceViolation(*pd->type, variance,
                                                     /*isOutputPos=*/false, paramName,
-                                                    localTypes, localAliases, &composed)) {
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
@@ -14385,7 +14591,8 @@ void Resolver::checkVariancePositions() {
                         if (variance == "in" &&
                             composedVarianceViolation(*pd->type, variance,
                                                     /*isOutputPos=*/true, paramName,
-                                                    localTypes, localAliases, &composed)) {
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
@@ -14400,7 +14607,8 @@ void Resolver::checkVariancePositions() {
                         composed = false;
                         if (composedVarianceViolation(*pd->type, variance,
                                                     /*isOutputPos=*/true, paramName,
-                                                    localTypes, localAliases, &composed)) {
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
@@ -14427,7 +14635,8 @@ void Resolver::checkVariancePositions() {
                     if (variance == "out" &&
                         composedVarianceViolation(*fd->type, variance,
                                                 /*isOutputPos=*/false, paramName,
-                                                localTypes, localAliases, &composed)) {
+                                                localTypes, localAliases, heads,
+                                                        &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, fd->type->span.begin,
                             std::string("type parameter `") +
@@ -14442,7 +14651,8 @@ void Resolver::checkVariancePositions() {
                     if (variance == "in" &&
                         composedVarianceViolation(*fd->type, variance,
                                                 /*isOutputPos=*/true, paramName,
-                                                localTypes, localAliases, &composed)) {
+                                                localTypes, localAliases, heads,
+                                                        &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, fd->type->span.begin,
                             std::string("type parameter `") +
