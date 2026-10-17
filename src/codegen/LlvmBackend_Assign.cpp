@@ -9722,9 +9722,45 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
                 dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
                 dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
                 srcIsNamedOwner = true;
-            } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-                srcIsNamedOwner =
-                    sema::isAutoPropertyStorageSymbol(ps, ctx_);
+            } else if (dynamic_cast<sema::PropertySymbol*>(sym) != nullptr) {
+                // fix #6387 (§28.9 / §28.6 / §28.2, v0.338): a property READ is
+                // a LEND — "a getter never transfers a reclamation obligation to
+                // its reader", for every declared type. So EVERY property read is
+                // a named owner here, and the wrapper must never reclaim it.
+                //
+                // The arm this replaces asked `isAutoPropertyStorageSymbol`, which
+                // answers "does this property have compiler-generated backing
+                // storage?" — a DIFFERENT question, and one whose NO answer was
+                // read here as "this read produces a fresh value the wrapper may
+                // own". For a hand-written getter (`get => _a`,
+                // `get => do return _a; end`) that misreading minted `ownsSrc =
+                // true`, and the wrapper freed a field its holder still owns:
+                // MEASURED heap-use-after-free, READ of size 8 in
+                // `Holder$DisposeCore`, freed by
+                // `bz$userenumenum$SelfA$SelfA$Dispose` (the ORIGINAL wrapper
+                // reclaiming), allocated in `Holder$ctor`.
+                //
+                // Nothing is given up by the widening, because the "fresh value"
+                // reading has no case here at all: sema REJECTS a getter that
+                // returns a freshly-produced owned value ("a property or indexer
+                // getter may not return a freshly-produced owned value — a getter
+                // is a borrow-producing position ... expose the factory as a
+                // method returning `owned T`", §28.6), and §28.9 states the same
+                // rule positively. So a getter's result is always a lend of
+                // storage the reader's holder already keeps alive, and the
+                // auto-property sub-case is subsumed rather than narrowed: an
+                // auto-property IS a `PropertySymbol`, and its answer does not
+                // change. §28.2 keeps the holder's release point the only place
+                // the instance is reclaimed ("and nowhere else").
+                //
+                // An INTERFACE-declared property keeps the same answer it had:
+                // `isAutoPropertyStorageSymbol` classified one `true` (the
+                // leak-over-UAF direction #2931 records), so this widening does
+                // not move it. It does not reach the distinction anyway — an
+                // interface-dispatched read's static type is the declaration-less
+                // `IEnumerable<T>` sentinel, so `actualTy->declaration` is null and
+                // the whole arm above is skipped.
+                srcIsNamedOwner = true;
             }
         }
         return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy,
