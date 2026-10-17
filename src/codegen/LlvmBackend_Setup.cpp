@@ -19963,21 +19963,106 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     bool isCall = dynamic_cast<const ast::CallExpr*>(init) != nullptr;
     bool isNew = dynamic_cast<const ast::NewExpr*>(init) != nullptr;
     bool ownsSource = isCall || isNew || wrappedHere;
-    // fix #2769 / §29.11 / §23.3 / §28.9: a BLOCK-BODIED property read of an
+    // fix #2769 / §29.2 / §23.3 / §28.9: a BLOCK-BODIED property read of an
     // iterator-format interface (IEnumerable<T>/IOwningEnumerable<T>/
-    // IAsyncEnumerable<T>/IOwningAsyncEnumerable<T>) mints a fresh WRAPPER
+    // IAsyncEnumerable<T>/IOwningAsyncEnumerable<T>) MINTING a fresh WRAPPER
     // frame inside the getter call — the #2703 representation path
     // (wrapAsIEnumerableForTarget at the body return) wraps an Array/Set/
     // LinkedList/class into a vtable-backed enumerator and returns it. The
     // local bound here owns that frame; without this arm the wrapper leaks
     // (the for-in sees a LocalSymbol and registers no loop-end dispose). An
     // auto-property / field read of an already-existing IEnumerable mints
-    // nothing and stays un-owned — the narrower MemberAccessExpr +
-    // blockGetterOf shape matches the fact precisely. // per #2769, #2703
+    // nothing and stays un-owned. // per #2769, #2703
+    //
+    // fix #6405 (§29.2 / §28.2 / §28.3 / §23.3, v0.338): the shape was a
+    // SYNTACTIC presence test — "there IS a block getter" — and that is not
+    // the mint. `wrapAsIEnumerableForTarget` DECLINES whenever the returned
+    // value already carries the declared head, and a block-bodied
+    //
+    //     property Seq: IEnumerable<T> get do return _seq; end; end Seq;
+    //
+    // over an `owned _seq: IEnumerable<T>` field is exactly that: the body
+    // hands back the HOLDER'S OWN ENUMERATOR, no frame is built, and the
+    // `owned` field keeps its obligation (§28.2 — "Every class instance is
+    // reclaimed by compiler-inserted code at its holder's release point and
+    // nowhere else"). A claim over that unminted frame registered the §29.2
+    // loop's `using var __source := source;` reclamation over a source that
+    // is the holder's storage, and the loop's end freed the holder's field
+    // before the holder's own teardown read it. MEASURED on f6021ee9:
+    //
+    //   var e := h.Seq; for var x in e do … end;
+    //
+    // exits 1 with `heap-use-after-free … READ of size 8`, 32-byte region,
+    // freed by `bz$arrenumown$ptr$Dispose` and read back by
+    // `bz$M.HolderI$DisposeCore` — the holder's destructor reading its own
+    // freed field. §29.2 states both halves of the rule this over-claim
+    // broke: the wrapping `using var` assumes the obligation for a FRESH
+    // class-typed expression, and for a source that is itself an owned
+    // local — a holder-owned field read through its accessor — the
+    // desugaring is a BORROW and "the obligation stays with the original
+    // owner".
+    //
+    // The repair is the #3419/#6397 repair, applied here for the third time
+    // in this file: ask the WRAP CREATOR what it did rather than re-deriving
+    // it from the static shape. `blockGetterOf` still GATES the arm (it
+    // picks the block spelling over the expression-bodied `computedGetterOf`
+    // sibling below and keeps the two disjoint), but it no longer decides
+    // the verdict — `lowerReturn`'s `wrapAsIEnumerableForTarget` call
+    // publishes that edge's own `outWrapMade` in `propBlockGetterReturnKinds_`
+    // under `kPropGetterReturnMint`, keyed on the PropertyDecl for the
+    // structural reason #6397 records (the accessor is a memoised function
+    // with no caller read node to key on, and once the memo hits it cannot be
+    // re-entered to see one). Ordering holds: `lowerStmt` lowers this
+    // decl's initializer — and so emits the accessor — immediately before
+    // this registration, which is the same ordering #3384 relies on for
+    // `iterFormatWrappedDecls_` two arms above.
+    //
+    // CLAIM = MINT, by construction: the map has exactly one writer for this
+    // bit, it is set-or-CLEARED per return edge (so a getter with several
+    // edges and a declining one erases the verdict rather than leaving a
+    // stale true), and it is erased on a decline. So the narrowing is not a
+    // re-derived predicate that can drift again — it reads the wrap
+    // creator's own observation.
+    //
+    // DIRECTION. This moves the claim from "any block getter" to "a block
+    // getter whose wrap fired", so it can only ever REMOVE claims, and every
+    // claim it removes is one over a frame the creator demonstrably did not
+    // build. The dangerous direction for a narrowing here is the opposite
+    // one — dropping a claim on a genuinely minted frame turns this UAF into
+    // a leak — and it is closed by construction because the same writer that
+    // sets the bit also clears it, so a mint is always published. The #2769
+    // minting shapes (a block getter over an `OwningArray<T>` /
+    // `Array<T>` / `Set<T>` / `LinkedList<T>` field, whose body return needs
+    // the wrap) keep claiming; measured in this commit's test file rows
+    // (A)/(B), which are the #2769 leak oracles and stay green.
     if (!ownsSource) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
-            if (blockGetterOf(ctx_.exprSymbol(*ma)))
-                ownsSource = true;
+            sema::Symbol* blockGetterSym6405 = ctx_.exprSymbol(*ma);
+            if (blockGetterOf(blockGetterSym6405)) {
+                // Same key the writer uses: `currentAccessorPropDecl_` is the
+                // PropertyDecl `ensurePropertyBlockGetter` published, and the
+                // #6397 consumer (`lowerForIn`'s `sourceIsNamedLocal` arm,
+                // LlvmBackend_Stmts.cpp) reads it off `ps->decl` the same way.
+                auto* ps6405 = blockGetterSym6405
+                    ? dynamic_cast<sema::PropertySymbol*>(blockGetterSym6405)
+                    : nullptr;
+                const ast::PropertyDecl* pd6405 =
+                    ps6405 && ps6405->decl
+                        ? dynamic_cast<const ast::PropertyDecl*>(ps6405->decl)
+                        : nullptr;
+                // A property whose block getter was never emitted (an
+                // imported / cross-module accessor this TU cannot body-lower,
+                // so no writer ran) reports no bit. That DECLINE is the safe
+                // side: it withholds a claim rather than publishing one, and
+                // the §28.2 argument above is what the withheld claim would
+                // have violated. A no-key read and a keyed-but-unset read are
+                // deliberately the same answer.
+                if (pd6405 &&
+                    (propBlockGetterReturnKinds_.count(pd6405) &&
+                     (propBlockGetterReturnKinds_.at(pd6405) &
+                      kPropGetterReturnMint)))
+                    ownsSource = true;
+            }
             // fix #2815 / §23.2 / §29.2 (v0.240): the EXPRESSION-BODIED
             // sibling of #2769. `public property P: IEnumerable<int> get =>
             // _items;` where `_items: Array<int>` — the wrap happens at the
@@ -21154,6 +21239,24 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             // IEnumerable mints nothing and stay un-owned; the narrower
             // MemberAccessExpr+blockGetterOf shape matches the fact
             // precisely. // per #2769, #2703
+            //
+            // ⚠ NOT YET NARROWED — #6405 fixed the `plain-var` twin of this
+            // arm (registerIterableSourceDisposal, the same claim in the same
+            // file) by reading the wrap creator's published mint verdict, and
+            // deliberately did NOT reach here: the `using var` path also
+            // carries the `usingVarSourceIsBorrow` OVERRIDE above, which lifts
+            // a §28.10 borrow-pin on the same syntactic predicate, so
+            // narrowing it is a two-site change with its own blast radius.
+            // MEASURED on this file's parent with the #6405 fix applied, the
+            // `using var e := h.Seq;` spelling over the DECLINE shape (a
+            // block-bodied `property Seq: IEnumerable<int> get do return
+            // _seq; end; end Seq;` over an `owned _seq: IEnumerable<int>`)
+            // still exits 1 with `heap-use-after-free … READ of size 8` in
+            // `bz$M.HolderI$DisposeCore` — the identical signature #6405
+            // fixed on the plain-`var` side, and the same §29.2 obligation
+            // ("the obligation stays with the original owner") this arm
+            // over-claims. Left as a separate change. // per §29.2 / §28.2,
+            // v0.338, #6405
             if (!ownsSource) {
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         ld->initializer.get())) {
