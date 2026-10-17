@@ -14104,19 +14104,6 @@ struct VarianceHeads {
 // has a nested type of that name — §2.7's own order, "the enclosing-type lookup
 // visits the nested type and then each type enclosing it, innermost first".
 //
-// ⚠ DIVERGENCE FROM THE NAME RESOLVER, DELIBERATE AND MEASURED. §2.7's rule is
-// wider: "the first type that has an ACCESSIBLE MEMBER of that name ends the
-// search … even when the member cannot be used there". So a METHOD or PROPERTY
-// of the inner enclosing type, named like the outer one's nested type, should
-// stop the walk. MEASURED: it does not — `Holder` declaring `method Box(): int`
-// does NOT stop a bare `Box<T>` in `Holder`'s body from binding to `Outer`'s
-// nested `Box` (the name resolver makes the same choice, so the two AGREE today
-// and the program is not mis-checked). This function therefore matches the
-// resolver rather than §2.7, and MUST be changed with it: when the resolver is
-// fixed to end the search, this must end it too, or the two will disagree. The
-// defect is in `TypeResolution_Names.cpp` and is NOT fixed here — filed for the
-// coordinator, not by this commit.
-//
 // Before this, a body-position bare `Box<T>` matched nothing at all:
 // `localTypes` holds the MODULE's top-level declarations and `heads.imported`
 // a module's EXPORTS, and neither can hold a nested type — so the two arms a
@@ -14126,20 +14113,176 @@ struct VarianceHeads {
 // Returning null leaves the two arms below exactly as they were: this function
 // only ever ADDS an answer, and never takes one away.
 //
-// SEAM-ACCESSOR: reads only `members` and `NestedTypeSymbol::type`, which symbol
-// collection populates for a type the name resolver can also see. `decl` and
-// `TypeDeclKind` are never touched here — the caller reads the kind.
+// SEAM-ACCESSOR: reads only `members`, `NestedTypeSymbol::type`, and — for
+// §2.7's `property Color: Color` carve-out — each member's own `decl`, which
+// symbol collection populates for a member the name resolver can also see.
+// `TypeDeclKind` is never touched here — the caller reads the kind.
+
+// fix #6383 follow-up (§2.7 warning row, v0.338): does `m` DECLARE its own name
+// as its declared type — §2.7's `property Color: Color` and `property Buffer:
+// Buffer<int>` idioms?
+//
+// §2.7's warning row is explicit that these are a CARVE-OUT: "warn, unless the
+// member's declared type is the resolved type (or an instantiation of the
+// resolved generic) — the `property Color: Color` idiom; qualify `this.` to
+// reach the member", and the prose repeats it ("the `property Color: Color`
+// and `property Buffer: Buffer<int>` idioms are its carve-out"). The carve-out
+// is stated where §2.7 states the member-vs-type contest generally, so it
+// governs the enclosing-member step too: a member that spells the colliding
+// name in its own declared type is not a blocker.
+//
+// It has to be a carve-out and not a coincidence. An enclosing-member step that
+// read such a member as a blocker would make the member UN-DECLARABLE — a
+// `property Color: Color` would end the search for its own type's name.
+//
+// The test is SPELLING, not resolved-type identity, and is a conservative
+// approximation of §2.7's "the member's declared type is the resolved type": it
+// asks whether the declared type's HEAD is the colliding name, which is what
+// makes the idiom spellable at all. The direction it can err in is the one that
+// ACCEPTS rather than rejects — a declared type of `Color.Something` under a
+// colliding name `Color` also unblocks — and there the name resolves to the
+// very `Color` the declared type's head names, which is what the spelling asked
+// for.
+//
+// SEAM-ACCESSOR: `Symbol::decl` only, and only the declared TYPE of a
+// property/field/method/operator/event/const — no body, no initializer, no
+// `TypeDeclKind`.
+static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name) {
+    if (!m || !m->decl) return false;
+    const ast::Type* ty = nullptr;
+    if (const auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+        ty = pd->type.get();
+    else if (const auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+        ty = fd->type.get();
+    else if (const auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl))
+        ty = md->returnType.get();
+    else if (const auto* od = dynamic_cast<const ast::OperatorDecl*>(m->decl))
+        ty = od->returnType.get();
+    else if (const auto* ed = dynamic_cast<const ast::EventDecl*>(m->decl))
+        ty = ed->type.get();
+    else if (const auto* cd = dynamic_cast<const ast::ConstDecl*>(m->decl))
+        ty = cd->type.get();
+    if (!ty || !ty->name || ty->name->parts.empty()) return false;
+    return ty->name->parts.front() == name;
+}
+
+// fix #6383 follow-up (§2.7 "Through nesting", §13.2, v0.338): does `owning`
+// declare an ACCESSIBLE member called `name` that is NOT a nested type — i.e.
+// does the bare-name search END at `owning` with no type to hand back?
+//
+// §2.7's stop rule is about the NAME, not about a type of that name: "Ending
+// the search at the first type that HAS THE NAME, even when the member cannot
+// be used there, keeps a bare name from passing over an enclosing member and
+// silently resolving to a same-named module declaration or import." So a
+// method, property, field, event or const of that name ends the search exactly
+// as a nested type does — there is simply nothing a TYPE position can use at the
+// end of it.
+//
+// A NESTED TYPE does not block: §2.7 says "Nested types of an enclosing type,
+// generic or not, are reached by bare name, since a nested type is one type and
+// needs no instantiation." The caller returns that type instead.
+//
+// Accessibility, under §13.2: inside the OWNING type's own body every level is
+// reachable, so nothing is filtered there. For an OUTER enclosing type,
+// `private` (reachable only within the declaring type) and `protected`
+// (reachable within the declaring type and types deriving from it — a nested
+// type is not one) are not accessible from this body and must not end the
+// search. `internal` (access within the declaring module) always is: the
+// enclosing chain can only come from the module being checked.
+//
+// SEAM-ACCESSOR: `Symbol::decl` (via `memberDeclaresCollidingName`),
+// `MemberSymbol::visibility`, and `NestedTypeSymbol` — all of them already read
+// on this chain by `walkNestedTypePath` or by the caller.
+static bool enclosingMemberEndsBareTypeSearch(const TypeSymbol* owning,
+                                              const Symbol* m,
+                                              std::string_view name,
+                                              bool ownBody) {
+    if (!owning || !m || m->name != name) return false;
+    // A nested type is admitted by bare name (§2.7 "Through nesting"); the
+    // caller hands that type back instead of ending the search.
+    if (dynamic_cast<const NestedTypeSymbol*>(m)) return false;
+    if (memberDeclaresCollidingName(m, name)) return false;  // §2.7 carve-out
+    const auto* member = dynamic_cast<const MemberSymbol*>(m);
+    if (member && !ownBody &&
+        (member->visibility == ast::Visibility::Private ||
+         member->visibility == ast::Visibility::Protected))
+        return false;  // §13.2 — not reachable from a nested body
+    return true;
+}
+
+// fix #6383 follow-up (§2.7 rule 1, §2.7 Through nesting, §2.7 warning row,
+// §11.6, §12.9, §13.2, v0.338): the same walk as #6383, with §2.7's STOP rule.
+//
+// #6383 landed this arm reading only `NestedTypeSymbol`, so a METHOD or PROPERTY
+// of the colliding name on an enclosing type did not end the walk, and #6383's
+// own comment said the arm "matches the resolver rather than §2.7, and MUST be
+// changed with it". MEASURED on a COMPOSED tree carrying #6383 and the §2.7
+// name-resolver fix, that divergence is a SECOND diagnostic on an
+// already-rejected program: `Holder` declaring `method Box(): int` next to a
+// bare `Box<T>` in its own body carries BOTH
+//
+//   unresolved type name `Box`; … a bare name's search ends at the first
+//   enclosing type that has it … (§2.7 Through nesting); and
+//   type parameter `T` is covariant (`out`) but appears in an input (parameter)
+//   position … (§12.9)
+//
+// §2.7 says the search STOPS, so there is no longer a resolved head and §12.9
+// has nothing to compose. It is not an over-rejection — the program is rejected
+// either way — but the two rules disagree about which of them owns the verdict.
+//
+// WHY THIS HALF IS ADDITIVE AND NEEDS NOTHING FROM THE OTHER COMMIT. The stop
+// is a property of §2.7 and of the chain in hand, both available here. The
+// change below is correct with the name-resolver fix ABSENT (this arm then
+// declines to compose for a spelling §2.7 says is unresolved, and the resolver's
+// own silence on that spelling is its own separate defect), PRESENT (the two
+// agree: one diagnostic, from §2.7), or REBASED into a different form (this arm
+// still answers §2.7 as §2.7 states it).
+//
+// THE SCOPE OF THE STOP, and it is narrow on purpose. §2.7's paragraph stating
+// the stop rule opens "**Through nesting.** IN A NESTED TYPE'S BODIES (§11.6),
+// the enclosing-type lookup visits the nested type and then each type enclosing
+// it" — so it is scoped to a NESTED type's body. A chain of ONE element is a
+// module top-level type's own body, where §2.7's rule 1 alone applies and its
+// normative table has NO row for a type position (its rows are a chain head, a
+// bare value read, an assignment target, a bare callee, a head continued by
+// `?.`/`!`, and the warning row) — every one a position at which a NAME is
+// read. So a top-level type's own member of the name does not end the search
+// here, which is also what keeps §2.7's own `property Color: Color` idiom
+// spellable at the top level.
+//
+// TWO AXES THIS DOES NOT COVER, declared rather than assumed. §2.7's rule-1
+// ranking paragraph says "the enclosing type's accessible members (inherited
+// included)", but §2.7's "Through nesting" paragraph — the one stating the stop
+// rule — enumerates the chain as "the nested type and then each type enclosing
+// it", with no BASE types in it, and inheritance has its own accessor
+// (`baseTypes`). Likewise a §21.10 local type's body has no `TypeDecl`-born
+// chain element here. Both are wider than the paragraph that states the stop,
+// so neither is smuggled in.
+//
+// SEAM-ACCESSOR: `members`, `NestedTypeSymbol::type`, `MemberSymbol::visibility`
+// and each member's own `decl` — see `enclosingMemberEndsBareTypeSearch`.
 const TypeSymbol* enclosingMemberBareName(
     const std::vector<const TypeSymbol*>& chain, std::string_view h) {
-    for (const TypeSymbol* enclosing : chain) {
+    // §2.7 "Through nesting" is scoped to a NESTED type's bodies: a chain of
+    // one is a module top-level type's own body, where rule 1's table has no
+    // type-position row (see the scope note above).
+    const bool nestedBody = chain.size() > 1;
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        const TypeSymbol* enclosing = chain[i];
         if (!enclosing) continue;
+        const bool ownBody = (i == 0);
         const TypeSymbol* nested = nullptr;
         for (Symbol* m : enclosing->members) {
             if (!m || m->name != h) continue;
             const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
-            if (!nt || !nt->type) continue;  // not a nested type / not yet built
-            if (nested && nested != nt->type) return nullptr;  // two of one name
-            nested = nt->type;
+            if (nt && nt->type) {
+                if (nested && nested != nt->type) return nullptr;  // two of one name
+                nested = nt->type;
+                continue;
+            }
+            if (nestedBody &&
+                enclosingMemberEndsBareTypeSearch(enclosing, m, h, ownBody))
+                return nullptr;  // §2.7: the search ENDS here, no type to compose
         }
         if (nested) return nested;
     }
@@ -14811,18 +14954,27 @@ void Resolver::checkVariancePositions() {
     // bare spelling loses its §12.9 entirely. `enclosingMemberBareName` gates on
     // `parts.size() == 1` and is never entered for a two-part path. So that §12.9
     // composes a position for a type the resolver does not bind, which is a
-    // name-resolution defect in `TypeResolution_Names.cpp`; it is NOT fixed here,
-    // and is reported to the coordinator so the resolver fix carries
-    // `enclosingMemberBareName` with it.
+    // name-resolution defect in `TypeResolution_Names.cpp`. The BARE half of
+    // that family is #6383 follow-up's: `enclosingMemberBareName` now honours
+    // §2.7's enclosing-member stop, so a head §2.7 says is unresolved composes
+    // nothing here. The QUALIFIED half is untouched and stays with #6369.
     //
     // SEAM-ACCESSOR: `members` and `NestedTypeSymbol::type`, as
-    // `walkNestedTypePath` already reads them; `decl` is untouched here.
+    // `walkNestedTypePath` already reads them.
     std::vector<std::pair<const TypeSymbol*, std::vector<const TypeSymbol*>>>
         varianceSites;
     {
         // Depth-capped so a malformed symbol graph cannot recurse without end.
         // A nested type is declared inside a type body, so the chain is as
         // deep as the declaration nesting; 64 is far past any real program.
+        //
+        // ⚠ MEASURED and it is a SILENT ACCEPTANCE, filed as #6391: the cap is
+        // not a bound on this language but a bound on this compiler, and a type
+        // nested 65 or more levels deep is never visited — so a real §12.9
+        // violation on it compiles, runs and exits 0. #6391 quotes the sweep and
+        // the exact first-accepted depth. Do not RAISE the constant without
+        // pinning the new boundary: an unpinned cap that moves is an unpinned
+        // soundness hole.
         constexpr std::size_t kMaxTypeNestingDepth = 64;
         std::vector<const TypeSymbol*> stack;  // outermost-first working chain
         auto visit = [&](auto&& self, const TypeSymbol* t, std::size_t depth) -> void {
