@@ -25526,6 +25526,13 @@ void Emitter::collectCdFreeEligible(
 }
 
 
+// fix #6395 (§21.1, §28.3 K1.5, v0.338): forward declaration. The definition
+// sits far below this file's producer predicates; the `.Aggregate` arm below
+// needs it to exclude a USER method that merely shares the intrinsic's name.
+// Same guard, same reason as the two `#4653` sites (see the definition).
+static bool calleeResolvedBySema(const ast::CallExpr& call,
+                                 const sema::SemaContext& ctx);
+
 // #422 / §4.6 / §28.9: is `init` a codegen-internal +1 string producer?
 // A string `+` BinaryExpr or an InterpolatedStringExpr — both lower to a fresh
 // malloc'd rc=1 header that codegen owns end-to-end. Binding such a result to a
@@ -27016,6 +27023,89 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         }
                         if (getter && isPlusOneStringProducer(getter)) return true;
                     }
+                }
+            }
+        }
+    }
+    // fix #6395 (§28.9 *Runtime-managed types*, §28.3 *Local variables,
+    // ownership, and borrows*, stdlib §5 `.Aggregate`, v0.338): a LINQ
+    // `.Aggregate(seed, fold)` whose ACCUMULATOR is a `string` is a single +1
+    // producer — the same shape every ToString/string.Join/range-slice arm above
+    // recognizes.
+    //
+    // WHY IT IS A PRODUCER, which the ToString-family arms each argue for their
+    // own lowering: this codegen OWNS the fold. `tryLowerCollectionInstanceCall`'s
+    // `.Aggregate` arm (LlvmBackend_Calls.cpp) lowers the loop itself and calls the
+    // fold through a `FunctionType` value; for a NON-NULLABLE `string` accumulator
+    // the closure's `ReturnStmt` / expression-body lowering mints the return by
+    // retaining (§28.3's classification of an announced return as a transfer to the
+    // caller), so the value the loop stores into `accSlot` is a fresh reference on
+    // EVERY step — including when the body is the identity `lambda(a, b) => a`,
+    // which returns its accumulator parameter. The companion change in the same
+    // commit releases each of those superseded references, so the ONE the arm
+    // returns is a single +1 that the consumer must adopt rather than add to.
+    //
+    // MEASURED, and the measurement is what distinguishes this residue from the
+    // one the per-step release already took. With that release in place and THIS
+    // arm absent, over 101 iterations of a bound receiver:
+    //
+    //   0 elements   0 allocs      <- no fold step, nothing minted
+    //   1 element  200 allocs
+    //   2 elements 200 allocs
+    //   3 elements 200 allocs      (3500 / 3700 / 3900 B — the byte count tracks
+    //                                the longer results, the COUNT does not)
+    //
+    // An allocation count INDEPENDENT of the element count is not an intermediate
+    // the loop dropped: those scale with the source. It is the value the arm
+    // returns, leaking once per EVALUATION because every consumer classified it a
+    // BORROW, so the consumer's scope-end release dropped only its own share and
+    // the fold's mint survived. Recognizing the arm clears all 200. Before either
+    // half the same program measured 402 on a bound receiver and 604 unbound —
+    // the 202-allocation difference is the receiver portion, and the residue
+    // common to both is what identifies it as the fold's own output.
+    //
+    // Gated on the SEED's type, not the element's: the SEED establishes the
+    // accumulator's type (the fold's `TAccum`), and it is the accumulator slot
+    // that carries a reference. An `int` / `decimal` / class accumulator takes
+    // neither slot nor release in the lowering and is correctly not recognized
+    // here.
+    //
+    // A `string?` accumulator IS admitted here, and deliberately so — this arm is
+    // the one that CLOSES the nullable axis, and the measurement is a 8-cell
+    // toggle of the three #6395 sub-changes (`bezelc --sanitize=address`, 101
+    // iterations, 6-element `Array<string>`, seed `"n"+"ull"`, identity fold
+    // `lambda(x: string?, y: string): string? => x`):
+    //
+    //   prevSlot  seedSlot  THIS arm     result
+    //     –          –         –          3737 B / 202 allocs  (the residue)
+    //     –          –         ✓          CLEAN                <-- this arm alone
+    //     –          ✓         –/✓        heap-use-after-free
+    //     ✓          –         –/✓        over-release, exit 134
+    //     ✓          ✓         –/✓        over-release, exit 134
+    //
+    // A `string?`-returning lambda does NOT mint +1 on return — both body forms
+    // gate that mint on `!retSemaTy->nullable` (see LlvmBackend_Exprs2.cpp and
+    // LlvmBackend_Stmts.cpp's ReturnStmt arm, whose comment states the rule and
+    // its reason: "the method-side `string?` mint (#2196) is a method-contract
+    // rule the lambda call-site ABI does not share"). So on a nullable
+    // accumulator the fold hands back its input unchanged, the loop owns no
+    // reference, and the ONLY reference in play is the seed's own — which this
+    // arm's adoption discharges. Hence `!nullable` belongs on the two RELEASING
+    // slots in LlvmBackend_Calls.cpp and must NOT be added here: adding it
+    // would restore the 3737 B / 202-allocation leak. "bz_string_release is a
+    // no-op on null" is NOT the argument for admitting the nullable shape here;
+    // the failing accumulator is non-null, and the argument is that the loop
+    // owns nothing to release.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee && call->args.size() == 2 && call->args[0].value) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "Aggregate" && !calleeResolvedBySema(*call, ctx_)) {
+                    const sema::TypeRef* seedTy =
+                        ctx_.exprType(*call->args[0].value);
+                    if (seedTy && seedTy->kind == sema::TypeRef::Kind::Primitive &&
+                        seedTy->primitive == sema::PrimitiveType::String)
+                        return true;  // the fold's return path mints rc=1
                 }
             }
         }
