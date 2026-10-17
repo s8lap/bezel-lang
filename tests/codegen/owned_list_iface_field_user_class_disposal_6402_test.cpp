@@ -207,9 +207,23 @@ BEZEL_TEST(codegen_owned_list_iface_field_user_class_disposal_6402,
 // element disposer and called `bz_array_free(val, disp)` — reading a length and
 // a disposer off the vtable AND, had the address survived, cascading a dispose
 // into elements this list does not own. `MyL`'s own `_a` is a borrowing
-// `Array<Cell>`, so the correct release disposes NO element: the rows' LSan
-// cleanliness with a non-empty element population is what proves the cascade
-// did not run.
+// `Array<Cell>`, so the correct release disposes NO element.
+//
+// WHAT THIS ROW DOES AND DOES NOT PROVE. `MyL`'s constructor allocates
+// `new Array<Cell>()` and never populates it, so this row runs against an EMPTY
+// element population. That is enough to catch a wrong DISPOSER being called (the
+// vtable slot read would be wrong and the run would not be clean), but it cannot
+// by itself distinguish "cascaded into the elements" from "did not cascade": a
+// cascade reading a garbage length off a vtable iterates zero times and disposes
+// nothing, which looks identical to a correct release. An earlier revision of
+// this comment claimed the opposite — that "LSan cleanliness with a non-empty
+// element population" was the proof — which this program does not produce.
+//
+// The stronger argument is structural, not empirical: the element-cascade code
+// lives in the ARRAY arm of the discriminator, which a class instance takes the
+// other branch past, so it is unreachable on this shape. A row with a genuinely
+// populated `Array<Cell>` is still owed and would confirm the argument by
+// execution; it is not what this row currently rests on.
 //
 // 500 x 1 = 500; 500 mod 251 = 249.
 BEZEL_TEST(codegen_owned_list_iface_field_user_class_disposal_6402,
