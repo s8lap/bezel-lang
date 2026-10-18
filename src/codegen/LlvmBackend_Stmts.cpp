@@ -9998,6 +9998,11 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             // (§28.2). Everything else keeps the classification it had.
             const ast::PropertyDecl* pd6397 =
                 ps6397 && ps6397->decl
+                    // SEAM-DEBT: #6397 ps6397->decl read — recovers only the
+                    // PropertyDecl KEY `propBlockGetterReturnKinds_` is indexed
+                    // on; it is not a classification read, and an imported
+                    // property has no map entry either way. Stays a class-3
+                    // AST-gated read; same posture as #4686 above.
                     ? dynamic_cast<const ast::PropertyDecl*>(ps6397->decl)
                     : nullptr;
             unsigned gk6397 = 0u;
@@ -10543,6 +10548,11 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             // must not touch it.
             const ast::PropertyDecl* pd6397b =
                 ps6397b && ps6397b->decl
+                    // SEAM-DEBT: #6397 ps6397b->decl read — the USER-CLASS
+                    // arm's twin of the marker above, same reason: it recovers
+                    // only the PropertyDecl KEY the mint map is indexed on, so
+                    // the sanctioned `sema::TypeSymbol` accessor would not
+                    // change an answer. Stays a class-3 AST-gated read.
                     ? dynamic_cast<const ast::PropertyDecl*>(ps6397b->decl)
                     : nullptr;
             unsigned gk6397b = 0u;
