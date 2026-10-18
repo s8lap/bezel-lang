@@ -1400,13 +1400,9 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
                     }
                 }
                 // Store the NestedTypeSymbol* so resolveNamed can extract
-                // ->type. Fall back to nullptr only when the symbol wasn't
-                // found (should not happen after slice 1 ran correctly).
-                typeScope.names[nt->decl->name] = nts;
-            } else if (nt->decl) {
-                // tsym not found (should not happen) — fall back to the
-                // old nullptr marker so at least the name is visible.
-                typeScope.names[nt->decl->name] = nullptr;
+                // ->type. A local type is not a NestedTypeSymbol and is not
+                // registered here; it is handled by resolveTypesInStmt's loop.
+                if (nts) typeScope.names[nt->decl->name] = nts;
             }
         }
     }
@@ -3808,11 +3804,17 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (!sym) {
         // Unknown — but a null lookup may also mean "name is in scope as
         // a generic-param marker" (we used nullptr to indicate that).
-        // Distinguish by checking if the key exists.
+        // Distinguish by checking if the value is nullptr — not just key
+        // presence, which would also match any real symbol (type name, etc.)
+        // stored in the scope.
         bool isGeneric = false;
         if (!qualifiedBuiltin)
             for (Scope* s = scope; s; s = s->parent) {
-                if (s->names.count(first)) { isGeneric = true; break; }
+                auto it = s->names.find(first);
+                if (it != s->names.end() && it->second == nullptr) {
+                    isGeneric = true;
+                    break;
+                }
             }
         if (isGeneric) {
             // Generic parameter — record as a Named with no declaration.
@@ -6089,14 +6091,15 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
                     }
                 }
             }
-            if (nts) typeScope.names[nt->decl->name] = nts;
-            // No `NestedTypeSymbol` to find is not silently dropped: the nested
-            // type is still reachable by its QUALIFIED path, and the nullptr
-            // marker is what `resolveTypeDecl`'s own loop falls back to in the
-            // same situation (its "(should not happen)" note). Registering the
-            // marker keeps the name VISIBLE, which is strictly more than
-            // leaving the scope empty.
-            else typeScope.names[nt->decl->name] = nullptr;
+            // Only register an actual NestedTypeSymbol*. A nullptr marker collides
+            // with the generic-param nullptr sentinel, and resolveNamed's
+            // generic-param check would then misidentify a local type's nested
+            // type as a generic parameter. A local type (LocalTypeSymbol) is not
+            // registered here; it is reached via its qualified path
+            // (e.g. Inner.Deep.Box) rather than by bare name.
+            if (nts) {
+                typeScope.names[nt->decl->name] = nts;
+            }
         }
         // fix #6401 (§21.10 + §2.7 "Through nesting", v0.338): pair this body
         // scope with the local type it belongs to, exactly as `resolveTypeDecl`
