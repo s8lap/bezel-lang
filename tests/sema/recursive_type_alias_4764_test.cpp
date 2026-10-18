@@ -53,6 +53,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::diagnosticMessageContains;
+using bezel::test::diagnosticMessageCount;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
@@ -276,4 +277,180 @@ BEZEL_TEST(recursive_type_alias_4764, cycle_still_rejected_beside_nested_use_632
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r,
                                                 "type alias `Loop6329d` is recursive"));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "27.8"));
+}
+
+// ---------------------------------------------------------------------------
+// test #6339 (§27.8, v0.338): pin the recursive-alias diagnostic IDENTITY that
+// #6329's AliasArgsGuard left behind.
+//
+// #6329's AliasArgsGuard pops the alias off `aliasResolutionStack_` while a
+// reference site resolves its OWN generic arguments, and restores it on exit.
+// Finding `r31-rv-6329`'s #6329 review measured a side effect outside the
+// producer's own matrix: recursive-alias shapes that still REJECT kept the
+// identical "is recursive (§27.8)" wording but reported a DIFFERENT ALIAS — the
+// alias named in a TYPE-ARGUMENT position (`Id`) rather than the alias that
+// is actually recursive (`L`).
+//
+// MEASURED on this tip, alias-by-alias, against a build with the guard's pop
+// neutered (`popped(false)`, i.e. the pre-#6329 resolution order). Both
+// compilers REJECT every shape below; what differs is WHICH alias the single
+// surviving line names:
+//
+//   shape                     this tip            pre-#6329 (pop neutered)
+//   L<T> := Id<L<T>>          `L`      (1 line)   `Id`     (1 line)  FALSE
+//   ...same + a use site      `L`      (1 line)   `Id`,`L` (2 lines)
+//   L<T> := L<T>              `L`      (1 line)   `L`      (1 line)  same
+//   A->B->C->A (3-cycle)      `B`,`C`,`A` (3)     `B`,`C`,`A` (3)     same
+//   L<T> := Array<L<T>>       `L`      (1 line)   `L`      (1 line)  same
+//
+// So the current behaviour is correct and IMPROVED: `Id` is not itself
+// recursive (`type Id<U> := U;` names nothing cyclic in its own body), and §27.8
+// constrains what a `type` DECLARATION may name. Reporting `Id` was a false
+// positive; reporting `L` is the true one.
+//
+// WHY THESE ROWS EXIST. Nothing asserted any of this, which is why no test went
+// red when #6329 landed: `git grep 6339 tests/` was empty, the conformance
+// corpus's `s27_8_0002` row is a different shape, and #4764's / #4784's rows
+// exercise only the shapes the guard was originally built for. A future row
+// could freeze the FALSE report, and a later refactor of the guard could undo
+// the improvement silently.
+//
+// ORACLE DISCIPLINE (per this repo's "pin the diagnostic that SURVIVES the
+// fix" rule). Each row asserts the SURVIVING line's IDENTITY — the report names
+// `L`, which is the alias that is actually recursive — and NOT merely a count.
+// `diagnosticMessageCount(r, "is recursive") == 1` alone is satisfied just as
+// well by the pre-#6329 compiler, which also emits exactly one "is recursive"
+// line for these shapes while naming the WRONG alias; the
+// `diagnosticMessageContains(r, "type alias `L...` is recursive")` +
+// `!diagnosticMessageContains(r, "type alias `Id...` is recursive")` pair is
+// what makes each row non-vacuous. The absence assertion on the false alias is
+// deliberately paired with that presence assertion rather than standing alone,
+// which would pass whether or not the compiler emitted anything correct.
+//
+// Every row also uses `failedAtCompileTimeWithRealLocation` (per this file's
+// existing discipline) so a crash/signal/timeout outcome cannot satisfy a
+// diagnostic check vacuously via its own backstop diagnostic.
+// ---------------------------------------------------------------------------
+
+// The issue's own clearest example: `L<T> := Id<L<T>>`. `Id` appears only in a
+// type-ARGUMENT position and is not recursive; `L` is. The report must name
+// `L`, exactly once.
+BEZEL_TEST(recursive_type_alias_4764, nested_alias_in_type_argument_names_recursive_alias_6339) {
+    auto r = runAot(
+        "module M; "
+        "type Id6339a<U> := U; "
+        "type L6339a<T> := Id6339a<L6339a<T>>; "
+        "public static class Program6339a "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    // The SURVIVING line, pinned by identity: the actually-recursive alias.
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "type alias `L6339a` is recursive"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "27.8"));
+    // The FALSE report #6329 removed must not come back.
+    BEZEL_EXPECT_FALSE(
+        diagnosticMessageContains(r, "type alias `Id6339a` is recursive"));
+    // And the total recursive-alias count is one, not the pre-#6329 pair.
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "is recursive"), 1);
+}
+
+// The literal COUNT drop 2 -> 1 that #6339 records: the same shape plus a use
+// site of `L`, which pre-#6329 walked the cycle a second time and so emitted
+// BOTH a false `Id` report and a true `L` report. Pinning the count here is
+// what stops the false line returning; pinning the identity is what stops the
+// true line being replaced by it.
+BEZEL_TEST(recursive_type_alias_4764, nested_alias_false_report_count_drops_to_one_6339) {
+    auto r = runAot(
+        "module M; "
+        "type Id6339b<U> := U; "
+        "type L6339b<T> := Id6339b<L6339b<T>>; "
+        "public static class Program6339b "
+        "  public static method Main(): int "
+        "    var v: L6339b<int> := 1; "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "type alias `L6339b` is recursive"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "27.8"));
+    BEZEL_EXPECT_FALSE(
+        diagnosticMessageContains(r, "type alias `Id6339b` is recursive"));
+    // Pre-#6329 this shape reported 2 (the false `Id` line plus this one).
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "is recursive"), 1);
+}
+
+// The DIRECT self-reference `L<T> := L<T>` — the shape the guard was originally
+// built for, and the one a regression in the pop would silently ACCEPT. Pinned
+// as a control: unaffected by #6329 (measured identical on both compilers), so
+// it is the row that catches an over-eager guard that pops and never restores.
+BEZEL_TEST(recursive_type_alias_4764, direct_self_reference_reports_once_6339) {
+    auto r = runAot(
+        "module M; "
+        "type L6339c<T> := L6339c<T>; "
+        "public static class Program6339c "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "type alias `L6339c` is recursive"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "27.8"));
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "is recursive"), 1);
+}
+
+// A cycle of length 3 — the longest shape that must still be caught, and the
+// one a guard keyed on "does this alias name ITSELF" would miss entirely
+// (no single alias here is self-referential). Each alias in the cycle is
+// reported exactly once, so this also pins that the count is per-alias rather
+// than "some fixed number".
+BEZEL_TEST(recursive_type_alias_4764, three_step_cycle_reports_each_alias_once_6339) {
+    auto r = runAot(
+        "module M; "
+        "type A6339d<T> := B6339d<T>; "
+        "type B6339d<T> := C6339d<T>; "
+        "type C6339d<T> := A6339d<T>; "
+        "public static class Program6339d "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "type alias `A6339d` is recursive"));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "type alias `B6339d` is recursive"));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "type alias `C6339d` is recursive"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "27.8"));
+    // One per alias in the cycle — three in total, never four.
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "is recursive"), 3);
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "type alias `A6339d` is recursive"), 1);
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "type alias `B6339d` is recursive"), 1);
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "type alias `C6339d` is recursive"), 1);
+}
+
+// The alias appearing ONLY inside a type argument — here of a built-in generic
+// head (`Array<...>`), which #4784's `nested_generic_arg_reported_once` covers
+// only in its NON-generic form (`type Loop4784a := Array<Loop4784a>;`). The
+// generic form is a distinct resolution path (the alias has a type-parameter
+// list the substitution map is built from) and was likewise unasserted.
+BEZEL_TEST(recursive_type_alias_4764, alias_only_in_type_argument_names_itself_6339) {
+    auto r = runAot(
+        "module M; "
+        "type L6339e<T> := Array<L6339e<T>>; "
+        "public static class Program6339e "
+        "  public static method Main(): int "
+        "    return 0; "
+        "  end Main; "
+        "end;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "type alias `L6339e` is recursive"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "27.8"));
+    BEZEL_EXPECT_EQ(diagnosticMessageCount(r, "is recursive"), 1);
 }
