@@ -24319,22 +24319,46 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             //     30,000 B / 1000 allocs while `IReadOnlyCollection<int>` +
             //     the SAME argument was clean, from BYTE-IDENTICAL callee
             //     code — the difference is entirely in what the CALLER passes.
-            //   * The wrapper's OWNER is the CALLER, not the callee. MEASURED,
-            //     with a BORROWED `x: IEnumerable<int>` parameter the caller
-            //     still disposes the wrapper after the call (and the array then
-            //     leaks 30,000 B, its own separate defect). Making the callee
-            //     release the wrapper as well — which is what the iterator
-            //     vtable contract at this slot calls for — turns that into a
-            //     heap-use-after-free ASan catches in `main` one instruction
-            //     after `Take` returns.
-            // So the enumerable heads need the ARGUMENT-LOWERING ownership
-            // transfer for an enumerable argument reconciled first (who owns
+            //   * The wrapper's OWNER is the CALLER, not the callee. The caller
+            //     disposes the wrapper after the call whatever the parameter's
+            //     modifier is; with a BORROWED `x: IEnumerable<int>` parameter
+            //     the array then leaks 30,000 B, its own separate defect (that
+            //     30,000 B row is MEASURED; it is unchanged by this arm either
+            //     way). The USE-AFTER-FREE, by contrast, is the OWNED case and
+            //     not the borrowed one: an `owned` parameter is the one whose
+            //     value this arm releases, and on an OWNED
+            //     `x: IEnumerable<int>` parameter admitting the head here makes
+            //     the callee release the wrapper as well — which is what the
+            //     iterator vtable contract at this slot calls for — on top of
+            //     the caller's own disposal. On that same
+            //     "routed every head there" revision ASan catches the double
+            //     release as a heap-use-after-free in `main` one instruction
+            //     after `Take` returns. The split is structural, not
+            //     incidental:
+            //     `registerUnwindOwnedParam` is reached only from
+            //     `pendingOwnedParams_` (LlvmBackend_Setup.cpp ~46957), so a
+            //     BORROWED parameter registers nothing at this slot AT ALL and
+            //     is not a case this arm can make worse.
+            // So this is an EVIDENCED decline, not a stylistic one: the borrowed
+            // 30,000 B is measured, and the owned-side use-after-free is
+            // structural (the callee release this arm performs plus the
+            // caller's own, on a value both can reach). It STRENGTHENS the case
+            // for keeping the enumerable heads out: the counterfactual a reader
+            // would otherwise have to imagine — "the wrapper is already disposed
+            // by the caller, so a callee release is free" — is exactly the
+            // mis-free, and it is confined to the owned modifier.
+            // For the same reason the enumerable heads need the ARGUMENT-LOWERING
+            // ownership transfer for an enumerable argument reconciled first (who owns
             // the materialised wrapper), which is a different site and a
             // different subsystem from this discharge. Recording the residual
             // rather than half-fixing it here is the same call #6415's producer
             // made for the list heads, one family out.
-            if (!h.empty() && !isListHead && isCollectionInterfaceName(rt))
-                ifaceHead = h;
+            // This conjunction IS the classifier the comments above and in
+            // `LlvmBackend_impl.hpp` call `isCollIfaceHead`; naming it here is
+            // what makes a reader's grep for that name land.
+            const bool isCollIfaceHead =
+                !h.empty() && !isListHead && isCollectionInterfaceName(rt);
+            if (isCollIfaceHead) ifaceHead = h;
         }
         if (!ifaceHead.empty()) {
             bool ifaceIsOwning = ifaceHead == "IOwningCollection";
