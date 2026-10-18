@@ -70,11 +70,13 @@
 // and #4509's follow-up owns. Row 5 keeps a STRICT leak oracle exactly where
 // this fix must not have cost anything.
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 #include <string>
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
@@ -129,6 +131,7 @@ BEZEL_TEST(codegen_capture_cell_nested_rescan_election_4524,
         "    var n: int := e1() + e2(); "
         "    return n; ");
     auto r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);       // ASan aborts on the pre-fix UAF
     BEZEL_EXPECT_EQ(r.exitCode, 22);
 }
@@ -155,6 +158,7 @@ BEZEL_TEST(codegen_capture_cell_nested_rescan_election_4524,
         "    var e1 := C.Run(); "
         "    return 0; ");
     auto r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);       // ASan aborts on the pre-fix double-free
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -182,6 +186,7 @@ BEZEL_TEST(codegen_capture_cell_nested_rescan_election_4524,
         "    var n: int := e1() + e2(); "
         "    return n; ");
     auto r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 22);
 }
@@ -224,6 +229,7 @@ BEZEL_TEST(codegen_capture_cell_nested_rescan_election_4524,
         "  end Main; "
         "end C;";
     auto r = runAotCheckedLenient(src);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 22);
 }
@@ -268,6 +274,7 @@ BEZEL_TEST(codegen_capture_cell_nested_rescan_election_4524,
         "  end Main; "
         "end C;";
     auto r = runAotChecked(src);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
