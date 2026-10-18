@@ -1490,6 +1490,33 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
 }
 
 namespace {
+// fix #5959 (stdlib §5 + spec §14.2, v0.338): the two §5 hashable gates in
+// this file — `linqHashableCheck` for the six constrained-block operators,
+// and `linqKeyHashableCheck` for `GroupBy`/`ToDictionary`'s member-level
+// TKey — share ONE set of deferral preconditions, so a TKey and an element
+// type cannot disagree about when the check may fire. TRUE when the type
+// cannot decide the §3.6 property yet and the gate must stand down.
+bool hashableCheckDefers(const TypeRef* t) {
+    if (!t) return true;
+    if (t->kind == TypeRef::Kind::Error) return true;
+    // Defer on an unresolved generic-parameter placeholder (extension
+    // bodies, `this`-typed receivers): the per-instantiation gate
+    // applies when T is bound, not now. The §3.6 hashable property
+    // surfaces its failure at the top-level type, so deferring at a
+    // parameter placeholder is safe — the constraint failure will fire
+    // at the call site that supplies a concrete T (§14.2's "the check
+    // runs at instantiation").
+    if (t->kind == TypeRef::Kind::Named && !t->declaration) {
+        // Builtin primitives (int, string, …) have null-decl Named refs
+        // with a non-null astNode — `isEqualityBearing` reports them
+        // hashable. A bare block-level type-parameter placeholder has a
+        // null astNode (the §26.4 "fresh block-level type parameter"
+        // rule's shape) — defer those.
+        if (!t->astNode) return true;
+    }
+    return false;
+}
+
 // fix #3331 (C5, stdlib §5 + proposal 0116 D9): the six LINQ operators
 // `Distinct`, `Union`, `Intersect`, `Except`, `Contains`, `ToSet` are
 // declared in the constrained `extension IEnumerable<T> where T:
@@ -1513,23 +1540,7 @@ namespace {
 // before its per-instantiation gate runs.
 bool linqHashableCheck(std::string_view m, const TypeRef* srcElem,
                        SourceLocation loc, SemaContext& ctx) {
-    if (!srcElem) return true;
-    if (srcElem->kind == TypeRef::Kind::Error) return true;
-    // Defer on an unresolved generic-parameter placeholder (extension
-    // bodies, `this`-typed receivers): the per-instantiation gate
-    // applies when T is bound, not now. The §3.6 hashable property
-    // surfaces its failure at the top-level type, so deferring at a
-    // parameter placeholder is safe — the constraint failure will fire
-    // at the call site that supplies a concrete T (§14.2's "the check
-    // runs at instantiation").
-    if (srcElem->kind == TypeRef::Kind::Named && !srcElem->declaration) {
-        // Builtin primitives (int, string, …) have null-decl Named refs
-        // with a non-null astNode — `isEqualityBearing` reports them
-        // hashable. A bare block-level type-parameter placeholder has a
-        // null astNode (the §26.4 "fresh block-level type parameter"
-        // rule's shape) — defer those.
-        if (!srcElem->astNode) return true;
-    }
+    if (hashableCheckDefers(srcElem)) return true;
     if (isEqualityBearing(srcElem, ctx)) return true;
     std::string msg =
         std::string("operator `") + std::string(m) +
@@ -2046,6 +2057,73 @@ std::string spellTypeRefForDiag(const TypeRef* a) {
         return s;
     }
     return "?";
+}
+
+// fix #5959 (stdlib §5 `GroupBy<TKey>` / `ToDictionary<TKey>[, TValue]`,
+// spec §14.2 + §3.6 hashable row clause (e), v0.338): a printable spelling
+// for a TKey type argument. `spellTypeRefForDiag` above answers "?" for a
+// FUNCTION TypeRef, and a function type is exactly the TKey this check
+// fires on most often (§3.6 clause (e)) — a "?"-named argument would fail
+// §14.2's "naming the constraint, the argument and the parameter it turns
+// on". Spell the §27.1 function-type form; everything else defers to the
+// shared speller so there is ONE spelling per non-function kind.
+std::string spellKeyTypeForDiag(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Function) return spellTypeRefForDiag(t);
+    std::string s = "(";
+    for (std::size_t i = 0; i < t->funcParams.size(); ++i) {
+        if (i) s += ", ";
+        if (!t->funcParams[i].modifier.empty())
+            s += std::string(t->funcParams[i].modifier) + " ";
+        s += spellTypeRefForDiag(t->funcParams[i].type);
+    }
+    s += ") -> ";
+    if (t->funcReturnOwned) s += "owned ";
+    s += spellTypeRefForDiag(t->funcReturn);
+    if (t->nullable) s += "?";
+    return s;
+}
+
+// fix #5959 (stdlib §5 + spec §14.2, v0.338): the gate for the §5 members
+// that key a HASH CONTAINER through a SELECTOR type parameter of their own —
+// `GroupBy<TKey>(key: (T) -> TKey) where TKey: hashable` and both
+// `ToDictionary` overloads, which state the same requirement on their own
+// TKey. `linqHashableCheck` above is the gate for the OTHER half of the §5
+// hashable surface: the six operators declared in the CONSTRAINED
+// `extension IEnumerable<T> where T: hashable` BLOCK, whose §14.2 violation
+// stdlib §5 records as "no applicable extension" (§26.5). These three are
+// the other form stdlib §5 names on the same line — "the ordinary
+// constraint form of language spec §14.2 … on the member's own type
+// parameter in the second" — so the diagnostic is §14.2's constraint
+// failure, not `linqHashableCheck`'s block-availability wording, and it
+// NAMES THE ARGUMENT AND THE PARAMETER (§14.2: "a compile error at that
+// site, naming the constraint, the argument and the parameter it turns
+// on"). Satisfaction is `isEqualityBearing` — the same §3.6 computation and
+// the same §3.6 rule-4 component-path fragment §14.2 admits no second
+// definition of.
+//
+// The five typing arms for these members (GroupBy and ToDictionary over a
+// lazy `IEnumerable<T>` receiver, over a concrete-collection receiver, and
+// ToDictionary over the string/IEnumerable<char> receiver) each consult
+// this BEFORE setting the call's exprType; the pre-fix silence was a
+// silent-acceptance inversion — the call compiled and the wrong key landed
+// in the Dictionary/IGrouping instead of a diagnostic.
+//
+// Returns true to type the call, false to reject. Defers (returns true) on
+// a null/Error type and on an unresolved block-level type-parameter
+// placeholder, exactly as `linqHashableCheck` does — a TKey bound only when
+// the lambda's return type resolves is decided then, not here.
+bool linqKeyHashableCheck(std::string_view m, const TypeRef* keyTy,
+                          SourceLocation loc, SemaContext& ctx) {
+    if (hashableCheckDefers(keyTy)) return true;
+    if (isEqualityBearing(keyTy, ctx)) return true;
+    std::string msg = std::string(m) + "()'s `TKey` type argument `" +
+                      spellKeyTypeForDiag(keyTy) +
+                      "` does not satisfy the constraint `where TKey: hashable` "
+                      "(\xC2\xA7""14.2; stdlib \xC2\xA7""5)";
+    const std::string detail = hashableFailureComponentPath(keyTy, ctx);
+    if (!detail.empty()) msg += detail;
+    ctx.diagnostics().report(Severity::Error, loc, msg);
+    return false;
 }
 
 // fix-forward #5641 (§15.1, v0.334): the receiver type-argument INDEX at
@@ -9871,6 +9949,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     keyTy = lamTy->funcReturn;
                             }
                         }
+                        // fix #5959 (stdlib §5 `GroupBy<TKey> … where TKey:
+                        // hashable` / spec §14.2, v0.338): the member's own
+                        // TKey constraint, consulted before the IGrouping
+                        // element type is built — a function-typed key
+                        // compiled silently before this.
+                        if (!linqKeyHashableCheck(m, keyTy, ce.span.begin, ctx_))
+                            return false;
                         static const ast::Type* kIGroupingNode2 =
                             []() -> ast::Type* {
                                 auto* qn = new ast::QualifiedName;
@@ -10149,6 +10234,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     lamTy->funcReturn)
                                     keyTy = lamTy->funcReturn;
                         }
+                        // fix #5959 (stdlib §5 `ToDictionary<TKey[, TValue]> …
+                        // where TKey: hashable` / spec §14.2, v0.338) — see
+                        // the GroupBy arm's sibling note; the diagnostic
+                        // reported here is fatal (hasErrors() gates codegen),
+                        // so skipping the typing is the whole rejection.
+                        if (!linqKeyHashableCheck(m, keyTy, ce.span.begin, ctx_))
+                            return;
                         ctx_.setExprType(
                             &ce,
                             makeDictResult(keyTy, toDictValueType(ce, srcElem)));
@@ -10324,6 +10416,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (lt->kind == TypeRef::Kind::Function &&
                                     lt->funcReturn)
                                     keyTy = lt->funcReturn;
+                        // fix #5959: the TKey gate, on the string
+                        // (IEnumerable<char>, #1220) receiver arm.
+                        if (!linqKeyHashableCheck(m, keyTy, ce.span.begin, ctx_))
+                            return;
                         ctx_.setExprType(
                             &ce,
                             makeDictResult(keyTy, toDictValueType(ce, charTy)));
@@ -11874,6 +11970,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         lamTy->funcReturn)
                                         keyTy = lamTy->funcReturn;
                             }
+                            // fix #5959: the TKey gate, on the concrete-
+                            // collection (Array/OwningArray/…) receiver arm.
+                            if (!linqKeyHashableCheck(m, keyTy,
+                                                      ce.span.begin, ctx_))
+                                return;
                             ctx_.setExprType(&ce,
                                 makeDictResult(keyTy, toDictValueType(
                                                    ce, recvTy->genericArgs[0])));
@@ -12050,6 +12151,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         keyTy = lamTy->funcReturn;
                                 }
                             }
+                            // fix #5959: the TKey gate, on the concrete-
+                            // collection (Array/OwningArray/…) receiver arm —
+                            // see the GroupBy arm in `typeLinqOperator`.
+                            if (!linqKeyHashableCheck(m, keyTy,
+                                                      ce.span.begin, ctx_))
+                                return;
                             // Build IGrouping<TKey, T> TypeRef using a synthetic
                             // astNode so codegen can identify it.
                             static const ast::Type* kIGroupingNode =
