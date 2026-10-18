@@ -311,6 +311,88 @@ BEZEL_TEST(drain_view_return_frame_lowered_6452,
 }
 
 // ===========================================================================
+// (F) THE OWNED-PARAMETER CLASS STILL TAKES THE OLD PATH (§28.3) — the
+// narrow, and the reason the narrow exists.
+//
+// #6452's first cut claimed in a `src/` comment and in its commit body that
+// `recv.Drain()` over an `owned` parameter is "rejected by the ownership pass
+// at the return site ... and never reaches codegen". Reviewer rv-6452 measured
+// that claim FALSE and was right: `Ownership.cpp`'s `cannot return ….Drain()`
+// site admits every UNTRACKED receiver (both of its arms end at "untracked
+// (parameter / import) — admitted", because a PLAIN parameter outlives the
+// call), and an `owned` parameter is untracked in exactly the same sense.
+//
+// With an un-narrowed mint this arm then made that class WORSE: the parameter
+// is discharged at the method's scope end (§28.3's affine auto-drop), so the
+// frame dangled — measured SEGV inside `bz_array_drain_next`
+// (src/runtime/bezel_runtime_collections.cpp) on a small NON-ZERO address
+// (0x0a / 0x0b on the measured run — a wild read at a small offset off the
+// freed array, so the address is not a stable fact; the function and the UAF
+// class are) where the base SEGVs at 0x0 with a `#2491` note. Both spellings
+// are here, because a narrowing that asks only the direct receiver misses the
+// chain root, and they are the same hazard:
+//   View(owned items: OwningArray<R>) return items.Drain();  // direct
+//   View(owned p: Bag)                 return p.items.Drain();  // chain
+//
+// ⚠ THIS ROW IS A SCOPE-CLAIM PIN, NOT A BEHAVIOURAL ONE. It calls
+// `parseAndCheckOwnership`, which runs Lexer → Parser → collectSymbols →
+// resolveTypes → typecheckExpressions → checkOwnership and RETURNS. It never
+// reaches codegen, so it is green at base, at the un-narrowed arm and at the
+// narrowing alike: it CANNOT observe `drainReceiverSourceDiesAtScopeEnd`, and
+// nothing here was tuned to make it. What it does pin is the SCOPE claim above
+// — the class still COMPILES, which is the property the narrow must not
+// disturb — and it will go RED the day the ownership pass learns to reject an
+// `owned`-parameter drain. It is kept, not deleted, and it is not asked to
+// discriminate; its runtime half is `drain_return_owned_parameter_still_
+// degrades_6452.bzl` in tests/lit, because the content is the `#2491`
+// NEEDLE and the gtest AOT harness discards stderr on a successful compile.
+// Asserting a crash from gtest would pin a defect as if it were a
+// requirement; asserting it from lit pins the DIAGNOSTIC that says so, which
+// is the part a future fix must change.
+//
+// That lit row asserts the exact count of `#2491` occurrences (two, one per
+// spelling), not just the presence of one — a single FileCheck directive
+// matches the first occurrence and moves on, so presence alone would survive a
+// narrowing that handled the direct receiver and missed the chain root.
+BEZEL_TEST(drain_view_return_frame_lowered_6452,
+           owned_parameter_drain_return_still_compiles_spec_28_3) {
+    const std::string src =
+        "module M; "
+        "class R public constructor() end constructor; end R; "
+        "class Bag "
+        "  public owned items: OwningArray<R>; "
+        "  public constructor() "
+        "    items := new OwningArray<R>(); "
+        "    items.Add(new R()); "
+        "  end constructor; "
+        "end Bag; "
+        "class Src "
+        "  public static method Make(): owned OwningArray<R> "
+        "    var a := new OwningArray<R>(); "
+        "    a.Add(new R()); "
+        "    return a; "
+        "  end Make; "
+        "end Src; "
+        // (F1) the DIRECT spelling — the drain receiver IS the owned parameter
+        "class Direct "
+        "  public static method View(owned items: OwningArray<R>): "
+        "IOwningEnumerable<R> return items.Drain(); end View; "
+        "end Direct; "
+        // (F2) the CHAIN spelling — the ROOT of the receiver chain is the
+        // owned parameter, and the direct receiver is an ordinary field
+        "class Chained "
+        "  public static method View(owned p: Bag): IOwningEnumerable<R> "
+        "    return p.items.Drain(); "
+        "  end View; "
+        "end Chained; ";
+    auto r = parseAndCheckOwnership(src);
+    // No rejection — that is the pre-existing state, and this row's job is to
+    // say so. Were #6452 ever to teach the ownership pass to reject this
+    // class, this assertion is the one that should go red first.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ===========================================================================
 // (E) THE ADMITTED CONTROL STILL COMPILES (§28.3) — the exact program
 // `drain_view_return_site_2175.return_this_field_drain_admitted_control_
 // spec_28_3` pins as admitted is also the one whose lowering this fix

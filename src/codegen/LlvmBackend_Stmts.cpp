@@ -212,6 +212,69 @@ const sema::TypeSymbol* Emitter::instrumentedAutoPropertyStoreClass(
     return instrumentedSetterClass(target, ps, pd);
 }
 
+// fix #6452: does a drain-view RECEIVER die at this method's own scope end?
+//
+// The receiver of a `recv.Drain()` (or a `recv.f.Drain()` chain) is the frame's
+// borrow SOURCE, and a source that dies at the callee's scope end leaves the
+// returned frame dangling. §28.3 lists the sources it rejects — "a scope-bound
+// local, a `using var`, an `owned` parameter" — and the ownership pass
+// (src/ownership/Ownership.cpp, the `cannot return \`…\`.Drain()` site)
+// implements the first TWO: its bare-identifier and chain-root arms both end at
+// "untracked (parameter / import) — admitted", because a plain parameter
+// outlives the call.
+//
+// That admits an `owned` parameter, and an `owned` parameter is discharged at
+// the method's scope end (§28.3's affine auto-drop). The warning that says so —
+// "owned parameter `items` is implicitly disposed at the end of the method" — is
+// REPORTED by the ownership pass (`MethodOwnership::run`,
+// src/ownership/Ownership.cpp), not by codegen. `registerUnwindOwnedParam`
+// (LlvmBackend_Setup.cpp) is the codegen-side DISPOSAL REGISTRATION and only
+// quotes that same sentence in its own comments; it emits no diagnostic. The
+// claim that matters here — the parameter dies at scope end — is the same
+// either way. MEASURED both legs:
+//
+//   View(owned items: OwningArray<R>) return items.Drain();   // direct
+//   View(owned p: Bag)                 return p.items.Drain(); // chain root
+//
+//   base  edf42bd3: compiles clean, `internal: … #2491`, SEGV 0x0 at the
+//                   caller (the pre-existing #6452 behaviour);
+//   with an un-narrowed #6452 mint: compiles clean, SEGV inside
+//                   `bz_array_drain_next`
+//                   (src/runtime/bezel_runtime_collections.cpp) on a small
+//                   NON-ZERO address — 0x0a for the direct spelling, 0x0b for
+//                   the chain root on the measured run, i.e. a wild read at a
+//                   small offset off a freed array, not a fixed address. That
+//                   is a frame over a collection the callee already freed.
+//
+// So the mint MUST decline here, and the question is asked of the chain ROOT
+// as well as of a bare receiver, because the two spellings are the same hazard
+// (Ownership.cpp walks the chain for exactly that reason).
+//
+// The real fix — teaching the ownership pass that an `owned` parameter is not
+// a surviving source — is a SEPARATE obligation and is deliberately not taken
+// here: declining the mint restores the base behaviour (a null return and its
+// `#2491` note), which is a compile-time-visible defect rather than a
+// use-after-free, and leaves the pass's own admission question untouched.
+bool Emitter::drainReceiverSourceDiesAtScopeEnd(const ast::Expr* recv) const {
+    if (!recv) return false;
+    // Walk to the chain root, exactly as Ownership.cpp's chain arm does:
+    // `p.f.g` and `p` must both answer for `p`.
+    const ast::Expr* root = recv;
+    while (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(root))
+        root = ma->target.get();
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(root);
+    if (!id) return false;
+    // `this.f.Drain()` — the receiver IS the object; it outlives the call.
+    if (id->name == "this") return false;
+    const auto* ps =
+        dynamic_cast<const sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+    if (!ps) return false;
+    // §22.4 writes the classification on the formal: "", "ref", "out",
+    // "out owned", "owned". Only the two owned spellings are discharged at
+    // scope end.
+    return ps->modifier == "owned" || ps->modifier == "out owned";
+}
+
 
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     noteFnAtObjectStmt(s);   // #5978: see `fnAtObject_`
@@ -2919,18 +2982,6 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // inline.
         detectAsyncPatternAKind(rs->value.get());
         llvm::Value* v = nullptr;
-        // fix #6452: this edge minted its own §29.2 wrapper frame (the
-        // `recv.Drain()` return face below). The #6397 publication further
-        // down reads only `wrapAsIEnumerableForTarget`'s OWN `outWrapMade`,
-        // and on this edge that second call declines — the value already
-        // carries the declared `IOwningEnumerable<T>` head — so the bit it
-        // publishes would be `false` over a frame that really was minted. The
-        // ERASE on a decline is load-bearing (#6397's own note: a claim over
-        // an unminted frame frees it out from under the holder), so an
-        // INVERTED claim is just as wrong as a missing one. This local is the
-        // return edge's own verdict, OR-ed in below; it is `false` for every
-        // other return shape, so that arm is untouched.
-        bool drainReturnFrameMinted = false;
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     rs->value.get())) {
@@ -3018,11 +3069,47 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // fields, the receiver-sourced notion of §28.6)". A `this`-rooted
             // drain is that receiver-sourced case — pinned as admitted by
             // `drain_view_return_site_2175.return_this_field_drain_admitted_
-            // control_spec_28_3`, which asserts hasErrors() == false. The
-            // scope-bound forms §28.3 REJECTS (`recv.Drain()` over a `using
-            // var` / plain owned local / `owned` parameter) are rejected by the
-            // ownership pass at the return site (#2175, the (a1)/(a2)/(a3)
-            // rows) and never reach codegen, so nothing here re-opens them.
+            // control_spec_28_3`, which asserts hasErrors() == false.
+            //
+            // ⚠ WHAT §28.3 REJECTS, AND HOW MUCH OF IT REACHES HERE — corrected
+            // after a reviewer measured a premise this comment originally got
+            // WRONG. §28.3 rejects a frame carrying "a borrow of a scope-bound
+            // local, a `using var`, an `owned` parameter". The ownership pass
+            // (Ownership.cpp, the "cannot return `x`.Drain()" return site)
+            // implements the first TWO and never rejects the third: both of
+            // its bare-identifier and chain-root arms return at "untracked
+            // (parameter / import) — admitted", because a PLAIN parameter
+            // outlives the call. So:
+            //
+            //   REJECTED upstream, never reaches this arm — measured, one
+            //   program per row, each a frame crossing a method boundary:
+            //     `var a := new OwningArray<R>(); return a.Drain();`
+            //     `using var a := …; return a.Drain();`
+            //     `var h := new Bag(); return h.items.Drain();`
+            //     `using var h := new Bag(); return h.items.Drain();`
+            //     (the #2175 (a1)/(a2)/(a3) rows and this arm's sibling
+            //     rejections; each prints the same `cannot return `x`.Drain()`
+            //     shape, whose tail names the source and why it dies —
+            //     "is a `using var` disposed at the callee's scope end" or
+            //     "is a scope-bound owned local disposed at the callee's
+            //     scope end")
+            //
+            //   REACHES THIS ARM, and must be handled here — also measured:
+            //     `me.items.Drain()`   (me: Owner, plain param)   OK, fixed
+            //     `p.items.Drain()`    (p: Bag,   plain param)     OK, fixed
+            //     `items.Drain()`      (items: OwningArray, plain) OK, fixed
+            //     `items.Drain()`      (items: OWNED parameter)    DECLINED
+            //     `p.items.Drain()`    (p: OWNED parameter)        DECLINED
+            //
+            // The two owned-parameter rows are the narrowing below. An `owned`
+            // parameter is discharged at the method's scope end (§28.3's affine
+            // auto-drop), so a frame minted over it dangles: with an
+            // UN-narrowed mint both SEGV inside `bz_array_drain_next`
+            // (a small non-zero address — 0x0a and 0x0b on the measured run,
+            // a wild read off the freed array, so the address itself is not a
+            // stable fact), where the base SEGVs at 0x0 in the
+            // caller with a `#2491` note. Declining restores the base
+            // behaviour. See `drainReceiverSourceDiesAtScopeEnd`.
             //
             // The body is the local-decl face VERBATIM — same gate, same
             // `wrapAsIEnumerableForTarget` call, same flags. That is the point:
@@ -3062,7 +3149,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     std::string_view srcHead =
                         builtinTypeName(ctx_.exprType(*dma->target));
                     if (common::isOwningCollectionHead(srcHead) &&
-                        !common::isDictionaryName(srcHead)) {
+                        !common::isDictionaryName(srcHead) &&
+                        // fix #6452: an `owned`-parameter receiver is
+                        // discharged at THIS method's scope end, so a frame
+                        // minted over it dangles. Declining keeps the base
+                        // behaviour (null + the `#2491` note) rather than
+                        // turning a null-page SEGV into a use-after-free.
+                        // Asked of the chain ROOT, so `p.f.Drain()` and
+                        // `f.Drain()` answer alike.
+                        !drainReceiverSourceDiesAtScopeEnd(dma->target.get())) {
                         llvm::Value* coll = lowerExpr(*dma->target);
                         if (coll && coll->getType()->isPointerTy()) {
                             bool made = false;
@@ -3070,10 +3165,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 coll, viewTy, dma->target.get(),
                                 /*ownLazyPipeline=*/false, &made,
                                 /*srcOwnedByCallee=*/false);
-                            if (made && frame && frame != coll) {
-                                v = frame;
-                                drainReturnFrameMinted = true;
-                            }
+                            if (made && frame && frame != coll) v = frame;
                         }
                     }
                 }
@@ -3664,12 +3756,6 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     /*outWrapMade=*/&wrapMade6397,
                     /*srcOwnedByCallee=*/
                     returnSourceIsCalleeOwnedCollection(rs->value.get()));
-                // fix #6452: this edge minted its own frame earlier (the
-                // `recv.Drain()` return face), so this call declining does not
-                // mean "no frame". OR the edge's own verdict in — see the
-                // declaration's note on why an INVERTED claim is as wrong as a
-                // missing one.
-                wrapMade6397 = wrapMade6397 || drainReturnFrameMinted;
                 if (currentAccessorPropSym_) {
                     // fix #6397: publish BOTH verdicts the for-in consumer
                     // reads. The field bit is decided from the SAME node this

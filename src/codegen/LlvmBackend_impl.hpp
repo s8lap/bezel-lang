@@ -12763,6 +12763,17 @@ private:
     // leak a non-confirmed transfer than risk a UAF).
     bool returnSourceIsCalleeOwnedCollection(const ast::Expr* src) const;
 
+    // fix #6452: does a drain-view RECEIVER (or the ROOT of a `recv.f.Drain()`
+    // chain) die at this method's own scope end? True only for an `owned`
+    // PARAMETER — §22.4's `owned` / `out owned` spellings — which §28.3's
+    // affine auto-drop discharges at method exit. The ownership pass's own
+    // "cannot return `x`.Drain()" site admits every untracked parameter because
+    // a PLAIN one outlives the call, so an `owned` parameter reaches codegen
+    // and a frame minted over it dangles (measured: SEGV in
+    // `bz_array_drain_next` where the base SEGVs at 0x0). Definition and the
+    // two measured spellings are on the definition in LlvmBackend_Stmts.cpp.
+    bool drainReceiverSourceDiesAtScopeEnd(const ast::Expr* recv) const;
+
     // fix #2299 / §28.9: emit an immediate free on the source collection
     // right at the RETURN coercion (NOT at scope end — scope-end disposal
     // would race the caller's iteration of the wrapping enumerator and

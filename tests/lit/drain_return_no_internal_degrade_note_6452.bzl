@@ -55,11 +55,14 @@
 //     correctly. It must keep being silent, so a fix that merely suppressed the
 //     note would go green here and red there. This is what makes the file a
 //     gate on the VALUE rather than on the text.
-//   * `drain_return_non_owning_head_still_degrades_6452.bzl` — the ONE shape
-//     this fix deliberately leaves alone (a fresh-producer receiver), which
-//     still draws the `#2491` note. It is here so that "no `#2491` on this
-//     arm" is a claim about a SCOPE and not about the note being suppressed
-//     wholesale.
+//   * `drain_return_owned_parameter_still_degrades_6452.bzl` — the receiver
+//     class this fix deliberately DECLINES, because an `owned` parameter is
+//     discharged at the callee's scope end and a frame minted over it dangles.
+//     It still draws the `#2491` note, in both spellings. This is what makes
+//     "no `#2491` on this arm" a claim about a SCOPE rather than about the note
+//     being suppressed wholesale — and it is the row that stops the scope from
+//     widening silently, since an arm that admitted this class would start
+//     minting here and the CHECKs below would stop matching.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s

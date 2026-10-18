@@ -79,4 +79,10 @@ end P;
 // REJECT: a property or indexer getter may not return a freshly-produced
 // REJECT: borrow-producing position
 // REJECT: §28.6
-// NOFRAME: #2491
+//
+// The only FileCheck prefix selected on this file is REJECT (see the single
+// RUN line), so a second prefix here would never be checked — a `CHECK-NOT` or
+// `CHECK` under an unselected prefix is vacuous, not a weaker assertion. This
+// file asserts ONE thing: the block form is rejected, by this rule, with this
+// wording. That wording is also its non-vacuity witness: a program that failed
+// to parse, or tripped an unrelated rule, prints none of these three lines.
