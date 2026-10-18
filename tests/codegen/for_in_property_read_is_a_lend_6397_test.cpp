@@ -41,9 +41,10 @@
 //     _6387`'s two landed rows AND `codegen_block_bodied_ienumerable_property
 //     _bound_disposal_2769`'s direct-for-in row go RED with `Direct leak of
 //     6400 byte(s) in 200 object(s) allocated from bz$prop$Seq$get`. This
-//     commit publishes that verdict, keyed on the PropertyDecl (see
+//     commit publishes that verdict, keyed on the PropertySymbol (see
 //     `propBlockGetterReturnKinds_` in LlvmBackend_impl.hpp for why the two
-//     families cannot share one key).
+//     families cannot share one key, and why the key is the symbol rather
+//     than the `ast::PropertyDecl` it used to be).
 //
 // (3) `wrapAsIEnumerableForTarget`'s USER-CLASS arm never reported its mint.
 //     Every other arm sets `outWrapMade`; that one is a tail `return`. It is

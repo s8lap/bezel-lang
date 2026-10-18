@@ -56,7 +56,7 @@
 // sibling and #6397 applied to the direct `for x in h.E` consumer. The block
 // getter's return edge publishes its own `wrapAsIEnumerableForTarget`
 // `outWrapMade` in `propBlockGetterReturnKinds_` under
-// `kPropGetterReturnMint`, keyed on the PropertyDecl, set-or-CLEARED per edge.
+// `kPropGetterReturnMint`, keyed on the PropertySymbol, set-or-CLEARED per edge.
 // So CLAIM = MINT by construction, and a decline erases the verdict instead
 // of leaving a stale claim.
 //

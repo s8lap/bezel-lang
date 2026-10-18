@@ -9997,14 +9997,17 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             // FIELD read hands back storage its holder already keeps alive
             // (§28.2). Everything else keeps the classification it had.
             // The map is keyed on the `sema::PropertySymbol` itself, so
-            // the read needs no `ps6397->decl` recovery — for a LOCAL
-            // property the symbol and its decl are 1:1 (one `collectMember`
-            // per `td.members` entry, one `td` visit per module), and for an
-            // IMPORTED property `ps6397->decl` is null so the old cast
-            // yielded no entry anyway — which is also what this lookup
-            // returns, because a writer only runs while a LOCAL accessor's
-            // body is emitted (`currentAccessorPropSym_` is set nowhere
-            // else). Same answer, one fewer AST-gated read.
+            // the read needs no `ps6397->decl` recovery — the enclosing
+            // `blockGetterOf` guard already proved `ps6397->decl` is a
+            // non-null PropertyDecl, so the deleted cast was re-deriving
+            // what the guard had established. Same answer, one fewer
+            // AST-gated class-3 read. (An imported property with NO decl
+            // never reaches this arm at all: `blockGetterOf` returns null
+            // for it. The imported property that DOES carry a re-parsed
+            // decl does reach it, and writer and reader now key the same
+            // `PropertySymbol*` — see `propBlockGetterReturnKinds_` in
+            // LlvmBackend_impl.hpp, which also records that this sub-case
+            // has no oracle.)
             unsigned gk6397 = 0u;
             if (ps6397 && propBlockGetterReturnKinds_.count(ps6397))
                 gk6397 = propBlockGetterReturnKinds_.at(ps6397);

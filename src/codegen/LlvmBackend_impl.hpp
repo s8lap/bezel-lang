@@ -1490,8 +1490,8 @@ private:
     // closes. CLAIM = MINT by construction, per #3384's shape.
     std::unordered_set<const ast::Node*> propReadIterWrappedExprs_;
     // fix #6397 (§28.9 / §29.2 / §23.3, v0.338): the BLOCK-bodied
-    // property-getter twin of the set above, keyed on the `ast::PropertyDecl`
-    // whose accessor minted the frame.
+    // property-getter twin of the set above, keyed on the
+    // `sema::PropertySymbol` whose accessor minted the frame.
     //
     // WHY IT CANNOT SHARE THE SET ABOVE. That set is keyed on the READ
     // EXPRESSION, because its only writer — `wrapPropertyArrayAsIEnumerable`,
@@ -1575,21 +1575,31 @@ private:
     // property for every accessor face, which is what both writers share.)
     //
     // ⚠ THE KEY IS THE `sema::PropertySymbol`, NOT THE `ast::PropertyDecl`
-    // it used to be. For a LOCAL property the two are 1:1 — `collectTypeDecl`
-    // runs `collectMember` once per `td.members` entry and `td` is visited
-    // once per module, so one `PropertyDecl` carries exactly one
-    // `PropertySymbol` — which is why every answer this map gives is
-    // unchanged by the re-key. But reading the key back off
-    // `ps->decl` at the consumer (LlvmBackend_Stmts.cpp's two `for`-in arms,
-    // LlvmBackend_Setup.cpp's #6405 arm) is an AST-GATED class-3
-    // imported-symbol read that answers "no entry" for every imported
-    // property and cannot be made to answer otherwise. Keying on the symbol
-    // deletes all three reads. It does NOT make the imported face reachable:
-    // BOTH writers run only while a LOCAL accessor's body is being emitted
-    // (`ensurePropertyAccessorFn` returns on `!pd`, and
-    // `currentAccessorPropSym_` is set only inside
-    // `ensurePropertyBlockGetter`), so an imported property still has no
-    // entry — the map answers the same thing it always did for one.
+    // it used to be. Reading the key back off `ps->decl` at the consumer
+    // (LlvmBackend_Stmts.cpp's two `for`-in arms, LlvmBackend_Setup.cpp's
+    // #6405 arm) is an AST-GATED class-3 imported-symbol read; keying on the
+    // symbol deletes all three. It changes no answer, because every one of
+    // those arms is guarded by `blockGetterOf` (or, on the #6405 arm, entered
+    // only when `blockGetterOf` returned non-null), and `blockGetterOf`
+    // returns non-null ONLY for a symbol that carries a non-null
+    // `ps->decl` PropertyDecl. So at every site that consults this map, the
+    // old `dynamic_cast<...PropertyDecl*>(ps->decl)` was re-deriving a fact
+    // the enclosing guard had already proven — and carrying it through an
+    // AST-gated read is exactly what the class-3 ratchet forbids.
+    //
+    // ⚠ AND THE IMPORTED CASE IS NOT "EXCLUDED BY CONSTRUCTION", which an
+    // earlier version of this comment asserted and which was too strong.
+    // `ModuleLoader` assigns `decl` for an imported member where it re-parsed
+    // body text, so an imported property CAN carry one: then `blockGetterOf`
+    // returns non-null, the reader arms ARE reached, and this TU's own
+    // `ensurePropertyBlockGetter` DOES run the writer, so the map is not
+    // empty. That sub-case is preserved by construction — reader and writer
+    // now key the SAME `sema::PropertySymbol*` object, so the match the old
+    // decl-derived key made is kept exactly — but it has NO ORACLE on either
+    // side of this change. The body-less imported accessor (the common case)
+    // declines at `blockGetterOf`'s `ps->decl` check in BOTH keyings, so it
+    // cannot distinguish them; it is a no-regression control, not evidence.
+    // See issue #6379 for the face that is still structurally unreachable.
     static constexpr unsigned kPropGetterBodyMint    = 1u << 2;
     std::unordered_map<const sema::PropertySymbol*, unsigned>
         propBlockGetterReturnKinds_;
