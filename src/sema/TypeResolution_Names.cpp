@@ -4889,6 +4889,99 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             ref.kind = TypeRef::Kind::Error;
             return;
         }
+        // fix #6425 (§2.7 rule 1, §11.3, §11.6, §21.10, v0.338): a MULTI-PART
+        // spelling whose head is a §21.10 LOCAL type's name.
+        //
+        // THE RULE. §2.7 rule 1 is "leftmost-first and type-wins": "Resolve the
+        // leftmost segment `A` as a bare name: local scope, then the enclosing
+        // type's accessible members … then the current module's declarations,
+        // then unambiguous imported bare names … then import aliases. If `A`
+        // resolves to a *type*, the rest of the chain resolves against that type
+        // (nested type, enum constant, static member — each segment in turn)."
+        // §21.10 puts a local type in "the current module's declarations": a
+        // local type's name "is in scope from its declaration statement to the
+        // end of the innermost enclosing statement block", and within its scope
+        // "the name is an ordinary type reference in body positions". §11.3 is
+        // what makes a nested type a MEMBER of the type that declares it, and it
+        // says in so many words that "a local record's own body may itself
+        // contain §11.6 nested member types, which follow their own rules" —
+        // and §11.6's rule is that such a type "is referenced from outside as
+        // `Outer.Nested`". So `Inner.Box` is an ordinary rule-1 chain with a
+        // local-type head, and the segments after it descend through
+        // `Inner`'s own members exactly as §11.6's do.
+        //
+        // THE DEFECT, and why it is a lookup-path gap rather than a missing
+        // registration. fix #6411 registered a local type's nested types — the
+        // §11.3 loop at this file's §21.10 arm — and that is what makes the
+        // BARE spelling work. What the multi-part path lacks is the HEAD. A
+        // local type is registered in `ctx_.module()->children` (the §21.10 arm
+        // below) and in no `Scope` at all — `lookupBareTypeName` walks the Scope
+        // chain and never reads module children, so the only rule-1 source that
+        // can see a local type is the module-children fallback in this
+        // function's `!sym` block, and that fallback is gated on
+        // `t.name->parts.size() == 1`. A multi-part spelling therefore had no
+        // path to a local type at all: `lookupName(first, scope)` walked the
+        // Scope chain, found nothing, and every qualified spelling of a local
+        // type's nested type was rejected as "unresolved type name `Inner`" — a
+        // diagnostic that blames the CHAIN HEAD, which §2.7 rule 1 had already
+        // resolved as a bare name elsewhere in the same body (`new Inner()`
+        // compiles), and never names the segment that actually failed. MEASURED
+        // on this branch's base: a local `record Inner` with `public record Box(W:
+        // int);`, referenced as `new Inner.Box(7)` from the enclosing method's
+        // body and as `Inner.Box` inside `Inner`'s own member body, both
+        // rejected with "unresolved type name `Inner`".
+        //
+        // WHAT THIS ADDS, and why it is an admission and not a loosening. This
+        // block can only ever set `sym` to a TypeSymbol whose name IS the head
+        // and whose recorded block extent CONTAINS this reference — the same
+        // `localScopeEndOffset` test the single-part fallback applies, so §21.10's
+        // two-methods rule ("Two different methods may each declare `record
+        // Row(…)`: the names never meet, and the types are distinct") holds here
+        // too and a sibling method's local type is never reached. The segments
+        // after the head are then resolved by the UNCHANGED §11.3 descent loop
+        // below, which reports "type `Inner` has no nested type named `X`
+        // (§11.3)" for a segment that is not there — a segment-accurate
+        // diagnostic in place of the head-accurate one it replaces.
+        //
+        // POSITION. This block sits BEFORE the import-alias arm and before
+        // rule 2's module-prefix match below, because §2.7 ranks the current
+        // module's declarations above both: a head that names an in-extent
+        // local type is a rule-1 answer, and placing it later would let an
+        // import alias or an imported module of the same name take a head §2.7
+        // gives to the local type.
+        //
+        // ⚠ MEMBER SIGNATURES ARE DELIBERATELY NOT REACHED HERE. §21.10 "The
+        // name may not appear in any member signature of an enclosing or sibling
+        // declaration — parameter, return, field/property/indexer,
+        // generic-constraint, or base/interface positions of the enclosing
+        // method itself, or of any member of any type declared outside the local
+        // type". That rule is the member-signature arm further down, and it is
+        // stated there for a single-part name; a qualified `Inner.Box` in one of
+        // those positions is REJECTED today and stays rejected by this guard,
+        // which is the conservative direction — admitting it is a different
+        // change with its own diagnostic, and this one is a reachability fix.
+        if (ctx_.module() && t.name->parts.size() > 1 &&
+            !(inMemberSignature_ && !inLocalTypeMembers_)) {
+            for (Symbol* child : ctx_.module()->children) {
+                auto* ts = dynamic_cast<TypeSymbol*>(child);
+                if (!ts || ts->name != first) continue;
+                // Same in-extent test as the single-part fallback further down,
+                // and the same conservative reading of a zero recorded end: the
+                // extent was not tracked for that declaration, so it counts as
+                // visible rather than falsely rejecting a valid program.
+                if (ts->isLocalType && ts->localScopeEndOffset &&
+                    t.span.begin.offset > ts->localScopeEndOffset)
+                    continue;
+                // Set `sym` and leave the `if (!sym)` below, rather than
+                // returning: §2.7 rule 1 says the REST of the chain resolves
+                // against this type, and that descent is the §11.3 loop after
+                // this whole block. Returning here would answer `Inner.Box`
+                // with `Inner` and drop the segment.
+                sym = ts;
+                break;
+            }
+        }
+        if (!sym) {
         // §2.2 v0.164 / §2.7 / #1365: import-alias resolution in type position.
         // `Alias.TypeName[.Nested...]` where `Alias` is an import alias.
         // Per §2.7 rule 1 this is checked before module-prefix matching.
@@ -5155,6 +5248,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         }
         ref.kind = TypeRef::Kind::Error;
         return;
+        }  // end of the `if (!sym)` that the #6425 local-type head can leave
     }
     // For multi-part QualifiedNames, descend through the looked-up symbol's
     // nested types for each subsequent part. Per Grammar A.8 / §11.3:
