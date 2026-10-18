@@ -8822,6 +8822,27 @@ llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
 // tag, one basic block per payload-bearing case, PHI join. The switch
 // default (payload-free cases and, defensively, an out-of-range tag) yields
 // true — a payload-free case is equal to itself by tag alone.
+//
+// fix #6169: a case payload's NULLABILITY is declared at the PAYLOAD SITE
+// (`choice W<T> Ok(v: T?)`) and the concrete type ARGUMENT carries none of it
+// (`W<Col>`'s `Col` is non-nullable). BOTH payload-type resolutions below —
+// the `instTy->genericArgs` substitution and `resolveTypeParamRef` — returned
+// the bare substituted type and dropped the `?`, so a `T?` payload of a choice
+// argument read back as a NON-NULLABLE `Col`. That is sound for `lf`/`rf` only
+// if they were the bare choice struct, and they are not: `nullableValueStructTy`
+// wraps a nullable choice as `{i8 hasValue; <choiceStruct>}`
+// (LlvmBackend_Layout.cpp's `isNullableChoiceTy` arm, #2447). The mismatch
+// dropped `emitValueEquality`'s null-safe nullable-value arm (`isNullableValueTy`,
+// which DOES include `isNullableChoiceTy`) and fell into the bare-choice arm
+// instead, which read the `hasValue` flag as the case tag and indexed payload
+// slot `{2,0}` on a two-field wrapper — `CreateExtractValue`'s null result
+// segfaulted in `Value::setName` (bezelc exit 139, `W<Col>` `=`, `GetHashCode`,
+// and any `Set<W<Col>>`). Per §9.2 "`T?` where `T` is admissible" and §8.4's
+// null-safe `=`, `T?` IS admissible, so sema accepting the program is correct
+// and the codegen read was the defect. Both resolutions now OR the declared
+// nullability in; nullable is idempotent, so an argument that is itself
+// nullable (`W<Col?>`) stays nullable. `emitChoiceHashCode` carries the same
+// pair of resolutions and the same fix. // per §9.2, §8.4, §35.7
 llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                                          const sema::TypeSymbol* choiceTy,
                                          const sema::TypeRef* instTy) {
@@ -8893,6 +8914,7 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                                 choiceTy->genericParams[i]->name == head &&
                                 i < instTy->genericArgs.size()) {
                                 pTy = *instTy->genericArgs[i];
+                                pTy.nullable = pTy.nullable || rawTy->nullable;
                                 break;
                             }
                         }
@@ -8903,9 +8925,11 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                     }
                 } else {
                     // Top-level call or no instTy: use the prior path.
-                    if (const sema::TypeRef* rt =
-                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (const sema::TypeRef* rt = resolveTypeParamRef(rawTy))
                         pTy = *rt;
+                    // fix #6169 — see the header note above.
+                    pTy.nullable = pTy.nullable || (rawTy && rawTy->nullable);
                 }
             }
             caseEq = builder_.CreateAnd(caseEq,
@@ -8997,6 +9021,8 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
                                 choiceTy->genericParams[i]->name == head &&
                                 i < instTy->genericArgs.size()) {
                                 pTy = *instTy->genericArgs[i];
+                                // fix #6169 — see emitChoiceEquality's header.
+                                pTy.nullable = pTy.nullable || rawTy->nullable;
                                 break;
                             }
                         }
@@ -9005,9 +9031,11 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
                         if (rawTy) pTy = *rawTy;
                     }
                 } else {
-                    if (const sema::TypeRef* rt =
-                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (const sema::TypeRef* rt = resolveTypeParamRef(rawTy))
                         pTy = *rt;
+                    // fix #6169 — see emitChoiceEquality's header.
+                    pTy.nullable = pTy.nullable || (rawTy && rawTy->nullable);
                 }
             }
             llvm::Value* pfVal = builder_.CreateExtractValue(
