@@ -14024,6 +14024,7 @@ enum class VariancePos {
     Invariant,     // no marker can be honoured through this occurrence
     Absent,        // the parameter does not occur here
     Unknown,       // a wrapper's own variance could not be established
+    Deferred,      // an INVARIANT head in a BASE LIST — disputed, see #6355
 };
 
 // Where the occurrence sits. The two differ in exactly one case, and only in a
@@ -14056,8 +14057,52 @@ enum class VarianceSite {
 // example IS an invariant head reached through an invariant deriving marker, so
 // it is evidence FOR acceptance, and the soundness argument is not). The two
 // mismatched-MARKER rejections stay pending the same ruling — see #6355.
+//
+// fix #6355: the deferral yields its OWN position, `Deferred`, and NOT
+// `Unknown`. This is the blast-radius half of the narrowing, and it is a
+// silent-acceptance inversion if `Unknown` is used.
+//
+// `mergeVariancePos` folds with `Unknown` as a POISON: one `Unknown` operand
+// makes the whole accumulator `Unknown`, and `composedVarianceViolation` reads
+// `Unknown` as "no violation". So returning `Unknown` here — which this
+// function did — deferred not one cell but the WHOLE base-list head: with
+// `interface D<out T>: Pair<A<T>, B<T>>`, one invariant base arg turned every
+// sibling arg of that head into an unchecked `Unknown`, and the head's verdict
+// stopped depending on the positions at all. A check whose verdict flips on an
+// unrelated sibling is being short-circuited, not reading the position.
+//
+// `Deferred` is the NEUTRAL element of the fold (`mergeVariancePos`, and
+// `slotPolarity` where it propagates as `Absent`). It withholds ITS OWN
+// verdict and leaves every sibling's intact — which is the question #6355
+// actually poses, "does the base list participate in the position check?",
+// asked of one argument rather than of a head.
+//
+// MEASURED with `invariantOrDefer` forced back to its pre-narrowing body
+// (`return VariancePos::Invariant;` — the blunt remedy `69338700` replaced),
+// against `69338700` as it stands, for `interface P4<out A, out B>` under
+// `out T`:
+//
+//                      blunt    69338700    this fix
+//     P4<IInv<T>,K<T>>   reject   ACCEPT      reject
+//     P4<Array<T>,K<T>>  reject   ACCEPT      reject
+//     P4<K<T>,IInv<T>>   reject   ACCEPT      reject
+//     P4<IInv<T>,C<T>>   reject   accept      accept
+//     P4<C<T>,C2<T>>     accept   accept      accept
+//
+// The three `ACCEPT`s in the middle column are the inversion, and the two
+// ACCEPTs in the right-hand column are the deferral #6355 legitimately
+// closed, still closed: `P4<IInv<T>, C<T>>` has no violation left once the
+// disputed argument is withheld, because `C<T>` is covariant-in under an `out`
+// marker. `P4<IInv<T>, K<T>>` is a genuine §12.9 violation on `K<T>` ALONE —
+// contravariant-in, under an `out` marker, in a covariant slot — and the blunt
+// remedy rejected it for the right reason.
+//
+// The member twin of the same shape (`method Get(): P4<IInv<T>, K<T>>`) is
+// rejected under ALL THREE, because `invariantOrDefer` answers `Invariant` at a
+// member site. Same heads, same positions, only the SITE differs — and that the
+// base list's verdict diverged from its member twin's is the whole tell.
 VariancePos invariantOrDefer(VarianceSite site) {
-    return site == VarianceSite::BaseList ? VariancePos::Unknown
+    return site == VarianceSite::BaseList ? VariancePos::Deferred
                                           : VariancePos::Invariant;
 }
 
@@ -14065,7 +14110,7 @@ VariancePos flipVariancePos(VariancePos p) {
     switch (p) {
     case VariancePos::CoVariant: return VariancePos::ContraVariant;
     case VariancePos::ContraVariant: return VariancePos::CoVariant;
-    default: return p;  // Invariant / Absent / Unknown pass through unchanged
+    default: return p;  // Invariant / Absent / Unknown / Deferred unchanged
     }
 }
 
@@ -14086,6 +14131,12 @@ VariancePos flipVariancePos(VariancePos p) {
 VariancePos slotPolarity(VariancePos slot, VariancePos wrapperVar) {
     if (wrapperVar == VariancePos::Unknown || slot == VariancePos::Unknown)
         return VariancePos::Unknown;
+    // fix #6355: a DEFERRED base-list head resolves to no polarity at all, so
+    // it propagates as `Absent` — the position a type that does not mention the
+    // parameter propagates as. It is emphatically NOT `Invariant`: folding it
+    // in as Invariant would erase the verdict of every sibling argument.
+    if (wrapperVar == VariancePos::Deferred) return VariancePos::Deferred;
+    if (slot == VariancePos::Deferred) return VariancePos::Deferred;
     if (wrapperVar == VariancePos::Absent || slot == VariancePos::Absent)
         return VariancePos::Absent;
     if (wrapperVar == VariancePos::Invariant || slot == VariancePos::Invariant)
@@ -14096,7 +14147,14 @@ VariancePos slotPolarity(VariancePos slot, VariancePos wrapperVar) {
 // Fold a second occurrence into an accumulator. Two occurrences that land in
 // DIFFERENT positions cannot both be honoured by one marker, so the fold is
 // Invariant — which rejects under either marker, the sound answer.
+//
+// fix #6355: `Deferred` is the NEUTRAL element of this fold, exactly as
+// `Absent` is — it contributes nothing and, critically, CONTributes nothing to
+// the siblings either. It is not `Unknown`, which poisons: see the block
+// comment on `invariantOrDefer` for why that distinction is load-bearing.
 VariancePos mergeVariancePos(VariancePos acc, VariancePos next) {
+    if (acc == VariancePos::Deferred) return next;
+    if (next == VariancePos::Deferred) return acc;
     if (acc == VariancePos::Absent) return next;
     if (next == VariancePos::Absent) return acc;
     if (acc == VariancePos::Unknown || next == VariancePos::Unknown)
@@ -15022,7 +15080,14 @@ VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName
                 outer,
                 namedHeadArgVariance(t, i, localTypes, localAliases, heads,
                                     site, aliasChain));
-            if (argSlot == VariancePos::Absent) continue;
+            // fix #6355: a DEFERRED argument contributes no verdict of its own
+            // and is not allowed to contribute one to its siblings either —
+            // `mergeVariancePos` makes `Deferred` the fold's neutral element.
+            // Skipping it here (rather than folding it) is what keeps a single
+            // disputed argument from deciding the whole head's verdict.
+            if (argSlot == VariancePos::Absent ||
+                argSlot == VariancePos::Deferred)
+                continue;
             acc = mergeVariancePos(
                 acc, composedParamPosition(*t.genericArgs[i], paramName, argSlot,
                                            localTypes, localAliases, heads,

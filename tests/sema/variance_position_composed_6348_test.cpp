@@ -170,6 +170,109 @@ BEZEL_TEST(variance_position_composed_6348,
         "interface D<in T>: IInv<T> end D; ");
 }
 
+// The deferral's BLAST RADIUS (fix #6355). The two rows above pin the deferral
+// itself; these pin that it defers ONE argument and not the whole base-list
+// head.
+//
+// `invariantOrDefer` returned `Unknown` for an invariant base-list head, and
+// `Unknown` is a POISON in `mergeVariancePos`: one such argument turned every
+// SIBLING argument of the same head into an unchecked `Unknown`, and
+// `composedVarianceViolation` reads `Unknown` as "no violation". So a genuine
+// §12.9 violation on one argument was accepted whenever an unrelated invariant
+// argument sat beside it — the verdict stopped depending on the positions at
+// all. It is now `Deferred`, the fold's NEUTRAL element: it withholds its own
+// verdict and leaves every sibling's intact.
+//
+// Each row below is a genuine violation on `K<T>` ALONE — contravariant-in
+// under an `out` marker — which the pre-fix compiler accepted only because of
+// the invariant sibling named in it. `P4` declares BOTH parameters `out`, so
+// `K<T>` in either slot is contravariant-in and `IInv<T>`/`Array<T>` in either
+// slot is the deferred one; the two are deliberately interchangeable in the
+// argument order, because the pre-fix fold was order-dependent.
+BEZEL_TEST(variance_position_composed_6348,
+           base_deferred_arg_does_not_mask_invariant_sibling_spec_12_9) {
+    expectRejected(
+        "interface IInv<T> method Put(x: T); end IInv; "
+        "interface K<in T> method Put2(x: T); end K; "
+        "interface P4<out A, out B> method GetB(): B; end P4; "
+        "interface D<out T>: P4<IInv<T>, K<T>> end D; ",
+        "whose own parameter variance cannot honour that position");
+}
+
+// The same shape with the arguments SWAPPED, so a fix that only handled one
+// position — or that made the fold order-dependent — cannot pass.
+BEZEL_TEST(variance_position_composed_6348,
+           base_deferred_arg_does_not_mask_invariant_sibling_swapped_spec_12_9) {
+    expectRejected(
+        "interface IInv<T> method Put(x: T); end IInv; "
+        "interface K<in T> method Put2(x: T); end K; "
+        "interface P4<out A, out B> method GetB(): B; end P4; "
+        "interface D<out T>: P4<K<T>, IInv<T>> end D; ",
+        "whose own parameter variance cannot honour that position");
+}
+
+// The invariant sibling need not be a declared interface: `Array` is a class,
+// and §12.9 makes every class "always invariant", so it reached the deferral
+// by the same arm. `P4<Array<T>, K<T>>` was accepted for the same reason.
+BEZEL_TEST(variance_position_composed_6348,
+           base_deferred_arg_does_not_mask_invariant_class_sibling_spec_12_9) {
+    expectRejected(
+        "interface K<in T> method Put2(x: T); end K; "
+        "interface P4<out A, out B> method GetB(): B; end P4; "
+        "interface D<out T>: P4<Array<T>, K<T>> end D; ",
+        "whose own parameter variance cannot honour that position");
+}
+
+// The MEMBER twin of the first row, and the control for the whole diagnosis: it
+// was already rejected before the fix, because `invariantOrDefer` returns
+// `Invariant` at a member site. Same base list, same heads, same positions —
+// only the SITE differs. A base list whose verdict differed from its member
+// twin's was the whole tell.
+//
+// Its diagnostic is the member-slot one ("appears in an input (parameter)
+// position ... in method `Get`"), not the base-list wording the rows above
+// pin, so the needle differs too. Pinned on the phrase that says the position
+// was read and found wrong, which is what makes it a control rather than a
+// bare "it was rejected".
+BEZEL_TEST(variance_position_composed_6348,
+           base_deferred_arg_member_twin_rejected_spec_12_9) {
+    expectRejected(
+        "interface IInv<T> method Put(x: T); end IInv; "
+        "interface K<in T> method Put2(x: T); end K; "
+        "interface P4<out A, out B> method GetB(): B; end P4; "
+        "interface D<out T> method Get(): P4<IInv<T>, K<T>>; end D; ",
+        "appears in an input (parameter) position");
+}
+
+// The deferral must ALSO not manufacture a violation from a sound sibling: the
+// remaining argument is `C<T>`, covariant-in under an `out` marker, which §12.9
+// honours. So `P4<IInv<T>, C<T>>` stays ACCEPTED — the disputed argument is
+// withheld and the undisputed one governs, which is what "defer THIS argument"
+// means. This row is what separates the fix from the blunt pre-narrowing
+// remedy, which rejected it (folding Invariant with CoVariant to Invariant) and
+// so would have re-opened the case #6355 legitimately closed.
+BEZEL_TEST(variance_position_composed_6348,
+           base_deferred_arg_does_not_mask_sound_sibling_spec_12_9) {
+    expectAccepted(
+        "interface IInv<T> method Put(x: T); end IInv; "
+        "interface C<out T> method Get(): T; end C; "
+        "interface P4<out A, out B> method GetB(): B; end P4; "
+        "interface D<out T>: P4<IInv<T>, C<T>> end D; ");
+}
+
+// Two sound siblings: the deferral withholds one and `C2<T>` governs, exactly
+// as above. Verdict unchanged from before the fix, pinned so a future edit that
+// made `Deferred` poison the other way would show up here too.
+BEZEL_TEST(variance_position_composed_6348,
+           base_deferred_arg_two_sound_siblings_accepted_spec_12_9) {
+    expectAccepted(
+        "interface IInv<T> method Put(x: T); end IInv; "
+        "interface C<out T> method Get(): T; end C; "
+        "interface C2<out T> method Get2(): T; end C2; "
+        "interface P4<out A, out B> method GetB(): B; end P4; "
+        "interface D<out T>: P4<C<T>, C2<T>> end D; ");
+}
+
 // --- the direct, non-composed positions are unchanged (no false positives) --
 
 BEZEL_TEST(variance_position_composed_6348, direct_out_return_still_accepted) {
