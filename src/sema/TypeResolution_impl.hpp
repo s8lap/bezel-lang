@@ -1564,10 +1564,10 @@ private:
     // C-compatible iff every field's type is an FFI-compatible scalar (integer
     // types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, `Ptr<T>`), an
     // inline array `[N]T` of such a scalar …, or another C-compatible record
-    // (nesting; recursion is impossible — records are value types)". `depth`
-    // bounds the nesting walk so a malformed (cyclic) declaration terminates
-    // rather than recursing forever.
-    bool isCCompatibleRecord(const ast::Type& t, Scope* scope, int depth = 0);
+    // (nesting; recursion is impossible — records are value types)". A per-path
+    // cycle guard replaces the old depth cap: it fires only on a malformed
+    // cyclic graph, never on a well-formed program.
+    bool isCCompatibleRecord(const ast::Type& t, Scope* scope);
 
     // §32.13 clause 4 (v0.306), the typed-handle form: "A C-compatible record
     // with exactly one field, of *integer or pointer* scalar type (integer
@@ -1581,7 +1581,7 @@ private:
     // `IntPtr`, `UIntPtr`, and C-compatible records". Deliberately NOT §32.5's
     // scalar set: `Ptr<U>` is an FFI-compatible scalar but is not a member
     // here, "which is exactly what makes `Ptr<Ptr<U>>` inadmissible".
-    bool isFfiPointeeType(const ast::Type& t, Scope* scope, int depth = 0);
+    bool isFfiPointeeType(const ast::Type& t, Scope* scope);
 
     // The `sema::TypeSymbol` a single-part named type resolves to through the
     // lexical scope chain, or null. A scope walk rather than
@@ -1599,10 +1599,14 @@ private:
     // is built from. Split this way so there is ONE classification, reached
     // either from an `ast::Type` written in an extern signature or from a
     // field's resolved type — not two spellings that can drift.
-    bool isCCompatibleRecordSym(const TypeSymbol* ts, int depth);
-    bool isCCompatibleFieldTypeRef(const TypeRef* rt, int depth);
-    bool isFfiScalarTypeRef(const TypeRef* rt, int depth);
-    bool isFfiPointeeTypeRef(const TypeRef* rt, int depth);
+    bool isCCompatibleRecordSym(const TypeSymbol* ts,
+                               std::unordered_set<const TypeSymbol*>& onChain);
+    bool isCCompatibleFieldTypeRef(
+        const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain);
+    bool isFfiScalarTypeRef(const TypeRef* rt,
+                            std::unordered_set<const TypeSymbol*>& onChain);
+    bool isFfiPointeeTypeRef(const TypeRef* rt,
+                             std::unordered_set<const TypeSymbol*>& onChain);
 
     // ---- §14.2: nested-generic constraint propagation -------------------
     //

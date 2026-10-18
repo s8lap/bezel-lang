@@ -13385,7 +13385,8 @@ const TypeSymbol* Resolver::namedTypeSymbolInScope(const ast::Type& t,
 // set. Reads the resolved TypeRef, never an `ast::TypeDecl`, so an IMPORTED
 // record (whose TypeSymbol has no declaration at all) classifies identically
 // to a local one — the #3152 seam.
-bool Resolver::isFfiScalarTypeRef(const TypeRef* rt, int depth) {
+bool Resolver::isFfiScalarTypeRef(
+    const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain) {
     if (!rt || rt->nullable) return false;
     if (rt->kind == TypeRef::Kind::Primitive)
         return isFfiPrimitive(rt->primitive);
@@ -13394,7 +13395,7 @@ bool Resolver::isFfiScalarTypeRef(const TypeRef* rt, int depth) {
     if (h == "IntPtr" || h == "UIntPtr") return true;
     if (h == "Ptr")
         return rt->genericArgs.size() == 1 &&
-               isFfiPointeeTypeRef(rt->genericArgs[0], depth + 1);
+               isFfiPointeeTypeRef(rt->genericArgs[0], onChain);
     return false;
 }
 
@@ -13403,7 +13404,8 @@ bool Resolver::isFfiScalarTypeRef(const TypeRef* rt, int depth) {
 // One member short of the scalar set above, deliberately: `Ptr<U>` "is an
 // FFI-compatible scalar … but is **not** a member here, which is exactly what
 // makes `Ptr<Ptr<U>>` inadmissible".
-bool Resolver::isFfiPointeeTypeRef(const TypeRef* rt, int depth) {
+bool Resolver::isFfiPointeeTypeRef(
+    const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain) {
     if (!rt || rt->nullable) return false;
     if (rt->kind == TypeRef::Kind::Primitive)
         return isFfiPrimitive(rt->primitive);
@@ -13411,33 +13413,42 @@ bool Resolver::isFfiPointeeTypeRef(const TypeRef* rt, int depth) {
     std::string_view h = rt->headName();
     if (h == "IntPtr" || h == "UIntPtr") return true;
     if (h == "Ptr") return false;  // the §32.12 v1 decline
-    return isCCompatibleRecordSym(rt->declaration, depth + 1);
+    return isCCompatibleRecordSym(rt->declaration, onChain);
 }
 
 // per §32.13 clause 1: a field's type is "an FFI-compatible scalar …, an
 // inline array `[N]T` of such a scalar (§32.5's element set …), or another
 // C-compatible record (nesting)".
-bool Resolver::isCCompatibleFieldTypeRef(const TypeRef* rt, int depth) {
+bool Resolver::isCCompatibleFieldTypeRef(
+    const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain) {
     if (!rt || rt->nullable) return false;
-    if (isFfiScalarTypeRef(rt, depth)) return true;
+    if (isFfiScalarTypeRef(rt, onChain)) return true;
     if (rt->kind == TypeRef::Kind::InlineArray)
-        return !rt->arrayOwned && isFfiScalarTypeRef(rt->arrayElement, depth);
+        return !rt->arrayOwned && isFfiScalarTypeRef(rt->arrayElement, onChain);
     if (rt->kind == TypeRef::Kind::Named)
-        return isCCompatibleRecordSym(rt->declaration, depth + 1);
+        return isCCompatibleRecordSym(rt->declaration, onChain);
     return false;
 }
 
-bool Resolver::isCCompatibleRecordSym(const TypeSymbol* ts, int depth) {
-    // §32.13 clause 1 says recursion is impossible ("records are value
-    // types"), which holds of a WELL-FORMED program; a malformed one must
-    // still terminate, and §9's own cycle check owns that diagnostic.
-    if (depth > 8 || !ts) return false;
+bool Resolver::isCCompatibleRecordSym(const TypeSymbol* ts,
+                                     std::unordered_set<const TypeSymbol*>& onChain) {
+    // per §32.13 clause 1 (v0.306), no depth qualifier on the nesting rule.
+    // A cycle can occur through a `Ptr` head or a class head (neither is
+    // C-compatible, so neither passes through this function), but the walk
+    // must still terminate on a malformed graph.  The cycle guard replaces the
+    // depth cap: it fires ONLY on a symbol already on the current enclosing
+    // path (a cycle), never on a well-formed program, since a record cannot
+    // contain itself by value.
+    if (!ts || !onChain.insert(ts).second) return false;
     if (ts->kind != ast::TypeDeclKind::Record) return false;
     // §3.6's common rules make the property "evaluated per-instantiation for
     // generic records". That evaluation is not wired here, so a generic record
     // is conservatively NOT classified — the direction that rejects a boundary
     // declaration rather than mis-admitting one.
-    if (!ts->genericParams.empty()) return false;
+    if (!ts->genericParams.empty()) {
+        onChain.erase(ts);
+        return false;
+    }
     bool any = false;
     for (const Symbol* m : ts->members) {
         auto* fs = dynamic_cast<const FieldSymbol*>(m);
@@ -13451,21 +13462,24 @@ bool Resolver::isCCompatibleRecordSym(const TypeSymbol* ts, int depth) {
         // §9.1 positional `Param`, the body `FieldDecl`, or — for an imported
         // record with neither — `ctx.importedMemberType`.
         if (!isCCompatibleFieldTypeRef(sema::storageComponentType(m, ctx_),
-                                       depth))
+                                       onChain)) {
+            onChain.erase(ts);
             return false;
+        }
     }
     // A record with no storage has no C struct to correspond to, so clause 2's
     // layout promise would have nothing to promise.
+    onChain.erase(ts);
     return any;
 }
 
-bool Resolver::isCCompatibleRecord(const ast::Type& t, Scope* scope,
-                                   int depth) {
+bool Resolver::isCCompatibleRecord(const ast::Type& t, Scope* scope) {
     if (t.nullable) return false;
-    return isCCompatibleRecordSym(namedTypeSymbolInScope(t, scope), depth);
+    std::unordered_set<const TypeSymbol*> onChain;
+    return isCCompatibleRecordSym(namedTypeSymbolInScope(t, scope), onChain);
 }
 
-bool Resolver::isFfiPointeeType(const ast::Type& t, Scope* scope, int depth) {
+bool Resolver::isFfiPointeeType(const ast::Type& t, Scope* scope) {
     // per §32.12 clause 1 (v0.306). A nullable pointee has no C
     // representation (§32.5's nullable-value-type rule).
     if (t.nullable) return false;
@@ -13476,12 +13490,15 @@ bool Resolver::isFfiPointeeType(const ast::Type& t, Scope* scope, int depth) {
     if (isFfiScalarPrimitiveName(n)) return true;
     if (n == "IntPtr" || n == "UIntPtr") return true;
     if (n == "Ptr") return false;  // the §32.12 v1 decline
-    return isCCompatibleRecord(t, scope, depth);
+    std::unordered_set<const TypeSymbol*> onChain;
+    return isCCompatibleRecordSym(namedTypeSymbolInScope(t, scope), onChain);
 }
 
 bool Resolver::isSingleFieldHandleRecord(const ast::Type& t, Scope* scope) {
     const TypeSymbol* ts = namedTypeSymbolInScope(t, scope);
-    if (t.nullable || !isCCompatibleRecordSym(ts, 0)) return false;
+    if (t.nullable) return false;
+    std::unordered_set<const TypeSymbol*> onChain;
+    if (!isCCompatibleRecordSym(ts, onChain)) return false;
     const TypeRef* only = nullptr;
     int count = 0;
     for (const Symbol* m : ts->members) {
@@ -13504,7 +13521,7 @@ bool Resolver::isSingleFieldHandleRecord(const ast::Type& t, Scope* scope) {
         std::string_view h = only->headName();
         if (h == "IntPtr" || h == "UIntPtr") return true;
         return h == "Ptr" && only->genericArgs.size() == 1 &&
-               isFfiPointeeTypeRef(only->genericArgs[0], 1);
+               isFfiPointeeTypeRef(only->genericArgs[0], onChain);
     }
     if (only->kind != TypeRef::Kind::Primitive) return false;
     switch (only->primitive) {
