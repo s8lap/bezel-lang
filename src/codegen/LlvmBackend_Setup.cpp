@@ -20046,7 +20046,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     // sibling below and keeps the two disjoint), but it no longer decides
     // the verdict — `lowerReturn`'s `wrapAsIEnumerableForTarget` call
     // publishes that edge's own `outWrapMade` in `propBlockGetterReturnKinds_`
-    // under `kPropGetterReturnMint`, keyed on the PropertyDecl for the
+    // under `kPropGetterReturnMint`, keyed on the property for the
     // structural reason #6397 records (the accessor is a memoised function
     // with no caller read node to key on, and once the memo hits it cannot be
     // re-entered to see one). Ordering holds: `lowerStmt` lowers this
@@ -20076,24 +20076,17 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
             sema::Symbol* blockGetterSym6405 = ctx_.exprSymbol(*ma);
             if (blockGetterOf(blockGetterSym6405)) {
-                // Same key the writer uses: `currentAccessorPropDecl_` is the
-                // PropertyDecl `ensurePropertyBlockGetter` published, and the
-                // #6397 consumer (`lowerForIn`'s `sourceIsNamedLocal` arm,
-                // LlvmBackend_Stmts.cpp) reads it off `ps->decl` the same way.
+                // Same key the writer uses: `currentAccessorPropSym_` is the
+                // `sema::PropertySymbol` `ensurePropertyBlockGetter`
+                // published, and the #6397 consumer (`lowerForIn`'s
+                // `sourceIsNamedLocal` arm, LlvmBackend_Stmts.cpp) keys on
+                // the same symbol. Reaching this arm at all means
+                // `blockGetterOf` found a block accessor, which it can only
+                // do for a property that HAS an `ast::PropertyDecl` — so the
+                // symbol needs no `->decl` recovery to name the key.
                 auto* ps6405 = blockGetterSym6405
                     ? dynamic_cast<sema::PropertySymbol*>(blockGetterSym6405)
                     : nullptr;
-                const ast::PropertyDecl* pd6405 =
-                    ps6405 && ps6405->decl
-                        // SEAM-DEBT: #6405 - a class-3 read on ps6405->decl.
-                        // The key must be the PropertyDecl the accessor
-                        // WRITER published, and it is reachable only through
-                        // the symbol's `decl`; for an imported accessor that
-                        // decl is the seam, and this arm's no-key read already
-                        // declines - the same safe side the writer's own
-                        // absence takes, so the read cannot over-claim.
-                        ? dynamic_cast<const ast::PropertyDecl*>(ps6405->decl)
-                        : nullptr;
                 // A property whose block getter was never emitted (an
                 // imported / cross-module accessor this TU cannot body-lower,
                 // so no writer ran) reports no bit. That DECLINE is the safe
@@ -20101,9 +20094,9 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
                 // the §28.2 argument above is what the withheld claim would
                 // have violated. A no-key read and a keyed-but-unset read are
                 // deliberately the same answer.
-                if (pd6405 &&
-                    (propBlockGetterReturnKinds_.count(pd6405) &&
-                     (propBlockGetterReturnKinds_.at(pd6405) &
+                if (ps6405 &&
+                    (propBlockGetterReturnKinds_.count(ps6405) &&
+                     (propBlockGetterReturnKinds_.at(ps6405) &
                       kPropGetterReturnMint)))
                     ownsSource = true;
             }

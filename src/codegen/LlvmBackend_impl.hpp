@@ -1573,9 +1573,27 @@ private:
     //
     // (The map's NAME is the block path's historical one; it is keyed on the
     // property for every accessor face, which is what both writers share.)
+    //
+    // ⚠ THE KEY IS THE `sema::PropertySymbol`, NOT THE `ast::PropertyDecl`
+    // it used to be. For a LOCAL property the two are 1:1 — `collectTypeDecl`
+    // runs `collectMember` once per `td.members` entry and `td` is visited
+    // once per module, so one `PropertyDecl` carries exactly one
+    // `PropertySymbol` — which is why every answer this map gives is
+    // unchanged by the re-key. But reading the key back off
+    // `ps->decl` at the consumer (LlvmBackend_Stmts.cpp's two `for`-in arms,
+    // LlvmBackend_Setup.cpp's #6405 arm) is an AST-GATED class-3
+    // imported-symbol read that answers "no entry" for every imported
+    // property and cannot be made to answer otherwise. Keying on the symbol
+    // deletes all three reads. It does NOT make the imported face reachable:
+    // BOTH writers run only while a LOCAL accessor's body is being emitted
+    // (`ensurePropertyAccessorFn` returns on `!pd`, and
+    // `currentAccessorPropSym_` is set only inside
+    // `ensurePropertyBlockGetter`), so an imported property still has no
+    // entry — the map answers the same thing it always did for one.
     static constexpr unsigned kPropGetterBodyMint    = 1u << 2;
-    std::unordered_map<const ast::Node*, unsigned> propBlockGetterReturnKinds_;
-    // fix #6397 (§28.9 / §29.2, v0.338): the `ast::PropertyDecl` whose
+    std::unordered_map<const sema::PropertySymbol*, unsigned>
+        propBlockGetterReturnKinds_;
+    // fix #6397 (§28.9 / §29.2, v0.338): the `sema::PropertySymbol` whose
     // accessor body is being emitted RIGHT NOW, published by
     // `ensurePropertyBlockGetter` (LlvmBackend_Assign.cpp) around its
     // `lowerScopedBlock` call so `lowerReturn` can attribute its mint to a
@@ -1585,7 +1603,18 @@ private:
     // this channel must survive into the callee for the whole body emission
     // and be restored by the same explicit save/restore block the accessor
     // representation pair sits in.
-    const ast::PropertyDecl* currentAccessorPropDecl_ = nullptr;
+    //
+    // It carries the map KEY only. It is deliberately a SEPARATE parameter
+    // from `ensurePropertyBlockGetter`'s `ps` (which feeds the memo key's
+    // owner-instantiation subst): threading the one symbol into both would
+    // change which memo entries exist for a GENERIC owner — the inline read
+    // sites pass no `ps` today and so get the erased-instantiation getter,
+    // while the thunk path gets the substituted one — and merging those two
+    // is a change to emitted functions that this re-key has no business
+    // making. `ensurePropertyBlockGetter` therefore takes both, and neither
+    // has a default, so a call site that has a symbol in scope cannot
+    // silently drop the key.
+    const sema::PropertySymbol* currentAccessorPropSym_ = nullptr;
     // §27.5 / #673: for boxed NON-FOR-VAR locals, maps each cell-holder alloca
     // (newSlot) to the ORIGINAL pre-boxing alloca (the variable's original
     // storage slot).  After boxing, the original slot is kept in sync on every
@@ -7705,11 +7734,19 @@ private:
     // property getter body (`get => do…end;`).  Calling it with `this` as the
     // sole argument returns the getter's value — avoids premature `ret` in the
     // outer method when `return` appears inside the getter.
-    // `ps` (optional) keys the memo on the owner's §14.1 instantiation
-    // (fix #5315); null keeps the instantiation-agnostic key.
+    // `ps` keys the memo on the owner's §14.1 instantiation (fix #5315);
+    // null keeps the instantiation-agnostic key, which is what the inline
+    // read sites have always passed.
+    // `psKey` is the property's `sema::PropertySymbol` — the KEY of
+    // `propBlockGetterReturnKinds_`, published to `lowerReturn` for the body
+    // emission below. It is a separate parameter from `ps` because filling
+    // `ps` at the sites that pass null would change their memo entry (see
+    // `currentAccessorPropSym_`), and it has NO default: every call site must
+    // say what it knows, so a site that has the symbol in scope cannot
+    // silently stop publishing the mint #6397 closed the leak with.
     llvm::Function* ensurePropertyBlockGetter(
         const ast::PropertyDecl* pd, const ast::PropertyAccessor* acc,
-        const sema::PropertySymbol* ps = nullptr);
+        const sema::PropertySymbol* ps, const sema::PropertySymbol* psKey);
 
     // #481 / §12.1 / §12.5 / §23: emit (or retrieve cached) a uniform-signature
     // accessor FUNCTION for a virtual property, so it can be installed in a

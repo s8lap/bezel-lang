@@ -3546,7 +3546,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // value that ALREADY has the declared head, so the wrap
                 // declines, the holder keeps the field (§28.2), and a claim
                 // over an unminted frame would free it out from under the
-                // holder. `currentAccessorPropDecl_` is non-null only inside
+                // holder. `currentAccessorPropSym_` is non-null only inside
                 // `ensurePropertyBlockGetter`'s body emission, so a METHOD's
                 // return edge — which reaches this same arm — publishes
                 // nothing and keeps its existing behaviour.
@@ -3557,7 +3557,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     /*outWrapMade=*/&wrapMade6397,
                     /*srcOwnedByCallee=*/
                     returnSourceIsCalleeOwnedCollection(rs->value.get()));
-                if (currentAccessorPropDecl_) {
+                if (currentAccessorPropSym_) {
                     // fix #6397: publish BOTH verdicts the for-in consumer
                     // reads. The field bit is decided from the SAME node this
                     // arm already holds (`rs->value`), by the classification
@@ -3572,15 +3572,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         dynamic_cast<sema::FieldSymbol*>(
                             ctx_.exprSymbol(*rs->value)) != nullptr;
                     unsigned k = propBlockGetterReturnKinds_.count(
-                                     currentAccessorPropDecl_)
+                                     currentAccessorPropSym_)
                                      ? propBlockGetterReturnKinds_[
-                                           currentAccessorPropDecl_]
+                                           currentAccessorPropSym_]
                                      : 0u;
                     k = (wrapMade6397 ? (k | kPropGetterReturnMint)
                                       : (k & ~kPropGetterReturnMint));
                     k = (returnsField6397 ? (k | kPropGetterReturnField)
                                           : (k & ~kPropGetterReturnField));
-                    propBlockGetterReturnKinds_[currentAccessorPropDecl_] = k;
+                    propBlockGetterReturnKinds_[currentAccessorPropSym_] = k;
                 }
             }
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
@@ -9996,18 +9996,18 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             // reader's whatever the body is, and a getter that hands back a
             // FIELD read hands back storage its holder already keeps alive
             // (§28.2). Everything else keeps the classification it had.
-            const ast::PropertyDecl* pd6397 =
-                ps6397 && ps6397->decl
-                    // SEAM-DEBT: #6397 ps6397->decl read — recovers only the
-                    // PropertyDecl KEY `propBlockGetterReturnKinds_` is indexed
-                    // on; it is not a classification read, and an imported
-                    // property has no map entry either way. Stays a class-3
-                    // AST-gated read; same posture as #4686 above.
-                    ? dynamic_cast<const ast::PropertyDecl*>(ps6397->decl)
-                    : nullptr;
+            // The map is keyed on the `sema::PropertySymbol` itself, so
+            // the read needs no `ps6397->decl` recovery — for a LOCAL
+            // property the symbol and its decl are 1:1 (one `collectMember`
+            // per `td.members` entry, one `td` visit per module), and for an
+            // IMPORTED property `ps6397->decl` is null so the old cast
+            // yielded no entry anyway — which is also what this lookup
+            // returns, because a writer only runs while a LOCAL accessor's
+            // body is emitted (`currentAccessorPropSym_` is set nowhere
+            // else). Same answer, one fewer AST-gated read.
             unsigned gk6397 = 0u;
-            if (pd6397 && propBlockGetterReturnKinds_.count(pd6397))
-                gk6397 = propBlockGetterReturnKinds_.at(pd6397);
+            if (ps6397 && propBlockGetterReturnKinds_.count(ps6397))
+                gk6397 = propBlockGetterReturnKinds_.at(ps6397);
             bool minted6397 =
                 propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
                 (gk6397 & kPropGetterReturnMint) != 0 ||
@@ -10546,18 +10546,12 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             // return _a; end get; end` mints NOTHING (the declared head is not
             // an iterator-format head) — so the holder keeps `_a` and this loop
             // must not touch it.
-            const ast::PropertyDecl* pd6397b =
-                ps6397b && ps6397b->decl
-                    // SEAM-DEBT: #6397 ps6397b->decl read — the USER-CLASS
-                    // arm's twin of the marker above, same reason: it recovers
-                    // only the PropertyDecl KEY the mint map is indexed on, so
-                    // the sanctioned `sema::TypeSymbol` accessor would not
-                    // change an answer. Stays a class-3 AST-gated read.
-                    ? dynamic_cast<const ast::PropertyDecl*>(ps6397b->decl)
-                    : nullptr;
+            // The USER-CLASS arm's twin of the sibling above: the map is
+            // keyed on the `sema::PropertySymbol`, so the read needs no
+            // `ps6397b->decl` recovery — same reasoning, same answer.
             unsigned gk6397b = 0u;
-            if (pd6397b && propBlockGetterReturnKinds_.count(pd6397b))
-                gk6397b = propBlockGetterReturnKinds_.at(pd6397b);
+            if (ps6397b && propBlockGetterReturnKinds_.count(ps6397b))
+                gk6397b = propBlockGetterReturnKinds_.at(ps6397b);
             bool minted6397b =
                 propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
                 (gk6397b & kPropGetterReturnMint) != 0 ||
@@ -11010,7 +11004,8 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                 }
                 // Try block getter (get => do...end).
                 else if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
-                    llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
+                    llvm::Function* getterFn = ensurePropertyBlockGetter(
+                        pd, acc, /*ps=*/nullptr, /*psKey=*/currentPropSym);
                     if (getterFn) {
                         auto* fnTy = getterFn->getFunctionType();
                         curVal = builder_.CreateCall(fnTy, getterFn, {enumObj2});

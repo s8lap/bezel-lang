@@ -5815,9 +5815,11 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
 }
 
 
-llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
+llvm::Function* Emitter::ensurePropertyBlockGetter(
+                                          const ast::PropertyDecl* pd,
                                           const ast::PropertyAccessor* acc,
-                                          const sema::PropertySymbol* ps) {
+                                          const sema::PropertySymbol* ps,
+                                          const sema::PropertySymbol* psKey) {
     // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
     // the shared/erased template every ordinary caller wants.
     //
@@ -5985,8 +5987,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     // has the same need and is deliberately NOT wired here: no measured
     // consumer reads the verdict for that family yet, and leaving it unwired
     // keeps the claim honest rather than half-claimed.
-    const ast::PropertyDecl* savedAccessorPropDecl = currentAccessorPropDecl_;
-    currentAccessorPropDecl_ = pd;
+    const sema::PropertySymbol* savedAccessorPropSym = currentAccessorPropSym_;
+    currentAccessorPropSym_ = psKey;
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
@@ -6015,7 +6017,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     // INHERIT, whereas this channel must be live for the whole body emission
     // (the mint happens deep inside `lowerScopedBlock`) and restored exactly
     // like the accessor representation pair beside it.
-    currentAccessorPropDecl_ = savedAccessorPropDecl;
+    currentAccessorPropSym_ = savedAccessorPropSym;
     // smKind_/smStateStruct_ (#2170), currentReturnTypeNode_/
     // currentLambdaReturnSemaTy_ (#2694) and the #2703 accessor-representation
     // pair are restored by ~NestedBodyScope.
@@ -6532,7 +6534,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                                                    /*readExpr=*/nullptr);
                 if (pd && v && unwrappedBeforeBodyWrap6397 &&
                     v != unwrappedBeforeBodyWrap6397)
-                    propBlockGetterReturnKinds_[pd] |= kPropGetterBodyMint;
+                    propBlockGetterReturnKinds_[ps] |= kPropGetterBodyMint;
                 // #2491 (twin of #2434): the property getter body's return
                 // expression failed to lower — this site bypasses emitReturn
                 // (calls CreateRet directly), so the `v ? v : null` fallback
@@ -14118,7 +14120,8 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
         if (pd) {
             if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
-                currentFn = ensurePropertyBlockGetter(pd, acc);
+                currentFn = ensurePropertyBlockGetter(
+                    pd, acc, /*ps=*/nullptr, /*psKey=*/currentPropSym);
             } else if (const ast::Expr* ge = computedGetterOf(currentPropSym)) {
                 llvm::Type* propRetTy = pd->type ? lowerType(pd->type.get()) : elemTy;
                 if (!propRetTy) propRetTy = elemTy;

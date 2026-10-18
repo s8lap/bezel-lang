@@ -3333,7 +3333,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // function (ncPd is non-null — blockGetterOf returns
                         // null for an imported property with no PropertyDecl).
                         llvm::Function* ncGetterFn =
-                            ensurePropertyBlockGetter(ncPd, ncBlockAcc);
+                            ensurePropertyBlockGetter(
+                                ncPd, ncBlockAcc, /*ps=*/nullptr,
+                                /*psKey=*/ncPropSym);
                         ncRaw = builder_.CreateCall(
                             ncGetterFn->getFunctionType(), ncGetterFn, {obj});
                         emitPendingCheck();  // §31.1/§31.2: throw propagation
@@ -7093,7 +7095,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // of one generic declaration otherwise share a single cached getter
             // and the second reads the first one's answer. `ps2` is null for a
             // non-generic owner, where the empty key is already correct.
-            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc, ps2);
+            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc, ps2, ps2);
             if (substInstalled) {
                 genericSubst_ = std::move(savedSubst);
                 genericSubstSemaTy_ = std::move(savedSema);
@@ -7722,7 +7724,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // worse user-visible outcome than a wrong value, and the same
             // omission is one field-layout drift away from a silent miscompile
             // whenever the two return types happen to agree.
-            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps);
+            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps, ps);
             llvm::Value* res =
                 builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
             // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
@@ -8215,7 +8217,8 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
                     auto* ipd = dynamic_cast<const ast::PropertyDecl*>(impl->decl);
                     if (ipd) {
                         llvm::Function* getterFn =
-                            ensurePropertyBlockGetter(ipd, acc);
+                            ensurePropertyBlockGetter(
+                                ipd, acc, /*ps=*/nullptr, /*psKey=*/impl);
                         llvm::Value* res = builder_.CreateCall(
                             getterFn->getFunctionType(), getterFn, {obj});
                         emitPendingCheck();

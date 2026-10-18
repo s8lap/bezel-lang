@@ -8050,7 +8050,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             currentEnumMethod_ = savedEnumMethod;
             currentChoiceMethod_ = savedChoiceMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
-            if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps)) {
+            if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps, ps)) {
                 // fix #2501 (§9.2/§27.6, v0.236): ensurePropertyBlockGetter's
                 // generated function always takes `this` as a POINTER
                 // (`fnTy = (ptr) -> retTy`, its own `currentThis_ = &*fn->
