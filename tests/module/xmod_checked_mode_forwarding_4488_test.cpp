@@ -78,10 +78,49 @@
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/aot_support.hpp"  // runAotModules
 #include "support/driver_run_support.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
+
+// ── PORT NOTE (#6386, round 2) — ROWS 1-3 ONLY, AND ROW 4 IS DECLINED ─────────
+//
+// Rows 1-3 now call `test::runAotModules` with the same `CodegenOptions` the
+// hand-rolled `buildImportAndRun4488` passed, instead of two of its own
+// `compileObject` / `compileFileForTest` calls plus `std::system`. Each row
+// asserts `r.ran` FIRST and unconditionally, then the exit code; the retired
+// runner's four negative sentinels (-2 library, -3 importer, -4 run) collapse
+// into one fact that also says WHICH, on `r.diagnostics`. The helper and its
+// sentinel scheme are KEPT — row 4 still uses them.
+//
+// ⚠ ROW 4 IS DELIBERATELY NOT PORTED, AND IT CANNOT BE. Its entire subject is
+// the NON-forwarding of `sanitizeAddress` on the `-c` library path: it passes
+// `libOpts.sanitizeAddress = true` to `compileObject` and requires it to be
+// IGNORED, because an instrumented `-c` object has no ASan runtime behind it at
+// a plain link. `runAotModules` applies ONE `opts` to EVERY module — it passes
+// `opts.sanitizeAddress` through `runAotModulesImpl` into `forkedCompileModule`
+// for each dependency — so porting row 4 would make the very forwarding it
+// forbids, and the row would go green on the opposite behaviour. This is
+// decline-with-reasons, not an oversight: `buildImportAndRun4488` remains for
+// row 4 alone.
+//
+// ⚠ ROW 2 IS THE ONE PORTED PROGRAM IN THIS LANE THAT DECLARES A CONTRACT.
+// Every other ported program has no `ensures` / `invariant`, so `runAotModules`
+// (which does NOT set `checkedContracts`, unlike `runAotModulesChecked`) is
+// behaviour-identical to the old runner for them. `kCcLib4488` declares
+// `ensures (false)`, so the bit is load-bearing here. Row 2 therefore uses the
+// PLAIN `runAotModules` with `checkedContractsOpts()` passed EXPLICITLY, rather
+// than switching to `runAotModulesChecked` and having the option implied by the
+// oracle's name. Rows 1 and 3 use `checkedDisposalOpts()`, which
+// `runAotModules` threads through unchanged.
+//
+// Rows 1 and 3 also gain a new `ran` assertion each that the old runner had no
+// way to make — its -2/-3/-4 sentinels were compared against an expected
+// POSITIVE value, so a scaffold failure could not be told from a wrong answer.
+// Both remain PLAIN-oracle rows: no leak oracle is added.
+//
+// Spec: §28.2, §22.16, §2.5, §2.6, v0.306, v0.338.
 
 namespace bezel::module {
 namespace {
@@ -241,12 +280,15 @@ codegen::CodegenOptions checkedContractsOpts() {
 // ===========================================================================
 BEZEL_TEST(xmod_checked_mode_forwarding_4488,
            checked_disposal_crosses_import_boundary_spec_28_2) {
-    const int rc = buildImportAndRun4488(
-        kCdLib4488, kCdAppUseAfterDispose4488, checkedDisposalOpts(),
-        checkedDisposalOpts(), "wt-4488-cd");
+    auto r = test::runAotModules(
+        {{"CdLib4488", kCdLib4488},
+         {"CdApp4488", kCdAppUseAfterDispose4488}},
+        "CdApp4488", checkedDisposalOpts());
+
+    BEZEL_EXPECT_TRUE(r.ran);
     // 1 == the imported method's §28.2 entry guard fired and the arm caught
     // DisposedAccessException. 0 == the pre-#4488 unchecked library.
-    BEZEL_EXPECT_EQ(1, rc);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // ===========================================================================
@@ -259,13 +301,22 @@ BEZEL_TEST(xmod_checked_mode_forwarding_4488,
 // CodegenOptions across the same boundary, which is what makes "derive the
 // options" rather than "forward checkedDisposal" the tested behaviour.
 // Measured pre-fix: 1 (the clause was never evaluated). Post-fix: 99.
+//
+// ⚠ THIS IS THE ONE ROW IN THE AREA WHERE `runAotModulesChecked` WOULD HAVE
+// CHANGED THE OBSERVABLE. Unlike every other ported program, `kCcApp4488`'s
+// library DOES declare an `ensures (false)` clause, so the `checkedContracts`
+// bit is load-bearing here rather than inert. The port uses the PLAIN
+// `runAotModules` with `checkedContractsOpts()` passed explicitly instead, so
+// the option is stated by the row rather than implied by the oracle's name.
 // ===========================================================================
 BEZEL_TEST(xmod_checked_mode_forwarding_4488,
            checked_contracts_crosses_import_boundary_spec_22_16) {
-    const int rc = buildImportAndRun4488(
-        kCcLib4488, kCcApp4488, checkedContractsOpts(), checkedContractsOpts(),
-        "wt-4488-cc");
-    BEZEL_EXPECT_EQ(99, rc);
+    auto r = test::runAotModules(
+        {{"CcLib4488", kCcLib4488}, {"CcApp4488", kCcApp4488}},
+        "CcApp4488", checkedContractsOpts());
+
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 99);
 }
 
 // ===========================================================================
@@ -280,15 +331,18 @@ BEZEL_TEST(xmod_checked_mode_forwarding_4488,
 // ===========================================================================
 BEZEL_TEST(xmod_checked_mode_forwarding_4488,
            correct_program_identical_in_both_modes_spec_28_2) {
-    const int checked = buildImportAndRun4488(
-        kCdLib4488, kCdAppCorrect4488, checkedDisposalOpts(),
-        checkedDisposalOpts(), "wt-4488-ok");
-    BEZEL_EXPECT_EQ(42, checked);
+    auto checked = test::runAotModules(
+        {{"CdLib4488", kCdLib4488}, {"CdApp4488", kCdAppCorrect4488}},
+        "CdApp4488", checkedDisposalOpts());
+    BEZEL_EXPECT_TRUE(checked.ran);
+    BEZEL_EXPECT_EQ(checked.exitCode, 42);
 
     const codegen::CodegenOptions release;  // §28.2 unchecked (release) mode
-    const int unchecked = buildImportAndRun4488(
-        kCdLib4488, kCdAppCorrect4488, release, release, "wt-4488-ok");
-    BEZEL_EXPECT_EQ(42, unchecked);
+    auto unchecked = test::runAotModules(
+        {{"CdLib4488", kCdLib4488}, {"CdApp4488", kCdAppCorrect4488}},
+        "CdApp4488", release);
+    BEZEL_EXPECT_TRUE(unchecked.ran);
+    BEZEL_EXPECT_EQ(unchecked.exitCode, 42);
 }
 
 // ===========================================================================

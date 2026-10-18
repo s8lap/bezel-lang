@@ -66,6 +66,7 @@
 #include <cstddef>
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"        // runAot / runAotChecked
 #include "test_harness.hpp"
 
@@ -73,18 +74,6 @@ using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic —
-// guard so an environment gap does not masquerade as this fix's own
-// regression (mirrors #1934 / the #1833 / #2411 / #2429 tests'
-// identical guard).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Res — owned instance, destructor decrements a static counter we read
 // after disposal (sanity test: at scope end, Res.alive == 0 → exactly-
@@ -128,7 +117,7 @@ BEZEL_TEST(out_owned_var_ctor_2681,
         "    return v + Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: LSan flags the undischarged `x` as a Direct leak, so the
     // ASan-checked run itself fails (r.ran == false) even though the
     // ordinary (non-ASan) compile succeeded with no diagnostic at all.

@@ -3333,7 +3333,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // function (ncPd is non-null — blockGetterOf returns
                         // null for an imported property with no PropertyDecl).
                         llvm::Function* ncGetterFn =
-                            ensurePropertyBlockGetter(ncPd, ncBlockAcc);
+                            ensurePropertyBlockGetter(
+                                ncPd, ncBlockAcc, /*ps=*/nullptr,
+                                /*psKey=*/ncPropSym);
                         ncRaw = builder_.CreateCall(
                             ncGetterFn->getFunctionType(), ncGetterFn, {obj});
                         emitPendingCheck();  // §31.1/§31.2: throw propagation
@@ -5384,7 +5386,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (obj) {
                     auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
                     llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
-                    return builder_.CreateTrunc(cnt64, i32(), "ll.cnt");
+                    llvm::Value* cnt = builder_.CreateTrunc(cnt64, i32(), "ll.cnt");
+                    // fix #6341 (§28.3, §28.9, stdlib §4.6/§4.7, v0.338): this
+                    // arm returned straight from `bz_llist_count`, UPSTREAM of the
+                    // `freeUnboundOwnedBorrowingArrayTemp` call the array-backed
+                    // `.Length`/`.Count` arm below makes — so #6352's `freeIsLlist`
+                    // arm, added to that helper precisely for this collection, was
+                    // LIVE but never reached from this face.
+                    // `LinkedList<T>` is in `isPlainBuiltinCollectionHead`, so the
+                    // helper already dispatches it to `bz_llist_free`; this face
+                    // simply never called it. The count is fully read into `cnt`
+                    // above FIRST, so the backing is dead from here on.
+                    // MEASURED on this fix's parent: a 100-iteration
+                    // `MakeLlist().Count` loop leaked 5,600 B in 100 allocations
+                    // (`bz_llist_alloc`, bezel_runtime_collections.cpp:1897),
+                    // against a clean `Array<T>` twin and a clean `Dictionary<K,V>`
+                    // twin of the identical loop.
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), obj, tt);
+                    return cnt;
                 }
             }
             // issue #545: Buffer<T>.Length → i64 header field load.
@@ -7076,7 +7095,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // of one generic declaration otherwise share a single cached getter
             // and the second reads the first one's answer. `ps2` is null for a
             // non-generic owner, where the empty key is already correct.
-            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc, ps2);
+            llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc, ps2, ps2);
             if (substInstalled) {
                 genericSubst_ = std::move(savedSubst);
                 genericSubstSemaTy_ = std::move(savedSema);
@@ -7705,7 +7724,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // worse user-visible outcome than a wrong value, and the same
             // omission is one field-layout drift away from a silent miscompile
             // whenever the two return types happen to agree.
-            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps);
+            llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps, ps);
             llvm::Value* res =
                 builder_.CreateCall(fn->getFunctionType(), fn, {currentThis_});
             // §31.1/§31.2 (FINDING [4]): see the qualified block-getter read
@@ -8198,7 +8217,8 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
                     auto* ipd = dynamic_cast<const ast::PropertyDecl*>(impl->decl);
                     if (ipd) {
                         llvm::Function* getterFn =
-                            ensurePropertyBlockGetter(ipd, acc);
+                            ensurePropertyBlockGetter(
+                                ipd, acc, /*ps=*/nullptr, /*psKey=*/impl);
                         llvm::Value* res = builder_.CreateCall(
                             getterFn->getFunctionType(), getterFn, {obj});
                         emitPendingCheck();

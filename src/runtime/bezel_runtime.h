@@ -1211,6 +1211,12 @@ void* bz_lazy_selectmany(void* up, int64_t out_elem_size,
 void* bz_lazy_zip(void* up, void* down, int64_t out_elem_size,
                   void* closure, void* comb);                        // comb: void(closure, a, b, out)
 void* bz_lazy_to_array(void* lazy, int64_t elem_size);
+// #6380 (§28.3 K8 / §28.9, v0.338): mark the SOURCE this lazy enumerator wraps
+// as owned, so bz_lazy_dispose frees it. `kind` names the source's backing —
+// 1 bz_array_t*, 2 bz_llist_t*, 3 bz_dict_t*. Codegen calls this only for a
+// source no name owns (an `owned` producer / fresh materializer used directly
+// as a LINQ receiver), so nothing else holds the value.
+void* bz_lazy_own_source(void* lazy, void* src, int32_t kind);
 
 // issue #389 / stdlib §4.10: drain a lazy enumerator (a non-Set IEnumerable<T>
 // `other` of a set-algebra call) into the key-snapshot shape bz_dict_keys_gen

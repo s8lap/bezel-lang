@@ -288,3 +288,334 @@ BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
         BEZEL_EXPECT_EQ(rc.exitCode, 42);
     }
 }
+
+// ===========================================================================
+// fix-forward #6405 — the `=> E` arrow-body carve-out must be as NARROW as
+// the rule it defers to, and the rule is Pattern A ONLY.
+//
+// 2425187c43 ("fix #6405: let §30.5 own the async producer arrow body it is
+// written for") suppressed §5.1 in the EXPRESSION-BODY arm of
+// `runMethodBody` so that §30.5's Pattern A producer-side check would lead
+// instead. It gated the carve-out on four conjuncts, the fourth being
+// `isTaskShapedRef(ctx_.exprType(*exprBody))` — a predicate that admits the
+// WHOLE task family, `OwningTask<T>` included. The rule it defers to is
+// scoped in the spec's own words to Pattern A:
+//
+//   §30.5 "Result lifetime and task disposal", *Producer-side return-type
+//   rules*, the bolded clause:
+//     "**No fourth kind: a non-`await` borrow return is rejected.** A
+//      `return` in an `async` body — an `async` method's or an `async`
+//      lambda's — whose return type is `Task<T>` for class or interface T,
+//      whose operand is a **borrow** and not a `return await` ... is a
+//      **compile error at the return site**".
+//
+//   The `OwningTask<T>` row is a SIBLING of that row and carries no such
+//   clause: "`OwningTask<T>` for **class or interface** T: the task produces
+//   a single owned result. Awaiting transfers ownership to the awaiter ...
+//   This is **Pattern B**." There is no "fourth kind" prohibition at a
+//   Pattern B producer, so there is nothing for §30.5 to own there — and,
+//   worse, nothing behind the suppression to reject the program either:
+//   `detectAsyncPatternAKind` (LlvmBackend_Async.cpp) reports §30.5 kind 1
+//   only under a non-null `asyncPatternAResultDisposer_`, which is attached
+//   for Pattern A only. A Pattern B producer therefore reaches codegen AND
+//   RUNS.
+//
+// MEASURED, both legs, my own numbers (not quoted from the review):
+//
+//   `async method Make(): OwningTask<Widget> => Task.FromOwnedResult(new
+//    Widget());`  — a 200-iteration program awaiting it in a loop.
+//
+//     2425187c43 (picked)  bezelc rc=0 (ACCEPTED)
+//                          run x3 -> exit 139 x3  (SIGSEGV, all three)
+//                          under --sanitize=address:
+//                            "ERROR: AddressSanitizer: SEGV on unknown
+//                             address 0x000000000010 ... The signal is
+//                             caused by a READ memory access.
+//                               #0 ... in bz$async$M.C$Main$Resume"
+//     2425187c43^ (base)  bezelc rc=1, §5.1
+//     this branch         bezelc rc=1, §5.1
+//
+//   The same spelling with `await` — the remedy the compiler's own §5.1
+//   message names — exits 42 cleanly on all three legs, plain and ASan.
+//
+//   The STATEMENT arm of the identical method already rejected this shape
+//   with §30.6 on all three legs, naming `OwningTask<T>` in its own text
+//   ("an `async` method's `return` must produce the element type of its
+//   `Task<T>`/`OwningTask<T>` return, not a `Task` value; add `await`").
+//   An arrow arm that ACCEPTS what the statement arm REJECTS on the same
+//   method is the signature of a hole, not of a hand-off.
+//
+// ORACLE. `reject_owningtask_exprbody_task_fromownedresult_30_5` below is
+// the pin that matters more than the code change: on 2425187c43 the program
+// COMPILES, so `failedAtCompileTimeWithRealLocation` is false and the row is
+// RED; with the fix it rejects with a real source location and the §5.1
+// needle, and it is GREEN. It is not vacuous — `runAot` fills
+// `JitResult::diagnostics` only on a reject, so an accepting program leaves
+// the assertion genuinely false rather than silently skipped.
+//
+// THE MATRIX. The predecessor's probe matrix enumerated
+// element-type x arm but never crossed the DECLARED WRAPPER, which is why
+// this landed: `Task<T>` and `OwningTask<T>` were not distinguished anywhere.
+// The rows below are the full 2 x 4 x 2 grid as individual named tests, so
+// no future cell can be missing the way this one was. Grid:
+//   wrapper in {Task, OwningTask} x element in {class, interface, Object,
+//   string} x arm in {arrow, statement-block}, plus a non-factory task call
+//   and a `FromException` control.
+//
+// Two cells of that grid — `OwningTask<interface>` arrow and
+// `OwningTask<Object>` arrow — are ACCEPTED, but they were accepted on
+// 2425187c^ too (MEASURED: leg B rc=0) and are STILL accepted with this
+// fix: a different mechanism, not the carve-out. §5.1's built-in-class
+// convertibility path does not fire for an interface/`Object` target at
+// all, so no suppression is involved and none is removed. The same program
+// segfaults 3/3 the same way. No row below asserts either verdict for those
+// two cells: pinning the acceptance would bank a known defect as correct,
+// and pinning a rejection would be red on this branch. Both are reported
+// and filed instead.
+
+namespace fixforward6405 {
+
+constexpr const char* kPrelude =
+    "module M; "
+    "public interface IShape method Area(): int; end IShape; "
+    "public class Sq: IShape public method Area(): int => 4; end Sq; "
+    "public class Widget public method Area(): int => 7; end Widget; "
+    "public class MyEx: Exception end MyEx; ";
+
+// §5.1's own convertibility sentence — the diagnostic a Pattern B arrow
+// body is restored to, and the one 2425187c^ produced for this shape.
+constexpr const char* kNotConvertible51 =
+    "not implicitly convertible to the target type";
+
+// §30.6's forgotten-`await` message — the STATEMENT arm's verdict on the
+// identical method. Distinct from `kNotConvertible51` (a different check, in
+// a different arm) and from `kFixDiagFragment` (Pattern A, codegen).
+constexpr const char* kAddAwait306 =
+    "must produce the element type of its `Task<T>`/`OwningTask<T>` return";
+
+// The stdlib-boundary rejection on `OwningTask<string>` (§30.5's
+// `OwningTask<T>` rows admit class or interface T only).
+constexpr const char* kOwningTaskNeedsClass =
+    "`OwningTask` requires a class or interface element type";
+
+// (wrapper, element) -> the factory expression producing that element.
+// `FromOwnedResult` is the reachable class-T factory (stdlib §6.7:
+// `Task.FromResult<T>` rejects class T, `Task.FromException<T>` takes an
+// `Exception`, so only `FromOwnedResult` forms the class-T wrong-slot
+// shape); `string` cannot be `owned`, so it uses `FromResult`.
+struct Cell {
+    const char* ret;    // the DECLARED async return type
+    const char* expr;   // the arrow/statement body operand
+};
+
+constexpr Cell kCells[] = {
+    {"Task<Widget>",      "Task.FromOwnedResult(new Widget())"},
+    {"Task<IShape>",      "Task.FromOwnedResult(new Sq())"},
+    {"Task<Object>",      "Task.FromOwnedResult(new Widget())"},
+    {"Task<string>",      "Task.FromResult(\"hi\")"},
+    {"OwningTask<Widget>", "Task.FromOwnedResult(new Widget())"},
+    {"OwningTask<IShape>", "Task.FromOwnedResult(new Sq())"},
+    {"OwningTask<Object>", "Task.FromOwnedResult(new Widget())"},
+    {"OwningTask<string>", "Task.FromResult(\"hi\")"},
+};
+
+// Both arms of one grid cell.
+inline std::string buildMethod(const Cell& c, bool arrow) {
+    return arrow ? std::string("  public static async method Make(): ") +
+                       c.ret + " => " + c.expr + "; "
+                 : std::string("  public static async method Make(): ") +
+                       c.ret + " return " + c.expr + "; end Make; ";
+}
+
+inline std::string buildProgram(const Cell& c, bool arrow) {
+    return std::string(kPrelude) + "public class C " + buildMethod(c, arrow) +
+           "  public static method Main(): int => 0; "
+           "end C;";
+}
+
+inline const Cell& cell(size_t i) { return kCells[i]; }
+
+}  // namespace fixforward6405
+
+// ---------------------------------------------------------------------------
+// THE PIN. `OwningTask<Widget>` element + `Task.FromOwnedResult` factory call
+// + `=>` arrow body => a REJECTION. This is the shape the predecessor's
+// matrix never enumerated.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          reject_owningtask_exprbody_task_fromownedresult_30_5) {
+    const auto& c = fixforward6405::cell(4);  // OwningTask<Widget>
+    auto r = runAot(fixforward6405::buildProgram(c, /*arrow=*/true));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kNotConvertible51));
+}
+
+// The STATEMENT arm of the same method, unchanged on every leg. It is the
+// evidence that the two arms must agree on the verdict, and §30.6's own text
+// names `OwningTask<T>` — the section that says a Pattern B producer must
+// still produce the ELEMENT type.
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          reject_owningtask_blockbody_task_fromownedresult_30_6) {
+    const auto& c = fixforward6405::cell(4);  // OwningTask<Widget>
+    auto r = runAot(fixforward6405::buildProgram(c, /*arrow=*/false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+// ---------------------------------------------------------------------------
+// THE MATRIX, row by row. Every cell that REJECTS, pinned by section.
+// ---------------------------------------------------------------------------
+
+// --- Pattern A (`Task<T>`), ARROW arm: §30.5 must still LEAD (the
+// predecessor's fix-forward, preserved unchanged by this commit). ---
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_class_exprbody_30_5) {
+    const auto& c = fixforward6405::cell(0);
+    auto r = runAot(fixforward6405::buildProgram(c, true));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFixDiagFragment));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_iface_exprbody_30_5) {
+    const auto& c = fixforward6405::cell(1);
+    auto r = runAot(fixforward6405::buildProgram(c, true));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFixDiagFragment));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_object_exprbody_30_5) {
+    const auto& c = fixforward6405::cell(2);
+    auto r = runAot(fixforward6405::buildProgram(c, true));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kFixDiagFragment));
+}
+
+// `Task<string>` has NO per-result disposer, so `asyncPatternAResultDisposer_`
+// is null and Pattern A's producer-side rejection does not fire for it either.
+// §5.1 must keep the position — the predecessor measured this and excluded
+// `string`; this row pins the exclusion so it cannot silently widen.
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_string_exprbody_5_1) {
+    const auto& c = fixforward6405::cell(3);
+    auto r = runAot(fixforward6405::buildProgram(c, true));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kNotConvertible51));
+}
+
+// --- Pattern A (`Task<T>`), STATEMENT arm: §30.6 on all four elements. ---
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_class_blockbody_30_6) {
+    const auto& c = fixforward6405::cell(0);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_iface_blockbody_30_6) {
+    const auto& c = fixforward6405::cell(1);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_object_blockbody_30_6) {
+    const auto& c = fixforward6405::cell(2);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_task_string_blockbody_30_6) {
+    const auto& c = fixforward6405::cell(3);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+// --- Pattern B (`OwningTask<T>`), ARROW arm. `class` is the pin above;
+// `string` never reaches this call site (§30.5's `OwningTask<T>` rows admit
+// class or interface T only, so the stdlib boundary rejects the declaration).
+// `interface` and `Object` are the two ACCEPTED, PRE-EXISTING cells: accepted
+// on 2425187c^, accepted still, segfaulting 3/3. Deliberately NOT pinned
+// here in either direction — see the header note. ---
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_owningtask_string_exprbody_5_1) {
+    const auto& c = fixforward6405::cell(7);
+    auto r = runAot(fixforward6405::buildProgram(c, true));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r,
+                                               fixforward6405::kOwningTaskNeedsClass));
+}
+
+// --- Pattern B (`OwningTask<T>`), STATEMENT arm: §30.6 on all four. ---
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_owningtask_class_blockbody_30_6) {
+    const auto& c = fixforward6405::cell(4);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_owningtask_iface_blockbody_30_6) {
+    const auto& c = fixforward6405::cell(5);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_owningtask_object_blockbody_30_6) {
+    const auto& c = fixforward6405::cell(6);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kAddAwait306));
+}
+
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_owningtask_string_blockbody_5_1) {
+    const auto& c = fixforward6405::cell(7);
+    auto r = runAot(fixforward6405::buildProgram(c, false));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r,
+                                               fixforward6405::kOwningTaskNeedsClass));
+}
+
+// ---------------------------------------------------------------------------
+// CONTROLS — the carve-out is not a blanket arrow-body exemption.
+// ---------------------------------------------------------------------------
+
+// A Task-returning call that is NOT a `Task` static-factory member is not in
+// codegen's `isTaskFactoryCallExpr` set, so codegen does not reject it and
+// §5.1 must keep the position.
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_control_nonfactory_task_call_5_1) {
+    auto r = runAot(std::string(fixforward6405::kPrelude) +
+        "public class C "
+        "  public static method Mk(): OwningTask<Widget> "
+        "    => Task.FromOwnedResult(new Widget()); "
+        "  public static async method Make(): Task<Widget> => Mk(); "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kNotConvertible51));
+}
+
+// `Task.FromException` is in the factory set but takes no result value, so
+// over a value-typed `Task<int>` return the element check keeps §5.1.
+BEZEL_TEST(async_pattern_a_task_factory_call_reject_4461,
+          matrix_control_fromexception_value_task_5_1) {
+    auto r = runAot(std::string(fixforward6405::kPrelude) +
+        "public class C "
+        "  public static async method Make(): Task<int> "
+        "    => Task.FromException(new MyEx()); "
+        "  public static method Main(): int => 0; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, fixforward6405::kNotConvertible51));
+}

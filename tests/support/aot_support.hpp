@@ -3201,6 +3201,181 @@ inline JitResult& markTimeout(JitResult& r, const char* where,
     return r;
 }
 
+// The dependency-producing compile step (`Driver::compileObject` — the ONLY
+// shape that embeds a module's §2.4 public-interface metadata) and the
+// importer's compile+link step, both isolated exactly as forkedCompile above.
+// `runAotModules` (#6379) needs both; they live here so the crash/hang
+// isolation, the token accounting, the deadline and the fork-failure policy
+// have ONE implementation rather than a second copy in a test file.
+inline CompileStatus forkedCompileModule(const std::string& srcPath,
+                                         const std::string& objectPath,
+                                         const std::vector<Dependency>& deps,
+                                         const codegen::CodegenOptions& opts,
+                                         const std::string& ccErrPath) {
+    return forkedDriverStep(
+        [&] {
+            Driver driver;
+            return driver.compileObject(srcPath, objectPath, deps, opts).success;
+        },
+        objectPath, "object", ccErrPath);
+}
+
+inline CompileStatus forkedCompileWithDeps(const std::string& srcPath,
+                                           const std::string& exePath,
+                                           const std::vector<Dependency>& deps,
+                                           const codegen::CodegenOptions& opts,
+                                           const std::string& ccErrPath) {
+    return forkedDriverStep(
+        [&] {
+            Driver driver;
+            return driver.compileFile(srcPath, exePath, deps, opts).success;
+        },
+        exePath, "executable", ccErrPath);
+}
+
+// ── THE RUN HALF, ONCE (#6379) ─────────────────────────────────────────────
+//
+// This body was `runAot`'s, verbatim, until a multi-module program needed the
+// same oracle (see `runAotModules` below). It was moved here rather than copied
+// so that a two-module program is judged by exactly the rule a one-module one
+// is: same forced-sanitize handling, same `detect_leaks=0` under the #1822
+// sweep, same `exitcode=0` pinning under the #4638 leak oracle, same
+// `markInfra`/`markTimeout` routing, same `ran`/`exitCode`/`stdoutText`
+// contract. Two copies of this would be a drift channel with no compiler check
+// on it — the class of defect `check_toolchain_skip_surface` and the
+// `driver_run_support.hpp` header both exist to close.
+inline JitResult runProgramFill(JitResult& r, const std::string& exePath,
+                                const std::string& outPath,
+                                const std::string& errPath,
+                                const codegen::CodegenOptions& opts,
+                                LeakDetectMode leakMode, const char* who,
+                                const std::string& asanOptionsOverride = {}) {
+    bool timedOut = false;
+    std::vector<std::pair<std::string, std::string>> runEnv;
+    if (opts.sanitizeAddress && !asanOptionsOverride.empty()) {
+        runEnv.push_back({"ASAN_OPTIONS", asanOptionsOverride});
+    } else if (opts.sanitizeAddress) {
+        // issue #4638: with the opt-in leak oracle on, enable LSan AND pin
+        // `exitcode=0`. The second half is not cosmetic — it is what makes
+        // Report mode verdict-preserving: LeakSanitizer otherwise REPLACES the
+        // program's exit status with its own (#4532's measured defect, where 7
+        // rows asserting a value saw 1 and one row asserting 1 passed
+        // vacuously). VERIFIED 2026-09-23 on the #4619 leak500 program:
+        // `detect_leaks=1:abort_on_error=0` exited 1 where the program returns
+        // 2; adding `exitcode=0` exited 2 with the report still printed. The
+        // report TEXT stays the oracle either way (the qr1 M3 rule the
+        // runAotChecked sibling follows), so nothing keys on the exit status.
+        runEnv.push_back(
+            {"ASAN_OPTIONS",
+             leakMode == LeakDetectMode::Off
+                 ? std::string("detect_leaks=0:abort_on_error=0")
+                 : std::string("detect_leaks=1:exitcode=0:abort_on_error=0")});
+    }
+    int execErrno = 0;
+    int status = aot_detail::spawnCaptured({exePath}, outPath, errPath,
+                                           aot_detail::aotTimeoutSec(), timedOut,
+                                           runEnv, &execErrno);
+    const int spawnErrno = errno;   // only meaningful when status < 0
+    // fix #3007: fork() for the program run failed. spawnCaptured's -1 is not a
+    // wait status; read as one it makes WIFSIGNALED true and reported "program
+    // terminated by signal 127" — a fabricated crash of a program that never
+    // started.
+    if (status < 0)
+        return aot_detail::markInfra(
+            r, who,
+            "fork() failed launching the compiled program (errno=" +
+                std::to_string(spawnErrno) + ": " +
+                std::strerror(spawnErrno) + ")");
+    // fix #3007: execv() failed — the executable the link produced could not be
+    // started (ENOEXEC / ENOMEM / EACCES / it vanished). The child exits 127,
+    // which is a value a Bezel Main may legitimately return, so the CLOEXEC
+    // errno pipe, not the exit code, is what makes this distinguishable.
+    if (execErrno != 0)
+        return aot_detail::markInfra(
+            r, who,
+            "could not exec the linked program " + exePath + " (errno=" +
+                std::to_string(execErrno) + ": " + std::strerror(execErrno) +
+                ")");
+    r.stdoutText = aot_detail::slurp(outPath);
+
+    if (timedOut) {
+        // fix #3732: route through markTimeout — the harness's PROGRAM run
+        // deadline (aotTimeoutSec, 30s default) fired. Marking Severity::Error
+        // here made every `BEZEL_EXPECT_TRUE(hasErrors())` and
+        // `BEZEL_EXPECT_FALSE(<var>.ran)` row read a hang as a rejection
+        // (#3007's measurement: 272 + 205 sites). The message keeps the
+        // verbatim "did not terminate within" so a row that already excludes
+        // that literal stays sound (the v182 absence test at
+        // tests/sema/catch_multitype_no_common_base_v182_test.cpp:360-366
+        // searches for "did not finish within" + the sibling run-side literal
+        // is matched by the source ratchet's exempt clause).
+        std::string runErr = aot_detail::slurp(errPath);
+        return aot_detail::markTimeout(
+            r, who,
+            std::string(who) + ": program did not terminate within " +
+                std::to_string(aot_detail::aotTimeoutSec()) +
+                "s; killed (runaway / deadlock)" +
+                (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
+    }
+    // #1822: surface any ASan report the program printed to its stderr so the
+    // whole-suite sweep detects a memory error in ANY program. A clean program
+    // prints nothing here → normal forced-ASan runs are unaffected. Only active
+    // under sanitizeAddress (the forced sweep, or an explicit caller).
+    if (opts.sanitizeAddress) {
+        std::string errText = aot_detail::slurp(errPath);
+        // issue #4638: a LEAK-ONLY report is handled here, BEFORE the #1822
+        // check below, and consumed. Order matters twice over: (1) the #1822
+        // predicate `hasSanitizerReport` already matches "detected memory
+        // leaks", so without this arm Report mode would fail the very rows it
+        // exists to merely count; (2) a run that printed an AddressSanitizer
+        // memory-error headline as well is NOT leak-only, falls through, and
+        // keeps the #1822 verdict — turning the census on must never soften a
+        // use-after-free into a note.
+        if (leakMode != LeakDetectMode::Off &&
+            aot_detail::hasLeakOnlyReport(errText)) {
+            const bool failing = (leakMode == LeakDetectMode::Strict);
+            aot_detail::noteLeakDetection(who, errText, failing);
+            if (failing) {
+                aot_detail::emitSanitizerReportToStderr(errText);
+                r.exitCode = -1;
+                r.diagnostics.report(
+                    Severity::Error, SourceLocation{},
+                    std::string(who) +
+                        ": LeakSanitizer fired in the test program "
+                        "(BEZEL_AOT_DETECT_LEAKS=strict, #4638)\n" + errText);
+                return r;
+            }
+            // Report mode: counted, printed, and DELIBERATELY not a verdict.
+            // Fall through to the normal exit-status path with `errText`
+            // consumed, so `ran` and `exitCode` are byte-for-byte what the same
+            // program yields with the knob unset.
+            errText.clear();
+        }
+        if (aot_detail::hasSanitizerReport(errText)) {
+            aot_detail::emitSanitizerReportToStderr(errText);
+            r.exitCode = -1;
+            r.diagnostics.report(
+                Severity::Error, SourceLocation{},
+                std::string(who) +
+                    ": AddressSanitizer fired in the test program\n" + errText);
+            return r;
+        }
+    }
+    if (WIFSIGNALED(status)) {
+        r.exitCode = -1;  // mirror runJit's failWith
+        std::string runErr = aot_detail::slurp(errPath);
+        r.diagnostics.report(
+            Severity::Error, SourceLocation{},
+            std::string(who ? who : "runAot") + ": program terminated by signal " +
+                std::to_string(WTERMSIG(status)) +
+                (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
+        return r;
+    }
+    r.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    r.ran = WIFEXITED(status);
+    return r;
+}
+
 }  // namespace aot_detail
 
 // ---------------------------------------------------------------------------
@@ -3284,134 +3459,12 @@ inline JitResult runAot(std::string_view source,
         return r;  // ran stays false — AOT is the stricter oracle (see header)
     }
 
-    // --- Run the executable, capturing stdout (stderr -> separate file). ------
-    // #1822: under forced ASan (the sweep) run with LSan OFF (detect_leaks=0) and
-    // report-not-abort (abort_on_error=0). LSan is deliberately off suite-wide —
-    // whole-suite leak detection is too noisy: negative tests that exit via an
-    // uncaught exception legitimately leave heap live at exit. LSan coverage
-    // stays on the curated runAotChecked call-sites (leak-clean by construction).
-    // abort_on_error=0 makes ASan PRINT the report and exit rather than SIGABRT,
-    // so the report text is captured intact.
-    bool timedOut = false;
-    std::vector<std::pair<std::string, std::string>> runEnv;
-    if (opts.sanitizeAddress) {
-        // issue #4638: with the opt-in leak oracle on, enable LSan AND pin
-        // `exitcode=0`. The second half is not cosmetic — it is what makes
-        // Report mode verdict-preserving: LeakSanitizer otherwise REPLACES the
-        // program's exit status with its own (#4532's measured defect, where 7
-        // rows asserting a value saw 1 and one row asserting 1 passed
-        // vacuously). VERIFIED 2026-09-23 on the #4619 leak500 program:
-        // `detect_leaks=1:abort_on_error=0` exited 1 where the program returns
-        // 2; adding `exitcode=0` exited 2 with the report still printed. The
-        // report TEXT stays the oracle either way (the qr1 M3 rule the
-        // runAotChecked sibling follows), so nothing keys on the exit status.
-        runEnv.push_back(
-            {"ASAN_OPTIONS",
-             leakMode == LeakDetectMode::Off
-                 ? std::string("detect_leaks=0:abort_on_error=0")
-                 : std::string("detect_leaks=1:exitcode=0:abort_on_error=0")});
-    }
-    int execErrno = 0;
-    int status = aot_detail::spawnCaptured({exePath}, outPath, errPath,
-                                           aot_detail::aotTimeoutSec(), timedOut,
-                                           runEnv, &execErrno);
-    const int spawnErrno = errno;   // only meaningful when status < 0
-    // fix #3007: fork() for the program run failed. spawnCaptured's -1 is not a
-    // wait status; read as one it makes WIFSIGNALED true and reported "program
-    // terminated by signal 127" — a fabricated crash of a program that never
-    // started.
-    if (status < 0)
-        return aot_detail::markInfra(
-            r, "runAot",
-            "fork() failed launching the compiled program (errno=" +
-                std::to_string(spawnErrno) + ": " +
-                std::strerror(spawnErrno) + ")");
-    // fix #3007: execv() failed — the executable the link produced could not be
-    // started (ENOEXEC / ENOMEM / EACCES / it vanished). The child exits 127,
-    // which is a value a Bezel Main may legitimately return, so the CLOEXEC
-    // errno pipe, not the exit code, is what makes this distinguishable.
-    if (execErrno != 0)
-        return aot_detail::markInfra(
-            r, "runAot",
-            "could not exec the linked program " + exePath + " (errno=" +
-                std::to_string(execErrno) + ": " + std::strerror(execErrno) +
-                ")");
-    r.stdoutText = aot_detail::slurp(outPath);
-
-    if (timedOut) {
-        // fix #3732: route through markTimeout — the harness's PROGRAM run
-        // deadline (aotTimeoutSec, 30s default) fired. Marking Severity::Error
-        // here made every `BEZEL_EXPECT_TRUE(hasErrors())` and
-        // `BEZEL_EXPECT_FALSE(<var>.ran)` row read a hang as a rejection
-        // (#3007's measurement: 272 + 205 sites). The message keeps the
-        // verbatim "did not terminate within" so a row that already excludes
-        // that literal stays sound (the v182 absence test at
-        // tests/sema/catch_multitype_no_common_base_v182_test.cpp:360-366
-        // searches for "did not finish within" + the sibling run-side literal
-        // is matched by the source ratchet's exempt clause).
-        std::string runErr = aot_detail::slurp(errPath);
-        return aot_detail::markTimeout(
-            r, "runAot",
-            "runAot: program did not terminate within " +
-                std::to_string(aot_detail::aotTimeoutSec()) +
-                "s; killed (runaway / deadlock)" +
-                (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
-    }
-    // #1822: surface any ASan report the program printed to its stderr so the
-    // whole-suite sweep detects a memory error in ANY program. A clean program
-    // prints nothing here → normal forced-ASan runs are unaffected. Only active
-    // under sanitizeAddress (the forced sweep, or an explicit caller).
-    if (opts.sanitizeAddress) {
-        std::string errText = aot_detail::slurp(errPath);
-        // issue #4638: a LEAK-ONLY report is handled here, BEFORE the #1822
-        // check below, and consumed. Order matters twice over: (1) the #1822
-        // predicate `hasSanitizerReport` already matches "detected memory
-        // leaks", so without this arm Report mode would fail the very rows it
-        // exists to merely count; (2) a run that printed an AddressSanitizer
-        // memory-error headline as well is NOT leak-only, falls through, and
-        // keeps the #1822 verdict — turning the census on must never soften a
-        // use-after-free into a note.
-        if (leakMode != LeakDetectMode::Off &&
-            aot_detail::hasLeakOnlyReport(errText)) {
-            const bool failing = (leakMode == LeakDetectMode::Strict);
-            aot_detail::noteLeakDetection("runAot", errText, failing);
-            if (failing) {
-                aot_detail::emitSanitizerReportToStderr(errText);
-                r.exitCode = -1;
-                r.diagnostics.report(
-                    Severity::Error, SourceLocation{},
-                    "runAot: LeakSanitizer fired in the test program "
-                    "(BEZEL_AOT_DETECT_LEAKS=strict, #4638)\n" + errText);
-                return r;
-            }
-            // Report mode: counted, printed, and DELIBERATELY not a verdict.
-            // Fall through to the normal exit-status path with `errText`
-            // consumed, so `ran` and `exitCode` are byte-for-byte what the same
-            // program yields with the knob unset.
-            errText.clear();
-        }
-        if (aot_detail::hasSanitizerReport(errText)) {
-            aot_detail::emitSanitizerReportToStderr(errText);
-            r.exitCode = -1;
-            r.diagnostics.report(
-                Severity::Error, SourceLocation{},
-                "runAot: AddressSanitizer fired in the test program\n" + errText);
-            return r;
-        }
-    }
-    if (WIFSIGNALED(status)) {
-        r.exitCode = -1;  // mirror runJit's failWith
-        std::string runErr = aot_detail::slurp(errPath);
-        r.diagnostics.report(
-            Severity::Error, SourceLocation{},
-            "runAot: program terminated by signal " +
-                std::to_string(WTERMSIG(status)) +
-                (runErr.empty() ? "" : "\n--- program stderr ---\n" + runErr));
-        return r;
-    }
-    r.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    r.ran = WIFEXITED(status);
-    return r;
+    // The run half lives in aot_detail::runProgramFill (#6379) so that a
+    // MULTI-MODULE program is judged by exactly the same oracle as this
+    // one — see the comment on that function for why it was moved rather
+    // than copied.
+    return aot_detail::runProgramFill(r, exePath, outPath, errPath, opts,
+                                      leakMode, "runAot");
 }
 
 // Convenience: default (release) codegen options — full parity with runJit.
@@ -3771,5 +3824,379 @@ inline JitResult runAotChecked(std::string_view source,
 inline JitResult runAotCheckedLenient(std::string_view source) {
     return runAotCheckedImpl(source, "runAotCheckedLenient", /*detectLeaks=*/false);
 }
+
+// ===========================================================================
+// runAotModules / runAotModulesChecked — the MULTI-MODULE oracles (#6379)
+// ===========================================================================
+//
+// ── THE HOLE THIS CLOSES ───────────────────────────────────────────────────
+//
+// `runAot` / `runAotChecked` compile ONE module: `cachedCompile` hands a single
+// source text to `Driver::compileFile` with `deps = {}`, so there was no way to
+// write a codegen row whose subject is a program with an `import` in it. A
+// multi-module program needs a dependency built with `Driver::compileObject`
+// (the only shape that embeds a §2.4 `.bezel.meta` public interface) passed to
+// the importer as a `Dependency`.
+//
+// The machinery was NOT absent — it was duplicated. `grep -rl compileObject
+// tests/` returns 376 files, of which the ones that build a real two-module
+// program each hand-roll the same four steps (write two sources, compileObject
+// the library, compileFile the app against a `Dependency`, run the exe), each
+// with its own result struct, its own exit-code decoding, its own LSan env
+// string and its own scratch naming — for example
+// tests/codegen/imported_generic_interface_string_property_4952_crossmod_test.cpp
+// (`CrossModuleAsanResult`) and the `runCrossModuleChecked` it says it mirrors
+// at tests/module/cross_module_import_test.cpp:577-629. Those copies are what
+// "no shared helper" means: there is no ONE answer to "how does an AOT test
+// run a two-module program", so no two rows answer it the same way.
+//
+// The consequence is not tidiness. #6375 (`fix #6375: select the wrapper's $ad
+// family by §29.2's slot-0 self-reference`) removed `vtableOf(enumTs)`'s
+// IMPORTED-skip, so it changes behaviour on exactly the two-module path — and
+// because no codegen row could express that path, its only evidence was a hand
+// run of `bezelc -c` + `--import`. Measured unaffected is not the same claim as
+// covered, and CI cannot tell the two apart.
+//
+// ── WHAT THIS IS NOT ───────────────────────────────────────────────────────
+//
+// It is NOT a replacement for `runAot`. Single-module rows keep using
+// `runAot`: they get the content-addressed link-cache (a whole gate compiles
+// each AOT program 2-3x under one compiler state, and the cache collapses
+// that to 1x), which this path does not have — a multi-module build is two
+// driver invocations over two different inputs, and inventing a composite cache
+// key for it is a separate piece of work with its own staleness surface. Rows
+// that do not need an `import` should not pay for one.
+//
+// The RUN half, though, is `aot_detail::runProgramFill` — the same function
+// `runAot` calls, moved out of it rather than copied — so a two-module program
+// is judged by exactly the rule a one-module program is: same forced-sanitize
+// handling, same `detect_leaks=0` under the #1822 sweep, same `exitcode=0`
+// pinning under the #4638 leak oracle, same `markInfra`/`markTimeout` routing,
+// same {ran, exitCode, stdoutText, diagnostics}. The COMPILE half is
+// `forkedDriverStep` too (`forkedCompileModule` / `forkedCompileWithDeps`), so
+// a two-module compile keeps the same crash isolation, the same link-token
+// accounting, the same deadline and the same fork-failure policy.
+//
+// ── THE DEPENDENCY ORDER ───────────────────────────────────────────────────
+//
+// Derived from each module's own `import` declarations rather than from the
+// order the caller happened to write them in, so a row reads as a set of
+// modules, not as a build script. The scan is LEXER-LITE, not a parse: it
+// skips line comments, block comments and string/char literals, then reads
+// `import <dotted.name>;` — the §2.2 declaration form, which cannot appear
+// inside a class or a method body. Skipping comments and literals is
+// load-bearing rather than cosmetic: the result is a SUPERSET of the
+// importer's real `Dependency` list, and an extra name makes the driver LOAD
+// that dependency's metadata whether or not the source imports it, so in
+// principle a program that should be rejected could compile. See
+// `importedModuleNames` for what is still not modelled and why that is
+// acceptable for hand-written test snippets. An import naming a module the
+// caller did NOT supply is left alone — it is the driver's business to resolve
+// or reject it, not the harness's to fabricate an artifact for. A genuine
+// cycle, or an entry name that was never supplied, is an INFRA failure (the
+// harness could not do its job), which fails the test loudly rather than being
+// read as a rejection.
+
+struct ModuleSource {
+    std::string name;      // the Bezel module name (§2.1); may be DOTTED
+    std::string source;    // its full compilation-unit text
+};
+
+namespace aot_detail {
+
+// A filename-safe artifact stem for a possibly-dotted module name. The
+// per-call index makes uniqueness structural rather than a property of the
+// name: `Com.Sub` and `Com_Sub` sanitize to the same string.
+inline std::string moduleStem(std::size_t index, const std::string& name) {
+    std::string s = "m" + std::to_string(index) + "_";
+    for (char c : name)
+        s.push_back((c == '.' || c == '_' ||
+                     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9'))
+                        ? c
+                        : '_');
+    return s;
+}
+
+// Every module name imported by `src`: each `import <dotted.name>;`. A word
+// that merely STARTS with "import" (`imported`, `important`) is skipped, and
+// so is one whose importee token is not a dotted identifier.
+inline std::vector<std::string> importedModuleNames(std::string_view src) {
+    auto isIdent = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_';
+    };
+    std::vector<std::string> out;
+    std::size_t i = 0;
+    // ⚠ THIS IS A LEXER-LITE SCAN, NOT A PARSE, and it is deliberately
+    // narrower than the first revision of this function — which read an
+    // `import` out of a `//` COMMENT and out of a STRING LITERAL, both
+    // MEASURED (review: `"import Lib1;"` inside a literal yielded `[Lib1]`).
+    // That matters because the result is a SUPERSET of the importer's real
+    // `Dependency` list: an extra name adds a dependency edge, and the driver
+    // then LOADS that dependency's metadata whether or not the source imports
+    // it. In principle a program that should be rejected could therefore
+    // compile. Skipping comments and literals removes the two spellings that
+    // were actually observed, and is the cheapest way to make the result agree
+    // with the source's real imports on every program anyone writes.
+    //
+    // WHAT IS STILL NOT GUARANTEED, stated rather than implied: this does not
+    // model nesting (a `/* */` inside a string, a `"` inside a comment). For
+    // a TEST harness whose inputs are hand-written Bezel snippets, that
+    // residual is not reachable; a caller feeding it arbitrary bytes should not
+    // expect a parse. The right long-term answer is a real lexer, not more
+    // ad-hoc skipping, and it is deliberately not built here.
+    while (i < src.size()) {
+        const char c = src[i];
+        // line comment — `//` to end of line
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            i += 2;
+            while (i < src.size() && src[i] != '\n') ++i;
+            continue;
+        }
+        // block comment — `/* … */`, unterminated to end of input
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            i = (i + 1 < src.size()) ? i + 2 : src.size();
+            continue;
+        }
+        // string / char literal — `\` escapes the next character. `$"…"`
+        // interpolation is still string CONTENT to this scanner, which is the
+        // conservative direction: an import inside an interpolation hole is not
+        // a top-level import declaration.
+        if (c == '"' || c == '\'') {
+            const char quote = c;
+            ++i;
+            while (i < src.size() && src[i] != quote) {
+                if (src[i] == '\\') ++i;
+                ++i;
+            }
+            if (i < src.size()) ++i;
+            continue;
+        }
+        if (src.compare(i, 6, "import") != 0 || (i > 0 && isIdent(src[i - 1]))) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i + 6;
+        if (j < src.size() && (isIdent(src[j]) || src[j] == '.')) { ++i; continue; }
+        while (j < src.size() && (src[j] == ' ' || src[j] == '\t' ||
+                                  src[j] == '\r' || src[j] == '\n')) ++j;
+        std::string name;
+        while (j < src.size() && (isIdent(src[j]) || src[j] == '.')) {
+            name.push_back(src[j]);
+            ++j;
+        }
+        if (!name.empty()) out.push_back(std::move(name));
+        i = j;
+    }
+    return out;
+}
+
+}  // namespace aot_detail
+
+// Shared implementation of the two multi-module oracles. `asanOptionsOverride`
+// is the runAotChecked family's `detect_leaks=<0|1>:exitcode=99:abort_on_error=0`;
+// empty selects runAot's own (#1822 / #4638) environment.
+inline JitResult runAotModulesImpl(const std::vector<ModuleSource>& modules,
+                                   std::string_view entry, const char* name,
+                                   codegen::CodegenOptions opts,
+                                   const std::string& asanOptionsOverride) {
+    JitResult r;
+    aot_detail::ensureInfraTallyAtExit();
+
+    // Same prologue runAot / runAotChecked apply, so a multi-module program
+    // participates in the #1822 and #4638 suite-wide knobs exactly as a
+    // single-module one does.
+    if (aot_detail::forceSanitizeAddress()) opts.sanitizeAddress = true;
+    if (aot_detail::forceCheckedContracts()) opts.checkedContracts = true;
+    const LeakDetectMode leakMode = aot_detail::leakDetectMode();
+    if (leakMode != LeakDetectMode::Off) opts.sanitizeAddress = true;
+
+    std::string infraWhy;
+    aot_detail::WorkDir wd{aot_detail::makeWorkDir(&infraWhy)};
+    if (wd.path.empty()) return aot_detail::markInfra(r, name, infraWhy);
+    namespace fs = aot_detail::fs;
+
+    // --- Locate the entry, reject duplicate names ---------------------------
+    const ModuleSource* entryMod = nullptr;
+    std::size_t entryIndex = 0;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (modules[i].name != entry) continue;
+        if (entryMod)
+            return aot_detail::markInfra(
+                r, name, "two modules are both named \"" + std::string(entry) +
+                             "\" — the entry module is ambiguous");
+        entryMod = &modules[i];
+        entryIndex = i;
+    }
+    if (!entryMod)
+        return aot_detail::markInfra(r, name,
+                                     "no module named \"" + std::string(entry) +
+                                         "\" was supplied to the multi-module "
+                                         "harness (names: " +
+                                         std::to_string(modules.size()) + ")");
+
+    // --- Topological order over the IN-SET imports --------------------------
+    std::vector<bool> placed(modules.size(), false);
+    std::vector<std::size_t> order;   // non-entry modules, dependencies first
+    for (std::size_t step = 0; step < modules.size(); ++step) {
+        bool progress = false;
+        for (std::size_t i = 0; i < modules.size(); ++i) {
+            if (i == entryIndex || placed[i]) continue;
+            bool ready = true;
+            for (const std::string& imp :
+                 aot_detail::importedModuleNames(modules[i].source)) {
+                for (std::size_t j = 0; j < modules.size() && ready; ++j) {
+                    if (modules[j].name != imp || j == entryIndex) continue;
+                    if (!placed[j]) ready = false;
+                }
+            }
+            if (!ready) continue;
+            placed[i] = true;
+            order.push_back(i);
+            progress = true;
+        }
+        if (progress) continue;
+        // Nothing could be placed this pass: either an import cycle, or a
+        // module that imports the ENTRY (which cannot be a dependency — the
+        // entry is the executable, §33.5/§33.6).
+        std::string stuck;
+        for (std::size_t i = 0; i < modules.size(); ++i) {
+            if (i == entryIndex || placed[i]) continue;
+            if (!stuck.empty()) stuck += ", ";
+            stuck += modules[i].name;
+        }
+        if (stuck.empty()) break;   // nothing left but the entry
+        return aot_detail::markInfra(
+            r, name,
+            "the supplied modules form an import cycle, or import the entry "
+            "module \"" + std::string(entry) + "\"; unsorted: " + stuck);
+    }
+
+    // --- Write every source -------------------------------------------------
+    std::vector<std::string> srcPaths(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        const std::string stem = aot_detail::moduleStem(i, modules[i].name);
+        srcPaths[i] = (fs::path(wd.path) / (stem + ".bzl")).string();
+        if (!aot_detail::writeSource(srcPaths[i], modules[i].source, &infraWhy))
+            return aot_detail::markInfra(r, name, infraWhy);
+    }
+    const std::string exePath = (fs::path(wd.path) / "prog").string();
+    const std::string outPath = (fs::path(wd.path) / "out.txt").string();
+    const std::string errPath = (fs::path(wd.path) / "run.err").string();
+
+    // --- Build the dependencies, then the entry -----------------------------
+    // §2.4 / §2.6 step 4: each non-entry module is compiled with
+    // `Driver::compileObject`, which is the only shape that embeds the
+    // module's public interface in `.bezel.meta` (driver/Driver.hpp). The
+    // importer's `Dependency` carries that same artifact as BOTH the metadata
+    // source and the object to link — the convention every hand-rolled
+    // two-module runner in tests/ already uses.
+    std::vector<Dependency> deps;
+    for (std::size_t i : order) {
+        std::vector<Dependency> ownDeps;
+        for (const Dependency& d : deps) ownDeps.push_back(d);
+        const std::string stem = aot_detail::moduleStem(i, modules[i].name);
+        const std::string objPath = (fs::path(wd.path) / (stem + ".o")).string();
+        const std::string ccErr = (fs::path(wd.path) / (stem + ".err")).string();
+        aot_detail::CompileStatus cc = aot_detail::forkedCompileModule(
+            srcPaths[i], objPath, ownDeps, opts, ccErr);
+        if (cc.outcome != aot_detail::CompileOutcome::Ok) {
+            if (cc.outcome == aot_detail::CompileOutcome::Infra)
+                return aot_detail::markInfra(r, name, cc.diag);
+            if (cc.outcome == aot_detail::CompileOutcome::TimedOut)
+                return aot_detail::markTimeout(r, name, cc.diag);
+            r.diagnostics.report(Severity::Error, SourceLocation{},
+                                 std::string(name) + ": dependency module \"" +
+                                     modules[i].name + "\": " + std::move(cc.diag));
+            return r;
+        }
+        Dependency d;
+        d.metadataPath = objPath;
+        d.objectPath = objPath;
+        deps.push_back(std::move(d));
+    }
+
+    const std::string entryCcErr = (fs::path(wd.path) / "cc.err").string();
+    aot_detail::CompileStatus cc = aot_detail::forkedCompileWithDeps(
+        srcPaths[entryIndex], exePath, deps, opts, entryCcErr);
+    if (cc.outcome != aot_detail::CompileOutcome::Ok) {
+        if (cc.outcome == aot_detail::CompileOutcome::Infra)
+            return aot_detail::markInfra(r, name, cc.diag);
+        if (cc.outcome == aot_detail::CompileOutcome::TimedOut)
+            return aot_detail::markTimeout(r, name, cc.diag);
+        r.diagnostics.report(Severity::Error, SourceLocation{},
+                             std::string(name) + ": entry module \"" +
+                                 std::string(entry) + "\": " + std::move(cc.diag));
+        return r;
+    }
+
+    return aot_detail::runProgramFill(r, exePath, outPath, errPath, opts,
+                                      leakMode, name, asanOptionsOverride);
+}
+
+// runAot for a program with imports. Same oracle as runAot: same forced-ASan
+// sweep, same #4638 leak-oracle handling, same {ran, exitCode, stdoutText,
+// diagnostics} contract. Modules may be supplied in ANY order — the build
+// order is derived from their `import` declarations.
+inline JitResult runAotModules(const std::vector<ModuleSource>& modules,
+                               std::string_view entry,
+                               const codegen::CodegenOptions& opts = {}) {
+    return runAotModulesImpl(modules, entry, "runAotModules", opts, {});
+}
+
+// runAotChecked for a program with imports: generated-code ASan plus
+// LeakSanitizer, `detect_leaks=1:exitcode=99:abort_on_error=0` — the same
+// environment and the same report-text oracle `runAotChecked` uses, so a leak
+// in a two-module program is detected exactly as it is in a one-module one.
+//
+// The toolchain probe and the SKIP accounting are `runAotCheckedImpl`'s, and
+// are replicated here rather than factored out of it because the two differ
+// in what they compile (one source vs a set) and that difference runs through
+// the whole body. A skip here counts into the SAME `checkedToolchainSkips()`
+// denominator, which is what `check_toolchain_skip_surface` measures.
+inline JitResult runAotModulesChecked(std::vector<ModuleSource> modules,
+                                      std::string_view entry,
+                                      codegen::CodegenOptions opts = {}) {
+    opts.checkedContracts = true;
+    opts.sanitizeAddress = true;
+    static const bool toolchainProbeOk = [] {
+        return std::system("clang --version > /dev/null 2>&1") == 0;
+    }();
+    if (::bezel::test::forceToolchainMissing() || !toolchainProbeOk) {
+        ::bezel::test::checkedToolchainSkips().fetch_add(
+            1, std::memory_order_relaxed);
+        JitResult r;
+        r.diagnostics.report(
+            Severity::Error, SourceLocation{},
+            "runAotModulesChecked: SKIP — C toolchain (clang) unavailable for "
+            "the ASan link");
+        return r;
+    }
+    return runAotModulesImpl(
+        std::move(modules), entry, "runAotModulesChecked", std::move(opts),
+        "detect_leaks=1:exitcode=99:abort_on_error=0");
+}
+
+// ⚠ NO `runAotModulesCheckedLenient`, AND THE REASON IS A MEASUREMENT.
+//
+// This revision ADDED one, for the two-level-delegation row, on the reasoning
+// that the 32-byte #6372 leak it saw was pre-existing and would make a strict
+// row red at both legs. That reasoning was right AT THE BASE IT WAS MEASURED
+// AT and wrong at the commit's own parent: #6372 (`95c1e290`) landed between
+// them and FIXED the leak, so at this parent there is nothing to suppress and
+// `Lenient` was stripping leak detection from the only row covering the
+// genuine `$ad` family. The row now uses the strict harness (measured green)
+// and this helper has no user.
+//
+// It is deleted rather than kept "for symmetry" with `runAotCheckedLenient`.
+// A helper with no row behind it is not symmetry, it is surface that reads as
+// coverage and is not — the exact failure #6379 exists to remove. If a future
+// two-module row genuinely needs `detect_leaks=0`, this is three lines: it is
+// the same `runAotModulesImpl` call with
+// `"detect_leaks=0:exitcode=99:abort_on_error=0"`, and `runProgramFill`'s
+// `asanOptionsOverride` parameter exists precisely so that arm is one string.
 
 }  // namespace bezel::test

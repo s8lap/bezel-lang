@@ -31,6 +31,7 @@ behaviour: a case whose verdict the compiler does not yet produce is a recorded
 divergence (see runner.py's baseline ratchet), not a case to be edited.
 """
 
+import argparse
 import os
 import re
 import sys
@@ -628,6 +629,29 @@ def main(argv, base_dir=None):
     if cmd not in ("lint", "build", "check", "summary", "audit"):
         print("usage: corpus.py [lint|build|check|summary|audit]", file=sys.stderr)
         return 2
+
+    if cmd == "check":
+        # Reject unknown flags so `--strict` or `--nonsense-flag` on a check
+        # command fails loudly rather than silently producing a clean line.
+        # corpus.py check is manifest-text only and never compiles.  The real
+        # strictness check is:
+        #   python3 scripts/gate_rule_corpus_baseline.py --strict --bezelc build/bezelc
+        for arg in argv[1:]:
+            if arg == "--help":
+                print("usage: corpus.py check [--help]")
+                print("Check that manifest.tsv is up to date with the cases.")
+                print("  (manifest-text only; does not compile or check behaviour)")
+                print("  For behaviour strictness:")
+                print("    python3 scripts/gate_rule_corpus_baseline.py "
+                      "--strict --bezelc build/bezelc")
+                return 0
+            if arg.startswith("--"):
+                print("corpus.py check: manifest-text only (never compiles); "
+                      "for behaviour strictness run:\n"
+                      "  python3 scripts/gate_rule_corpus_baseline.py "
+                      "--strict --bezelc build/bezelc",
+                      file=sys.stderr)
+                return 2
 
     rows, problems = load_cases(cases_dir)
     if problems:

@@ -2095,9 +2095,67 @@ llvm::Value* Emitter::materializeVtableIEnumerableToArray(
 llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                                             sema::TypeRef*& elemRef,
                                             bool ownFreshGroupings,
-                                            llvm::Value** outRecvArr) {
+                                            llvm::Value** outRecvArr,
+                                            bool ownSourceTemp) {
     if (outRecvArr) *outRecvArr = nullptr;
     auto* recvTy = ctx_.exprType(recvExpr);
+    // #6380 (§28.3 *unbound owned temporaries*, §28.9, stdlib §4.4–§4.11 /
+    // §4.17–§4.18, v0.338): does this receiver have an OWNER of its own? It does
+    // not when it is a CALL used directly as the receiver that produced a fresh
+    // value no name, field or parameter holds — an `owned`-returning producer, or
+    // a fresh array/dict materializer. §28.3 K8 discharges such a temporary "at
+    // the end of the full expression in which it is produced", and on every LINQ
+    // source path that boundary is the CONSUMING enumeration, which is exactly
+    // the lazy enumerator's lifetime. So the lazy source built below OWNS it
+    // (bz_lazy_own_source) and bz_lazy_dispose reclaims it.
+    //
+    // WHY HERE AND NOT AT THE CONSUMER. This function lowers the receiver
+    // EXPRESSION ITSELF, so by the time a terminal has rebound its `recv` to the
+    // bz_lazy_to_array snapshot, the source value exists only inside this
+    // callee and no consumer can name it — the residual #6380 inherits from
+    // #6366. It is also the only site every consumer funnels through: a
+    // `.ToArray()`/`.Sum()`/for-in over `X` and one over `X.Where(…)` both land
+    // here exactly once, at the innermost source. Reclaiming here therefore
+    // covers the whole family — every backing, and both reasons a receiver
+    // materializes (a LINQ terminal directly, or a lazy operator ahead of one)
+    // — from one site, instead of threading the value out through each.
+    //
+    // The gate is the SAME population `freeUnboundOwnedBorrowingArrayTemp`
+    // discharges at end-of-statement (`isFreshOwnerlessArrayMaterializerExpr` /
+    // `isUnboundOwnedBorrowingArrayCallExpr`), so the two reclaims can never
+    // disagree about which value is unowned — one rule, two ends of the same
+    // full expression.
+    const bool srcIsUnboundOwnedTemp =
+        ownSourceTemp &&
+        (isFreshOwnerlessArrayMaterializerExpr(&recvExpr) ||
+         isUnboundOwnedBorrowingArrayCallExpr(&recvExpr));
+    // The runtime free this source's backing needs — the SAME three-way
+    // classification `freeUnboundOwnedBorrowingArrayTemp` dispatches on
+    // (Setup.cpp): `LinkedList` is bz_llist_t*-backed, a generic-keyed
+    // `Set`/`SortedSet` and every `Dictionary` head are bz_dict_t*-backed
+    // (`genericBackingType(..., isSet=true)`, the same predicate the Set member
+    // arms read), and everything else in the borrowing family is
+    // bz_array_t*-backed. Passed as the `kind` argument rather than a function
+    // pointer so the runtime needs no indirect-call machinery.
+    const bool srcFreeIsDict =
+        isDictTypeName(recvTy) ||
+        (recvTy && (recvTy->headName() == "Set" ||
+                    recvTy->headName() == "OwningSet" ||
+                    recvTy->headName() == "SortedSet") &&
+         genericBackingType(recvTy, 0, /*isSet=*/true, nullptr) != nullptr);
+    const int64_t srcFreeKind =
+        isLinkedListTypeName(recvTy) ? 2 : (srcFreeIsDict ? 3 : 1);
+    // Hand the wrap just built to the runtime as an owned source. No-op unless
+    // the receiver is one of the unowned shapes above, so every borrowed
+    // receiver keeps exactly the wrap it had.
+    auto ownWrappedSource = [&](llvm::Value* lazy,
+                                llvm::Value* src) -> llvm::Value* {
+        if (!srcIsUnboundOwnedTemp || !lazy || !src) return lazy;
+        auto* fn = declareC("bz_lazy_own_source", ptrTy(),
+                            {ptrTy(), ptrTy(), i32()});
+        return builder_.CreateCall(fn,
+            {lazy, src, builder_.getInt32((int32_t)srcFreeKind)}, "lazy.osrc");
+    };
     // stdlib §5 (#752): a bare `GroupBy(...)` is IEnumerable<IGrouping<TKey,T>>
     // (so isLazyEnumerableType below is true), but lowerExpr cannot lower it to
     // a usable enumerator — only the `.ToArray()` interception handled GroupBy,
@@ -2419,8 +2477,10 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 ? "bz_lazy_from_owned_str_dict_array"
                 : "bz_lazy_from_owned_array";
             auto* ownFn = declareC(ownName, ptrTy(), {ptrTy(), i64()});
-            return builder_.CreateCall(ownFn,
-                {arr, builder_.getInt64(esz)}, "lazy.dict");
+            return ownWrappedSource(
+                builder_.CreateCall(ownFn, {arr, builder_.getInt64(esz)},
+                                    "lazy.dict"),
+                recv);
         }
     }
     // issue #775 / §16.3: a `Range<T>` is IEnumerable<T>. Wrap its value struct
@@ -2549,9 +2609,11 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                         sortedSetSnapshotToSortedArray(recv, recvTy, &ssz)) {
                     auto* ownFn = declareC("bz_lazy_from_owned_array", ptrTy(),
                                            {ptrTy(), i64()});
-                    return builder_.CreateCall(
-                        ownFn, {sortedArr, builder_.getInt64(ssz)},
-                        "lazy.sortedset");
+                    return ownWrappedSource(
+                        builder_.CreateCall(ownFn,
+                            {sortedArr, builder_.getInt64(ssz)},
+                            "lazy.sortedset"),
+                        recv);
                 }
                 // The snapshot helper only declines when the element type has
                 // no LLVM lowering — the same shape that would make every arm
@@ -2561,8 +2623,10 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 // for any element `genericBackingType` has just admitted.
             }
             auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
-            return builder_.CreateCall(setFn,
-                {recv, builder_.getInt64((int64_t)ksz)}, "lazy.set");
+            return ownWrappedSource(
+                builder_.CreateCall(setFn,
+                    {recv, builder_.getInt64((int64_t)ksz)}, "lazy.set"),
+                recv);
         }
     }
     // per §4.6/§4.7 + §5 fix #450: LinkedList<T>/OwningLinkedList<T> is
@@ -2571,7 +2635,9 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     if (isLinkedListTypeName(recvTy)) {
         int64_t esz = collectionElemSize(recvTy);
         auto* fn = declareC("bz_lazy_from_llist", ptrTy(), {ptrTy(), i64()});
-        return builder_.CreateCall(fn, {recv, builder_.getInt64(esz)}, "lazy.llist");
+        return ownWrappedSource(
+            builder_.CreateCall(fn, {recv, builder_.getInt64(esz)}, "lazy.llist"),
+            recv);
     }
     // fix #1220 / §5 / §9.6: string is IEnumerable<char>. Materialize it into
     // a fresh owned Array<char> (elem_size=4, one i32 code-point per slot) via
@@ -2599,12 +2665,22 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     int64_t esz = collectionElemSize(recvTy);
     auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
     // #2151 / §28.3: surface the borrowed array through the out-param so callers
-    // that CONSUME the lazy (ToDictionary, etc., which route through
+    // that CONSUME the lazy (ToDictionary, which routes through
     // bz_lazy_dispose) can still reclaim an unbound fresh-materializer
     // receiver at the call site — the lazy wrap itself is a borrow, so
     // bz_lazy_dispose leaves the array alive for the caller.
-    if (outRecvArr) *outRecvArr = recv;
-    return builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src");
+    //
+    // #6380: that reclaim and the owning wrap are MUTUALLY EXCLUSIVE. When the
+    // receiver is an unbound fresh owned temporary the runtime now owns it
+    // (ownWrappedSource, whose dispose free IS the reclaim), so the array must
+    // not ALSO be handed back for the caller to free — two frees of one
+    // temporary. `ownSourceTemp=false` is how a caller that reclaims explicitly
+    // (ToDictionary, the one site that passes this out-param) opts out; with it,
+    // the out-param below is null and the runtime reclaims instead.
+    if (outRecvArr && !srcIsUnboundOwnedTemp) *outRecvArr = recv;
+    return ownWrappedSource(
+        builder_.CreateCall(wrapFn, {recv, builder_.getInt64(esz)}, "lazy.src"),
+        recv);
 }
 
 llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
@@ -2855,11 +2931,20 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // `isFreshOwnerlessArrayMaterializerExpr` / `isUnboundOwnedBorrowingArrayCallExpr`
         // so a named-local / `using var` / `move`-receiver is NOT freed again
         // (its owner disposes it — no double-free, no UAF).
+        //
+        // #6380 / §28.3 K8 / §28.9: `ownSourceTemp=false` opts THIS site out of
+        // the owning wrap lowerToLazyEnumerator now applies to an unbound fresh
+        // owned temporary. This is the one site that can reclaim the source
+        // itself — it is the only caller passing `outRecvArr` — so it keeps the
+        // explicit reclaim and the borrow, and `bz_lazy_dispose` leaves the
+        // source array alive for the call below to free exactly once. Letting
+        // the runtime own it as well would free the same array twice.
         sema::TypeRef* elemRef = nullptr;
         llvm::Value* recvArr = nullptr;
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef,
                                                   /*ownFreshGroupings=*/false,
-                                                  &recvArr);
+                                                  &recvArr,
+                                                  /*ownSourceTemp=*/false);
         if (!lazy) return nullptr;
         llvm::Type* elemTy2 = elemLlvmOf(elemRef);
 
@@ -3882,7 +3967,24 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "Count" && call.args.empty()) {
         auto* fn = declareC("bz_llist_count", i64(), {ptrTy()});
         llvm::Value* cnt = builder_.CreateCall(fn, {recv}, "ll.cnt");
-        return builder_.CreateTrunc(cnt, i32(), "ll.cnt.i32");
+        llvm::Value* cnt32 = builder_.CreateTrunc(cnt, i32(), "ll.cnt.i32");
+        // fix #6341 (§28.3, §28.9, stdlib §4.6/§4.7, v0.338): the NO-ARG CALL
+        // twin of the `.Count` PROPERTY arm's new reclaim in
+        // LlvmBackend_Exprs.cpp. The `Array` `.Length`/`.Count` arm
+        // (LlvmBackend_Calls.cpp) reaches the same helper through its
+        // `freeFreshInputTemp()` lambda, and #6352 gave the Set/Dictionary
+        // `.Count` arms the explicit call — but this arm had neither, so
+        // `MakeLlist().Count()` returned straight out of the runtime call and
+        // leaked the whole list. MEASURED on this fix's parent: 5,600 B in 100
+        // allocations over a 100-iteration loop (`bz_llist_alloc`,
+        // bezel_runtime_collections.cpp:1897), against clean `Array<T>` and
+        // clean `Dictionary<K,V>` twins.
+        // No-op for a bound / aliased / `move`d receiver (not this call shape)
+        // and for the OWNING family (`isPlainBuiltinCollectionHead` excludes
+        // `OwningLinkedList`), so no UAF / double-free; the count is fully read
+        // into `cnt32` before the backing is released.
+        freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+        return cnt32;
     }
     // --- Clear() --- disposes all elements (OwningLinkedList) and frees all
     // nodes, then re-allocates an empty list. Simplest: remove all from front.
@@ -4055,6 +4157,32 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         phi->addIncoming(builder_.getFalse(), condBB);
         return phi;
     }
+    // #6380 (§28.3 *unbound owned temporaries*, §28.9, stdlib §4.6/§4.7,
+    // v0.338): this function lowers the RECEIVER before it knows whether the
+    // member is one of its arms, so a member it does NOT implement (`Sum`,
+    // `Any`, `First`, `Max`, …) falls to here having already emitted the
+    // receiver's IR. Returning nullptr hands the call to the next handler
+    // (`tryLowerCollectionInstanceCall` → `typeCall`, Calls2.cpp), which lowers
+    // the SAME receiver expression AGAIN. For an unbound `owned` temporary that
+    // double evaluation produces two objects and reclaims neither — MEASURED on
+    // this fix's parent, `f.Make().Sum()` over a `LinkedList<int>` allocated
+    // 202 lists (`bz_llist_alloc`, gdb breakpoint count) across 101 iterations
+    // and leaked 101 of them, 28,280 B; the lazyTerminal ownership transfer this
+    // commit adds reclaims one of the two, leaving the other 14,140 B, and the
+    // reclaim below closes it.
+    //
+    // The SAME helper the §5 eager array terminal arms and the `_ :=` discard
+    // use, gated on the same unbound-temporary population, so it is a no-op for
+    // every receiver that has an owner of its own (a named local, a field, a
+    // parameter, a `move`) — those are discharged by that owner, and freeing
+    // one here would be a use-after-free. It runs only when this handler has
+    // produced nothing, so no value it still needs is released.
+    //
+    // NARROW: this is the fall-through path — the member is not one of this
+    // handler's arms at all. The `return nullptr` sites INSIDE an arm (a
+    // lowering that failed part-way) abandon `recv` the same way and are NOT
+    // covered here.
+    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
     return nullptr;
 }
 

@@ -1318,6 +1318,168 @@ llvm::Function* Emitter::emitImportedIndexerGetterInheritedWrapper(
     return fn;
 }
 
+// fix #6353 (§23.4 / §14.1 / §12.1 / §2.8.3 rule 4, v0.338): the SUBSTITUTED
+// vtable-dispatch wrapper for a virtual indexer on an IMPORTED GENERIC base.
+// See the declaration in LlvmBackend_impl.hpp for the diagnosis and the gate;
+// this is the body.
+//
+// The signature is built under the receiver's §14.1 substitution, so the
+// dispatched accessor reads as its bound type (`T := string` → ptr) instead of
+// the declared parameter's i32 erasure placeholder. The BODY is #2545's dispatch
+// verbatim — `vptr = load(this); fn = load(vptr + slot); return fn(this, idx…)`
+// — so nothing about WHICH function runs changes; only the ABI it is called
+// through does. The vtable slot index is `propGetSlot_`/`propSetSlot_`, the
+// same index the caller and the pre-existing wrapper both GEP.
+llvm::Function* Emitter::emitImportedVirtualIndexerSubstWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy,
+        bool isSet) {
+    if (!ps || ps->decl || !ps->parent || !recvTy) return nullptr;
+    if (!isVirtualIndexer(ps)) return nullptr;
+    if (isStaticProperty(ps)) return nullptr;  // no `this`, no vtable slot
+    // The slot must exist, else this is NOT the virtual-dispatch path at all
+    // (#2414's `bz$<Class>$idxget$<arity>` direct-call ABI owns it).
+    auto& slotMap = isSet ? propSetSlot_ : propGetSlot_;
+    auto slotIt = slotMap.find(ps);
+    if (slotIt == slotMap.end()) return nullptr;
+    // Generic base only — a non-generic parent has no erasure to undo.
+    if (ps->parent->genericParams.empty()) return nullptr;
+    if (recvTy->kind != sema::TypeRef::Kind::Named || !recvTy->declaration)
+        return nullptr;
+    auto& cache = isSet ? importedVirtualIndexerSubstSetterWrappers_
+                        : importedVirtualIndexerSubstGetterWrappers_;
+    auto cacheKey = std::make_pair(ps, recvTy);
+    auto cached = cache.find(cacheKey);
+    if (cached != cache.end()) return cached->second;
+
+    // THE SUBSTITUTION. Two sources, in the same order `GenericRecvSubstGuard`
+    // (#6319) composes them: the receiver's OWN arguments bind the parameters of
+    // the receiver's own class (the accessor declared on `LIB.VB<T>` itself),
+    // which `computeAncestorGenericSubst` refuses by design (`cur == ancestor`);
+    // otherwise the base-chain walk supplies them for an accessor declared on an
+    // ANCESTOR (`class D: Mid<int>` reaching `Root<T>`). A chain it cannot pin
+    // every link of is REFUSED — the "never install a substitution we cannot
+    // prove" discipline — leaving the pre-fix (erased) wrapper in place.
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    bool installed = false;
+    std::unordered_map<std::string_view, llvm::Type*> recvSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> recvSema;
+    {
+        const std::vector<std::string_view> recvParams =
+            sema::genericParamNames(recvTy->declaration);
+        if (recvTy->declaration == ps->parent &&
+            !recvParams.empty() &&
+            recvParams.size() == recvTy->genericArgs.size()) {
+            for (std::size_t gi = 0; gi < recvParams.size(); ++gi) {
+                recvSema[recvParams[gi]] = recvTy->genericArgs[gi];
+            }
+        }
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (computeAncestorGenericSubst(recvTy, ps->parent, ancSubst, ancSema)) {
+            recvSubst = ancSubst;
+            recvSema = ancSema;
+        }
+        if (!recvSema.empty()) {
+            // Lower each argument under the OUTER substitution (both maps honor
+            // it), so a nested instantiation `VB<Box<int>>` binds T to the
+            // specialized `Box<int>` rather than to an `int` placeholder — the
+            // same two-step #6319's guard performs.
+            for (auto& [pname, pref] : recvSema) {
+                if (pref) recvSubst[pname] = lowerTypeRef(pref);
+            }
+            genericSubst_ = recvSubst;
+            genericSubstSemaTy_ = recvSema;
+            installed = true;
+        }
+    }
+
+    // The signature, under the substitution: the ELEMENT type from the
+    // reconstructed side table (an imported indexer has no `pd->type`; §23.4's
+    // get/set share the declared type) and each index parameter from its
+    // `ParameterSymbol`.
+    sema::TypeRef* memberRef = ctx_.importedMemberType(ps);
+    llvm::Type* elemTy = memberRef ? lowerTypeRef(memberRef) : nullptr;
+    std::vector<llvm::Type*> paramTys;
+    bool ok = elemTy != nullptr;
+    paramTys.push_back(ptrTy());  // `this`
+    for (sema::Symbol* p : ps->indexerParams) {
+        auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+        sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
+        llvm::Type* plt = pt ? lowerTypeRef(pt) : nullptr;
+        if (!plt) { ok = false; break; }
+        paramTys.push_back(plt);
+    }
+    if (isSet) paramTys.push_back(elemTy ? elemTy : i32());
+    // THE "ONLY WHERE IT MOVES" GATE. If nothing about the ABI differs from the
+    // erased form, the pre-existing wrapper is already correct and this one adds
+    // nothing — so decline and let the caller keep it. This is the same test
+    // #2955's sema gate applies (`substitutedArgMovesAbi`): a `VB<int>` receiver
+    // binds T to the same i32 the placeholder lowers to, and a `VB<string>`
+    // receiver does not. Comparing the substituted element against the ERASED
+    // one (the same `memberRef` lowered with the substitution removed) is the
+    // direct expression of it.
+    if (ok) {
+        genericSubst_ = savedSubst;
+        genericSubstSemaTy_ = savedSemaTy;
+        llvm::Type* erasedTy = memberRef ? lowerTypeRef(memberRef) : nullptr;
+        if (erasedTy && erasedTy == elemTy) ok = false;
+        if (installed) {
+            genericSubst_ = recvSubst;
+            genericSubstSemaTy_ = recvSema;
+        }
+    }
+    if (!ok || !elemTy) {
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        return nullptr;
+    }
+
+    auto* fnTy = llvm::FunctionType::get(
+        isSet ? llvm::Type::getVoidTy(llvm_) : elemTy, paramTys, false);
+    // fix #3548's naming discipline: derive the symbol from the §2.8.3 rule 3
+    // IDENTITIES (owner's mangled name + accessor name + the receiver type's
+    // mangling), never from a heap pointer value — an ASLR-fresh address in the
+    // name would make the object file differ between two runs of the same
+    // compiler on the same source. The `set` suffix keeps get/set distinct, which
+    // the slot index alone would not.
+    std::string wrapperName =
+        "bz$" + mangledTypeName(ps->parent) + "$vt$idx" + (isSet ? "set$" : "get$") +
+        mangleTypeRefForSymbol(recvTy) + "$" +
+        std::to_string(slotIt->second) + "$subst";
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, wrapperName, module_.get());
+    cache[cacheKey] = fn;
+
+    // The body — #2545's dispatch, emitted UNDER the substitution so the
+    // signature stays consistent for its whole body.
+    auto* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+    auto savedIP = savedInsert ? builder_.GetInsertPoint()
+                               : decltype(savedInsert->begin()){};
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    llvm::Value* thisPtr = &*fn->args().begin();
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), thisPtr, "subst.vptr");
+    llvm::Value* slotPtr = builder_.CreateGEP(
+        ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
+    llvm::Value* fnPtr =
+        builder_.CreateLoad(ptrTy(), slotPtr, isSet ? "subst.idxset" : "subst.idxget");
+    std::vector<llvm::Value*> callArgs;
+    for (auto& a : fn->args()) callArgs.push_back(&a);
+    llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, callArgs);
+    if (isSet) builder_.CreateRetVoid();
+    else builder_.CreateRet(r);
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert, savedIP);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    return fn;
+}
+
+
 // fix #3353 setter twin. Mirrors the getter wrapper but emits
 // `void set(ptr this, idx..., T value)` whose body is `GEP slot; store value`.
 // Same pre-conditions: imported, generic base, derived receiver with
@@ -2578,6 +2740,75 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // null for value/class element borrows. Call AFTER the copy is built and
     // (for the comparer form) BEFORE any closure release, mirroring the copy's
     // own retain. Idempotent guards mean a non-materializer receiver is a no-op.
+    //
+    // THE EAGER-TERMINAL TWIN OF `freeLazyTemp`, and the WHOLE of the reclaim on
+    // an eager receiver. `freeLazyTemp` (above) opens `if (!lazyTempArr) return;`
+    // — a no-op exactly when the receiver was NOT materialized out of a lazy
+    // source — and `freeFreshInputTemp` opens `if (lazyTempArr) return;`, so the
+    // two are complementary on one flag and can never both fire.
+    //
+    // A LINQ source is materialized into `lazyTempArr` only when `lazyTerminal`
+    // (Call.cpp:2497) holds: a lazy / LinkedList / Range / vtable-IEnumerable /
+    // string / Set receiver. An `Array<T>` or `Stack<T>` receiver with NO
+    // preceding lazy operator keeps `lazyTerminal == false`, so it reaches the
+    // terminal DIRECTLY — no `bz_lazy_t*` is ever built, #6380's
+    // `bz_lazy_own_source` transfer has nothing to act on, and `freeLazyTemp` is
+    // inert. On that path `freeFreshInputTemp` is the ONLY reclaim, so a
+    // terminal return site in the `isArr` block below that neither hands a
+    // borrow of a receiver slot to its caller nor omits it for another stated
+    // reason is leaking a whole container per evaluation.
+    //
+    // The set is NOT "every terminal return site". MEASURED leftovers, each
+    // byte-identical before and after the fix that filled the 28 gaps, and each
+    // deliberately out of this change's scope: `Set<T>.Add` / `.Contains` /
+    // `.Remove` / `.Clear` / `.UnionWith` and `Dictionary`/`Set` `.Count`
+    // inside the same block still carry no reclaim (43,228 B / 606 allocs for
+    // `MakeSet().Contains(2)`, 43,632 / 707 for `.Add(9)`, 42,824 / 505 for
+    // `.Remove(2)`, 42,016 / 303 for `.Clear()`, 86,860 / 1313 for
+    // `.UnionWith(...)`, 42,420 / 505 for `MakeDict().Count`). §28.3 closes
+    // the question of why a name-keyed list is the wrong shape here — "the
+    // `owned` return qualifier is the single signal that drives the reclaim;
+    // there is no special-cased list of method names" — so they belong to the
+    // Set-family arms, not to a list written here. This change does not touch
+    // them; they are reported, not fixed.
+    //
+    // Before this lane only five terminal return sites called it: `.Length` /
+    // `.Count` (no-arg), `.Sum` (the int/long accumulator arm), and the three
+    // copy-forms `.Reversed()` / `.Sorted()` / `.Sorted(comparer)` — which is
+    // why those terminals were leak-free and their siblings were not. MEASURED
+    // on the parent (staging a3065a15), over 101-iteration loops under ASan,
+    // with the receiver an `owned`-returning user method consumed only in
+    // receiver position (`f.Make().Terminal()`, `Make(): owned Array<int>` /
+    // `owned Stack<int>` / `owned Array<decimal>`): 12,120 B leaked per shape
+    // at 14 terminals (Any, All, Contains, First, Single, Last, Min, Max,
+    // Average, Aggregate, ElementAt, FirstOrNull, LastOrNull, SingleOrNull) x
+    // {Array, Stack}, plus IndexOf on Array and the decimal `.Sum` arm — 30
+    // operator-position-0 shapes, each a full container per evaluation,
+    // byte-identical to the `_ := f.Make();` binding, which is the asymmetry
+    // that identifies the defect. Every one of the 14 is the same mechanism:
+    // the terminal reads `recv` to exhaustion and then returns without
+    // reclaiming it.
+    //
+    // THE COUNTS ARE PER-ARTIFACT, and deliberately not reconciled to one
+    // number, because each artifact counts a different slice of the author's
+    // matrix: the 30 above is the OPERATOR-POSITION-0 two-family subset this
+    // comment is about; the commit body's 52 is the FULL matrix (that subset
+    // plus operator positions 1 and 2, plus a one-element producer); the test
+    // file's table row quotes the per-family halves of the full matrix
+    // (`Array<T>` 30 / `Stack<T>` 14) because that is how it lays the matrix
+    // out. The number that is PINNED, and the only one a reader should count,
+    // is the regression-row count in
+    // `tests/codegen/eager_terminal_unbound_owned_reclaim_test.cpp`.
+    //
+    // The gate is UNCHANGED (`isFreshOwnerlessArrayMaterializerExpr` /
+    // `isUnboundOwnedBorrowingArrayCallExpr`), so this adds no new population
+    // that could be over-freed: a bound / `using var` / aliased / `move`d /
+    // returned receiver is not that CallExpr shape and is still freed by its own
+    // owner — no UAF, no double-free. Per §28.3 (unbound owned temporaries) the
+    // obligation is discharged "at the end of the full expression in which it is
+    // produced", and on this path that boundary is the terminal's own return;
+    // §28.9's runtime-managed tier is EXHAUSTIVE and names no collection, so the
+    // obligation is a real disposal, not an optimization.
     auto freeFreshInputTemp = [&]() {
         if (lazyTempArr) return;  // the lazy-terminal path frees via freeLazyTemp
         // stdlib §5 (#755): `recv` is an IGrouping's element array — the GROUPING
@@ -2593,6 +2824,77 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // at end-of-full-expression. A bound/`move`d/returned/owned-arg receiver is
         // not a chained-receiver CallExpr of this shape → not freed → no UAF.
         freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+    };
+
+    // §28.11 (element slot policy), RuntimeManaged row: a `string` element slot
+    // in a BORROWING collection is a SHARED REFERENCE, and the indexer-get row
+    // reads "reference out" — the caller receives a reference, not the
+    // collection's own. `freeUnboundOwnedBorrowingArrayTemp` honours that by
+    // handing `bz_array_free` the string-release element disposer, so reclaiming
+    // an `Array<string>` receiver releases the +1 the array co-owns per element.
+    // That is a correct disposal of the ARRAY; it is fatal only where the value
+    // this call RETURNS is one of those slots.
+    //
+    // Where it is fatal: a terminal that returns an element lowers to
+    // `bz_array_get` + `CreateLoad` and hands the CALLER the bare slot pointer.
+    // The caller's own +1 is minted by the CONSUMER's binding lowering — and
+    // that runs AFTER this function returns. MEASURED in the emitted code for
+    // `var s := "…".Split(",").First();`, in exactly this order:
+    //
+    //     bz_array_get
+    //     bz_array_free(recv, bz$strElemRelease)     <-- the reclaim, here
+    //     bz_string_retain                          <-- the consumer's +1, too late
+    //
+    // so the reclaim drops the last +1 and the reference the caller receives
+    // aliases a released `bz_string*`. MEASURED heap-use-after-free in
+    // `bz_string_to_utf8z` (bezel_runtime_strings.cpp:1250) on
+    // `"alpha,beta,gamma".Split(",").First()` and on every sibling with the
+    // same lowering — `.Last()`, `.ElementAt(1)`, `.FirstOrNull()`,
+    // `.LastOrNull()`, `.First(lambda…)`, `.Last(lambda…)`, `.Min()`,
+    // `.MinOrNull()` — while the scalar terminals over the same receiver
+    // (`.Contains("beta")`, `.Count()`) are clean on both sides, because nothing
+    // they return aliases the backing.
+    //
+    // So on an ELEMENT-RETURNING terminal the reclaim is DECLINED for a
+    // `string`-element receiver and the temporary leaks — the direction §28.3
+    // tolerates ("else it leaks (the safe direction)") and exactly the state
+    // before this fix. Deleting the reclaim outright is NOT the alternative
+    // being taken: every other terminal keeps it, and the 52 int/decimal shapes
+    // it fixes stay fixed.
+    //
+    // THE SOUND REMEDY IS NOT THIS ONE, and is not taken here because it is not
+    // a one-site change: mint the +1 HERE, before the free, and suppress the
+    // consumer's mint so the reference is not double-counted — which means
+    // teaching `isPlusOneStringProducer` that a LINQ element terminal is a +1
+    // producer, a predicate every consumer (bind, return, argument, field store,
+    // the nullable `*OrNull` arms) then reads. An unconditional retain here
+    // instead would double-count: the consumer's own retain plus a local's
+    // scope-end release would leave one unreleased +1 per evaluation, trading a
+    // use-after-free for a leak. That decision, and the `Aggregate`-aliases-an-
+    // element case it must also answer, are #6393.
+    //
+    // `recvElemIsString` is derived with the SAME three conjuncts
+    // `freeUnboundOwnedBorrowingArrayTemp` uses for its `elemIsString`
+    // (Setup.cpp), deliberately spelled the same way so the two cannot drift:
+    // a non-nullable `string` primitive in generic slot 0. It is a property of
+    // the RECEIVER, not of a method name — §28.3's "there is no special-cased
+    // list of method names" is about the reclaim's trigger, and this narrows
+    // where a borrow escapes rather than naming a second trigger.
+    const sema::TypeRef* recvEl =
+        (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
+                                                : nullptr;
+    const bool recvElemIsString = recvEl && !recvEl->nullable &&
+        recvEl->kind == sema::TypeRef::Kind::Primitive &&
+        recvEl->primitive == sema::PrimitiveType::String;
+
+    // The element-returning sibling of `freeFreshInputTemp`. Every terminal
+    // return site in the `isArr` block whose RESULT may be one of `recv`'s own
+    // slots calls THIS; the sites whose result is a scalar (bool / int / double /
+    // decimal) call `freeFreshInputTemp` directly, because nothing they hand
+    // back aliases the backing.
+    auto freeFreshInputTempUnlessStringElementEscapes = [&]() {
+        if (recvElemIsString) return;  // §28.11 — the result borrows a slot; see above
+        freeFreshInputTemp();
     };
 
     // -----------------------------------------------------------------------
@@ -2756,6 +3058,59 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     elemTy->kind == sema::TypeRef::Kind::Primitive &&
                     elemTy->primitive == sema::PrimitiveType::String &&
                     !elemTy->nullable;
+                // fix #6394 (§28.3 *Unbound owned temporaries*, §28.9, stdlib
+                // §4.10, v0.338): reclaim an UNBOUND `owned`-producing Set
+                // receiver at the end of the full expression, in every arm of
+                // this block whose result is not one of the receiver's own
+                // element slots. #6352 gave `.Count`/`.IsEmpty` this call; its
+                // siblings below carried none at all, so an
+                // `owned Set<T>`-producing call consumed only in receiver
+                // position (`f.MakeSet().Terminal()`) leaked its whole table.
+                // MEASURED on this fix's parent at 101 iterations
+                // (`bezelc --sanitize=address`):
+                //
+                //   f.MakeSet().Contains(2)    43,228 B / 606 allocs
+                //   f.MakeSet().Add(9)         43,632 B /  707
+                //   f.MakeSet().Remove(2)      42,824 B /  505
+                //   f.MakeSet().Clear()        41,600 B /  300
+                //   f.MakeSet().UnionWith(f.Other())  86,860 B / 1313
+                //
+                // against 0 for the byte-identical `var s := f.MakeSet();` twin
+                // of each, which is the asymmetry that identifies the defect: a
+                // BOUND receiver is discharged by its own owner, and these arms
+                // reached no discharge at all.
+                //
+                // The gate is the SAME `freeUnboundOwnedBorrowingArrayTemp` /
+                // same population the `.Count` arm two arms down already calls —
+                // an unbound `owned`-returning call consumed only as this
+                // member's receiver. A named local, a `using var`, an alias, a
+                // `move` and a `new` receiver are not that CallExpr shape, so
+                // they stay discharged by their own owner: no double-free, no
+                // UAF (MEASURED: every bound twin of the table above is clean).
+                //
+                // PLACEMENT, not the trigger, is what each arm differs on. §28.3
+                // discharges the temporary "after every use of it within that
+                // expression has completed", so the call sits AFTER the
+                // operation that consumes the receiver — after `bz_dict_set_gen`
+                // for `.Add`, after `bz_dict_clear*` for `.Clear` (whose return
+                // is `unit`, so its obligation is at the end of the full
+                // expression and not at any return site), after the algebra fold
+                // for `.UnionWith`/`.ExceptWith`/`.IntersectWith`/
+                // `.IsSubsetOf`/`.IsSupersetOf`. Nothing any of those arms
+                // returns aliases the backing (a bool, a unit, or — for the
+                // algebra family — a bool), so no arm needs the
+                // `UnlessStringElementEscapes` discipline its element-returning
+                // sibling `SortedSet.First`/`.Last` carries below.
+                //
+                // §28.3 also closes the shape question: "The `owned` return
+                // qualifier is the single signal that drives the reclaim; there
+                // is no special-cased list of method names" — so this is one
+                // helper call per existing arm, gated on that one signal, and
+                // NOT a method-name list written a second time here.
+                auto freeUnboundSetReceiver = [&]() {
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                        recvTy);
+                };
                 // .Add(item) — insert (idempotent by content; §4.10 dedup).
                 if (m == "Add" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
@@ -2769,6 +3124,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* fn = declareC("bz_dict_set_gen",
                         llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
                     builder_.CreateCall(fn, {recv, elemPtr(item), sentinel});
+                    // fix #6394: the insert is the last read of `recv`; reclaim
+                    // the unbound receiver here (§28.3's end-of-full-expression
+                    // boundary, which for this arm is its own return).
+                    freeUnboundSetReceiver();
                     return llvm::ConstantInt::get(i32(), 0);
                 }
                 // fix #522 / §4.10: .TryAdd(item): bool — inserts iff not
@@ -2801,6 +3160,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateCall(setFn, {recv, ep, sentinel});
                     builder_.CreateBr(afterBB);
                     builder_.SetInsertPoint(afterBB);
+                    // fix #6394: afterBB is the join of both arms (inserted and
+                    // already-present), so it is the one point at which `recv` is
+                    // provably no longer read on either edge — the reclaim goes
+                    // here, not in `insertBB`, which would free the table on only
+                    // one path to this return.
+                    freeUnboundSetReceiver();
                     // Return true iff newly inserted (i.e. was not present).
                     return notPresent;
                 }
@@ -2810,7 +3175,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     if (!item) return nullptr;
                     auto* fn = declareC("bz_dict_contains_gen", i1(),
                                         {ptrTy(), ptrTy()});
-                    return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.has");
+                    llvm::Value* has =
+                        builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.has");
+                    // fix #6394: the membership query is a PURE BORROW of the
+                    // argument (`item`), never of the receiver, so the bool this
+                    // arm returns aliases nothing and the reclaim is safe here.
+                    freeUnboundSetReceiver();
+                    return has;
                 }
                 // .Remove(item): bool
                 // #429 / §28.9 / §4.10: for a Set<string>, use the releasing
@@ -2821,27 +3192,55 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (m == "Remove" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
                     if (!item) return nullptr;
-                    if (isStrSet) {
-                        auto* fn = declareC("bz_dict_remove_set_string", i1(),
-                                            {ptrTy(), ptrTy()});
-                        return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.rm");
-                    }
-                    auto* fn = declareC("bz_dict_remove_gen", i1(),
-                                        {ptrTy(), ptrTy()});
-                    return builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.rm");
+                    auto* rmFn = declareC(isStrSet ? "bz_dict_remove_set_string"
+                                                   : "bz_dict_remove_gen",
+                                          i1(), {ptrTy(), ptrTy()});
+                    llvm::Value* removed =
+                        builder_.CreateCall(rmFn, {recv, elemPtr(item)}, "set.rm");
+                    // fix #6394: reclaim AFTER the unlink, so the removal has
+                    // already resolved the one element's ownership and the
+                    // receiver's own release pass cannot discharge it twice —
+                    // `bz_dict_remove_set_string` frees that entry's key slot, so
+                    // `bz_set_string_keys_release` below finds nothing left in it.
+                    freeUnboundSetReceiver();
+                    return removed;
                 }
                 // .Count: int
                 if (m == "Count" && call.args.empty()) {
                     auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
-                    return builder_.CreateTrunc(
+                    llvm::Value* cnt = builder_.CreateTrunc(
                         builder_.CreateCall(fn, {recv}), i32(), "set.cnt");
+                    // fix #6352 (§28.3 *Unbound owned temporaries*, §28.9,
+                    // stdlib §4.10, v0.338): the DICT-backed Set twin of the
+                    // Dictionary `.Count` arm's #1013 reclaim and of the Array
+                    // `.Length`/`.Count` arm's #1006(b) one. The count is read
+                    // from the set FIRST, then an UNBOUND owned-producing
+                    // receiver is reclaimed via `bz_dict_free` (inside the
+                    // helper) — a no-op for a bound/aliased/`move`d/`new`
+                    // receiver, which is not this call shape and so is freed by
+                    // its own owner (no double-free, no UAF). Pre-fix this arm
+                    // returned straight from the runtime call, so an
+                    // `owned Set<T>`-producing call consumed as a receiver here
+                    // leaked its whole table: MEASURED 70,752 B / 402 allocs over
+                    // a 200-iteration `MakeSet().Count` loop, against a clean
+                    // `Array<T>` twin of the same loop.
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                        recvTy);
+                    return cnt;
                 }
                 // .IsEmpty(): bool
                 if (m == "IsEmpty" && call.args.empty()) {
                     auto* fn = declareC("bz_dict_count", i64(), {ptrTy()});
-                    return builder_.CreateICmpEQ(
+                    llvm::Value* empty = builder_.CreateICmpEQ(
                         builder_.CreateCall(fn, {recv}),
                         builder_.getInt64(0), "set.empty");
+                    // fix #6352: the same unbound-temporary reclaim the `.Count`
+                    // arm directly above carries — `MakeSet().IsEmpty` is the
+                    // identical shape (an `owned Set<T>` producer consumed only
+                    // as this member's receiver) and leaked identically.
+                    freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv,
+                                                        recvTy);
+                    return empty;
                 }
                 // per §4.10 (#351): .Clear() empties the backing table. The
                 // table stays allocated for reuse; Count is 0 afterward.
@@ -2860,6 +3259,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         builder_.CreateCall(fn,
                             {recv, llvm::ConstantPointerNull::get(ptrTy())});
                     }
+                    // fix #6394: `.Clear()` returns `unit`, so its §28.3
+                    // obligation cannot sit at a return site at all — the
+                    // boundary is the end of the full expression, and this arm's
+                    // return IS that boundary. The clear itself has already
+                    // emptied the table (`bz_dict_clear_set_strings` memsets the
+                    // buckets and zeroes `count`), so the reclaim's own string
+                    // pass below finds no live key to release a second time.
+                    freeUnboundSetReceiver();
                     return llvm::ConstantInt::get(i32(), 0);  // unit result
                 }
                 // per §4.10 (#351/#389): set-algebra ops over a dict-backed Set.
@@ -2877,8 +3284,19 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     // `elemTy` here is the self element's TypeRef (the binding
                     // from genericBackingType above); the helper lowers it.
                     if (llvm::Value* res = tryLowerSetAlgebra(
-                            m, recv, *call.args[0].value, elemTy, elemIsRecord))
+                            m, recv, *call.args[0].value, elemTy, elemIsRecord)) {
+                        // fix #6394: reclaim AFTER the fold — `UnionWith` /
+                        // `IntersectWith` mutate the receiver and `ExceptWith`
+                        // / the two `Is*Of` predicates read it, so the fold is
+                        // the last use of `recv`. `tryLowerSetAlgebra` returning
+                        // null means it deferred (element-type mismatch), and
+                        // then this arm falls out to the next handler, which
+                        // discharges the same unbound population at
+                        // LlvmBackend_Calls3.cpp's fall-through reclaim — so the
+                        // reclaim is taken only on the arm that consumed `recv`.
+                        freeUnboundSetReceiver();
                         return res;
+                    }
                     // other element type mismatched self → defer (fall out).
                 }
                 // fix #1426 / stdlib §4.18: SortedSet<T>.First (least) and
@@ -2960,6 +3378,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* freeFn = declareC("free",
                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
                     builder_.CreateCall(freeFn, {keyPtr});
+                    // fix #6394: this arm is the ONE element-returning member of
+                    // the dict-backed Set block, so it takes the sibling
+                    // `freeFreshInputTempUnlessStringElementEscapes` discipline
+                    // rather than the unconditional reclaim its neighbours take.
+                    // `bz_dict_min_key_gen`/`_max_key_gen` hand back a COPY of the
+                    // key BYTES, so freeing `keyPtr` disposes the copy — but the
+                    // pointer loaded OUT of that copy is the element itself. For a
+                    // `SortedSet<string>` that is a §28.11 shared-reference slot,
+                    // whose indexer-get row reads "reference out": reclaiming the
+                    // set would release the very reference this arm returns, and
+                    // the caller's +1 is minted by its own binding lowering, which
+                    // runs after this function returns (#6393's face). For a
+                    // value / class / record element the loaded value is a copy or
+                    // a borrow of storage the table does not own, so the reclaim is
+                    // free.
+                    if (!recvElemIsString) freeUnboundSetReceiver();
                     return elemVal;
                 }
                 return nullptr;  // remaining ops scoped out for dict-backed sets
@@ -3132,6 +3566,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phi->addIncoming(builder_.getTrue(), bodyBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return phi;
         }
 
@@ -3142,6 +3577,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* nonEmpty =
                 builder_.CreateICmpSGT(len, builder_.getInt64(0), "any0.r");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return nonEmpty;
         }
 
@@ -3179,6 +3615,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phi->addIncoming(builder_.getFalse(), bodyBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return phi;
         }
 
@@ -3220,6 +3657,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(closure);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return builder_.CreateLoad(i32(), cntSlot, "cnt.r");
         }
 
@@ -3339,6 +3777,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(endBB);
                 if (relCl && closure) emitClosureRelease(closure);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 return builder_.CreateLoad(decTy, accSlot, "sum.r");
             }
 
@@ -3498,6 +3937,68 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            // fix #6366 (§28.3 *Unbound owned temporaries*, §28.9, stdlib
+            // §4.6/§4.7/§4.8, v0.338): the `Sum` twin of the `.Length`/
+            // `.Count` arm's reclaim a few lines above (which routes through
+            // this same `freeFreshInputTemp`). The accumulator is fully read
+            // into `accSlot` BEFORE the reclaim, so the backing is dead from
+            // here on. Without it, an UNBOUND `owned`-producing call consumed
+            // only as this member's receiver (`f.Make().Sum()`) leaked its
+            // whole collection: MEASURED on this fix's parent over 101
+            // iterations, 12,120 B for an `owned Array<int>` producer
+            // (`bz_array_alloc`) — against 0 for the byte-identical
+            // `_ := f.Make();` binding, which is the asymmetry that identifies
+            // this defect.
+            //
+            // NARROW: the `lazyTerminal` receiver path was NOT fixed here, and
+            // it is NOT a `LinkedList<T>`-specific residue — see the corrected
+            // scoping in the commit body and in
+            // tests/codegen/unbound_owned_collection_temp_reclaim_6366_test.cpp.
+            // A receiver that takes the `lazyTerminal` MATERIALIZATION path
+            // leaked, whatever its family. MEASURED at this fix's tip over 101
+            // iterations (`bezelc --sanitize=address`):
+            //
+            //   f.Make().Sum()             Array<int>        CLEAN (this arm)
+            //   f.Make().Sum()             LinkedList<int>   28,280 B
+            //   f.Make().ToArray()         Array<int>        12,120 B
+            //   f.Make().Where(..).Sum()   Array<int>        12,120 B
+            //
+            // `LinkedList<T>` is never array-backed, so EVERY terminal on it
+            // materializes and every one leaked; an `Array<T>` receiver
+            // materializes only when the terminal is a LINQ one (`ToArray`) or
+            // when a lazy operator precedes it (`Where(...).Sum()`). Scoping a
+            // follow-up to `LinkedList` would have left both Array faces
+            // behind.
+            //
+            // WHY it leaked: `lowerToLazyEnumerator(*ma->target, …)` lowers the
+            // receiver expression ITSELF, so by the time `recv` is rebound to
+            // the `bz_lazy_to_array` snapshot the source value exists only
+            // inside that callee — `freeFreshInputTemp` returns early
+            // (lazyTempArr is set, correctly: the snapshot is `recv`), and the
+            // source is left unreclaimed.
+            //
+            // fix #6380 (§28.3 K8, §28.9, stdlib §4.4–§4.11/§4.17–§4.18,
+            // v0.338) closed that path — NOT by threading the source out to
+            // each consumer, but by having `lowerToLazyEnumerator` TRANSFER
+            // ownership of an unbound fresh `owned` source to the lazy it
+            // builds (`bz_lazy_own_source`), so `bz_lazy_dispose` reclaims it
+            // whichever consumer drains the pipeline. Every shape named above
+            // measures 0 after #6380, over 101 iterations:
+            //
+            //   f.Make().Sum()             LinkedList<int>   0 B
+            //   f.Make().ToArray()         Array<int>        0 B
+            //   f.Make().Where(..).Sum()   Array<int>        0 B
+            //
+            // Rows for those live in
+            // tests/codegen/lazy_terminal_unbound_owned_source_reclaim_6380_test.cpp.
+            //
+            // No-op unless the receiver is exactly that shape, so
+            // a bound / `using var` / aliased / `move`d receiver is freed by
+            // its own owner (no double-free, no UAF). `freeLazyTemp` above
+            // still owns the LAZY snapshot a LINQ terminal materializes, and
+            // `freeFreshInputTemp` returns early on exactly that shape, so the
+            // two never both fire.
+            freeFreshInputTemp();
             return builder_.CreateLoad(accLLTy, accSlot, "sum.r");
         }
         // per §5 LINQ: .Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum)
@@ -3517,6 +4018,225 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!foldCl) return nullptr;
             auto* accSlot = entryAlloca(accTy);
             builder_.CreateStore(seed, accSlot);
+            // fix #6395 (§28.9 runtime-managed tier, §28.3 unbound owned
+            // temporaries, stdlib §5 `.Aggregate`, v0.338): discharge the
+            // reference each fold STEP produced, once it is superseded. Before
+            // this slot, `accSlot` was overwritten with `next` and every value
+            // the fold produced but the last was dropped on the floor with its
+            // +1 intact — a whole string per element per evaluation.
+            //
+            // The discharge is `prevSlot`, not `accSlot`, and that is the whole
+            // design. The SEED is not this loop's to release: it arrives as
+            // argument 0 and its reference discipline belongs to the argument
+            // lowering (a +1 producer transfers, a borrow does not), so releasing
+            // `accSlot` before the first store would over-release whatever the
+            // seed expression produced. `prevSlot` starts null and therefore
+            // holds ONLY values `next` itself put there — references the closure
+            // call minted, which the closure's own return path retains
+            // whichever value it returns (its accumulator parameter, a captured
+            // borrow, a concatenation), so every one of them is genuinely this
+            // loop's to release. `bz_string_release` is null- and
+            // sentinel-safe, so the null first iteration needs no branch.
+            //
+            // ⚠ THE PREMISE IS THE FOLD'S RETURN MINT, AND IT IS GATED ON
+            // `!nullable` — `aggAccIsManagedRef` below carries that conjunct and
+            // must not lose it. A `string?`-returning lambda deliberately does NOT
+            // mint +1 on return: both body forms gate the mint on
+            // `!retSemaTy->nullable` (LlvmBackend_Exprs2.cpp, the expression
+            // body; LlvmBackend_Stmts.cpp's ReturnStmt arm, which says so in
+            // terms — "a `string?` lambda return does not mint there, so it must
+            // not mint here either… the method-side `string?` mint (#2196) is a
+            // method-contract rule the lambda call-site ABI does not share").
+            // So on a nullable accumulator `next` is `acc` unchanged: the loop
+            // OWNS NOTHING, and every release this arm performs is an
+            // over-release. MEASURED (`bezelc --sanitize=address`, 101
+            // iterations, a 6-element `Array<string>` source, seed `"n"+"ull"`,
+            // identity fold `lambda(x: string?, y: string): string? => x`),
+            // toggling these three sub-changes independently:
+            //
+            //   prevSlot  seedSlot  isPlusOneStringProducer   result
+            //     –          –                –                3700 B / 200 allocs
+            //     –          –                ✓                CLEAN
+            //     –          ✓                –/✓              heap-use-after-free
+            //     ✓          –                –/✓              over-release, exit 134
+            //     ✓          ✓                –/✓              over-release, exit 134
+            //
+            // EITHER releasing slot over-releases on its own; for the identity
+            // fold the residue is closed by the `isPlusOneStringProducer` arm
+            // alone, which is why that arm keeps its nullable coverage (see
+            // LlvmBackend_Setup.cpp). For a concatenating fold the recognizer
+            // alone still leaves 25,452 B / 1,212 allocations.
+            //
+            // ON THE RESIDUE: the all-gates-off measurement is byte-identical
+            // to the pre-#6395 parent (3700 B / 200 allocations). The
+            // per-evaluation residue is element-count-invariant (2 allocations
+            // over 101 iterations, shared with the parent), which is what
+            // distinguishes the returned value from a dropped intermediate.
+            //
+            // The LAST value is deliberately NOT discharged here: it is the
+            // result this arm returns, and its reference is the caller's (whose
+            // own binding lowering mints what it needs). Releasing it would be a
+            // use-after-free on the returned value; skipping it is the transfer.
+            //
+            // MEASURED on this fix's parent at 101 iterations
+            // (`bezelc --sanitize=address`), a BOUND receiver
+            // (`var a := f.Make(); a.Aggregate("", lambda(x,y) => x + y)` over
+            // an `Array<string>`) leaked 7,235 B / 402 allocs while the
+            // UNBOUND twin leaked 25,819 B / 604 — the 18,584 B difference is
+            // the receiver portion #6396's reclaim already takes, and the
+            // byte-identical residue on both is what identifies the residue as
+            // the fold's own output rather than the receiver.
+            //
+            // Gated on the SEED's type, not the element's: it is the
+            // accumulator slot that carries the reference.
+            //
+            // `!nullable` is not a null-safety convenience — `bz_string_release`
+            // being a no-op on null is irrelevant here, because the failing
+            // accumulator is NOT null. It is the mint predicate: this arm may
+            // release a fold output only if the fold's return path minted one,
+            // and the repo's own mint gates on a non-nullable `string` return.
+            // See the ⚠ block above.
+            //
+            // And the axis is the FOLD's RETURN type, not the SEED's expression
+            // type — which is the measurement's second, quieter lesson.
+            // `a.Aggregate("n" + "ull", lambda(x: string?, y: string): string?
+            // => x)`: the seed EXPRESSION is an ordinary non-nullable `string`
+            // (a concat of two literals), and the accumulator's nullability
+            // lives entirely in the fold's annotations. Gating on
+            // `exprType(args[0])` compiles, changes nothing, and leaves the
+            // over-release in place — verified: the row still aborted with exit
+            // 134 after that edit and before this one. `args[1]` is the fold.
+            const sema::TypeRef* foldTyRef = ctx_.exprType(*call.args[1].value);
+            const sema::TypeRef* aggAccRef =
+                (foldTyRef && foldTyRef->kind == sema::TypeRef::Kind::Function)
+                    ? foldTyRef->funcReturn
+                    : foldTyRef;
+            // …and the mint is a TRANSFER-or-RETAIN, so the premise this arm
+            // discharges is true whenever EITHER half fires. Verbatim from the
+            // mint site (LlvmBackend_Exprs2.cpp, expression body — the ReturnStmt
+            // sibling in LlvmBackend_Stmts.cpp reads the same three):
+            //
+            //   emitStringRetain(v)  iff  retSemaTy->kind == Primitive
+            //                             && primitive == String
+            //                             && !retSemaTy->nullable
+            //                             && !isPlusOneStringProducer(body)
+            //                             && !returnedStringLocalOwnsPlusOne(body)
+            //
+            // Negated, a step's `next` carries a fresh +1 when the fold's return
+            // is a non-nullable `string` (the RETAIN fires) OR its body is
+            // itself a +1 producer (the transfer fires). Both halves are needed
+            // and each is measured:
+            //
+            //   `=> x`     over `string?`  neither half → no mint → the loop owns
+            //                                  nothing and every release it makes
+            //                                  is an over-release (exit 134).
+            //   `=> x! + y` over `string?`  the transfer fires → a fresh +1 per
+            //                                  step, and the per-step release is
+            //                                  correct and load-bearing: dropping
+            //                                  it costs 25,452 B / 1,212 allocs over
+            //                                  101 iterations, where the rejected
+            //                                  8a8c3246 measured that same shape
+            //                                  CLEAN. A blanket `!nullable` here is
+            //                                  therefore NOT the fix — it is the
+            //                                  band-aid the reviewer warned about,
+            //                                  and it was measured before being
+            //                                  rejected.
+            //
+            // A BLOCK-bodied fold takes the same transfer half, read off the
+            // ReturnStmt instead of `exprBody` — which is what the ReturnStmt
+            // mint site reads too. Restricted to a body that is EXACTLY ONE
+            // `return <expr>`: that is the only shape where the arm's decision
+            // is decidable from here. Two returns, or a return nested in a
+            // conditional, are left undecided and fall to the non-nullable half
+            // alone, which is the conservative direction — it under-releases a
+            // case that is already unreleased rather than over-releases one
+            // that is not. MEASURED: a single-return nullable block fold over a
+            // 6-element source leaked 25,452 B / 1,212 allocs with the gate
+            // reading only `exprBody`, and is clean once this reads the
+            // ReturnStmt; the base measures 30,352 B / 1,412 on the same
+            // program, so the residual was under-discharge on both sides, never
+            // unsoundness. The fold-body short-circuit in the `aggFoldBodyMints`
+            // initializer below keeps the call from reaching `isPlusOneStringProducer`
+            // when the fold body is absent; that function returns false on a null
+            // argument in any case. Cited by SYMBOL and not by line (#6450): the
+            // line 02b7025a gave was already off by one against its own tree, and
+            // a line is a position that a neighbouring hunk moves.
+            const auto* foldLam =
+                dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get());
+            const ast::Expr* aggFoldBody = nullptr;
+            if (foldLam) {
+                if (foldLam->exprBody)
+                    aggFoldBody = foldLam->exprBody.get();
+                else if (foldLam->stmts.size() == 1) {
+                    if (const auto* ret = dynamic_cast<const ast::ReturnStmt*>(
+                            foldLam->stmts[0].get()))
+                        aggFoldBody = ret->value.get();
+                }
+            }
+            const bool aggFoldBodyMints =
+                aggFoldBody && isPlusOneStringProducer(aggFoldBody);
+            const bool aggAccIsManagedRef =
+                aggAccRef && aggAccRef->kind == sema::TypeRef::Kind::Primitive &&
+                aggAccRef->primitive == sema::PrimitiveType::String &&
+                (!aggAccRef->nullable || aggFoldBodyMints);
+            // The gate is `mint ⇔ ¬nullable ∧ ¬producer ∧ ¬returnedLocalOwnsOne`
+            // (per §28.3, a transfer-or-retain), so "the loop owns this step" is
+            // the disjunction of its three negated conjuncts. This arm implements
+            // only the first two: a nullable `string` accumulator does NOT carry
+            // a +1 (a `string?` lambda return deliberately omits the mint per
+            // #2688), so `returnedLocalOwnsOne` never fires for a lambda
+            // accumulator parameter. A returned local's own +1 is escaped — it
+            // flows to the caller — so the loop does not own it either. The
+            // identity-fold rows empirically confirm this: `returnedStringOwns
+            // PlusOne` does not fire, and the nullable identity fold aborts
+            // without it.
+            // Allocated only on that population, so the null seed below is only
+            // ever asked for a pointer type (a `string` accumulator lowers to
+            // `ptr`); an `int`/`decimal`/struct accumulator takes neither the
+            // slot nor the release, and neither does a NULLABLE `string` (⚠
+            // above).
+            auto* prevSlot = aggAccIsManagedRef ? entryAlloca(ptrTy()) : nullptr;
+            if (prevSlot)
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     prevSlot);
+            // The SEED is a THIRD reference this arm owns, and a distinct one
+            // from the fold's outputs. `call.args[0].value` is lowered HERE (the
+            // §5 LINQ arms lower their own arguments; nothing else discharges
+            // them), so when that expression is itself a +1 producer its single
+            // reference TRANSFERS into this arm and the arm must drop it — the
+            // same §28.3 argument-contribution rule the fold outputs follow.
+            // A borrow seed (a named local, a field, a literal) is NOT this
+            // arm's to release, so the slot is seeded with the seed value only
+            // on that producer population and null otherwise, and
+            // `bz_string_release`'s null-safety discharges nothing for the
+            // rest. `seedSlot` is emptied on the FIRST fold step and re-armed
+            // with null, so the seed is released exactly once, after the one
+            // read of it, and never when the source is EMPTY — where the seed
+            // IS the value this arm returns. MEASURED on this fix's parent: an
+            // identity fold over `["aa","bb"]` seeded with the `+` producer
+            // `"p" + "q"` leaked exactly 200 allocations over 101 iterations —
+            // one undischarged seed per evaluation, invariant in the element
+            // count, which is what separates it from a dropped fold output.
+            //
+            // LIMIT, measured not assumed: this covers the seed when the seed
+            // EXPRESSION is a +1 producer. Bound to a local first, the same seed
+            // leaks 3535 B / 202 allocs identically on both sides of this fix —
+            // the leaked object is the local's own 32-byte string, i.e. an
+            // argument-reference mechanism distinct from the fold's output and
+            // out of scope here. A borrow seed the arm did not mint is not the
+            // arm's to release, and releasing one would collide with the
+            // local's own scope-end discharge.
+            //
+            // `seedSlot` rides on `aggAccIsManagedRef` and therefore on the same
+            // `!nullable` mint predicate as `prevSlot`, for the same reason and
+            // with the same measurement: a nullable accumulator's fold does not
+            // re-mint the seed, so on an identity fold the seed IS the returned
+            // value and releasing it is a use-after-free on the arm's own result
+            // — that is the `seedSlot`-only cell of the matrix above.
+            auto* seedSlot =
+                (aggAccIsManagedRef && isPlusOneStringProducer(call.args[0].value.get()))
+                    ? entryAlloca(ptrTy()) : nullptr;
+            if (seedSlot) builder_.CreateStore(seed, seedSlot);
             auto* idxSlot = entryAlloca(i64());
             builder_.CreateStore(builder_.getInt64(0), idxSlot);
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -3539,12 +4259,27 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot, "agg.env");
             auto* foldTy = llvm::FunctionType::get(accTy, {ptrTy(), accTy, elemTy}, false);
             llvm::Value* next = builder_.CreateCall(foldTy, fnPtr, {envPtr, acc, el}, "agg.next");
+            if (aggAccIsManagedRef) {
+                // Release the PREVIOUS fold output — the one this store is about
+                // to orphan — before overwriting `prevSlot` with the new one.
+                emitStringRelease(builder_.CreateLoad(ptrTy(), prevSlot, "agg.prev"));
+                builder_.CreateStore(next, prevSlot);
+            }
+            if (seedSlot) {
+                // First step only: the seed has now been read once and `accSlot`
+                // holds the fold's output instead. Re-arm with null so the
+                // release cannot recur on later iterations.
+                emitStringRelease(builder_.CreateLoad(ptrTy(), seedSlot, "agg.seed"));
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     seedSlot);
+            }
             builder_.CreateStore(next, accSlot);
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             if (relCl) emitClosureRelease(foldCl);  // #422: inline-lambda transient
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return builder_.CreateLoad(accTy, accSlot, "agg.r");
         }
         // per §5/§5.1 LINQ: .Average(fn: (T)->numeric): double  /  .Average(): double
@@ -3647,6 +4382,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 emitPendingCheck();
                 if (relCl && closure) emitClosureRelease(closure);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 return builder_.CreateLoad(decTy, divSlot, "avg.r");
             }
 
@@ -3713,6 +4449,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* cnt = builder_.CreateSIToFP(len, dblTy, "avg.cnt");
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return builder_.CreateFDiv(total, cnt, "avg.r");
         }
         // per §5 LINQ: .Min/.Max (fn: (T)->int): int  or no-arg for Array<int>
@@ -3786,6 +4523,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.CreateBr(condBB);
                 builder_.SetInsertPoint(endBB);
                 freeLazyTemp();
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
 
@@ -3851,6 +4589,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 builder_.SetInsertPoint(endBB);
                 if (relClMM) emitClosureRelease(closure);
                 freeLazyTemp();
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 return builder_.CreateLoad(decTy, accSlot, "mm.r");
             }
 
@@ -3992,6 +4731,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.CreateBr(condBB);
                     builder_.SetInsertPoint(endBB);
                     freeLazyTemp();
+                    freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
                 }
                 // fix #2770: a REFERENCE element (class or interface — both
@@ -4201,6 +4941,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.SetInsertPoint(endBB);
                     if (relCl) emitClosureRelease(closureP);  // #422 inline-lambda
                     freeLazyTemp();
+                    freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
                 }
             }
@@ -4335,6 +5076,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(endBB);
             if (relCl && closure) emitClosureRelease(closure);  // #422: inline-lambda
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return builder_.CreateLoad(accLLTy, accSlot, "mm.r");
         }
         // fix #2783 (stdlib §5.1, v0.240): .MinOrNull() / .MaxOrNull() —
@@ -4570,6 +5312,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
                     emptyBB);
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 llvm::Value* res = builder_.CreateInsertValue(
                     llvm::UndefValue::get(nst), hvPhi, {0u});
                 resultV = builder_.CreateInsertValue(
@@ -4579,6 +5322,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ptrPhi->addIncoming(exitVal, condBB);
                 ptrPhi->addIncoming(nullResult, emptyBB);
                 freeLazyTemp();
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 resultV = ptrPhi;
             }
             return resultV;
@@ -4630,6 +5374,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notFound, "InvalidOperationException");
             llvm::Value* fstv = builder_.CreateLoad(elemTy, resultSlot, "fst.r");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return fstv;
         }
         // per §5 LINQ (#789): .Last(pred: (T)->bool): T — the LAST element
@@ -4677,6 +5422,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notFound, "InvalidOperationException");
             llvm::Value* lstv = builder_.CreateLoad(elemTy, resultSlot, "lstp.r");
             freeLazyTemp();
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return lstv;
         }
         // per §5 LINQ (#789): .Single(pred): T — the sole element satisfying the
@@ -4737,6 +5483,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitGuardThrow(notOne, "InvalidOperationException");
             llvm::Value* sglv = builder_.CreateLoad(elemTy, resultSlot, "sgl.r");
             freeLazyTemp();
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return sglv;
         }
         // per §5 LINQ (#789): .LastOrNull(pred): T? — the LAST element satisfying
@@ -4824,6 +5571,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::Constant::getNullValue(elemTy), loadedV, "lon.ptr");
             }
             freeLazyTemp();
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return resultV;
         }
         // per §5 LINQ element access (no-predicate forms): First()/Single()
@@ -4860,6 +5608,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // #1930: over a bare GroupBy this returns a live grouping — keep it,
             // free its siblings + the array spine (else free the borrow snapshot).
             freeLazyTemp(keepGroupByGrouping ? fstv : nullptr);
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return fstv;
         }
         if (m == "Last" && call.args.empty()) {
@@ -4876,6 +5625,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
             llvm::Value* lstv = builder_.CreateLoad(retTy, out, "lst.r");
             freeLazyTemp(keepGroupByGrouping ? lstv : nullptr);  // #1930: keep the returned grouping
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return lstv;
         }
         if (m == "ElementAt" && call.args.size() == 1 && call.args[0].value) {
@@ -4896,6 +5646,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(getFn, {recv, idx, out, builder_.getInt64(esz)});
             llvm::Value* eav = builder_.CreateLoad(retTy, out, "elemat.r");
             freeLazyTemp(keepGroupByGrouping ? eav : nullptr);  // #1930: keep the returned grouping
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return eav;
         }
         // stdlib §5: FirstOrNull() / FirstOrNull(predicate): return the first
@@ -4984,6 +5735,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 0), preBB);
                 // Free AFTER the PHI nodes.
                 freeLazyTemp();
+                freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
                 llvm::Value* res = builder_.CreateInsertValue(
                     llvm::UndefValue::get(nst), hvPhi, {0u});
                 resultV = builder_.CreateInsertValue(res, valPhi, {1u});
@@ -4997,6 +5749,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // free its siblings + the array spine; a runtime-null ptrPhi (empty)
                 // makes _except free all (correct, nothing is returned).
                 freeLazyTemp(keepGroupByGrouping ? ptrPhi : nullptr);  // Free AFTER the PHI node.
+                freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
                 resultV = ptrPhi;
             }
             return resultV;
@@ -5097,6 +5850,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "fon.ptr");
             }
             freeLazyTemp();
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return resultV;
         }
         // stdlib §5 (#661): SingleOrNull(predicate: (T)->bool): T? — return the
@@ -5220,6 +5974,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     "son.ptr");
             }
             freeLazyTemp();
+            freeFreshInputTempUnlessStringElementEscapes();  // §28.11: a `string` slot's reference escapes — see the lambda
             return resultV;
         }
         // per §5 LINQ: .Skip / .Take are LAZY — see tryLowerLazyLinqCall.
@@ -5887,6 +6642,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phiIdx->addIncoming(builder_.getInt64(-1), condBB);
             llvm::Value* iofv = builder_.CreateTrunc(phiIdx, i32(), "iof.i32");
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return iofv;
         }
         // per §5 LINQ: .Distinct() is LAZY — see tryLowerLazyLinqCall.
@@ -7614,6 +8370,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             phiCon->addIncoming(builder_.getTrue(), foundBB);
             phiCon->addIncoming(builder_.getFalse(), condBB);
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
+            freeFreshInputTemp();  // per §28.3 + §28.9, v0.338 — the eager-terminal twin (see freeFreshInputTemp)
             return phiCon;
         }
 
@@ -8380,7 +9137,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // a no-op for the common named-local receiver. Mirrors the
             // `.Count()` arm's identical call, placed last since it is the
             // final use of `recv`.
-            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+            //
+            // fix-forward #6419 (§28.11 *Collection element ownership*, stdlib
+            // §4.8, v0.338): the `dictValueColumnEscapes` argument is the
+            // escape axis and it is `true` here, which is the whole content of
+            // this fix-forward. The
+            // `DictionaryEntry<K,V>` this arm is about to RETURN holds
+            // `dtValDecoded`, and `decodeDictValueAt` produced that by passing a
+            // pointer-typed V straight through "as a borrow" — it IS the table's
+            // own `e.val`. `bz_dict_values_str`/`_gen` say so in their own
+            // header ("the values themselves are owned by the dictionary and
+            // must NOT be freed by the caller"), and this arm's own opening
+            // comment already records the consequence for `OwningDictionary`:
+            // the value "is disposed exactly once, at the dictionary's own
+            // scope end — never here".
+            //
+            // So the table is still reclaimed (header, buckets, order spine,
+            // every key byte-copy — nothing the returned entry points into: its
+            // Key is rebuilt fresh by `decodeDictStringKeyAt`, its Value is a
+            // `bz_string*` the free does not own), and only the §28.11 value
+            // DISCHARGE is declined. Declining the whole reclaim instead — what
+            // `freeFreshInputTempUnlessStringElementEscapes` does one block
+            // over for an `Array<string>` element terminal — would give back the
+            // table leak too, and the measurement shows the table free is sound
+            // here.
+            //
+            // MEASURED on this fix's parent (dc3c8f2a), 101 iterations,
+            // `bezelc --sanitize=address`, `Dictionary<string,string>` AND the
+            // int-keyed `Dictionary<int,string>` twin:
+            // `==ERROR: AddressSanitizer: heap-use-after-free ... freed by
+            // thread T0 here: #0 free #1 bz$strElemRelease`, exit 1. The base
+            // (dc3c8f2a^) runs the same program to completion, correct stdout,
+            // leaks only — so dc3c8f2a introduced this, and declining the
+            // discharge removes it.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy,
+                                               /*dictValueColumnEscapes=*/true);
 
             llvm::Value* dtEntryVal = llvm::UndefValue::get(dtEntryStTy);
             dtEntryVal = builder_.CreateInsertValue(dtEntryVal, dtKeyDecoded, {0u});
@@ -8441,6 +9232,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_dict_clear", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {recv, dispV});
+            // fix #6419 (§28.3 *Unbound owned temporaries*, §28.9, stdlib
+            // §4.8/§4.9/§4.17, v0.338): reclaim an UNBOUND `owned Dictionary` /
+            // `OwningDictionary` / `SortedDictionary`-producing receiver here.
+            // #6394 gave the `isArr` block's Set arms this call; this is the
+            // sibling `isDict` block, which carried it only in its `.Count` and
+            // First/Last snapshot arms. MEASURED on this fix's parent
+            // (867dfb00) at 101 iterations under `bezelc --sanitize=address`:
+            //
+            //   MakeDict().Contains("bb")   42,925 B / 606 allocs
+            //   MakeDict().Add("dd", 4)      43,228 B / 707
+            //   MakeDict().Remove("aa")      42,622 B / 505
+            //   MakeDict().Clear()           42,016 B / 303
+            //
+            // against 0 for the byte-identical `var d := MakeDict();` twin of
+            // each — the asymmetry that identifies the defect, since a BOUND
+            // receiver is discharged by its own owner (§28.3).
+            //
+            // PLACEMENT is §28.3's end-of-full-expression boundary, and it is
+            // forced here for a reason `.Clear`'s `unit` result does not make
+            // obvious: `bz_dict_clear` EMPTIES the table but leaves the
+            // `bz_dict_t` header, its bucket array and its insertion-order
+            // spine allocated (stdlib §4.8: "Clear() … empties it; the
+            // dictionary itself stays allocated"). So the reclaim must come
+            // AFTER the clear — which is also the arm's own return.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return llvm::ConstantInt::get(i32(), 0);  // unit result
         }
         // .ContainsKey(k) / .Contains(k) (alias, §4.8): bool
@@ -8450,7 +9266,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!k) return nullptr;
             if (keyTy) {
                 auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
+                llvm::Value* has =
+                    builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
+                // fix #6419: the membership probe is a PURE BORROW of both the
+                // argument (which `bz_dict_contains_gen` hashes and compares by
+                // the lowered key BYTES) and the receiver, so the `bool` this
+                // arm returns aliases nothing and §28.3's end-of-full-expression
+                // reclaim is safe here.
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+                return has;
             }
             auto [kd, kl, kw] = strDataLen(k);
             auto* fn = declareC("bz_dict_contains_str", i1(),
@@ -8465,6 +9289,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // sole (already-completed) use of its buffer.
             if (isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: the twin of the generic-key reclaim above — the bool
+            // aliases nothing, so the receiver's own obligation is discharged at
+            // this return (§28.3's end-of-full-expression boundary).
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return r;
         }
         // fix #3372 / stdlib §4.8 + §4.9 (v0.282, §1 Try shape (d)):
@@ -8557,6 +9385,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // release scoped to the branch it belongs to).
             if (!keyTy && isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: `endBB` is the join of BOTH arms — the duplicate edge
+            // (value disposed, table untouched) and the insert edge (value
+            // transferred into the table) — so it is the one point at which
+            // `recv` is provably no longer read on either path. The reclaim
+            // goes HERE, not in `insBB`, which would free the table on the
+            // insert path only and leave the duplicate path to double-free
+            // against the receiver's own owner. `phi` is a `bool` over the
+            // insertion outcome and aliases no slot of the receiver, so the
+            // returned value is unaffected (§28.3's end-of-full-expression
+            // boundary is this return).
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return phi;
         }
         // .Add(k, v) / .Set(k, v)
@@ -8684,6 +9523,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // / OwningSet Add nulling paths.
                 if (dictValIsOwning)
                     nullTransferredOwnedLocalSlot(call.args[1].value.get());
+                // fix #6419: the insert is the last read of `recv` — the table
+                // now OWNS the value, and `.Add` returns `unit`, so nothing this
+                // arm hands back aliases the backing and §28.3's reclaim goes
+                // here, after the insert. Placed after `nullTransferredOwned
+                // LocalSlot` so the transfer bookkeeping is unchanged; the two
+                // touch disjoint state (the caller's slot vs the dict header).
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
                 return llvm::ConstantInt::get(i32(), 0);
             }
             auto [kd, kl, kw] = strDataLen(k);
@@ -8706,6 +9552,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // exactly-once regardless of which edge fires.
             if (isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: the twin of the generic-key reclaim above, on this arm's
+            // one non-throwing return. §28.3's boundary is the end of the full
+            // expression, which for a `unit`-returning arm IS its own return.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return llvm::ConstantInt::get(i32(), 0);
         }
         // .Remove(k): bool — per §4.9: OwningDictionary.Remove disposes the
@@ -8742,16 +9592,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!valDisp && dictIsStringValue)
                 valDisp = stringElementReleaseThunk();
             if (keyTy) {
+                // fix #6419: both generic-key returns are hoisted into
+                // `removeResult` so the receiver's §28.3 reclaim can run on the
+                // ONE edge this arm returns through, exactly as the string-key
+                // branch below already does. Hoisting a `CreateCall` changes no
+                // code — the call keeps its position relative to every other
+                // instruction — it only gives the name a binding.
+                llvm::Value* removeResult;
                 if (valDisp) {
                     // OwningDictionary (or Dict<K,string>) with generic key.
                     auto* fn = declareC("bz_dict_remove_gen_disposing", i1(),
                                         {ptrTy(), ptrTy(), ptrTy()});
-                    return builder_.CreateCall(
+                    removeResult = builder_.CreateCall(
                         fn, {recv, genKeyPtr(k), llvm::cast<llvm::Value>(valDisp)},
                         "dict.remove");
+                } else {
+                    auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
+                    removeResult = builder_.CreateCall(
+                        fn, {recv, genKeyPtr(k)}, "dict.remove");
                 }
-                auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
+                // fix #6419: the removed value is DISPOSED inside the call
+                // (`_disposing` variant) or never entered the table, and the
+                // `bool` this arm hands back aliases no slot of it — so the
+                // unbound receiver is spent here and §28.3's reclaim is safe.
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+                return removeResult;
             }
             auto [kd, kl, kw] = strDataLen(k);
             llvm::Value* removeResult;
@@ -8772,6 +9637,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // complete by this point — release a fresh +1 KEY producer now.
             if (isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: the twin of the generic-key reclaim above, placed at
+            // this arm's single return so BOTH the disposing and the plain
+            // `bz_dict_remove_str` variants are covered by the one call.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return removeResult;
         }
         // fix #643 / stdlib §4.9: .PopValue(k): owned V — retrieve the owned

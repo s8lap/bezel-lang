@@ -3215,6 +3215,26 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
     }
 }
 
+// fix #6327 / §27.8, §12.1, §11.2 (v0.338): the spelling compare, alias
+// expansion or not. An alias expansion is ALREADY alias-transparent to it: a
+// declaration-less Named pair is compared through `TypeRef::headName()`
+// (`TypeRef.hpp`), which reads `aliasResolvedHead` — the UNDERLYING head the
+// expansion carries — before the use-site one, so `Id<Q>` on one side and `Q`
+// on the other are the same head and the same type, exactly as §27.8's "pure
+// synonym" requires. #6316 instead gave up on the spelling the moment an alias
+// marker appeared anywhere in either tree and fell back to the blind
+// `typeRefEqual`, which cannot tell two class type parameters apart at all
+// (`P` with `Q` compared equal): a plainly wrong override whose pair merely
+// MENTIONS an alias was accepted. The only remaining blind case is an
+// IMPORTED declaration, where the marker does not survive the artifact
+// boundary and a spelling read would compare the alias name, not the type.
+static bool typeRefEqualScopedUnlessAlias(const TypeRef* a, const TypeRef* b,
+                                          bool anyImported) {
+    if (anyImported)
+        return Resolver::typeRefEqual(a, b);
+    return Resolver::typeRefEqualSameScope(a, b);
+}
+
 bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
     return typeRefEqualImpl(a, b, /*sameScope=*/false);
 }
@@ -3486,6 +3506,140 @@ static std::string_view builtinExceptionName(const TypeRef* t) {
     return common::isBuiltinExceptionName(n) ? n : std::string_view{};
 }
 
+// fix #6335 / §22.6, §11.3, §12.9 (v0.338): a parameter type in the
+// §22.6/§11.3 clash predicate. `typeRefEqual` decides a `Named` pair by
+// declaration-POINTER identity, and every ref that names a built-in class or
+// interface (`Array`, `IEnumerable`, `IList`, `ICollection`, `Set`, `Object`,
+// `Exception`, `Task`, ...) or a CLASS type parameter carries
+// `declaration == nullptr` — the always-available built-ins have no user
+// TypeSymbol (§31.4). The blind compare therefore calls `Array<V>` and
+// `IEnumerable<V>` the same type, and two overloads differing only in which
+// stdlib instantiation they name are reported as indistinguishable: a pair
+// that §22.6 admits and §12.9 separates (collection vs interface). The same
+// blindness is what `typeRefEqualSameScope` fixes on the override path
+// (#6315); this is the declaration-side half, the twin of #6292's call-side
+// half.
+//
+// Two guards keep the name compare from over-reaching:
+//
+//  * §11.3 "Generic methods" (v0.338): "Two methods declaring the same number
+//    of type parameters of their own compare their parameter types with those
+//    type parameters corresponding by position, not by name ... So `M<T>(x: T)`
+//    and `M<U>(x: U)` clash ... Neither type-parameter names nor `where`
+//    constraints distinguish members." A bare type parameter is therefore
+//    compared by its POSITION in the declaring method's own list, never by
+//    spelling — and a type parameter is never the same type as a non-type-
+//    parameter (`M<T>(x: int)` beside `M<U>(x: U)` are distinguishable).
+//    CLASS type parameters are not covered by that clause, which speaks of
+//    "type parameters of their own", so `V` and `W` are compared by spelling
+//    like any other declaration-less Named ref — the same reading
+//    `typeRefEqualSameScope` already applies to `Array<V>` with `Array<W>`
+//    (#6315), so both paths agree.
+//
+//  * §27.8 (v0.338) makes a type alias transparent for identity, and its
+//    closing sentence is SYMMETRIC: "Type aliases — generic or not — see
+//    through to the aliased type for identity, equality, method dispatch,
+//    and overload resolution." An aliased TypeRef has had its UNDERLYING
+//    payload copied in (with the use-site astNode restored), and the
+//    underlying head is carried on the ref itself in `aliasResolvedHead`.
+//    `headName()` reads `aliasResolvedHead` FIRST, so the head compare
+//    below already sees through an alias on BOTH sides: `Id<V>` (whose
+//    `aliasResolvedHead` is `V`) compares as `V`, which is what makes it
+//    one type with a bare `V` and the two spellings still clash.
+//
+//    This is fix #6344. The guard that used to sit here read
+//    `!a->aliasResolvedHead.empty()` and, when it fired, SKIPPED the head
+//    compare entirely -- consulting the alias-resolved head on ONE side
+//    only. That made the verdict depend on argument order: `Take(x: Id<V>)`
+//    beside `Take(x: W)` was reported indistinguishable while the mirror
+//    `Take(x: W)` beside `Take(x: Id<V>)` was accepted, though §27.8's
+//    see-through is symmetric and the two spellings name one type either
+//    way round. The comment above it justified the skip by claiming
+//    `headName()` "would compare `Id<V>`'s alias spelling `Id`", which is
+//    false -- `headName()` returns `aliasResolvedHead`, never the alias
+//    spelling. Dropping the guard therefore changes a verdict ONLY where
+//    `aliasResolvedHead` is non-empty, i.e. exactly where `headName()`
+//    was already returning the underlying head.
+//
+// A ref with NO readable head (neither astNode, importedName nor an alias
+// head) still keeps the blind compare, through the `ha.empty() || hb.empty()`
+// arm below: an unknown head is not evidence of a difference.
+static bool overloadSigTypeRefEqual(const TypeRef* a, const TypeRef* b,
+                                    const std::vector<Symbol*>& aTPs,
+                                    const std::vector<Symbol*>& bTPs) {
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->nullable != b->nullable) return false;
+    switch (a->kind) {
+        case TypeRef::Kind::Error:
+            return false;
+        case TypeRef::Kind::Unit:
+            return true;
+        case TypeRef::Kind::Primitive:
+            return a->primitive == b->primitive;
+        case TypeRef::Kind::Named: {
+            if (a->declaration != b->declaration) return false;
+            if (!a->declaration) {
+                // §11.3 positional correspondence for a bare type parameter
+                // of the DECLARING METHOD's own list.
+                auto indexOf = [](const TypeRef* t,
+                                  const std::vector<Symbol*>& tps) -> int {
+                    if (!t->genericArgs.empty()) return -1;
+                    std::string_view n = t->headName();
+                    for (std::size_t k = 0; k < tps.size(); ++k) {
+                        if (auto* gps =
+                                dynamic_cast<GenericParamSymbol*>(tps[k])) {
+                            if (gps->name == n) return static_cast<int>(k);
+                        }
+                    }
+                    return -1;
+                };
+                const int ia = indexOf(a, aTPs);
+                const int ib = indexOf(b, bTPs);
+                if (ia >= 0 && ib >= 0) return ia == ib;
+                if (ia >= 0 || ib >= 0) return false;
+                const std::string_view ha = a->headName();
+                const std::string_view hb = b->headName();
+                if (ha.empty() || hb.empty() || ha == hb) {
+                    // equal heads, or an unreadable head: fall through to the
+                    // structural compare below.
+                } else {
+                    return false;
+                }
+            }
+            if (a->genericArgs.size() != b->genericArgs.size()) return false;
+            for (std::size_t i = 0; i < a->genericArgs.size(); ++i) {
+                if (!overloadSigTypeRefEqual(a->genericArgs[i],
+                                             b->genericArgs[i], aTPs, bTPs))
+                    return false;
+            }
+            return true;
+        }
+        case TypeRef::Kind::InlineArray:
+            if (a->arrayOwned != b->arrayOwned) return false;
+            if (a->arraySizeValue >= 0 && b->arraySizeValue >= 0 &&
+                a->arraySizeValue != b->arraySizeValue)
+                return false;
+            return overloadSigTypeRefEqual(a->arrayElement, b->arrayElement,
+                                          aTPs, bTPs);
+        case TypeRef::Kind::Function: {
+            if (a->funcParams.size() != b->funcParams.size()) return false;
+            for (std::size_t i = 0; i < a->funcParams.size(); ++i) {
+                if (a->funcParams[i].modifier != b->funcParams[i].modifier)
+                    return false;
+                if (!overloadSigTypeRefEqual(a->funcParams[i].type,
+                                             b->funcParams[i].type, aTPs,
+                                             bTPs))
+                    return false;
+            }
+            return a->funcReturnOwned == b->funcReturnOwned &&
+                   overloadSigTypeRefEqual(a->funcReturn, b->funcReturn, aTPs,
+                                           bTPs);
+        }
+    }
+    return false;
+}
+
 bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                            const std::vector<Symbol*>& b,
                                            const std::vector<Symbol*>& aGenericParams,
@@ -3559,7 +3713,8 @@ bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                    : nullptr;
         TypeRef* tb = pb->declType ? ctx_.resolvedType(*pb->declType)
                                    : nullptr;
-        if (!typeRefEqual(ta, tb)) return false;
+        if (!overloadSigTypeRefEqual(ta, tb, aGenericParams, bGenericParams))
+            return false;
         {
             // fix #5862: two different built-in exception classes.
             std::string_view na = builtinExceptionName(ta);
@@ -6138,16 +6293,60 @@ void Resolver::checkDuplicateTopLevelTypes() {
     }
 }
 
+// fix #6445 (§11.6 "Nested types" / §12.10, v0.338): the roots of this walk
+// must include every NESTED type, not only `ctx_.module()->children`.
+//
+// The pre-fix loop rooted the DFS at module children alone, so a cycle whose
+// every member sits inside another type was never entered and never reported.
+// §12.10 requires an ERROR for it ("no type may, directly or transitively,
+// list itself among its base classes"), and with the diagnostic missing the
+// cycle reached codegen, where `Emitter::classStruct`'s base-chain walk
+// (`for (const TypeSymbol* cur = t; cur;) { cur = baseClassOf(cur); }`,
+// LlvmBackend_Layout.cpp) has no cycle guard at all and spins forever — a
+// hang with no output, MEASURED at rc=124/40s on `class Outer` holding
+// `private class P1 : P2` / `private class P2 : P1`. The fix is to make the
+// nested types reachable as ROOTS, never to bound either walk: a depth cap
+// would convert the hang into a silent acceptance, and §12.10 wants the
+// diagnostic.
+//
+// Nested types are reached through the one shared recursive walk,
+// `sema/NestedTypeWalk.hpp`'s `visitTypeAndNested` (§11.6, fix #3574) — the
+// same accessor thirteen other passes in this file use, rather than a
+// hand-copied member walk. `checkInheritanceCycles` walks the module children
+// ITSELF and adds the nested arms through that helper, because the module
+// children are not all types: §21.10 method-LOCAL types are registered there
+// too (see the sibling loop in checkDuplicateTopLevelTypes), are legitimately
+// cycle-checked today, and `forEachTypeAndNested` deliberately does not reach
+// them. Dropping them here would trade this hang for a second one.
+//
+// `done` stays PER ROOT, exactly as before: sharing it across roots would let
+// the first root's DFS mark a cycle participant "fully explored" and the
+// second root would return immediately without reporting it, losing the
+// second `circular inheritance` diagnostic the top-level repro emits.
+//
+// Nothing else rides on this iteration set. `checkCycleFrom` reads only
+// `baseTypes` (and `name`/`declLoc` for the message), reports only on a
+// genuine re-entry of a symbol already on the CURRENT DFS path, and drives no
+// generic substitution, no §12.9 variance composition and no §12.1 base-type
+// path walk — so adding roots cannot widen any other behaviour. The returned
+// `hadCycle` flag does gate checkAbstractImplementations /
+// checkStaticInterfaceConformance / checkHidingAndOverride (TypeResolution.cpp:
+// those three walks a base graph they cannot traverse finitely), and it can
+// now become true only for a program that is being REJECTED here.
 bool Resolver::checkInheritanceCycles() {
     if (!ctx_.module()) return false;
     std::unordered_set<TypeSymbol*> reported;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
+    auto walkRoots = [&](TypeSymbol* root) {
         std::unordered_set<TypeSymbol*> onStack;
         std::unordered_set<TypeSymbol*> done;
         std::vector<TypeSymbol*> path;
-        checkCycleFrom(t, onStack, done, path, reported);
+        checkCycleFrom(root, onStack, done, path, reported);
+    };
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        walkRoots(t);
+        bezel::sema::visitTypeAndNested(t, walkRoots);
     }
     return !reported.empty();
 }
@@ -6175,23 +6374,99 @@ TypeRef* Resolver::applyGenericSubst(
         TypeRef* tr,
         const std::unordered_map<std::string_view, TypeRef*>& genericSubst) {
     return sema::substituteGenericArgs(
-        tr, sema::SubstArgs{ctx_, genericSubst});
+        tr, sema::SubstArgs{ctx_, genericSubst, {}, false, true});
 }
 
-// §12.1 (#6299): the positions, in each class's `baseTypes`, of the base-type
-// path from `from` down to `target` (depth-first, first path found). Returns
-// false when `target` is not reachable through `baseTypes`.
+// fix #6327 (§27.8, §12.1, §11.2, v0.338): the same walk for a BASE member's
+// declared type, which may itself BE an alias expansion over the base class's
+// own type parameter (`property V: Id<W>` in `B2<K, W>`). §27.8 makes an alias
+// a pure synonym, so `Id<W>` IS `W` and the chain substitution must reach
+// through it. `applyGenericSubst` looks a bare-parameter leaf up by its
+// SYNTACTIC head (`SubstArgs.cpp` `paramHead`), and an alias expansion carries
+// the alias's use site in `astNode` (`Id`), so `W` was missed and the base
+// type kept its unsubstituted `W`. The walker's `aliasChainParams` mode — the
+// one #6321 added for exactly this shape — retries the lookup by
+// `aliasResolvedHead` (the underlying parameter's name), so it substitutes
+// `Id<W>` -> `Q` and leaves every other spelling exactly as `applyGenericSubst`
+// leaves it (the retry is skipped for a built-in underlying head, which is
+// never a parameter).
+static TypeRef* applyBaseMemberSubst(
+        SemaContext& ctx, TypeRef* tr,
+        const std::unordered_map<std::string_view, TypeRef*>& genericSubst) {
+    return sema::substituteGenericArgs(
+        tr, sema::SubstArgs{ctx, genericSubst, SourceLocation{},
+                            /*validateNestedInlineArrays=*/false,
+                            /*aliasChainParams=*/true});
+}
+
+// §12.1 (#6299, v0.338): the positions, in each class's `baseTypes`, of the
+// base-type path from `from` down to `target` (depth-first, first path found).
+// Returns false when `target` is not reachable through `baseTypes`.
+//
+// The walk is TOTAL — it terminates on the SHAPE of the base-type graph, not
+// on a count (#6416). It used to carry a bare `depth > 64` literal, which is
+// the WRONG direction for this call site: §12.1 states override matching with
+// no depth qualifier ("parameter types … must match the base member
+// exactly"), and a base chain 65 classes long is legal Bezel at every level.
+// Past the bound the walk returned "not reachable", `buildBaseClassGenericSubst`
+// therefore composed an EMPTY substitution, the base member's `P(a: T)` was
+// read unsubstituted, and a correct `E: C65<string>` overriding `P(a: string)`
+// was REJECTED with a §12.1 override-mismatch diagnostic naming a rule it
+// satisfied. Raising the literal would leave the same hole one constant
+// higher, and DIAGNOSING at the bound would reject a program the spec admits
+// for a reason Appendix C.1 does not list; removing the bound is the only
+// spec-faithful repair, exactly as for the sibling §12.9 walks in #6391 and
+// #6408.
+//
+// What replaces the count is a per-path cycle guard: `onChain` holds the
+// symbols on the CURRENT enclosing path, inserted on entry and erased on
+// every SUCCEEDED exit.  The function has four exit paths (three return
+// statements; the first covers both the null and the failed-insert case):
+//
+//   1. `!from` early-out:        nothing was inserted — erase is unnecessary.
+//   2. `!onChain.insert(…).second`: insert failed, meaning `from` is already
+//      on the path from an ANCESTOR frame.  The entry belongs to that frame;
+//      erasing here would remove the ancestor's guard and allow the same
+//      symbol to be re-entered from a sibling branch, causing a hang on any
+//      cyclic hierarchy.  This is the load-bearing exit path for §12.10 cycles.
+//   3. Success (found `target`):  `from` is on the current path; erase it.
+//   4. Exhausted all bases:      `from` is not on the path to `target`; erase it.
+//
+// Multiple INTERFACE bases are legal (§11.2): a class can implement I1 and I2
+// even when both extend J, giving the classic diamond.  The erasure is what
+// makes the diamond work — without it, the second branch into J finds J already
+// on the path, bails, and the target (reachable only through that branch) is
+// never found.  The interface diamond (I1:J, I2:J, E:I1, I2, D) is the case
+// that proves the erasure is load-bearing for the interface graph.  The test
+// `interface_diamond_correct_override_accepted` in this file mechanically
+// demonstrates that without the erasure the row goes RED; with it, it is GREEN.
+// This is in contrast to the class case: §11.1 (line 1768) is single-inheritance
+// for classes, so a class base is never reachable by two paths.
+//
+// The guard fires only on a genuine cycle — a program the compiler accepts
+// cannot contain one, because §12.10 rejects an inheritance cycle: a type may
+// not, directly or transitively, list itself among its base types — neither as
+// the base class of a class, nor as an extended interface of an interface.
+// This ordering is MEASURED, not assumed:
+// `sema_base_type_path_depth_total_6416.inheritance_cycle_reports_12_10_not_override_mismatch`
+// (tests/sema/base_type_path_depth_total_6416_test.cpp) compiles a three-class
+// cycle and pins §12.10's own diagnostic, so the guard cannot pre-empt it into
+// a silent acceptance.
 static bool baseTypePathTo(const TypeSymbol* from, const TypeSymbol* target,
-                           std::vector<std::size_t>& path, int depth) {
-    if (!from || depth > 64) return false;
+                           std::vector<std::size_t>& path,
+                           std::unordered_set<const TypeSymbol*>& onChain) {
+    if (!from || !onChain.insert(from).second) return false;
     for (std::size_t bi = 0; bi < from->baseTypes.size(); ++bi) {
         const TypeSymbol* b = from->baseTypes[bi];
         if (!b) continue;
         path.push_back(bi);
-        if (b == target || baseTypePathTo(b, target, path, depth + 1))
+        if (b == target || baseTypePathTo(b, target, path, onChain)) {
+            onChain.erase(from);
             return true;
+        }
         path.pop_back();
     }
+    onChain.erase(from);
     return false;
 }
 
@@ -6221,7 +6496,8 @@ void Resolver::buildBaseClassGenericSubst(
     // records no argument at some level leaves the map empty, as before.
     if (!derivedClass || !baseClass) return;
     std::vector<std::size_t> path;
-    if (!baseTypePathTo(derivedClass, baseClass, path, 0)) return;
+    std::unordered_set<const TypeSymbol*> onChain;
+    if (!baseTypePathTo(derivedClass, baseClass, path, onChain)) return;
     std::unordered_map<std::string_view, TypeRef*> bound;  // child's params → derived-scope args
     const TypeSymbol* child = derivedClass;
     for (std::size_t bi : path) {
@@ -7204,8 +7480,43 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // parameter, which are inputs).
         TypeRef* dTy =
             dDecl->type ? ctx_.resolvedType(*dDecl->type) : nullptr;
-        TypeRef* bTySubst = applyGenericSubst(bTy, genericSubst);
-        if (!typeRefEqual(dTy, bTySubst)) {
+        // #6327 (§27.8, v0.338): the base's OWN declared type may be an alias
+        // over the base class's type parameter (`property V: Id<W>`), so the
+        // chain substitution must reach through the alias expansion — hence
+        // applyBaseMemberSubst, not applyGenericSubst.
+        TypeRef* bTySubst = applyBaseMemberSubst(ctx_, bTy, genericSubst);
+        // #6316 / #12.1, §11.2 (v0.338): `dTy` is in the derived class's
+        // scope and `bTySubst` was read into it through the chain-composed
+        // `genericSubst`, so a class type parameter compares by spelling
+        // (`[i: P]: P` does not implement `B2<P, Q>`'s `[i: K]: W`).
+        // #6327: an alias expansion no longer makes the compare blind — §27.8
+        // makes an alias a pure synonym, and the spelling read sees through
+        // it — so only an IMPORTED base (where the marker is lost) stays on
+        // the blind compare.
+        //
+        // fix #6328 (§12.1, §11.2, §27.8, v0.338): for an IMPORTED base that
+        // blind compare cannot stay: `bDecl` is null (the artifact interface
+        // carries no AST, §2.8.2/§2.8.3), so `bTy` arrives through
+        // ctx_.importedMemberType, and a class type parameter crossing the
+        // artifact boundary is exactly a declaration-less Named ref whose head
+        // is its name — the shape the blind `typeRefEqual` equates with every
+        // other declaration-less Named ref. `B2<P, Q>`'s `V: Q` was therefore
+        // "implemented" by `V: P` across a module boundary while the identical
+        // one-unit program is rejected.
+        //
+        // `overrideSpellingDiffers` is the same walk the method-return and
+        // method-parameter sites already run on an IMPORTED base
+        // (checkOverrideSignatureMatch, above), so this adds no new failure
+        // mode: it compares a base class parameter against its substituted
+        // argument in the derived scope, is alias-transparent by construction
+        // (`declLessNamedSpelling` reads `aliasResolvedHead` first), and leaves
+        // every other spelling to `typeRefEqual`. A base type that is NOT a
+        // class parameter — a builtin, a user class — is not a substitution
+        // site, so the walk declines it exactly as it declines one for a
+        // local base.
+        const auto valueScope = makeOverrideTParamScope(derived, base, genericSubst);
+        if (!typeRefEqualScopedUnlessAlias(dTy, bTySubst, !bDecl) ||
+            overrideSpellingDiffers(dTy, bTy, valueScope, false)) {
             err("property type");
         }
 
@@ -10354,7 +10665,14 @@ void Resolver::checkAbstractImplementations() {
                     if (!ctype) continue;
                     if (itype->kind == TypeRef::Kind::Error ||
                         ctype->kind == TypeRef::Kind::Error) continue;
-                    if (!typeRefEqual(itype, ctype)) {
+                    // #6316 / §11.2: `itype` names no class type parameter
+                    // (non-generic interface) and `ctype` was read into the
+                    // implementing class's scope above, so a type parameter
+                    // compares by spelling (`Box<Exception>` is not `Box<U>`).
+                    if (!typeRefEqualScopedUnlessAlias(
+                            itype, ctype,
+                            ctx_.isImported(ips) ||
+                                ctx_.isImported(cit->second))) {
                         ctx_.diagnostics().report(
                             Severity::Error, cit->second->declLoc,
                             std::string("property `") + std::string(name) +
@@ -10380,7 +10698,10 @@ void Resolver::checkAbstractImplementations() {
                 if (!itype || !ctype) continue;
                 if (itype->kind == TypeRef::Kind::Error ||
                     ctype->kind == TypeRef::Kind::Error) continue;
-                if (!typeRefEqual(itype, ctype)) {
+                // #6316 / §9.1, §11.2: the positional field's declared type
+                // is in `t`'s own scope; same spelling compare as above.
+                if (!typeRefEqualScopedUnlessAlias(
+                        itype, ctype, ctx_.isImported(ips))) {
                     ctx_.diagnostics().report(
                         Severity::Error, t->declLoc,
                         std::string("property `") + std::string(name) +
@@ -13163,7 +13484,8 @@ const TypeSymbol* Resolver::namedTypeSymbolInScope(const ast::Type& t,
 // set. Reads the resolved TypeRef, never an `ast::TypeDecl`, so an IMPORTED
 // record (whose TypeSymbol has no declaration at all) classifies identically
 // to a local one — the #3152 seam.
-bool Resolver::isFfiScalarTypeRef(const TypeRef* rt, int depth) {
+bool Resolver::isFfiScalarTypeRef(
+    const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain) {
     if (!rt || rt->nullable) return false;
     if (rt->kind == TypeRef::Kind::Primitive)
         return isFfiPrimitive(rt->primitive);
@@ -13172,7 +13494,7 @@ bool Resolver::isFfiScalarTypeRef(const TypeRef* rt, int depth) {
     if (h == "IntPtr" || h == "UIntPtr") return true;
     if (h == "Ptr")
         return rt->genericArgs.size() == 1 &&
-               isFfiPointeeTypeRef(rt->genericArgs[0], depth + 1);
+               isFfiPointeeTypeRef(rt->genericArgs[0], onChain);
     return false;
 }
 
@@ -13181,7 +13503,8 @@ bool Resolver::isFfiScalarTypeRef(const TypeRef* rt, int depth) {
 // One member short of the scalar set above, deliberately: `Ptr<U>` "is an
 // FFI-compatible scalar … but is **not** a member here, which is exactly what
 // makes `Ptr<Ptr<U>>` inadmissible".
-bool Resolver::isFfiPointeeTypeRef(const TypeRef* rt, int depth) {
+bool Resolver::isFfiPointeeTypeRef(
+    const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain) {
     if (!rt || rt->nullable) return false;
     if (rt->kind == TypeRef::Kind::Primitive)
         return isFfiPrimitive(rt->primitive);
@@ -13189,33 +13512,42 @@ bool Resolver::isFfiPointeeTypeRef(const TypeRef* rt, int depth) {
     std::string_view h = rt->headName();
     if (h == "IntPtr" || h == "UIntPtr") return true;
     if (h == "Ptr") return false;  // the §32.12 v1 decline
-    return isCCompatibleRecordSym(rt->declaration, depth + 1);
+    return isCCompatibleRecordSym(rt->declaration, onChain);
 }
 
 // per §32.13 clause 1: a field's type is "an FFI-compatible scalar …, an
 // inline array `[N]T` of such a scalar (§32.5's element set …), or another
 // C-compatible record (nesting)".
-bool Resolver::isCCompatibleFieldTypeRef(const TypeRef* rt, int depth) {
+bool Resolver::isCCompatibleFieldTypeRef(
+    const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain) {
     if (!rt || rt->nullable) return false;
-    if (isFfiScalarTypeRef(rt, depth)) return true;
+    if (isFfiScalarTypeRef(rt, onChain)) return true;
     if (rt->kind == TypeRef::Kind::InlineArray)
-        return !rt->arrayOwned && isFfiScalarTypeRef(rt->arrayElement, depth);
+        return !rt->arrayOwned && isFfiScalarTypeRef(rt->arrayElement, onChain);
     if (rt->kind == TypeRef::Kind::Named)
-        return isCCompatibleRecordSym(rt->declaration, depth + 1);
+        return isCCompatibleRecordSym(rt->declaration, onChain);
     return false;
 }
 
-bool Resolver::isCCompatibleRecordSym(const TypeSymbol* ts, int depth) {
-    // §32.13 clause 1 says recursion is impossible ("records are value
-    // types"), which holds of a WELL-FORMED program; a malformed one must
-    // still terminate, and §9's own cycle check owns that diagnostic.
-    if (depth > 8 || !ts) return false;
+bool Resolver::isCCompatibleRecordSym(const TypeSymbol* ts,
+                                     std::unordered_set<const TypeSymbol*>& onChain) {
+    // per §32.13 clause 1 (v0.306), no depth qualifier on the nesting rule.
+    // A cycle can occur through a `Ptr` head or a class head (neither is
+    // C-compatible, so neither passes through this function), but the walk
+    // must still terminate on a malformed graph.  The cycle guard replaces the
+    // depth cap: it fires ONLY on a symbol already on the current enclosing
+    // path (a cycle), never on a well-formed program, since a record cannot
+    // contain itself by value.
+    if (!ts || !onChain.insert(ts).second) return false;
     if (ts->kind != ast::TypeDeclKind::Record) return false;
     // §3.6's common rules make the property "evaluated per-instantiation for
     // generic records". That evaluation is not wired here, so a generic record
     // is conservatively NOT classified — the direction that rejects a boundary
     // declaration rather than mis-admitting one.
-    if (!ts->genericParams.empty()) return false;
+    if (!ts->genericParams.empty()) {
+        onChain.erase(ts);
+        return false;
+    }
     bool any = false;
     for (const Symbol* m : ts->members) {
         auto* fs = dynamic_cast<const FieldSymbol*>(m);
@@ -13229,21 +13561,24 @@ bool Resolver::isCCompatibleRecordSym(const TypeSymbol* ts, int depth) {
         // §9.1 positional `Param`, the body `FieldDecl`, or — for an imported
         // record with neither — `ctx.importedMemberType`.
         if (!isCCompatibleFieldTypeRef(sema::storageComponentType(m, ctx_),
-                                       depth))
+                                       onChain)) {
+            onChain.erase(ts);
             return false;
+        }
     }
     // A record with no storage has no C struct to correspond to, so clause 2's
     // layout promise would have nothing to promise.
+    onChain.erase(ts);
     return any;
 }
 
-bool Resolver::isCCompatibleRecord(const ast::Type& t, Scope* scope,
-                                   int depth) {
+bool Resolver::isCCompatibleRecord(const ast::Type& t, Scope* scope) {
     if (t.nullable) return false;
-    return isCCompatibleRecordSym(namedTypeSymbolInScope(t, scope), depth);
+    std::unordered_set<const TypeSymbol*> onChain;
+    return isCCompatibleRecordSym(namedTypeSymbolInScope(t, scope), onChain);
 }
 
-bool Resolver::isFfiPointeeType(const ast::Type& t, Scope* scope, int depth) {
+bool Resolver::isFfiPointeeType(const ast::Type& t, Scope* scope) {
     // per §32.12 clause 1 (v0.306). A nullable pointee has no C
     // representation (§32.5's nullable-value-type rule).
     if (t.nullable) return false;
@@ -13254,12 +13589,15 @@ bool Resolver::isFfiPointeeType(const ast::Type& t, Scope* scope, int depth) {
     if (isFfiScalarPrimitiveName(n)) return true;
     if (n == "IntPtr" || n == "UIntPtr") return true;
     if (n == "Ptr") return false;  // the §32.12 v1 decline
-    return isCCompatibleRecord(t, scope, depth);
+    std::unordered_set<const TypeSymbol*> onChain;
+    return isCCompatibleRecordSym(namedTypeSymbolInScope(t, scope), onChain);
 }
 
 bool Resolver::isSingleFieldHandleRecord(const ast::Type& t, Scope* scope) {
     const TypeSymbol* ts = namedTypeSymbolInScope(t, scope);
-    if (t.nullable || !isCCompatibleRecordSym(ts, 0)) return false;
+    if (t.nullable) return false;
+    std::unordered_set<const TypeSymbol*> onChain;
+    if (!isCCompatibleRecordSym(ts, onChain)) return false;
     const TypeRef* only = nullptr;
     int count = 0;
     for (const Symbol* m : ts->members) {
@@ -13282,7 +13620,7 @@ bool Resolver::isSingleFieldHandleRecord(const ast::Type& t, Scope* scope) {
         std::string_view h = only->headName();
         if (h == "IntPtr" || h == "UIntPtr") return true;
         return h == "Ptr" && only->genericArgs.size() == 1 &&
-               isFfiPointeeTypeRef(only->genericArgs[0], 1);
+               isFfiPointeeTypeRef(only->genericArgs[0], onChain);
     }
     if (only->kind != TypeRef::Kind::Primitive) return false;
     switch (only->primitive) {
@@ -13652,10 +13990,23 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
 //   in T (contravariant)  → allowed only in INPUT positions:
 //                              ordinary method parameters (not `out`-params).
 //
-// Nested positions (T inside a function-type parameter, T inside another
-// generic's type arguments) are NOT checked here — position composition is
-// deferred to a later slice. This keeps the check sound (no false positives)
-// while eliminating the most common unsound declarations (direct param misuse).
+// fix #6348 (v0.338): the position is COMPOSED, not merely read at the bare
+// `T`. §12.9: "Position is composed across nested type constructors. A type
+// parameter inside another generic type inherits position from that wrapper's
+// variance… Function types are themselves variant (covariant in return,
+// contravariant in parameter, see below), and the same composition rule
+// applies." The check used to test only a bare `T` and skip every nested
+// occurrence — a documented deferral (see the lit row
+// `sema_variance_position__spec_12_9_event_out_T_nested_function_accepted`),
+// which left `method Put(xs: Array<T>)` and `method Get(): Array<T>` on an
+// `out T` silently accepted. The base list is composed the same way: "The
+// extending interface instantiates the base's variant parameter with its own
+// type parameter, holding the deriving interface's variance."
+//
+// A wrapper whose OWN variance cannot be established — a head this pass does
+// not resolve, e.g. an interface imported from another module — yields
+// `Unknown` and is skipped rather than guessed, so the check stays free of
+// false positives.
 //
 // The check is purely over the raw AST (`ast::Type` nodes), because TypeRefs
 // for generic param references carry no name (declaration == nullptr), and
@@ -13665,47 +14016,1350 @@ bool Resolver::checkExternType(const ast::Type& t, bool returnPosition,
 
 namespace {
 
+// The composed position of one occurrence of a variant type parameter,
+// expressed as seen from OUTSIDE the type that holds the occurrence (§12.9).
+enum class VariancePos {
+    CoVariant,     // an `out T` position
+    ContraVariant, // an `in T` position
+    Invariant,     // no marker can be honoured through this occurrence
+    Absent,        // the parameter does not occur here
+    Unknown,       // a wrapper's own variance could not be established
+    Deferred,      // an INVARIANT head in a BASE LIST — disputed, see #6355
+};
+
+// Where the occurrence sits. The two differ in exactly one case, and only in a
+// base list — see `invariantOrDefer` (#6355).
+enum class VarianceSite {
+    Member,   // an ordinary member signature (method, property, field)
+    BaseList, // a `: Base<...>` entry of the interface itself
+};
+
+// narrow #6348 / spec-question #6355 (§12.9, v0.338). An INVARIANT wrapper
+// means two different things by site.
+//
+// In a MEMBER slot it is settled: §12.9 makes classes, records and unmarked
+// heads "always invariant", so no marker survives one — `out T` with
+// `method Put(xs: Array<T>)` is a real soundness hole and stays rejected.
+//
+// In a BASE LIST it is disputed, and #6348 shipped a reading of the dispute it
+// had no issue for. §12.9 says "A generic interface may extend a generic base
+// whose variance is different from its own", and its worked example is
+// `IList<T>` — invariant — extending `IReadOnlyList<out T>`. The spec also
+// closes with "The inheritance relation only fixes the type argument
+// substituted into the base — it does not alter what positions T may legally
+// appear in within the derived interface", which on its face withdraws the base
+// list from the position check ENTIRELY, mismatched markers included. Against
+// that, C# rejects the shape (CS1961), so the constraint reading has precedent
+// and the sentence is not free of doubt. #6355 records both.
+//
+// This narrowing defers the invariant case only, because that is the case both
+// readings agree cannot be settled from the text alone (the spec's blessed
+// example IS an invariant head reached through an invariant deriving marker, so
+// it is evidence FOR acceptance, and the soundness argument is not). The two
+// mismatched-MARKER rejections stay pending the same ruling — see #6355.
+//
+// fix #6355: the deferral yields its OWN position, `Deferred`, and NOT
+// `Unknown`. This is the blast-radius half of the narrowing, and it is a
+// silent-acceptance inversion if `Unknown` is used.
+//
+// `mergeVariancePos` folds with `Unknown` as a POISON: one `Unknown` operand
+// makes the whole accumulator `Unknown`, and `composedVarianceViolation` reads
+// `Unknown` as "no violation". So returning `Unknown` here — which this
+// function did — deferred not one cell but the WHOLE base-list head: with
+// `interface D<out T>: Pair<A<T>, B<T>>`, one invariant base arg turned every
+// sibling arg of that head into an unchecked `Unknown`, and the head's verdict
+// stopped depending on the positions at all. A check whose verdict flips on an
+// unrelated sibling is being short-circuited, not reading the position.
+//
+// `Deferred` is the NEUTRAL element of the fold (`mergeVariancePos`, and
+// `slotPolarity` where it propagates as `Absent`). It withholds ITS OWN
+// verdict and leaves every sibling's intact — which is the question #6355
+// actually poses, "does the base list participate in the position check?",
+// asked of one argument rather than of a head.
+//
+// MEASURED with `invariantOrDefer` forced back to its pre-narrowing body
+// (`return VariancePos::Invariant;` — the blunt remedy `69338700` replaced),
+// against `69338700` as it stands, for `interface P4<out A, out B>` under
+// `out T`:
+//
+//                      blunt    69338700    this fix
+//     P4<IInv<T>,K<T>>   reject   ACCEPT      reject
+//     P4<Array<T>,K<T>>  reject   ACCEPT      reject
+//     P4<K<T>,IInv<T>>   reject   ACCEPT      reject
+//     P4<IInv<T>,C<T>>   reject   accept      accept
+//     P4<C<T>,C2<T>>     accept   accept      accept
+//
+// The three `ACCEPT`s in the middle column are the inversion, and the two
+// ACCEPTs in the right-hand column are the deferral #6355 legitimately
+// closed, still closed: `P4<IInv<T>, C<T>>` has no violation left once the
+// disputed argument is withheld, because `C<T>` is covariant-in under an `out`
+// marker. `P4<IInv<T>, K<T>>` is a genuine §12.9 violation on `K<T>` ALONE —
+// contravariant-in, under an `out` marker, in a covariant slot — and the blunt
+// remedy rejected it for the right reason.
+//
+// The member twin of the same shape (`method Get(): P4<IInv<T>, K<T>>`) is
+// rejected under ALL THREE, because `invariantOrDefer` answers `Invariant` at a
+// member site. Same heads, same positions, only the SITE differs — and that the
+// base list's verdict diverged from its member twin's is the whole tell.
+VariancePos invariantOrDefer(VarianceSite site) {
+    return site == VarianceSite::BaseList ? VariancePos::Deferred
+                                          : VariancePos::Invariant;
+}
+
+VariancePos flipVariancePos(VariancePos p) {
+    switch (p) {
+    case VariancePos::CoVariant: return VariancePos::ContraVariant;
+    case VariancePos::ContraVariant: return VariancePos::CoVariant;
+    default: return p;  // Invariant / Absent / Unknown / Deferred unchanged
+    }
+}
+
+// The polarity, seen from OUTSIDE the wrapper, of a slot the wrapper holds at
+// variance `wrapperVar` while the wrapper itself sits at polarity `slot`: a
+// covariant slot keeps the outer polarity, a contravariant one flips it, an
+// invariant one erases it (§12.9's composition rule).
+//
+// fix #6354: `Absent` passes through unchanged. It means "the parameter does
+// not occur in this slot", so the slot constrains nothing — and NOT the same
+// thing as a contravariant one. This arm was dormant until #6354, because no
+// other producer of `wrapperVar` can return `Absent`: a declared head's slot is
+// Co/Contra/Invariant and an unresolvable one is `Unknown`. The alias arm below
+// CAN return it, for an alias parameter its body never mentions — and without
+// this arm such a slot fell through to `flipVariancePos`, turning a phantom
+// parameter into a CONTRAVARIANT one and newly rejecting `type Phantom<T> :=
+// int; interface I<out T> method Get(): Phantom<T>; end I;`.
+VariancePos slotPolarity(VariancePos slot, VariancePos wrapperVar) {
+    if (wrapperVar == VariancePos::Unknown || slot == VariancePos::Unknown)
+        return VariancePos::Unknown;
+    // fix #6355: a DEFERRED base-list head resolves to no polarity at all, so
+    // it propagates as `Absent` — the position a type that does not mention the
+    // parameter propagates as. It is emphatically NOT `Invariant`: folding it
+    // in as Invariant would erase the verdict of every sibling argument.
+    if (wrapperVar == VariancePos::Deferred) return VariancePos::Deferred;
+    if (slot == VariancePos::Deferred) return VariancePos::Deferred;
+    if (wrapperVar == VariancePos::Absent || slot == VariancePos::Absent)
+        return VariancePos::Absent;
+    if (wrapperVar == VariancePos::Invariant || slot == VariancePos::Invariant)
+        return VariancePos::Invariant;
+    return wrapperVar == VariancePos::CoVariant ? slot : flipVariancePos(slot);
+}
+
+// Fold a second occurrence into an accumulator. Two occurrences that land in
+// DIFFERENT positions cannot both be honoured by one marker, so the fold is
+// Invariant — which rejects under either marker, the sound answer.
+//
+// fix #6355: `Deferred` is the NEUTRAL element of this fold, exactly as
+// `Absent` is — it contributes nothing and, critically, CONTributes nothing to
+// the siblings either. It is not `Unknown`, which poisons: see the block
+// comment on `invariantOrDefer` for why that distinction is load-bearing.
+VariancePos mergeVariancePos(VariancePos acc, VariancePos next) {
+    if (acc == VariancePos::Deferred) return next;
+    if (next == VariancePos::Deferred) return acc;
+    if (acc == VariancePos::Absent) return next;
+    if (next == VariancePos::Absent) return acc;
+    if (acc == VariancePos::Unknown || next == VariancePos::Unknown)
+        return VariancePos::Unknown;
+    if (acc == next) return acc;
+    return VariancePos::Invariant;
+}
+
 // Return true iff the ast::Type `t` is a bare reference to the generic
 // parameter named `paramName` — a single-part QualifiedName with no generic
-// args, not nullable (nullable doesn't affect the position check, but the
-// bare-name test is sufficient to isolate direct occurrences).
-//
-// This deliberately does NOT recurse into function-type params, return
-// types, or generic type arguments — those compose positions in ways this
-// check defers (see comment above).
-bool isDirectParamRef(const ast::Type& t, std::string_view paramName) {
+// args. Nullability is irrelevant to the position (a `T?` sits wherever a `T`
+// does), so it is not tested here.
+bool isBareParamRef(const ast::Type& t, std::string_view paramName) {
     if (t.kind != ast::TypeKind::Named) return false;
     if (!t.name || t.name->parts.size() != 1) return false;
     if (!t.genericArgs.empty()) return false;  // e.g. T<U> — not a bare param ref
     return t.name->parts.front() == paramName;
 }
 
-// Check whether `t` contains a direct reference to `paramName` AND that
-// reference is in an invalid position given the declared variance.
+// The nine COVARIANT generic interfaces of the standard library (v0.338
+// stdlib §4.1/§4.12, §6.5 — every `out T` in `Bezel_Standard_Library.md`).
+// They are compiler built-ins with no TypeSymbol, so their marker cannot be
+// read off a `GenericParamSymbol` and is listed here instead. Each declares
+// exactly ONE type parameter, at index 0. Every other built-in generic head is
+// a class or an invariant interface, and §12.9 makes those "always invariant"
+// whatever their arity.
+bool builtinHeadIsCovariantAtZero(std::string_view head) {
+    static constexpr std::array<std::string_view, 9> kCovariant = {
+        "IEnumerable", "IEnumerator", "IAsyncEnumerable", "IAsyncEnumerator",
+        "IReadOnlyCollection", "IReadOnlyList",
+        "IEvent", "IAsyncEvent", "ISharedEvent",
+    };
+    return std::find(kCovariant.begin(), kCovariant.end(), head) !=
+           kCovariant.end();
+}
+
+// fix #6354 (§27.8, §12.9, v0.338): the LOCAL generic type ALIAS the head
+// spells, or null when it spells none.
+//
+// `TypeAliasDecl` is a `TopDecl`, so an alias is its own symbol — NOT a
+// `TypeSymbol` with a `TypeDeclKind` — which is why the `localTypes` walk
+// below never saw one and an alias head composed to `Unknown` and was skipped.
+// §27.8 makes that wrong: "Type aliases — generic or not — see through to the
+// aliased type for identity, equality, method dispatch, and overload
+// resolution. They are a naming convenience, not a separate type kind", and
+// "Each instantiation of the alias is interchangeable with the corresponding
+// instantiation of the aliased type."
+//
+// The match is on an UNQUALIFIED spelling only, and then on the whole simple
+// name — never on `parts.back()`. `TypeAliasDecl` is a `TopDecl` (A.2) and
+// §27.8 says "Type aliases may be declared at module level", so an alias has no
+// enclosing type and a qualified spelling can never name one; requiring
+// `parts.size() == 1` is therefore exact rather than merely conservative. It is
+// also the discipline #6351's review required of that branch's imported arm,
+// where the simple-name comparison resolved `Outer.Inner<T>` against an
+// unrelated top-level `Inner` and newly REJECTED a spec-legal program.
+const TypeAliasSymbol* resolveLocalAliasHead(
+    const ast::Type& head, const std::vector<TypeAliasSymbol*>& localAliases) {
+    if (!head.name || head.name->parts.size() != 1) return nullptr;
+    const TypeAliasSymbol* found = nullptr;
+    for (const TypeAliasSymbol* as : localAliases) {
+        if (!as || as->name != head.name->parts.front()) continue;
+        if (found) return nullptr;  // two aliases of one name — never guess
+        found = as;
+    }
+    return found;
+}
+
+// ⚠ fix #6408 (§12.9, §27.8, §11.6, Appendix C.1, v0.338): there is NO hop
+// bound on this see-through, and that is the whole fix. What stood here was
+// `kMaxAliasSeeThroughDepth = 32`, and the justification it carried ("§27.8 makes
+// a cycle a compile error … so on a program the checker accepts there is
+// nothing to hit this") covers CYCLES ONLY. A long NON-CYCLIC alias chain is
+// perfectly legal — §27.8 puts no limit on how many aliases one may chain
+// through, and §11.6 states no limit on type nesting — so the bound fired on
+// ordinary programs, and it fired SILENTLY: `composedParamPosition` returned
+// `Unknown`, which `composedVarianceViolation` treats as "no violation", so a
+// real §12.9 violation past the 32nd hop was never reported.
+//
+// MEASURED on the base (`04d402b3`): the chain
+// `type A0<T> := A1<T>; … type A{n}<T> := Array<T>;` under
+// `Holder<out T>.Get(): A0<T>` rejects at n = 5 and n = 31 with
+// "(§12.9)" and COMPILES CLEAN (rc = 0) at n = 32, 33 and 40.
+//
+// The first silently accepted chain is 32, and there is NO off-by-one here: 32
+// IS `kMaxAliasSeeThroughDepth`, and it is ALSO the first accepted length. The
+// guard read `if (depth >= kMaxAliasSeeThroughDepth) return Unknown;` and was
+// tested BEFORE the hop, with the walk entering `A0` at `depth == 0`, so it
+// stopped ENTERING at `depth == 32` — declined `A32` and composed `A0..A31`.
+//
+// The sibling cap in this same file (#6391's `kMaxTypeNestingDepth = 64`) is
+// the same shape but NOT the same boundary: its guard reads `depth >
+// kMaxTypeNestingDepth` — a STRICT `>`, not a `>=` — so it admits depth 64 and
+// first DECLINES at 65, one PAST its bound. Two caps, one comparison operator
+// apart. Neither is an off-by-one; record each as the operator it is, because
+// #6391's boundary does not transfer to a `>=` that does not have it.
+//
+// WHY THE BOUND IS REMOVED RATHER THAN RAISED. §12.9 states the position rule
+// with no depth qualifier — "Position is composed across nested type
+// constructors", one rule for every interface — and Appendix C.1:11596 lists
+// the invariant unconditionally ("Variant generic parameters (`in`, `out`)
+// appear only in the appropriate position"). So "the compiler cannot decide
+// this deep" is not a spec situation at all; it is this implementation
+// creating the ambiguity, and the depth at which it admits it is a property of
+// a literal in this file. A larger literal leaves the same hole one constant
+// higher. A cap that DIAGNOSED was also considered and rejected: it would make
+// a long-but-LEGAL alias chain un-compilable for a reason the spec nowhere
+// states, which is a spec ruling rather than an implementation fix (the same
+// argument, and the same refusal, as #6391 for `kMaxTypeNestingDepth`).
+//
+// WHAT REPLACES IT is a CYCLE guard — the instrument the deleted comment was
+// reaching for ("a bound, not a cycle detector"), and the right one for the
+// hazard a cap is good at. It is a PER-PATH set, not a global "seen": an alias
+// is walked once per chain that reaches it, so a DAG that reaches the same
+// alias by two routes is composed on both, exactly as before the bound.
+//
+// ON THE ORDERING RISK. A cycle guard can convert a REJECTED program into a
+// silently accepted one if it fires BEFORE §27.8's own diagnostic, which is
+// the defect class all over again. It cannot here, and the ordering is
+// structural rather than lucky: §27.8's diagnostic is emitted from
+// `Resolver::resolveNamed` (`TypeResolution_Names.cpp`, the "` alias is
+// recursive" report) during NAME RESOLUTION, which runs inside
+// `TypeResolution::run` long before `checkVariancePositions()` is reached at
+// `TypeResolution.cpp:747`. MEASURED, not assumed: `type A0<T> := A1<T>;
+// type A1<T> := A2<T>; type A2<T> := A0<T>;` reports "type alias `A1` is
+// recursive (§27.8) … may not reference itself, directly or through a chain of
+// other aliases" and exits 1 on BOTH legs. What this guard returns on a cycle
+// is `Unknown` — the same conservative non-answer every other unresolvable head
+// yields, which skips the §12.9 check rather than guessing — so even if the
+// order were reversed the cycle is still REJECTED, by §27.8, and this walk
+// merely declines to add a second opinion.
+//
+// THE RECURSION IS NOT A NEW COST, and here that needed MEASURING rather than
+// reasoning, because an alias chain is NOT nested in the source the way §11.6
+// type nesting is (#6391's argument, that the parser had already recursed
+// through the same structure, does NOT transfer: a 1000-alias chain is 1000
+// sibling top-level declarations). So the envelope was measured on both legs
+// — see the commit body and the test file's depth rows.
+
+// fix #6351 (§12.9, v0.338): the heads this pass may resolve a variance for.
+//
+// `imported` maps a module's §2.1 dotted name to that module's exported types,
+// gathered from the modules THIS FILE actually imported (`sourceImports_` x
+// `SemaContext::importedTypesOf` — the same pairing `TypeResolution::run` uses
+// to expose import-gated names, so the two can never disagree about what is in
+// scope). §13.2 puts only `public` top-level types in a module's metadata, so
+// every symbol here is one the importing file could legally name.
+//
+// `aliases` is `importAliases_` (§2.2: alias -> dotted module name), so a head
+// spelled through an alias — `L.IThing` — resolves against the ONE module `L`
+// names rather than by a machine-wide simple-name scan.
+//
+// `moduleNames` is `sourceImports_` as a set of the SAME dotted module names
+// `imported` is keyed by, so a qualifier that is a MODULE name with no alias
+// (§2.7's `Module.Type` spelling) is distinguishable from one that is an
+// enclosing-type path (§11.6's `Outer.Box`). That distinction is what stops a
+// local `Outer` from being read as a module prefix — see `resolveImportedHead`.
+// `enclosingChain` is the chain of types enclosing the use site, INNERMOST
+// FIRST and INCLUDING the type whose own body the site sits in — the interface
+// `checkVariancePositions` is currently walking. It answers a BARE name that
+// names a §11.6 nested type of one of them, per §2.7 rule 1's "then the
+// enclosing type's accessible members" step and §2.7's "Through nesting"
+// paragraph ("the enclosing-type lookup visits the nested type and then each
+// type enclosing it, innermost first") — see `enclosingMemberBareName`.
+struct VarianceHeads {
+    const std::unordered_map<std::string, std::vector<TypeSymbol*>>* imported =
+        nullptr;
+    const std::unordered_map<std::string, std::string>* aliases = nullptr;
+    const std::unordered_set<std::string>* moduleNames = nullptr;
+    std::vector<const TypeSymbol*> enclosingChain;
+};
+
+// fix #6383 (§2.7 rule 1, §2.7 Through nesting, §11.6, v0.338): the §2.7 rule 1 step this pass
+// was missing — "Resolve the leftmost segment `A` as a bare name: local scope,
+// THEN THE ENCLOSING TYPE'S ACCESSIBLE MEMBERS, then the current module's
+// declarations, then unambiguous imported bare names, then import aliases".
+//
+// §2.7's "Through nesting" paragraph says what that step admits for a TYPE:
+// "Nested types of an enclosing type, generic or not, are reached by bare name,
+// since a nested type is one type and needs no instantiation." Only a nested
+// type is read here, and the chain walk STOPS at the first enclosing type that
+// has a nested type of that name — §2.7's own order, "the enclosing-type lookup
+// visits the nested type and then each type enclosing it, innermost first".
+//
+// Before this, a body-position bare `Box<T>` matched nothing at all:
+// `localTypes` holds the MODULE's top-level declarations and `heads.imported`
+// a module's EXPORTS, and neither can hold a nested type — so the two arms a
+// bare name reached both missed it, the composition was `Unknown`, and §12.9
+// SKIPPED the spelling.
+//
+// Returning null leaves the two arms below exactly as they were: this function
+// only ever ADDS an answer, and never takes one away.
+//
+// SEAM-ACCESSOR: reads only `members`, `NestedTypeSymbol::type`, and — for
+// §2.7's `property Color: Color` carve-out — each member's own `decl`, which
+// symbol collection populates for a member the name resolver can also see.
+// `TypeDeclKind` is never touched here — the caller reads the kind.
+
+// fix #6383 follow-up (§2.7 warning row, v0.338): does `m` DECLARE its own name
+// as its declared type — §2.7's `property Color: Color` and `property Buffer:
+// Buffer<int>` idioms?
+//
+// §2.7's warning row is explicit that these are a CARVE-OUT: "warn, unless the
+// member's declared type is the resolved type (or an instantiation of the
+// resolved generic) — the `property Color: Color` idiom; qualify `this.` to
+// reach the member", and the prose repeats it ("the `property Color: Color`
+// and `property Buffer: Buffer<int>` idioms are its carve-out"). The carve-out
+// is stated where §2.7 states the member-vs-type contest generally, so it
+// governs the enclosing-member step too: a member that spells the colliding
+// name in its own declared type is not a blocker.
+//
+// It has to be a carve-out and not a coincidence. An enclosing-member step that
+// read such a member as a blocker would make the member UN-DECLARABLE — a
+// `property Color: Color` would end the search for its own type's name.
+//
+// The test is SPELLING, not resolved-type identity, and is a conservative
+// approximation of §2.7's "the member's declared type is the resolved type": it
+// asks whether the declared type's HEAD is the colliding name, which is what
+// makes the idiom spellable at all. The direction it can err in is the one that
+// ACCEPTS rather than rejects — a declared type of `Color.Something` under a
+// colliding name `Color` also unblocks — and there the name resolves to the
+// very `Color` the declared type's head names, which is what the spelling asked
+// for.
+//
+// SEAM-ACCESSOR: `Symbol::decl` only, and only the declared TYPE of a
+// property/field/method/operator/event/const — no body, no initializer, no
+// `TypeDeclKind`.
+//
+// WHY THESE SIX READS ARE LOCAL-ONLY (the audit's ALREADY-CORRECT verdict,
+// #3152). `m` is drawn from `enclosing->members`, and every `enclosing` is an
+// element of `heads.enclosingChain`, which is built by exactly ONE walk: the
+// `varianceSites` collection below, rooted at `ctx_.module()->children`.
+// MEASURED: `module()->children` has exactly TWO writers in the tree. They are
+// named here by FUNCTION, which is a recipe that survives the next neighbouring
+// hunk, rather than by LINE, which is a position and has already failed twice
+// here: 27bed773 cited a `TypeResolution_Names.cpp` line that was unrelated
+// constraint code even in the tree it was written against, and the line it
+// meant has since shifted again (5871 at 27bed773, 6018 when #6450 was filed,
+// further since). A line number is still given below, labelled MOVEABLE, as a
+// convenience only — never as the referent.
+//   * `collectSymbols` in `SymbolCollection.cpp`, whose `mod->children` append
+//     is the module's own top-level declarations (line MOVEABLE, 2603 at 0a28f12).
+//   * the `ast::LocalTypeDecl` arm of `Resolver::resolveTypesInStmt` in
+//     `TypeResolution_Names.cpp`, which appends a §21.10 local type, itself
+//     locally declared (line MOVEABLE, 6112 at 0a28f12).
+// — while `ModuleLoader` writes imported symbols into
+// `SemaContext::importedByModule_`, NEVER into the module being compiled's
+// children. Every element of the chain, and therefore every member read here,
+// is consequently a LOCAL declaration: `m->decl` IS the real local
+// `ast::*Decl`, and these casts cannot answer wrong for an import.
+//
+// NOT ROUTED THROUGH A BOTH-SOURCES ACCESSOR, deliberately. This is a test of
+// SPELLING, not of resolved-type identity. `TypeRef::headName()` prefers
+// `aliasResolvedHead` over the use-site syntactic head (see `TypeRef.hpp`'s
+// #1462 note), so a §27.8 alias — `type Color := SomethingElse` beside a member
+// spelled `Color: Color` — would compare the ALIAS TARGET's head and flip the
+// very carve-out §2.7's `property Color: Color` idiom depends on. The
+// sanctioned accessors (`storageComponentType`, `methodReturnResolvedType`,
+// `eventPayloadResolvedType`) all answer the RESOLVED type, so routing through
+// them would change the PREDICATE, not merely its provenance. A local read is
+// the correct instrument for a local-only question.
+static bool memberDeclaresCollidingName(const Symbol* m, std::string_view name) {
+    if (!m || !m->decl) return false;
+    const ast::Type* ty = nullptr;
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a property's declared type.
+    if (const auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+        ty = pd->type.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a field's declared type.
+    else if (const auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+        ty = fd->type.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a method's return's declared type.
+    else if (const auto* md = dynamic_cast<const ast::MethodDecl*>(m->decl))
+        ty = md->returnType.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — an operator's return's declared type.
+    else if (const auto* od = dynamic_cast<const ast::OperatorDecl*>(m->decl))
+        ty = od->returnType.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — an event's payload's declared type.
+    else if (const auto* ed = dynamic_cast<const ast::EventDecl*>(m->decl))
+        ty = ed->type.get();
+    // SEAM-ACCESSOR: local declaration-site read, per the reachability
+    // proof above — a const's declared type.
+    else if (const auto* cd = dynamic_cast<const ast::ConstDecl*>(m->decl))
+        ty = cd->type.get();
+    if (!ty || !ty->name || ty->name->parts.empty()) return false;
+    return ty->name->parts.front() == name;
+}
+
+// fix #6383 follow-up (§2.7 "Through nesting", §13.1, v0.338): does `owning`
+// declare an ACCESSIBLE member called `name` that is NOT a nested type — i.e.
+// does the bare-name search END at `owning` with no type to hand back?
+//
+// §2.7's stop rule is about the NAME, not about a type of that name: "Ending
+// the search at the first type that HAS THE NAME, even when the member cannot
+// be used there, keeps a bare name from passing over an enclosing member and
+// silently resolving to a same-named module declaration or import." So a
+// method, property, field, event or const of that name ends the search exactly
+// as a nested type does — there is simply nothing a TYPE position can use at the
+// end of it.
+//
+// A NESTED TYPE does not block: §2.7 says "Nested types of an enclosing type,
+// generic or not, are reached by bare name, since a nested type is one type and
+// needs no instantiation." The caller returns that type instead.
+//
+// Accessibility, under §13.1 "Levels", whose four-row table reads `private` as
+// "The declaring class only", `protected` as "The declaring class and all
+// classes derived from it", and `internal` as "Code in the same module" —
+// exactly the three-way filter below. Inside the OWNING type's own body every
+// level is reachable, so nothing is filtered there. For an OUTER enclosing type,
+// `private` and `protected` are not accessible from this body (a nested type is
+// not a class deriving from the declaring one) and so must not end the search.
+// `internal` always is: the enclosing chain can only come from the module being
+// checked.
+//
+// SEAM-ACCESSOR: `Symbol::decl` (via `memberDeclaresCollidingName`),
+// `MemberSymbol::visibility`, and `NestedTypeSymbol` — all of them already read
+// on this chain by `walkNestedTypePath` or by the caller.
+static bool enclosingMemberEndsBareTypeSearch(const TypeSymbol* owning,
+                                              const Symbol* m,
+                                              std::string_view name,
+                                              bool ownBody) {
+    if (!owning || !m || m->name != name) return false;
+    // A nested type is admitted by bare name (§2.7 "Through nesting"); the
+    // caller hands that type back instead of ending the search.
+    if (dynamic_cast<const NestedTypeSymbol*>(m)) return false;
+    if (memberDeclaresCollidingName(m, name)) return false;  // §2.7 carve-out
+    const auto* member = dynamic_cast<const MemberSymbol*>(m);
+    if (member && !ownBody &&
+        (member->visibility == ast::Visibility::Private ||
+         member->visibility == ast::Visibility::Protected))
+        return false;  // §13.1 — not reachable from a nested body
+    return true;
+}
+
+// fix #6383 follow-up (§2.7 rule 1, §2.7 Through nesting, §2.7 warning row,
+// §11.6, §12.9, §13.1, v0.338): the same walk as #6383, with §2.7's STOP rule.
+//
+// #6383 landed this arm reading only `NestedTypeSymbol`, so a METHOD or PROPERTY
+// of the colliding name on an enclosing type did not end the walk, and #6383's
+// own comment said the arm "matches the resolver rather than §2.7, and MUST be
+// changed with it". MEASURED on a COMPOSED tree carrying #6383 and the §2.7
+// name-resolver fix, that divergence is a SECOND diagnostic on an
+// already-rejected program: `Holder` declaring `method Box(): int` next to a
+// bare `Box<T>` in its own body carries BOTH
+//
+//   unresolved type name `Box`; … a bare name's search ends at the first
+//   enclosing type that has it … (§2.7 Through nesting); and
+//   type parameter `T` is covariant (`out`) but appears in an input (parameter)
+//   position … (§12.9)
+//
+// §2.7 says the search STOPS, so there is no longer a resolved head and §12.9
+// has nothing to compose. It is not an over-rejection — the program is rejected
+// either way — but the two rules disagree about which of them owns the verdict.
+//
+// WHY THIS HALF IS ADDITIVE AND NEEDS NOTHING FROM THE OTHER COMMIT. The stop
+// is a property of §2.7 and of the chain in hand, both available here. The
+// change below is correct with the name-resolver fix ABSENT (this arm then
+// declines to compose for a spelling §2.7 says is unresolved, and the resolver's
+// own silence on that spelling is its own separate defect), PRESENT (the two
+// agree: one diagnostic, from §2.7), or REBASED into a different form (this arm
+// still answers §2.7 as §2.7 states it).
+//
+// THE SCOPE OF THE STOP, and it is narrow on purpose. §2.7's paragraph stating
+// the stop rule opens "**Through nesting.** IN A NESTED TYPE'S BODIES (§11.6),
+// the enclosing-type lookup visits the nested type and then each type enclosing
+// it" — so it is scoped to a NESTED type's body. A chain of ONE element is a
+// module top-level type's own body, where §2.7's rule 1 alone applies and its
+// normative table has NO row for a type position (its rows are a chain head, a
+// bare value read, an assignment target, a bare callee, a head continued by
+// `?.`/`!`, and the warning row) — every one a position at which a NAME is
+// read. So a top-level type's own member of the name does not end the search
+// here, which is also what keeps §2.7's own `property Color: Color` idiom
+// spellable at the top level.
+//
+// TWO AXES THIS DOES NOT COVER, declared rather than assumed. §2.7's rule-1
+// ranking paragraph says "the enclosing type's accessible members (inherited
+// included)", but §2.7's "Through nesting" paragraph — the one stating the stop
+// rule — enumerates the chain as "the nested type and then each type enclosing
+// it", with no BASE types in it, and inheritance has its own accessor
+// (`baseTypes`). Likewise a §21.10 local type's body has no `TypeDecl`-born
+// chain element here. Both are wider than the paragraph that states the stop,
+// so neither is smuggled in.
+//
+// SEAM-ACCESSOR: `members`, `NestedTypeSymbol::type`, `MemberSymbol::visibility`
+// and each member's own `decl` — see `enclosingMemberEndsBareTypeSearch`.
+const TypeSymbol* enclosingMemberBareName(
+    const std::vector<const TypeSymbol*>& chain, std::string_view h) {
+    // §2.7 "Through nesting" is scoped to a NESTED type's bodies: a chain of
+    // one is a module top-level type's own body, where rule 1's table has no
+    // type-position row (see the scope note above).
+    const bool nestedBody = chain.size() > 1;
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        const TypeSymbol* enclosing = chain[i];
+        if (!enclosing) continue;
+        const bool ownBody = (i == 0);
+        const TypeSymbol* nested = nullptr;
+        for (Symbol* m : enclosing->members) {
+            if (!m || m->name != h) continue;
+            const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
+            if (nt && nt->type) {
+                if (nested && nested != nt->type) return nullptr;  // two of one name
+                nested = nt->type;
+                continue;
+            }
+            if (nestedBody &&
+                enclosingMemberEndsBareTypeSearch(enclosing, m, h, ownBody))
+                return nullptr;  // §2.7: the search ENDS here, no type to compose
+        }
+        if (nested) return nested;
+    }
+    return nullptr;
+}
+
+// fix #6373 (§2.2, §2.7 rule 1, §2.7 rule 2, §11.3, §11.6, v0.338): what the
+// QUALIFIER of a dotted head selects — decided ONCE, and read by every arm of
+// the composed walk, so no two arms can disagree about what a spelling names.
+//
+// A head's path is `Qualifier . Rest`. §2.7 rule 1 resolves the leftmost
+// segment as a bare name (local scope, then the enclosing type's members, then
+// the current module's declarations, then unambiguous imported bare names, then
+// import aliases); only if it binds to a TYPE does the rest of the chain resolve
+// against that type (nested type, §11.6), and only if it binds to a MODULE does
+// the rest name a member of that module (§2.7 rule 2, `Module.Type`).
+//
+//   LocalTopLevel — a local top-level TYPE. §2.2: a local declaration shadows an
+//       import, so the spelling is an enclosing-type path and binds INSIDE that
+//       local type (or nowhere). This pass cannot resolve a nested LOCAL head,
+//       so it answers nothing — the skip, and never a guess. #6351's P9.
+//   LocalAlias    — a local `type X := ...`. §27.8 declares aliases at module
+//       level, so an alias has no enclosing type and `Alias.Member` names
+//       nothing at all. #6351's guard scanned `localTypes`, which holds
+//       `TypeSymbol`s only, so a same-named ALIAS slipped past it and the
+//       module's exports were read for a spelling the name resolver had already
+//       bound to the alias. Same verdict as LocalTopLevel: nothing.
+//   ImportedModule — an import ALIAS, or a MODULE name this file wrote an
+//       `import` for. `module` carries the DOTTED name and `partsConsumed` how
+//       many path segments that name took, which is what distinguishes `Lib.Box`
+//       from `Com.Sub.Box` under `import Com.Sub;` (§2.2/§2.5 allow a dotted
+//       module name, and `sourceImports_` is keyed by the full dotted name, so a
+//       `parts.front()`-only test never finds it).
+//   None          — a bare name, or a qualifier naming nothing at all. A bare
+//       name is answered by the bare-name tables; a qualifier that names nothing
+//       makes the WHOLE spelling unresolvable, so no bare-name table may answer
+//       for it.
+struct HeadQualifier {
+    enum class Kind { Bare, LocalTopLevel, LocalAlias, ImportedModule, None };
+    Kind kind = Kind::Bare;
+    std::string module;              // ImportedModule: the DOTTED name
+    std::size_t partsConsumed = 0;   // ImportedModule: segments it spelled
+};
+
+// fix #6373 (§11.6, v0.338): the §11.6 nested-type walk — `parts[from ..]` off
+// `ts`, one `NestedTypeSymbol` per component, null at the first one that is
+// absent. This is `resolveNamed`'s own qualified walk, so the two agree on what
+// a nested spelling names.
+//
+// SEAM-ACCESSOR: `ts` is reached off `heads.imported`, so on the import path it
+// is an IMPORTED `TypeSymbol` reconstructed by `ModuleLoader` with no AST and no
+// `decl`. This walk reads only `members` and `NestedTypeSymbol::name`/`type`,
+// which the loader does populate, and never `decl`.
+const TypeSymbol* walkNestedTypePath(const TypeSymbol* ts,
+                                     const std::vector<std::string_view>& parts,
+                                     std::size_t from) {
+    for (std::size_t i = from; i < parts.size(); ++i) {
+        const TypeSymbol* inner = nullptr;
+        for (Symbol* m : ts->members) {
+            const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
+            if (nt && nt->name == parts[i] && nt->type) { inner = nt->type; break; }
+        }
+        if (!inner) return nullptr;
+        ts = inner;
+    }
+    return ts;
+}
+
+HeadQualifier classifyHeadQualifier(
+    const ast::Type& head, const std::vector<TypeSymbol*>& localTypes,
+    const std::vector<TypeAliasSymbol*>& localAliases, const VarianceHeads& heads) {
+    HeadQualifier q;
+    const auto& parts = head.name->parts;
+    if (parts.size() < 2) return q;  // Bare
+    const std::string qualifier(parts.front());
+    // §2.2 — a LOCAL declaration shadows an import of the same name, and the
+    // name resolver consults the module scope — every top-level type AND every
+    // top-level alias, `TypeResolution::run` populating it from
+    // `ctx_.module()->children` — BEFORE its alias and module arms. Both local
+    // kinds therefore outrank both module spellings, and both leave the spelling
+    // naming nothing this pass can resolve.
+    for (const TypeSymbol* ts : localTypes)
+        if (ts && ts->name == qualifier) {
+            q.kind = HeadQualifier::Kind::LocalTopLevel;
+            return q;
+        }
+    for (const TypeAliasSymbol* as : localAliases)
+        if (as && as->name == qualifier) {
+            q.kind = HeadQualifier::Kind::LocalAlias;
+            return q;
+        }
+    if (heads.aliases) {
+        const auto it = heads.aliases->find(qualifier);
+        if (it != heads.aliases->end()) {
+            q.kind = HeadQualifier::Kind::ImportedModule;
+            q.module = it->second;
+            q.partsConsumed = 1;
+            return q;
+        }
+    }
+    // §2.7 rule 2 — try each PREFIX of the dotted name, LONGEST FIRST, against
+    // the modules this file imported. This is `resolveNamed`'s own loop, and it
+    // is what makes a MULTI-SEGMENT module name reachable: under
+    // `import Com.Sub;` the spelling `Com.Sub.Box<T>` consumes two segments
+    // before `Box` is read, where a `parts.front()`-only test looked up `Com` —
+    // not an imported module name — and silently skipped a real §12.9 violation.
+    if (heads.moduleNames) {
+        for (std::size_t n = parts.size() - 1; n >= 1; --n) {
+            std::string prefix;
+            for (std::size_t k = 0; k < n; ++k) {
+                if (k > 0) prefix += '.';
+                prefix += std::string(parts[k]);
+            }
+            if (!heads.moduleNames->count(prefix)) continue;
+            q.kind = HeadQualifier::Kind::ImportedModule;
+            q.module = prefix;
+            q.partsConsumed = n;
+            return q;
+        }
+    }
+    q.kind = HeadQualifier::Kind::None;
+    return q;
+}
+
+// fix #6369 (§11.6, §2.7 rule 1, §12.9, v0.338): the LOCAL half of the §11.6
+// nested-type walk — the head `head` names among the enclosing types this module
+// DECLARES, or null.
+//
+// §11.6: "a nested type … is referenced from outside as `Outer.Nested`" — so
+// the qualified spelling is the ordinary spelling for a nested head, and §12.9's
+// composed position check must read its marker like any other head's. Before
+// this the local side of the walk stopped at `parts.size() == 1`
+// (`namedHeadArgVariance`'s local-top-level table) and `resolveImportedHead`
+// deliberately returns null for a `LocalTopLevel` qualifier, so a LOCAL
+// `Outer.Inner<T>` resolved by NO arm: `Unknown`, and §12.9 SKIPPED it. Under
+// `out T` in a return slot against a contravariant `Outer.Inner<in T>` that is
+// a real violation the compiler accepted, ran and exited 0 on — a silent
+// acceptance, the same class as #6373's Finding 2.
+//
+// SAME WALK AS THE IMPORT ARM, AND THAT IS THE POINT. `walkNestedTypePath` is
+// `resolveNamed`'s own qualified descent (`TypeResolution_Names.cpp`: "descend
+// through the looked-up symbol's nested types for each subsequent part"), so
+// this arm and the imported one cannot disagree about what a dotted spelling
+// names: both look up the qualifying type, then take one `NestedTypeSymbol`
+// per remaining segment. What decides which of the two answers a spelling is
+// #6373's `classifyHeadQualifier`, decided ONCE — `LocalTopLevel` here,
+// `ImportedModule` there — and the caller reaches this function only on the
+// former. There is no third reading of a qualified spelling to get wrong.
+//
+// Two non-answers, neither a guess:
+//   * no local type, or MORE THAN ONE, of the qualifier's name. §21.10 admits
+//     same-named local types in disjoint blocks, and picking one of them would
+//     read a marker off a type the use site may not name; null is the same
+//     "ambiguous — skip" rule `resolveImportedHead`'s bare-name arm applies.
+//   * a qualifying type that has no such nested type. `resolveNamed` reports
+//     that spelling (§11.3, "type `Outer` has no nested type named `Nope`"),
+//     so the program is rejected on its own account and this pass must add
+//     nothing — see `nested_local_head_missing_member_adds_no_variance`.
+const TypeSymbol* resolveLocalNestedHead(
+    const ast::Type& head, const std::vector<TypeSymbol*>& localTypes) {
+    if (!head.name || head.name->parts.size() < 2) return nullptr;
+    const std::string_view qualifier = head.name->parts.front();
+    const TypeSymbol* top = nullptr;
+    for (const TypeSymbol* ts : localTypes) {
+        if (!ts || ts->name != qualifier) continue;
+        if (top) return nullptr;  // two declarations of one name — never guess
+        top = ts;
+    }
+    if (!top) return nullptr;
+    return walkNestedTypePath(top, head.name->parts, 1);
+}
+
+// fix #6351 (second attempt; the first was REJECTed for a false resolve), as
+// completed by fix #6373: the head `head` names among the imported types, or
+// null.
+//
+// THE RULE: this function may only ever hand back a type the NAME RESOLVER would
+// bind to that spelling. It enforces that by deciding what the QUALIFIER binds
+// FIRST (`classifyHeadQualifier`) and then following the REST of the path the
+// way `resolveNamed` follows it — the module's export at `parts[consumed]`, then
+// §11.6 nested types. No component is ever matched on `parts.back()` alone.
+//
+//   * LocalTopLevel / LocalAlias -> null (see the enum's own comment). #6351's
+//     P9 hole and #6373's second one, closed by one test.
+//   * ImportedModule  -> the module's export at `parts[partsConsumed]`, then the
+//     remaining components as nested types. A component that does not exist
+//     yields null, so `Lib.Outer.Box<T>` against a module exporting only a
+//     top-level `Box<in T>` no longer reads `Lib.Box`'s marker — while
+//     `Lib.Outer.Box<in T>` against a module that really exports that nested
+//     type still resolves and still rejects, which a "require exactly two path
+//     parts" rule would have thrown away.
+//   * None            -> null. Never guess.
+//   * Bare            -> every imported module, null on a second match, which
+//     §2.2 already rejects as ambiguous.
+//
+// Null means `Unknown` upstream: a skip, the pre-#6351 behaviour, and the safe
+// direction — a false skip can only miss a rejection, while a false resolve
+// produces one.
+const TypeSymbol* resolveImportedHead(
+    const ast::Type& head, const VarianceHeads& heads,
+    const std::vector<TypeSymbol*>& localTypes,
+    const std::vector<TypeAliasSymbol*>& localAliases) {
+    if (!head.name || head.name->parts.empty() || !heads.imported) return nullptr;
+    const auto& parts = head.name->parts;
+
+    const HeadQualifier q =
+        classifyHeadQualifier(head, localTypes, localAliases, heads);
+
+    if (q.kind == HeadQualifier::Kind::ImportedModule) {
+        const auto mod = heads.imported->find(q.module);
+        if (mod == heads.imported->end()) return nullptr;
+        const std::string_view typeName = parts[q.partsConsumed];
+        const TypeSymbol* top = nullptr;
+        for (const TypeSymbol* ts : mod->second)
+            if (ts && ts->name == typeName) { top = ts; break; }
+        if (!top) return nullptr;
+        return walkNestedTypePath(top, parts, q.partsConsumed + 1);
+    }
+    if (q.kind != HeadQualifier::Kind::Bare) return nullptr;
+
+    // A BARE name: every imported module, and null on a second match.
+    const std::string_view h = parts.back();
+    const TypeSymbol* found = nullptr;
+    for (const auto& entry : *heads.imported) {
+        for (const TypeSymbol* ts : entry.second) {
+            if (!ts || ts->name != h) continue;
+            if (found) return nullptr;  // ambiguous bare name — skip
+            found = ts;
+        }
+    }
+    return found;
+}
+
+VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName,
+                                  VariancePos outer,
+                                  const std::vector<TypeSymbol*>& localTypes,
+                                  const std::vector<TypeAliasSymbol*>& localAliases,
+                                  const VarianceHeads& heads,
+                                  VarianceSite site,
+                                  std::unordered_set<const TypeAliasSymbol*>&
+                                      aliasChain);
+
+// §12.9: "A type parameter inside another generic type inherits position from
+// that wrapper's variance" — so argument `argIndex` of the head spelled by
+// `head` sits in the head's own slot at that index.
+//
+// `localTypes` is the current module's declared types; a head found there
+// reads its `GenericParamSymbol::variance` (#3143: populated on both the local
+// and the imported side). `localAliases` is the module's `type X<T> := …`
+// declarations, which are `TopDecl`-level symbols rather than `TypeSymbol`s
+// and are therefore invisible to that walk — since fix #6354 a head found among
+// them is answered from the type it NAMES (§27.8, see below). A built-in head
+// (the authoritative table `Resolver::builtinTypeArity`, via
+// `isBuiltinTypeName`) is covariant only if it is one of the nine listed
+// above. Anything else is `Unknown` — the caller skips rather than guesses.
+VariancePos namedHeadArgVariance(const ast::Type& head, std::size_t argIndex,
+                                 const std::vector<TypeSymbol*>& localTypes,
+                                 const std::vector<TypeAliasSymbol*>& localAliases,
+                                 const VarianceHeads& heads,
+                                 VarianceSite site,
+                                 std::unordered_set<const TypeAliasSymbol*>&
+                                     aliasChain) {
+    if (!head.name || head.name->parts.empty()) return VariancePos::Unknown;
+    const std::string_view h = head.name->parts.back();
+    // fix #6373 (§2.2, §2.7 rule 1, v0.338): the qualifier decides which scope
+    // answers, so this local-top-level table answers BARE NAMES ONLY.
+    //
+    // The walk below used to compare `parts.back()` — the spelling's LAST
+    // segment — with no test on whether the spelling was qualified at all, so
+    // `Lib.Box<T>` was answered off a LOCAL top-level `Box` whenever the file
+    // happened to declare one. §2.7 rule 1 resolves the leftmost segment first
+    // and resolves the rest against whatever THAT binds to; a module-qualified
+    // spelling therefore never consults the local table, and §2.2's shadowing
+    // rule is about a BARE name (`Box<T>`), which is the one this arm keeps.
+    //
+    // MEASURED both ways on the base, with a local `Box` and a same-named
+    // `Lib.Box` carrying OPPOSITE markers, so the two spellings cannot be
+    // confused:
+    //   local `in T`, `Lib.Box` `out T`, spelled `Lib.Box<T>` -> REJECTED, and
+    //     it must COMPILE (§2.7 rule 2 binds `Lib.Box`, covariant);
+    //   local `out T`, `Lib.Box` `in T`, spelled `Lib.Box<T>` -> ACCEPTED, and
+    //     it must be REJECTED (a real §12.9 violation, silently skipped).
+    // That is a false resolve in the shape #6351's first attempt was REJECTed
+    // for: it turns a legal program into an error.
+    const bool qualifiedSpelling = head.name->parts.size() > 1;
+    if (!qualifiedSpelling) {
+        // fix #6383 (§2.7 rule 1, §2.7 Through nesting, §11.6, §12.9, v0.338): a
+        // bare name in a type body that names an enclosing type's NESTED type.
+        //
+        // §2.7 rule 1 ranks "the enclosing type's accessible members" ABOVE
+        // "the current module's declarations" and above imports, and §2.7's
+        // "Through nesting" paragraph says why with a rule of its own: "Nested
+        // types of an enclosing type, generic or not, are reached by bare name,
+        // since a nested type is one type and needs no instantiation."
+        //
+        // So this arm sits FIRST in the bare-name branch, ahead of the top-level
+        // table below: with both a nested `Box` and a top-level `Box` in scope,
+        // the enclosing-type step is the earlier one in §2.7 rule 1's order and
+        // so is the binding — answering off the top-level one instead would
+        // read a marker off a type the spelling does not name, #6373's false
+        // resolve in mirror image. That precedence is PINNED, in both
+        // directions, by the two `shadowed_by_top_level` rows of
+        // `nested_type_bare_name_body_variance_6383`; a reviewer-planted mutant
+        // that puts the top-level table first SURVIVED without them.
+        //
+        // MEASURED before this fix (base `5df02d87`): `out T` in a RETURN slot
+        // against a body-position bare contravariant `Box<in T>` compiled, ran
+        // and exited 0. The composition is `Unknown` because `localTypes` holds
+        // the module's TOP-LEVEL declarations only, so neither this table nor
+        // `resolveImportedHead`'s bare arm — the two arms a bare name reaches —
+        // could see a nested type at all.
+        if (const TypeSymbol* body =
+                enclosingMemberBareName(heads.enclosingChain, h)) {
+            // The same reading rules as the two arms below, deliberately: a
+            // class, record, enum or choice is always invariant (§12.9), and a
+            // head with no marker at `argIndex` defers through
+            // `invariantOrDefer` (#6355) rather than guessing. The marker read
+            // is the NESTED type's own.
+            if (body->kind != ast::TypeDeclKind::Interface)
+                return invariantOrDefer(site);
+            if (argIndex >= body->genericParams.size())
+                return invariantOrDefer(site);
+            const auto* gps =
+                dynamic_cast<GenericParamSymbol*>(body->genericParams[argIndex]);
+            if (!gps) return invariantOrDefer(site);
+            if (gps->variance == "out") return VariancePos::CoVariant;
+            if (gps->variance == "in") return VariancePos::ContraVariant;
+            return invariantOrDefer(site);
+        }
+        for (const TypeSymbol* ts : localTypes) {
+            if (ts->name != h) continue;
+            // A class, record, enum or choice is always invariant (§12.9), and it
+            // may in any case carry no marker at all.
+            if (ts->kind != ast::TypeDeclKind::Interface) return invariantOrDefer(site);
+            if (argIndex >= ts->genericParams.size()) return invariantOrDefer(site);
+            const auto* gps = dynamic_cast<GenericParamSymbol*>(ts->genericParams[argIndex]);
+            if (!gps) return invariantOrDefer(site);
+            if (gps->variance == "out") return VariancePos::CoVariant;
+            if (gps->variance == "in") return VariancePos::ContraVariant;
+            return invariantOrDefer(site);
+        }
+    }
+    // fix #6369 (§11.6, §2.7 rule 1, §12.9, v0.338): a NESTED LOCAL head.
+    // §11.6 makes `Outer.Inner` the ordinary spelling of a nested type, and
+    // §2.7 rule 1 resolves the leftmost segment first — to a local type here,
+    // so the REST of the path names a member of that type rather than of a
+    // module. Nothing answered that spelling before: the table above answers
+    // BARE names only (#6373), and `resolveImportedHead` returns null for a
+    // `LocalTopLevel` qualifier by design, so the composed walk yielded
+    // `Unknown` and §12.9 SKIPPED a real violation.
+    //
+    // The qualifier is classified rather than merely tested, so this arm and
+    // the imported one below are the SAME rule read off ONE verdict
+    // (#6373's `classifyHeadQualifier`): `LocalTopLevel` walks the module's
+    // own declarations, `ImportedModule` walks a module's exports, and no
+    // spelling is answered by both or by neither.
+    if (qualifiedSpelling &&
+        classifyHeadQualifier(head, localTypes, localAliases, heads).kind ==
+            HeadQualifier::Kind::LocalTopLevel) {
+        if (const TypeSymbol* nested =
+                resolveLocalNestedHead(head, localTypes)) {
+            // The same reading rules as the two walks above, deliberately: a
+            // class, record, enum or choice is always invariant (§12.9), and a
+            // head with no marker at `argIndex` defers through
+            // `invariantOrDefer` (#6355) rather than guessing. The marker is
+            // the NESTED type's own — `resolveLocalNestedHead` returns what
+            // `walkNestedTypePath` landed on, never the enclosing class.
+            if (nested->kind != ast::TypeDeclKind::Interface)
+                return invariantOrDefer(site);
+            if (argIndex >= nested->genericParams.size())
+                return invariantOrDefer(site);
+            const auto* gps =
+                dynamic_cast<GenericParamSymbol*>(nested->genericParams[argIndex]);
+            if (!gps) return invariantOrDefer(site);
+            if (gps->variance == "out") return VariancePos::CoVariant;
+            if (gps->variance == "in") return VariancePos::ContraVariant;
+            return invariantOrDefer(site);
+        }
+    }
+    // fix #6354 (§27.8, §12.9): a LOCAL GENERIC ALIAS head. §12.9 forbids a
+    // marker on an alias parameter ("the variance markers are interface-only
+    // syntax … `in`/`out` on a generic parameter of a class, record, method, or
+    // type alias is a compile error"), so the alias's own parameter carries no
+    // marker to read and the answer has to come from the type it NAMES: §27.8
+    // makes an alias "a pure synonym … a naming convenience, not a separate
+    // type kind", so `MyList<T>` IS `Array<T>` and argument 0 of `MyList` sits
+    // in `Array`'s invariant slot 0, while `Getter<T>` IS `(T) -> ()`, whose
+    // slot 0 is a function PARAMETER slot and therefore contravariant.
+    //
+    // The answer is `composedParamPosition` over the alias's body at polarity
+    // `CoVariant` — exactly "the variance of the alias's parameter at
+    // `argIndex`, as seen from outside the body", the same question the
+    // surrounding composition already answers. A CHAINED alias
+    // (`type A<T> := B<T>; type B<T> := Array<T>;`) therefore needs no special
+    // case: the recursive call sees `B<T>` and takes the arms above.
+    //
+    // Three non-answers, each distinct and none of them a guess: a body that
+    // does not mention the parameter yields `Absent` (a phantom parameter
+    // constrains no use site); an alias with no declaration, no body, or fewer
+    // parameters than the use site supplies yields `Unknown`; and so does a
+    // chain that has come back round to an alias it already holds on
+    // `aliasChain` (fix #6408 — a CYCLE, which §27.8 rejects on its own).
+    if (const TypeAliasSymbol* as = resolveLocalAliasHead(head, localAliases)) {
+        const auto* ad = dynamic_cast<const ast::TypeAlias*>(as->decl);
+        if (!ad || !ad->aliasedType) return VariancePos::Unknown;
+        if (argIndex >= as->genericParams.size()) return VariancePos::Unknown;
+        // fix #6408 (§12.9, §27.8, v0.338): the CYCLE guard that replaces
+        // `kMaxAliasSeeThroughDepth`. An alias is followed only if it is not
+        // already on the chain being composed, so a chain of any LENGTH is
+        // composed to its end and a cycle terminates. `Unknown` is the same
+        // conservative non-answer an unresolvable head yields, and §27.8 has
+        // already rejected the program by the time this runs — see the block
+        // comment where the constant was.
+        if (!aliasChain.insert(as).second) return VariancePos::Unknown;
+        struct ChainGuard {
+            std::unordered_set<const TypeAliasSymbol*>& set;
+            const TypeAliasSymbol* as;
+            ~ChainGuard() { set.erase(as); }
+        } chainGuard{aliasChain, as};
+        const auto* aps =
+            dynamic_cast<GenericParamSymbol*>(as->genericParams[argIndex]);
+        if (!aps) return VariancePos::Unknown;
+        return composedParamPosition(*ad->aliasedType, aps->name,
+                                     VariancePos::CoVariant, localTypes,
+                                     localAliases, heads, site, aliasChain);
+    }
+    // fix #6351 (§12.9, §2.2, §2.7, §13.2): a head IMPORTED from another
+    // module. §12.9's rule names no module boundary — "Position is composed
+    // across nested type constructors. A type parameter inside another generic
+    // type inherits position from that wrapper's variance" — and #3143
+    // populates `GenericParamSymbol::variance` on the imported side too
+    // (`ModuleLoader::convertGenericParams`), so the marker is read from the
+    // same field either way and an imported head composes exactly as a local
+    // one does. Before this arm the only sources were `localTypes`, the local
+    // aliases, and the built-in table, so every imported head composed to
+    // `Unknown` and was SILENTLY SKIPPED.
+    //
+    // ARM ORDER — local first, imports second, and that order is §2.2's, not
+    // an arbitrary preference. Reaching this arm already means neither the
+    // local-type walk above nor the local alias above matched, so for a name
+    // that is BOTH an imported type and a local alias the ALIAS has won —
+    // which is the shadowing rule the name resolver itself applies (§2.2: "a
+    // local declaration shadows an import"), so the two can never disagree
+    // about which type the spelling names. It also resolves the qualified
+    // spelling correctly for free: `resolveLocalAliasHead` matches only a
+    // single-part name (§27.8 aliases are module-level, A.2 `TypeAliasDecl` is
+    // a `TopDecl`), so `L.Foo<T>` never reaches this arm through an alias at
+    // all and searches the module `L` names instead.
+    //
+    // `resolveImportedHead` enforces the same rule from the other side: it
+    // returns null outright when the qualifier is a local top-level type or a
+    // local alias, searches a module only when the qualifier provably names one
+    // (#6373 — and it follows the rest of the path as nested types, so a
+    // three-segment spelling whose middle segment does not exist resolves to
+    // nothing rather than to the last component).
+    if (const TypeSymbol* its =
+            resolveImportedHead(head, heads, localTypes, localAliases)) {
+        // The same reading rules as the local-type walk above, deliberately:
+        // a class, record, enum or choice is always invariant (§12.9), and a
+        // head with no marker at `argIndex` defers through `invariantOrDefer`
+        // (#6355) rather than guessing.
+        if (its->kind != ast::TypeDeclKind::Interface)
+            return invariantOrDefer(site);
+        if (argIndex >= its->genericParams.size()) return invariantOrDefer(site);
+        const auto* gps =
+            dynamic_cast<GenericParamSymbol*>(its->genericParams[argIndex]);
+        if (!gps) return invariantOrDefer(site);
+        if (gps->variance == "out") return VariancePos::CoVariant;
+        if (gps->variance == "in") return VariancePos::ContraVariant;
+        return invariantOrDefer(site);
+    }
+    // fix #6373 (§2.3, §2.7 rule 1, v0.338): the built-in table answers BARE
+    // NAMES ONLY, for the same reason the local-top-level table above now does.
+    // §2.3's built-ins are "use without import" — they are reachable as bare
+    // names, and a qualified spelling reaches one ONLY through its home
+    // module's qualified name, which `resolveNamed` REWRITES to the bare name
+    // in the AST (fix #4698 / #6040) before this pass reads it. So a qualified
+    // spelling arriving here names nothing this table can answer.
+    //
+    // MEASURED on the base: with `import LibX;` where `LibX` exports no
+    // `Array`, `method Put(x: LibX.Array<T>)` under `out T` was rejected TWICE —
+    // once correctly, by "module `LibX` has no public type `Array` (§2.7)", and
+    // once by a §12.9 diagnostic byte-identical to the one the bare `Array<T>`
+    // spelling legitimately earns. The spelling never named the built-in.
+    if (qualifiedSpelling) return VariancePos::Unknown;
+    if (!isBuiltinTypeName(h)) return VariancePos::Unknown;
+    if (argIndex == 0 && builtinHeadIsCovariantAtZero(h)) return VariancePos::CoVariant;
+    return invariantOrDefer(site);
+}
+
+// The composed position of `paramName` inside `t`, given that `t` itself
+// occupies a slot of polarity `outer`.
+VariancePos composedParamPosition(const ast::Type& t, std::string_view paramName,
+                                  VariancePos outer,
+                                  const std::vector<TypeSymbol*>& localTypes,
+                                  const std::vector<TypeAliasSymbol*>& localAliases,
+                                  const VarianceHeads& heads,
+                                  VarianceSite site,
+                                  std::unordered_set<const TypeAliasSymbol*>&
+                                      aliasChain) {
+    switch (t.kind) {
+    case ast::TypeKind::Named: {
+        if (t.genericArgs.empty())
+            return isBareParamRef(t, paramName) ? outer : VariancePos::Absent;
+        VariancePos acc = VariancePos::Absent;
+        for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+            // §12.9: "A type parameter inside another generic type inherits
+            // position from that wrapper's variance" — argument `i` occupies
+            // the head's own slot at index `i`, so the head's variance is
+            // applied to the slot the whole type occupies here.
+            const VariancePos argSlot = slotPolarity(
+                outer,
+                namedHeadArgVariance(t, i, localTypes, localAliases, heads,
+                                    site, aliasChain));
+            // fix #6355: a DEFERRED argument contributes no verdict of its own
+            // and is not allowed to contribute one to its siblings either —
+            // `mergeVariancePos` makes `Deferred` the fold's neutral element.
+            // Skipping it here (rather than folding it) is what keeps a single
+            // disputed argument from deciding the whole head's verdict.
+            if (argSlot == VariancePos::Absent ||
+                argSlot == VariancePos::Deferred)
+                continue;
+            acc = mergeVariancePos(
+                acc, composedParamPosition(*t.genericArgs[i], paramName, argSlot,
+                                           localTypes, localAliases, heads,
+                                           site, aliasChain));
+        }
+        return acc;
+    }
+    case ast::TypeKind::Function: {
+        // §12.9: "Function types are themselves variant — covariant in return
+        // type, contravariant in parameter types." An `out` parameter of the
+        // function type is an output slot for the same reason a method's is.
+        VariancePos acc = VariancePos::Absent;
+        if (t.funcReturn)
+            acc = mergeVariancePos(
+                acc, composedParamPosition(*t.funcReturn, paramName, outer,
+                                           localTypes, localAliases, heads,
+                                           site, aliasChain));
+        for (const auto& fp : t.funcParams) {
+            if (!fp.type) continue;
+            const bool isOut = fp.modifier == "out" || fp.modifier == "out owned";
+            acc = mergeVariancePos(
+                acc, composedParamPosition(*fp.type, paramName,
+                                           isOut ? outer : flipVariancePos(outer),
+                                           localTypes, localAliases, heads,
+                                           site, aliasChain));
+        }
+        return acc;
+    }
+    case ast::TypeKind::InlineArray: {
+        // An inline array's element slot is both read and written by value, so
+        // no marker survives it (the value-type half of §12.9's invariance).
+        if (!t.arrayElement) return VariancePos::Absent;
+        return composedParamPosition(*t.arrayElement, paramName,
+                                     VariancePos::Invariant, localTypes,
+                                     localAliases, heads, site, aliasChain);
+    }
+    default:
+        return VariancePos::Absent;
+    }
+}
+
+// Check whether `t` places `paramName` in a position the declared variance
+// cannot honour.
 //
 // `paramVariance`  — "out" (covariant) or "in" (contravariant).
-// `isOutputPos`    — true when `t` occurs in an output position (method
+// `isOutputPos`    — true when `t` itself sits in an output position (method
 //                    return, readonly property, `out` parameter).
 //
-// Returns true iff a violation was detected at this direct level.
-// (Nested positions inside function types or generic args are skipped.)
-bool directVarianceViolation(const ast::Type& t,
-                              std::string_view paramVariance,
-                              bool isOutputPos,
-                              std::string_view paramName) {
-    if (!isDirectParamRef(t, paramName)) return false;
-    if (paramVariance == "out" && !isOutputPos) return true;   // out T in input
-    if (paramVariance == "in"  &&  isOutputPos) return true;   // in T in output
-    return false;
+// Returns true iff a violation was detected, setting `*composed` when the
+// offending occurrence was reached THROUGH a nested type constructor rather
+// than being a bare `T` in the member's own slot. An `Unknown` composed
+// position — some wrapper whose own variance this pass could not establish —
+// reports no violation (no false positives).
+bool composedVarianceViolation(const ast::Type& t,
+                               std::string_view paramVariance,
+                               bool isOutputPos,
+                               std::string_view paramName,
+                               const std::vector<TypeSymbol*>& localTypes,
+                               const std::vector<TypeAliasSymbol*>& localAliases,
+                               const VarianceHeads& heads,
+                               bool* composed = nullptr,
+                               VarianceSite site = VarianceSite::Member) {
+    // fix #6408 (§12.9, §27.8, v0.338): the per-path alias chain the cycle
+    // guard cuts on. It starts EMPTY here, is pushed and popped by the alias
+    // arm of `namedHeadArgVariance` alone, and lives across the whole member
+    // walk rather than across members, so one member's chain never cuts
+    // another's. Empty at every entry point, so it can never be inherited.
+    std::unordered_set<const TypeAliasSymbol*> aliasChain;
+    const VariancePos pos = composedParamPosition(
+        t, paramName,
+        isOutputPos ? VariancePos::CoVariant : VariancePos::ContraVariant,
+        localTypes, localAliases, heads, site, aliasChain);
+    if (pos == VariancePos::Unknown || pos == VariancePos::Absent) return false;
+    const bool bad = paramVariance == "out" ? pos != VariancePos::CoVariant
+                                            : pos != VariancePos::ContraVariant;
+    if (bad && composed) *composed = !isBareParamRef(t, paramName);
+    return bad;
+}
+
+// The trailing clause a diagnostic appends when the offending occurrence was
+// reached through a nested type constructor rather than sitting bare in the
+// member's own slot. Empty for the direct case, so every pre-existing
+// diagnostic text is unchanged.
+std::string varianceComposedClause(bool composed) {
+    return composed ? " (composed through a nested type constructor)" : "";
 }
 
 }  // anonymous namespace
 
 void Resolver::checkVariancePositions() {
     if (!ctx_.module()) return;
+    // fix #6348: the composed walk resolves each generic HEAD it steps through
+    // against the module's own declared types, so collect them once up front.
+    std::vector<TypeSymbol*> localTypes;
+    // fix #6354: `type X<T> := …` is a `TopDecl`-level `TypeAliasSymbol`, NOT a
+    // `TypeSymbol`, so the loop above cannot see it. Collect the aliases beside
+    // the types for the same reason — a head this pass cannot resolve is
+    // `Unknown` and skipped, and an alias head was being skipped because of a
+    // kind it was not, not because its variance was unknown (§27.8).
+    std::vector<TypeAliasSymbol*> localAliases;
     for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t || t->kind != ast::TypeDeclKind::Interface) continue;
+        if (auto* ts = dynamic_cast<TypeSymbol*>(child)) localTypes.push_back(ts);
+        if (auto* as = dynamic_cast<TypeAliasSymbol*>(child))
+            localAliases.push_back(as);
+    }
+    // fix #6351: the same, for the heads this file IMPORTED. §12.9's rule
+    // names no module boundary — "Position is composed across nested type
+    // constructors" — so an imported head composes exactly as a local one
+    // does, and before this the composed walk resolved `localTypes` only and
+    // yielded `Unknown` for every imported head, silently accepting `out T`
+    // with `method Get(): IThing<T>` against a contravariant `IThing<in T>`.
+    //
+    // Gated on `sourceImports_`, the set of modules THIS FILE wrote an
+    // `import` for — the same gate `TypeResolution::run` uses to expose
+    // import-gated names, so the variance check can never resolve a head the
+    // name resolver would not have bound. A head from a module that was merely
+    // loaded as a dependency (and never imported) stays `Unknown`.
+    //
+    // The bundle carries ONLY the import-side tables. The local types and
+    // aliases stay explicit parameters, so there is exactly one source of
+    // truth for each and no way for the import arm's `namesLocalTopLevel`
+    // test to read a different vector from the local-type walk it must agree
+    // with (§2.2 shadowing).
+    std::unordered_map<std::string, std::vector<TypeSymbol*>> importedTypes;
+    for (const std::string& mod : sourceImports_) {
+        if (const std::vector<TypeSymbol*>* exported = ctx_.importedTypesOf(mod))
+            importedTypes[mod] = *exported;
+    }
+    // fix #6383 (§2.7, §11.6, §12.9, v0.338): the interfaces this pass checks,
+    // each with the chain of types enclosing its own body, innermost first and
+    // INCLUDING itself. That chain is what `heads.enclosingChain` carries and
+    // what `enclosingMemberBareName` walks, so a bare name in a type body can
+    // reach a §11.6 nested type of that type or of any type enclosing it
+    // (§2.7 "Through nesting").
+    //
+    // The traversal now DESCENDS into §11.6 nested types, which it did not:
+    // the loop below used to read `ctx_.module()->children` only, so a nested
+    // interface's body was never checked at all. That omission is exactly why
+    // this issue's shape was unreachable before — the bare name could not name
+    // anything, and the enclosing scope that would name it was never walked. A
+    // nested interface is an interface, and §12.9's rule states no nesting
+    // exemption: a body-position bare `Box<T>` resolving to an enclosing type's
+    // nested `Box<in T>` under an `out T` return slot is a violation whether or
+    // not the interface declaring the slot is itself nested.
+    //
+    // The enclosing type that carries the nested head is NEVER the interface
+    // carrying the slot, which is why the two fixes are required together.
+    // the diagnostic names §11.8: an interface body rejects a nested type
+    // (`interface I<out T> interface Box<in X> … end Box; end I;` →
+    // `expected 'method', 'property', 'event', or 'static method'/'static
+    // operator' (§11.8) in interface body`). The spec does not state this
+    // prohibition explicitly; §11.2's examples show only methods/properties/events
+    // in an interface body, and §11.6 grants nested types to a CLASS body
+    // ("A class body may declare nested classes, records, enums, and interfaces")
+    // or a RECORD body ("Nested types in records are permitted but uncommon")
+    // or a §21.10 local record — never an interface's. So the enclosing member
+    // step could never fire for a body the old loop visited, and the new arm
+    // would have been dead code without this traversal.
+    //
+    // Only INTERFACES are COLLECTED, for the same reason the old loop followed
+    // only interfaces: §12.9's `in`/`out` are interface-only syntax, so a class,
+    // record or local type in the chain contributes members but is never itself
+    // checked. Those three families are still WALKED, though — they are where
+    // the enclosing member step finds its nested type.
+    //
+    // ⚠ A §21.10 method-local type therefore IS reached, through the enclosing
+    // type's `NestedTypeSymbol` members. MEASURED: a local `record Local` holding
+    // `interface Bad<in X>` + `interface H<out T>.Get(): Bad<T>` — the BARE
+    // spelling this arm serves — is silent on the base and REJECTED §12.9 here,
+    // while the name resolver rejects that same spelling with `unresolved type
+    // name 'Bad'`, emitted ALONGSIDE the §12.9. So on the bare spelling this
+    // checker gets FURTHER than the resolver, which is the direction the fix
+    // intends: it answers a spelling the resolver cannot yet bind. Not a defect
+    // this arm introduces.
+    //
+    // The GENUINE pre-existing divergence is on the QUALIFIED spelling
+    // `Local.Bad<T>`, and it is not this commit's. MEASURED by discriminator:
+    // with this arm neutered the qualified spelling still emits §12.9 — it is
+    // served by #6369's `resolveLocalNestedHead`, already on base — while the
+    // bare spelling loses its §12.9 entirely. `enclosingMemberBareName` gates on
+    // `parts.size() == 1` and is never entered for a two-part path. So that §12.9
+    // composes a position for a type the resolver does not bind, which is a
+    // name-resolution defect in `TypeResolution_Names.cpp`. The BARE half of
+    // that family is #6383 follow-up's: `enclosingMemberBareName` now honours
+    // §2.7's enclosing-member stop, so a head §2.7 says is unresolved composes
+    // nothing here. The QUALIFIED half is untouched and stays with #6369.
+    //
+    // SEAM-ACCESSOR: `members` and `NestedTypeSymbol::type`, as
+    // `walkNestedTypePath` already reads them.
+    std::vector<std::pair<const TypeSymbol*, std::vector<const TypeSymbol*>>>
+        varianceSites;
+    {
+        // ⚠ fix #6391 (§12.9, §11.6, Appendix C.1, v0.338): this walk used to
+        // stop at `kMaxTypeNestingDepth = 64`, which was a bound on THIS
+        // COMPILER rather than on this language, and it stopped SILENTLY: a
+        // type nested 65 or more levels deep was never visited, so a §12.9
+        // violation on it compiled, ran and exited 0. MEASURED on the base at
+        // `da1ec4d5`, the same program rejects at depth 64 and compiles clean
+        // at depth 65.
+        //
+        // WHY THERE IS NO CAP HERE AT ALL, which is the whole fix. §12.9 states
+        // the position rule with no depth qualifier — "Position is composed
+        // across nested type constructors", one rule for every interface — and
+        // Appendix C.1 lists it as a compiler-enforced invariant without one
+        // ("Variant generic parameters (`in`, `out`) appear only in the
+        // appropriate position"). §11.6 puts nested types in a type body and
+        // states no limit on how deep that nesting goes, so a violation nested
+        // 65 deep is the SAME violation as one nested 1 deep. A cap therefore
+        // buys nothing the language offers and costs a silent acceptance of a
+        // soundness rule — the "practical consequence" §12.9 leans on being
+        // unavailable at that depth.
+        //
+        // The alternative — keeping a cap and DIAGNOSING the program as too
+        // deeply nested to check — was considered and rejected. It would reject
+        // a program §12.9 admits, for a reason the spec nowhere states:
+        // Appendix C is "the invariants the compiler enforces" and no such
+        // entry exists, and §11.6 states no depth limit, so a deeply nested but
+        // LEGAL declaration would become un-compilable. Inventing that
+        // rejection is a spec ruling, not an implementation fix.
+        //
+        // THE BOUND THAT REMAINS is a CYCLE guard, which is a different thing
+        // and is the right instrument for the hazard the cap was reaching for.
+        // A declaration cannot contain itself, so on any program the checker
+        // ACCEPTS `onChain` never fires: it exists so a malformed SYMBOL graph
+        // terminates instead of recursing until the stack is exhausted. It
+        // rejects nothing and skips nothing that a well-formed program can
+        // spell — unlike a depth bound, which skips exactly the declarations
+        // whose depth happens to exceed a literal.
+        //
+        // THE RECURSION IS NOT NEW and is not the binding constraint at any
+        // depth this compiler accepts. `visit` recurses once per level of §11.6
+        // nesting, and the parser must already have recursed through the same
+        // nesting to build the AST this walk reads. MEASURED, by the R31
+        // non-author review of this commit: a 2000-level chain compiles clean
+        // (10 s, 430 MB RSS), and the stack is exhausted at ~2150-2200 — not at
+        // 5000, and not in the parser. A backtrace on BOTH the base and this
+        // fix puts the faulting frame in the OWNERSHIP pass's nested-type member
+        // recursion, `bezel::ownership::(anonymous namespace)::checkMember` at
+        // Ownership.cpp:16554 / :16778, which runs AFTER this walk
+        // (Driver.cpp:236, after TypeResolution.cpp:747). Both legs fault at the
+        // same depth, so removing the cap here neither introduces nor removes an
+        // exhaustion: this walk is simply never the first pass to run out.
+        // (An earlier revision of this comment attributed the exhaustion to the
+        // parser at 5000. That was a guess about the mechanism; the measurement
+        // above is what the conclusion actually rests on, and it is unchanged.)
+        std::unordered_set<const TypeSymbol*> onChain;  // cycle guard
+        std::vector<const TypeSymbol*> stack;  // outermost-first working chain
+        auto visit = [&](auto&& self, const TypeSymbol* t) -> void {
+            if (!t || !onChain.insert(t).second) return;  // cycle: never on a
+                                                        // well-formed program
+            stack.push_back(t);
+            if (t->kind == ast::TypeDeclKind::Interface)
+                varianceSites.emplace_back(
+                    t, std::vector<const TypeSymbol*>(stack.rbegin(),
+                                                      stack.rend()));
+            for (Symbol* m : t->members) {
+                const auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
+                if (nt && nt->type) self(self, nt->type);
+            }
+            stack.pop_back();
+            onChain.erase(t);  // the chain, not "seen": a type is walked once
+                               // per ENCLOSING PATH, so a graph that reaches it
+                               // twice is checked on both, as it was before.
+        };
+        for (Symbol* child : ctx_.module()->children)
+            if (auto* ts = dynamic_cast<TypeSymbol*>(child)) visit(visit, ts);
+    }
+    // Not `const` because of that per-iteration assignment; it is read only
+    // through the `const VarianceHeads&` every callee takes.
+    VarianceHeads heads{&importedTypes, &importAliases_, &sourceImports_};
+    for (const auto& [t, chain] : varianceSites) {
+        heads.enclosingChain = chain;
         // Collect variant generic params (those with "in" or "out").
         // For each, perform the member-by-member position check.
         for (Symbol* gp : t->genericParams) {
@@ -13715,21 +15369,56 @@ void Resolver::checkVariancePositions() {
             const std::string_view variance  = gps->variance;  // "in" or "out"
 
             // Walk each member of the interface.
-            // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children`
-            // (checkVariancePositions's own loop) — never an imported type
-            // (#3152).
+            // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children` and
+            // its `NestedTypeSymbol` members (checkVariancePositions's own
+            // `varianceSites` walk) — never an imported type (#3152).
             auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
             if (!td) continue;
 
+            // fix #6348 (§12.9): "The extending interface instantiates the
+            // base's variant parameter with its own type parameter, holding
+            // the deriving interface's variance" — the base list is composed
+            // exactly like a member return type (an output position).
+            for (const auto& bt : td->baseTypes) {
+                if (!bt) continue;
+                bool baseComposed = false;
+                if (!composedVarianceViolation(*bt, variance,
+                                               /*isOutputPos=*/true, paramName,
+                                               localTypes, localAliases, heads,
+                                                 &baseComposed,
+                                               VarianceSite::BaseList))
+                    continue;
+                const std::string head =
+                    (bt->name && !bt->name->parts.empty())
+                        ? std::string(bt->name->parts.back())
+                        : std::string("<base>");
+                ctx_.diagnostics().report(
+                    Severity::Error, bt->span.begin,
+                    std::string("type parameter `") + std::string(paramName) +
+                    "` is " +
+                    (variance == "out" ? "covariant (`out`)"
+                                       : "contravariant (`in`)") +
+                    " but appears in base type `" + head +
+                    "`, whose own parameter variance cannot honour that "
+                    "position" + varianceComposedClause(baseComposed) +
+                    " (§12.9)");
+            }
+
             for (const auto& mem : td->members) {
                 if (!mem) continue;
+                // fix #6348: set when the offending occurrence was reached
+                // through a nested type constructor rather than sitting bare
+                // in the member's own slot.
+                bool composed = false;
 
                 // --- MethodDecl ---
                 if (auto* md = dynamic_cast<const ast::MethodDecl*>(mem.get())) {
                     // Return type is an output position.
                     if (md->returnType &&
-                        directVarianceViolation(*md->returnType, variance,
-                                                /*isOutputPos=*/true, paramName)) {
+                        composedVarianceViolation(*md->returnType, variance,
+                                                /*isOutputPos=*/true, paramName,
+                                                localTypes, localAliases, heads,
+                                                        &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, md->returnType->span.begin,
                             std::string("type parameter `") +
@@ -13737,7 +15426,8 @@ void Resolver::checkVariancePositions() {
                             (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
                             " but appears in an " +
                             (variance == "out" ? "input (parameter)" : "output (return)") +
-                            " position in method `" + std::string(md->name) +
+                            " position" + varianceComposedClause(composed) +
+                            " in method `" + std::string(md->name) +
                             "` (§12.9)");
                     }
                     // Each parameter: check modifier for out-param vs. input.
@@ -13746,8 +15436,11 @@ void Resolver::checkVariancePositions() {
                         // `out` and `out owned` parameters are output positions.
                         bool paramIsOutput = (p.modifier == "out" ||
                                               p.modifier == "out owned");
-                        if (directVarianceViolation(*p.type, variance,
-                                                    paramIsOutput, paramName)) {
+                        composed = false;
+                        if (composedVarianceViolation(*p.type, variance,
+                                                    paramIsOutput, paramName,
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, p.type->span.begin,
                                 std::string("type parameter `") +
@@ -13755,7 +15448,8 @@ void Resolver::checkVariancePositions() {
                                 (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
                                 " but appears in an " +
                                 (paramIsOutput ? "output (out-param)" : "input (parameter)") +
-                                " position in parameter `" + std::string(p.name) +
+                                " position" + varianceComposedClause(composed) +
+                                " in parameter `" + std::string(p.name) +
                                 "` of method `" + std::string(md->name) +
                                 "` (§12.9)");
                         }
@@ -13783,33 +15477,42 @@ void Resolver::checkVariancePositions() {
                     if (!isReadonly) {
                         // Read-write: setter is an input position — `out T` is unsafe.
                         if (variance == "out" &&
-                            directVarianceViolation(*pd->type, variance,
-                                                    /*isOutputPos=*/false, paramName)) {
+                            composedVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/false, paramName,
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
                                 std::string(paramName) +
                                 "` is covariant (`out`) but appears in a "
                                 "read-write property `" + std::string(pd->name) +
-                                "`, which has a setter (input position) (§12.9)");
+                                "`, which has a setter (input position)" +
+                                varianceComposedClause(composed) + " (§12.9)");
                         }
                         // `in T` in read-write property: the getter is an
                         // output position — flag as violation.
                         if (variance == "in" &&
-                            directVarianceViolation(*pd->type, variance,
-                                                    /*isOutputPos=*/true, paramName)) {
+                            composedVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/true, paramName,
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
                                 std::string(paramName) +
                                 "` is contravariant (`in`) but appears in a "
                                 "read-write property `" + std::string(pd->name) +
-                                "`, which has a getter (output position) (§12.9)");
+                                "`, which has a getter (output position)" +
+                                varianceComposedClause(composed) + " (§12.9)");
                         }
                     } else {
                         // Readonly property: pure output.
-                        if (directVarianceViolation(*pd->type, variance,
-                                                    /*isOutputPos=*/true, paramName)) {
+                        composed = false;
+                        if (composedVarianceViolation(*pd->type, variance,
+                                                    /*isOutputPos=*/true, paramName,
+                                                    localTypes, localAliases, heads,
+                                                            &composed)) {
                             ctx_.diagnostics().report(
                                 Severity::Error, pd->type->span.begin,
                                 std::string("type parameter `") +
@@ -13817,7 +15520,8 @@ void Resolver::checkVariancePositions() {
                                 (variance == "out" ? "covariant (`out`)" : "contravariant (`in`)") +
                                 " but appears in a readonly property `" +
                                 std::string(pd->name) +
-                                "` — readonly properties are output positions (§12.9)");
+                                "` — readonly properties are output positions" +
+                                varianceComposedClause(composed) + " (§12.9)");
                         }
                     }
                     continue;
@@ -13833,27 +15537,34 @@ void Resolver::checkVariancePositions() {
                     // A field is both readable and writable → both input and output.
                     // `out T` in an input context is a violation.
                     if (variance == "out" &&
-                        directVarianceViolation(*fd->type, variance,
-                                                /*isOutputPos=*/false, paramName)) {
+                        composedVarianceViolation(*fd->type, variance,
+                                                /*isOutputPos=*/false, paramName,
+                                                localTypes, localAliases, heads,
+                                                        &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, fd->type->span.begin,
                             std::string("type parameter `") +
                             std::string(paramName) +
                             "` is covariant (`out`) but appears in field `" +
                             std::string(fd->name) +
-                            "` (invariant position — §12.9)");
+                            "` (invariant position" + varianceComposedClause(composed) +
+                            " — §12.9)");
                     }
                     // `in T` in an output context is a violation.
+                    composed = false;
                     if (variance == "in" &&
-                        directVarianceViolation(*fd->type, variance,
-                                                /*isOutputPos=*/true, paramName)) {
+                        composedVarianceViolation(*fd->type, variance,
+                                                /*isOutputPos=*/true, paramName,
+                                                localTypes, localAliases, heads,
+                                                        &composed)) {
                         ctx_.diagnostics().report(
                             Severity::Error, fd->type->span.begin,
                             std::string("type parameter `") +
                             std::string(paramName) +
                             "` is contravariant (`in`) but appears in field `" +
                             std::string(fd->name) +
-                            "` (invariant position — §12.9)");
+                            "` (invariant position" + varianceComposedClause(composed) +
+                            " — §12.9)");
                     }
                     continue;
                 }

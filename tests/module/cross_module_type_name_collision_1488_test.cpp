@@ -40,94 +40,78 @@
 //   (c) control: a single-module build with no cross-module collision
 //       potential is unaffected by the qualified mangling scheme.
 
-#include "driver/Driver.hpp"
+#include "support/aot_support.hpp"
+#include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <string>
-#include <sys/wait.h>
 #include <vector>
-#include "support/unique_stem.hpp"
 
 
 namespace bezel::module {
+
+using bezel::test::JitResult;
+
 namespace {
 
-namespace fs = std::filesystem;
+// ── HARNESS (test #6386) ───────────────────────────────────────────────────
+//
+// This file used to carry its own two-dependency runner (`buildAndRunTwoLibs`:
+// two `compileObject`s, a two-entry `Dependency` vector, `std::system`, a
+// hand-rolled -1 on every failure) plus a single-module twin
+// (`buildAndRunSingle`). Both are now the shared helpers from
+// tests/support/aot_support.hpp (#6379).
+//
+// THE SHAPE IS THE ONE #6379 NAMED. This is exactly the multi-module program
+// `runAotModules` exists for: ONE entry module importing TWO dependency
+// artifacts. The harness derives the build order from each module's own
+// `import` declarations — `App` imports `LibA` and `LibD as D`, and
+// `importedModuleNames` reads `LibD` out of the alias form — so the three
+// modules are supplied as a set and the order is not the caller's problem.
+//
+// The run half is `aot_detail::runProgramFill`, the SAME function `runAot`
+// calls; the compile halves are `forkedCompileModule` (`Driver::compileObject`,
+// the only shape that embeds the §2.4 `.bezel.meta` public interface) and
+// `forkedCompileWithDeps`. A driver crash in either library build is therefore
+// FORK-ISOLATED, where the old runner ran both in the test process.
+//
+// ⚠ WHAT THE PORT ADDS. Every row below asserted a bare exit code against a
+// runner that returned -1 for a compile failure, a link failure, a fork failure
+// and a runtime signal alike. Each now asserts `r.ran` FIRST and
+// unconditionally, then the SAME exit code as before. That matters most for
+// (a) and (b), whose whole subject is a LINK failure: the pre-fix behaviour
+// was "multiple definition of `bz$Tx$Hello`" at the native link step, which
+// the old runner flattened to -1 and the new one reports as `ran == false`
+// with clang's linker text in `r.diagnostics`. The value assertions are
+// unchanged: 3, 7, 42, 15.
+//
+// ⚠ ONE REAL DIFFERENCE, measured and deliberate. The old runner executed with
+// `std::system(exe)`, inheriting the ambient environment, so under the #1822
+// whole-suite ASan sweep (`BEZEL_AOT_FORCE_SANITIZE=address`) it ran with
+// LeakSanitizer ON by default and a leak would have replaced the program's own
+// exit status with LSan's. `runAot` pins `detect_leaks=0` under the sweep
+// (#4532 measured that whole-suite leak detection is too noisy, and §28.2
+// checked disposal leaks BY DESIGN). MEASURED under that sweep at this commit:
+// all four rows are clean, so no row here depended on the inherited detection.
+//
+// THE SINGLE-MODULE CONTROL (c) stays on `runAot`, not `runAotModules`:
+// #6379 is explicit that the multi-module helper is NOT a replacement for it,
+// because a one-module row keeps the content-addressed link-cache that a whole
+// gate collapses 2-3 compilations of the same program into 1.
 
-struct TempFile {
-    std::string path;
-    explicit TempFile(const std::string& p) : path(p) {}
-    ~TempFile() { std::remove(path.c_str()); }
-};
-
-void writeSource(const std::string& path, const std::string& src) {
-    std::ofstream out(path);
-    out << src;
+JitResult buildAndRunTwoLibs(const std::string& libASrc,
+                             const std::string& libBSrc,
+                             const std::string& mainSrc) {
+    return bezel::test::runAotModules(
+        {bezel::test::ModuleSource{"LibA", libASrc},
+         bezel::test::ModuleSource{"LibD", libBSrc},
+         bezel::test::ModuleSource{"App", mainSrc}},
+        "App");
 }
 
-// Compile two independent library modules (libASrc, libBSrc) to objects, then
-// compile mainSrc importing BOTH as dependencies, link, run, and return the
-// exit code (-1 on any compile/link/run failure). Mirrors buildAndRun in
-// cross_module_exception_test.cpp, extended to two dependency artifacts —
-// exactly the shape #1488's repro needs (one consumer, two same-named-type
-// libraries).
-int buildAndRunTwoLibs(const std::string& libASrc, const std::string& libBSrc,
-                       const std::string& mainSrc, const std::string& tag) {
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1488_" + tag + "_" + unique_stem("");
-    TempFile aSrc((dir / (stem + "_a.bzl")).string());
-    TempFile aObj((dir / (stem + "_a.o")).string());
-    TempFile bSrc((dir / (stem + "_b.bzl")).string());
-    TempFile bObj((dir / (stem + "_b.o")).string());
-    TempFile mSrc((dir / (stem + "_main.bzl")).string());
-    TempFile mExe((dir / stem).string());
-
-    writeSource(aSrc.path, libASrc);
-    writeSource(bSrc.path, libBSrc);
-    writeSource(mSrc.path, mainSrc);
-
-    bezel::Driver driver;
-    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
-    if (!ra.success) return -1;
-    bezel::CompileResult rb = driver.compileObject(bSrc.path, bObj.path);
-    if (!rb.success) return -1;
-
-    std::vector<bezel::Dependency> deps;
-    bezel::Dependency da;
-    da.metadataPath = aObj.path;
-    da.objectPath = aObj.path;
-    deps.push_back(da);
-    bezel::Dependency db;
-    db.metadataPath = bObj.path;
-    db.objectPath = bObj.path;
-    deps.push_back(db);
-
-    bezel::CompileResult rMain = driver.compileFile(mSrc.path, mExe.path, deps);
-    if (!rMain.success) return -1;
-
-    int status = std::system(mExe.path.c_str());
-    if (status == -1 || !WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
-}
-
-// Single-module build for the control test.
-int buildAndRunSingle(const std::string& src, const std::string& tag) {
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1488_single_" + tag + "_" + unique_stem("");
-    TempFile mSrc((dir / (stem + ".bzl")).string());
-    TempFile mExe((dir / stem).string());
-    writeSource(mSrc.path, src);
-
-    bezel::Driver driver;
-    bezel::CompileResult r = driver.compileFile(mSrc.path, mExe.path);
-    if (!r.success) return -1;
-
-    int status = std::system(mExe.path.c_str());
-    if (status == -1 || !WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
+// Single-module build for the control test — `runAot`, per the note above.
+JitResult buildAndRunSingle(const std::string& src) {
+    return bezel::test::runAot(src);
 }
 
 }  // namespace
@@ -145,7 +129,7 @@ int buildAndRunSingle(const std::string& src, const std::string& tag) {
 // D.Tx.Hello() reads "hello from D". Expect 3.
 BEZEL_TEST(cross_module_type_name_collision_1488,
           same_named_public_types_link_and_both_usable_via_alias_spec_2_2) {
-    int code = buildAndRunTwoLibs(
+    JitResult r = buildAndRunTwoLibs(
         // liba.bzl
         "module LibA; "
         "public class Tx: Exception "
@@ -167,11 +151,12 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
         "    if D.Tx.Hello() = \"hello from D\" then ok := ok + 2; end; "
         "    return ok; "
         "  end Main; "
-        "end Program;",
-        "alias_usable");
+        "end Program;"
+        );
     // Before the fix: -1 (compile/link failure — the multiple-definition
     // error). After the fix: 3 (both calls bind to their own module's Hello).
-    BEZEL_EXPECT_EQ(code, 3);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
 
 // (b) §2.8.3 rule 4: "`is` tests, `catch` clauses... match identically
@@ -191,7 +176,7 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
 // Expect 7.
 BEZEL_TEST(cross_module_type_name_collision_1488,
           is_and_catch_distinguish_same_named_types_spec_2_8_3_rule_4) {
-    int code = buildAndRunTwoLibs(
+    JitResult r = buildAndRunTwoLibs(
         // liba.bzl
         "module LibA; "
         "public class Tx: Exception "
@@ -228,11 +213,12 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
         "    if a is LibA.Tx then ok := ok + 4; end; "
         "    return ok; "
         "  end Main; "
-        "end Program;",
-        "is_catch_distinguish");
+        "end Program;"
+        );
     // Before the fix: -1 (compile/link failure, same root cause as (a)).
     // After the fix: 7 — every check resolves to its own type, none cross-match.
-    BEZEL_EXPECT_EQ(code, 7);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
 
 // (c) Control: a single-module build has no cross-module collision surface at
@@ -241,7 +227,7 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
 // does not regress the overwhelmingly common single-module case.
 BEZEL_TEST(cross_module_type_name_collision_1488,
           single_module_same_pattern_unaffected_control) {
-    int code = buildAndRunSingle(
+    JitResult r = buildAndRunSingle(
         "module Solo; "
         "class Tx: Exception "
         "  public static method Hello(): string => \"hello from Solo\"; "
@@ -251,9 +237,10 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
         "    if Tx.Hello() = \"hello from Solo\" then return 42; end; "
         "    return 0; "
         "  end Main; "
-        "end Program;",
-        "single_control");
-    BEZEL_EXPECT_EQ(code, 42);
+        "end Program;"
+        );
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 
 // (d) §12.7 *Function-typed targets* (v0.338) over §2.8.3 rule 3 (issue
@@ -267,7 +254,7 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
 // four that must not.
 BEZEL_TEST(cross_module_type_name_collision_1488,
           function_type_test_distinguishes_same_named_slot_types_spec_12_7) {
-    int code = buildAndRunTwoLibs(
+    JitResult r = buildAndRunTwoLibs(
         "module LibA; "
         "public class Tx "
         "  public constructor() end constructor; "
@@ -306,9 +293,10 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
         "    if ld is (LibA.Tx) -> () then ok := ok + 128; end; "
         "    return ok; "
         "  end Main; "
-        "end Program;",
-        "fn_type_slot_identity");
-    BEZEL_EXPECT_EQ(code, 15);
+        "end Program;"
+        );
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 15);
 }
 
 }  // namespace bezel::module

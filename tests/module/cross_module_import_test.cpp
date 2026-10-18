@@ -49,6 +49,9 @@
 
 
 namespace bezel::module {
+
+using bezel::test::JitResult;
+
 namespace {
 
 // --- sema-level harness -----------------------------------------------------
@@ -565,69 +568,97 @@ void writeSource(const std::string& path, const std::string& src) {
 // #2290 / #710: run a two-module (A-imports-B) executable under generated-code
 // AddressSanitizer/LeakSanitizer — the cross-module counterpart of
 // support/aot_support.hpp's runAotChecked, which only compiles a single module.
-// Compiles `aSrc` to a dependency object (plain, no sanitizer — see
-// bezelc's own "--sanitize=address applies to the executable build" rule),
-// then compiles+links `bSrc` against it with `opts.sanitizeAddress = true`, then
-// runs the executable with LeakSanitizer on and inspects both the exit status
-// and the captured ASan/LSan report text (aot_detail::hasSanitizerReport) — a
-// leak, double-free, or use-after-free in the imported ctor body's owned local
-// (inlined into B's IR by inlineCtorBody, §14.1) fails the assertion the same
-// way runAotChecked's single-module oracle does. Returns exit code, or -1 on
-// any build/run failure (caller inspects `*sawSanitizerReport`/`*built ok`).
-struct CrossModuleAsanResult {
-    bool builtOk = false;
-    bool ran = false;
-    bool sanitizerFired = false;
-    int exitCode = -1;
-    std::string sanitizerText;
-};
-
-CrossModuleAsanResult runCrossModuleChecked(const std::string& aSource,
-                                            const std::string& bSource) {
-    namespace aot_detail = bezel::test::aot_detail;
-    CrossModuleAsanResult result;
-    auto dir = std::filesystem::temp_directory_path();
-    std::string stem = unique_stem("bezel_2290_asan_");
-    TempFile aSrc((dir / (stem + "_a.bzl")).string());
-    TempFile aObj((dir / (stem + "_a.o")).string());
-    TempFile bSrc((dir / (stem + "_b.bzl")).string());
-    TempFile bExe((dir / (stem + "_b")).string());
-    TempFile sanOut((dir / (stem + ".san.txt")).string());
-    TempFile stdOut((dir / (stem + ".out.txt")).string());
-
-    writeSource(aSrc.path, aSource);
-    writeSource(bSrc.path, bSource);
-
-    bezel::Driver driver;
-    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
-    if (!ra.success) return result;
-
-    std::vector<bezel::Dependency> deps;
-    bezel::Dependency d;
-    d.metadataPath = aObj.path;
-    d.objectPath = aObj.path;
-    deps.push_back(d);
-
-    codegen::CodegenOptions opts;
-    opts.sanitizeAddress = true;
-    bezel::CompileResult rb =
-        driver.compileFile(bSrc.path, bExe.path, deps, opts);
-    if (!rb.success) return result;
-    result.builtOk = true;
-
-    bool timedOut = false;
-    int status = aot_detail::spawnCaptured(
-        {bExe.path}, stdOut.path, sanOut.path, aot_detail::aotTimeoutSec(),
-        timedOut, {{"ASAN_OPTIONS", "detect_leaks=1:exitcode=99:abort_on_error=0"}});
-    if (timedOut) return result;
-
-    std::string sanText = aot_detail::slurp(sanOut.path);
-    bool crashed = WIFSIGNALED(status);
-    result.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    result.ran = WIFEXITED(status);
-    result.sanitizerFired = crashed || aot_detail::hasSanitizerReport(sanText);
-    result.sanitizerText = std::move(sanText);
-    return result;
+//
+// ── HARNESS (test #6386) ───────────────────────────────────────────────────
+//
+// This used to be the file's own `CrossModuleAsanResult` + `runCrossModuleChecked`:
+// a `Driver::compileObject` for the dependency, a `Driver::compileFile` for the
+// importer, a hand-written `spawnCaptured` with its own
+// `ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0`, and its own result
+// struct with five fields (`builtOk`, `ran`, `sanitizerFired`, `exitCode`,
+// `sanitizerText`). `bezel::test::runAotModulesChecked`
+// (tests/support/aot_support.hpp, #6379) IS this, so the copy is retired rather
+// than kept in step.
+//
+// THE ENVIRONMENT IS BYTE-FOR-BYTE THE SAME STRING. `runAotModulesChecked`
+// passes exactly `detect_leaks=1:exitcode=99:abort_on_error=0` to
+// `aot_detail::runProgramFill` — which is `runAot`'s own run half, MOVED out of
+// it rather than copied (#6379) — so a leak, a double-free and a
+// use-after-free in an imported ctor body's owned local (inlined into the
+// importer's IR by inlineCtorBody, §14.1) fail exactly as they did before, and
+// `exitcode=99` still replaces the program's own status on a real ASan report.
+// The `sanitizeAddress` bit reaches the DEPENDENCY build the same way too:
+// `runAotModulesImpl` forces it on under the #1822 sweep, and
+// `Driver::compileObject` still forces it OFF for the library artifact itself,
+// which is bezelc's own "--sanitize=address applies to the executable build"
+// rule and is unchanged.
+//
+// WHAT THE PORT ADDS, AND IT IS NOT NOTHING:
+//
+//   * CRASH ISOLATION ON THE COMPILE SIDE. The old runner called
+//     `Driver::compileObject` / `compileFile` in the TEST PROCESS; the new one
+//     goes through `forkedCompileModule` / `forkedCompileWithDeps`.
+//   * A CRASH NO LONGER READS AS A VALUE. The old struct collapsed a compiler
+//     crash, a link failure, a fork failure, a runtime signal and a timeout all
+//     into `builtOk == false` — one boolean, no text. `r.diagnostics` carries
+//     the driver's stderr, or `compiler CRASHED (signal N)`, or `program
+//     terminated by signal N`, or `did not terminate within`.
+//   * TWO ABSORBING EARLY RETURNS GONE. The call sites were
+//         BEZEL_EXPECT_TRUE(r.builtOk);  if (!r.builtOk) return;
+//         BEZEL_EXPECT_TRUE(!r.sanitizerFired);  if (r.sanitizerFired) return;
+//         BEZEL_EXPECT_TRUE(r.ran);
+//     Each `if (...) return;` SKIPPED every later assertion on that leg, so a
+//     build failure produced exactly one failure line and a sanitizer report
+//     produced one. `r.ran` is false in BOTH cases, so a single
+//     `BEZEL_EXPECT_TRUE(r.ran)` covers them and the value assertion still runs
+//     and still fires. No assertion is removed — the two guards become
+//     unreachable by construction and the two expectations they shadowed are
+//     subsumed by `ran`.
+//
+// ⚠ ONE OPTION WIDENS, AND IT IS THE POINT. `runAotModulesChecked` also sets
+// `opts.checkedContracts = true` (§22.16 checked-CONTRACTS mode: `ensures` /
+// `invariant` clause evaluation), which this file's hand-rolled runner did NOT.
+// It is the SANCTIONED default — `runAotChecked`, the single-module sibling,
+// sets the same bit (aot_support.hpp:3482) — so the hand-rolled copy was the
+// outlier, and "no ONE answer to how does an AOT test run a checked program" is
+// precisely what #6379 exists to remove. The two programs here declare no
+// `ensures` / `invariant` clause, so no clause evaluation is emitted and the
+// observable is unchanged: MEASURED, both rows exit at their original values
+// (42, 84) and `ran` is true. What the bit WOULD change for a program that does
+// declare such a clause is the opposite of a weakening — it makes a false
+// clause raise `ContractViolationException` (§31.4) instead of going unobserved.
+//
+// ⚠ SANITIZER SENSITIVITY IS MEASURED, NOT ASSUMED. A green `Checked` row on a
+// box whose leak detection is inert proves nothing, so the plant was run:
+// dropping the `using` from row 32's owned local
+// (`using var buf := new OwningBuffer<int>(4)` → `var buf := …`, one
+// whitespace-only edit, reverted immediately after) turns the row RED with
+//
+//     ==3851724==ERROR: LeakSanitizer: detected memory leaks
+//     SUMMARY: AddressSanitizer: 72 byte(s) leaked in 2 allocation(s).
+//     assertion failed: r.ran            (cross_module_import_test.cpp:3438)
+//     expected equality: r.exitCode == 42 (cross_module_import_test.cpp:3442)
+//
+// with row 33 still green in the same run. So the leak oracle on this path is
+// live, and the un-planted green above is a measurement rather than silence.
+//
+// ⚠ NO SKIP GUARD IS ADDED. `runAotModulesChecked` reports a missing ASan
+// toolchain as a `SKIP` diagnostic with `ran == false`, so this row goes RED on
+// a box that cannot link ASan rather than quietly passing. That is the loud
+// direction and it matches every other `runAotChecked` row in the suite; it
+// also adds one site to `check_toolchain_skip_surface`'s denominator, which per
+// CLAUDE.md is banked once per batch by the integrator, not here.
+//
+// The DEPENDENCY MODULE NAME is a parameter: the harness matches a module to
+// its `import` by NAME, so a hardcoded name would make every row in the file
+// report the same unrelated "module not found" reject.
+JitResult runCrossModuleChecked(const std::string& libName,
+                                const std::string& aSource,
+                                const std::string& bSource) {
+    return bezel::test::runAotModulesChecked(
+        {bezel::test::ModuleSource{libName, aSource},
+         bezel::test::ModuleSource{"App", bSource}},
+        "App");
 }
 
 }  // namespace
@@ -3430,11 +3461,7 @@ BEZEL_TEST(cross_module_import,
         "  end Main; "
         "end Program;";
 
-    CrossModuleAsanResult r = runCrossModuleChecked(aSource, bSource);
-    BEZEL_EXPECT_TRUE(r.builtOk);
-    if (!r.builtOk) return;
-    BEZEL_EXPECT_TRUE(!r.sanitizerFired);
-    if (r.sanitizerFired) return;  // report already captured in r.sanitizerText
+    JitResult r = runCrossModuleChecked("Gen2290BufLib", aSource, bSource);
     BEZEL_EXPECT_TRUE(r.ran);
     // Before the fix: buf[0]'s read is dropped, len reads 0. After: 42, and the
     // OwningBuffer's allocation is disposed exactly once (no LSan leak report,
@@ -3471,11 +3498,7 @@ BEZEL_TEST(cross_module_import,
         "  end Main; "
         "end Program;";
 
-    CrossModuleAsanResult r = runCrossModuleChecked(aSource, bSource);
-    BEZEL_EXPECT_TRUE(r.builtOk);
-    if (!r.builtOk) return;
-    BEZEL_EXPECT_TRUE(!r.sanitizerFired);
-    if (r.sanitizerFired) return;
+    JitResult r = runCrossModuleChecked("Gen2290Buf2Lib", aSource, bSource);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 84);  // 42 + 42, both instantiations disposed once
 }

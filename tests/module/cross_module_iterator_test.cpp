@@ -22,91 +22,65 @@
 // path requires additional investigation into the async state-machine frame
 // lowering cross-module (the SIGABRT is in IR verification after the wrong
 // load type is emitted).  Deferred per CLAUDE.md §4 decline-with-reasons.
+//
+// ── HARNESS (test #6386) ───────────────────────────────────────────────────
+//
+// This file used to carry TWO private runners: `compileAndRunCrossModule` (four
+// hand-rolled steps over a `compileObject`'d library plus an importer, with its
+// own `TempFile`/`writeSource`/exit-code decoding) and
+// `compileAndRunSingleModule`. Both are now the shared helpers from
+// tests/support/aot_support.hpp (#6379):
+//
+//   * the three cross-module rows use `bezel::test::runAotModules`, whose run
+//     half is `aot_detail::runProgramFill` — the SAME function `runAot` calls —
+//     and whose compile half is `forkedCompileModule` (a `Driver::compileObject`,
+//     the only shape that embeds the §2.4 `.bezel.meta` public interface) plus
+//     `forkedCompileWithDeps`;
+//   * the CONTROL row is a SINGLE-module program, and #6379 is explicit that
+//     `runAotModules` is not a replacement for `runAot` — a one-module row keeps
+//     the content-addressed link-cache that a whole gate collapses 2-3
+//     compilations of the same program into 1. It is therefore `runAot`.
+//
+// WHAT THE PORT ADDS. Each row asserted a bare exit code, and the old runner
+// returned -1 for a compile failure, a link failure, a fork failure and a
+// runtime signal alike. Every row now asserts `r.ran` FIRST and
+// unconditionally, so none of them can pass for a reason other than "the
+// program compiled, linked, ran to normal termination and returned N".
+//
+// ⚠ ONE REAL DIFFERENCE, measured and deliberate. The old runner executed with
+// `std::system(exe)`, which inherits the ambient environment — so under the
+// #1822 whole-suite ASan sweep (`BEZEL_AOT_FORCE_SANITIZE=address`) it ran with
+// LeakSanitizer ON by default, and a leak would have replaced the program's own
+// exit status with LSan's. `runAot` pins `detect_leaks=0` under the sweep
+// instead, because whole-suite leak detection is too noisy and because §28.2
+// checked disposal leaks BY DESIGN (#4532 measured that cost). MEASURED under
+// `BEZEL_AOT_FORCE_SANITIZE=address` at this commit: all four rows are clean,
+// so no row here depended on that inherited leak detection.
 
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <string>
-#include <sys/wait.h>
 #include <vector>
 
-#include "driver/Driver.hpp"
-#include "support/scratch_dir.hpp"
-#include "support/unique_stem.hpp"
+#include "support/aot_support.hpp"
+#include "support/codegen_support.hpp"
 #include "test_harness.hpp"
+
+using bezel::test::JitResult;
+using bezel::test::ModuleSource;
+using bezel::test::runAot;
+using bezel::test::runAotModules;
 
 namespace {
 
-namespace fs = std::filesystem;
-
-// Per-process unique working dir under the shared scratch base. The previous
-// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
-// race-prone: parallel shards overwrote each other's _lib.bzl / _lib.o /
-// _main.bzl mid-compileObject and garbled the in-flight child read. The atomic
-// unique_stem + /var/tmp/bezel-scratch parent fixes that class of flake
-// (#3002-class COVERAGE SHORT).
-const std::filesystem::path& wtDir495() {
-    return wtScratchDir("wt-495");
-}
-
-struct TempFile {
-    std::string path;
-    explicit TempFile(const std::string& p) : path(p) {}
-    ~TempFile() { std::remove(path.c_str()); }
-};
-
-void writeSource(const std::string& path, const std::string& src) {
-    std::ofstream out(path);
-    out << src;
-}
-
-// Compile lib → object, compile main importing lib → executable, run;
-// return exit code or -1.
-int compileAndRunCrossModule(const std::string& libSrc,
-                             const std::string& mainSrc) {
-    auto dir = wtDir495();
-    std::string stem = unique_stem("bezel_iter495");
-    TempFile lSrc((dir / (stem + "_lib.bzl")).string());
-    TempFile lObj((dir / (stem + "_lib.o")).string());
-    TempFile mSrc((dir / (stem + "_main.bzl")).string());
-    TempFile mExe((dir / (stem + "_main")).string());
-
-    writeSource(lSrc.path, libSrc);
-    writeSource(mSrc.path, mainSrc);
-
-    bezel::Driver driver;
-    bezel::CompileResult rl = driver.compileObject(lSrc.path, lObj.path);
-    if (!rl.success) return -1;
-
-    bezel::Dependency dep;
-    dep.metadataPath = lObj.path;
-    dep.objectPath   = lObj.path;
-    std::vector<bezel::Dependency> deps{dep};
-
-    bezel::CompileResult rm = driver.compileFile(mSrc.path, mExe.path, deps);
-    if (!rm.success) return -1;
-
-    int status = std::system(mExe.path.c_str());
-    if (status == -1 || !WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
-}
-
-// Single-module helper (reuse iterator_native_test harness pattern).
-int compileAndRunSingleModule(const std::string& src) {
-    auto dir = wtDir495();
-    std::string stem = unique_stem("bezel_iter495_sm");
-    TempFile srcF((dir / (stem + ".bzl")).string());
-    TempFile exeF((dir / stem).string());
-
-    writeSource(srcF.path, src);
-
-    bezel::Driver driver;
-    bezel::CompileResult r = driver.compileFile(srcF.path, exeF.path);
-    if (!r.success) return -1;
-
-    int status = std::system(exeF.path.c_str());
-    if (status == -1 || !WIFEXITED(status)) return -1;
-    return WEXITSTATUS(status);
+// The dependency's MODULE NAME is a parameter, not a constant: these rows each
+// name their library differently (`SeqLib`, `RangeLib`, `LimLib`), and the
+// harness matches a module to its `import` by name — a wrong name here would
+// make the driver resolve nothing and every row would report the same
+// unrelated "module not found" reject. `App` is the entry in all three.
+JitResult compileAndRunCrossModule(const std::string& libName,
+                                   const std::string& libSrc,
+                                   const std::string& mainSrc) {
+    return runAotModules(
+        {ModuleSource{libName, libSrc}, ModuleSource{"App", mainSrc}}, "App");
 }
 
 }  // namespace
@@ -117,8 +91,12 @@ int compileAndRunSingleModule(const std::string& src) {
 
 // §29.3 (control): same-module yield iterator sums 1..5 → 15.
 // This must continue to work after the cross-module fix.
+//
+// SINGLE-MODULE, so `runAot` and not `runAotModules` — see the harness note
+// above. Its value assertion is unchanged: still 15 (1+2+3+4+5), now preceded
+// by `r.ran`.
 BEZEL_TEST(cross_module_iter_495, control_same_module_iterator_spec_29_3) {
-    BEZEL_EXPECT_EQ(compileAndRunSingleModule(
+    JitResult r = runAot(
         "module M; "
         "public class Seq "
         "  public static method Sequence(n: int): IEnumerable<int> "
@@ -129,8 +107,9 @@ BEZEL_TEST(cross_module_iter_495, control_same_module_iterator_spec_29_3) {
         "    for var x in Seq.Sequence(5) do sum := sum + x; end; "
         "    return sum; "
         "  end Main; "
-        "end Seq;"),
-        15);  // 1+2+3+4+5
+        "end Seq;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 15);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,8 +125,16 @@ BEZEL_TEST(cross_module_iter_495, control_same_module_iterator_spec_29_3) {
 // ---------------------------------------------------------------------------
 
 // §29.3 / §2.5 (#495-A): cross-module yield iterator; sum 1..5 = 15.
+//
+// ⚠ THIS IS THE ROW THE PORT MAKES SHARPEST. The defect it pins was a SEGFAULT.
+// Under the old runner a SIGSEGV surfaced as `status == -1` → `WIFEXITED` false
+// → -1, which differs from 15, so the row did go red. But it was red for the
+// same reason an unrelated toolchain hiccup would make it red, and the
+// diagnostic said nothing about where. `r.ran` is false on a runtime signal
+// and `r.diagnostics` then carries "program terminated by signal 11" — so a
+// re-break reports the crash rather than a bare number mismatch.
 BEZEL_TEST(cross_module_iter_495, cross_module_sync_iterator_sum_spec_29_3) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(
+    JitResult r = compileAndRunCrossModule("SeqLib",
         // Library: exports a yield-based Sequence method.
         "module SeqLib; "
         "public class Seq "
@@ -166,15 +153,16 @@ BEZEL_TEST(cross_module_iter_495, cross_module_sync_iterator_sum_spec_29_3) {
         "    end; "
         "    return sum; "
         "  end Main; "
-        "end Program;"),
-        15);  // 1+2+3+4+5
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 15);  // 1+2+3+4+5
 }
 
 // §29.3 / §2.5 (#495-A): cross-module yield iterator with a while loop body;
 // verifies that the captured parameter (`n`) is correctly spilled/restored in
 // the imported state machine frame.
 BEZEL_TEST(cross_module_iter_495, cross_module_sync_while_yield_spec_29_3) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(
+    JitResult r = compileAndRunCrossModule("RangeLib",
         "module RangeLib; "
         "public class R "
         "  public static method Range(lo: int, hi: int): IEnumerable<int> "
@@ -195,15 +183,16 @@ BEZEL_TEST(cross_module_iter_495, cross_module_sync_while_yield_spec_29_3) {
         "    end; "
         "    return sum; "
         "  end Main; "
-        "end Program;"),
-        55);  // 1+2+…+10
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 55);  // 1+2+…+10
 }
 
 // §29.3 / §2.5 (#495-A): cross-module iterator with a conditional yield break;
 // verifies the vtable dispatch survives early termination from the imported
 // iterator.
 BEZEL_TEST(cross_module_iter_495, cross_module_sync_limited_yield_break_spec_29_3) {
-    BEZEL_EXPECT_EQ(compileAndRunCrossModule(
+    JitResult r = compileAndRunCrossModule("LimLib",
         "module LimLib; "
         "public class L "
         "  public static method Limited(n: int): IEnumerable<int> "
@@ -223,6 +212,7 @@ BEZEL_TEST(cross_module_iter_495, cross_module_sync_limited_yield_break_spec_29_
         "    end; "
         "    return sum; "
         "  end Main; "
-        "end Program;"),
-        15);  // 1+2+3+4+5
+        "end Program;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 15);  // 1+2+3+4+5
 }

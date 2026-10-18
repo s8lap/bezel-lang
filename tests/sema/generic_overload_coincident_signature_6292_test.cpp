@@ -170,12 +170,12 @@ BEZEL_TEST(generic_overload_coincident_signature_6292,
 // coincides with the non-generic declaration), so the tie-break applies.
 //
 // With the non-generic candidate declared FIRST this prints 5, which is what
-// §22.6 requires. With it declared SECOND the same call prints 10 — the
-// generic candidate — which is the pre-existing order dependence filed as
-// #6332. MEASURED identical on a clean `git checkout --` of
-// src/sema/ExprTypecheck_Calls.cpp at 389ca74b, so it is NOT introduced here.
-// Both expectations are pinned so the #6292 check is shown not to fire on
-// either, and so #6332's fix has a row to flip deliberately.
+// §22.6 requires. With it declared SECOND it used to print 10 — the generic
+// candidate — making the verdict depend on declaration order; that was
+// #6332, and its fix makes this second expectation 5 as well. Both orders are
+// pinned here so #6292's coincidence check is shown not to fire on either,
+// and so the order independence §22.6 guarantees is asserted rather than
+// assumed.
 BEZEL_TEST(generic_overload_coincident_signature_6292,
            non_generic_preference_beats_coincidence_spec_22_6) {
     const std::string kNonGenericFirst =
@@ -194,10 +194,16 @@ BEZEL_TEST(generic_overload_coincident_signature_6292,
                "5\n");
     // #6332: §22.6 selects the non-generic candidate here too; this row
     // records what the compiler does today, not what the spec wants.
+    // #6332: §22.6's non-generic preference applies here too, so this now
+    // prints 5 like the order above. Before the #6332 fix it printed 10 — the
+    // generic candidate — because `Array<int>` is a declaration-less `Named`
+    // that `judgeable` rejects, `resolveOverload` returned `Undecidable` above
+    // its own non-generic tie-break, and `resolveMethodOverload` fell through
+    // to `return initial`, i.e. the first-declared candidate.
     expectRuns(kNonGenericLast,
                "    using var a := new Array<int>();\n"
                "    Console.WriteLine(U.Pick(a));\n",
-               "10\n");
+               "5\n");
 }
 
 // s22_6_0006: an INSTANCE receiver reaches the same coincidence through the

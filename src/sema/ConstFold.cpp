@@ -1,7 +1,9 @@
 #include "sema/ConstFold.hpp"
 
+#include <functional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 #include "common/IntLiteral.hpp"
 
@@ -311,46 +313,99 @@ int shiftCountDomainWidth(PrimitiveType p) {
 // the shift-domain fault. Structurally identical walk — only meaningful once
 // the caller has confirmed `e` is structurally a constant expression; this is
 // a fault probe, not an "is this constant" check.
+//
+// fix #6429 (§6.5, §17.14, v0.338): this walk used to stop at depth > 64 and
+// return `none` — indistinguishable from "I looked and found no fault" — so a
+// shift-domain violation nested 65 or more expression-level hops deep was
+// never reported: the program compiled, ran and exited 0. §6.5 states the
+// shift-count domain rule with no depth qualifier ("A count outside the domain
+// is a fault: a compile error when the count is a compile-time constant") and
+// §17.14 quotes the same rule for constant-evaluation faults. The cap was a
+// bound on this compiler rather than on this language, and everything past it
+// was silently accepted unverified.
+//
+// The bound is REMOVED, not raised. A larger literal leaves the same hole one
+// constant higher, and a cap that DIAGNOSED the program as too deeply nested
+// would reject a program §6.5/§17.14 admits (no depth limit is stated in
+// either section), for a reason the spec nowhere lists — that is a spec ruling,
+// not an implementation fix.
+//
+// What replaces the cap is a CYCLE guard: the walk recurses through the
+// expression tree, not through declaration nesting (contrast
+// `containsConstDivByZero` whose `depth > 64` cap remains — it recurses through
+// const INITIALIZER expressions, which are bounded by the parser's own
+// expression-depth limit). A well-formed expression cannot contain itself as a
+// sub-expression, so `onChain` never fires on any program this probe accepts. It
+// exists so a malformed AST (e.g. from a future parser error-recovery path that
+// leaves a cyclic expression) terminates instead of recursing until stack
+// exhaustion. That termination rejects nothing that a well-formed program can
+// spell.
 ConstShiftDomainFault findConstShiftDomainFault(
     const ast::Expr& e,
     const std::function<std::optional<long long>(std::string_view, int)>&
-        resolveIdent,
-    int depth) {
-    ConstShiftDomainFault none;
-    if (depth > 64) return none;  // cyclic / runaway const reference
-    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
-        if (!b->left || !b->right) return none;
-        if (b->op == "<<" || b->op == ">>") {
-            int leftBits = inferIntWidthBitsForShift(*b->left);
-            if (leftBits > 0) {
-                if (auto r = foldIntConst(*b->right, resolveIdent, depth + 1)) {
-                    if (*r < 0 || *r >= leftBits) {
-                        ConstShiftDomainFault f;
-                        f.found = true;
-                        f.leftShift = (b->op == "<<");
-                        f.count = *r;
-                        f.width = leftBits;
-                        return f;
+        resolveIdent) {
+    std::unordered_set<const ast::Expr*> onChain;  // cycle guard: per-path
+    std::function<ConstShiftDomainFault(const ast::Expr&)> visit =
+        [&](const ast::Expr& expr) -> ConstShiftDomainFault {
+            ConstShiftDomainFault none;
+            if (!onChain.insert(&expr).second) return none;  // cycle guard
+            // The AST is strictly tree-shaped (unique_ptr children, no shared
+            // nodes — Node.hpp: "keep the hierarchy strictly tree-shaped"), so
+            // onChain fires only on a malformed self-referential AST, never on
+            // any well-formed program.  Erase on the way out so the guard is
+            // per enclosing path: a node reached by two different paths is
+            // visited on each path, exactly as the original depth-limited walk.
+            auto eraseOnReturn = [&]() { onChain.erase(&expr); };
+            if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&expr)) {
+                if (!b->left || !b->right) {
+                    eraseOnReturn();
+                    return none;  // null guard
+                }
+                if (b->op == "<<" || b->op == ">>") {
+                    int leftBits = inferIntWidthBitsForShift(*b->left);
+                    if (leftBits > 0) {
+                        if (auto r = foldIntConst(*b->right, resolveIdent)) {
+                            if (*r < 0 || *r >= leftBits) {
+                                eraseOnReturn();
+                                ConstShiftDomainFault f;
+                                f.found = true;
+                                f.leftShift = (b->op == "<<");
+                                f.count = *r;
+                                f.width = leftBits;
+                                return f;
+                            }
+                        }
                     }
                 }
+                auto lf = visit(*b->left);
+                if (lf.found) {
+                    eraseOnReturn();
+                    return lf;
+                }
+                auto rf = visit(*b->right);
+                eraseOnReturn();
+                return rf;
             }
-        }
-        auto lf = findConstShiftDomainFault(*b->left, resolveIdent, depth + 1);
-        if (lf.found) return lf;
-        return findConstShiftDomainFault(*b->right, resolveIdent, depth + 1);
-    }
-    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
-        if (!u->operand) return none;
-        return findConstShiftDomainFault(*u->operand, resolveIdent, depth + 1);
-    }
-    // A bare identifier naming a `const` whose own initializer carries the
-    // fault: `const SZ: int := 1 << 40; var a: [SZ]int;` — the fold recurses
-    // into the initializer, so the probe must too. `resolveIdent` returns only
-    // a VALUE, so the initializer expression is not reachable from here; the
-    // declaration site reports its own fault (every const initializer is
-    // checked where it is written, §17.14), which is where the diagnostic
-    // belongs.
-    return none;
+            if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&expr)) {
+                if (!u->operand) {
+                    eraseOnReturn();
+                    return none;
+                }
+                auto uf = visit(*u->operand);
+                eraseOnReturn();
+                return uf;
+            }
+            // A bare identifier naming a `const` whose own initializer carries the
+            // fault: `const SZ: int := 1 << 40; var a: [SZ]int;` — the fold recurses
+            // into the initializer, so the probe must too. `resolveIdent` returns only
+            // a VALUE, so the initializer expression is not reachable from here; the
+            // declaration site reports its own fault (every const initializer is
+            // checked where it is written, §17.14), which is where the diagnostic
+            // belongs.
+            eraseOnReturn();
+            return none;
+        };
+    return visit(e);
 }
 
 // fix #3879 (§22.12, v0.294): see ConstFold.hpp for the rule this states and

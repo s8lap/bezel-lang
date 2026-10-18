@@ -1184,6 +1184,32 @@ private:
 
     Symbol* lookupName(std::string_view name, Scope* scope);
 
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): `lookupName`, plus
+    // §2.7's rule that a bare type name's search ENDS at the first enclosing
+    // type that has the name. Returns exactly what `lookupName` returns, and
+    // writes the enclosing type whose body DECLARES a member of that name (and
+    // so ended the search without supplying one) to `*stoppedAt`, or null when
+    // the search ran to completion. See the definition for why a body scope
+    // alone cannot express this.
+    //
+    // fix #6410 (§2.7 "Through nesting", warning row, v0.338): `resolving` is
+    // the `ast::Type` node the caller is resolving RIGHT NOW, or null. It is
+    // threaded only so §2.7's `property Color: Color` carve-out can ask "is
+    // this member's own declared type the type being resolved?" without waiting
+    // for `setResolvedType`, which `resolveType` writes only AFTER
+    // `resolveNamed` has returned — i.e. after this lookup. Without it the
+    // carve-out is unanswerable for the one member it exists to admit.
+    Symbol* lookupBareTypeName(std::string_view name, Scope* scope,
+                               TypeSymbol** stoppedAt,
+                               const ast::Type* resolving = nullptr);
+
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): does `owning`
+    // declare an ACCESSIBLE member called `name` that is not a nested type?
+    // `resolving` is `lookupBareTypeName`'s, passed on unchanged; see there.
+    bool enclosingTypeMemberBlocksBareName(const TypeSymbol* owning,
+                                           std::string_view name,
+                                           const ast::Type* resolving = nullptr);
+
     // Slice 3d: walk a method/ctor body and resolve every type
     // ascription on LocalDecl / catch arm. Recurses through control-
     // flow constructs. Locals themselves are not registered here (that
@@ -1538,10 +1564,10 @@ private:
     // C-compatible iff every field's type is an FFI-compatible scalar (integer
     // types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, `Ptr<T>`), an
     // inline array `[N]T` of such a scalar …, or another C-compatible record
-    // (nesting; recursion is impossible — records are value types)". `depth`
-    // bounds the nesting walk so a malformed (cyclic) declaration terminates
-    // rather than recursing forever.
-    bool isCCompatibleRecord(const ast::Type& t, Scope* scope, int depth = 0);
+    // (nesting; recursion is impossible — records are value types)". A per-path
+    // cycle guard replaces the old depth cap: it fires only on a malformed
+    // cyclic graph, never on a well-formed program.
+    bool isCCompatibleRecord(const ast::Type& t, Scope* scope);
 
     // §32.13 clause 4 (v0.306), the typed-handle form: "A C-compatible record
     // with exactly one field, of *integer or pointer* scalar type (integer
@@ -1555,7 +1581,7 @@ private:
     // `IntPtr`, `UIntPtr`, and C-compatible records". Deliberately NOT §32.5's
     // scalar set: `Ptr<U>` is an FFI-compatible scalar but is not a member
     // here, "which is exactly what makes `Ptr<Ptr<U>>` inadmissible".
-    bool isFfiPointeeType(const ast::Type& t, Scope* scope, int depth = 0);
+    bool isFfiPointeeType(const ast::Type& t, Scope* scope);
 
     // The `sema::TypeSymbol` a single-part named type resolves to through the
     // lexical scope chain, or null. A scope walk rather than
@@ -1573,10 +1599,14 @@ private:
     // is built from. Split this way so there is ONE classification, reached
     // either from an `ast::Type` written in an extern signature or from a
     // field's resolved type — not two spellings that can drift.
-    bool isCCompatibleRecordSym(const TypeSymbol* ts, int depth);
-    bool isCCompatibleFieldTypeRef(const TypeRef* rt, int depth);
-    bool isFfiScalarTypeRef(const TypeRef* rt, int depth);
-    bool isFfiPointeeTypeRef(const TypeRef* rt, int depth);
+    bool isCCompatibleRecordSym(const TypeSymbol* ts,
+                               std::unordered_set<const TypeSymbol*>& onChain);
+    bool isCCompatibleFieldTypeRef(
+        const TypeRef* rt, std::unordered_set<const TypeSymbol*>& onChain);
+    bool isFfiScalarTypeRef(const TypeRef* rt,
+                            std::unordered_set<const TypeSymbol*>& onChain);
+    bool isFfiPointeeTypeRef(const TypeRef* rt,
+                             std::unordered_set<const TypeSymbol*>& onChain);
 
     // ---- §14.2: nested-generic constraint propagation -------------------
     //
@@ -1601,6 +1631,20 @@ private:
     // resolveTypeDecl). Null at module scope. Used to attribute a deferred
     // generic-param argument to the type parameter / owner it belongs to.
     TypeSymbol* currentOuterType_ = nullptr;
+
+    // fix #6383 follow-up (§2.7 "Through nesting", v0.338): the body scopes
+    // of the enclosing types, innermost LAST, as (Scope*, owning TypeSymbol*)
+    // pairs — pushed beside `currentOuterType_` in resolveTypeDecl and popped
+    // with it. The type SCOPE CHAIN is already the §2.7 enclosing chain (a
+    // nested type's body scope parents to the outer type's body scope), but a
+    // body scope registers only the type's GENERIC PARAMETERS and NESTED TYPES
+    // (§11.3/#482), never its fields, methods, properties or events — so the
+    // chain silently SKIPS every enclosing member, which is the §2.7 defect
+    // `lookupBareTypeName` exists to close. Pairing each body scope with its
+    // owner is what lets that walk tell "this scope carried the name" from
+    // "the type whose body this scope belongs to DECLARES a member of that
+    // name" — a distinction the bare scope map cannot express.
+    std::vector<std::pair<const Scope*, TypeSymbol*>> typeBodyScopes_;
 
     // §28.1 (v0.196, #1817): the generic constraints of the method/operator
     // whose signature is currently being resolved (set at the top of

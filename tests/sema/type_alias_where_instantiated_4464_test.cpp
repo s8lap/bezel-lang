@@ -319,3 +319,208 @@ BEZEL_TEST(type_alias_where_instantiated_4464,
         "  end Main; "
         "end ProgramP18p;");
 }
+
+// ── #6324 (§27.8, v0.338): a generic alias of a nullable type loses its `?` ──
+//
+// §27.8 "Generic type aliases": "Each instantiation of the alias is
+// interchangeable with the corresponding instantiation of the aliased type."
+// `type Nl<T> := T?` is such an alias, so `Nl<int>` IS `int?` — and the spec's
+// own §27.8 example family writes the `?` inside alias bodies
+// (`type Handler<T> := (T, string?) -> bool;`), so the body shape is legal.
+//
+// THE DEFECT. resolveNamed's generic-alias arm has a fast path (the #4447 one,
+// src/sema/TypeResolution_Names.cpp) for "the alias body is EXACTLY a bare
+// generic param", tested as: the body is a Named type, its name has exactly one
+// part, and it has no generic args. A `T?` body satisfies ALL THREE — the `?`
+// lives on `ast::Type::nullable`, NOT inside `name->parts` — so the fast path
+// fired for it and returned the concrete type argument verbatim, bypassing
+// `substituteAliasGenericArgs` (SubstArgs.cpp) entirely. That substitution is
+// exactly what preserves nullability at a bare-parameter leaf
+// (`applyBareParamSubst`, `T? -> int?`). Dropping it made `Nl<int>` resolve as
+// a BARE `int`, so a correct program was rejected — the §27.8 synonym broken in
+// the accepting direction on a use site and the rejecting direction here.
+//
+// MEASURED, base b28c2119 vs this fix, `bezelc scratch/alias_nullable.bzl`:
+//   base: "the initializer for `m` is nullable but the target type is
+//          non-nullable (§7)"      (rc=1)
+//   tip:  no diagnostic, compiles   (rc=0)
+// The control `var m: int? := null;` compiled on both.
+//
+// Row 1 is the issue's own repro and is the ONLY one that fails without the
+// fix. Row 2 pins the reject side of the SAME change: a non-nullable alias
+// body must still reject a `null` initializer, which is the control that proves
+// the fix redirected a misattributed `?` rather than blanket-accepting.
+
+BEZEL_TEST(type_alias_nullable_body_6324,
+           nl_base_concrete_bare_null_init_accepted_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Nl<T> := T?;
+public class Program
+  public static method Main(): int
+    var m: Nl<int> := null;
+    _ := m;
+    Console.WriteLine("ok");
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ok\n");
+}
+
+// Control: a NON-nullable alias body must still reject `null`. Before the fix
+// this row passed by accident (the `?` was never carried, for either body);
+// after the fix it passes because the `?` is carried only for a nullable body.
+BEZEL_TEST(type_alias_nullable_body_6324,
+           nn_alias_bare_null_init_rejected_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Id<T> := T;
+public class Program
+  public static method Main(): int
+    var m: Id<int> := null;
+    _ := m;
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "the initializer for `m` is nullable but the target type is "
+           "non-nullable"));
+}
+
+// The `?` must survive to a READ as well as to the declaration: reading a
+// `Nl<int>` into a bare `int` is a nullability error (§7), which only fires if
+// the use site really resolved `Nl<int>` to `int?`.
+BEZEL_TEST(type_alias_nullable_body_6324,
+           nl_base_concrete_bare_read_into_int_rejected_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Nl<T> := T?;
+public class Program
+  public static method Main(): int
+    var m: Nl<int> := null;
+    var n: int := m;
+    _ := n;
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "the initializer for `n` is nullable but the target type is "
+           "non-nullable"));
+}
+
+// §15.1 / §3.6 rule 2: `T?` at a type parameter substituted by an inline array
+// stays a compile error. Before the fix this shape rejected for the WRONG
+// reason (the §7 "target type is non-nullable", because the `?` had been
+// dropped before substitution); with the `?` correctly carried into the
+// substitution it rejects at its real home. Pins the diagnostic, not just the
+// verdict.
+BEZEL_TEST(type_alias_nullable_body_6324,
+           nl_alias_inline_array_rejected_spec_15_1) {
+    auto r = runAot(R"(
+module A;
+type Nl<T> := T?;
+public class Program
+  public static method Main(): int
+    var m: Nl<[3]int> := null;
+    _ := m;
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "nullable inline-array"));
+}
+
+// An alias OF an alias of a nullable type: `Nl2<T> := Nl<T>`, so `Nl2<int>` is
+// still `int?`. §27.8 permits aliases of aliases.
+BEZEL_TEST(type_alias_nullable_body_6324,
+           nl_alias_of_alias_null_init_accepted_spec_27_8) {
+    auto r = runAot(R"(
+module A;
+type Nl<T> := T?;
+type Nl2<T> := Nl<T>;
+public class Program
+  public static method Main(): int
+    var m: Nl2<int> := null;
+    _ := m;
+    Console.WriteLine("ok");
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "ok\n");
+}
+
+// The `nl_base_concrete_bare` shape the #6327/#6328 review found and this
+// commit's row unblocks: a property override whose BASE value type is a bare
+// CONCRETE type reached through the nullable alias (`B<P, Nl<int>>`), with the
+// derived override naming the class's own generic parameter (`P`). The two are
+// different types — `int?` vs `string` once `E<P, Q>` is instantiated — so
+// §12.1 requires a rejection. MEASURED: REJECTED on base b28c2119, REJECTED at
+// this fix's tip, AND REJECTED with #6327 (211365eb) applied on top. The
+// accept-side control (the override spelled `Nl<int>`, matching the base) is
+// accepted on all three.
+BEZEL_TEST(type_alias_nullable_body_6324,
+           nl_base_concrete_bare_override_rejected_spec_12_1) {
+    auto r = runAot(R"(
+module A;
+type Nl<T> := T?;
+public abstract class B<K, W>
+  public constructor() end constructor;
+  public abstract property V: W;
+end B;
+public class E<P, Q>: B<P, Nl<int>>
+  public constructor() end constructor;
+  public override property V: P => throw new Exception("x");
+end E;
+public class Program
+  public static method Main(): int
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "override of `V` does not match the base member's property type"));
+}
+
+// Accept-side control for the row above: the override spells the alias the base
+// spells, so §12.1 is satisfied and the program compiles.
+BEZEL_TEST(type_alias_nullable_body_6324,
+           nl_base_concrete_bare_override_matching_accepted_spec_12_1) {
+    auto r = runAot(R"(
+module A;
+type Nl<T> := T?;
+public abstract class B<K, W>
+  public constructor() end constructor;
+  public abstract property V: W;
+end B;
+public class E<P, Q>: B<P, Nl<int>>
+  public constructor() end constructor;
+  public override property V: Nl<int> => throw new Exception("x");
+end E;
+public class Program
+  public static method Main(): int
+    return 0;
+  end Main;
+end Program;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

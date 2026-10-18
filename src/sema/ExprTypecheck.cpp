@@ -7637,6 +7637,39 @@ void ExprTC::checkAssignable(
             from->kind == TypeRef::Kind::Named && !from->declaration &&
             from->genericArgs.empty() && !fromIsTypeVar &&
             isBuiltinClassHead(fromName);
+        // fix #6347 (§5.1 "Reference conversions", v0.338): the SAME
+        // predicate WITHOUT the `from->genericArgs.empty()` restriction —
+        // i.e. it also answers true for a GENERIC built-in class such as
+        // `Array<int>`, `LinkedList<int>`, `Set<int>`, `OwningArray<int>`,
+        // `Dictionary<K,V>`. The `genericArgs.empty()` restriction on
+        // `fromBuiltinClass` exists (see the block comment ABOVE this
+        // predicate, which states the exclusion set and its reasons) only so
+        // that a built-in→built-in VARIANCE pair (`Array<T>` → `IEnumerable<T>`,
+        // stdlib §4.4/§29) falls through to the §12.9 variance arm, which is
+        // keyed on a NULL-DECLARATION target. A USER class target has a
+        // declaration, so the variance arm never sees that pair, and the
+        // `genericArgs.empty()` source predicate made the whole Repro-A gate
+        // below unreachable for every generic built-in: `var b: Box<int> := a;`
+        // over `a: Array<int>` was silently ACCEPTED, compiled, and read
+        // `Box<int>`'s field `V` out of the ARRAY's first word (printed `0`,
+        // never the `5` the program expects). `OwningArray<int>` was rejected
+        // for an UNRELATED reason (§4.2/#1327 takes its owning shape first),
+        // not by this arm — every one of these names is in the same
+        // `kHeapPointerReferenceBuiltins` row and none is a built-in
+        // interface head, so `isBuiltinClassHead` cannot separate them.
+        // §5.1's list of implicit reference conversions is CLOSED ("The
+        // following conversions are implicit") — identity, class-to-base,
+        // anything-to-`Object`, type-to-an-interface-it-conforms-to,
+        // interface-to-extended-interface, type-parameter-to-its-bound, and
+        // §12.9 variance. An unrelated user class is none of those, and
+        // §5.1 defines a reference conversion as "representation-preserving
+        // — the same reference viewed at a WIDER static type"; `Box<int>` is
+        // not wider than `Array<int>`, it is a different type. Used ONLY for
+        // the `toUserClass` pair below, where `to` carrying a declaration
+        // already rules out every legitimate built-in target.
+        bool fromBuiltinClassAnyArgs =
+            from->kind == TypeRef::Kind::Named && !from->declaration &&
+            !fromIsTypeVar && isBuiltinClassHead(fromName);
         bool toBuiltinClass =
             to->kind == TypeRef::Kind::Named && !to->declaration &&
             to->genericArgs.empty() && !toIsTypeVar &&
@@ -7728,13 +7761,13 @@ void ExprTC::checkAssignable(
         // target or a class derived from it is on record — the same two
         // shapes, on the same terms, as for a built-in exception target
         // (see ExprTypecheck_impl.hpp).
-        if (fromBuiltinClass && toUserClass &&
+        if (fromBuiltinClassAnyArgs && toUserClass &&
             !hasNamedAncestor(from, to->declaration->name) &&
             pendingTypeFactAdmits(fromExpr, to)) {
             if (from->nullable && !to->nullable) reportNullable();
             return;
         }
-        if (fromBuiltinClass && toUserClass &&
+        if (fromBuiltinClassAnyArgs && toUserClass &&
             !hasNamedAncestor(from, to->declaration->name)) {
             const std::string toN(to->declaration->name);
             // Distinguish EXCEPTION sources (kept under #4644's old
@@ -18674,7 +18707,177 @@ void ExprTC::runMethodBody(
         // an `async` value method carries the peeled element type in
         // currentReturnType_, so `=> await P()` is checked against that element,
         // matching the block-form `return await P();`.)
-        if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_) {
+        //
+        // narrow #4770 (§5.1, §30.6, v0.307), applied to the EXPRESSION-BODY
+        // spelling. The `return E;` STATEMENT arm above already runs a
+        // forgotten-`await` guard FIRST and lets a fired guard SUPPRESS the
+        // downstream §5.1 assignability check — "this check leads ... the
+        // §30.6 message names the remedy (`add await`) and must lead ...
+        // checkAssignable itself is unchanged; the suppress is at this call
+        // site". The `=> E` arm had no such guard and did not need one: until
+        // fix #6347 (§5.1, v0.338) a generic built-in class source
+        // (`OwningTask<Widget4461>`, `Array<int>`, ...) FELL THROUGH
+        // `checkAssignable`'s §5.1 path, because the `genericArgs.empty()`
+        // restriction on that path's `fromBuiltinClass` predicate excluded
+        // every source carrying type arguments. So the expression body reached
+        // codegen, whose `detectAsyncPatternAKind` (LlvmBackend_Async.cpp,
+        // §30.5 kind 1) reports the producer-side violation.
+        //
+        // #6347 widened that predicate to `fromBuiltinClassAnyArgs`, and that
+        // is a real §5.1 repair which must NOT be narrowed back: before it,
+        // `var x: Widget4461 := Task.FromOwnedResult(new Widget4461());` was
+        // SILENTLY ACCEPTED outside any async body (MEASURED on b28c2119: no
+        // diagnostic at all), and `var b: Box<int> := a;` over `a: Array<int>`
+        // compiled into a read of `Box<int>`'s field out of the array's first
+        // word. What #6347 broke is only the fall-through THIS position
+        // depended on: for `async method Make(): Task<Widget4461> =>
+        // Task.FromOwnedResult(new Widget4461());` the generic §5.1 message
+        // ("the built-in type `OwningTask` is not a `Widget4461`") now
+        // pre-empts the producer-side message that actually OWNS the shape.
+        //
+        // §30.5 "Result lifetime and task disposal" owns the shape and names
+        // the remedy — "return a fresh owned value ... or `return await` an
+        // admitted task source" — while §5.1 only restates the consequence.
+        // §5.1's reference-conversion list is CLOSED ("The following
+        // conversions are implicit": identity; class to base class
+        // transitively up to `Object`; any type to `Object`; a type to an
+        // interface it implements or conforms to; interface to extended
+        // interface; a type parameter to an interface or class its constraints
+        // guarantee conformance to; the variance-induced conversions of
+        // §12.9) and admits no unrelated-class pair, and its own definition
+        // of the family excludes this one — a reference conversion is
+        // "representation-preserving — the same reference viewed at a WIDER
+        // static type", which `OwningTask<Widget4461>` viewed as
+        // `Widget4461` is not. The producer-side diagnostic agrees and says
+        // so ("Add `await` (e.g. `=> await Task.FromOwnedResult(new T())`)").
+        // The statement-form twin already leads for exactly this reason; §30.6
+        // is the section that diagnostic cites for the `return await
+        // Producer()` remedy, and §30.6 defers the body's conformance back to
+        // §30.1 and §30.5 ("the body must conform to the named type exactly as
+        // an `async` method's body conforms to its declared type under [§30.1]
+        // and [§30.5]").
+        //
+        // The carve-out is therefore as narrow as the rule it defers to: it
+        // fires only where `detectAsyncPatternAKind` is guaranteed to fire in
+        // turn, so nothing is admitted here that codegen would not reject
+        // anyway. Both halves are load-bearing:
+        //
+        //  * `isTaskFactoryCall30_5` is codegen's own `isTaskFactoryCallExpr`
+        //    predicate (`Task.FromOwnedResult` / `FromResult` /
+        //    `FromException`), reproduced verbatim. The other shapes in
+        //    codegen's rejection set (MemberAccessExpr / NullCondMemberExpr /
+        //    IndexExpr) keep the §5.1 check, and a Task-returning call that is
+        //    NOT a Task-factory member (a user method returning `Task<T>`)
+        //    keeps it too — codegen does not reject those.
+        //  * `elementIsRefType30_5` is §30.5's own "Pattern A result slots
+        //    apply to class or interface T" scoping, matching the
+        //    `asyncResultTy_->isPointerTy()` guard `detectAsyncPatternAKind`
+        //    returns early on. `Task<T>` over a copyable value type, a
+        //    `string`, a record, enum or choice is §30.5's OTHER row and has
+        //    no producer-side rejection in codegen at all, so the §5.1 check
+        //    must keep running there: `async method Make(): Task<int> =>
+        //    Task.FromResult(42);` is caught by "heap reference and target is
+        //    a value type" and stays caught (MEASURED: suppressing it
+        //    unconditionally admitted the program outright).
+        const auto* tfCall30_5 =
+            dynamic_cast<const ast::CallExpr*>(exprBody);
+        const auto* tfCallee30_5 =
+            tfCall30_5
+                ? dynamic_cast<const ast::MemberAccessExpr*>(
+                      tfCall30_5->callee.get())
+                : nullptr;
+        const auto* tfTarget30_5 =
+            tfCallee30_5
+                ? dynamic_cast<const ast::IdentifierExpr*>(
+                      tfCallee30_5->target.get())
+                : nullptr;
+        const bool isTaskFactoryCall30_5 =
+            tfTarget30_5 && tfTarget30_5->name == "Task" &&
+            (tfCallee30_5->member == "FromOwnedResult" ||
+             tfCallee30_5->member == "FromResult" ||
+             tfCallee30_5->member == "FromException");
+        // fix-forward #6405 (§30.5, v0.338): the DECLARED wrapper must be
+        // `Task<T>` — Pattern A — before §5.1 yields this position to the
+        // producer-side check. Two independent grounds, both read off the
+        // spec's own wording and off codegen, not inferred:
+        //
+        // (a) The rule this suppression defers to is scoped in its own words
+        //     to Pattern A. §30.5 "Result lifetime and task disposal",
+        //     *Producer-side return-type rules*, the bolded clause:
+        //     "**No fourth kind: a non-`await` borrow return is rejected.**
+        //     A `return` in an `async` body — an `async` method's or an
+        //     `async` lambda's — whose return type is `Task<T>` for class or
+        //     interface T, whose operand is a **borrow** and not a `return
+        //     await` ... is a **compile error at the return site**". The
+        //     `OwningTask<T>` row is a SIBLING row of that list and carries no
+        //     such clause: "`OwningTask<T>` for **class or interface** T: the
+        //     task produces a single owned result. Awaiting transfers
+        //     ownership to the awaiter ... This is **Pattern B**." There is no
+        //     "fourth kind" prohibition to defer to, so there is nothing for
+        //     §30.5 to own at a Pattern B producer and nothing for this
+        //     suppression to defer.
+        //
+        // (b) There is no producer-side rejection behind the suppression for a
+        //     Pattern B producer, so deferring is silent acceptance, not a
+        //     hand-off. `detectAsyncPatternAKind` (LlvmBackend_Async.cpp)
+        //     reports §30.5 kind 1 only under a non-null
+        //     `asyncPatternAResultDisposer_`, which is attached for Pattern A
+        //     only — a Pattern B producer has none, so the program reaches
+        //     codegen and RUNS. MEASURED on 2425187c: the three Pattern B
+        //     cells `OwningTask<class|interface|Object>` in an ARROW body
+        //     `=> Task.FromOwnedResult(...)` compile (rc 0); the same
+        //     spellings in the STATEMENT arm all reject (§30.6). The arrow
+        //     arm accepting what the statement arm rejects on the same method
+        //     is the signature of a hole, not of a hand-off.
+        //
+        // `currentMethodDecl_` is set only at the `async` METHOD site (the
+        // operator and property `runMethodBody` calls never set it, and never
+        // set `inAsyncContext_` either, so they cannot reach this guard); a
+        // null or non-`Task<T>` wrapper leaves `declaredIsPatternA30_5` false
+        // and §5.1 keeps the position, which is the pre-#6405 verdict.
+        const TypeRef* declaredRet30_5 =
+            (currentMethodDecl_ && currentMethodDecl_->returnType)
+                ? ctx_.resolvedType(*currentMethodDecl_->returnType)
+                : nullptr;
+        const bool declaredIsPatternA30_5 =
+            declaredRet30_5 &&
+            declaredRet30_5->kind == TypeRef::Kind::Named &&
+            declaredRet30_5->astNode && declaredRet30_5->astNode->name &&
+            declaredRet30_5->astNode->name->parts.size() == 1 &&
+            declaredRet30_5->headName() == "Task" &&
+            !declaredRet30_5->genericArgs.empty();
+        // §30.5's "Pattern A" scoping: class or interface T (and the
+        // runtime-managed spellings that share the pointer representation).
+        const TypeRef* elemTy30_5 = currentReturnType_;
+        bool elementIsRefType30_5 = false;
+        if (elemTy30_5) {
+            if (elemTy30_5->kind == TypeRef::Kind::Primitive)
+                // `Object` ONLY. §30.5's "runtime-managed" rows cover a
+                // `string` result too, but `Task<string>` attaches NO
+                // per-result disposer, so `detectAsyncPatternAKind`'s arm is
+                // gated off (`asyncPatternAResultDisposer_` is null) and
+                // `Task<string>` gets no producer-side rejection at all —
+                // MEASURED: admitting it here compiled
+                // `async method Make(): Task<string> => Task.FromResult("hi");`
+                // outright, where §5.1's "heap reference and target is a value
+                // type" had rejected it. §5.1 must keep that position.
+                elementIsRefType30_5 =
+                    elemTy30_5->primitive == PrimitiveType::Object;
+            else if (elemTy30_5->kind == TypeRef::Kind::Named)
+                elementIsRefType30_5 =
+                    elemTy30_5->declaration
+                        ? (elemTy30_5->declaration->kind ==
+                               ast::TypeDeclKind::Class ||
+                           elemTy30_5->declaration->kind ==
+                               ast::TypeDeclKind::Interface)
+                        : !isValueBuiltinByName(elemTy30_5->headName());
+        }
+        const bool section30_5OwnsPosition =
+            inAsyncContext_ && declaredIsPatternA30_5 &&
+            elementIsRefType30_5 && isTaskFactoryCall30_5 &&
+            isTaskShapedRef(ctx_.exprType(*exprBody));
+        if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
+            !section30_5OwnsPosition) {
             checkAssignable(
                 ctx_.exprType(*exprBody), currentReturnType_,
                 exprBody->span.begin, "returned value",

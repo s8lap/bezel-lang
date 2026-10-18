@@ -212,6 +212,69 @@ const sema::TypeSymbol* Emitter::instrumentedAutoPropertyStoreClass(
     return instrumentedSetterClass(target, ps, pd);
 }
 
+// fix #6452: does a drain-view RECEIVER die at this method's own scope end?
+//
+// The receiver of a `recv.Drain()` (or a `recv.f.Drain()` chain) is the frame's
+// borrow SOURCE, and a source that dies at the callee's scope end leaves the
+// returned frame dangling. §28.3 lists the sources it rejects — "a scope-bound
+// local, a `using var`, an `owned` parameter" — and the ownership pass
+// (src/ownership/Ownership.cpp, the `cannot return \`…\`.Drain()` site)
+// implements the first TWO: its bare-identifier and chain-root arms both end at
+// "untracked (parameter / import) — admitted", because a plain parameter
+// outlives the call.
+//
+// That admits an `owned` parameter, and an `owned` parameter is discharged at
+// the method's scope end (§28.3's affine auto-drop). The warning that says so —
+// "owned parameter `items` is implicitly disposed at the end of the method" — is
+// REPORTED by the ownership pass (`MethodOwnership::run`,
+// src/ownership/Ownership.cpp), not by codegen. `registerUnwindOwnedParam`
+// (LlvmBackend_Setup.cpp) is the codegen-side DISPOSAL REGISTRATION and only
+// quotes that same sentence in its own comments; it emits no diagnostic. The
+// claim that matters here — the parameter dies at scope end — is the same
+// either way. MEASURED both legs:
+//
+//   View(owned items: OwningArray<R>) return items.Drain();   // direct
+//   View(owned p: Bag)                 return p.items.Drain(); // chain root
+//
+//   base  edf42bd3: compiles clean, `internal: … #2491`, SEGV 0x0 at the
+//                   caller (the pre-existing #6452 behaviour);
+//   with an un-narrowed #6452 mint: compiles clean, SEGV inside
+//                   `bz_array_drain_next`
+//                   (src/runtime/bezel_runtime_collections.cpp) on a small
+//                   NON-ZERO address — 0x0a for the direct spelling, 0x0b for
+//                   the chain root on the measured run, i.e. a wild read at a
+//                   small offset off a freed array, not a fixed address. That
+//                   is a frame over a collection the callee already freed.
+//
+// So the mint MUST decline here, and the question is asked of the chain ROOT
+// as well as of a bare receiver, because the two spellings are the same hazard
+// (Ownership.cpp walks the chain for exactly that reason).
+//
+// The real fix — teaching the ownership pass that an `owned` parameter is not
+// a surviving source — is a SEPARATE obligation and is deliberately not taken
+// here: declining the mint restores the base behaviour (a null return and its
+// `#2491` note), which is a compile-time-visible defect rather than a
+// use-after-free, and leaves the pass's own admission question untouched.
+bool Emitter::drainReceiverSourceDiesAtScopeEnd(const ast::Expr* recv) const {
+    if (!recv) return false;
+    // Walk to the chain root, exactly as Ownership.cpp's chain arm does:
+    // `p.f.g` and `p` must both answer for `p`.
+    const ast::Expr* root = recv;
+    while (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(root))
+        root = ma->target.get();
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(root);
+    if (!id) return false;
+    // `this.f.Drain()` — the receiver IS the object; it outlives the call.
+    if (id->name == "this") return false;
+    const auto* ps =
+        dynamic_cast<const sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+    if (!ps) return false;
+    // §22.4 writes the classification on the formal: "", "ref", "out",
+    // "out owned", "owned". Only the two owned spellings are discharged at
+    // scope end.
+    return ps->modifier == "owned" || ps->modifier == "out owned";
+}
+
 
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     noteFnAtObjectStmt(s);   // #5978: see `fnAtObject_`
@@ -2957,84 +3020,156 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 else if (const ast::Type* rn = returnReprTypeNode())
                     retTargetTy = ctx_.resolvedType(*rn);
                 if (const sema::TypeRef* rrt = retTargetTy) {
-                    // §15.3 (#781): a `return [e1, …]` whose declared return
-                    // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
-                    // the `[N x elem]` aggregate and returns it BY VALUE.
-                    // lowerExpr returns null for a CollectionLiteralExpr, and
-                    // materializeHeapCollectionLiteral only makes a heap
-                    // bz_array_t* (a `ptr`, the wrong type for an inline
-                    // return) — so without this the method returned an
-                    // undef/zero array and the caller's `var a := Make()`
-                    // materialized as all-null. Mirrors the inline-array
-                    // local-decl build (lowerLocalDecl).
-                    if (rrt->kind == sema::TypeRef::Kind::InlineArray &&
-                        !cl->isDict) {
-                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
-                                lowerTypeRef(rrt))) {
-                            llvm::Type* elemTy = aty->getElementType();
-                            llvm::AllocaInst* tmp = entryAlloca(aty);
-                            for (std::size_t i = 0; i < cl->elements.size();
-                                 ++i) {
-                                if (!cl->elements[i]) continue;
-                                llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                                if (!ev) {
-                                    // fix #3712 (§3.2 / §15.1 / §17.11,
-                                    // v0.286): a UNIT-typed element is not a
-                                    // lowering failure — see
-                                    // lowerCollectionLiteralElementOrUnitNull
-                                    // (hoisted from fix #3528's local-decl
-                                    // guard; LlvmBackend_Setup.cpp).
-                                    ev = lowerCollectionLiteralElementOrUnitNull(
-                                        *cl->elements[i], elemTy);
-                                    if (!ev) {
-                                        // #1386: ICE — lowerExpr returned
-                                        // null for an inline-array return
-                                        // element.
-                                        ctx_.diagnostics().report(
-                                            Severity::Error,
-                                            cl->elements[i]->span.begin,
-                                            "internal: lowerExpr returned "
-                                            "null for inline-array return "
-                                            "element — #1386");
-                                        continue;
-                                    }
-                                }
-                                if (ev->getType() != elemTy &&
-                                    ev->getType()->isIntegerTy() &&
-                                    elemTy->isIntegerTy()) {
-                                    unsigned eb =
-                                        ev->getType()->getIntegerBitWidth();
-                                    unsigned db =
-                                        elemTy->getIntegerBitWidth();
-                                    ev = db > eb
-                                             ? builder_.CreateSExt(ev, elemTy)
-                                             : builder_.CreateTrunc(ev,
-                                                                    elemTy);
-                                }
-                                // fix #4317 (§15.1 / §8.6, v0.298): box a
-                                // value-typed (record) element into its box
-                                // representation before the store — see the
-                                // detailed derivation at the sibling
-                                // IndexExpr-arm fix earlier in this function.
-                                // No-op for a class element (already a bare
-                                // pointer) or a non-Object/interface element.
-                                ev = boxForTarget(ev, rrt->arrayElement,
-                                                  cl->elements[i].get());
-                                llvm::Value* gep = builder_.CreateGEP(
-                                    aty, tmp,
-                                    {builder_.getInt32(0),
-                                     builder_.getInt32((int)i)});
-                                builder_.CreateStore(ev, gep);
-                            }
-                            v = builder_.CreateLoad(aty, tmp, "ret.inlarr");
-                        }
-                    } else if (!cl->isDict)
-                        v = materializeHeapCollectionLiteral(cl, rrt);
-                    else if (!cl->keys.empty())
-                        v = materializeHeapDictLiteral(cl, rrt);
+                    // fix #6325 (§15.4, v0.338): the inline-array (§15.3 /
+                    // #781), heap-collection and dictionary arms moved into
+                    // `lowerReturnCollectionLiteral` so the two arrow-body
+                    // faces share this one implementation — the four-way
+                    // mirror #2924 recorded about the #2491 diagnostic is the
+                    // same shape, and the arrow faces had NO arms at all.
+                    // The §15.3 rationale (an inline return needs the `[N x
+                    // elem]` aggregate BY VALUE; the heap materializers make a
+                    // `ptr`, the wrong type) and the #3712 / #4317 / #1386
+                    // element handling are unchanged, verbatim, beside it.
+                    v = lowerReturnCollectionLiteral(cl, rrt);
                 }
             }
             if (!v) v = lowerExpr(*rs->value);
+            // fix #6452 (§28.3 *Returning a deferred-activation frame* / §29.2 /
+            // §29.1 / §28.6; stdlib §4.5 / §4.13, v0.338): the RETURN face of
+            // the builtin `recv.Drain()` view. #4750 / #4772 gave the
+            // LOCAL-DECL face a mint (LlvmBackend_Setup.cpp, `if (!v && init)`),
+            // but the `return recv.Drain();` spelling reached NOTHING:
+            // `lowerCallExpr` has no `Drain` arm (only the for-in desugaring and
+            // the GetOwningEnumerator dispatch recognise the shape, by walking
+            // back to the initializer), so `v` stayed null, the §29.2 coercion
+            // further down was gated on `v && rs->value` and never ran, and the
+            // method returned the `v ? v : null` fallback — a NULL. The only
+            // signal was the internal `#2491` warning, which the §3 / #605
+            // permissive posture deliberately leaves a Warning, so the program
+            // COMPILED CLEAN and then SEGV'd in user code:
+            //
+            //     public method View(): IOwningEnumerable<R>
+            //       return Items.Drain();        // -> null
+            //     end View;
+            //     using var v: IOwningEnumerable<R> := h.View();   // SEGV
+            //
+            // MEASURED at edf42bd3: `warning: internal: return-value expression
+            // failed to lower to a value (degraded to a zero/null return
+            // value) — #2491` and then `AddressSanitizer: SEGV on unknown
+            // address 0x000000000000 ... in bz$M.P$Run`. Four independent
+            // routes carry that note pre-fix — the forward-array, LIFO and
+            // node-list backings plus a plain-parameter receiver
+            // (tests/lit/drain_return_no_internal_degrade_note_6452.bzl).
+            //
+            // The shape is SPEC-ADMITTED, which is why the answer is a real
+            // value and not a diagnostic. §28.3: "A non-iterator method may
+            // therefore compose and return such a frame ... provided every
+            // borrow the returned frame carries is sourced from the method's
+            // own parameters or receiver (directly or through the receiver's
+            // fields, the receiver-sourced notion of §28.6)". A `this`-rooted
+            // drain is that receiver-sourced case — pinned as admitted by
+            // `drain_view_return_site_2175.return_this_field_drain_admitted_
+            // control_spec_28_3`, which asserts hasErrors() == false.
+            //
+            // ⚠ WHAT §28.3 REJECTS, AND HOW MUCH OF IT REACHES HERE — corrected
+            // after a reviewer measured a premise this comment originally got
+            // WRONG. §28.3 rejects a frame carrying "a borrow of a scope-bound
+            // local, a `using var`, an `owned` parameter". The ownership pass
+            // (Ownership.cpp, the "cannot return `x`.Drain()" return site)
+            // implements the first TWO and never rejects the third: both of
+            // its bare-identifier and chain-root arms return at "untracked
+            // (parameter / import) — admitted", because a PLAIN parameter
+            // outlives the call. So:
+            //
+            //   REJECTED upstream, never reaches this arm — measured, one
+            //   program per row, each a frame crossing a method boundary:
+            //     `var a := new OwningArray<R>(); return a.Drain();`
+            //     `using var a := …; return a.Drain();`
+            //     `var h := new Bag(); return h.items.Drain();`
+            //     `using var h := new Bag(); return h.items.Drain();`
+            //     (the #2175 (a1)/(a2)/(a3) rows and this arm's sibling
+            //     rejections; each prints the same `cannot return `x`.Drain()`
+            //     shape, whose tail names the source and why it dies —
+            //     "is a `using var` disposed at the callee's scope end" or
+            //     "is a scope-bound owned local disposed at the callee's
+            //     scope end")
+            //
+            //   REACHES THIS ARM, and must be handled here — also measured:
+            //     `me.items.Drain()`   (me: Owner, plain param)   OK, fixed
+            //     `p.items.Drain()`    (p: Bag,   plain param)     OK, fixed
+            //     `items.Drain()`      (items: OwningArray, plain) OK, fixed
+            //     `items.Drain()`      (items: OWNED parameter)    DECLINED
+            //     `p.items.Drain()`    (p: OWNED parameter)        DECLINED
+            //
+            // The two owned-parameter rows are the narrowing below. An `owned`
+            // parameter is discharged at the method's scope end (§28.3's affine
+            // auto-drop), so a frame minted over it dangles: with an
+            // UN-narrowed mint both SEGV inside `bz_array_drain_next`
+            // (a small non-zero address — 0x0a and 0x0b on the measured run,
+            // a wild read off the freed array, so the address itself is not a
+            // stable fact), where the base SEGVs at 0x0 in the
+            // caller with a `#2491` note. Declining restores the base
+            // behaviour. See `drainReceiverSourceDiesAtScopeEnd`.
+            //
+            // The body is the local-decl face VERBATIM — same gate, same
+            // `wrapAsIEnumerableForTarget` call, same flags. That is the point:
+            // #3392 is the recorded cost of letting the two faces' predicates
+            // drift, so the return face asks the SAME authority rather than
+            // re-deriving which leaf to mint, and a future leaf added to
+            // `owningDrainWrapForHead` reaches both faces the day it is added.
+            // §29.2's coercion further down then sees a value that already
+            // carries the declared `IOwningEnumerable<T>` head and declines, so
+            // exactly one frame is minted and it is minted once.
+            //
+            // Two constraints this arm holds to, both measured rather than
+            // assumed:
+            //   * `#3377` — the fresh-producer receiver exclusions
+            //     (`!CallExpr && !NewExpr` on the drain target) are the same
+            //     ones the local-decl face carries. `MakePool().Drain()` is
+            //     deliberately left alone: re-lowering it would evaluate the
+            //     producer twice, and taking its frame's `this` capture as
+            //     something this edge owns is exactly the leak #3377 records.
+            //     `srcOwnedByCallee=false` keeps the wrap a BORROW of the
+            //     collection, so the holder still frees the (emptied) array —
+            //     the return edge claims the FRAME only.
+            //   * `#2703` / axiom A4 — nothing here reads or writes
+            //     `currentReturnTypeNode_`. The +0 read-face suppression for an
+            //     accessor body is not this arm's to move.
+            if (!v && rs->value) {
+                auto* dce = dynamic_cast<const ast::CallExpr*>(rs->value.get());
+                auto* dma = dce ? dynamic_cast<const ast::MemberAccessExpr*>(
+                                      dce->callee.get())
+                                : nullptr;
+                const sema::TypeRef* viewTy = ctx_.exprType(*rs->value);
+                if (dma && dma->member == "Drain" && dma->target &&
+                    dce->args.empty() &&
+                    builtinTypeName(viewTy) == "IOwningEnumerable" &&
+                    !dynamic_cast<const ast::CallExpr*>(dma->target.get()) &&
+                    !dynamic_cast<const ast::NewExpr*>(dma->target.get())) {
+                    std::string_view srcHead =
+                        builtinTypeName(ctx_.exprType(*dma->target));
+                    if (common::isOwningCollectionHead(srcHead) &&
+                        !common::isDictionaryName(srcHead) &&
+                        // fix #6452: an `owned`-parameter receiver is
+                        // discharged at THIS method's scope end, so a frame
+                        // minted over it dangles. Declining keeps the base
+                        // behaviour (null + the `#2491` note) rather than
+                        // turning a null-page SEGV into a use-after-free.
+                        // Asked of the chain ROOT, so `p.f.Drain()` and
+                        // `f.Drain()` answer alike.
+                        !drainReceiverSourceDiesAtScopeEnd(dma->target.get())) {
+                        llvm::Value* coll = lowerExpr(*dma->target);
+                        if (coll && coll->getType()->isPointerTy()) {
+                            bool made = false;
+                            llvm::Value* frame = wrapAsIEnumerableForTarget(
+                                coll, viewTy, dma->target.get(),
+                                /*ownLazyPipeline=*/false, &made,
+                                /*srcOwnedByCallee=*/false);
+                            if (made && frame && frame != coll) v = frame;
+                        }
+                    }
+                }
+            }
         }
         // §30.5 / #1332 (v0.162): read and reset the chained-return flag now that
         // lowerExpr has completed (lowerAwait already used the flag to suppress the
@@ -3583,13 +3718,129 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // is therefore the same wrap/dispose round trip the expression-bodied
         // sibling has always had, not a new ownership obligation.
         if (const ast::Type* rn = returnReprTypeNode())
-            if (v && rs->value)
+            if (v && rs->value) {
+                // fix #6397 (§28.9 / §29.2 / §23.3, v0.338): PUBLISH this
+                // edge's mint. The wrap above is the one a BLOCK-bodied
+                // getter's `return` makes (§23.3, #2703), and until this fix
+                // it published nothing at all — `propReadIterWrappedExprs_`
+                // has exactly two writers and both are inside
+                // `wrapPropertyArrayAsIEnumerable`, the EXPRESSION-bodied
+                // creator. So the for-in consumer classified every
+                // block-bodied getter's read as a lend and nobody reclaimed
+                // the frame: MEASURED, two of #6387's landed rows and #2769's
+                // direct-for-in row RED with `Direct leak of 6400 byte(s) in
+                // 200 object(s) allocated from bz$prop$Seq$get`.
+                //
+                // The key is the PROPERTY, not this `return`, because this
+                // statement lives in the accessor's own memoised function
+                // while the consumer keys on the CALLER's read node and, once
+                // the memo hits, cannot re-enter this emission. See
+                // `propBlockGetterReturnKinds_` in LlvmBackend_impl.hpp.
+                //
+                // The verdict is the wrap-creator's own `outWrapMade`, so
+                // CLAIM = MINT holds by construction, and the ERASE on a
+                // decline is load-bearing rather than tidiness: a block-bodied
+                // `property Seq: IEnumerable<int> get do return _seq; end
+                // get; end` over an `owned _seq: IEnumerable<int>` returns a
+                // value that ALREADY has the declared head, so the wrap
+                // declines, the holder keeps the field (§28.2), and a claim
+                // over an unminted frame would free it out from under the
+                // holder. `currentAccessorPropSym_` is non-null only inside
+                // `ensurePropertyBlockGetter`'s body emission, so a METHOD's
+                // return edge — which reaches this same arm — publishes
+                // nothing and keeps its existing behaviour.
+                bool wrapMade6397 = false;
                 v = wrapAsIEnumerableForTarget(
                     v, ctx_.resolvedType(*rn), rs->value.get(),
                     /*ownLazyPipeline=*/true,
-                    /*outWrapMade=*/nullptr,
+                    /*outWrapMade=*/&wrapMade6397,
                     /*srcOwnedByCallee=*/
                     returnSourceIsCalleeOwnedCollection(rs->value.get()));
+                if (currentAccessorPropSym_) {
+                    // fix #6397: publish BOTH verdicts the for-in consumer
+                    // reads. The field bit is decided from the SAME node this
+                    // arm already holds (`rs->value`), by the classification
+                    // the codebase already runs on that very expression —
+                    // `wrapAsIEnumerableForTarget`'s user-class arm asks
+                    // exactly `ctx_.exprSymbol(*srcExpr)` for its
+                    // `srcIsNamedOwner` (LlvmBackend_Assign.cpp). §28.2 is why
+                    // a field read is a lend whoever the holder is: "Every
+                    // class instance is reclaimed by compiler-inserted code at
+                    // its holder's release point … and nowhere else."
+                    bool returnsField6397 =
+                        dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*rs->value)) != nullptr;
+                    unsigned k = propBlockGetterReturnKinds_.count(
+                                     currentAccessorPropSym_)
+                                     ? propBlockGetterReturnKinds_[
+                                           currentAccessorPropSym_]
+                                     : 0u;
+                    k = (wrapMade6397 ? (k | kPropGetterReturnMint)
+                                      : (k & ~kPropGetterReturnMint));
+                    k = (returnsField6397 ? (k | kPropGetterReturnField)
+                                          : (k & ~kPropGetterReturnField));
+                    propBlockGetterReturnKinds_[currentAccessorPropSym_] = k;
+                }
+            }
+        // fix #6449 (§23.3 "Block-form properties" / §28.9 "Runtime-managed
+        // types", v0.338): the STANDALONE block-bodied `string` property getter
+        // hands back a normalized +1 on EVERY exit.
+        //
+        // The arm at LlvmBackend_Stmts.cpp ~3688 that mints a method's `string`
+        // return is keyed on `currentReturnTypeNode_`, which #2694/#2703 keeps
+        // NULL inside an accessor body — that suppression is deliberate and
+        // correct as long as BOTH sides of the contract hold: an accessor's
+        // read face is a lend (+0) and no call site discharges anything. What
+        // made it stop holding is that a block-bodied getter is emitted
+        // OUT-OF-LINE (`ensurePropertyBlockGetter` → `bz$prop$<name>$get`),
+        // so its body's value flows to the reader verbatim, and #5321's
+        // all-producer arm taught `isPlusOneStringProducer` to classify such a
+        // read +1 only when EVERY return is a +1 producer. A body that MIXES a
+        // producer return with a borrow return classified false, no consumer
+        // registered a discharge, and the producer edge's +1 escaped the
+        // accessor: MEASURED on #6449, `SUMMARY: AddressSanitizer: 8000
+        // byte(s) leaked in 400 allocation(s)` over 200 reads, attributed to
+        // `bz$prop$Tag$get`, with the all-producer and all-borrow controls
+        // clean on the same build.
+        //
+        // The two halves of the fix are one contract and must land together:
+        // this mint normalizes EVERY exit to +1, and the matching classification
+        // change in `isPlusOneStringProducer`'s `inlinedGetterBody` block arm
+        // makes every read of such a getter +1. Landing this arm alone would
+        // hand a consumer a +1 it treats as a borrow — an inflate; landing the
+        // classification alone would release a reference never minted — a
+        // use-after-free. §28.9's "the two accessor body spellings … are
+        // semantically indistinguishable at every read site" is what the pair
+        // buys, and §28.9's "the implementation reclaims the production; how is
+        // not specified" is what leaves the choice of normalization open; it is
+        // the same contract `ensureVirtualStringGetterOwnershipThunk` (#4952)
+        // already guarantees for a vtable/itable slot and
+        // `emitExportedPropertyGetters` (#5342) for a cross-module `$propget`
+        // stub, which is why the read face still transfers no NET obligation:
+        // retain inside, release at the reader.
+        //
+        // The two transfer exclusions mirror the lambda-body `string` arm
+        // above and the method-return arm below EXACTLY, for the same reason —
+        // a returned expression that ALREADY carries its own +1 must not be
+        // retained on top of it, or the surplus reference is never dropped.
+        // `returnReprTypeNode()` is the accessor's OWN declared type, handed
+        // out only while `currentFn_` IS the accessor function that registered
+        // it (`accessorReturnTypeNode_`/`accessorReturnTypeFn_`), so this arm
+        // sees `pd->type` and nothing else. The nullable spelling mints too,
+        // matching the method-return arm's #2196 reasoning: `bz_string_retain`
+        // is a no-op on null, so a `return null;` is still a null carry rather
+        // than a +1.
+        if (const ast::Type* accRet6449 = returnReprTypeNode())
+            if (inStandalonePropBlockGetter_ && v && rs->value &&
+                v->getType()->isPointerTy()) {
+                const sema::TypeRef* accRetTy6449 = ctx_.resolvedType(*accRet6449);
+                if (accRetTy6449 &&
+                    accRetTy6449->kind == sema::TypeRef::Kind::Primitive &&
+                    accRetTy6449->primitive == sema::PrimitiveType::String &&
+                    !isPlusOneStringProducer(rs->value.get()) &&
+                    !returnedStringLocalOwnsPlusOne(rs->value.get()))
+                    emitStringRetain(v);
+            }
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the
@@ -4114,8 +4365,47 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (!diverged_ && v) emitStringRelease(v);
             return diverged_;
         }
-        if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
-        return diverged_;  // CG40: a throw-expression terminated the block
+        // fix #6366 (§28.3 K8 *Unbound owned temporaries*, §28.9, §17.13, stdlib
+        // §4.6/§4.7/§4.8, v0.338): a BARE COLLECTION-producer statement
+        // (`f.Make();`, where `Make(): owned Array<int>` /
+        // `owned LinkedList<int>`) leaks its whole collection. §28.3 K8 puts
+        // the boundary at "end of the full expression", which for an expression
+        // statement coincides with end of statement (§21.9) — the same
+        // sentence #2655's arm above cites for the Class-typed case.
+        //
+        // Why a SEPARATE arm rather than a widening of #2655's: that arm's
+        // `disposeOwnedValue` is set only for §21.9's `ownedProduced` set,
+        // which requires kind == Class, and a builtin collection is not a
+        // Class — so the arm above has already returned by the time a
+        // collection reaches here. Reusing it would mean editing sema's
+        // `ownedProduced` walk, which would then need the *class* dispose
+        // convention for values that have no class vtable at all.
+        //
+        // The reclaim itself is the SAME helper the `_ := expr;` DiscardStmt
+        // arm uses for a fresh collection materializer (#1015, a few hundred
+        // lines below), so this adds no new free logic and no new name list:
+        // `freeUnboundOwnedBorrowingArrayTemp` already dispatches llist /
+        // dict / array (#6352 added its `freeIsLlist` arm, #6341 made the
+        // LinkedList faces reach it at all). It is a NO-OP for any receiver
+        // that is not exactly a fresh unbound owned-producing call, so a bare
+        // statement that consumes someone ELSE's collection is untouched.
+        //
+        // MEASURED on this fix's parent over 101 iterations: 12,120 B for the
+        // `owned Array<int>` producer and 14,140 B for the
+        // `owned LinkedList<int>` twin — against 0 for the byte-identical
+        // `_ := f.Make();` binding, which is the asymmetry that identifies
+        // this defect (the reclaim fires when the temporary is CONSUMED, and
+        // not when it is discarded entirely).
+        {
+            if (es->expr) {
+                llvm::Value* v = lowerExpr(*es->expr);
+                if (!diverged_ && v) {
+                    freeUnboundOwnedBorrowingArrayTemp(
+                        es->expr.get(), v, ctx_.exprType(*es->expr));
+                }
+            }
+            return diverged_;  // CG40: a throw-expression terminated the block
+        }
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
         if (ds->value) {
@@ -7603,6 +7893,24 @@ bool Emitter::lowerLinkedListFor(const ast::ForStmt& fs) {
     builder_.CreateStore(builder_.CreateCall(nextFn, {nodeC}), nodeSlot);
     builder_.CreateBr(condBB);
     builder_.SetInsertPoint(endBB);
+    // fix #6341 (§28.3, §28.9, §29.2, stdlib §4.6/§4.7, v0.338): the LinkedList
+    // twin of the array for-in path's reclaim (the `freeUnboundOwnedBorrowingArrayTemp`
+    // call at lowerArrayFor's `endBB`, #1055). A fresh `owned LinkedList<T>`
+    // iterated directly as the source (`for var s in MakeLlist() do … end`) is
+    // owned by nothing once the loop ends, and this function — unlike
+    // lowerArrayFor — reached no disposal at all, so the list AND every node it
+    // still held leaked. MEASURED on this fix's parent: 5,600 B in 100
+    // allocations over a 100-iteration loop (`bz_llist_alloc`,
+    // bezel_runtime_collections.cpp:1897), against clean `Array<T>` and
+    // clean `Dictionary<K,V>` twins.
+    // Placed at `endBB`, which BOTH normal completion and `break` reach (a
+    // `return` inside the body diverges before this point — the source leaks,
+    // the same safe direction and the same limitation the array path documents).
+    // `listObj` is not read again below this point, so releasing it here is
+    // sound. No-op unless the iterable is exactly a fresh unbound owned-producing
+    // call, so a bound / `using var` / aliased iterable is never freed twice —
+    // its own owner does that.
+    freeUnboundOwnedBorrowingArrayTemp(fs.iterable.get(), listObj, iterTy);
     return true;
 }
 
@@ -8906,8 +9214,30 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // ownerless dict materializer (its narrow guard) — a bound / `move`d /
     // aliased dict is never matched, so no UAF / double-free. The temp key/value
     // extraction arrays are freed above first; this frees the dict itself.
+    //
+    // fix-forward #6419 (§28.11 *Collection element ownership*, stdlib §4.8,
+    // v0.338): the escape axis, read from the SAME `forVarCapturedEscaping`
+    // predicate this function's own Key release consults above (fix #4161) —
+    // one authority for "can this loop variable outlive the loop", read twice
+    // rather than re-derived. The loop var's field 1 is `decodeDictValueAt`'s
+    // borrow of `e.val`, exactly as at the First/Last/Single/ElementAt
+    // terminal; when a closure captured the loop var and may escape, the boxed
+    // cell is a shallow copy holding that same pointer, so the value outlives
+    // this reclaim. Declining only the §28.11 value DISCHARGE (the table free
+    // is unaffected) is what keeps the common, non-capturing shape leak-free.
+    //
+    // MEASURED on dc3c8f2a, 101 iterations, `bezelc --sanitize=address`, an
+    // escaping `lambda() => entry.Value.Length` assigned to an outer `f` inside
+    // the body and called after the loop returns:
+    // `==ERROR: AddressSanitizer: heap-use-after-free ... freed by thread T0
+    // here: #0 free #1 bz$strElemRelease`. The NON-capturing twin of the same
+    // loop measures clean on dc3c8f2a (exit 0, correct stdout, no leak), which
+    // is why the gate is `forVarCapturedEscaping` and not unconditional — an
+    // unconditional decline would trade that leak-free shape back for a leak.
     freeUnboundOwnedBorrowingArrayTemp(fs.iterable.get(), dictObj,
-                                       ctx_.exprType(*fs.iterable));
+                                       ctx_.exprType(*fs.iterable),
+                                       /*dictValueColumnEscapes=*/
+                                           forVarCapturedEscaping);
     return true;
 }
 
@@ -9873,8 +10203,117 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedLocal = true;
-        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedLocal = sema::isAutoPropertyStorageSymbol(ps, ctx_);
+        } else if (auto* ps6397 =
+                       dynamic_cast<sema::PropertySymbol*>(sym)) {
+            // fix #6397 (§28.9, §28.2, §29.2, v0.338): a property READ is a
+            // LEND — "a getter never transfers a reclamation obligation to its
+            // reader" — so this loop must not reclaim the value the read
+            // produced. §28.2 keeps the holder's release point the only place
+            // that instance is reclaimed ("and nowhere else"). The arm this
+            // replaces asked `isAutoPropertyStorageSymbol`, which answers "does
+            // this property have compiler-generated backing storage?" — a
+            // DIFFERENT question, whose NO answer was read here as "this read
+            // produces a FRESH value the loop owns". MEASURED for a
+            // hand-written getter (`get => _a`): heap-use-after-free, READ of
+            // size 8 in `Holder$DisposeCore`, freed in `main` by the loop-end
+            // disposal, allocated in `Holder$ctor`.
+            //
+            // ⚠ BUT THE READ IS NOT ALWAYS THE VALUE IN `srcSlot`, so this is
+            // NOT an unconditional `true` — and MEASURED, an unconditional
+            // `true` here is a LEAK, not a fix. §29.2's wrap-creator
+            // (`wrapPropertyArrayAsIEnumerable`) fires at an iterator-format
+            // property read whose getter WIDENS its body expression to the
+            // declared type, and the frame it mints is held by NOBODY but this
+            // loop: `property Items: IEnumerable<int> get => _items;` over an
+            // `owned _items: Array<int>` is the ordinary case. An
+            // unconditional `true` leaks that frame — MEASURED 6400 B in 200
+            // objects, allocated in `bz$…$Seq$get` — and turns #6387's own two
+            // landed tests plus #2769 / #2815 / #3356 RED. Widening the
+            // predicate to "every property read is a named owner" is therefore
+            // the wrong half of this fix, not a conservative one.
+            //
+            // So the question is not "is a read a lend" but "did THIS read mint
+            // a frame", and that verdict is not re-derived here.
+            // `propReadIterWrappedExprs_` already records it, keyed on the read
+            // expression, INSERTED by the wrap helper on a mint and ERASED on a
+            // decline (see its declaration in LlvmBackend_impl.hpp, whose
+            // comment records that the hand-written name-list it replaced had
+            // already drifted once). `Setup.cpp`'s
+            // `registerIterableSourceDisposal` reads the same set for the same
+            // reason. The ordering holds: `fs.iterable` is lowered at the top of
+            // this function, well before this arm, so the mint is already
+            // recorded when it is read here. CLAIM = MINT by construction, the
+            // identity that comment states for the `Setup.cpp` reader.
+            // The FIRST key is the read node — the EXPRESSION-bodied creator
+            // (`wrapPropertyArrayAsIEnumerable`) mints inline, in THIS function,
+            // and is handed the read node. The SECOND is the BLOCK-bodied
+            // getter's twin, whose mint is made inside the accessor's own
+            // memoised function and therefore cannot be keyed on a node this
+            // side ever sees; `lowerReturn` publishes it against the property
+            // instead, and `ensurePropertyBlockGetter` guarantees that
+            // publication happened while `fs.iterable` was lowered above.
+            //
+            // ⚠ THE SECOND KEY IS NOT A WIDENING TO "ANY BLOCK-BODIED
+            // GETTER MINTS" — that is the over-claim #2769's local-decl arm
+            // makes and it is wrong in the UAF direction: a block-bodied
+            // `property Seq: IEnumerable<int> get do return _seq; end get;
+            // end` over an `owned _seq: IEnumerable<int>` declines the wrap
+            // (the returned value already HAS the declared head), so claiming
+            // its frame would free the holder's field at the loop's end.
+            // The verdict here is the wrap-creator's own, not a re-derivation.
+            //
+            // ⚠ AND "NO FRAME MINTED" IS NOT BY ITSELF THE ANSWER — a getter
+            // may hand back a value nobody else owns, with no §29.2 wrap
+            // anywhere. #1840's landed rows pin that: `public property Seq:
+            // IEnumerable<int> => C.Gen();` over a yielding `Gen()`, where the
+            // iterator `Gen()` allocates is the LOOP's to reclaim. A consumer
+            // keyed on the mint alone classifies that as a lend and
+            // `forin_computed_property_ienumerable_1840`'s member-access row
+            // goes RED with `Direct leak of 40 byte(s) in 1 object(s)
+            // allocated from bz$M.C$Gen`. So the answer is "is the value the
+            // receiver's own storage", and the two published verdicts cover
+            // both halves without re-deriving either: a minted frame is the
+            // reader's whatever the body is, and a getter that hands back a
+            // FIELD read hands back storage its holder already keeps alive
+            // (§28.2). Everything else keeps the classification it had.
+            // The map is keyed on the `sema::PropertySymbol` itself, so
+            // the read needs no `ps6397->decl` recovery — the enclosing
+            // `blockGetterOf` guard already proved `ps6397->decl` is a
+            // non-null PropertyDecl, so the deleted cast was re-deriving
+            // what the guard had established. Same answer, one fewer
+            // AST-gated class-3 read. (An imported property with NO decl
+            // never reaches this arm at all: `blockGetterOf` returns null
+            // for it. The imported property that DOES carry a re-parsed
+            // decl does reach it, and writer and reader now key the same
+            // `PropertySymbol*` — see `propBlockGetterReturnKinds_` in
+            // LlvmBackend_impl.hpp, which also records that this sub-case
+            // has no oracle.)
+            unsigned gk6397 = 0u;
+            if (ps6397 && propBlockGetterReturnKinds_.count(ps6397))
+                gk6397 = propBlockGetterReturnKinds_.at(ps6397);
+            bool minted6397 =
+                propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
+                (gk6397 & kPropGetterReturnMint) != 0 ||
+                // fix #6397 follow-up (§28.9 / §29.2, v0.338): the accessor
+                // BODY's own mint, for the face on which the getter is a
+                // separate slot function (`virtual` / interface dispatch) rather
+                // than inlined at this read. Without this term the consumer saw
+                // "no mint" on a frame the accessor really minted, took the
+                // field-lend branch and withdrew the loop's reclamation.
+                (gk6397 & kPropGetterBodyMint) != 0;
+            // The BLOCK-bodied getter reports its own return edges through the
+            // map; the EXPRESSION-bodied getter is inlined at the read site, so
+            // the same question is asked of its body expression directly. Both
+            // ask one thing: does the getter hand back a FIELD read?
+            bool fieldLend6397 = (gk6397 & kPropGetterReturnField) != 0;
+            if (!fieldLend6397)
+                if (const ast::Expr* eg6397 = computedGetterOf(ps6397))
+                    fieldLend6397 =
+                        dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*eg6397)) != nullptr;
+            sourceIsNamedLocal =
+                sema::isAutoPropertyStorageSymbol(ps6397, ctx_) ||
+                (fieldLend6397 && !minted6397);
         }
     }
     // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): an
@@ -10328,8 +10767,10 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // disposal and must still fire.
     //
     // The `enumPtr == srcPtr` test is a RUNTIME compare, mirroring
-    // `lowerAwaitFor`'s `afor.enown` guard (#1268/#2356): `enumTs == ts` is
-    // only a STRUCTURAL fact (the class exposes MoveNext + Current), not a
+    // `lowerAwaitFor`'s `afor.enown` guard (#1268/#2356): the guard's static
+    // condition (whether exact or, since #6376, ancestor-widened) is only a
+    // STRUCTURAL fact (the class exposes MoveNext + Current, and is the
+    // source's own type or a base of it), not a
     // proof that this particular `GetEnumerator()` body returns `this` — a
     // self-implementing class could instead construct and return a fresh
     // instance of its own type, in which case the two pointers differ and the
@@ -10344,53 +10785,244 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedOwner = true;
-        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedOwner = sema::isAutoPropertyStorageSymbol(ps, ctx_);
+        } else if (auto* ps6397b =
+                       dynamic_cast<sema::PropertySymbol*>(sym)) {
+            // fix #6397 (§28.9, §28.2, §29.2, v0.338): the SECOND of the two
+            // same-file spellings, and the one that is NOT optional — this is
+            // the user-class path, reached when the source's declared type is a
+            // user class that implements IEnumerable<T> itself. A property READ
+            // is a LEND — "a getter never transfers a reclamation obligation to
+            // its reader" — so this loop must not reclaim it. The arm this
+            // replaces asked `isAutoPropertyStorageSymbol`, whose NO answer was
+            // read as "this read produces a FRESH value the loop owns":
+            // MEASURED heap-use-after-free, READ of size 8 in
+            // `Holder$DisposeCore`, freed in `main` by this loop's own
+            // source-slot disposal, allocated in `Holder$ctor`.
+            //
+            // MEASURED: patching ONLY the `lowerIEnumerableBuiltinFor` spelling
+            // above leaves the `SelfA`-typed repro red — the two functions are
+            // the two arms of the dispatch, selected by the source's DECLARED
+            // TYPE, so they govern different spellings and neither alone is a
+            // fix. See the commit body for the measured patch matrix.
+            //
+            // ⚠ AND IT IS NOT AN UNCONDITIONAL `true` EITHER — same reason as
+            // the sibling above, and for the same measured reason: this loop
+            // reaches the user-class arm even when the read minted a §29.2
+            // wrap frame (a getter declaring `IEnumerable<T>` over a user-class
+            // body expression), and that frame is held by nobody but this loop.
+            // An unconditional `true` leaks it — MEASURED 6400 B in 200
+            // objects — and turns #6387's two landed tests plus #2769 / #2815 /
+            // #3356 RED. So this arm reads the SAME authority as its sibling:
+            // `propReadIterWrappedExprs_`, which the wrap helper keys on the
+            // read expression and ERASES on a decline. `fs.iterable` is lowered
+            // at the top of this function, before this arm, so the mint is
+            // already recorded. CLAIM = MINT by construction.
+            //
+            // Plus the BLOCK-bodied getter's SECOND publisher, keyed on the
+            // property rather than the read — see the sibling above for why
+            // the two keys differ and why the property-keyed verdict is the
+            // wrap-creator's own (`outWrapMade`, published by `lowerReturn`)
+            // rather than "any block-bodied getter mints". That distinction is
+            // load-bearing HERE too: this arm is the USER-CLASS path, reached
+            // when the source's declared type is a class implementing
+            // IEnumerable<T>, and a block-bodied `property Seq: SelfA get do
+            // return _a; end get; end` mints NOTHING (the declared head is not
+            // an iterator-format head) — so the holder keeps `_a` and this loop
+            // must not touch it.
+            // The USER-CLASS arm's twin of the sibling above: the map is
+            // keyed on the `sema::PropertySymbol`, so the read needs no
+            // `ps6397b->decl` recovery — same reasoning, same answer.
+            unsigned gk6397b = 0u;
+            if (ps6397b && propBlockGetterReturnKinds_.count(ps6397b))
+                gk6397b = propBlockGetterReturnKinds_.at(ps6397b);
+            bool minted6397b =
+                propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
+                (gk6397b & kPropGetterReturnMint) != 0 ||
+                // fix #6397 follow-up (§28.9 / §29.2, v0.338): the accessor
+                // BODY's own mint — the same third term as the sibling arm
+                // above, and for the same reason.
+                (gk6397b & kPropGetterBodyMint) != 0;
+            // Same two verdicts as the sibling above, and the same reason for
+            // the field bit: §28.2 makes a getter's field read storage its
+            // holder already keeps alive, while a getter that PRODUCES a value
+            // (`=> C.Gen()`, #1840) hands the reader one nobody else owns.
+            bool fieldLend6397b = (gk6397b & kPropGetterReturnField) != 0;
+            if (!fieldLend6397b)
+                if (const ast::Expr* eg6397b = computedGetterOf(ps6397b))
+                    fieldLend6397b =
+                        dynamic_cast<sema::FieldSymbol*>(
+                            ctx_.exprSymbol(*eg6397b)) != nullptr;
+            sourceIsNamedOwner =
+                sema::isAutoPropertyStorageSymbol(ps6397b, ctx_) ||
+                (fieldLend6397b && !minted6397b);
         }
     }
+    // fix #6376 (§28.9, §29.1, §29.11, v0.338): could the enumerator BE the
+    // source object? The question this guard exists to answer is a question
+    // about the VALUE, so it must be asked of the value's TYPE RELATIONSHIP,
+    // not of two symbols the structural scan happened to pick.
+    //
+    // `enumTs` is the output of a scan ("some class in this module exposing
+    // MoveNext + Current", lines 10163-10227), so for a self-returning class
+    // INHERITED by the source's actual type the scan picks the BASE and
+    // `enumTs == ts` is FALSE even though `enumPtr == srcPtr` holds: the object
+    // IS its own enumerator. The guard then does not fire, the loop reclaims
+    // the receiver, and the source's own scope reclaims it again — a genuine
+    // double free. MEASURED, on the repro in this commit's test file:
+    //
+    //   heap-use-after-free READ of size 8 on the 24-byte enumerator region,
+    //   freed by the loop-end disposal (from the enumerator slot) and read
+    //   back by main after the source's own disposal — with the CORRECT
+    //   enumeration printed first (`selfsub=6`) and only the exit-time
+    //   reclamation faulting. Plain leg exit 139, ASan leg heap-use-after-free.
+    //
+    // So the condition is "is `enumTs` `ts` or a CLASS ANCESTOR of `ts`", which
+    // covers the inherited self-returning idiom. `classBaseOf` mirrors the
+    // existing one at LlvmBackend_Layout.cpp:233 (`baseTypes` carries
+    // interfaces too; only a CLASS base participates in the class chain).
+    //
+    // This is a strictly WIDENING of a safety guard — the extra cases are ones
+    // where the loop would otherwise reclaim an object it does not own. It is
+    // NOT a widening of the §29.11 independent-enumerator semantics: the
+    // runtime `enumPtr == srcPtr` compare below still decides whether the two
+    // pointers actually alias, so a self-implementing class that constructs
+    // and returns a FRESH instance of its own type keeps the ordinary
+    // distinct-object disposal (that argument is #2384's and is unchanged).
+    auto classBaseOf = [](const sema::TypeSymbol* t) -> const sema::TypeSymbol* {
+        if (!t) return nullptr;
+        for (const sema::TypeSymbol* b : t->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) return b;
+        return nullptr;
+    };
+    // Bounded by the visited set so a cyclic base list cannot spin. Only a
+    // CLASS chain is walked: an interface base carries no vtable, so it can
+    // never be the type whose instance `enumPtr` holds.
+    bool enumIsTsOrBase = false;
+    {
+        std::set<const sema::TypeSymbol*> seen6376;
+        for (const sema::TypeSymbol* cur = ts; cur; cur = classBaseOf(cur)) {
+            if (cur == enumTs) { enumIsTsOrBase = true; break; }
+            if (!seen6376.insert(cur).second) break;
+        }
+    }
+    // Whether the SOURCE and the ENUMERATOR are the same OBJECT is a question
+    // about the VALUE, and it is answered ONCE here, at runtime, as
+    // `enumPtr == srcPtr` (#2384's compare, whose argument is unchanged by
+    // #6376's widening of the STRUCTURAL precondition). Which of the two
+    // entries the aliasing test should guard depends only on who owns the
+    // source — never on `enumIsTsOrBase`, which is a fact about two SYMBOLS the
+    // structural scan picked.
+    //
+    // fix #6378 (§28.3, §28.9, §29.1, §29.11, v0.338): before this, the
+    // source's own disposal registration was gated on `!enumIsTsOrBase` — a
+    // STATIC type guess that conflates "the enumerator's static type is a
+    // class related to the source's" with "the enumerator IS the source
+    // object". For a self-implementing class whose `GetEnumerator` returns a
+    // FRESH instance of its OWN type (`return new FreshSelf(lo, hi);`) the
+    // two pointers DIFFER, so the guess suppressed the only disposal the
+    // unowned temporary source would ever get and the source leaked. That is
+    // exactly the case #2384's own comment says must take "the ordinary
+    // distinct-object disposal": the guard's static condition is only a
+    // STRUCTURAL fact (the class exposes MoveNext + Current, and is the
+    // source's own type or a base of it), not a proof that this particular
+    // `GetEnumerator()` body returns `this`.
+    //
+    //   MEASURED at this fix's parent (r30-c1 @ 95c1e290), `bezelc
+    //   --sanitize=address`, 301 passes of `for var x in new FreshSelf(1, 3)`:
+    //
+    //     1806
+    //     Direct leak of 7224 byte(s) in 301 object(s)
+    //     SUMMARY: AddressSanitizer: 7224 byte(s) leaked in 301 allocation(s)
+    //
+    //   7224/301 = 24 B per pass — one `FreshSelf`. Read off the IR (not
+    //   inferred): the loop's `%12` is the `new FreshSelf` of the `for`-in head
+    //   and `%36` is the separate `calloc` inside `bz$M.FreshSelf$GetEnumerator`,
+    //   and the loop-end disposal reaches only `%5` (the enumerator slot) —
+    //   there is no second entry. The issue reported the leak as the
+    //   ENUMERATOR's; it is the SOURCE's. Confirmed by control: binding the
+    //   same object to a name (`var f := new FreshSelf(1, 3); for var x in f`)
+    //   is LSan-CLEAN, because a named source is disposed at its own scope end
+    //   and never needed this registration.
+    //
+    // So the runtime compare is now the only authority, asked in the direction
+    // the ownership requires: a NAMED source is disposed by its OWN scope, so
+    // the ENUMERATOR entry is the one that must be suppressed when the two
+    // alias; an UNNAMED source has no other owner, so the SOURCE entry is the
+    // one that must be suppressed. In both directions exactly one disposal
+    // survives the aliasing case, and a genuinely distinct source is now
+    // disposed in both.
     llvm::AllocaInst* enumDisposeSlot = enumSlot;
-    if (enumTs == ts && sourceIsNamedOwner) {
-        llvm::Value* enumIsSrc =
-            builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.selfen");
-        enumDisposeSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(
-            builder_.CreateSelect(enumIsSrc,
-                                  llvm::ConstantPointerNull::get(ptrTy()),
-                                  enumPtr, "ien.enown"),
-            enumDisposeSlot);
+    llvm::AllocaInst* srcDisposeSlot = nullptr;
+    if (sourceIsNamedOwner) {
+        // §28.9: the source owns itself; this loop must not reclaim it.
+        if (enumIsTsOrBase) {
+            llvm::Value* enumIsSrc =
+                builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.selfen");
+            enumDisposeSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(
+                builder_.CreateSelect(enumIsSrc,
+                                      llvm::ConstantPointerNull::get(ptrTy()),
+                                      enumPtr, "ien.enown"),
+                enumDisposeSlot);
+        }
+    } else if (disposerFns_.count(ts)) {
+        // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): the loop is the
+        // temporary source's SOLE owner and must dispose it exactly once.
+        // When the enumerator IS that same object the enumerator's own entry
+        // does it, so this slot is nulled; when it is a DISTINCT object (#6378)
+        // this entry is what disposes it.
+        //
+        // The nulling is conditional on the enumerator's entry actually being
+        // registered: if `enumTs` has no disposer there is no entry to do the
+        // disposal, and nulling the source would turn a leak into a bigger one.
+        if (disposerFns_.count(enumTs)) {
+            llvm::Value* srcIsEnum =
+                builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.srcisenum");
+            srcDisposeSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(
+                builder_.CreateSelect(srcIsEnum,
+                                      llvm::ConstantPointerNull::get(ptrTy()),
+                                      srcPtr, "ien.srconly"),
+                srcDisposeSlot);
+        } else {
+            srcDisposeSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(srcPtr, srcDisposeSlot);
+        }
     }
     disposeStack_.emplace_back();
-    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): a genuinely UNOWNED
-    // temporary iterable source (`for var x in new IntRange(...) do ... end`
-    // — the `new` result is bound to no other name anywhere) has no
-    // independent disposer in the program; this loop is its SOLE owner and
-    // must dispose it too, exactly as it already disposes the enumerator it
-    // constructs. Only the TWO-CLASS idiom needs a SEPARATE registration
-    // here (`enumTs != ts`): `srcPtr` is then a genuinely distinct object
-    // from `enumPtr`. The self-returning idiom (`enumTs == ts`) needs no
-    // separate entry — `enumPtr == srcPtr` at runtime, and the
-    // `enumDisposeSlot` registration just below (identity-guarded to null
-    // when `sourceIsNamedOwner`, or the plain `enumSlot` otherwise) already
-    // disposes that single shared object exactly once. A NAMED source
-    // (`sourceIsNamedOwner`) is disposed at ITS OWN scope end by the
-    // ordinary local/param/field disposal machinery — registering it again
-    // here would double-free. Mirrors `lowerIEnumerableBuiltinFor`'s
-    // identical `!sourceIsNamedLocal` gate for the array/collection sibling
-    // path (§29.2: "a freshly produced source value with no owning binding
-    // ... is owned by this loop"). Pushed BEFORE the enumerator's own entry
-    // so LIFO scope-end disposal (`emitDisposals` iterates in reverse) frees
-    // the enumerator first, the source second — the natural reverse of their
-    // construction order; the two never alias here (`enumTs != ts` is
-    // exactly this branch's guard) so the order has no correctness
-    // consequence, only readability.
-    llvm::AllocaInst* srcDisposeSlot = nullptr;
-    if (!sourceIsNamedOwner && enumTs != ts && disposerFns_.count(ts)) {
-        srcDisposeSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(srcPtr, srcDisposeSlot);
+    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): the source's slot was
+    // built ABOVE (where the aliasing compare lives, since both entries must
+    // be able to see `enumPtr` and `srcPtr` before the scope is popped).
+    // Pushed BEFORE the enumerator's own entry so LIFO scope-end disposal
+    // (`emitDisposals` iterates in reverse) frees the enumerator first, the
+    // source second — the natural reverse of their construction order; the
+    // aliasing compare above makes the order correct either way.
+    // Mirrors `lowerIEnumerableBuiltinFor`'s identical `!sourceIsNamedLocal`
+    // gate for the array/collection sibling path (§29.2: "a freshly produced
+    // source value with no owning binding ... is owned by this loop").
+    if (srcDisposeSlot)
         disposeStack_.back().push_back({srcDisposeSlot, ts});
+    if (disposerFns_.count(enumTs)) {
+        Disposal d{enumDisposeSlot, enumTs};
+        // fix #6372 (§28.2 / §29.2 / §29.11, v0.338): `enumTs` is a STRUCTURAL
+        // GUESS, so the enumerator's disposal SLOT is a runtime question. This
+        // entry used the plain class convention (Dispose at slot 2), which on a
+        // DELEGATING `GetEnumerator` — whose result is already in §29.11
+        // iterator-vtable format — called `MoveNext` instead of `Dispose`,
+        // freeing the wrapper without disposing it. `iterEnumOrClassDispose`
+        // picks the family from the value's own vtable at disposal time
+        // (§29.2's slot-0 self-reference), the same discriminator
+        // `useOwnVtable` uses below to drive MoveNext / Current. As of #6381
+        // both now call the ONE definition, `isIterVtableSelfReferenced`
+        // (LlvmBackend_impl.hpp), which `wrapUserClassAsIEnumerable`'s `$ad`
+        // family selection calls too, so the three sites cannot drift apart
+        // about which family this value is in.
+        // MEASURED on this fix's parent: `Direct leak of 24 byte(s)` in
+        // `bz$D1.Rng$GetEnumerator`; the identical manual-driven program is
+        // LSan-clean.
+        d.iterEnumOrClassDispose = true;
+        disposeStack_.back().push_back(d);
     }
-    if (disposerFns_.count(enumTs))
-        disposeStack_.back().push_back({enumDisposeSlot, enumTs});
 
     // Determine the loop variable's element type.
     llvm::Type* elemTy = ptrTy();  // default: reference type
@@ -10423,6 +11055,96 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // null-guards each slot itself, so passing a possibly-null entry is safe.
     registerForLoopSpillSlots(fs, {enumSlot, srcDisposeSlot, varSlot});  // #747 R42
 
+    // fix #6361 / §29.1 / §29.11 (v0.338): does the enumerator `GetEnumerator()`
+    // actually returned have the layout `enumTs` was guessed to have?
+    //
+    // `enumTs` above was picked by a STRUCTURAL scan (MoveNext + Current), the
+    // same guess `wrapUserClassAsIEnumerable` makes — correct for the two-class
+    // idiom (`return new IntRangeEnum(...)`) and the self-returning one
+    // (`return this`), WRONG when `GetEnumerator` DELEGATES
+    // (`return _c.GetEnumerator();`). On the delegating shape the value is not
+    // an `enumTs` instance: §29.11 says a `GetEnumerator` whose declared return
+    // is the `IEnumerator<T>` head produces a value ALREADY in iterator-vtable
+    // format (slot 0 = a 5-slot iterator vtable, [1]=Dispose, [2]=MoveNext,
+    // [3]=Current, [4]=GetEnumerator). Driving it with the guessed class's
+    // methods then reads `_cur` at the byte offset `_cur` occupies in a real
+    // `Counter` ({ptr, i8, i32} — byte 12) out of a
+    // `userenumenum.Counter$Counter` wrapper ({ptr, ptr, ptr, i1}) — i.e. bits
+    // 32..47 of the wrapper's own `enumerator` POINTER. Confirmed in the IR as
+    // a SEGV in `bz$P9.Counter$MoveNext` with `rdi = <heap ptr> + 0xc`.
+    //
+    // A single runtime test picks between the two families, so no static guess
+    // is trusted. Fix #6343 added the same idea to `wrapUserClassAsIEnumerable`
+    // for the manual `while e.MoveNext()` driver; THIS is the `for`-in driver,
+    // which reaches the same confused value through its own copy of the guess
+    // and ran no adapter at all.
+    //
+    // `vtableOf` returns null for an IMPORTED `enumTs` (imports have no local
+    // vtable global, LlvmBackend_Setup.cpp ~L5096), so an IDENTITY test against
+    // `vt$(enumTs)` could not be built for it at all. The test below does not
+    // name `enumTs` and does not consult `vtableOf`, so that gap does not arise
+    // here.
+    auto iterSlotFn = [&](llvm::Value* obj, unsigned slot) -> llvm::Value* {
+        llvm::Value* vt = builder_.CreateLoad(ptrTy(), obj);
+        llvm::Value* addr = builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(slot)});
+        return builder_.CreateLoad(ptrTy(), addr);
+    };
+
+    // THE DISCRIMINATOR, AND WHY IT IS NOT AN IDENTITY TEST AGAINST `enumTs`.
+    // (The predicate itself is `isIterVtableSelfReferenced`, defined ONCE in
+    // LlvmBackend_impl.hpp since #6381; this comment is the rationale for it.)
+    //
+    // The first attempt at this fix (#6361 `6ac6fabf`) used #6343's predicate —
+    // "the receiver's slot-0 vtable is not `vt$(enumTs)`, therefore the receiver
+    // is in §29.11 iterator-vtable format". That is unsound: `enumTs` is picked
+    // by a STRUCTURAL scan, so an instance of any SUBCLASS of the guessed class
+    // has a different vtable while being an ordinary class instance, and the
+    // adapter arm then read slot 2 of a CLASS vtable — which is `Dispose`, not
+    // `MoveNext` (`vt$C.SelfBase = [td, itmap, Dispose, tostr, eq, hash,
+    // MoveNext, Current$propget]`). MEASURED: `for var x in new SelfDerived(3)`
+    // printed 6 at base and 0 with `6ac6fabf`. A negative predicate cannot
+    // exclude a subclass; only a POSITIVE one can.
+    //
+    // The positive discriminator is §29.2's own vtable shape. Every §29.11
+    // iterator vtable this compiler emits puts ITSELF in slot 0 —
+    // `elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy())` at all 14
+    // build sites in LlvmBackend_Assign.cpp, so the global reads
+    //   [0]=<itself>, [1]=Dispose, [2]=MoveNext, [3]=Current, [4]=GetEnumerator
+    // while every CLASS vtable puts its type descriptor there:
+    //   [0]=td$…, [1]=itmap, [2]=Dispose, [3]=tostr, …, [6]=MoveNext
+    // So `load(obj)->vtable[0] == vtable` is TRUE for a §29.11 value and FALSE
+    // for every class instance including subclasses. It cannot be satisfied by
+    // inheritance, because a subclass's vtable is a different global whose `[0]`
+    // is a different global.
+    //
+    // MEASURED on both sides of the distinction (BEZEL_DUMP_IR):
+    //   SELF-REF bz$arrenum$i32$vtable                     (builtin enumerator)
+    //   SELF-REF bz$userenumenum$Counter$Counter$vtable    (compiler wrapper)
+    //   SELF-REF bz$userenumenum$Counter$Counter$vtable$ad (fix #6343's family)
+    //   NOT-SELF bz$exc$vtable$table                      (a real class-family table)
+    auto useOwnVtable = [&](llvm::Value* obj) -> llvm::Value* {
+        // The §29.11 slot-0 self-reference — ONE definition, shared with the
+        // disposal arm and the `$ad` family selection (fix #6381), so the
+        // three sites cannot disagree about which family a value is in. The
+        // null guard is this site's own: `for`-in nulls the enumerator slot and
+        // the guard rides in the `and` the branch consumes.
+        //
+        // The comparison is bound to a local rather than inlined into
+        // `CreateAnd`'s argument list, deliberately: C++ does not fix the order
+        // in which a call's arguments are evaluated, and that order IS the
+        // emitted instruction order, so inlining would make it unspecified.
+        //
+        // The emitted IR is NOT byte-identical to what the transcription
+        // produced, and provably cannot be — see the note on the helper. The
+        // difference is SSA renumbering of three instructions inside this
+        // block and nothing else: same instructions, same `and` operand order,
+        // and all of them read `obj` with no store in between.
+        llvm::Value* isSelfRef = isIterVtableSelfReferenced(obj);
+        return builder_.CreateAnd(
+            builder_.CreateNot(builder_.CreateIsNull(obj)), isSelfRef,
+            "ien.useownvt");
+    };
+
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ien.body", currentFn_);
     auto* endBB  = llvm::BasicBlock::Create(llvm_, "ien.end",  currentFn_);
@@ -10431,11 +11153,46 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // cond: __enum.MoveNext() → bool.
     builder_.SetInsertPoint(condBB);
     llvm::Value* enumObj = builder_.CreateLoad(ptrTy(), enumSlot);
-    std::vector<llvm::Value*> mnArgs = {enumObj};
-    llvm::Value* moved = emitMethodCall(moveNextSym, mnArgs, false);
-    if (!moved) {
-        // If MoveNext can't be resolved via vtable, fall back to false.
-        moved = builder_.getFalse();
+    llvm::Value* moved = nullptr;
+    if (llvm::Value* useOwn = useOwnVtable(enumObj)) {
+        // fix #6361: the delegating shape — re-dispatch through the value's OWN
+        // iterator vtable (slot 2). The direct path is kept in its own block so
+        // its IR stays byte-identical for the two-class and self-returning
+        // idioms, which is what `emitMethodCall`'s class-virtual handling (and
+        // its null fallback) depends on.
+        auto* adBB    = llvm::BasicBlock::Create(llvm_, "ien.mnown",  currentFn_);
+        auto* directBB= llvm::BasicBlock::Create(llvm_, "ien.mndirect",currentFn_);
+        auto* mergeBB = llvm::BasicBlock::Create(llvm_, "ien.mnmerge", currentFn_);
+        builder_.CreateCondBr(useOwn, adBB, directBB);
+
+        builder_.SetInsertPoint(adBB);
+        llvm::Value* adMoved = builder_.CreateCall(
+            llvm::FunctionType::get(i1(), {ptrTy()}, false),
+            iterSlotFn(enumObj, 2), {enumObj}, "ien.mnown");
+        builder_.CreateBr(mergeBB);
+
+        builder_.SetInsertPoint(directBB);
+        std::vector<llvm::Value*> mnArgs2 = {enumObj};
+        llvm::Value* directMoved = emitMethodCall(moveNextSym, mnArgs2, false);
+        if (!directMoved) directMoved = builder_.getFalse();
+        // `emitMethodCall` may emit its own exception-check continuation, so the
+        // block that actually reaches `mergeBB` is wherever it left the insert
+        // point — naming `directBB` would give the phi a non-predecessor.
+        auto* directEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(mergeBB);
+
+        builder_.SetInsertPoint(mergeBB);
+        auto* movedPhi = builder_.CreatePHI(i1(), 2, "ien.moved");
+        movedPhi->addIncoming(adMoved, adBB);
+        movedPhi->addIncoming(directMoved, directEnd);
+        moved = movedPhi;
+    } else {
+        std::vector<llvm::Value*> mnArgs = {enumObj};
+        moved = emitMethodCall(moveNextSym, mnArgs, false);
+        if (!moved) {
+            // If MoveNext can't be resolved via vtable, fall back to false.
+            moved = builder_.getFalse();
+        }
     }
     builder_.CreateCondBr(moved, bodyBB, endBB);
 
@@ -10443,6 +11200,12 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     builder_.SetInsertPoint(bodyBB);
     {
         llvm::Value* enumObj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+        // The guessed-class read of `Current`, in all three of its spellings
+        // (method, local property accessor, imported `$propget` stub). Lifted
+        // into a lambda so fix #6361's adapter branch below can keep it in its
+        // OWN basic block, leaving its emitted IR byte-identical on the path
+        // that still takes it.
+        auto emitDirectCurrent = [&](llvm::Value* enumObj2) -> llvm::Value* {
         llvm::Value* curVal = nullptr;
         if (currentSym) {
             // Method-form Current.
@@ -10524,7 +11287,8 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                 }
                 // Try block getter (get => do...end).
                 else if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
-                    llvm::Function* getterFn = ensurePropertyBlockGetter(pd, acc);
+                    llvm::Function* getterFn = ensurePropertyBlockGetter(
+                        pd, acc, /*ps=*/nullptr, /*psKey=*/currentPropSym);
                     if (getterFn) {
                         auto* fnTy = getterFn->getFunctionType();
                         curVal = builder_.CreateCall(fnTy, getterFn, {enumObj2});
@@ -10563,6 +11327,43 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                 curVal = builder_.CreateTrunc(curVal, elemTy);
             if (curVal->getType() == elemTy)
                 builder_.CreateStore(curVal, varSlot);
+        }
+        return curVal;
+        };
+
+        // fix #6361 (§29.1 / §29.11, v0.338): the `Current` half of the same
+        // discriminator, reading the value's OWN iterator-vtable slot 3 on the
+        // delegating shape. `varSlot` is the join point (both arms store into
+        // it), so no phi is needed and neither arm has to materialize a value
+        // the other does not produce.
+        auto storeCurrent = [&](llvm::Value* v) {
+            if (!v) return;
+            if (v->getType() != elemTy && elemTy->isIntegerTy() &&
+                v->getType()->isIntegerTy())
+                v = builder_.CreateTrunc(v, elemTy);
+            if (v->getType() == elemTy)
+                builder_.CreateStore(v, varSlot);
+        };
+
+        if (llvm::Value* useOwn = useOwnVtable(enumObj2)) {
+            auto* adBB     = llvm::BasicBlock::Create(llvm_, "ien.curad",     currentFn_);
+            auto* directBB = llvm::BasicBlock::Create(llvm_, "ien.curdirect", currentFn_);
+            auto* contBB   = llvm::BasicBlock::Create(llvm_, "ien.curcont",   currentFn_);
+            builder_.CreateCondBr(useOwn, adBB, directBB);
+
+            builder_.SetInsertPoint(adBB);
+            storeCurrent(builder_.CreateCall(
+                llvm::FunctionType::get(elemTy, {ptrTy()}, false),
+                iterSlotFn(enumObj2, 3), {enumObj2}, "ien.curad"));
+            builder_.CreateBr(contBB);
+
+            builder_.SetInsertPoint(directBB);
+            emitDirectCurrent(enumObj2);
+            builder_.CreateBr(contBB);
+
+            builder_.SetInsertPoint(contBB);
+        } else {
+            emitDirectCurrent(enumObj2);
         }
     }
 

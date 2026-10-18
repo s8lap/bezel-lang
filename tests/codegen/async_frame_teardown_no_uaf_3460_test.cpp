@@ -63,6 +63,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan AOT harness
 #include "test_harness.hpp"
 
@@ -79,6 +80,7 @@
 #include <unistd.h>
 #include <vector>
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
@@ -155,7 +157,10 @@ BEZEL_TEST(codegen_async_frame_teardown_no_uaf_3460,
     std::atomic<int> ran_ok{0};
 
     // Warm the bincache so all 8 children share one compile result.
-    (void)runAotChecked(kN24);
+    {
+        JitResult warm = runAotChecked(kN24);
+        BEZEL_EXPECT_FALSE(checkedToolchainSkipped(warm));
+    }
 
     std::vector<std::thread> workers;
     workers.reserve(W);
@@ -164,6 +169,7 @@ BEZEL_TEST(codegen_async_frame_teardown_no_uaf_3460,
                               &asan_error_count, &leak_count, &ran_ok]() {
             for (int i = 0; i < K; ++i) {
                 JitResult r = runAotChecked(kN24);
+                BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
                 // fix #4540: scan the diagnostics UNCONDITIONALLY. The `!r.ran`
                 // guard this replaces was not a filter, it was a blindfold:
                 // `runAotChecked` reports a fired sanitizer as ran=false WITH

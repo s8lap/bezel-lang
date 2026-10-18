@@ -897,9 +897,19 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
 //       vtable-less builtin has no arm there yet, an `internal:` warning is
 //       raised and the slot is left untouched — the same #2992 "leak before
 //       wild-jump" trade the `using var` chain makes, applied here too.
+//       (2a) fix #6368 — the vtable-less BUILT-IN COLLECTION family
+//       (`Array<T>` / `Dictionary<K,V>` / `LinkedList<T>` / `Set<T>` / …),
+//       which arm (2) reached but `classifyVtablelessBuiltinRelease` has no
+//       arm for. See the `ownedCaptureCollectionRelease` comment below for why
+//       the collection release is NOT a name-keyed `emitVtablelessBuiltinRelease`
+//       arm and is dispatched through `buildCollectionTempDisposal` instead.
 //   (3) Recognised class (user class / builtin exception / imported user
 //       class) — has a real vtable, vtable dispatch is correct
-//       (`emitDisposeAndReclaim`).
+//       (`emitDisposeAndReclaim`). NOTE (fix #6345): the comment here used to
+//       assert a builtin exception satisfies `pt->declaration`, which is what
+//       made the arm look complete; it carries NO declaration, so the arm
+//       needed the `isBuiltinExceptionTypeRef` twin. The discriminator is now
+//       "`declaration`, OR a precisely-recognised §31.4 built-in exception".
 //   (4) Anything else (a primitive, a borrow-only record, an alias into
 //       case (3), etc.) — `internal:` WARNING. Not the silent vtable jump.
 //
@@ -909,6 +919,174 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
 // together enumerate the three shapes an `owned` capture's declared type can
 // take, so the negative list's silent-fail mode is gone; a future built-in
 // either enters (2) (after its arm lands) or hits the (2)-no-arm warning.
+// fix #6368 (§28.11 / §28.3 / §28.9 / §30.1, v0.338): release an `owned` ASYNC
+// CAPTURE whose declared type is a vtable-less BUILT-IN COLLECTION
+// (`Array<T>` / `Dictionary<K,V>` / `LinkedList<T>` / `Set<T>` / `Stack<T>` /
+// `Queue<T>` and their `Owning*` siblings). Returns false for every other
+// declared type, so the caller falls through to the arms below unchanged.
+//
+// THE DEFECT THIS CLOSES. `emitOwnedParamCaptureDispose`'s arm (2) routes every
+// `common::isVtableLessBuiltinClassName(bn)` receiver through
+// `emitVtablelessBuiltinRelease`, whose `classifyVtablelessBuiltinRelease` name
+// table covers 18 non-collection built-ins. A COLLECTION is vtable-less by the
+// same predicate and had no arm, so the compiler said so out loud and left the
+// backing un-reclaimed on every async-frame teardown:
+//
+//   internal: emitOwnedParamCaptureDispose: vtable-less built-in class 'Array'
+//   has no release arm; the slot is left un-reclaimed (a bounded leak)
+//   — extend emitVtablelessBuiltinRelease to reclaim it; #3157
+//
+// MEASURED on 85a3cb36: `async method Take(owned a: Array<int>)` called 500×
+// reported `SUMMARY: AddressSanitizer: 60000 byte(s) leaked in 1000
+// allocation(s)` (2 allocations × 60 B per call — the `bz_array_t` header and
+// its data buffer). The same shape on a `Dictionary<int, string>` reported
+// 210,000 B.
+//
+// WHY THIS IS NOT A NEW ARM IN `classifyVtablelessBuiltinRelease`. That
+// function's parameter is a NAME (`std::string_view bn`), chosen by
+// fix-forward #4185 so the classify/emit split has no IR side effects and both
+// consumers share one list. A collection's release is NOT name-keyed, though:
+// it is the runtime free function PLUS the §28.11 element-slot disposer, and the
+// latter is a function of the collection's ELEMENT TYPE, which the head name
+// does not carry. `Array<int>` (a §28.11 VALUE slot, null disposer) and
+// `Array<Cell>` (a BORROW slot, also null) and `Array<string>` (a runtime-
+// managed slot, the string-release thunk) are the SAME `bn`. Putting the
+// element-type read behind a name-only classifier would either widen that
+// function's parameter to a `TypeRef` — undoing #4185's stated design — or
+// smuggle a second, collection-only name table beside it, which is exactly the
+// two-lists-drift shape #4185 round 2 removed.
+//
+// So the classification is NOT re-derived here. It is `buildCollectionTempDisposal`
+// — the SAME (slot, TypeRef) → `Disposal` helper `registerUnwindOwnedParam`
+// already calls for a collection-typed `owned` PARAMETER on the callee side
+// (#3033), and the same one `registerUsingDisposal` calls for a named
+// `using var` collection local. It already picks the right runtime free
+// (`bz_array_free` / `bz_llist_free` / `bz_dict_free`), the right §28.11
+// element/value disposer via `elementPolicyFor`, the `Set<string>` string-key
+// release, the dict value-box freer, and the dict-backed-vs-array-backed `Set`
+// choice. Routing the frame capture through it is what keeps the three ends
+// (frame / callee / `using var`) from drifting.
+//
+// §28.11 ANSWERS "is `bz_array_free` the right release for `Array<T>`?" — yes,
+// with the disposer the element's CATEGORY requires and no other. stdlib §4.4:
+// "`Array<T>` stores borrows … The array's `Dispose()` is a no-op — `Array<T>` is
+// trivial-dispose (language spec §28.9): the backing storage is part of the
+// instance's single allocation, released with it by the compiler-inserted free
+// at the array's owner's release point — and the elements are not disposed."
+// That is the same shape the `StringBuilder` arm above uses `bz_array_free` for,
+// but NOT the same wiring: a `StringBuilder` OWNS a +1 per string part and
+// passes the string-release thunk, while a borrowing `Array<T>` owns nothing
+// per element and passes null (or, for the owning family, the §28.11
+// class-element cascade). `buildCollectionTempDisposal` derives which, from the
+// element type; this function adds no opinion of its own.
+//
+// WHY THE FRAME AND NOT THE CALLEE. #3033 already gave the SYNC spelling of
+// this exact defect a release: MEASURED on this tree, `static method
+// Take(owned a: Array<int>)` called 500× leaks NOTHING and exits with the
+// spec-computed value. An async method never reaches that callee edge at
+// teardown — the value lives in the FRAME, and the frame's terminal auto-dispose
+// is the only code that can reclaim it (§30.1: "`owned` parameters transfer into
+// the frame … any `owned` parameter never moved out is disposed by the frame
+// when the task reaches its terminal state"). #6337's own comment records the
+// identical split for the §31.4 exception population. So the two ends disagreed
+// and only the frame end was wrong.
+//
+// NO INTERFACE HEAD IS ADMITTED, and that is the load-bearing scope decision of
+// this function — for the enumeration heads AND for the LIST heads
+// (`IList<T>` / `IReadOnlyList<T>` / `IOwningList<T>`).
+//
+// At this site the declared type does not determine the runtime kind. The
+// registry says so directly: `isVtableLessBuiltinClassName(n)` is
+// `isReservedBuiltinTypeName(n) && !contains(kBuiltinInterfaceHeads, n)`
+// (BuiltinRegistry.cpp, #2921 / #2923), and `kBuiltinInterfaceHeads` holds
+// exactly `IList`, `IOwningList` and `IReadOnlyList` as the subset whose
+// runtime value MAY BE A USER CLASS — the exact COMPLEMENT of
+// `isVtableLessBuiltinClassName`. §8.1 makes such a user class legal and the
+// compiler accepts it with no diagnostic, so a `bz_array_t*`-backed `Array<T>`
+// and a vtable-bearing `class MyL: IList<int>` arrive at this same capture
+// under the same declared spelling.
+//
+// `IEnumerable<T>` and its siblings (`IEnumerator<T>`, `IReadOnlyCollection<T>`,
+// `ICollection<T>`, `IOwningCollection<T>`, `IAsyncEnumerable<T>`) fail for the
+// same reason, and admitting them would be a use-after-free rather than a fix.
+// Freeing the array-backed member needs `bz_array_free(arr, null)`; freeing the
+// user-class member needs vtable slot-2 dispatch, because the object's first
+// word is a vtable pointer and `bz_array_free` would read the vtable as a
+// length. MEASURED on 85a3cb36, the SAME `owned e: IEnumerable<int>` capture
+// receives both.
+//
+// An earlier revision of this function DID admit the two list heads
+// (`isBorrowingListInterfaceName` / `isOwningListInterfaceName`) on the
+// strength of a comment asserting "the compiler KNOWS those are array-backed".
+// MEASURED, that assertion is refuted by `kBuiltinInterfaceHeads` above, and
+// the admission converted a loud bounded leak into a WILD FREE: with
+// `async Take(owned x: IList<int>)` receiving `new MyL()` where
+// `class MyL: IList<int>`, ASan reported
+// `SEGV on unknown address in __asan::Allocator::Deallocate <- free <-
+// bz_array_free` (bezel_runtime_collections.cpp:351), and the SAME program
+// without `--sanitize=address` died `Segmentation fault (core dumped)` / exit
+// 139, where the un-fixed tree merely leaked 80 B / 5 allocs behind the arm-(5)
+// `internal:` warning. The same held for `IOwningList<Cell>`.
+//
+// The list heads were ALSO wider than the callee end this function mirrors:
+// `registerUnwindOwnedParam`'s collection branch admits only
+// `isLinkedListTypeName(rt) || isDictTypeName(rt) || isCollectionTypeName(rt)`
+// — never the list interfaces — so the frame widened PAST the callee in
+// precisely the unsound direction, defeating the "the three ends cannot drift"
+// argument above. Excluding the list heads restores exact frame/callee parity.
+//
+// The leak for the whole interface-head population therefore remains, and it
+// remains LOUD — arm (5) still raises its `internal:` warning rather than
+// freeing unsoundly, which is the deliberate #3157 trade and the whole point:
+// a leak the compiler announces beats a SEGV it does not. It is reported in the
+// commit body and tracked for a runtime kind tag (#6368), not coded around
+// here. The four rows in `async_owned_builtin_collection_param_6368_test.cpp`
+// that pass a user-class member, an array-backed member, and both list heads
+// through this same capture are what make that polymorphism an ASSERTED
+// property of this site rather than a claim in a comment.
+bool Emitter::emitOwnedCaptureCollectionRelease(const sema::TypeRef* pt,
+                                                llvm::Value* obj) {
+    // Only the CONCRETE array/llist/dict-backed built-in names — exactly the
+    // set `registerUnwindOwnedParam` admits at the callee end, so the frame
+    // end is no WIDER than the end it mirrors. Deliberately NOT
+    // `isCollectionInterfaceName` (the non-list heads) and deliberately NOT
+    // `isBorrowingListInterfaceName` / `isOwningListInterfaceName` (the list
+    // heads): every one of those sits in `kBuiltinInterfaceHeads` (#2921 /
+    // #2923), so a user class may implement it and the runtime value is then
+    // vtable-bearing, not array-backed. See the comment above.
+    if (!pt || pt->kind != sema::TypeRef::Kind::Named || pt->declaration)
+        return false;
+    if (!isCollectionTypeName(pt) && !isLinkedListTypeName(pt) &&
+        !isDictTypeName(pt))
+        return false;
+    if (!obj || !obj->getType()->isPointerTy()) return false;
+    // `buildCollectionTempDisposal` reads its `Disposal::slot` back through
+    // `emitDisposals` (`boxedStorage(it->slot, …)` then a load), so it needs a
+    // real alloca rather than the bare `llvm::Value*` the frame loop holds.
+    // The ALLOCA goes in the entry block (a mid-block alloca is legal LLVM but
+    // costs a stack frame the resume function's own layout does not account
+    // for); the STORE goes at the CURRENT insert point, because `obj` is
+    // defined here — storing it from the entry-block builder would reference a
+    // value that does not exist yet at that point (measured: `SEGV in
+    // bz_array_free` reading a garbage pointer, the load finding whatever the
+    // uninitialised slot held).
+    llvm::IRBuilder<> entryBuilder(
+        &*currentFn_->getEntryBlock().getFirstInsertionPt());
+    llvm::AllocaInst* slot = entryBuilder.CreateAlloca(
+        ptrTy(), nullptr, "opc.coll.slot");
+    builder_.CreateStore(obj, slot);
+    Disposal d = buildCollectionTempDisposal(slot, pt);
+    // No null-guard here: every caller of this function has already emitted one
+    // (`emitAsyncOwnedParamAutoDispose` / the async-iterator Dispose sweep test
+    // the capture slot against null before routing here), and `emitDisposals`'s
+    // collection / dict / linkedList arms each re-test the loaded value against
+    // null themselves, so a null capture is a no-op rather than a wild free.
+    std::vector<Disposal> one{d};
+    emitDisposals(one, /*isUnwind=*/false);
+    return true;
+}
+// per §28.11, §28.3, §30.1, v0.338, fix #6368
+
 // // per §29.8 / §30.1, fix #3157
 void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
     // (1) Task family — emitted by #3125.
@@ -922,6 +1100,46 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
     // circuit the explicit-Dispose chain (#2969) — two established predicates,
     // brought together here so the frame path matches them.
     const sema::TypeRef* pt = paramTypeOf(p);
+    // fix #6367 (§28.3 / §28.8 / §14.1, v0.338): resolve the DECLARED type
+    // through the ACTIVE generic substitution before any arm reads it. This is
+    // the frame-side twin #6337 added to `registerUnwindOwnedParam` (the
+    // callee-side end) for the SAME population: an `owned t: T` parameter of a
+    // GENERIC method has `pt` = a bare type-parameter TypeRef
+    // (`declaration == nullptr`, head name `T`), so arm (3)'s
+    // `pt->declaration` test and `isBuiltinExceptionTypeRef(pt)` (which
+    // resolves the astNode NAME in `builtinVtable_`) both miss it and arm (5)
+    // fires. The two ends disagreed for the generic spelling: the callee twin
+    // substituted, the frame twin did not.
+    //
+    // #6337's own measured shape, carried to the frame end: `async method
+    // Take<Exception>(owned e: T)` called as `Take<Exception>(new
+    // IOException("abc"))` leaked 20,000 B / 500 allocs at 500 iterations, with
+    // the arm-(5) `internal:` warning raised FOUR times per declaration (the
+    // success edge, the fault edge, and the two state-machine emission paths
+    // that reach this routing decision).
+    //
+    // WHY IT IS SAFE HERE — the over-release hazard this twin carries. The
+    // substitution can bind `T` to a VALUE type (`Take<int>(5)`), where
+    // `resolveTypeParamRef` returns a PRIMITIVE TypeRef, not a Named one. Every
+    // arm below is gated on `TypeRef::Kind::Named` or on a builtin NAME, so a
+    // primitive substitution falls through all of them to arm (5) and is left
+    // un-reclaimed — which is CORRECT: there is nothing to reclaim. It cannot
+    // reach arm (2) (a primitive has no builtin class name), arm (3) (not
+    // Named), or arm (4) (not Named). `resolveTypeParamRef` is the SAME
+    // function `registerUnwindOwnedParam` already applies at this very
+    // population for this very reason, and it returns its argument unchanged
+    // when `genericSubstSemaTy_` is empty or the head is not bound, so a
+    // non-generic declaration is untouched. Pinned by
+    // `generic_owned_param_value_substitution_is_never_freed` in
+    // `async_owned_generic_param_frame_discharge_6367_test.cpp`.
+    pt = resolveTypeParamRef(pt);
+    // (2a) fix #6368 (§28.11 / §28.3 / §30.1, v0.338): the vtable-less BUILT-IN
+    // COLLECTION family. Dispatched HERE, before arm (2)'s name table, because
+    // a collection's release is not name-keyed — see
+    // `ownedCaptureCollectionRelease`'s comment for the full argument. Placed
+    // after #6367's `resolveTypeParamRef` on purpose: a `Take<Array<int>>`
+    // capture only reaches this arm once the substitution has resolved `T`.
+    if (pt && emitOwnedCaptureCollectionRelease(pt, obj)) return;
     std::string_view bn = pt ? builtinTypeName(pt) : std::string_view{};
     if (!bn.empty() && common::isVtableLessBuiltinClassName(bn)) {
         if (emitVtablelessBuiltinRelease(bn, obj)) return;
@@ -937,11 +1155,53 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
         return;
     }
     // (3) Recognised class — has a vtable; `emitDisposeAndReclaim` is correct.
-    // Catches user classes (local and imported) AND built-in exceptions (whose
-    // `builtinVtable_` slot #3191 reads through). `pt->declaration` is set for
-    // all three populations and is deliberately the discriminator (the import
-    // alias / case (2) take the vtable-less path above, never this one).
-    if (pt && pt->kind == sema::TypeRef::Kind::Named && pt->declaration) {
+    // Catches user classes (local and imported) AND, since fix #6345, built-in
+    // exceptions (whose `builtinVtable_` slot #3191 reads through).
+    //
+    // fix #6345 (§28.3, §28.8, §31.4, v0.338): the discriminator used to be
+    // `pt->declaration` ALONE, and the comment here asserted that a §31.4
+    // language-built-in exception "sets" it. It does not — a built-in carries
+    // NO user TypeSymbol (`TypeRef::declaration == nullptr`), so EVERY
+    // `async method Take(owned e: Exception)` fell past case (3) AND case (4)
+    // (which requires a Named declaration-less head `IDisposable` /
+    // `IAsyncDisposable`) into case (5), where the slot is reported and left
+    // UN-RECLAIMED. MEASURED at a865fa56 on this tree's repro:
+    // `SUMMARY: AddressSanitizer: 2000 byte(s) leaked in 50 allocation(s)`
+    // (50 × the 40-byte `new IOException("a")`, 40 B per call), with
+    // `internal: emitOwnedParamCaptureDispose: unrecognised owned parameter
+    // type` raised TWICE for one declaration. The USER-class twin of the same
+    // shape (`async method Take(owned b: Boom)`, `Boom` a plain class) is CLEAN
+    // on the same binary — so this is in-family, and the predicate was the whole
+    // defect.
+    //
+    // This is the SAME declaration-blindness #6337 fixed in
+    // `registerUnwindOwnedParam`, at a DIFFERENT site: #6337 discharges the
+    // value on the callee's normal/unwind edge, and never reaches the async
+    // frame's terminal auto-dispose — the three `frame.captures` loops in
+    // LlvmBackend_Async.cpp (plain async, async-iterator Dispose) and
+    // LlvmBackend_Iterators.cpp (sync iterator). Those three all route here, so
+    // widening HERE closes all three populations at one site.
+    //
+    // SCOPE — the precise `isBuiltinExceptionTypeRef`, deliberately NOT the
+    // loose `isBuiltinExceptionType`. `Ref` requires a declaration-less Named
+    // TypeRef whose astNode NAME resolves in `builtinVtable_`, i.e. exactly the
+    // §31.4 hierarchy; the loose predicate would also admit every other
+    // declaration-less Named type (a collection, a `Task`) and sweep the
+    // vtable-less case (2) — and the Task family — in wrongly. Case (2) above
+    // still runs first and still owns the genuinely vtable-less built-ins, which
+    // are NOT in `builtinVtable_` and so cannot be matched here. It is the same
+    // named recognizer #6311's caller-side gate and #6337's callee-side gate
+    // already use for this same population, so the three ends agree.
+    //
+    // §31.1 makes a built-in exception an ordinary owned heap class instance and
+    // §28.3 states the auto-drop obligation for it exactly as for any other class
+    // in the same position; `setupBuiltinExceptions` mints every §31.4 member a
+    // real vtable whose slot 2 is `bz$exDisposeMsg`, which is precisely what the
+    // `dynamicDispose` this drives dispatches through. So the user-class arm
+    // above is not merely a close enough fit — it is the SAME code path, and the
+    // user-class control above proves that path is leak-free.
+    if (pt && pt->kind == sema::TypeRef::Kind::Named &&
+        (pt->declaration || isBuiltinExceptionTypeRef(pt))) {
         emitDisposeAndReclaim(obj);
         return;
     }
@@ -1287,7 +1547,18 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         }
         }
     }
+    // fix #6402 (§8.1 / §28.4 / §28.5): a skip target for the LIST-INTERFACE
+    // dispose below. When the slot holds a vtable-bearing user class, that arm
+    // must NOT run the array code that follows it, so it branches here instead;
+    // the block is entered at the top of the NEXT iteration (every exit from
+    // this loop body is a `continue`) or, after the last iteration, right here —
+    // whichever comes first — so it always acquires a terminator.
+    llvm::BasicBlock* collifSkipBB = nullptr;
     for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
+        if (collifSkipBB) {
+            builder_.SetInsertPoint(collifSkipBB);
+            collifSkipBB = nullptr;
+        }
         llvm::StructType* st = classStruct(ts);
         unsigned idx = fieldIndex_[it->fs];
         llvm::Value* addr = builder_.CreateStructGEP(st, currentThis_, idx);
@@ -1296,6 +1567,123 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // cascades disposal into its class elements (for an owning collection).
         // bz_array_free / bz_llist_free are null-safe, so no field null-check needed.
         if (it->collTy) {
+            // fix #6402 (§8.1 / §28.5 / §28.9 / §28.11 / §12.4, v0.338): a LIST
+            // INTERFACE HEAD field is the ONE `owned` collection field whose
+            // runtime kind the declared type does NOT determine. Every other
+            // `it->collTy` is a CONCRETE built-in name, and those are sealed —
+            // `class MyL: Array<int>` is rejected with `cannot inherit from
+            // compiler-known class 'Array' … (§12.4, §31.4)`, MEASURED — so a
+            // concrete-typed slot can only ever hold the header-less C struct
+            // the bz_*_free family expects. The list heads are different: §8.1
+            // makes `class MyL: IList<int>` legal, `kBuiltinInterfaceHeads`
+            // (#2921 / #2923, BuiltinRegistry.cpp) records IList / IOwningList /
+            // IReadOnlyList as EXACTLY the reserved names whose runtime value may
+            // be a user class — the precise COMPLEMENT of
+            // `isVtableLessBuiltinClassName` — and sema accepts the assignment
+            // with no diagnostic.
+            //
+            // Everything below this point assumed a bz_array_t / bz_llist_t /
+            // bz_dict_t, which made a vtable-bearing value a WILD FREE, not a
+            // leak: on a user class word 0 is a vtable pointer, so `arr->data`,
+            // `arr->count` and `arr->elem_disposer` are all read OFF THE VTABLE.
+            // That is why neither `bz_array_free_dynamic` nor the #3026
+            // `kind`-tag probe (`bz_runtime_dispose`, which reads offset 48/88)
+            // helps — #3026's tag lives inside the very struct the value does
+            // not have, so probing it is an out-of-bounds read of a user object
+            // that is smaller than the offset.
+            //
+            // MEASURED on this tree's base, `bezelc` + `--sanitize=address`,
+            // 500 constructions, ALL FOUR heads × a user class SEGV
+            // (`AddressSanitizer: SEGV … in __asan::Allocator::Deallocate`,
+            // and `Segmentation fault (core dumped)` / exit 139 plain):
+            //
+            //   owned _f: IList<int>          <- new MyL()  bz_array_free_dynamic
+            //   owned _f: IList<string>       <- new MyL()  bz_array_free   (elemDisp)
+            //   owned _f: IOwningList<Cell>   <- new MyL()  bz_array_free   (owning elem)
+            //   owned _f: IReadOnlyList<int>  <- new MyL()  bz_array_free_dynamic
+            //   class Holder(owned v: IList<int>)  <- new MyL()  bz_array_free_dynamic
+            //
+            // The last row is this same emission site: `ownedCollectionFieldType`'s
+            // `fs->posParam` arm admits the list heads too, so a captured primary-
+            // -ctor parameter lands here with the same `it->collTy` and is fixed by
+            // the same branch. The three listed array rows are the discriminator's
+            // must-not-regress half.
+            //
+            // THE DISCRIMINATOR is `bz_obj_is_string(val, vtableTablePtr())` —
+            // the same helper and the same emitted vtable table #417 uses to tell
+            // an `Object` slot's string from its class instance, and the same one
+            // the IEquatable<string> / IComparable<string> site uses
+            // (LlvmBackend_Calls2.cpp, the "Discriminate at run time" block). Its
+            // contract is a whitelist NEGATION, so it is only sound where the
+            // slot admits a closed population — which is exactly this one, and by
+            // the same argument #417's own site records: in an `IList<int>` slot the
+            // only values admitted are (a) a concrete built-in collection, whose
+            // word 0 is `arr->data` — a heap pointer, never a listed vtable (and
+            // NULL for an empty backing, which the null-terminator loop stops at,
+            // so it answers "string", i.e. the array arm) — and (b) a user class
+            // declaring the head, whose vtable IS registered (user and imported
+            // classes alike; see LlvmBackend_Setup.cpp's registration, and #1843's
+            // finalizeVtableTable for the lazily-created specialized vtables).
+            // There is no `Object`-typed escape hatch here: an interface head is
+            // not the root type, so the #417 "receiver reachability is NOT
+            // determined by what the object declares" caveat does not apply.
+            // A value whose word 0 is an UNREGISTERED vtable (an iterator or
+            // collection-adapter vtable, a lazy pipeline) still answers "string"
+            // and takes the array arm — but such a value was already wild-freed
+            // before this change, so this makes no previously-correct program
+            // incorrect, which is the same bar #417's site sets for itself.
+            //
+            // The vtable branch is `emitDisposeAndReclaim(val)` + null-after —
+            // LITERALLY the class-instance arm at the bottom of this loop, which
+            // is what a user class in an `owned` slot gets everywhere else. So the
+            // user class is freed exactly once, its own `owned` fields are
+            // discharged by its destructor, and the field is nulled for a
+            // re-entrant pass. The array arm below is UNCHANGED: every existing
+            // branch (the #2608 dynamic free, the #6270 Set free, the llist/dict
+            // switch, the plain `bz_array_free(val, disp)`) still emits, and still
+            // `continue`s out of the loop. No existing test flips.
+            llvm::BasicBlock* arrBB = nullptr;
+            if (isListInterfaceName(it->collTy)) {
+                auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* isStr = builder_.CreateCall(
+                    isStrFn, {val, vtableTablePtr()}, "collif.isstr");
+                // bz_obj_is_string answers "not a string" (== 0) exactly when
+                // word 0 is a registered vtable, i.e. a user class instance.
+                llvm::Value* isVtable =
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                llvm::Value* live = builder_.CreateICmpNE(
+                    val, llvm::ConstantPointerNull::get(ptrTy()));
+                llvm::Value* isUserClass =
+                    builder_.CreateAnd(isVtable, live, "collif.userclass");
+                auto* objBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.collif.obj", currentFn_);
+                arrBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.collif.arr", currentFn_);
+                collifSkipBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.collif.skip", currentFn_);
+                builder_.CreateCondBr(isUserClass, objBB, arrBB);
+                builder_.SetInsertPoint(objBB);
+                // §28.4 step 2 / §28.5: the same `emitDisposeAndReclaim` +
+                // null-after pair the class-instance arm at the bottom of this
+                // loop uses — a user class in an `owned` slot is freed exactly
+                // once, its own `owned` fields are discharged by its destructor
+                // (so MyL's `owned _a: Array<int>` is freed through MyL's own
+                // field arm, not by reinterpreting it as an array), and the slot
+                // is nulled so a re-entrant pass finds null and skips.
+                emitDisposeAndReclaim(val);
+                builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                     addr);
+                // Skip the array code below rather than falling into it. This
+                // MUST be a real branch: null-poisoning the `val` local instead
+                // was MEASURED wrong, because `val` is one C++ variable used by
+                // BOTH arms — poisoning it hands the null to the array arm too,
+                // so the array-backed spelling stopped freeing its backing
+                // (`owned _f: IList<int> := new Array<int>(3)` went from
+                // LSan-clean to `34000 byte(s) leaked in 1000 allocation(s)`).
+                builder_.CreateBr(collifSkipBB);
+            }
+            if (arrBB) builder_.SetInsertPoint(arrBB);
             // #602 / §28.11 v0.135: derive element disposer directly from
             // elementPolicyFor (covering class, interface, Shared/Weak elements).
             // A borrowing Array/Stack/Queue<string> co-owns a +1 per element
@@ -1393,6 +1781,10 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 auto* dynFn = declareC("bz_array_free_dynamic",
                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(dynFn, {val});
+                if (collifSkipBB) {
+                    builder_.CreateBr(collifSkipBB);
+                    builder_.SetInsertPoint(collifSkipBB);
+                }
                 continue;
             }
             // fix #6270 (§28.5 / §28.11, v0.338): a borrowing `Set<T>` whose
@@ -1421,6 +1813,10 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                                      {ptrTy(), ptrTy()});
                 builder_.CreateCall(
                     dfn, {val, llvm::ConstantPointerNull::get(ptrTy())});
+                if (collifSkipBB) {
+                    builder_.CreateBr(collifSkipBB);
+                    builder_.SetInsertPoint(collifSkipBB);
+                }
                 continue;
             }
             const char* freeName = isLL   ? "bz_llist_free"
@@ -1429,6 +1825,10 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {val, disp});
+            if (collifSkipBB) {
+                builder_.CreateBr(collifSkipBB);
+                builder_.SetInsertPoint(collifSkipBB);
+            }
             continue;
         }
         // §28.5/§24 (#879): owned Subscription (or Subscription?) field —
@@ -1504,6 +1904,78 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 llvm_, "owned.iter.cont", currentFn_);
             builder_.CreateCondBr(isNull, iterContBB, iterDispBB);
             builder_.SetInsertPoint(iterDispBB);
+            // fix #6414 / §8.1 / §28.5 / §29.7 (v0.338): an `owned`
+            // IEnumerable<T> / IOwningEnumerable<T> FIELD whose runtime value is
+            // a USER CLASS wild-jumps. Everything below assumes the ITERATOR
+            // format ([0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current, §29.7) and
+            // calls through slot 1. That holds for the two kinds this arm was
+            // built for — MEASURED that BOTH of them reach THIS arm and both are
+            // correct today: an array-backed `IEnumerable<int>` field is
+            // materialised into a vtable-backed iterator WRAPPER by the
+            // construction path, and a real enumerator is the frame itself.
+            // It does NOT hold for a user class: §8.1 makes `class MyE:
+            // IEnumerable<int>` legal, §28.5 admits the interface-typed owned
+            // field precisely because "runtime dispatch resolves disposal to
+            // the underlying class's Dispose()", and such a value is stored
+            // RAW, so word 0 is the CLASS vtable. Slot 1 of a class vtable is
+            // not a Dispose function, and calling it is a wild jump, not a
+            // mis-free — MEASURED, 500 constructions per row:
+            //   AddressSanitizer: SEGV … "PC is at a non-executable region.
+            //   Maybe a wild jump?"  #0 itmap$M.MyE, with NO intervening frame
+            //   (the slot-1 target is not a real function). Plain oracle:
+            //   Segmentation fault (core dumped), exit 139.
+            //
+            // So the release is chosen at RUN TIME, with the same
+            // discriminator #6402 / #6413 / #6415 use:
+            // `bz_obj_is_string(val, vtableTablePtr())` answers "not a string"
+            // (== 0) exactly when word 0 is a REGISTERED vtable. Its contract
+            // is a whitelist NEGATION, and it discriminates in exactly the right
+            // direction for this arm, which is the point worth stating: the
+            // ITERATOR vtables are NOT registered, so they answer "string" and
+            // keep the slot-1 dispatch they need. (An unregistered vtable is
+            // why #6402's own note lists "an iterator or collection-adapter
+            // vtable" among the values that answer "string" — here that
+            // property is load-bearing rather than a caveat.) A user class's
+            // vtable IS registered (user and imported classes alike, with
+            // #1843's `finalizeVtableTable` covering lazily-created specialized
+            // vtables), so it answers "not a string" and takes the class arm.
+            // Both surviving populations are handled correctly, so this makes
+            // no previously-correct program incorrect — the bar #417's site
+            // sets for itself.
+            //
+            // The class arm is `emitDisposeAndReclaim` — LITERALLY the
+            // class-instance arm at the bottom of this loop, so the class is
+            // freed exactly once and its own `owned` fields are discharged by
+            // its destructor rather than reinterpreted as an iterator frame.
+            // No extra predicate is needed: `iterField` is set on exactly two
+            // paths, and BOTH are gated on `isVtableBackedIEnumerableType` (the
+            // auto-property-storage arm above and the FieldSymbol arm), so
+            // reaching here already means the slot's declared type is an
+            // iterator-interface head.
+            {
+                auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* isStr = builder_.CreateCall(
+                    isStrFn, {val, vtableTablePtr()}, "iterfield.isstr");
+                llvm::Value* isVtable =
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                llvm::Value* notNull = builder_.CreateICmpNE(
+                    val, llvm::ConstantPointerNull::get(ptrTy()));
+                llvm::Value* isUserClass = builder_.CreateAnd(
+                    isVtable, notNull, "iterfield.userclass");
+                auto* objBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.iter.obj", currentFn_);
+                auto* itBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.iter.slot1", currentFn_);
+                builder_.CreateCondBr(isUserClass, objBB, itBB);
+                builder_.SetInsertPoint(objBB);
+                // §28.4 step 2 / §28.5: the class-instance release.
+                emitDisposeAndReclaim(val);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+                builder_.CreateBr(iterContBB);
+                builder_.SetInsertPoint(itBB);
+            }
             // Dispatch vtable slot 1 (Dispose) — frees the frame.
             llvm::Value* vt = builder_.CreateLoad(ptrTy(), val);
             llvm::Value* dispSlot =
@@ -1643,6 +2115,12 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
     }
+    // fix #6402: if the LAST owned field took the list-interface user-class
+    // arm, its `owned.collif.skip` block is still empty and would reach
+    // verification without a terminator. Continue the rest of the function from
+    // there — which both terminates it and keeps the post-loop code reachable
+    // from both the skip path and the ordinary path.
+    if (collifSkipBB) builder_.SetInsertPoint(collifSkipBB);
 
     // §15.1.1 line 1957 / §15.3 (#747): a move-only OWNING inline-array FIELD
     // ([N owned]T? / [N owned]T) — "for class fields, the enclosing class's
@@ -8698,6 +9176,115 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* contBB = llvm::BasicBlock::Create(llvm_, "coll.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, frBB);
             builder_.SetInsertPoint(frBB);
+            // fix #6433 / §28.1 / §28.3 / §28.5 / §28.11 / §8.1 (v0.338): the
+            // slot's declared type is a POLYMORPHIC collection-interface head,
+            // so the runtime backing is NOT determined by the declared type.
+            // MEASURED, the implementing set per head (probe over every
+            // stdlib §4 collection, 500 calls, `bezelc --sanitize=address` +
+            // `ASAN_OPTIONS=detect_leaks=1`):
+            //
+            //   ICollection<T>        <- Array, LinkedList, Set
+            //   IReadOnlyCollection<T><- Array, LinkedList, Set, Stack, Queue
+            //   IOwningCollection<T>  <- OwningArray / OwningLinkedList / OwningSet
+            //   + a USER CLASS at each of them (§8.1 makes
+            //     `class MyColl: ICollection<int>` legal and sema accepts the
+            //     assignment with no diagnostic)
+            //
+            // (The ENUMERABLE heads `IEnumerable<T>` / `IOwningEnumerable<T>`
+            // are deliberately NOT routed here: an enumerable argument is
+            // materialised by the CALLER into a vtable-backed enumerator
+            // wrapper whose vtable is UNREGISTERED and whose offset 48 carries
+            // no kind tag, so this pair would neither free it nor mis-free it —
+            // it would leave it, and the wrapper's own owner is the caller.
+            // `registerUnwindOwnedParam` records the measurement and why.)
+            //
+            // THREE runtime kinds, and the two discriminator helpers that
+            // already exist for them — the same composition #3026 emits at the
+            // explicit `.Dispose()` call site (LlvmBackend_Calls2.cpp's
+            // `isCollectionInterfaceName` arm) and the same
+            // `bz_obj_is_string` split #6402 / #6413 / #6414 use at the owned
+            // FIELD sites.
+            //
+            // WHY BOTH, IN THIS ORDER. `bz_obj_is_string(val,
+            // vtableTablePtr())` answers "not a string" (== 0) exactly when
+            // word 0 is a REGISTERED vtable, i.e. a user class instance — that
+            // is the §28.5 arm (it states "runtime dispatch resolves disposal to
+            // the underlying class's `Dispose()`" for an interface-typed owned
+            // value, at its field position; see the §28.1/§28.3 synthesis in
+            // `registerUnwindOwnedParam`), taken through
+            // `emitDisposeAndReclaim`, so the object's own `owned` fields are
+            // discharged by its destructor rather than reinterpreted as an
+            // array. `bz_runtime_dispose` (#3026) then dispatches the remaining
+            // population on the kind tag at offset 48 (bz_array_t /
+            // bz_llist_t) and offset 88 (bz_dict_t), calling the matching
+            // `bz_*_free`. Soundness of the second half here rests on the same
+            // closed-population argument #6402 records: a concrete built-in
+            // collection's word 0 is `arr->data` — a heap pointer, never a
+            // listed vtable (and NULL for an empty backing, which the
+            // null-terminator scan stops at, so it answers "string") — and a
+            // user class declaring the head has a REGISTERED vtable (user and
+            // imported classes alike, with #1843's `finalizeVtableTable`
+            // covering lazily-created specialized vtables), so it is routed
+            // away above and never reaches the kind probe. There is no
+            // `Object`-typed escape hatch at an interface head, so the #417
+            // "receiver reachability is NOT determined by what the object
+            // declares" caveat does not apply.
+            //
+            // The probe is UNCONDITIONAL here, exactly as it already is at the
+            // explicit `.Dispose()` site #3026 established: an untagged pointer
+            // (BZ_RUNTIME_KIND_NONE, or any value neither probe matches) makes
+            // `bz_runtime_dispose` return without doing anything — a bounded
+            // leak, never a wild free. That is the trade the runtime header
+            // records for this helper, and this change does not widen it.
+            //
+            // §28.3 requires the undischarged `owned` value to be disposed
+            // exactly once on every path, so the null-store below is
+            // load-bearing: a sibling / outer disposal registered against the
+            // same slot reads null on its later pass and skips.
+            if (it->collIfaceRuntimeKind) {
+                auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* isStr = builder_.CreateCall(
+                    isStrFn, {arr, vtableTablePtr()}, "colliface.isstr");
+                llvm::Value* isVtable =
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                llvm::Value* notNull = builder_.CreateICmpNE(
+                    arr, llvm::ConstantPointerNull::get(ptrTy()));
+                llvm::Value* isUserClass = builder_.CreateAnd(
+                    isVtable, notNull, "colliface.userclass");
+                auto* objBB = llvm::BasicBlock::Create(
+                    llvm_, "colliface.obj", currentFn_);
+                auto* kindBB = llvm::BasicBlock::Create(
+                    llvm_, "colliface.kind", currentFn_);
+                auto* ifaceContBB = llvm::BasicBlock::Create(
+                    llvm_, "colliface.cont", currentFn_);
+                builder_.CreateCondBr(isUserClass, objBB, kindBB);
+                builder_.SetInsertPoint(objBB);
+                emitDisposeAndReclaim(arr);
+                builder_.CreateBr(ifaceContBB);
+                builder_.SetInsertPoint(kindBB);
+                llvm::Value* disp = it->collectionElemDisposer
+                    ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
+                    : llvm::ConstantPointerNull::get(ptrTy());
+                auto* kindFn = declareC("bz_runtime_dispose",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy()});
+                builder_.CreateCall(kindFn, {arr, disp});
+                // fix #1878 (§28.4, v0.306): the owning head's element cascade
+                // is a disposal point too — the same count the array arm below
+                // makes, and for the same reason: the thunk dispatches each
+                // element's own vtable Dispose, user code reached WITHOUT
+                // emitDynamicDispose.
+                if (elementDisposerRunsUserCode(it->collectionElemDisposer))
+                    ++userCodeDisposalCount_;
+                builder_.CreateBr(ifaceContBB);
+                builder_.SetInsertPoint(ifaceContBB);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                continue;
+            }
             // fix #2630 / §28.5/§28.11 / stdlib §4.3: a `using var` typed by a
             // BORROWING list interface (IReadOnlyList<T>/IList<T>) whose static
             // head erases the dynamic backing — could be borrowing Array<T>
@@ -9796,6 +10383,90 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                                  addr);
             builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // fix #6372 (§28.2 / §29.2 / §29.11, v0.338): the `for`-in loop-end
+        // disposal of an enumerator whose static class was GUESSED. The guess
+        // (`enumTs`, picked by the structural MoveNext+Current scan in
+        // `lowerIEnumerableFor`) is right for the two-class and self-returning
+        // idioms and wrong for a DELEGATING `GetEnumerator`, whose result is
+        // already in §29.11 iterator-vtable format. The class convention below
+        // therefore called slot 2 — `MoveNext` — on an iterator vtable, freeing
+        // the wrapper without ever disposing it.
+        //
+        // MEASURED on this fix's parent (r31-c1 @ 7201a5bc), `bezelc
+        // --sanitize=address` on the delegating `for`-in repro: `Direct leak of
+        // 24 byte(s)` in `bz$D1.Rng$GetEnumerator` — the wrapper (a 32-byte
+        // heap block) was reclaimed, so the block release ran, but the slot-2
+        // call it made first was `MoveNext`, not `Dispose`, so the 24-byte
+        // `RngEnum` the wrapper held was never disposed. The identical program
+        // driven manually (`using var e := b.GetEnumerator(); while
+        // e.MoveNext()`) is LSan-clean, because #6343's `$ad` family there
+        // runs slot 1 — the discriminator in the IR shows the two drivers
+        // reaching the same wrapper through different vtable conventions.
+        //
+        // WHICH SLOT is a RUNTIME question, answered here by §29.2's own
+        // positive shape test rather than by any static guess: every §29.11
+        // iterator vtable this compiler emits puts ITSELF in slot 0, while every
+        // CLASS vtable puts a type descriptor there. `vtable[0] == vtable` is
+        // true for the iterator format and false for every class instance
+        // INCLUDING a subclass — which is precisely what #6361's rejected
+        // "not vt$(enumTs)" identity test could not exclude.
+        if (it->iterEnumOrClassDispose) {
+            // §27.5: a captured ("boxed") local lives inside a shared heap
+            // cell — ask `boxedStorage`, the single authority for "given a
+            // disposal slot, where does the object live?", exactly as the
+            // `iterEnumDispose` and `cls` arms of this same loop do.
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* famBB = llvm::BasicBlock::Create(llvm_, "ien.fam", currentFn_);
+            auto* iterBB =
+                llvm::BasicBlock::Create(llvm_, "ien.iter.dispose", currentFn_);
+            auto* clsBB =
+                llvm::BasicBlock::Create(llvm_, "ien.cls.dispose", currentFn_);
+            auto* contBB =
+                llvm::BasicBlock::Create(llvm_, "ien.disposal.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, famBB);
+            builder_.SetInsertPoint(famBB);
+            // §29.2 slot-0 self-reference, from the ONE definition shared with
+            // `lowerIEnumerableFor`'s `useOwnVtable` and with
+            // `wrapUserClassAsIEnumerable`'s `$ad` family selection (fix #6381),
+            // so the three sites cannot disagree about which family this value
+            // is in. The null guard above is this site's own — a separate
+            // branch into `contBB`, which is why the helper carries only the
+            // comparison. `ien.selfref` is this site's own name for the `icmp`,
+            // passed through so the IR is unchanged.
+            llvm::Value* isIteratorFormat =
+                isIterVtableSelfReferenced(obj, "ien.selfref");
+            builder_.CreateCondBr(isIteratorFormat, iterBB, clsBB);
+
+            // Iterator arm: Dispose is slot 1 (§29.2), and — unlike the class
+            // arm — it frees its OWN frame, so there is no block release here.
+            // Frees the inner enumerator too: a compiler-minted wrapper's
+            // slot-1 Dispose disposes and reclaims the delegate it holds.
+            builder_.SetInsertPoint(iterBB);
+            llvm::Value* vtI = builder_.CreateLoad(ptrTy(), obj);
+            llvm::Value* dispSlotI =
+                builder_.CreateGEP(ptrTy(), vtI, {builder_.getInt32(1)});
+            llvm::Value* dispFnI = builder_.CreateLoad(ptrTy(), dispSlotI);
+            builder_.CreateCall(
+                llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()},
+                                        false),
+                dispFnI, {obj});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+
+            // Class arm: the ordinary §28.2 convention, unchanged — Dispose at
+            // slot 2 through the object's own vtable, then the block release.
+            builder_.SetInsertPoint(clsBB);
+            emitDisposeAndReclaim(obj, cdFreeEligibleSlots_.count(it->slot) != 0);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+
             builder_.SetInsertPoint(contBB);
             continue;
         }

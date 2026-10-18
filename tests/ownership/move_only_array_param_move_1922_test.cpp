@@ -43,7 +43,8 @@
 // slot-read gap is out of scope here. This regression pins the whole-read shapes,
 // which is exactly the parameter analogue of the #1899 fix.
 
-#include "support/aot_support.hpp"       // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
+#include "support/aot_support.hpp"        // runAotChecked — AOT + ASan/LSan oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -83,15 +84,6 @@ bool hasMovedOutError(const OwnershipResult& r, const std::string& name) {
         if (d.message.find("`" + name + "`") == std::string::npos) continue;
         return true;
     }
-    return false;
-}
-
-// A checked AOT run is SKIPPED (not failed) when the ASan link toolchain is
-// absent (mirrors the #1899 harness helper).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
     return false;
 }
 
@@ -274,7 +266,7 @@ BEZEL_TEST(move_only_array_param_move_1922,
         "    return Take([new Cell(1)]); "
         "  end Main; end C;";
     JitResult r = runAotChecked(kSingleMoveRuntime);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);

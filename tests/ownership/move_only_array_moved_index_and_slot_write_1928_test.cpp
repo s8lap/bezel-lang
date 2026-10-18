@@ -46,7 +46,8 @@
 // array with a live index. A runtime check confirms the valid slot write on a
 // live array still disposes each heap cell exactly once (ASan/LSan-clean).
 
-#include "support/aot_support.hpp"       // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
+#include "support/aot_support.hpp"        // runAotChecked — AOT + ASan/LSan oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -80,15 +81,6 @@ bool hasMovedOutError(const OwnershipResult& r, const std::string& name) {
         if (d.message.find("`" + name + "`") == std::string::npos) continue;
         return true;
     }
-    return false;
-}
-
-// A checked AOT run is SKIPPED (not failed) when the ASan link toolchain is
-// absent (mirrors the #1899/#1925 harness helper).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
     return false;
 }
 
@@ -274,7 +266,7 @@ BEZEL_TEST(move_only_array_moved_index_and_slot_write_1928,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(kRuntime);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     // Each of the three live cells is disposed exactly once — no double-free,

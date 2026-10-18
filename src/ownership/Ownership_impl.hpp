@@ -458,8 +458,15 @@ public:
     // in if/while/for/try/do). These run a NARROW check only (not the full
     // ownership pass), so accessor bodies surface no other new diagnostics.
     void checkGetterFreshOwnedReturn(const ast::Expr& e);
-    void scanGetterReturns(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
-    void scanGetterReturnsStmt(const ast::Stmt* s);
+    // fix #6404 (§28.6, v0.338): `getterReturnType` is the GETTER'S OWN declared
+    // return type — the §28.6 bullet-2 mint-announcing carve keys on it, per
+    // §28.3's "The classification stays by declared return type". Threaded (not
+    // a member) so a nested walk can never read a different accessor's type.
+    void scanGetterReturns(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+        const sema::TypeRef* getterReturnType);
+    void scanGetterReturnsStmt(const ast::Stmt* s,
+                               const sema::TypeRef* getterReturnType);
 
     // #1484 / #2168 / §23.1 / §28.6: declaration initializers that store a
     // freshly-produced owned value (producerState == Owned) into NON-`owned`
@@ -1100,6 +1107,81 @@ private:
     };
     std::unordered_map<const sema::Symbol*, std::vector<RecordBorrowSource>>
         recordBorrowLocalSource_;
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): the CAPTURE-SOURCE set
+    // a FUNCTION-TYPED local carries, as the spec's LEAST FIXPOINT over the
+    // capture relation.
+    //
+    // §28.3 (v0.338) requires, for a lambda literal, "a captured function
+    // value its own set, **transitively**", and — for sets that depend on one
+    // another through captures — "they are the least sets that satisfy this
+    // clause: a cycle adds nothing beyond the sources its assignments carry in
+    // from outside it". Neither half was implemented: the capture-source walk
+    // (`borrowSourceForExpr`'s Shape 3 and `checkClosureEscapesOnReturn`'s
+    // capture loop) classified each captured identifier only as an owned
+    // scope-bound local (`isEscapeBoundLocal`) or as a borrow-bearing
+    // record/span/choice carrier, and a captured FUNCTION-typed local is
+    // neither — so the walk returned nothing and the holder's set stayed
+    // EMPTY. Measured on the issue's own repro: the transitive two-hop chain
+    // (`var h := lambda() => do return it; end; var g := lambda() => h();
+    // return g;`) compiled CLEAN over a `using var it` source, and the f↔g
+    // cyclic variant did the same and then crashed codegen. The cycle is a
+    // SYMPTOM of the missing transitive half, not a separate defect — see the
+    // termination argument on collectCaptureSourceFixpoint.
+    //
+    // Keyed by the function-typed local's symbol; the value is the least set
+    // of escape-bound source symbols that local carries. Populated ONCE, by the
+    // pre-pass collectCaptureSourceFixpoint, which runs before the dataflow so
+    // every consumer sees a complete, order-independent answer.
+    std::unordered_map<const sema::Symbol*, std::vector<sema::Symbol*>>
+        captureSourceFixpoint_;
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): the pre-pass. Collects
+    // the capture relation over function-typed locals in the body and iterates
+    // it to the LEAST FIXPOINT.
+    //
+    // TERMINATION (the spec's clause is a least fixpoint, so a loop is the
+    // honest implementation; the argument is what makes the loop safe):
+    // iterate the monotone operator "carry the union of my captured
+    // function-typed locals' sets" from the empty map. The carrier is a set
+    // over a FINITE universe — the escape-bound symbols of this one method
+    // body — so every iteration only ADDS members to a set drawn from a finite
+    // domain. A strictly-increasing sequence of subsets of a finite set is
+    // bounded in length by |universe| (each non-fixed-point round adds at
+    // least one member to at least one set, and no round ever removes one), so
+    // the loop reaches a fixed point in finitely many rounds and cannot spin.
+    // The round count is therefore a PROOF, not a cap: the loop exits only on
+    // a round that adds nothing, never on a depth or iteration limit that
+    // would silently stop checking. (A depth cap here is exactly the defect
+    // class this repo's guards exist to prevent.) // per §28.3, v0.338
+    void collectCaptureSourceFixpoint(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void collectCaptureSourceFixpointStmt(const ast::Stmt& s);
+    void collectCaptureSourceFixpointInit(const ast::Node& ld);
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): the shared "value `v` is
+    // assigned to `holder`" entry point, covering both the lambda-literal and
+    // bare-identifier-alias spellings. Single so the two cannot drift.
+    // per §28.3, v0.338
+    void collectCaptureSourcesInto(sema::Symbol* holder, const ast::Expr& value);
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): the fixpoint's input
+    // relation, split by contribution kind — edges are the function-typed
+    // locals a holder INHERITS from, leaves the escape-bound sources it captures
+    // DIRECTLY. Scratch for collectCaptureSourceFixpoint only; cleared there.
+    std::unordered_map<const sema::Symbol*, std::vector<sema::Symbol*>>
+        captureEdgeSets_;
+    std::unordered_map<const sema::Symbol*, std::vector<sema::Symbol*>>
+        captureLeafSets_;
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): the escape-bound
+    // sources `sym` — a function-typed local — carries, per the fixpoint map.
+    // Empty when `sym` is not a tracked function-typed local or carries no
+    // escape-bound source. // per §28.3, v0.338
+    const std::vector<sema::Symbol*>& captureSourcesOf(
+        const sema::Symbol* sym) const;
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): the first LIVE
+    // escape-bound source in `sym`'s carried set, or null. The fixpoint map is
+    // syntactic; liveness is applied HERE because only at consumption is
+    // `states_` populated (the pre-pass runs before the dataflow). Single-source
+    // convenience for the capture walks, which report one borrow at a time.
+    // per §28.3, v0.338
+    sema::Symbol* captureSourceOf(const sema::Symbol* sym);
     // issue #4225 (§28.3/§28.7/§30.14 v0.180): the sibling window table for a
     // PLAIN identifier alias holder (`var y := x;` / `y := x;` where the
     // source is a class/interface-typed local, tracked via
@@ -3841,6 +3923,14 @@ private:
     // borrow (store-to-field, out/ref param, multi-hop alias, closure
     // capture). // per §28.3, §31.1
     bool isEscapeBoundLocal(sema::Symbol* sym) const;
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): is `sym` a binding of
+    // FUNCTION type — a closure value, the one binding kind that carries a
+    // capture-source set ("a captured function value its own set,
+    // transitively"). Plain and NULLABLE function types both qualify: the
+    // issue's own shape is `var f: (() -> Item)? := null;`, and the nullability
+    // is a property of the VALUE, not of the binding's ability to carry a set.
+    // Restricted to local / parameter symbols. // per §28.3, v0.338
+    bool isFunctionTypedLocal(sema::Symbol* sym) const;
 
     // §28.3 / §28.9 (#861): populate `localDepth_` with each LocalDecl's
     // block-nesting depth, and (fix #3520) each catch arm's BINDING depth.

@@ -48,9 +48,11 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -60,6 +62,7 @@ namespace {
 // as the destructor-count exit code.
 int run(const std::string& src) {
     auto r = runAotChecked(src);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (!r.ran) {
         for (const auto& d : r.diagnostics.diagnostics()) {
             std::cout << "  diag: " << d.message << "\n";

@@ -2006,21 +2006,12 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
 
     auto savedSubst = genericSubst_;
     auto savedSema = genericSubstSemaTy_;
-    // Install the substitution `ts` supplies to its generic ancestor `anc`;
-    // false (substitution untouched) when there is nothing to bind.
+    // fix #6377: this is now `installAncestorGenericSubstFor` — the SAME helper
+    // the class-VTABLE twin below calls, so the two passes cannot drift on what
+    // "the substitution `ts` supplies to `anc`" means.
     auto installAncestorSubst = [&](const sema::TypeSymbol* ts,
                                     const sema::TypeSymbol* anc) {
-        if (!anc || anc == ts || anc->genericParams.empty()) return false;
-        sema::TypeRef synth;
-        synth.kind = sema::TypeRef::Kind::Named;
-        synth.declaration = const_cast<sema::TypeSymbol*>(ts);
-        std::unordered_map<std::string_view, llvm::Type*> s;
-        std::unordered_map<std::string_view, const sema::TypeRef*> sm;
-        if (!computeAncestorGenericSubst(&synth, anc, s, sm) || s.empty())
-            return false;
-        genericSubst_ = std::move(s);
-        genericSubstSemaTy_ = std::move(sm);
-        return true;
+        return installAncestorGenericSubstFor(ts, anc);
     };
     auto restore = [&]() {
         genericSubst_ = savedSubst;
@@ -2126,6 +2117,175 @@ void Emitter::patchConcreteDerivedGenericBaseItables() {
                 sit != ifacePropertySetIndex_.end())
                 patchSlot(/*isSet=*/true, sit->second);
             restore();
+        }
+
+        if (changed)
+            gv->setInitializer(llvm::ConstantArray::get(init->getType(), elems));
+    }
+}
+
+
+// fix #6377 (§14.1 / §12.1 / §23.4 / §2.8.3 rule 4, v0.338): install the
+// substitution `ts`'s OWN base clause induces on the GENERIC ancestor `anc`.
+// Shared by #4933's itable pass and #6377's vtable pass below so the two
+// cannot drift on what "the substitution `ts` supplies to `anc`" means — the
+// first version of each was a private lambda, and two copies of a walk that
+// decides which specialization is sound is exactly how a pair of twins drifts.
+//
+// FALSE (substitution untouched) is the refusal: no ancestor to walk, a
+// non-generic `anc`, or a chain `computeAncestorGenericSubst` declines to
+// resolve. The caller owns save/restore of genericSubst_/genericSubstSemaTy_,
+// the discipline `mergeAncestorGenericSubst` (fix #2889) established.
+bool Emitter::installAncestorGenericSubstFor(const sema::TypeSymbol* ts,
+                                            const sema::TypeSymbol* anc) {
+    if (!ts || !anc || anc == ts || anc->genericParams.empty()) return false;
+    sema::TypeRef synth;
+    synth.kind = sema::TypeRef::Kind::Named;
+    synth.declaration = const_cast<sema::TypeSymbol*>(ts);
+    std::unordered_map<std::string_view, llvm::Type*> s;
+    std::unordered_map<std::string_view, const sema::TypeRef*> sm;
+    if (!computeAncestorGenericSubst(&synth, anc, s, sm) || s.empty())
+        return false;
+    genericSubst_ = std::move(s);
+    genericSubstSemaTy_ = std::move(sm);
+    return true;
+}
+
+
+// fix #6377 (§14.1 / §12.1 / §23.4 / §2.8.3 rule 4, v0.338). See the
+// declaration comment in LlvmBackend_impl.hpp.
+//
+// WHAT §14.1, §12.1, §23.4 AND §2.8.3 rule 4 SAY. §14.1 makes `E1`'s base
+// clause `B<Array<int>>` an INSTANTIATION of `B<T>` with `Array<int>` bound for
+// `T`, and §2.8.3 rule 4 gives that instantiation its own runtime identity;
+// §12.1 makes `B`'s `virtual property [i: int]: T` the member `E1` inherits;
+// §23.4 says an indexer participates in `virtual`/`override` like a method. So
+// the accessor `E1` dispatches is `B`'s, running at T = Array<int>.
+//
+// THE DEFECT — a SILENT WRONG ANSWER, the top defect class in this repository.
+// MEASURED on this fix's parent (staging 27f35b9b) on the issue's own repro,
+// with BEZEL_DUMP_IR=1:
+//
+//   %class.B          = type { ptr, i8, i32 }
+//   %"class.B$spec0"  = type { ptr, i8, ptr }
+//   @"vt$M.B"  = internal constant [7 x ptr] [..., ptr @"bz$indexer$get"]
+//   @"vt$M.E1" =             constant [7 x ptr] [..., ptr @"bz$indexer$get"]
+//   @"vt$M.E2" =             constant [7 x ptr] [..., ptr @"bz$indexer$get"]
+//   define internal i32 @"bz$indexer$get"(ptr %0, i32 %1) {
+//     %3 = getelementptr inbounds nuw %class.B, ptr %0, i32 0, i32 2
+//     %4 = load i32, ptr %3, align 4
+//     ret i32 %4
+//   }
+//   ... %15 = call ptr %idxget(ptr %12, i32 0)
+//
+// ONE i32-returning accessor, GEPing the ERASED `%class.B`, in THREE vtables,
+// and called through `%idxget` as if it returned a POINTER. The objects are
+// `%"class.E1$spec0"` / `%"class.E2$spec0"`, whose field 2 is a `ptr` at byte
+// 16; the accessor reads an `i32` at byte 12 — the PADDING between the `i8`
+// disposed flag and the `ptr`. `lowerNew` callocs the object, so the padding is
+// deterministically ZERO: the program compiles, links, runs and exits 0,
+// printing 0 where 3 and 9 are expected. No diagnostic, no IR-verifier abort
+// (the mistyped call is INDIRECT — through a vtable slot LLVM loaded as `ptr` —
+// so the verifier never sees a signature to reject), no sanitizer report.
+//
+// WHY NOBODY REPAIRED IT. `specializedVtableFor` is the per-instantiation
+// vtable repair, and it is reached only under an active substitution
+// (`if (!shared || genericSubst_.empty()) return shared;`). At `new E1()` no
+// substitution is active — `E1` declares no type parameter of its own — so it
+// returns the SHARED `vt$M.E1` untouched. Instrumented on this parent:
+// `specializedVtableFor(E1) subst=0` for every `new E1()` site. #4933 fixed
+// exactly this for the ITABLE face of the same shape (`patchConcreteDerived
+// GenericBaseItables`, whose accessor half is the same `templateAccessorFn` +
+// `buildSpecializedAccessorFn` pair), and its repro had no interface-free
+// reading path to expose the class-vtable face.
+//
+// The memo key is NOT the defect, and this is the point a reviewer corrected on
+// the issue. `ensureIndexerGetterFn` memoizes on `(ps, accessorSpecTagNow())`,
+// and `accessorSpecTagFor` canonicalizes on `(ts, substKey, idKey)` — the CLASS
+// is already in the tag, so `E1` and `E2` mint DIFFERENT tags and the two
+// specializations get DIFFERENT memo entries. The key is only reached if some
+// caller asks under an installed substitution at all, and for a non-generic
+// `E1` nobody did.
+//
+// WHAT IT INSTALLS. For each CLASS vtable of a non-generic local class, each
+// PROPERTY / INDEXER accessor slot that still holds the ERASED template
+// accessor is re-lowered under the substitution its own base clause induces on
+// the declaring ancestor — the same builders `specializedVtableFor` uses for a
+// generic class, and the same "only a slot still holding the template is ours
+// to replace" guard, so an override declared on a non-generic class is never
+// touched.
+//
+// Runs next to #4933's pass, for the same reason: a specialization is a full
+// body emission, and #2759 records why no body may be lowered before Pass D has
+// created every vtable global.
+void Emitter::patchConcreteDerivedGenericBaseVtableAccessors() {
+    // Deterministic order (#3020): vtables_ is keyed by pointers.
+    std::vector<std::pair<const sema::TypeSymbol*, llvm::GlobalVariable*>>
+        work;
+    for (const auto& [ts, gv] : vtables_) {
+        if (!ts || !gv || !ts->genericParams.empty()) continue;
+        if (ts->kind != ast::TypeDeclKind::Class || ctx_.isImported(ts))
+            continue;
+        if (!gv->hasInitializer()) continue;
+        work.push_back({ts, gv});
+    }
+    std::sort(work.begin(), work.end(), [](const auto& a, const auto& b) {
+        return a.second->getName() < b.second->getName();
+    });
+
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    auto restore = [&]() {
+        genericSubst_ = savedSubst;
+        genericSubstSemaTy_ = savedSema;
+    };
+
+    for (const auto& [ts, gv] : work) {
+        auto vmIt = vtableMethods_.find(ts);
+        if (vmIt == vtableMethods_.end()) continue;
+        auto* init = llvm::cast<llvm::ConstantArray>(gv->getInitializer());
+        unsigned nElems = init->getType()->getNumElements();
+        std::vector<llvm::Constant*> elems;
+        elems.reserve(nElems);
+        for (unsigned i = 0; i < nElems; ++i)
+            elems.push_back(init->getAggregateElement(i));
+        bool changed = false;
+
+        for (std::size_t i = 0; i < vmIt->second.size(); ++i) {
+            const VSlot& vs = vmIt->second[i];
+            if (vs.method || !vs.prop) continue;
+            unsigned slot = kVirtualMethodsBase + static_cast<unsigned>(i);
+            if (slot >= nElems) continue;
+            // Resolve the most-derived implementation exactly as buildVtable
+            // does, so this asks about the accessor that IS in the slot.
+            sema::PropertySymbol* impl =
+                vs.prop->isIndexer ? classIndexerMatching(ts, vs.prop)
+                                   : classPropertyByName(ts, vs.prop->name);
+            if (!impl || !impl->parent) continue;
+            llvm::Function* canon = templateAccessorFn(impl, vs.isSet);
+            if (!canon) continue;
+            // fix #4952 (§4.6/§28.3/§28.9, v0.307): the shared vtable's slot may
+            // itself hold the ownership-normalizing thunk over `canon` — rebuild
+            // that exact value before the "still holds the template" guard, the
+            // same reconstruction #4933's itable accessor half makes.
+            llvm::Function* installedCanon =
+                (!vs.isSet && !impl->isIndexer)
+                    ? ensureVirtualStringGetterOwnershipThunk(impl, canon,
+                                     /*allowNullableResult=*/true)  // fix #5320
+                    : canon;
+            if (elems[slot] != llvm::cast<llvm::Constant>(installedCanon))
+                continue;
+            if (!installAncestorGenericSubstFor(ts, impl->parent)) continue;
+            llvm::Function* specFn =
+                buildSpecializedAccessorFn(ts, impl, vs.isSet);
+            restore();
+            if (!specFn) continue;
+            if (!vs.isSet && !impl->isIndexer)
+                specFn = ensureVirtualStringGetterOwnershipThunk(impl, specFn,
+                                     /*allowNullableResult=*/true);  // fix #5320
+            if (specFn == installedCanon) continue;
+            elems[slot] = llvm::cast<llvm::Constant>(specFn);
+            changed = true;
         }
 
         if (changed)
@@ -2773,6 +2933,72 @@ Emitter::RecordSubstGuard::RecordSubstGuard(Emitter* em, const sema::TypeRef* rt
 }
 
 Emitter::RecordSubstGuard::~RecordSubstGuard() {
+    if (!active) return;
+    e->genericSubst_ = std::move(savedSubst);
+    e->genericSubstSemaTy_ = std::move(savedSemaTy);
+}
+
+
+// fix #6319 (§23.4 / §14.1, v0.338): the kind-agnostic twin of
+// RecordSubstGuard immediately above — same param<->arg binding, minus the
+// Record/Choice gate, so a generic CLASS receiver (`VB<Array<int>>`) installs
+// its own substitution too. See the struct's declaration in
+// LlvmBackend_impl.hpp for the dispatch defect it fixes.
+Emitter::GenericRecvSubstGuard::GenericRecvSubstGuard(Emitter* em,
+                                                      const sema::TypeRef* rt,
+                                                      const sema::TypeSymbol* decl)
+    : e(em) {
+    // A value/record/choice receiver is what RecordSubstGuard already covers;
+    // this guard exists for the CLASS and INTERFACE kinds §23.4 dispatches
+    // through.
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
+        return;
+    // §14.1: the SAME `sema::genericParamNames` source RecordSubstGuard reads
+    // (the AST decl for a local class/interface, TypeSymbol::genericParams
+    // from ModuleLoader::convertGenericParams for an imported one), so an
+    // imported generic base's key substitutes exactly as a local one does.
+    // Keep the arity guard — a bare `VB` TypeRef (no genericArgs) carries no
+    // binding and must keep the declared lowering.
+    const std::vector<std::string_view> gpNames =
+        sema::genericParamNames(rt->declaration);
+    if (!gpNames.empty() && gpNames.size() == rt->genericArgs.size()) {
+        savedSubst = e->genericSubst_;
+        savedSemaTy = e->genericSubstSemaTy_;
+        std::unordered_map<std::string_view, llvm::Type*> newSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+        for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+            // Lower/resolve each argument under the OUTER substitution (both
+            // honor it), so a nested instantiation `VB<Box<int>>` binds T to
+            // the specialized `Box<int>` rather than to an `int` placeholder.
+            newSubst[gpNames[gi]] = e->lowerTypeRef(rt->genericArgs[gi]);
+            newSema[gpNames[gi]] = e->resolveTypeParamRef(rt->genericArgs[gi]);
+        }
+        e->genericSubst_ = std::move(newSubst);
+        e->genericSubstSemaTy_ = std::move(newSema);
+        active = true;
+    }
+    // The ANCESTOR half (§14.1 through a base chain): the receiver's own
+    // binding above must already be installed, so the chain walk's
+    // `lowerTypeRef(Array<U>)` resolves `U`. `computeAncestorGenericSubst`
+    // refuses a chain it cannot pin every link of, and a refusal here leaves
+    // the pre-fix (declared) lowering in place rather than guessing.
+    if (decl && decl != rt->declaration && !decl->genericParams.empty()) {
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (em->computeAncestorGenericSubst(rt, decl, ancSubst, ancSema)) {
+            if (!active) {
+                savedSubst = e->genericSubst_;
+                savedSemaTy = e->genericSubstSemaTy_;
+            }
+            for (const auto& kv : ancSubst) e->genericSubst_[kv.first] = kv.second;
+            for (const auto& kv : ancSema)
+                e->genericSubstSemaTy_[kv.first] = kv.second;
+            active = true;
+        }
+    }
+}
+
+Emitter::GenericRecvSubstGuard::~GenericRecvSubstGuard() {
     if (!active) return;
     e->genericSubst_ = std::move(savedSubst);
     e->genericSubstSemaTy_ = std::move(savedSemaTy);
@@ -7824,7 +8050,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             currentEnumMethod_ = savedEnumMethod;
             currentChoiceMethod_ = savedChoiceMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
-            if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps)) {
+            if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc, ps, ps)) {
                 // fix #2501 (§9.2/§27.6, v0.236): ensurePropertyBlockGetter's
                 // generated function always takes `this` as a POINTER
                 // (`fnTy = (ptr) -> retTy`, its own `currentThis_ = &*fn->
@@ -8596,6 +8822,27 @@ llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
 // tag, one basic block per payload-bearing case, PHI join. The switch
 // default (payload-free cases and, defensively, an out-of-range tag) yields
 // true — a payload-free case is equal to itself by tag alone.
+//
+// fix #6169: a case payload's NULLABILITY is declared at the PAYLOAD SITE
+// (`choice W<T> Ok(v: T?)`) and the concrete type ARGUMENT carries none of it
+// (`W<Col>`'s `Col` is non-nullable). BOTH payload-type resolutions below —
+// the `instTy->genericArgs` substitution and `resolveTypeParamRef` — returned
+// the bare substituted type and dropped the `?`, so a `T?` payload of a choice
+// argument read back as a NON-NULLABLE `Col`. That is sound for `lf`/`rf` only
+// if they were the bare choice struct, and they are not: `nullableValueStructTy`
+// wraps a nullable choice as `{i8 hasValue; <choiceStruct>}`
+// (LlvmBackend_Layout.cpp's `isNullableChoiceTy` arm, #2447). The mismatch
+// dropped `emitValueEquality`'s null-safe nullable-value arm (`isNullableValueTy`,
+// which DOES include `isNullableChoiceTy`) and fell into the bare-choice arm
+// instead, which read the `hasValue` flag as the case tag and indexed payload
+// slot `{2,0}` on a two-field wrapper — `CreateExtractValue`'s null result
+// segfaulted in `Value::setName` (bezelc exit 139, `W<Col>` `=`, `GetHashCode`,
+// and any `Set<W<Col>>`). Per §9.2 "`T?` where `T` is admissible" and §8.4's
+// null-safe `=`, `T?` IS admissible, so sema accepting the program is correct
+// and the codegen read was the defect. Both resolutions now OR the declared
+// nullability in; nullable is idempotent, so an argument that is itself
+// nullable (`W<Col?>`) stays nullable. `emitChoiceHashCode` carries the same
+// pair of resolutions and the same fix. // per §9.2, §8.4, §35.7
 llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                                          const sema::TypeSymbol* choiceTy,
                                          const sema::TypeRef* instTy) {
@@ -8667,6 +8914,7 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                                 choiceTy->genericParams[i]->name == head &&
                                 i < instTy->genericArgs.size()) {
                                 pTy = *instTy->genericArgs[i];
+                                pTy.nullable = pTy.nullable || rawTy->nullable;
                                 break;
                             }
                         }
@@ -8677,9 +8925,11 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                     }
                 } else {
                     // Top-level call or no instTy: use the prior path.
-                    if (const sema::TypeRef* rt =
-                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (const sema::TypeRef* rt = resolveTypeParamRef(rawTy))
                         pTy = *rt;
+                    // fix #6169 — see the header note above.
+                    pTy.nullable = pTy.nullable || (rawTy && rawTy->nullable);
                 }
             }
             caseEq = builder_.CreateAnd(caseEq,
@@ -8771,6 +9021,8 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
                                 choiceTy->genericParams[i]->name == head &&
                                 i < instTy->genericArgs.size()) {
                                 pTy = *instTy->genericArgs[i];
+                                // fix #6169 — see emitChoiceEquality's header.
+                                pTy.nullable = pTy.nullable || rawTy->nullable;
                                 break;
                             }
                         }
@@ -8779,9 +9031,11 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
                         if (rawTy) pTy = *rawTy;
                     }
                 } else {
-                    if (const sema::TypeRef* rt =
-                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (const sema::TypeRef* rt = resolveTypeParamRef(rawTy))
                         pTy = *rt;
+                    // fix #6169 — see emitChoiceEquality's header.
+                    pTy.nullable = pTy.nullable || (rawTy && rawTy->nullable);
                 }
             }
             llvm::Value* pfVal = builder_.CreateExtractValue(

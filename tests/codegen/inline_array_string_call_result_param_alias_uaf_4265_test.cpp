@@ -116,6 +116,7 @@
 
 #include <regex>
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -124,6 +125,7 @@ namespace {
 // exactly as it is on a leak — see #4254/#4232's identical pattern.
 int runChecked(const std::string& program) {
     auto r = runAotChecked(program);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     return r.ran ? r.exitCode : -999;
 }
 
@@ -137,6 +139,7 @@ int runChecked(const std::string& program) {
 // FAIL-WITHOUT/PASS-WITH UAF row.
 bool leaksAtLeast(const std::string& program, long minBytes) {
     auto r = runAotChecked(program);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (r.ran) return false;  // no sanitizer finding at all — wrongly clean
     static const std::regex kLeak(
         R"(AddressSanitizer: (\d+) byte\(s\) leaked)");

@@ -91,11 +91,15 @@ struct ConstShiftDomainFault {
     long long count = 0;     // the folded, out-of-domain count
     int width = 0;           // the left operand's bit width (the domain bound)
 };
+// fix #6429 (§6.5, §17.14, v0.338): the walk is now TOTAL over the
+// expression graph — no depth cap, only a cycle guard that terminates on a
+// malformed AST and on no well-formed program. The old `depth > 64` cap
+// silently skipped the check past that depth, making a real §6.5/§17.14
+// violation nested 65+ hops deep compile silently.
 ConstShiftDomainFault findConstShiftDomainFault(
     const ast::Expr& e,
     const std::function<std::optional<long long>(std::string_view, int)>&
-        resolveIdent,
-    int depth = 0);
+        resolveIdent);
 
 // fix #3879 (§22.12, v0.294): is `rt` an admissible declared type for a
 // class-level (or enum-body) `const` (grammar A.4 `ConstDecl`)? §22.12's

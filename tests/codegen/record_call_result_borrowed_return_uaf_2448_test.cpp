@@ -53,10 +53,12 @@
 // so that test was NOT encoding the #2448 bug (it happens to already be a
 // SOUND shape) — verified by re-running it against this fix.
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"   // runAotChecked / runAotCheckedLenient
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
@@ -87,6 +89,7 @@ BEZEL_TEST(record_call_result_borrowed_return_uaf_2448,
         "  if h.f.s <> \"hello-world-borrow-probe\" then return 2; end; "
         "  return 42; "
         "end Main; end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // false pre-fix: ASan heap-use-after-free
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -121,6 +124,7 @@ BEZEL_TEST(record_call_result_borrowed_return_uaf_2448,
         "  if h.tag <> \"hello-world-borrow-ctor-arg-probe\" then return 2; end; "
         "  return 42; "
         "end Main; end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // false pre-fix: ASan heap-use-after-free
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -148,6 +152,7 @@ BEZEL_TEST(record_call_result_borrowed_return_uaf_2448,
         "  if p.s = \"\" then return 1; end; "
         "  return 42; "
         "end Main; end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // no crash — the excluded shape's release
                                 // simply does not fire (a bounded leak,
                                 // not asserted leak-free here)

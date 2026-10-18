@@ -14,6 +14,8 @@
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 #include "sema/SubstArgs.hpp"       // sema::substituteGenericArgs — generic class IComparable check
+#include "sema/GenericParams.hpp"   // sema::hasVariantGenericParam — §12.9 variance read from BOTH
+                                   // sources (#3143; an AST-only read answers invariant for an import)
 
 // fix #4724 / #4801 (§4.4, §5.2, §6.4, v0.307): the compile-time float and
 // decimal folds reuse the runtime's decimal entry points — the SAME ops codegen
@@ -1488,6 +1490,33 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
 }
 
 namespace {
+// fix #5959 (stdlib §5 + spec §14.2, v0.338): the two §5 hashable gates in
+// this file — `linqHashableCheck` for the six constrained-block operators,
+// and `linqKeyHashableCheck` for `GroupBy`/`ToDictionary`'s member-level
+// TKey — share ONE set of deferral preconditions, so a TKey and an element
+// type cannot disagree about when the check may fire. TRUE when the type
+// cannot decide the §3.6 property yet and the gate must stand down.
+bool hashableCheckDefers(const TypeRef* t) {
+    if (!t) return true;
+    if (t->kind == TypeRef::Kind::Error) return true;
+    // Defer on an unresolved generic-parameter placeholder (extension
+    // bodies, `this`-typed receivers): the per-instantiation gate
+    // applies when T is bound, not now. The §3.6 hashable property
+    // surfaces its failure at the top-level type, so deferring at a
+    // parameter placeholder is safe — the constraint failure will fire
+    // at the call site that supplies a concrete T (§14.2's "the check
+    // runs at instantiation").
+    if (t->kind == TypeRef::Kind::Named && !t->declaration) {
+        // Builtin primitives (int, string, …) have null-decl Named refs
+        // with a non-null astNode — `isEqualityBearing` reports them
+        // hashable. A bare block-level type-parameter placeholder has a
+        // null astNode (the §26.4 "fresh block-level type parameter"
+        // rule's shape) — defer those.
+        if (!t->astNode) return true;
+    }
+    return false;
+}
+
 // fix #3331 (C5, stdlib §5 + proposal 0116 D9): the six LINQ operators
 // `Distinct`, `Union`, `Intersect`, `Except`, `Contains`, `ToSet` are
 // declared in the constrained `extension IEnumerable<T> where T:
@@ -1511,23 +1540,7 @@ namespace {
 // before its per-instantiation gate runs.
 bool linqHashableCheck(std::string_view m, const TypeRef* srcElem,
                        SourceLocation loc, SemaContext& ctx) {
-    if (!srcElem) return true;
-    if (srcElem->kind == TypeRef::Kind::Error) return true;
-    // Defer on an unresolved generic-parameter placeholder (extension
-    // bodies, `this`-typed receivers): the per-instantiation gate
-    // applies when T is bound, not now. The §3.6 hashable property
-    // surfaces its failure at the top-level type, so deferring at a
-    // parameter placeholder is safe — the constraint failure will fire
-    // at the call site that supplies a concrete T (§14.2's "the check
-    // runs at instantiation").
-    if (srcElem->kind == TypeRef::Kind::Named && !srcElem->declaration) {
-        // Builtin primitives (int, string, …) have null-decl Named refs
-        // with a non-null astNode — `isEqualityBearing` reports them
-        // hashable. A bare block-level type-parameter placeholder has a
-        // null astNode (the §26.4 "fresh block-level type parameter"
-        // rule's shape) — defer those.
-        if (!srcElem->astNode) return true;
-    }
+    if (hashableCheckDefers(srcElem)) return true;
     if (isEqualityBearing(srcElem, ctx)) return true;
     std::string msg =
         std::string("operator `") + std::string(m) +
@@ -2044,6 +2057,73 @@ std::string spellTypeRefForDiag(const TypeRef* a) {
         return s;
     }
     return "?";
+}
+
+// fix #5959 (stdlib §5 `GroupBy<TKey>` / `ToDictionary<TKey>[, TValue]`,
+// spec §14.2 + §3.6 hashable row clause (e), v0.338): a printable spelling
+// for a TKey type argument. `spellTypeRefForDiag` above answers "?" for a
+// FUNCTION TypeRef, and a function type is exactly the TKey this check
+// fires on most often (§3.6 clause (e)) — a "?"-named argument would fail
+// §14.2's "naming the constraint, the argument and the parameter it turns
+// on". Spell the §27.1 function-type form; everything else defers to the
+// shared speller so there is ONE spelling per non-function kind.
+std::string spellKeyTypeForDiag(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Function) return spellTypeRefForDiag(t);
+    std::string s = "(";
+    for (std::size_t i = 0; i < t->funcParams.size(); ++i) {
+        if (i) s += ", ";
+        if (!t->funcParams[i].modifier.empty())
+            s += std::string(t->funcParams[i].modifier) + " ";
+        s += spellTypeRefForDiag(t->funcParams[i].type);
+    }
+    s += ") -> ";
+    if (t->funcReturnOwned) s += "owned ";
+    s += spellTypeRefForDiag(t->funcReturn);
+    if (t->nullable) s += "?";
+    return s;
+}
+
+// fix #5959 (stdlib §5 + spec §14.2, v0.338): the gate for the §5 members
+// that key a HASH CONTAINER through a SELECTOR type parameter of their own —
+// `GroupBy<TKey>(key: (T) -> TKey) where TKey: hashable` and both
+// `ToDictionary` overloads, which state the same requirement on their own
+// TKey. `linqHashableCheck` above is the gate for the OTHER half of the §5
+// hashable surface: the six operators declared in the CONSTRAINED
+// `extension IEnumerable<T> where T: hashable` BLOCK, whose §14.2 violation
+// stdlib §5 records as "no applicable extension" (§26.5). These three are
+// the other form stdlib §5 names on the same line — "the ordinary
+// constraint form of language spec §14.2 … on the member's own type
+// parameter in the second" — so the diagnostic is §14.2's constraint
+// failure, not `linqHashableCheck`'s block-availability wording, and it
+// NAMES THE ARGUMENT AND THE PARAMETER (§14.2: "a compile error at that
+// site, naming the constraint, the argument and the parameter it turns
+// on"). Satisfaction is `isEqualityBearing` — the same §3.6 computation and
+// the same §3.6 rule-4 component-path fragment §14.2 admits no second
+// definition of.
+//
+// The five typing arms for these members (GroupBy and ToDictionary over a
+// lazy `IEnumerable<T>` receiver, over a concrete-collection receiver, and
+// ToDictionary over the string/IEnumerable<char> receiver) each consult
+// this BEFORE setting the call's exprType; the pre-fix silence was a
+// silent-acceptance inversion — the call compiled and the wrong key landed
+// in the Dictionary/IGrouping instead of a diagnostic.
+//
+// Returns true to type the call, false to reject. Defers (returns true) on
+// a null/Error type and on an unresolved block-level type-parameter
+// placeholder, exactly as `linqHashableCheck` does — a TKey bound only when
+// the lambda's return type resolves is decided then, not here.
+bool linqKeyHashableCheck(std::string_view m, const TypeRef* keyTy,
+                          SourceLocation loc, SemaContext& ctx) {
+    if (hashableCheckDefers(keyTy)) return true;
+    if (isEqualityBearing(keyTy, ctx)) return true;
+    std::string msg = std::string(m) + "()'s `TKey` type argument `" +
+                      spellKeyTypeForDiag(keyTy) +
+                      "` does not satisfy the constraint `where TKey: hashable` "
+                      "(\xC2\xA7""14.2; stdlib \xC2\xA7""5)";
+    const std::string detail = hashableFailureComponentPath(keyTy, ctx);
+    if (!detail.empty()) msg += detail;
+    ctx.diagnostics().report(Severity::Error, loc, msg);
+    return false;
 }
 
 // fix-forward #5641 (§15.1, v0.334): the receiver type-argument INDEX at
@@ -2904,12 +2984,19 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             explicitListSoleSurvivor_[&ce] = m;
         return m;
     };
-    if (cands.size() == 1) return soleSurvivor(cands[0]);
-
-    // A discard argument (`out _`) is outside the value-conversion ranking of
-    // §22.6's worked examples; fall back to arity/first-bind.
-    for (const auto& a : ce.args)
-        if (a.isDiscard) return arityFallback();
+    // fix #6334 (§22.6 stage 3, v0.338): the lone-candidate short-circuit
+    // (`cands.size() == 1`) and the discard-argument bail used to sit HERE,
+    // above the §14.5 phase-1 substitution and the substituted parameter rows.
+    // A sole candidate therefore returned before anything had substituted its
+    // signature, so nothing downstream ever saw the type its parameter
+    // actually has for this call. Both are moved down, as a PAIR and in the
+    // same order, to just after the rows are built: the short-circuit must
+    // still precede the discard bail, because a lone candidate carrying a
+    // discard argument resolved through `soleSurvivor` and must keep doing so.
+    // Nothing between here and the new site mutates `cands` except the #6001
+    // coincidence drop, which makes the #6334 check MORE accurate (it reads
+    // the survivor that drop leaves); the shape-uniformity loop and the #6292
+    // coincidence check above are both no-ops at `cands.size() == 1`.
 
     // fix #5101 (§14.5 phase 1 / §22.6, v0.307): compute each GENERIC
     // candidate's phase-1 argument-driven-unification substitution BEFORE
@@ -2948,6 +3035,9 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // it is a separate concern.
     std::vector<std::unordered_map<std::string_view, TypeRef*>> phase1Subst(
         cands.size());
+    // fix #6334: did phase-1 unification fail by DISAGREEMENT (§14.1
+    // "Agreement", reported by `typeCall`) rather than by matching nothing?
+    std::vector<bool> phase1Conflicted(cands.size(), false);
     // fix #6228 (§22.6 "Generic candidates" / §14.5, v0.338): a call that
     // writes its method type arguments (`c.S<int>(b)`) has no inference to
     // run: each generic candidate with the same count of type parameters
@@ -3045,6 +3135,12 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                           phase1Subst[c], &conflicts);
         }
         if (!conflicts.empty()) phase1Subst[c].clear();
+        // fix #6334: record WHICH kind of empty this is. An empty map from a
+        // §14.1 "Agreement" conflict is already reported by `typeCall`'s
+        // #896 diagnostic, so the #6334 check must not add a second message
+        // for it; an empty map because unification simply matched nothing is
+        // the inference FAILURE §22.6 stage 3 then rejects.
+        phase1Conflicted[c] = !conflicts.empty();
     }
 
     // §22.6 ranks the bound argument positions. For each candidate, build
@@ -3418,6 +3514,163 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         }
     }
 
+    // fix #6334 (§22.6 stage 3, §5.1, §14.5, v0.338): a LONE candidate is
+    // never re-checked. With one candidate there is no ranking to run, so the
+    // short-circuit returned it as soon as the §22.5 arity bind succeeded —
+    // and an ARITY match is not applicability. §22.6 stage 3 says "when none
+    // of the candidates applies, the call is an error", and for the commonest
+    // argument type in Bezel that stage never got consulted: `checkCallArity`'s
+    // per-argument `checkAssignable` compares each argument against the
+    // candidate's UNSUBSTITUTED formal (a bare `V`), and a §5.1 check against
+    // an unbound type parameter defers.
+    //
+    // MEASURED on this tree before the fix: `U.S(a)` with `a: Array<int>`
+    // against a lone `S<V>(x: Box<V>)` compiled and RAN, reading `x.V` — the
+    // `Box<V>` field slot — off an `Array<int>`. Compiled with
+    // `--sanitize=address` the dispatch through that slot faults:
+    // "AddressSanitizer: SEGV on unknown address 0x000000000000 ... The
+    // signal is caused by a READ memory access ... pc points to the zero
+    // page". The identical hole is on the `c.S(a)` instance spelling (a lone
+    // instance `S<V>(x: Box<V>)` on `c: C` likewise printed its body), and it
+    // is not specific to a generic parameter: a lone NON-generic
+    // `S(x: Box<int>)` against the same `Array<int>` accepted too — §5.1's own
+    // `checkAssignable` has no declaration to compare against for a
+    // declaration-less `Array<T>` and lets it through.
+    //
+    // THE FIX is §22.6 stage 3 applied to the one shape that reaches it with
+    // nothing decided. A sole candidate is checked here only when §14.5
+    // inference bound NOTHING and the parameter and the argument are then
+    // DECIDABLY unrelated — the check is not a new applicability predicate, it
+    // is §22.6's own "when none of the candidates applies, the call is an
+    // error" for the case where "none applies" is certain.
+    //
+    // It is deliberately NOT keyed on "inference bound nothing". That map is
+    // empty for shapes that ARE applicable: `unifyArgSubst` binds only on a
+    // structural head match and never through a §12 subtype step, so it also
+    // leaves the map empty for `string` and for a user
+    // `class Str: IEnumerable<char>` against `S<V>(x: IEnumerable<V>)`. Both
+    // are valid and both compile today, and
+    // `explicit_type_arg_list_overload_6312.
+    // string_to_ienumerable_char_runs_spec_4_6` PINS the first. A fix keyed
+    // on the empty map breaks it; a fix keyed on `definitelyInapplicable` (#6312/#6322)
+    // breaks it differently, MEASURED — that reports the VALID
+    // `Array<int>` → `IEnumerable<int>` as certainly inapplicable, because its
+    // cross-declaration arm asks `hasNamedAncestor`, which does not resolve the
+    // stdlib borrowing hierarchy for a declaration-less `Array<T>`. Both
+    // broader readings were built, measured, and rejected; see `unrelatedUserHead`
+    // below for the subset that needs no ruling.
+    //
+    // Gated on:
+    //   * no EXPLICIT type-argument list — #6312's block in the `Undecidable`
+    //     arm owns that shape with its own §14.5 diagnostic, and checking it
+    //     here too would double-report and replace a §14.5 message with a §5.1
+    //     one;
+    //   * and no discard argument (`out _`), which the bail below owns.
+    //
+    // It reads NO AST. An earlier revision of this block gated on
+    // `dynamic_cast<const ast::MethodDecl*>(cands[0]->decl)` to reach
+    // `checkArgsAgainstParams`, which takes the declared parameter list — and
+    // that cast is null for EVERY imported method, so the check was silently
+    // absent across a module boundary (umbrella #3152 class-3 seam; caught by
+    // `scripts/check_imported_symbol_reads.py`). The bound branch it guarded
+    // is gone, and what remains needs only `cands[0]->genericParams` (a
+    // `MethodSymbol` field, populated on both sides) and the already-computed
+    // substituted rows, so an imported lone generic callee is checked too.
+    //
+    // The two §22.6 outcomes a sole candidate can reach, both of which the
+    // short-circuit below used to pass through unjudged.
+    if (cands.size() == 1 && !(callTypeArgs && !callTypeArgs->empty())) {
+        bool hasDiscard = false;
+        for (const auto& a : ce.args)
+            if (a.isDiscard) hasDiscard = true;
+        if (!hasDiscard) {
+                // Inference BOUND NOTHING, so every row still names the
+                // candidate's own method type parameters. §14.5: "a candidate
+                // whose inference fails is inapplicable and drops out" — with
+                // one candidate, none survives, so §22.6 stage 3 makes the
+                // call an error. That is the rule; what it must NOT do is
+                // fire wherever the map happens to be empty, because an empty
+                // map is NOT by itself evidence of a failed match.
+                //
+                // MEASURED: `S<V>(x: IEnumerable<V>)` leaves the map empty
+                // for BOTH `Array<int>`... no — for `string` and for a user
+                // `class Str: IEnumerable<char>`, because `unifyArgSubst`
+                // binds only on a structural head match and never through a
+                // §12 subtype step. Both calls are valid and both compile
+                // today, and
+                // `explicit_type_arg_list_overload_6312.
+                // string_to_ienumerable_char_runs_spec_4_6` PINS the first.
+                // Rejecting on "the map is empty" therefore breaks a
+                // deliberately-accepted shape; this is filed as a
+                // `spec-question` (does §14.5 inference see through §12
+                // subtyping?), and the check below is confined to the subset
+                // that needs no such ruling.
+                //
+                // That subset: the parameter's HEAD is a user-declared class
+                // or record (§3.1 kind), and the argument reaches it in
+                // neither direction. §5.1's named-to-named conversions are
+                // identity, a §12 subtype→supertype step, or (from a
+                // primitive) boxing — boxing is out with both sides named.
+                // A stdlib built-in collection type cannot be a declared base
+                // of, nor declare a base of, a user's own class, so for a
+                // USER-declared parameter head the subtype step is decidable
+                // by declaration identity alone and neither direction can
+                // hold. That is what makes this certain where the
+                // `IEnumerable<V>` case is not.
+                auto userClassHead = [](const TypeRef* pt) {
+                    if (!pt || pt->kind != TypeRef::Kind::Named ||
+                        !pt->declaration)
+                        return false;
+                    return pt->declaration->kind == ast::TypeDeclKind::Class ||
+                           pt->declaration->kind ==
+                               ast::TypeDeclKind::Record;
+                };
+                auto reaches = [&](const TypeRef* from, const TypeRef* to) {
+                    if (from->declaration && to->declaration)
+                        return isSubtype(from->declaration, to->declaration);
+                    return hasNamedAncestor(const_cast<TypeRef*>(from),
+                                            to->headName());
+                };
+                bool unrelatedUserHead = false;
+                for (std::size_t i = 0;
+                     i < paramTypes[0].size() && !unrelatedUserHead; ++i) {
+                    const TypeRef* at = argTypeRows[0][i];
+                    const TypeRef* pt = paramTypes[0][i];
+                    if (!at || !pt) continue;
+                    if (!userClassHead(pt) || at->nullable || pt->nullable)
+                        continue;
+                    // A declared `in`/`out` type parameter makes the pair
+                    // §12.9 VARIANT, which `isSubtype` over declarations does
+                    // not model; leave those alone rather than guess.
+                    // `sema::hasVariantGenericParam`, NOT a hand-rolled walk
+                    // of `declaration->genericParams`: that reads the AST, so
+                    // for an IMPORTED `Box<out V>` it answers "" (invariant)
+                    // and this check would reject a call §12.9 admits.
+                    // GenericParams.hpp is the ONE accessor for this fact
+                    // (umbrella #3152, family #3143).
+                    if (sema::hasVariantGenericParam(pt->declaration))
+                        continue;
+                    if (!reaches(at, pt) && !reaches(pt, at))
+                        unrelatedUserHead = true;
+                }
+                if (unrelatedUserHead && !cands[0]->genericParams.empty() &&
+                    !phase1Conflicted[0])
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "no overload of `" + std::string(initial->name) +
+                            "` is applicable to these arguments; no type "
+                            "argument binds this argument to the candidate's "
+                            "parameter, and the two are unrelated (§5.1, "
+                            "§14.5, §22.6)");
+        }
+    }
+    if (cands.size() == 1) return soleSurvivor(cands[0]);
+
+    // A discard argument (`out _`) is outside the value-conversion ranking of
+    // §22.6's worked examples; fall back to arity/first-bind.
+    for (const auto& a : ce.args)
+        if (a.isDiscard) return arityFallback();
+
     // §26.5 step 1 (v0.183): for a dot-call (`x.Foo(...)`) whose callee
     // resolved to an instance member by name, note whether a same-named
     // extension also matches the receiver — it was never considered (step 1
@@ -3647,6 +3900,83 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                     best = cx;
                 }
                 if (best != cands.size() && !contested) return cands[best];
+            }
+            // fix #6332 (§22.6 "Generic candidates", §14.5, v0.338): §22.6's
+            // LAST tie-break before ambiguity is "When a non-generic
+            // candidate and a generic candidate are both applicable, and
+            // neither the ranking nor the defaulted-arity tie-break separates
+            // them, the non-generic candidate is selected."
+            // `resolveOverload` implements exactly that comparison
+            // (`unambiguouslyBetter`'s last clause, at its last `return`), but
+            // `Undecidable` returns EARLY, above it — so on this path the rule
+            // never runs.
+            //
+            // MEASURED on the issue's repro: `Pick<V>(x: V)` declared first and
+            // `Pick(x: Array<int>)` declared second, called as `U.Pick(a)` with
+            // `a: Array<int>`, printed 10 (the generic); with the two
+            // declarations SWAPPED it printed 5. The verdict is decided by
+            // declaration order.
+            //
+            // WHY the #5859 tie-break above cannot see it: `a: Array<int>` is
+            // a declaration-less `Named`, which `judgeable` rejects, so every
+            // candidate arrives marked inapplicable and both loops below this
+            // point (they gate on `r.applicable[c]`) select nothing. What
+            // `builtinRefPrefers` then compares is the generic candidate's
+            // SUBSTITUTED row, `V := Array<int>`, against the non-generic
+            // candidate's `Array<int>` — identical, so neither is strictly
+            // better and the strict-ordering block declines to decide. That
+            // is the one case §22.6's non-generic preference exists for.
+            //
+            // GUARDED to be additive in the same sense as #5859's: no
+            // diagnostic is emitted here, so nothing that compiles today can
+            // start failing; the block returns only when exactly ONE
+            // non-generic candidate of the right arity exists, and only
+            // after `implicitlyConvertible` confirms §5.1 admits the
+            // argument at every bound position (so a non-generic candidate
+            // the arguments plainly cannot reach never wins). Every other
+            // undecidable shape — including the genuine tie with two
+            // non-generic candidates, and any call with no non-generic
+            // candidate at all — falls through unchanged.
+            {
+                std::size_t pick = cands.size();
+                bool ambiguousNonGeneric = false;
+                for (std::size_t c = 0; c < cands.size(); ++c) {
+                    if (!cands[c]->genericParams.empty()) continue;
+                    if (sema::formalParamCount(*cands[c]) != ce.args.size())
+                        continue;
+                    bool admits = true;
+                    for (std::size_t i = 0; i < argTypes.size(); ++i) {
+                        const TypeRef* at = argTypeRows[c][i];
+                        const TypeRef* pt = paramTypes[c][i];
+                        if (!at || !pt) continue;
+                        // §5.1 admissibility, using the SAME grade
+                        // `builtinRefPrefers` applies two blocks above:
+                        // identity, else a §12 ancestor step, and a nullable
+                        // source does not reach a non-nullable target. This
+                        // is NOT `implicitlyConvertible` — MEASURED on these
+                        // exact rows it returns false for `Array<int>` into
+                        // `Array<int>`, including the case where the two
+                        // `TypeRef`s are the same pointer, so it cannot serve
+                        // as the admissibility test for a built-in class
+                        // reference at all.
+                        if (typeRefEqual(at, pt)) continue;
+                        if (at->nullable && !pt->nullable) {
+                            admits = false;
+                            break;
+                        }
+                        if (!hasNamedAncestor(const_cast<TypeRef*>(at),
+                                              namedRefSimpleName(pt)))
+                            admits = false;
+                    }
+                    if (!admits) continue;
+                    if (pick != cands.size()) {
+                        ambiguousNonGeneric = true;
+                        break;
+                    }
+                    pick = c;
+                }
+                if (pick != cands.size() && !ambiguousNonGeneric)
+                    return cands[pick];
             }
             if (!hasNamed) {
                 for (std::size_t c = 0; c < cands.size(); ++c) {
@@ -9619,6 +9949,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     keyTy = lamTy->funcReturn;
                             }
                         }
+                        // fix #5959 (stdlib §5 `GroupBy<TKey> … where TKey:
+                        // hashable` / spec §14.2, v0.338): the member's own
+                        // TKey constraint, consulted before the IGrouping
+                        // element type is built — a function-typed key
+                        // compiled silently before this.
+                        if (!linqKeyHashableCheck(m, keyTy, ce.span.begin, ctx_))
+                            return false;
                         static const ast::Type* kIGroupingNode2 =
                             []() -> ast::Type* {
                                 auto* qn = new ast::QualifiedName;
@@ -9897,6 +10234,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     lamTy->funcReturn)
                                     keyTy = lamTy->funcReturn;
                         }
+                        // fix #5959 (stdlib §5 `ToDictionary<TKey[, TValue]> …
+                        // where TKey: hashable` / spec §14.2, v0.338) — see
+                        // the GroupBy arm's sibling note; the diagnostic
+                        // reported here is fatal (hasErrors() gates codegen),
+                        // so skipping the typing is the whole rejection.
+                        if (!linqKeyHashableCheck(m, keyTy, ce.span.begin, ctx_))
+                            return;
                         ctx_.setExprType(
                             &ce,
                             makeDictResult(keyTy, toDictValueType(ce, srcElem)));
@@ -10072,6 +10416,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 if (lt->kind == TypeRef::Kind::Function &&
                                     lt->funcReturn)
                                     keyTy = lt->funcReturn;
+                        // fix #5959: the TKey gate, on the string
+                        // (IEnumerable<char>, #1220) receiver arm.
+                        if (!linqKeyHashableCheck(m, keyTy, ce.span.begin, ctx_))
+                            return;
                         ctx_.setExprType(
                             &ce,
                             makeDictResult(keyTy, toDictValueType(ce, charTy)));
@@ -11622,6 +11970,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         lamTy->funcReturn)
                                         keyTy = lamTy->funcReturn;
                             }
+                            // fix #5959: the TKey gate, on the concrete-
+                            // collection (Array/OwningArray/…) receiver arm.
+                            if (!linqKeyHashableCheck(m, keyTy,
+                                                      ce.span.begin, ctx_))
+                                return;
                             ctx_.setExprType(&ce,
                                 makeDictResult(keyTy, toDictValueType(
                                                    ce, recvTy->genericArgs[0])));
@@ -11798,6 +12151,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         keyTy = lamTy->funcReturn;
                                 }
                             }
+                            // fix #5959: the TKey gate, on the concrete-
+                            // collection (Array/OwningArray/…) receiver arm —
+                            // see the GroupBy arm in `typeLinqOperator`.
+                            if (!linqKeyHashableCheck(m, keyTy,
+                                                      ce.span.begin, ctx_))
+                                return;
                             // Build IGrouping<TKey, T> TypeRef using a synthetic
                             // astNode so codegen can identify it.
                             static const ast::Type* kIGroupingNode =
@@ -24633,7 +24992,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // (module loaded with no exported types or the loader could
                 // not find it) or because the for-loop above did not match.
                 // Both share the same diagnostic wording and exemption
-                // (neutral form: §13.2 — top-level types default to private
+                // (neutral form: §13.2 — a top-level type is module-internal
                 // unless declared public; §2.7 — only the named module's
                 // exported types are reachable through a module prefix).
                 const std::string partialMember5025c(ma.member);

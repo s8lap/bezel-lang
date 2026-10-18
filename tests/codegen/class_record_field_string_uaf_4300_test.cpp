@@ -57,12 +57,14 @@
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::runAotCheckedLenient;
 
 namespace {
@@ -73,6 +75,7 @@ namespace {
 // even when the UAF fix is correctly applied.
 int runChecked(const std::string& program) {
     auto r = runAotCheckedLenient(program);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     return r.ran ? r.exitCode : -999;
 }
 }  // namespace

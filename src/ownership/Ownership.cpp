@@ -478,6 +478,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // construction roots are already collected and the transitive resolution
     // reaches the scope-bound source. // per §35.5, §9.7 (v0.220)
     collectCaseArmBorrowSources(body);
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): close the capture-source
+    // sets of function-typed locals over the LEAST FIXPOINT the clause names, so
+    // a closure capturing another closure carries that closure's sources. Runs
+    // AFTER the collectors above so a borrow-bearing local's provenance is
+    // already in place, and BEFORE the dataflow so every consumer
+    // (borrowSourceForExpr's Shape 3, checkClosureEscapesOnReturn's capture
+    // loop) reads one complete, order-independent answer. See the pass's own
+    // comment for the termination argument. // per §28.3, v0.338
+    collectCaptureSourceFixpoint(body);
     // §28.14 (v0.175, #808): scoped callback parameters. Record the enclosing
     // method's parameter symbols (distinguishes real captures from lambda-
     // internal params), then run the three syntactic pre-passes: call-site
@@ -16291,8 +16300,43 @@ static std::string_view staticReturnTypeRejected(
     if (returnType.kind != ast::TypeKind::Named || !returnType.name ||
         returnType.name->parts.empty())
         return {};
-    const std::string_view head = returnType.name->parts.front();
     const sema::TypeRef* rt = ctx.resolvedType(returnType);
+    // fix #6325 (§27.8 *Type aliases* / §28.3, v0.338): read the head through
+    // the ALIAS-TRANSPARENT accessor, not the syntactic one. §27.8: "An alias
+    // is not a separate kind of type; it is a naming convenience for an
+    // existing one. Identity, equality, and method dispatch all see through
+    // the alias" — so the §28.3 announced-set carve lists are keyed on the
+    // UNDERLYING head, and `TypeRef::headName()` is the sanctioned read for
+    // exactly this ("the ONE read every builtin-collection/wrapper identity
+    // check should use instead of `astNode->name->parts[0]`, so a type alias
+    // resolves correctly", #1462).
+    //
+    // MEASURED on r31-c1 before this line: `type Arr0<E> := Array<E>;` with
+    // `public static method Make(): Arr0<int> => [1, 2, 3];` — the head read
+    // as `Arr0`, which is in no carve list and no plain-collection list, so
+    // `isClassOrInterfaceResult(rt)`'s arm returned `Arr0` … except `rt` for
+    // `Arr0<int>` carries the RESOLVED head, so (A) declined and (A') missed
+    // on `isPlainBuiltinCollectionHead("Arr0")`. The declaration was accepted
+    // where the identical `Array<int>` spelling is rejected — a SILENT
+    // acceptance inversion, and (once #6325's codegen arm materializes the
+    // literal) a real 120-byte leak: the array is allocated and nobody is
+    // named to dispose it. Spelling `owned Arr0<int>` is admitted either way;
+    // only the UNMARKED form changes verdict, and it now matches the type it
+    // is.
+    //
+    // `headName()` falls back to the syntactic head for every non-alias
+    // TypeRef, so every declaration that is not alias-spelled reaches the same
+    // string it did before — this changes no existing verdict except the
+    // alias-spelled ones the rule already intended to cover.
+    //
+    // Arm (B) below keeps the SYNTACTIC head: it is a name-set test against
+    // the declared generic parameter NAMES (a type parameter is a name in
+    // scope, not a type whose identity resolves), and the §14.2 `where`
+    // constraint it consults is spelled with that name. Alias-transparency is
+    // a property of a type, and (B) is about a name.
+    const std::string_view syntacticHead = returnType.name->parts.front();
+    const std::string_view head =
+        (rt && !rt->headName().empty()) ? rt->headName() : syntacticHead;
 
     // (A) CONCRETE class/interface return. Not in the announced set unless the
     // declared head is one of the type-keyed carves: Task-family, iterable/
@@ -16329,7 +16373,7 @@ static std::string_view staticReturnTypeRejected(
         auto inParams = [&](const std::vector<ast::GenericParam>* ps) -> bool {
             if (!ps) return false;
             for (const ast::GenericParam& g : *ps)
-                if (g.name == head) return true;
+                if (g.name == syntacticHead) return true;
             return false;
         };
         const bool methodLevel = inParams(methodGenericParams);
@@ -16340,7 +16384,7 @@ static std::string_view staticReturnTypeRejected(
         auto isValueConstrained = [&](const std::vector<ast::GenericConstraint>* cs) -> bool {
             if (!cs) return false;
             for (const ast::GenericConstraint& gc : *cs) {
-                if (gc.typeParam != head) continue;
+                if (gc.typeParam != syntacticHead) continue;
                 for (const ast::ConstraintItem& item : gc.items)
                     if (item.kind == "value") return true;
             }
@@ -16359,7 +16403,7 @@ static std::string_view staticReturnTypeRejected(
             if (p.modifier.find("owned") != std::string_view::npos) continue;
             if (p.modifier.find("out") != std::string_view::npos) continue;
             if (p.modifier.find("ref") != std::string_view::npos) continue;
-            if (bareReturnTypeMentionsParam(*p.type, head)) return {};
+            if (bareReturnTypeMentionsParam(*p.type, syntacticHead)) return {};
         }
         return head;  // empty-set bare-T → rejected — spell `owned T`
     }
@@ -16847,7 +16891,15 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                     mo.checkGetterFreshOwnedReturn(*acc.exprBody);
                 } else if (acc.bodyKind ==
                            ast::PropertyAccessorBodyKind::Block) {
-                    mo.scanGetterReturns(acc.stmts);
+                    // fix #6404 (§28.6, v0.338): the mint-announcing carve is
+                    // keyed on the getter's OWN declared return type — the
+                    // property's `type` — per §28.3's "The classification stays
+                    // by declared return type". `pd->type` is null for an
+                    // untyped property; a null return type is never
+                    // mint-announcing, so the carve simply does not apply.
+                    mo.scanGetterReturns(
+                        acc.stmts,
+                        pd->type ? ctx.resolvedType(*pd->type) : nullptr);
                 }
                 // fix #5621 (§28.3, v0.326): for block-bodied getters, scan
                 // return statements and check that any returned function value
