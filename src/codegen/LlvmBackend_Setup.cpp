@@ -38214,7 +38214,7 @@ bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
 // derives from `recvVal` BEFORE calling this (the backing is released here).
 void Emitter::freeUnboundOwnedBorrowingArrayTemp(
         const ast::Expr* recvExpr, llvm::Value* recvVal,
-        const sema::TypeRef* recvTy) {
+        const sema::TypeRef* recvTy, bool dictValueColumnEscapes) {
     if (!recvExpr || !recvVal) return;
     // #1013: a fresh unbound `Dictionary<K,V>` materializer temp (`a.ToDictionary
     // (k).Count()`) is dict-backed — reclaim it with bz_dict_free (the struct AND
@@ -38322,21 +38322,18 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
         // on the `.Count` arm ALONE — an arm that had carried the reclaim call
         // since #1013, because this line returned before reaching it.
         //
-        // WHAT IS STILL DECLINED, and is a separate gap this change does not
-        // close: a `Dictionary<K, string>` VALUE column co-owns a +1 per stored
-        // value (§28.9's runtime-managed tier; the reason `.Remove` uses
-        // `bz_dict_remove_str_disposing` with `stringElementReleaseThunk`), and
-        // `bz_dict_free`'s `dispose_val` argument is applied to the VALUE
-        // column. This function computes `elemDisp` from `genericArgs[0]` — for
-        // a Dictionary that is the KEY — so `elemDisp` stays NULL and those
-        // per-value +1s leak. That is exactly the behaviour the int-keyed
-        // `Dictionary<int, string>` twin already has today (its `elemIsString` is
-        // likewise false, so it too reaches `bz_dict_free(d, NULL)`), so the
-        // string-keyed head is now CONSISTENT with it rather than newly wrong.
-        // Recorded as a residual, not fixed here: the value column is a
-        // different column from the one this gate ever reasoned about, and
-        // adding `elemDisp` for it is a distinct change with its own
-        // exactly-once proof to make.
+        // WHAT IS STILL DECLINED, and is a different column from the one this
+        // gate ever reasoned about: the `Dictionary<K, string>` VALUE column
+        // co-owns a +1 per stored value (§28.9's runtime-managed tier; the
+        // reason `.Remove` uses `bz_dict_remove_str_disposing` with
+        // `stringElementReleaseThunk`), and `bz_dict_free`'s `dispose_val`
+        // argument is applied to that column. This function derives `elemDisp`
+        // from `genericArgs[0]` — for a Dictionary that is the KEY — so nothing
+        // here discharges the values. It is NOT a gap: the block below this one
+        // installs the value disposer from `genericArgs[1]`, which is the column
+        // `bz_dict_free` actually walks, for both key types. See there for the
+        // exactly-once proof and for the two call sites that must decline it
+        // because the value they hand back is one of those very slots.
         if (isSetFamilyHead) {
             auto* relFn = declareC("bz_set_string_keys_release",
                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
@@ -38384,7 +38381,36 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
     // excludes the owning family, and this head is a Dictionary-family one), and
     // a nullable `string?` value is excluded by the `!nullable` conjunct, so a
     // null value never reaches the release.
-    if (freeIsDict && !isSetFamilyHead) {
+    //
+    // fix-forward #6419 (§28.11 *Collection element ownership*, stdlib §4.8,
+    // v0.338): `dictValueColumnEscapes` is the fourth exclusion, and it is the
+    // one that makes the paragraph above true rather than nearly true. The
+    // exactly-once proof above counts discharges against the TABLE's own +1s;
+    // it says nothing about a reference the CALL SITE has already handed to the
+    // caller out of one of those same slots. `decodeDictValueAt` returns a
+    // pointer-typed V as "a borrow" — the identical `bz_string*` the table
+    // holds — so on the First/Last/Single/ElementAt terminal (and on a dict
+    // for-in loop whose loop variable an escaping closure captured) discharging
+    // here frees the block the caller is about to read.
+    //
+    // MEASURED on dc3c8f2a (this fix's parent), 101 iterations,
+    // `bezelc --sanitize=address`, `var e := P.MakeDict().First(); n := n +
+    // e.Value.Length;` over `Dictionary<string,string>` — and identically for
+    // `Dictionary<int,string>` and for the escaping-capture for-in shape:
+    //
+    //   ==ERROR: AddressSanitizer: heap-use-after-free on address 0x... READ ...
+    //   freed by thread T0 here: #0 free  #1 bz$strElemRelease
+    //
+    // The base (dc3c8f2a^) runs all three to completion with correct output and
+    // leaks only — so this is a regression dc3c8f2a introduced, not a gap it
+    // found. The table free itself is sound on those arms (the base runs it,
+    // and the returned `DictionaryEntry` holds no pointer into the buckets or
+    // the key copies — its Key is rebuilt fresh by `decodeDictStringKeyAt`), so
+    // the DECLINE here is of the value discharge only, not of the free: the
+    // backing, the bucket array, the order spine and every key byte-copy are
+    // still reclaimed. What leaks is one +1 per stored value, which is §28.3's
+    // stated safe direction and is what these arms measured before #6419 at all.
+    if (freeIsDict && !isSetFamilyHead && !dictValueColumnEscapes) {
         const sema::TypeRef* vEl =
             (recvTy && recvTy->genericArgs.size() > 1)
                 ? recvTy->genericArgs[1] : nullptr;

@@ -88,6 +88,17 @@
 // type alone. Placing one there needs its own exactly-once proof and is a
 // separate change.
 //
+// AND WHAT HALF 3 ITSELF IS SUBJECT TO (fix-forward #6419, the LAST section of
+// this file). That paragraph's exactly-once proof counts DISCHARGES against the
+// table's own +1s. It does not cover a reference the call site has already
+// handed to the caller OUT of one of those same slots — and `.First`/`.Last`/
+// `.Single`/`.ElementAt` do exactly that, because `decodeDictValueAt` returns a
+// pointer-typed V as "a borrow" (the table's own `e.val`), as does the dict
+// for-in loop's loop variable. On those arms the cascade is a heap-use-after-
+// free, not a leak. So the arm list above is right and the REASONING was not
+// complete: the fix-forward adds the escape axis, declines the value discharge
+// at the two sites that hand a slot out, and keeps the table free everywhere.
+//
 // A leak pin must prove its detector ran. `runAotChecked` defaults to
 // `ASAN_OPTIONS=detect_leaks=0`, so a plain row is VACUOUS for a leak: green on
 // a broken tree while showing a clean sanitizer trio. Every leak row below arms
@@ -99,6 +110,7 @@
 // found at LSan defaults.
 
 #include <cstdlib>
+#include <regex>
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -108,6 +120,7 @@
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
+using bezel::test::runAotCheckedLenient;
 
 namespace {
 
@@ -238,6 +251,62 @@ void expectGenKeyArmNoLeak(const char* armBody, int expectedAcc) {
         BEZEL_EXPECT_TRUE(r.stdoutText.find(std::to_string(expectedAcc)) !=
                           std::string::npos);
     }
+}
+
+// ===========================================================================
+// THE ESCAPE AXIS (fix-forward #6419) — helpers.
+//
+// `r.ran == false` is AMBIGUOUS for these rows: a LeakSanitizer finding and a
+// heap-use-after-free both stop the process with a non-zero status, and these
+// arms legitimately leak the values they decline to discharge. So the oracle
+// here is NOT `r.ran` — it is (a) a crash-oracle row with LeakSanitizer OFF,
+// where `r.ran` IS unambiguous, and (b) a separate magnitude row for the leak.
+// Folding the two into one `runAotChecked` row would let the leak mask the
+// crash it is standing next to.
+
+// A crash row: LeakSanitizer OFF (`runAotCheckedLenient` — the same oracle
+// `dict_entry_for_var_capture_escaping_release_4161_test.cpp` uses, for the
+// same reason: the path deliberately leaves a runtime-managed value leaking,
+// never trading a leak for a use-after-free, so a strict LSan oracle would
+// flag the accepted trade-off as a regression). Here `r.ran` is unambiguous —
+// it is false if and only if the generated program died on a memory error.
+void expectNoMemoryError(const std::string& program, const char* expected) {
+    JitResult r = runAotCheckedLenient(program);
+    // Loud-first, silent-second, in that order — never `if (skipped) return;`
+    // before the assertion (see the file header).
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    if (skipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find(expected) != std::string::npos);
+}
+
+// A no-leak row (the shape that is NOT an escape): strict LSan armed.
+void expectNoLeak(const std::string& program, const char* expected) {
+    LeakEnv scope("strict");
+    JitResult r = runAotChecked(program);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    if (skipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find(expected) != std::string::npos);
+}
+
+// Total bytes LSan reports as leaked, or 0 when it reports no leak at all.
+// §30 (and the sibling files' own `leaksAtLeast`): never pin an EXACT byte
+// count — LSan is conservative and its totals jitter. The caller asserts a
+// generous CEILING, whose job is to separate two regimes that differ by ~6x,
+// not to pin a number.
+long leakedBytes(const std::string& program) {
+    LeakEnv scope("strict");
+    JitResult r = runAotChecked(program);
+    static const std::regex kLeak(R"(AddressSanitizer: (\d+) byte\(s\) leaked)");
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        std::smatch m;
+        if (std::regex_search(d.message, m, kLeak))
+            return std::stol(m[1].str());
+    }
+    return 0;
 }
 
 }  // namespace
@@ -510,4 +579,242 @@ BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("101") != std::string::npos);
+}
+// ===========================================================================
+// THE ESCAPE AXIS (fix-forward #6419, §28.11 *Collection element ownership*,
+// stdlib §4.8, v0.338).
+//
+// WHAT IS PINNED HERE, AND WHY THE FILE HEADER'S HALF-3 PARAGRAPH IS NOT THE
+// WHOLE STORY. Half 3 cascades the §28.11 value column on every reclaim of a
+// `Dictionary<K, string>` receiver, because the +1 was taken at `.Add` and
+// `bz_dict_free`'s second argument walks exactly that column. What Half 3's
+// proof counted was DISCHARGES against the table's own +1s. It said nothing
+// about a reference the call site had already handed to the caller OUT of one
+// of those same slots — and two sites do.
+//
+// `.First()`/`.Last()`/`.Single()`/`.ElementAt()` build the returned
+// `DictionaryEntry<K,V>` with `decodeDictValueAt`, which for a pointer-typed V
+// passes `e.val` through "as a borrow" (the runtime says the same in
+// `bz_dict_values_str`'s own header: "the values themselves are owned by the
+// dictionary and must NOT be freed by the caller"). The dict for-in loop's loop
+// variable holds the same borrow, and a closure that captures it and ESCAPES
+// the loop keeps it alive past the loop-exit reclaim.
+//
+// So on those arms dc3c8f2a freed the block the caller was about to read.
+// MEASURED on dc3c8f2a, 101 iterations, `bezelc --sanitize=address`,
+// ASAN_OPTIONS=detect_leaks=1:
+//
+//   var e := P.MakeDict().First(); n := n + e.Value.Length;   // Dictionary<string,string>
+//   ==ERROR: AddressSanitizer: heap-use-after-free on address 0x7bbddcbe0048
+//   READ of size 8 at 0x7bbddcbe0048 thread T0
+//   freed by thread T0 here:
+//       #0 ... in free
+//       #1 0x0000003672a5 in bz$strElemRelease bezel
+//   exit=1
+//
+// The base (dc3c8f2a^) runs the identical program to completion with correct
+// output (`303`) and leaks only — so this is a regression dc3c8f2a INTRODUCED,
+// not a gap it found. The three rows below pin all three reachable shapes, and
+// `for_in_..._without_a_capture_still_discharges_each_reference_once` is the
+// control that keeps the remedy from being the blunt one (declining the whole
+// reclaim, which `freeFreshInputTempUnlessStringElementEscapes` does one block
+// over for an `Array<string>` element terminal): that control would give back
+// the leak fix for the common, non-capturing loop.
+// ===========================================================================
+
+// A string-keyed `Dictionary<string,string>` producer whose values are `+1`
+// producers (concatenation), so each stored value carries the table's own +1.
+static std::string strValProducer() {
+    return
+        "module M; "
+        "class P public "
+        "  static method MakeDict(): owned Dictionary<string, string> "
+        "    var d: Dictionary<string, string> := "
+        "        new Dictionary<string, string>(); "
+        "    d.Add(\"aa\", \"va\" + \"a\"); d.Add(\"bb\", \"vb\" + \"b\"); "
+        "    return d; "
+        "  end MakeDict; "
+        "end P; ";
+}
+
+BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
+           first_on_a_string_valued_dictionary_does_not_free_the_entry_it_returns_spec_28_11) {
+    // 3 (the first entry's value "vaa") x 101.
+    expectNoMemoryError(
+        strValProducer() +
+        "class C public "
+        "  static method Main(): int "
+        "    var i := 0; "
+        "    var n := 0; "
+        "    while " + std::string(kIterations) + " do "
+        "      var e := P.MakeDict().First(); "
+        "      n := n + e.Value.Length; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(n); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ",
+        "303");
+}
+
+// The int-keyed twin. It is a separate row and not a variation for its own
+// sake: `e.val` is the value column for BOTH key modes, but the two key modes
+// reach this arm through DIFFERENT snapshot calls (`bz_dict_values_str` vs
+// `bz_dict_values_gen`), and a fix that gated only on the key spelling would
+// leave one of them crashing.
+BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
+           first_on_an_int_keyed_string_valued_dictionary_does_not_free_the_entry_it_returns_spec_28_11) {
+    expectNoMemoryError(
+        "module M; "
+        "class P public "
+        "  static method MakeDict(): owned Dictionary<int, string> "
+        "    var d: Dictionary<int, string> := new Dictionary<int, string>(); "
+        "    d.Add(1, \"va\" + \"a\"); d.Add(2, \"vb\" + \"b\"); "
+        "    return d; "
+        "  end MakeDict; "
+        "end P; "
+        "class C public "
+        "  static method Main(): int "
+        "    var i := 0; "
+        "    var n := 0; "
+        "    while " + std::string(kIterations) + " do "
+        "      var e := P.MakeDict().First(); "
+        "      n := n + e.Value.Length; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(n); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ",
+        "303");
+}
+
+// The dict for-in loop's own reclaim (LlvmBackend_Stmts.cpp), with an ESCAPING
+// capture. This is the shape the loop's own Key release is already gated on
+// (`forVarCapturedEscaping`, fix #4161) — the Value needed the same authority,
+// which is why the fix-forward passes that predicate rather than inventing a
+// second one. Ordinary completion, no `return` anywhere: the closure is
+// assigned to an outer local and called after the loop has already reclaimed
+// the table.
+BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
+           for_in_over_a_string_valued_dictionary_with_an_escaping_capture_does_not_free_the_entry_spec_28_11) {
+    expectNoMemoryError(
+        "module M; "
+        "class P public "
+        "  static method MakeDict(): owned Dictionary<string, string> "
+        "    var d: Dictionary<string, string> := "
+        "        new Dictionary<string, string>(); "
+        "    d.Add(\"aa\", \"va\" + \"a\"); d.Add(\"bb\", \"vb\" + \"b\"); "
+        "    return d; "
+        "  end MakeDict; "
+        "  static method MakeClosure(): () -> int "
+        "    var f: () -> int := lambda() => 0; "
+        "    for var entry in P.MakeDict() do "
+        "      f := lambda() => entry.Value.Length; "
+        "    end for; "
+        "    return f; "
+        "  end MakeClosure; "
+        "end P; "
+        "class C public "
+        "  static method Main(): int "
+        "    var i := 0; "
+        "    var n := 0; "
+        "    while " + std::string(kIterations) + " do "
+        "      var g := P.MakeClosure(); "
+        "      n := n + g(); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(n); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ",
+        "303");
+}
+
+// THE CONTROL, and the row that decides between the two candidate remedies.
+// The NON-capturing twin of the loop above must stay LEAK-FREE: with the
+// disposer installed (dc3c8f2a's behaviour, and unchanged by this fix-forward)
+// it measures exit 0, correct output and NO leak. A remedy that declined the
+// value discharge on this arm unconditionally — the blunt reading of "a
+// for-in loop's entries are borrows" — would leave 101 x 2 strings outstanding
+// and fail here. So the gate is the escape, not the arm.
+//
+// 6 (both entries, 3 each) x 101 = 606.
+//
+// Proven non-vacuous the same way: built with the blunt remedy (the escape gate
+// made unconditional at this site) the same loop measures 7,272 B / 404 allocs
+// under LSan and this row reports `assertion failed: r.ran`. So the gate is
+// measured to be the escape and not the arm.
+BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
+           for_in_over_a_string_valued_dictionary_without_a_capture_still_discharges_each_reference_once_spec_28_11) {
+    expectNoLeak(
+        strValProducer() +
+        "class C public "
+        "  static method Main(): int "
+        "    var i := 0; "
+        "    var n := 0; "
+        "    while " + std::string(kIterations) + " do "
+        "      for var e in P.MakeDict() do "
+        "        n := n + e.Value.Length; "
+        "      end for; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(n); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ",
+        "606");
+}
+
+// THE TABLE IS STILL RECLAIMED. The escape axis declines the VALUE DISCHARGE,
+// not the free — so on the `.First` arm the header, the bucket array, the
+// insertion-order spine and every per-key byte copy are still reclaimed (the
+// returned entry points into none of them: its Key is rebuilt fresh by
+// `decodeDictStringKeyAt`, its Value is a `bz_string*` the dict free does not
+// own). This row pins that with a LEAK CEILING, which is the only observable
+// that distinguishes "declined the discharge" from "declined the reclaim".
+//
+// Measured at 101 iterations over the 2-entry `strValProducer()`
+// (`bezelc --sanitize=address`, ASAN_OPTIONS=detect_leaks=1), and the ceiling
+// row was MEASURED green/red against a build carrying the blunt remedy rather
+// than assumed:
+//
+//   this fix                                   7,272 B / 404 allocs
+//   the blunt remedy (decline the whole free) 49,894 B / 909 allocs
+//   dc3c8f2a                                   no leak summary at all — the
+//                                              heap-use-after-free aborts before
+//                                              LSan reports
+//
+// The ceiling sits ~2.7x above the measured value and ~2.5x below the blunt
+// remedy, so it survives LSan's conservative-scan jitter in either direction
+// while still failing the remedy this fix rejects. PROVEN, not asserted: with
+// the blunt remedy built, this row reports
+// `assertion failed: leaked <= kCeiling` — so it is not a vacuous green that
+// would also have passed before the fix.
+//
+// (Note the `dc3c8f2a` line: on that tree this row is a VACUOUS green, because
+// a use-after-free suppresses the leak summary entirely and `leakedBytes`
+// returns 0. That is why the UAF it would otherwise cover is pinned by the
+// three crash-oracle rows above, on a separate oracle, rather than by this
+// one.)
+BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
+           first_still_reclaims_the_dictionary_backing_on_an_escaping_value_arm_spec_28_3) {
+    const long kCeiling = 20000;
+    const long leaked = leakedBytes(
+        strValProducer() +
+        "class C public "
+        "  static method Main(): int "
+        "    var i := 0; "
+        "    var n := 0; "
+        "    while " + std::string(kIterations) + " do "
+        "      var e := P.MakeDict().First(); "
+        "      n := n + e.Value.Length; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(n); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ");
+    BEZEL_EXPECT_TRUE(leaked <= kCeiling);
 }

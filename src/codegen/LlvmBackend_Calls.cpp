@@ -9134,7 +9134,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // a no-op for the common named-local receiver. Mirrors the
             // `.Count()` arm's identical call, placed last since it is the
             // final use of `recv`.
-            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+            //
+            // fix-forward #6419 (§28.11 *Collection element ownership*, stdlib
+            // §4.8, v0.338): the `dictValueColumnEscapes` argument is the
+            // escape axis and it is `true` here, which is the whole content of
+            // this fix-forward. The
+            // `DictionaryEntry<K,V>` this arm is about to RETURN holds
+            // `dtValDecoded`, and `decodeDictValueAt` produced that by passing a
+            // pointer-typed V straight through "as a borrow" — it IS the table's
+            // own `e.val`. `bz_dict_values_str`/`_gen` say so in their own
+            // header ("the values themselves are owned by the dictionary and
+            // must NOT be freed by the caller"), and this arm's own opening
+            // comment already records the consequence for `OwningDictionary`:
+            // the value "is disposed exactly once, at the dictionary's own
+            // scope end — never here".
+            //
+            // So the table is still reclaimed (header, buckets, order spine,
+            // every key byte-copy — nothing the returned entry points into: its
+            // Key is rebuilt fresh by `decodeDictStringKeyAt`, its Value is a
+            // `bz_string*` the free does not own), and only the §28.11 value
+            // DISCHARGE is declined. Declining the whole reclaim instead — what
+            // `freeFreshInputTempUnlessStringElementEscapes` does one block
+            // over for an `Array<string>` element terminal — would give back the
+            // table leak too, and the measurement shows the table free is sound
+            // here.
+            //
+            // MEASURED on this fix's parent (dc3c8f2a), 101 iterations,
+            // `bezelc --sanitize=address`, `Dictionary<string,string>` AND the
+            // int-keyed `Dictionary<int,string>` twin:
+            // `==ERROR: AddressSanitizer: heap-use-after-free ... freed by
+            // thread T0 here: #0 free #1 bz$strElemRelease`, exit 1. The base
+            // (dc3c8f2a^) runs the same program to completion, correct stdout,
+            // leaks only — so dc3c8f2a introduced this, and declining the
+            // discharge removes it.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy,
+                                               /*dictValueColumnEscapes=*/true);
 
             llvm::Value* dtEntryVal = llvm::UndefValue::get(dtEntryStTy);
             dtEntryVal = builder_.CreateInsertValue(dtEntryVal, dtKeyDecoded, {0u});

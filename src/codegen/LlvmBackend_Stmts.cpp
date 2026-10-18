@@ -8956,8 +8956,30 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // ownerless dict materializer (its narrow guard) — a bound / `move`d /
     // aliased dict is never matched, so no UAF / double-free. The temp key/value
     // extraction arrays are freed above first; this frees the dict itself.
+    //
+    // fix-forward #6419 (§28.11 *Collection element ownership*, stdlib §4.8,
+    // v0.338): the escape axis, read from the SAME `forVarCapturedEscaping`
+    // predicate this function's own Key release consults above (fix #4161) —
+    // one authority for "can this loop variable outlive the loop", read twice
+    // rather than re-derived. The loop var's field 1 is `decodeDictValueAt`'s
+    // borrow of `e.val`, exactly as at the First/Last/Single/ElementAt
+    // terminal; when a closure captured the loop var and may escape, the boxed
+    // cell is a shallow copy holding that same pointer, so the value outlives
+    // this reclaim. Declining only the §28.11 value DISCHARGE (the table free
+    // is unaffected) is what keeps the common, non-capturing shape leak-free.
+    //
+    // MEASURED on dc3c8f2a, 101 iterations, `bezelc --sanitize=address`, an
+    // escaping `lambda() => entry.Value.Length` assigned to an outer `f` inside
+    // the body and called after the loop returns:
+    // `==ERROR: AddressSanitizer: heap-use-after-free ... freed by thread T0
+    // here: #0 free #1 bz$strElemRelease`. The NON-capturing twin of the same
+    // loop measures clean on dc3c8f2a (exit 0, correct stdout, no leak), which
+    // is why the gate is `forVarCapturedEscaping` and not unconditional — an
+    // unconditional decline would trade that leak-free shape back for a leak.
     freeUnboundOwnedBorrowingArrayTemp(fs.iterable.get(), dictObj,
-                                       ctx_.exprType(*fs.iterable));
+                                       ctx_.exprType(*fs.iterable),
+                                       /*dictValueColumnEscapes=*/
+                                           forVarCapturedEscaping);
     return true;
 }
 

@@ -19381,9 +19381,56 @@ private:
     // result from `recvVal` first (the backing is released here). Shared by the
     // chained-method-receiver sites and the `.Length`/`.Count` borrow-position
     // property read.
+    //
+    // fix-forward #6419 (§28.11 *Collection element ownership*, §28.3, stdlib
+    // §4.8, v0.338): `dictValueColumnEscapes` is the escape axis the per-value
+    // disposer has to know about, and it is a PARAMETER rather than something
+    // this function can derive — only the CALL SITE knows whether the value the
+    // call hands back is one of the receiver's own `e.val` slots.
+    //
+    // The discharge itself is #6419's change 3: a borrowing `Dictionary<K,
+    // string>` co-owns a +1 per stored VALUE (§28.11), the +1 was taken at
+    // `.Add`, and `bz_dict_free`'s second argument is applied to exactly that
+    // column — so a reclaim that frees the table WITHOUT it strands one +1 per
+    // entry. That is right for every arm whose RESULT aliases nothing, and
+    // wrong — a heap-use-after-free — for the two that hand the caller a
+    // reference to one of those very slots:
+    //
+    //   * `tryLowerCollectionInstanceCall`'s `isDict` First/Last/Single/
+    //     ElementAt snapshot (LlvmBackend_Calls.cpp) builds its returned
+    //     `DictionaryEntry<K,V>` by `decodeDictValueAt`, which for a
+    //     pointer-typed V passes `e.val` through "as a borrow" — the runtime's
+    //     own words for `bz_dict_values_str`/`_gen` are "the values themselves
+    //     are owned by the dictionary and must NOT be freed by the caller".
+    //     MEASURED heap-use-after-free, freed by `bz$strElemRelease`.
+    //   * `lowerDictEntryFor`'s loop-exit reclaim (LlvmBackend_Stmts.cpp), when
+    //     a closure captures the loop variable and may ESCAPE the loop: the
+    //     boxed cell is a shallow copy holding the same `e.val`, so calling the
+    //     closure after the loop reads freed memory. Same free stack.
+    //     (That site already reads the same `forVarCapturedEscaping` predicate
+    //     for its KEY release — fix #4161 — so the two share one authority.)
+    //
+    // When it is set, the table is still freed (its backing, buckets, order
+    // spine and per-key byte copies are the table's own and nothing else reads
+    // them) and only the VALUE discharge is declined: those +1s leak, which is
+    // §28.3's stated safe direction and strictly less than the leak the whole
+    // reclaim would cost. Minting the +1 HERE instead (so the caller's
+    // reference is its own) is NOT the alternative, for the reason
+    // `freeFreshInputTempUnlessStringElementEscapes` already records for the
+    // `Array<string>` element-returning terminals: it would need
+    // `isPlusOneStringProducer` to learn these arms are +1 producers, and
+    // nothing on the `DictionaryEntry` consumption side releases the extra +1
+    // — an unconditional retain is a leak wearing the fix's clothes.
+    //
+    // Every other call site passes the default `false`, and that default is
+    // CORRECT for all of them: each one's result is an `int`, a `bool`, a
+    // `unit`, or nothing at all. The enumeration behind that claim is in
+    // #6419's fix-forward commit body — a new VALUE-returning dict arm must
+    // pass `true` here or it inherits a use-after-free.
     void freeUnboundOwnedBorrowingArrayTemp(const ast::Expr* recvExpr,
                                             llvm::Value* recvVal,
-                                            const sema::TypeRef* recvTy);
+                                            const sema::TypeRef* recvTy,
+                                            bool dictValueColumnEscapes = false);
     // fix #1909 / §17.13 / §28.3 / §28.11: dispose an UNBOUND owned temporary
     // whose type is an OWNING collection (OwningArray/OwningDictionary/
     // OwningSet/OwningStack/OwningQueue/OwningLinkedList) — the discard
