@@ -791,5 +791,18 @@ else
     echo "EXTRACT: clean (${NCASES:-?} fragments extracted, extractor exit 0)"
 fi
 
+# ---- 5. GRAMMAR: the editor grammars match Appendix B ----------------------
+# editors/vscode's TextMate grammar and the docs site's highlight.js language
+# are generated from the keyword lists of Appendix B; a keyword added to or
+# retired from the spec without regenerating them fails here.
+python3 scripts/gen_editor_grammars.py --check || STRUCT=1
+
+# ---- 6. BOOK: the docs site splits without breaking a link ----------------
+# scripts/build_book.py splits the documents into mdBook pages and rewrites
+# their links; --check verifies every link that resolves in a document still
+# resolves on the split site (no mdbook needed). The landing builds the site
+# itself (docs/proposals/spec-change-process.md, *Landing*).
+python3 scripts/build_book.py --check || STRUCT=1
+
 [ "$STRUCT" -eq 0 ] && echo "check_docs: OK" || echo "check_docs: FAIL"
 exit "$STRUCT"

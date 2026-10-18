@@ -62,12 +62,14 @@ Two rules make the classification honest:
 
 ## 3. The mechanical gate — `scripts/check_docs.sh`
 
-**NEW (this document ships it).** Every revision, of every class, must pass `scripts/check_docs.sh` before it lands. It is the docs-side counterpart to `scripts/gate.sh`: one blessed command, four checks, non-zero exit on any structural failure.
+**NEW (this document ships it).** Every revision, of every class, must pass `scripts/check_docs.sh` before it lands. It is the docs-side counterpart to `scripts/gate.sh`: one blessed command, six checks, non-zero exit on any structural failure.
 
 1. **Anchor resolution** — every intra/cross-doc `[…](file#anchor)` link resolves, against both anchor styles the repo uses (explicit `<a id="sec-…">` for cross-references and GitHub heading-slugs for the tables of contents).
 2. **Version consistency** — the spec/stdlib/rationale/changelog headers agree on the revision, and `Bezel_Changelog.md` has exactly one `### v0.NNN changelog` entry for it. *(This is the check that caught the v0.184 header drift.)*
 3. **§-citation typo lint** (advisory) — spec §-references to section numbers with no heading are flagged; advisory because legitimately-cross-doc citations produce residual noise.
 4. **Example-extraction parity** — `scripts/extract_doc_examples.py` runs clean over the *current* docs into a scratch tree, so a malformed code example is a hard failure. It never touches the committed conformance corpus (see §7 on `#1380`).
+5. **Editor grammars** — `scripts/gen_editor_grammars.py --check`: the VS Code extension's TextMate grammar (`editors/vscode/`) and the docs site's highlight.js language are generated from Appendix B's keyword lists, so a keyword added or retired without regenerating them fails here. Fix: run the script without `--check` and commit its output.
+6. **Docs-site split** — `scripts/build_book.py --check`: the documents are split into the mdBook site's pages and every rewritten link is checked; a link that resolves in a document but not on the split site fails. No `mdbook` is needed for the check.
 
 `scripts/check_docs.sh --quick` runs checks 1–3 (skips extraction) for a fast inner-loop check while drafting.
 
@@ -188,6 +190,7 @@ For a **ruling** or a **design-change graduation** (the full path):
 - [ ] Dry-run all edits as one sequence — each `old` unique, applies clean.
 - [ ] Bump the four version headers in lockstep; write the single shared changelog entry with its Migration note (§5).
 - [ ] `scripts/check_docs.sh` passes (§3).
+- [ ] **Build the docs site:** `scripts/build_book.py` (needs `mdbook` 0.4.52) splits the documents and runs `mdbook build` into `build/book/html`; it must finish clean. If Appendix B changed, `scripts/gen_editor_grammars.py` has regenerated the editor grammars in the same commit (check 5 enforces it). After the push to `main`, the *Docs site* workflow (`.github/workflows/docs-site.yml`) publishes the site.
 - [ ] File a tracking issue, labelled `spec-tracking`, for every spec-ahead-of-impl delta; comment/close the issues the revision resolves (§5).
 - [ ] **If any ruling changes a verdict: sweep `tests/conformance/rules/` for cases stating the old rule and fix them in the same commit** (§5 item 3c). Search by rule text and construct, not by section number; fix each case's `rule:` header too; delete rather than bend a case the revision makes unwritable, recording why.
 - [ ] **Before asserting any absence** — that something does not exist, is not admitted, or is a compile error — grep `src/` and `tests/` for it (§5 item 3b). If the implementation provides it, that is an impl-ahead-of-spec delta with its own issue; if the check cannot settle it, record the question and the probe rather than the absence.

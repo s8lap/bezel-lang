@@ -1,0 +1,55 @@
+# Publishes the documentation site (mdBook) to GitHub Pages.
+#
+# The pages are generated from docs/ by scripts/build_book.py, the same script
+# the spec landing runs (docs/proposals/spec-change-process.md, *Landing*).
+# Needs no LLVM, so it runs while the compiler CI is disabled.
+#
+# One-time setup: Settings → Pages → Source: "GitHub Actions". Pages on a
+# private repository needs a paid plan; on a public one it is free.
+name: Docs site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'scripts/build_book.py'
+      - '.github/workflows/docs-site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdBook
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin
+          mdbook --version
+      - name: Check and build the site
+        run: |
+          python3 scripts/build_book.py --check
+          python3 scripts/build_book.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/book/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

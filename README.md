@@ -120,6 +120,8 @@ docs/   normative spec, standard library, design rationale, changelog, guides
 - `docs/Bezel_Changelog.md` — the per-revision narrative history and migration notes
 - `docs/Bezel_Guide_01_Memory_and_Ownership.md`,
   `docs/Bezel_Guide_02_Errors_and_Nullability.md` — example-first guides
+- The documentation site: `scripts/build_book.py` builds it with mdBook from `docs/` into `build/book/html` (published to GitHub Pages by `.github/workflows/docs-site.yml`)
+- `editors/vscode/` — the VS Code extension (syntax highlighting, editing rules, snippets); its grammar is generated from the spec by `scripts/gen_editor_grammars.py`
 - `CLAUDE.md` — working discipline; `tests/README.md` — test-writing guide
 
 ## License
