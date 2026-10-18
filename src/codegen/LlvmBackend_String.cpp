@@ -3821,6 +3821,52 @@ llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
 // exact hazard emitChoiceEquality's own header comment documents). The
 // switch's default (an out-of-range tag; defensive only, never reachable
 // for a validly-constructed value) yields the bare type name.
+//
+// fix #6458: the THIRD spelling of the payload-substitution defect #6169
+// fixed at `emitChoiceEquality` / `emitChoiceHashCode` (LlvmBackend_Layout.cpp
+// — the same `grep -rn 'pTy = \*instTy->genericArgs\[i\]' src/codegen/`).
+// A case payload spells its nullability at the PAYLOAD SITE (`choice W<T>
+// Ok(v: T?)`); the concrete type ARGUMENT carries none of it (`W<Col>`'s
+// `Col` is non-nullable). BOTH payload-type resolutions below — the
+// `instTy->genericArgs` substitution (fix #4278) and `resolveTypeParamRef` —
+// returned the bare substituted type and dropped the `?`, so a `T?` payload of
+// a choice argument read back as a NON-NULLABLE `Col`. That is sound for
+// `fieldVal` only if it were the bare choice struct, and it is not:
+// `nullableValueStructTy` wraps a nullable choice as `{i8 hasValue;
+// <choiceStruct>}` (its `isNullableChoiceTy` arm, #2447). The mismatch skipped
+// `emitValueToString`'s null-safe nullable-value arm (`isNullableValueTy`,
+// which DOES include `isNullableChoiceTy`) and fell into the bare-choice arm
+// instead, which read the `hasValue` flag as the case tag and indexed payload
+// slot `{2,0}` on a two-field wrapper — `CreateExtractValue`'s null result
+// segfaulted in `Value::setName` (bezelc exit 139, `W<Col>.Ok(null).ToString()`
+// and `W<Col>.Ok(pn).ToString()` over a null `pn: Col?`; gdb `#4
+// emitChoiceToString (LlvmBackend_String.cpp:3883) <- #5 emitValueToString
+// (:3314) <- #6 emitChoiceToString (:3914)`). Per §9.2 "`T?` where `T` is
+// admissible" and §8.5/§35.7's rendering rules, `Col?` IS admissible, so sema
+// accepting the program is correct and the codegen read was the defect. Both
+// resolutions now OR the declared nullability in; nullable is idempotent, so an
+// argument that is itself nullable (`W<Col?>`) stays nullable.
+//
+// Fixed at THIS call site rather than inside `resolveTypeParamRef`, which drops
+// a nullable `T?` and is reached from ~163 call sites across ElementPolicy,
+// Async, Calls, Calls2, Calls3, Assign, Exprs, Exprs2, Stmts, Setup, Disposal,
+// Layout and String. Do NOT narrow that helper: it returns a raw
+// `const sema::TypeRef*` INTO `genericSubstSemaTy_`, and constness is
+// load-bearing (it is injected as `isFreshOwnedClassProducer`'s shared
+// TypeParamResolver hook). Carrying the `?` out of it means a CALLER-LOCAL
+// buffer, and that buffer must outlive every dereference of the pointer the
+// helper hands back — the scope hazard fix #3487 corrected in
+// `LlvmBackend_Assign.cpp`, whose `concrHolder` is declared in the scope that
+// outlives the dereference rather than inside the inner `if`. The SANCTIONED
+// accessor for exactly this defect is `nullableTypeParamConcrete`
+// (`LlvmBackend_impl.hpp`, 13 uses), which hands the nullable copy back BY
+// VALUE into a caller-owned `sema::TypeRef&` so that obligation stays explicit
+// at the site; teaching the raw-pointer helper to do the same would push it
+// onto ~163 call sites at once. Per-site OR is the shape and is byte-identical
+// to #6169's, which fixed its own two sites the same way;
+// `LlvmBackend_Assign.cpp` and `LlvmBackend_Calls.cpp` reach the same two
+// resolutions through `nullableTypeParamConcrete`.
+// per §9.2, §8.5, §35.7
 llvm::Value* Emitter::emitChoiceToString(llvm::Value* val,
                                          const sema::TypeSymbol* choiceTy,
                                          const sema::TypeRef* instTy) {
@@ -3898,6 +3944,8 @@ llvm::Value* Emitter::emitChoiceToString(llvm::Value* val,
                                 choiceTy->genericParams[i]->name == head &&
                                 i < instTy->genericArgs.size()) {
                                 pTy = *instTy->genericArgs[i];
+                                // fix #6458 — see the header note above.
+                                pTy.nullable = pTy.nullable || rawTy->nullable;
                                 break;
                             }
                         }
@@ -3906,9 +3954,12 @@ llvm::Value* Emitter::emitChoiceToString(llvm::Value* val,
                         if (rawTy) pTy = *rawTy;
                     }
                 } else {
-                    if (const sema::TypeRef* rt =
-                            resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                    // Top-level call or no instTy: use the prior path.
+                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+                    if (const sema::TypeRef* rt = resolveTypeParamRef(rawTy))
                         pTy = *rt;
+                    // fix #6458 — see the header note above.
+                    pTy.nullable = pTy.nullable || (rawTy && rawTy->nullable);
                 }
             }
             llvm::Value* fieldStr = emitValueToString(fieldVal, &pTy);
