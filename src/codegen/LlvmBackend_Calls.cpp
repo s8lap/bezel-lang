@@ -4155,9 +4155,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // reading only `exprBody`, and is clean once this reads the
             // ReturnStmt; the base measures 30,352 B / 1,412 on the same
             // program, so the residual was under-discharge on both sides, never
-            // unsoundness. (`isPlusOneStringProducer(nullptr)` is TRUE by the
-            // string-literal rule, so an absent body must never be passed to
-            // it — hence the explicit `value` check.)
+            // unsoundness. The `aggFoldBody &&` guard (line 4173) prevents the
+            // call from reaching `isPlusOneStringProducer` when the fold body
+            // is absent; the function itself returns false on a null argument.
             const auto* foldLam =
                 dynamic_cast<const ast::LambdaExpr*>(call.args[1].value.get());
             const ast::Expr* aggFoldBody = nullptr;
