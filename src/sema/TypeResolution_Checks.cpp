@@ -6293,16 +6293,60 @@ void Resolver::checkDuplicateTopLevelTypes() {
     }
 }
 
+// fix #6445 (§11.6 "Nested types" / §12.10, v0.338): the roots of this walk
+// must include every NESTED type, not only `ctx_.module()->children`.
+//
+// The pre-fix loop rooted the DFS at module children alone, so a cycle whose
+// every member sits inside another type was never entered and never reported.
+// §12.10 requires an ERROR for it ("no type may, directly or transitively,
+// list itself among its base classes"), and with the diagnostic missing the
+// cycle reached codegen, where `Emitter::classStruct`'s base-chain walk
+// (`for (const TypeSymbol* cur = t; cur;) { cur = baseClassOf(cur); }`,
+// LlvmBackend_Layout.cpp) has no cycle guard at all and spins forever — a
+// hang with no output, MEASURED at rc=124/40s on `class Outer` holding
+// `private class P1 : P2` / `private class P2 : P1`. The fix is to make the
+// nested types reachable as ROOTS, never to bound either walk: a depth cap
+// would convert the hang into a silent acceptance, and §12.10 wants the
+// diagnostic.
+//
+// Nested types are reached through the one shared recursive walk,
+// `sema/NestedTypeWalk.hpp`'s `visitTypeAndNested` (§11.6, fix #3574) — the
+// same accessor thirteen other passes in this file use, rather than a
+// hand-copied member walk. `checkInheritanceCycles` walks the module children
+// ITSELF and adds the nested arms through that helper, because the module
+// children are not all types: §21.10 method-LOCAL types are registered there
+// too (see the sibling loop in checkDuplicateTopLevelTypes), are legitimately
+// cycle-checked today, and `forEachTypeAndNested` deliberately does not reach
+// them. Dropping them here would trade this hang for a second one.
+//
+// `done` stays PER ROOT, exactly as before: sharing it across roots would let
+// the first root's DFS mark a cycle participant "fully explored" and the
+// second root would return immediately without reporting it, losing the
+// second `circular inheritance` diagnostic the top-level repro emits.
+//
+// Nothing else rides on this iteration set. `checkCycleFrom` reads only
+// `baseTypes` (and `name`/`declLoc` for the message), reports only on a
+// genuine re-entry of a symbol already on the CURRENT DFS path, and drives no
+// generic substitution, no §12.9 variance composition and no §12.1 base-type
+// path walk — so adding roots cannot widen any other behaviour. The returned
+// `hadCycle` flag does gate checkAbstractImplementations /
+// checkStaticInterfaceConformance / checkHidingAndOverride (TypeResolution.cpp:
+// those three walks a base graph they cannot traverse finitely), and it can
+// now become true only for a program that is being REJECTED here.
 bool Resolver::checkInheritanceCycles() {
     if (!ctx_.module()) return false;
     std::unordered_set<TypeSymbol*> reported;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
+    auto walkRoots = [&](TypeSymbol* root) {
         std::unordered_set<TypeSymbol*> onStack;
         std::unordered_set<TypeSymbol*> done;
         std::vector<TypeSymbol*> path;
-        checkCycleFrom(t, onStack, done, path, reported);
+        checkCycleFrom(root, onStack, done, path, reported);
+    };
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        walkRoots(t);
+        bezel::sema::visitTypeAndNested(t, walkRoots);
     }
     return !reported.empty();
 }
