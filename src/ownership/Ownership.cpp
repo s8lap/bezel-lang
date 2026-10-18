@@ -478,6 +478,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // construction roots are already collected and the transitive resolution
     // reaches the scope-bound source. // per §35.5, §9.7 (v0.220)
     collectCaseArmBorrowSources(body);
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): close the capture-source
+    // sets of function-typed locals over the LEAST FIXPOINT the clause names, so
+    // a closure capturing another closure carries that closure's sources. Runs
+    // AFTER the collectors above so a borrow-bearing local's provenance is
+    // already in place, and BEFORE the dataflow so every consumer
+    // (borrowSourceForExpr's Shape 3, checkClosureEscapesOnReturn's capture
+    // loop) reads one complete, order-independent answer. See the pass's own
+    // comment for the termination argument. // per §28.3, v0.338
+    collectCaptureSourceFixpoint(body);
     // §28.14 (v0.175, #808): scoped callback parameters. Record the enclosing
     // method's parameter symbols (distinguishes real captures from lambda-
     // internal params), then run the three syntactic pre-passes: call-site

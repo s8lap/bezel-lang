@@ -5501,6 +5501,30 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (!sym) continue;
+            // fix #6296 (§28.3 *Provenance* clause 1, v0.338): a captured
+            // FUNCTION value carries its own set, transitively. The sibling leg
+            // for a returned *bare* holder is in checkIndirectEscapeOnReturn;
+            // this is the one for a returned *lambda literal* (`return lambda()
+            // => h();`), which reached this loop and classified `h` as neither
+            // an owned local nor a borrow-bearing carrier, so nothing fired.
+            if (sema::Symbol* carried = captureSourceOf(sym)) {
+                if (scope == EscapeScope::Method && isEscapeBoundLocal(carried)) {
+                    report(
+                        Severity::Error, id->span.begin,
+                        std::string("returned closure captures `") +
+                        std::string(sym->name) +
+                        "`, which carries a borrow of `" +
+                        std::string(carried->name) +
+                        "` whose source is disposed at scope end — a captured "
+                        "function value carries its own sources transitively "
+                        "(§28.3), so the closure aliases an owned scope-bound "
+                        "local and letting it escape lets the borrow outlive "
+                        "that local (§28.3 / §9.7 borrow-lifetime rule, "
+                        "use-after-dispose); bind the source in a longer-lived "
+                        "scope, or copy the data the closure needs out of it)");
+                    return;
+                }
+            }
             // §31.1 (issue #392): a returned/escaping closure capturing a
             // catch-bound exception variable. The caught exception is a borrow
             // whose lifetime is the catch arm body; capturing it does not
@@ -7413,6 +7437,13 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
         for (const ast::IdentifierExpr* id : ids) {
             sema::Symbol* sym = ctx_.exprSymbol(*id);
             if (isEscapeBoundLocal(sym)) return sym;
+            // fix #6296 (§28.3 *Provenance* clause 1, v0.338): a captured
+            // FUNCTION value "carries its own set, transitively" — resolve the
+            // fixpoint's answer for it. This is the leg the issue's repro was
+            // missing: `g` captures `f`, `f` captures `it`, and neither leg read
+            // the other, so `states_[g].source` stayed empty and the §28.3
+            // outlive rejection never fired.
+            if (sema::Symbol* carried = captureSourceOf(sym)) return carried;
             // §9.7 (#2144): a captured local of borrow-bearing record /
             // builtin-span type re-borrows every source the record carries
             // (recordBorrowLocalSource_, the #1726/#1966 provenance). The
@@ -7473,6 +7504,23 @@ static const sema::TypeRef* symbolTypeRef(const sema::Symbol* sym) {
     if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym))
         return ps->resolvedDeclType;
     return nullptr;
+}
+
+// fix #6296 (§28.3 *Provenance* clause 1, v0.338): is `sym` a binding of
+// FUNCTION type — a closure value, which is what carries a capture-source set
+// (§28.3 counts "a captured function value its own set, transitively"). Both a
+// plain and a NULLABLE function type qualify: `var f: (() -> Item)? := null;`
+// is the issue's own shape, and the nullability is about the VALUE's absence,
+// not about the binding's inability to carry a set.
+//
+// Restricted to LOCAL and PARAMETER symbols — a class-typed field or a module
+// function is not a binding this pass can attribute an assignment to, and the
+// capture walk resolves only method-scope bindings anyway.
+// per §28.3, v0.338
+bool MethodOwnership::isFunctionTypedLocal(sema::Symbol* sym) const {
+    if (!sym) return false;
+    const sema::TypeRef* ty = symbolTypeRef(sym);
+    return ty && ty->kind == sema::TypeRef::Kind::Function;
 }
 
 void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
@@ -7615,6 +7663,36 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
                     "rule; bind the source in the caller's scope and build the "
                     "aliasing value there instead)");
             }
+            return;
+        }
+    }
+
+    // fix #6296 (§28.3 *Provenance* clause 1, v0.338): a FUNCTION-typed holder
+    // carries its capture-source set as a SET (the least fixpoint), not as the
+    // single `states_[holder].source` the one-hop walk records — and in the
+    // cyclic shape the holder is declared BEFORE the source it eventually
+    // carries, so its `states_` entry was computed while the source was not yet
+    // Owned and came out empty. Resolving here, at the RETURN, is the sound
+    // place: `states_` is fully populated, so the liveness filter answers
+    // correctly for every carried source regardless of declaration order.
+    //
+    // Consulted only when the single-source path below did not already fire, so
+    // this is strictly a completion of it — the non-cyclic shape keeps its
+    // existing diagnostic and existing position, and no program that rejects
+    // today changes wording.
+    if (sym && isFunctionTypedLocal(sym) &&
+        (!states_.count(sym) || !states_[sym].source)) {
+        if (sema::Symbol* carried = captureSourceOf(sym)) {
+            report(
+                Severity::Error, id->span.begin,
+                std::string("returned `") + std::string(id->name) +
+                "` carries a borrow of `" + std::string(carried->name) +
+                "` whose source is disposed at scope end — a captured function "
+                "value carries its own sources transitively (§28.3), so the "
+                "value aliases an owned scope-bound local and returning it "
+                "lets the borrow outlive that local (§28.3 / §9.7 "
+                "borrow-lifetime rule; bind the source in the caller's scope "
+                "and build the aliasing value there instead)");
             return;
         }
     }
@@ -13675,6 +13753,233 @@ void MethodOwnership::collectRecordBorrowRoots(
         addRoot(e);
     }
 }
+
+// fix #6296 (§28.3 *Provenance* clause 1, v0.338): the LEAST FIXPOINT over the
+// capture-source sets of function-typed locals.
+//
+// §28.3 (v0.338) requires, for a lambda literal, that it contribute "a captured
+// function value its own set, TRANSITIVELY", and — where those sets depend on
+// one another through captures — "they are the least sets that satisfy this
+// clause: A CYCLE ADDS NOTHING beyond the sources its assignments carry in from
+// OUTSIDE it". Both halves were unimplemented: the capture-source walks
+// (`borrowSourceForExpr`'s Shape 3 and `checkClosureEscapesOnReturn`'s capture
+// loop) classify a captured identifier only as an escape-bound owned local /
+// catch binding, or as a borrow-bearing record/span/choice carrier — and a
+// captured FUNCTION-typed local is none of those, so its own carried set was
+// never read and the holder's set stayed empty.
+//
+// MEASURED false ACCEPT before this pass (no cycle involved — which is why the
+// cycle is a symptom and not the defect): `using var it := new Item(); var h :=
+// lambda() => do return it; end; var g := lambda() => h(); return g;` compiled
+// CLEAN. The direct twin (`return h;`) is rejected with the §28.3/§9.7
+// "carries a borrow of `it` … lets the borrow outlive that local" error, so the
+// machinery existed and worked — it simply stopped after one hop. The issue's
+// cyclic repro is the same gap seen from the other side: `g`'s set resolves
+// through `f` and `f`'s through `g`, neither leg ever read the other's, so
+// `return g` was admitted and codegen then crashed on the admitted program.
+//
+// The relation collected here, per function-typed local `holder`:
+//   captureEdgeSets_[holder]  — the function-typed locals whose sets `holder`
+//                                INHERITS (one hop of the transitive clause);
+//   captureLeafSets_[holder]  — the escape-bound SOURCE symbols `holder`
+//                                captures DIRECTLY (the one-hop case).
+// Both kinds are needed: dropping the edges IS the bug, and dropping the leaves
+// would regress the direct case the existing walks already handle.
+//
+// TERMINATION. The operator is "union my edges' carried sets into my own",
+// applied from the leaves. It is MONOTONE, and each carrier is a set over a
+// FINITE universe (the escape-bound symbols of this one method body), so every
+// round only ADDS members and none are ever removed: a strictly-growing chain of
+// subsets of a finite set has length at most |universe|. The loop therefore
+// reaches a fixed point after finitely many rounds and CANNOT spin.
+//
+// That is a PROOF, not a cap. The loop exits solely on a round that adds
+// nothing; there is deliberately no depth limit and no iteration counter,
+// because a guard that stops checking early is worse than no guard — it reads
+// as a guard. // per §28.3, v0.338
+void MethodOwnership::collectCaptureSourceFixpoint(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    captureEdgeSets_.clear();
+    captureLeafSets_.clear();
+    captureSourceFixpoint_.clear();
+    for (const auto& s : body)
+        if (s) collectCaptureSourceFixpointStmt(*s);
+
+    // Seed with the direct (one-hop) sources, then close over the edges.
+    // Seed from BOTH maps: a holder that only INHERITS (captures another
+    // function value but no escape-bound source directly) has no leaf entry, and
+    // seeding from the leaves alone would leave it out of the carrier entirely —
+    // it would then never be visited, never receive its inherited set, and never
+    // propagate that set onward. That is exactly the cyclic repro's shape.
+    captureSourceFixpoint_ = captureLeafSets_;
+    for (const auto& [holder, tos] : captureEdgeSets_) captureSourceFixpoint_[holder];
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto& [holder, carried] : captureSourceFixpoint_) {
+            auto e = captureEdgeSets_.find(holder);
+            if (e == captureEdgeSets_.end()) continue;
+            for (sema::Symbol* next : e->second) {
+                auto src = captureSourceFixpoint_.find(next);
+                if (src == captureSourceFixpoint_.end()) continue;
+                for (sema::Symbol* s : src->second) {
+                    if (std::find(carried.begin(), carried.end(), s) ==
+                        carried.end()) {
+                        carried.push_back(s);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // A holder whose set came out EMPTY is indistinguishable, to a consumer,
+    // from a local this pass never tracked — so keep the map to the holders that
+    // actually carry something. (`captureSourcesOf` returns an empty vector for
+    // an absent key, which is the right answer for both.)
+    for (auto it = captureSourceFixpoint_.begin();
+         it != captureSourceFixpoint_.end();) {
+        it = it->second.empty() ? captureSourceFixpoint_.erase(it)
+                                 : std::next(it);
+    }
+}
+
+void MethodOwnership::collectCaptureSourceFixpointStmt(const ast::Stmt& s) {
+    // §28.3: a captured binding holds "EVERY VALUE IT IS EVER ASSIGNED …
+    // whatever the assignment's position relative to the capture or to the
+    // read" — so both a DECLARATION's initializer and every later REBIND feed
+    // the same set. Order does not matter to the fixpoint.
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) collectCaptureSourceFixpointInit(*ld);
+        return;
+    }
+    if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lcd->value) collectCaptureSourceFixpointInit(*lcd);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        // Only a plain `:=` to a BARE IDENTIFIER rebinds the binding itself; a
+        // field or index target is a slot store, not a rebind of the local, and
+        // a compound assignment is not a whole-value rebind either.
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+        if (tid && as->op == ":=" && as->value)
+            collectCaptureSourcesInto(ctx_.exprSymbol(*tid), *as->value);
+        return;
+    }
+    // Recurse into nested scopes: a lambda bound inside a block, a loop body or
+    // a try arm contributes exactly like one bound at the top of the method.
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        for (const auto& st : ifs->ifBranch.body)
+            if (st) collectCaptureSourceFixpointStmt(*st);
+        for (const auto& el : ifs->elifBranches)
+            for (const auto& st : el.body)
+                if (st) collectCaptureSourceFixpointStmt(*st);
+        for (const auto& st : ifs->elseBody)
+            if (st) collectCaptureSourceFixpointStmt(*st);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& st : ws->body)
+            if (st) collectCaptureSourceFixpointStmt(*st);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& st : fs->body)
+            if (st) collectCaptureSourceFixpointStmt(*st);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& st : dob->body)
+            if (st) collectCaptureSourceFixpointStmt(*st);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& st : ts->body)
+            if (st) collectCaptureSourceFixpointStmt(*st);
+        for (const auto& arm : ts->catches)
+            if (arm.body) collectCaptureSourceFixpointStmt(*arm.body);
+        for (const auto& st : ts->finallyBody)
+            if (st) collectCaptureSourceFixpointStmt(*st);
+        return;
+    }
+}
+
+void MethodOwnership::collectCaptureSourceFixpointInit(const ast::Node& ld) {
+    const ast::Expr* init = nullptr;
+    if (auto* d = dynamic_cast<const ast::LocalDecl*>(&ld))
+        init = d->initializer.get();
+    else if (auto* c = dynamic_cast<const ast::LocalConstDecl*>(&ld))
+        init = c->value.get();
+    if (!init) return;
+    if (sema::LocalSymbol* lsym = findLocalSymbol(ld))
+        collectCaptureSourcesInto(lsym, *init);
+}
+
+// fix #6296 (§28.3 *Provenance* clause 1, v0.338): the one shared entry point —
+// "value `v` is assigned to `holder`", contributing either a lambda's captures
+// (declaration / literal rebind) or, for a bare-identifier alias, the aliased
+// function value's own set. Kept single so the declaration and rebind spellings
+// cannot drift. // per §28.3, v0.338
+void MethodOwnership::collectCaptureSourcesInto(sema::Symbol* holder,
+                                               const ast::Expr& value) {
+    if (!holder || !isFunctionTypedLocal(holder)) return;
+    if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&value)) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        collectLambdaIdentifiers(*lam, ids);
+        for (const ast::IdentifierExpr* id : ids) {
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            if (!sym) continue;
+            if (isFunctionTypedLocal(sym)) {
+                auto& e = captureEdgeSets_[holder];
+                if (std::find(e.begin(), e.end(), sym) == e.end())
+                    e.push_back(sym);
+            } else {
+                // Record the captured local SYNTACTICALLY and leave the
+                // escape-bound test to the consumer. This pre-pass runs BEFORE
+                // the dataflow, so `states_` is empty here and
+                // isEscapeBoundLocal — which reads states_[sym].state — would
+                // answer false for every local, silently recording nothing and
+                // reproducing the very false ACCEPT this pass exists to close.
+                // Filtering later, where states_ is populated, is also the more
+                // precise placement: liveness is a flow property, and a source
+                // disposed before the return is correctly not a live borrow.
+                auto& l = captureLeafSets_[holder];
+                if (std::find(l.begin(), l.end(), sym) == l.end())
+                    l.push_back(sym);
+            }
+        }
+        return;
+    }
+    // `var g2 := f;` — an alias of another function value inherits its set
+    // wholesale (§28.3's transitive clause applied to a bare rebind).
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&value)) {
+        if (sema::Symbol* src = ctx_.exprSymbol(*id)) {
+            if (isFunctionTypedLocal(src)) {
+                auto& e = captureEdgeSets_[holder];
+                if (std::find(e.begin(), e.end(), src) == e.end())
+                    e.push_back(src);
+            }
+        }
+    }
+}
+
+const std::vector<sema::Symbol*>& MethodOwnership::captureSourcesOf(
+    const sema::Symbol* sym) const {
+    static const std::vector<sema::Symbol*> kNone;
+    auto it = captureSourceFixpoint_.find(sym);
+    return it == captureSourceFixpoint_.end() ? kNone : it->second;
+}
+
+sema::Symbol* MethodOwnership::captureSourceOf(const sema::Symbol* sym) {
+    // The fixpoint is syntactic; LIVENESS is applied HERE, at consumption, where
+    // `states_` is populated. A carried source that is no longer a live
+    // escape-bound obligation at this point (already disposed / moved out, or a
+    // parameter, which outlives the call) is not a live borrow to diagnose —
+    // the same guard the direct capture paths apply.
+    for (sema::Symbol* s : captureSourcesOf(sym))
+        if (isEscapeBoundLocal(s)) return s;
+    return nullptr;
+}
+
 
 void MethodOwnership::collectRecordBorrowSource(const ast::Node& ld) {
     // §28.3 (v0.186, #1726): "A live local of borrow-bearing record type — a

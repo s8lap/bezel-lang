@@ -9232,7 +9232,46 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 }
                 builder_.CreateStore(ccRes, ccResSlot);
                 Disposal d{ccResSlot, calleeTy->funcReturn->declaration};
-                disposeStack_.back().push_back(d);
+                // fix #6296: `disposeStack_.back()` on an EMPTY vector is UB —
+                // it reads out of bounds and then memmoves, which is the SIGSEGV
+                // this fix's repro hit (frames: __memmove_avx_unaligned_erms
+                // <- vector<Disposal>::push_back <- Emitter::lowerCallDispatch).
+                // Before this fix, this site was the ONLY `back()` in the file
+                // reached without an emptiness test; every other one sits under
+                // a `disposeStack_.empty()` check — either an
+                // `if (!…empty()) { … }` wrapper or one of the two early-return
+                // `// gate 5` guards. That is checkable at any time by grepping
+                // the two patterns in this file and confirming every `back()`
+                // is under one of them.
+                //
+                // WHY THE EMPTY BRANCH REGISTERS NOTHING, stated here in full so
+                // it does not depend on a reader finding it elsewhere: an
+                // unregistered value leaks, and a leak is the deliberate choice
+                // at this site. The alternative — disposing at the call — is a
+                // use-after-free, not merely untidy: `ccResSlot` is either
+                // `pendingChainCallLocalSlot_`, the slot of a real local in this
+                // scope that may be read again later, or the fresh `ccres.slot`
+                // alloca minted two statements above, and BOTH outlive this
+                // statement. Freeing either here would leave a live reference
+                // dangling, whereas skipping the registration leaks a value that
+                // has no remaining reader once the frame is gone.
+                //
+                // Other registrations in this file make the same trade, and no
+                // pointer to any of them is given here ON PURPOSE: a comment that
+                // quotes the phrase it tells the reader to search for matches
+                // itself, so the search would come back here rather than land on
+                // the sibling. The argument above is stated in full instead of
+                // delegated to a place a reader may not find.
+                //
+                // Reachability: with #6296's sema fix the reporter's own program
+                // is REJECTED before codegen runs, so this guard is not what
+                // keeps that program from crashing, and the non-author review of
+                // that fix probed for a reachable case eight times without
+                // finding one. There is consequently NO gtest pin for this guard
+                // and that is a known gap, not an oversight. It is a UB fix for
+                // whatever else gets here.
+                if (!disposeStack_.empty())
+                    disposeStack_.back().push_back(d);
             }
             // #422 / §28.9: release the transient closure after the call.
             // fix #3704 (narrowed) / §27.5 / §28.9 / §30.5 (v0.287):
