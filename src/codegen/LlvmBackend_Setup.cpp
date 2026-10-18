@@ -20048,6 +20048,13 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
                     : nullptr;
                 const ast::PropertyDecl* pd6405 =
                     ps6405 && ps6405->decl
+                        // SEAM-DEBT: #6405 - a class-3 read on ps6405->decl.
+                        // The key must be the PropertyDecl the accessor
+                        // WRITER published, and it is reachable only through
+                        // the symbol's `decl`; for an imported accessor that
+                        // decl is the seam, and this arm's no-key read already
+                        // declines - the same safe side the writer's own
+                        // absence takes, so the read cannot over-claim.
                         ? dynamic_cast<const ast::PropertyDecl*>(ps6405->decl)
                         : nullptr;
                 // A property whose block getter was never emitted (an

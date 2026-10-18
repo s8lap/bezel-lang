@@ -18707,7 +18707,126 @@ void ExprTC::runMethodBody(
         // an `async` value method carries the peeled element type in
         // currentReturnType_, so `=> await P()` is checked against that element,
         // matching the block-form `return await P();`.)
-        if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_) {
+        //
+        // narrow #4770 (§5.1, §30.6, v0.307), applied to the EXPRESSION-BODY
+        // spelling. The `return E;` STATEMENT arm above already runs a
+        // forgotten-`await` guard FIRST and lets a fired guard SUPPRESS the
+        // downstream §5.1 assignability check — "this check leads ... the
+        // §30.6 message names the remedy (`add await`) and must lead ...
+        // checkAssignable itself is unchanged; the suppress is at this call
+        // site". The `=> E` arm had no such guard and did not need one: until
+        // fix #6347 (§5.1, v0.338) a generic built-in class source
+        // (`OwningTask<Widget4461>`, `Array<int>`, ...) FELL THROUGH
+        // `checkAssignable`'s §5.1 path, because the `genericArgs.empty()`
+        // restriction on that path's `fromBuiltinClass` predicate excluded
+        // every source carrying type arguments. So the expression body reached
+        // codegen, whose `detectAsyncPatternAKind` (LlvmBackend_Async.cpp,
+        // §30.5 kind 1) reports the producer-side violation.
+        //
+        // #6347 widened that predicate to `fromBuiltinClassAnyArgs`, and that
+        // is a real §5.1 repair which must NOT be narrowed back: before it,
+        // `var x: Widget4461 := Task.FromOwnedResult(new Widget4461());` was
+        // SILENTLY ACCEPTED outside any async body (MEASURED on b28c2119: no
+        // diagnostic at all), and `var b: Box<int> := a;` over `a: Array<int>`
+        // compiled into a read of `Box<int>`'s field out of the array's first
+        // word. What #6347 broke is only the fall-through THIS position
+        // depended on: for `async method Make(): Task<Widget4461> =>
+        // Task.FromOwnedResult(new Widget4461());` the generic §5.1 message
+        // ("the built-in type `OwningTask` is not a `Widget4461`") now
+        // pre-empts the producer-side message that actually OWNS the shape.
+        //
+        // §30.5 "Result lifetime and task disposal" owns the shape and names
+        // the remedy — "return a fresh owned value ... or `return await` an
+        // admitted task source" — while §5.1 only restates the consequence.
+        // §5.1's reference-conversion list is CLOSED ("The following
+        // conversions are implicit": identity; class to base class
+        // transitively up to `Object`; any type to `Object`; a type to an
+        // interface it implements or conforms to; interface to extended
+        // interface; a type parameter to an interface or class its constraints
+        // guarantee conformance to; the variance-induced conversions of
+        // §12.9) and admits no unrelated-class pair, and its own definition
+        // of the family excludes this one — a reference conversion is
+        // "representation-preserving — the same reference viewed at a WIDER
+        // static type", which `OwningTask<Widget4461>` viewed as
+        // `Widget4461` is not. The producer-side diagnostic agrees and says
+        // so ("Add `await` (e.g. `=> await Task.FromOwnedResult(new T())`)").
+        // The statement-form twin already leads for exactly this reason; §30.6
+        // is the section that diagnostic cites for the `return await
+        // Producer()` remedy, and §30.6 defers the body's conformance back to
+        // §30.1 and §30.5 ("the body must conform to the named type exactly as
+        // an `async` method's body conforms to its declared type under [§30.1]
+        // and [§30.5]").
+        //
+        // The carve-out is therefore as narrow as the rule it defers to: it
+        // fires only where `detectAsyncPatternAKind` is guaranteed to fire in
+        // turn, so nothing is admitted here that codegen would not reject
+        // anyway. Both halves are load-bearing:
+        //
+        //  * `isTaskFactoryCall30_5` is codegen's own `isTaskFactoryCallExpr`
+        //    predicate (`Task.FromOwnedResult` / `FromResult` /
+        //    `FromException`), reproduced verbatim. The other shapes in
+        //    codegen's rejection set (MemberAccessExpr / NullCondMemberExpr /
+        //    IndexExpr) keep the §5.1 check, and a Task-returning call that is
+        //    NOT a Task-factory member (a user method returning `Task<T>`)
+        //    keeps it too — codegen does not reject those.
+        //  * `elementIsRefType30_5` is §30.5's own "Pattern A result slots
+        //    apply to class or interface T" scoping, matching the
+        //    `asyncResultTy_->isPointerTy()` guard `detectAsyncPatternAKind`
+        //    returns early on. `Task<T>` over a copyable value type, a
+        //    `string`, a record, enum or choice is §30.5's OTHER row and has
+        //    no producer-side rejection in codegen at all, so the §5.1 check
+        //    must keep running there: `async method Make(): Task<int> =>
+        //    Task.FromResult(42);` is caught by "heap reference and target is
+        //    a value type" and stays caught (MEASURED: suppressing it
+        //    unconditionally admitted the program outright).
+        const auto* tfCall30_5 =
+            dynamic_cast<const ast::CallExpr*>(exprBody);
+        const auto* tfCallee30_5 =
+            tfCall30_5
+                ? dynamic_cast<const ast::MemberAccessExpr*>(
+                      tfCall30_5->callee.get())
+                : nullptr;
+        const auto* tfTarget30_5 =
+            tfCallee30_5
+                ? dynamic_cast<const ast::IdentifierExpr*>(
+                      tfCallee30_5->target.get())
+                : nullptr;
+        const bool isTaskFactoryCall30_5 =
+            tfTarget30_5 && tfTarget30_5->name == "Task" &&
+            (tfCallee30_5->member == "FromOwnedResult" ||
+             tfCallee30_5->member == "FromResult" ||
+             tfCallee30_5->member == "FromException");
+        // §30.5's "Pattern A" scoping: class or interface T (and the
+        // runtime-managed spellings that share the pointer representation).
+        const TypeRef* elemTy30_5 = currentReturnType_;
+        bool elementIsRefType30_5 = false;
+        if (elemTy30_5) {
+            if (elemTy30_5->kind == TypeRef::Kind::Primitive)
+                // `Object` ONLY. §30.5's "runtime-managed" rows cover a
+                // `string` result too, but `Task<string>` attaches NO
+                // per-result disposer, so `detectAsyncPatternAKind`'s arm is
+                // gated off (`asyncPatternAResultDisposer_` is null) and
+                // `Task<string>` gets no producer-side rejection at all —
+                // MEASURED: admitting it here compiled
+                // `async method Make(): Task<string> => Task.FromResult("hi");`
+                // outright, where §5.1's "heap reference and target is a value
+                // type" had rejected it. §5.1 must keep that position.
+                elementIsRefType30_5 =
+                    elemTy30_5->primitive == PrimitiveType::Object;
+            else if (elemTy30_5->kind == TypeRef::Kind::Named)
+                elementIsRefType30_5 =
+                    elemTy30_5->declaration
+                        ? (elemTy30_5->declaration->kind ==
+                               ast::TypeDeclKind::Class ||
+                           elemTy30_5->declaration->kind ==
+                               ast::TypeDeclKind::Interface)
+                        : !isValueBuiltinByName(elemTy30_5->headName());
+        }
+        const bool section30_5OwnsPosition =
+            inAsyncContext_ && elementIsRefType30_5 && isTaskFactoryCall30_5 &&
+            isTaskShapedRef(ctx_.exprType(*exprBody));
+        if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
+            !section30_5OwnsPosition) {
             checkAssignable(
                 ctx_.exprType(*exprBody), currentReturnType_,
                 exprBody->span.begin, "returned value",
