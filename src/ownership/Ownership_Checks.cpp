@@ -20582,7 +20582,8 @@ bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const
 // the comment header on the predicate below for the full split. Static, file-
 // local (mirrors the existing isBorrowBearingRecord family of file-locals).
 static bool choiceHoldsBorrows(const sema::TypeRef* rt,
-                               sema::SemaContext& ctx);
+                               sema::SemaContext& ctx,
+                               std::unordered_set<const sema::TypeRef*>& seen);
 
 // §35.4 / §9.7 (v0.307, #4708): a choice that "HOLDS BORROWS" — per §35.4's
 // own header text (the derived type property distinct from classification):
@@ -20615,7 +20616,8 @@ static bool choiceHoldsBorrows(const sema::TypeRef* rt,
 // // per §35.4 / §9.7 (v0.307)
 bool MethodOwnership::isBorrowBearingChoice(const sema::TypeRef* rt) const {
     if (!rt) return false;
-    return choiceHoldsBorrows(rt, ctx_);
+    std::unordered_set<const sema::TypeRef*> seen;
+    return choiceHoldsBorrows(rt, ctx_, seen);
 }
 
 // §35.4 / §9.7 (v0.307, #4708): see header on isBorrowBearingChoice. Static
@@ -20628,7 +20630,8 @@ bool MethodOwnership::isBorrowBearingChoice(const sema::TypeRef* rt) const {
 // at any nested choice payload — guarded against record↔choice mutual
 // recursion via a path set (mirror of isBorrowBearingRecordImpl's #1611).
 static bool choiceHoldsBorrows(const sema::TypeRef* rt,
-                               sema::SemaContext& ctx) {
+                               sema::SemaContext& ctx,
+                               std::unordered_set<const sema::TypeRef*>& seen) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
     if (rt->declaration->kind != ast::TypeDeclKind::Choice) return false;
@@ -20638,7 +20641,20 @@ static bool choiceHoldsBorrows(const sema::TypeRef* rt,
     if (*verdict == common::ChoiceClassification::ValueLike) return false;
     // Owning: any case has a plain (non-`owned`) borrow-carrying payload
     // under §9.7's field-level definition + §35.4's holds-borrows transitivity.
-    std::unordered_set<const sema::TypeRef*> seen;
+    // fix #6169: `seen` is threaded THROUGH the recursion below, not a fresh
+    // per-call set. It used to be declared here, so the insert always
+    // succeeded (an empty local never already holds `rt`) and the guard was
+    // dead: the Owning walk's nested-choice recurse built a NEW set at every
+    // level, so a mutually-recursive pair (`choice A<T> X(b: B<T>)`,
+    // `choice B<T> Y(a: A<T>)` — both Owning) never terminated and bezelc
+    // exhausted the stack (SIGSEGV) instead of reaching §35.1's
+    // value-cycle rejection. PATH semantics (insert on entry, erase on exit),
+    // matching isBorrowBearingRecordImpl's #1611 guard exactly: a TypeRef
+    // already ON THIS CALL CHAIN contributes no new information, while a
+    // sibling payload may still re-classify the same TypeRef under its own
+    // substitution. Termination, not a depth cap — a cap that silently
+    // stopped checking would be the same silent-acceptance class this walk
+    // exists to prevent. // per §35.4, §9.7
     if (!seen.insert(rt).second) return false;  // cycle (PATH guard).
     bool result = false;
     for (const sema::ChoiceCaseSymbol* ccs :
@@ -20674,7 +20690,7 @@ static bool choiceHoldsBorrows(const sema::TypeRef* rt,
                     } else if (ft->declaration->kind ==
                                ast::TypeDeclKind::Choice) {
                         // §35.4 transitivity: nested choice reads THIS property.
-                        if (choiceHoldsBorrows(ft, ctx)) result = true;
+                        if (choiceHoldsBorrows(ft, ctx, seen)) result = true;
                     }
                     break;
                 }
