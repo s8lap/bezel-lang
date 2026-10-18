@@ -27269,6 +27269,20 @@ bool Emitter::isPrimitiveToStringCG27c(const ast::Expr* expr) const {
 bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
+    // fix #6440 (latent hazard from #6395): a string-returning CALL whose callee
+    // sema resolved is deliberately excluded from this recognizer. A resolved
+    // MethodSymbol may return a BORROW of a field rather than an owned value
+    // (e.g. `method GetName(): string return self._name end` — a field accessor
+    // that returns a borrow of the receiver's `_name` slot). The caller-side
+    // release this recognizer enables would then free a value the callee still
+    // references (UAF). The same guard was added to the two sibling recognizers
+    // in #4653 (LlvmBackend_Setup.cpp, `isFreshBorrowingArrayMaterializerLocal`
+    // and `isFreshOwnerlessArrayMaterializerExpr`) for the identical reason.
+    // This guard is latent today: every Bezel method returning `String` mints
+    // +1 on its return path (#2196), so a user method returning a borrow of its
+    // receiver's field does not exist yet. The guard is what keeps it from
+    // existing after the next change to that mint.
+    if (calleeResolvedBySema(*call, ctx_)) return false;
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
     if (!ms) return false;                         // builtin string method / not a method
     if (ms->isOperator) return false;              // operator overloads excluded
