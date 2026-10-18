@@ -90,9 +90,11 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"   // runAot / runAotChecked(Lenient) — AOT + ASan/LSan
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
@@ -135,6 +137,7 @@ BEZEL_TEST(codegen_closure_captured_cell_returned_uaf_4198,
         "    return g(); "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: heap-use-after-free in main
     BEZEL_EXPECT_EQ(r.exitCode, 42);
@@ -171,6 +174,7 @@ BEZEL_TEST(codegen_closure_captured_cell_returned_uaf_4198,
         "    return 0; "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -201,6 +205,7 @@ BEZEL_TEST(codegen_closure_captured_cell_returned_uaf_4198,
         "    return g(); "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: heap-use-after-free in main
     BEZEL_EXPECT_EQ(r.exitCode, 7);
@@ -236,6 +241,7 @@ BEZEL_TEST(codegen_closure_captured_cell_returned_uaf_4198,
         "    return 0; "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -266,6 +272,7 @@ BEZEL_TEST(codegen_closure_captured_cell_returned_uaf_4198,
         "    return g(); "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: heap-use-after-free in main
     BEZEL_EXPECT_EQ(r.exitCode, 42);
@@ -301,6 +308,7 @@ BEZEL_TEST(codegen_closure_captured_cell_returned_uaf_4198,
         "    return g(); "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
@@ -338,6 +346,7 @@ BEZEL_TEST(codegen_closure_captured_cell_returned_uaf_4198,
         "    return 0; "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

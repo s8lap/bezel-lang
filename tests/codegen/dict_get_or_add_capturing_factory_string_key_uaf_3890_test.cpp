@@ -92,9 +92,11 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
@@ -147,6 +149,7 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_string_key_uaf_3890,
         "  i := i + 1; "
         "end; "
         "return 0; "));
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -180,6 +183,7 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_string_key_uaf_3890,
         "  i := i + 1; "
         "end; "
         "return 0; "));
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -210,6 +214,7 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_string_key_uaf_3890,
         "  i := i + 1; "
         "end; "
         "return 0; "));
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
