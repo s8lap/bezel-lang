@@ -140,12 +140,14 @@
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -154,6 +156,7 @@ namespace {
 // exactly as it is on a leak — see #4254/#4265/#4280's identical pattern.
 int runChecked(const std::string& program) {
     auto r = runAotChecked(program);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     return r.ran ? r.exitCode : -999;
 }
 
@@ -163,6 +166,7 @@ int runChecked(const std::string& program) {
 // identically-named helper.
 bool leaksAtLeast(const std::string& program, long minBytes) {
     auto r = runAotChecked(program);
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (r.ran) return false;  // no sanitizer finding at all — wrongly clean
     static const std::regex kLeak(
         R"(AddressSanitizer: (\d+) byte\(s\) leaked)");

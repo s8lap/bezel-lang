@@ -50,9 +50,11 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
 #include "test_harness.hpp"
 
+using bezel::test::checkedToolchainSkipped;
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
@@ -215,6 +217,7 @@ BEZEL_TEST(owned_local_loop_unconditional_move_uaf_2439,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
@@ -246,6 +249,7 @@ BEZEL_TEST(owned_local_loop_unconditional_move_uaf_2439,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
+    BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
