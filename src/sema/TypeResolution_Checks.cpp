@@ -6420,13 +6420,34 @@ static TypeRef* applyBaseMemberSubst(
 //
 // What replaces the count is a per-path cycle guard: `onChain` holds the
 // symbols on the CURRENT enclosing path, inserted on entry and erased on
-// every exit, so a class reachable by two different base paths is still
-// walked on both. It fires only on a symbol already on the enclosing path —
-// a genuine cycle — which a program this compiler accepts cannot contain,
-// because §12.10 rejects an inheritance cycle ("no type may, directly or
-// transitively, list itself among its base classes") during class-graph
-// construction, before an override check reaches this walk. That ordering is
-// MEASURED, not assumed:
+// every SUCCEEDED exit.  The function has four exit paths (three return
+// statements; the first covers both the null and the failed-insert case):
+//
+//   1. `!from` early-out:        nothing was inserted — erase is unnecessary.
+//   2. `!onChain.insert(…).second`: insert failed, meaning `from` is already
+//      on the path from an ANCESTOR frame.  The entry belongs to that frame;
+//      erasing here would remove the ancestor's guard and allow the same
+//      symbol to be re-entered from a sibling branch, causing a hang on any
+//      cyclic hierarchy.  This is the load-bearing exit path for §12.10 cycles.
+//   3. Success (found `target`):  `from` is on the current path; erase it.
+//   4. Exhausted all bases:      `from` is not on the path to `target`; erase it.
+//
+// Multiple INTERFACE bases are legal (§11.2): a class can implement I1 and I2
+// even when both extend J, giving the classic diamond.  The erasure is what
+// makes the diamond work — without it, the second branch into J finds J already
+// on the path, bails, and the target (reachable only through that branch) is
+// never found.  The interface diamond (I1:J, I2:J, E:I1, I2, D) is the case
+// that proves the erasure is load-bearing for the interface graph.  The test
+// `interface_diamond_correct_override_accepted` in this file mechanically
+// demonstrates that without the erasure the row goes RED; with it, it is GREEN.
+// This is in contrast to the class case: §11.1 (line 1768) is single-inheritance
+// for classes, so a class base is never reachable by two paths.
+//
+// The guard fires only on a genuine cycle — a program the compiler accepts
+// cannot contain one, because §12.10 rejects an inheritance cycle: a type may
+// not, directly or transitively, list itself among its base types — neither as
+// the base class of a class, nor as an extended interface of an interface.
+// This ordering is MEASURED, not assumed:
 // `sema_base_type_path_depth_total_6416.inheritance_cycle_reports_12_10_not_override_mismatch`
 // (tests/sema/base_type_path_depth_total_6416_test.cpp) compiles a three-class
 // cycle and pins §12.10's own diagnostic, so the guard cannot pre-empt it into
