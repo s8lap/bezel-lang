@@ -38292,24 +38292,105 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
         // bz_dict_free." Call it, then free the table.
         //
         // The set-family gate (`isSetFamilyHead`, computed above) is load-bearing
-        // in BOTH directions: the helper reads the key slot AS a `bz_string*`,
-        // which is valid exactly where the element IS the key, and the
-        // `Dictionary<string, V>` key column needs a release contract that does
-        // not exist for the table as a whole (#429 shipped only the two
-        // set-specific entry points). A string-keyed `Dictionary` therefore
-        // DECLINES, leaving its (bounded, per-key) string leak standing — this
-        // function's standing safe direction, and declining rather than guessing
-        // at a release contract. The follow-up is recorded in the handback.
-        if (!isSetFamilyHead) return;
-        auto* relFn = declareC("bz_set_string_keys_release",
-                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
-        builder_.CreateCall(relFn, {recvVal});
-        // `elemDisp` stays null: `bz_dict_free`'s second argument is the VALUE
-        // column's disposer, and the value column of a set-family table is not
-        // where its elements live.
+        // in the direction #6352 established: the helper reads the key slot AS a
+        // `bz_string*`, which is valid exactly where the element IS the key.
+        //
+        // fix #6419 (§28.3 *Unbound owned temporaries*, §28.9, stdlib §4.8 /
+        // §4.17, v0.338): the DECLINE this gate used to carry is WITHDRAWN for
+        // the `Dictionary<string, V>` / `SortedDictionary<string, V>` heads.
+        // The decline was justified by an absence of a release contract — and
+        // that absence is real — but it was applied to the wrong thing: it
+        // skipped the WHOLE free (backing header, bucket array, insertion-order
+        // spine and every key copy) when the ONLY thing it declined was the
+        // per-key string release. Reading the two runtime entry points settles
+        // what the table actually holds (both in
+        // src/runtime/bezel_runtime_collections.cpp):
+        //
+        //   * `bz_dict_set_str` stores `bz_key_dup(k, k_len, k_w)` — a fresh
+        //     `malloc`'d BYTE COPY of the caller's key bytes.
+        //   * `bz_dict_set_gen` stores `malloc(d->key_size)` + `memcpy` — the
+        //     same shape for the generic-key table.
+        //   * `bz_dict_free` then does `free(e.key)` for every live entry, then
+        //     frees `buckets`, `order` and the header.
+        //
+        // So a Dictionary-family KEY column holds NO co-owned +1 on any
+        // `bz_string*` — it is a copy, and `bz_dict_free(d, NULL)` reclaims it
+        // completely. There is nothing for a release helper to do, so declining
+        // was over-conservative and cost the entire container. That is the
+        // measured half of this fix: a string-keyed `owned Dictionary` receiver
+        // consumed unbound leaked 42,925 B / 606 allocations at 101 iterations
+        // on the `.Count` arm ALONE — an arm that had carried the reclaim call
+        // since #1013, because this line returned before reaching it.
+        //
+        // WHAT IS STILL DECLINED, and is a separate gap this change does not
+        // close: a `Dictionary<K, string>` VALUE column co-owns a +1 per stored
+        // value (§28.9's runtime-managed tier; the reason `.Remove` uses
+        // `bz_dict_remove_str_disposing` with `stringElementReleaseThunk`), and
+        // `bz_dict_free`'s `dispose_val` argument is applied to the VALUE
+        // column. This function computes `elemDisp` from `genericArgs[0]` — for
+        // a Dictionary that is the KEY — so `elemDisp` stays NULL and those
+        // per-value +1s leak. That is exactly the behaviour the int-keyed
+        // `Dictionary<int, string>` twin already has today (its `elemIsString` is
+        // likewise false, so it too reaches `bz_dict_free(d, NULL)`), so the
+        // string-keyed head is now CONSISTENT with it rather than newly wrong.
+        // Recorded as a residual, not fixed here: the value column is a
+        // different column from the one this gate ever reasoned about, and
+        // adding `elemDisp` for it is a distinct change with its own
+        // exactly-once proof to make.
+        if (isSetFamilyHead) {
+            auto* relFn = declareC("bz_set_string_keys_release",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(relFn, {recvVal});
+        }
+        // `elemDisp` stays null on this branch: `bz_dict_free`'s second argument
+        // is the VALUE column's disposer, and for the set-family head the value
+        // column is not where its elements live (`e.val` is unset — the element
+        // is the KEY slot). The Dictionary-family VALUE column is a different
+        // matter, and is handled below, outside this branch.
     } else if (elemIsString) {
         ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
         if (ep.cat == ElementPolicy::Category::RuntimeManaged)
+            elemDisp = stringElementReleaseThunk();
+    }
+    // fix #6419 (§28.11 *Collection element ownership*, §28.9, stdlib §4.8 /
+    // §4.17, v0.338): the Dictionary-family VALUE column. §28.11's
+    // "Collection element ownership" places a borrowed `Dictionary<K, string>`'s
+    // co-owned +1 on the VALUE, not the key, and every release site in this
+    // backend already says so — `.Remove` uses `bz_dict_remove_str_disposing`
+    // with `stringElementReleaseThunk`, `.Clear` passes the same thunk to
+    // `bz_dict_clear`, the indexer-overwrite path passes it to its disposing
+    // setter, `registerUsingDisposal`'s dictionary branch installs it, and
+    // `buildCollectionTempDisposal` installs it. This function was the one
+    // release site that did NOT: `el` above is `genericArgs[0]`, which for a
+    // Dictionary is the KEY, so a `Dictionary<K, string>` reached
+    // `bz_dict_free(d, NULL)` and stranded one +1 per stored value. MEASURED on
+    // this fix's parent at 101 iterations, an unbound `Dictionary<string,string>`
+    // receiver leaked 6,464 B / 202 allocations through this path.
+    //
+    // Reading the slot from `genericArgs[1]` is what makes it correct rather
+    // than merely plausible: `bz_dict_free` applies its second argument to
+    // `e.val` (bezel_runtime_collections.cpp:868), which is exactly the column
+    // `genericArgs[1]` describes, so the thunk is aimed where the reference
+    // lives — the same alignment `#6352`'s comment above records as the thing
+    // its own first draft got wrong when it passed the ARRAY disposer here.
+    //
+    // EXACTLY ONCE. The +1 this drops was taken at insert: `.Add`'s
+    // `dictIsStringValue && !isPlusOneStringProducer(value)` guard retains, or
+    // transfers when the value is itself a producer. A value already removed
+    // from the table was released by `.Remove` and is not in `e.val` here, and
+    // `.Clear` empties the table before this runs — no double-discharge on any
+    // path. The exclusions are the same ones `.Remove` and `.Clear` apply:
+    // `OwningDictionary` cannot reach here at all (`isPlainBuiltinCollectionHead`
+    // excludes the owning family, and this head is a Dictionary-family one), and
+    // a nullable `string?` value is excluded by the `!nullable` conjunct, so a
+    // null value never reaches the release.
+    if (freeIsDict && !isSetFamilyHead) {
+        const sema::TypeRef* vEl =
+            (recvTy && recvTy->genericArgs.size() > 1)
+                ? recvTy->genericArgs[1] : nullptr;
+        if (vEl && !vEl->nullable &&
+            vEl->kind == sema::TypeRef::Kind::Primitive &&
+            vEl->primitive == sema::PrimitiveType::String)
             elemDisp = stringElementReleaseThunk();
     }
     const char* freeName = freeIsLlist ? "bz_llist_free"

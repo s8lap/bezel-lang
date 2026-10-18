@@ -9195,6 +9195,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_dict_clear", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {recv, dispV});
+            // fix #6419 (§28.3 *Unbound owned temporaries*, §28.9, stdlib
+            // §4.8/§4.9/§4.17, v0.338): reclaim an UNBOUND `owned Dictionary` /
+            // `OwningDictionary` / `SortedDictionary`-producing receiver here.
+            // #6394 gave the `isArr` block's Set arms this call; this is the
+            // sibling `isDict` block, which carried it only in its `.Count` and
+            // First/Last snapshot arms. MEASURED on this fix's parent
+            // (867dfb00) at 101 iterations under `bezelc --sanitize=address`:
+            //
+            //   MakeDict().Contains("bb")   42,925 B / 606 allocs
+            //   MakeDict().Add("dd", 4)      43,228 B / 707
+            //   MakeDict().Remove("aa")      42,622 B / 505
+            //   MakeDict().Clear()           42,016 B / 303
+            //
+            // against 0 for the byte-identical `var d := MakeDict();` twin of
+            // each — the asymmetry that identifies the defect, since a BOUND
+            // receiver is discharged by its own owner (§28.3).
+            //
+            // PLACEMENT is §28.3's end-of-full-expression boundary, and it is
+            // forced here for a reason `.Clear`'s `unit` result does not make
+            // obvious: `bz_dict_clear` EMPTIES the table but leaves the
+            // `bz_dict_t` header, its bucket array and its insertion-order
+            // spine allocated (stdlib §4.8: "Clear() … empties it; the
+            // dictionary itself stays allocated"). So the reclaim must come
+            // AFTER the clear — which is also the arm's own return.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return llvm::ConstantInt::get(i32(), 0);  // unit result
         }
         // .ContainsKey(k) / .Contains(k) (alias, §4.8): bool
@@ -9204,7 +9229,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!k) return nullptr;
             if (keyTy) {
                 auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
+                llvm::Value* has =
+                    builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
+                // fix #6419: the membership probe is a PURE BORROW of both the
+                // argument (which `bz_dict_contains_gen` hashes and compares by
+                // the lowered key BYTES) and the receiver, so the `bool` this
+                // arm returns aliases nothing and §28.3's end-of-full-expression
+                // reclaim is safe here.
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+                return has;
             }
             auto [kd, kl, kw] = strDataLen(k);
             auto* fn = declareC("bz_dict_contains_str", i1(),
@@ -9219,6 +9252,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // sole (already-completed) use of its buffer.
             if (isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: the twin of the generic-key reclaim above — the bool
+            // aliases nothing, so the receiver's own obligation is discharged at
+            // this return (§28.3's end-of-full-expression boundary).
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return r;
         }
         // fix #3372 / stdlib §4.8 + §4.9 (v0.282, §1 Try shape (d)):
@@ -9311,6 +9348,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // release scoped to the branch it belongs to).
             if (!keyTy && isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: `endBB` is the join of BOTH arms — the duplicate edge
+            // (value disposed, table untouched) and the insert edge (value
+            // transferred into the table) — so it is the one point at which
+            // `recv` is provably no longer read on either path. The reclaim
+            // goes HERE, not in `insBB`, which would free the table on the
+            // insert path only and leave the duplicate path to double-free
+            // against the receiver's own owner. `phi` is a `bool` over the
+            // insertion outcome and aliases no slot of the receiver, so the
+            // returned value is unaffected (§28.3's end-of-full-expression
+            // boundary is this return).
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return phi;
         }
         // .Add(k, v) / .Set(k, v)
@@ -9438,6 +9486,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // / OwningSet Add nulling paths.
                 if (dictValIsOwning)
                     nullTransferredOwnedLocalSlot(call.args[1].value.get());
+                // fix #6419: the insert is the last read of `recv` — the table
+                // now OWNS the value, and `.Add` returns `unit`, so nothing this
+                // arm hands back aliases the backing and §28.3's reclaim goes
+                // here, after the insert. Placed after `nullTransferredOwned
+                // LocalSlot` so the transfer bookkeeping is unchanged; the two
+                // touch disjoint state (the caller's slot vs the dict header).
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
                 return llvm::ConstantInt::get(i32(), 0);
             }
             auto [kd, kl, kw] = strDataLen(k);
@@ -9460,6 +9515,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // exactly-once regardless of which edge fires.
             if (isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: the twin of the generic-key reclaim above, on this arm's
+            // one non-throwing return. §28.3's boundary is the end of the full
+            // expression, which for a `unit`-returning arm IS its own return.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return llvm::ConstantInt::get(i32(), 0);
         }
         // .Remove(k): bool — per §4.9: OwningDictionary.Remove disposes the
@@ -9496,16 +9555,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!valDisp && dictIsStringValue)
                 valDisp = stringElementReleaseThunk();
             if (keyTy) {
+                // fix #6419: both generic-key returns are hoisted into
+                // `removeResult` so the receiver's §28.3 reclaim can run on the
+                // ONE edge this arm returns through, exactly as the string-key
+                // branch below already does. Hoisting a `CreateCall` changes no
+                // code — the call keeps its position relative to every other
+                // instruction — it only gives the name a binding.
+                llvm::Value* removeResult;
                 if (valDisp) {
                     // OwningDictionary (or Dict<K,string>) with generic key.
                     auto* fn = declareC("bz_dict_remove_gen_disposing", i1(),
                                         {ptrTy(), ptrTy(), ptrTy()});
-                    return builder_.CreateCall(
+                    removeResult = builder_.CreateCall(
                         fn, {recv, genKeyPtr(k), llvm::cast<llvm::Value>(valDisp)},
                         "dict.remove");
+                } else {
+                    auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
+                    removeResult = builder_.CreateCall(
+                        fn, {recv, genKeyPtr(k)}, "dict.remove");
                 }
-                auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
-                return builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.remove");
+                // fix #6419: the removed value is DISPOSED inside the call
+                // (`_disposing` variant) or never entered the table, and the
+                // `bool` this arm hands back aliases no slot of it — so the
+                // unbound receiver is spent here and §28.3's reclaim is safe.
+                freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
+                return removeResult;
             }
             auto [kd, kl, kw] = strDataLen(k);
             llvm::Value* removeResult;
@@ -9526,6 +9600,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // complete by this point — release a fresh +1 KEY producer now.
             if (isPlusOneStringProducer(call.args[0].value.get()))
                 emitStringRelease(k);
+            // fix #6419: the twin of the generic-key reclaim above, placed at
+            // this arm's single return so BOTH the disposing and the plain
+            // `bz_dict_remove_str` variants are covered by the one call.
+            freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
             return removeResult;
         }
         // fix #643 / stdlib §4.9: .PopValue(k): owned V — retrieve the owned
