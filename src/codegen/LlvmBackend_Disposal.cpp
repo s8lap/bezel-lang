@@ -1904,6 +1904,78 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 llvm_, "owned.iter.cont", currentFn_);
             builder_.CreateCondBr(isNull, iterContBB, iterDispBB);
             builder_.SetInsertPoint(iterDispBB);
+            // fix #6414 / §8.1 / §28.5 / §29.7 (v0.338): an `owned`
+            // IEnumerable<T> / IOwningEnumerable<T> FIELD whose runtime value is
+            // a USER CLASS wild-jumps. Everything below assumes the ITERATOR
+            // format ([0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current, §29.7) and
+            // calls through slot 1. That holds for the two kinds this arm was
+            // built for — MEASURED that BOTH of them reach THIS arm and both are
+            // correct today: an array-backed `IEnumerable<int>` field is
+            // materialised into a vtable-backed iterator WRAPPER by the
+            // construction path, and a real enumerator is the frame itself.
+            // It does NOT hold for a user class: §8.1 makes `class MyE:
+            // IEnumerable<int>` legal, §28.5 admits the interface-typed owned
+            // field precisely because "runtime dispatch resolves disposal to
+            // the underlying class's Dispose()", and such a value is stored
+            // RAW, so word 0 is the CLASS vtable. Slot 1 of a class vtable is
+            // not a Dispose function, and calling it is a wild jump, not a
+            // mis-free — MEASURED, 500 constructions per row:
+            //   AddressSanitizer: SEGV … "PC is at a non-executable region.
+            //   Maybe a wild jump?"  #0 itmap$M.MyE, with NO intervening frame
+            //   (the slot-1 target is not a real function). Plain oracle:
+            //   Segmentation fault (core dumped), exit 139.
+            //
+            // So the release is chosen at RUN TIME, with the same
+            // discriminator #6402 / #6413 / #6415 use:
+            // `bz_obj_is_string(val, vtableTablePtr())` answers "not a string"
+            // (== 0) exactly when word 0 is a REGISTERED vtable. Its contract
+            // is a whitelist NEGATION, and it discriminates in exactly the right
+            // direction for this arm, which is the point worth stating: the
+            // ITERATOR vtables are NOT registered, so they answer "string" and
+            // keep the slot-1 dispatch they need. (An unregistered vtable is
+            // why #6402's own note lists "an iterator or collection-adapter
+            // vtable" among the values that answer "string" — here that
+            // property is load-bearing rather than a caveat.) A user class's
+            // vtable IS registered (user and imported classes alike, with
+            // #1843's `finalizeVtableTable` covering lazily-created specialized
+            // vtables), so it answers "not a string" and takes the class arm.
+            // Both surviving populations are handled correctly, so this makes
+            // no previously-correct program incorrect — the bar #417's site
+            // sets for itself.
+            //
+            // The class arm is `emitDisposeAndReclaim` — LITERALLY the
+            // class-instance arm at the bottom of this loop, so the class is
+            // freed exactly once and its own `owned` fields are discharged by
+            // its destructor rather than reinterpreted as an iterator frame.
+            // No extra predicate is needed: `iterField` is set on exactly two
+            // paths, and BOTH are gated on `isVtableBackedIEnumerableType` (the
+            // auto-property-storage arm above and the FieldSymbol arm), so
+            // reaching here already means the slot's declared type is an
+            // iterator-interface head.
+            {
+                auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* isStr = builder_.CreateCall(
+                    isStrFn, {val, vtableTablePtr()}, "iterfield.isstr");
+                llvm::Value* isVtable =
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                llvm::Value* notNull = builder_.CreateICmpNE(
+                    val, llvm::ConstantPointerNull::get(ptrTy()));
+                llvm::Value* isUserClass = builder_.CreateAnd(
+                    isVtable, notNull, "iterfield.userclass");
+                auto* objBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.iter.obj", currentFn_);
+                auto* itBB = llvm::BasicBlock::Create(
+                    llvm_, "owned.iter.slot1", currentFn_);
+                builder_.CreateCondBr(isUserClass, objBB, itBB);
+                builder_.SetInsertPoint(objBB);
+                // §28.4 step 2 / §28.5: the class-instance release.
+                emitDisposeAndReclaim(val);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+                builder_.CreateBr(iterContBB);
+                builder_.SetInsertPoint(itBB);
+            }
             // Dispatch vtable slot 1 (Dispose) — frees the frame.
             llvm::Value* vt = builder_.CreateLoad(ptrTy(), val);
             llvm::Value* dispSlot =

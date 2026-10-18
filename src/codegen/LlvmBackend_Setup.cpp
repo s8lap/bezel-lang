@@ -33166,6 +33166,64 @@ bool Emitter::lowerOwnedClassFieldStore(const ast::Expr& target,
     sema::Symbol* sym = ctx_.exprSymbol(target);
     auto* fs = dynamic_cast<sema::FieldSymbol*>(sym);
     if (fs && isOwnedIteratorInterfaceField(fs)) {
+        // fix #6414 / §8.1 / §28.5 / §28.7 / §29.7 (v0.338): the drop-on-
+        // overwrite twin of the scope-end `iterField` arm in
+        // LlvmBackend_Disposal.cpp. §28.7 ("Reassigning owned fields and locals
+        // — drop-on-overwrite") requires the displaced value to be disposed
+        // "null-guarded and dynamically dispatched, exactly the machinery
+        // scope-end disposal already uses" — so this arm and that one must
+        // classify the same value the same way, and before this change only
+        // the scope-end half could be fixed at a time.
+        //
+        // Everything in this arm assumes the ITERATOR format
+        // ([0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current, §29.7) and calls through
+        // slot 1. That is right for the two kinds MEASURED to reach it (a
+        // vtable-backed iterator WRAPPER, and a real enumerator frame, both of
+        // which are clean today) and WRONG for a user class: §8.1 makes
+        // `class MyE: IEnumerable<int>` legal, §28.5 admits the interface-typed
+        // owned field because "runtime dispatch resolves disposal to the
+        // underlying class's Dispose()", and the value is stored RAW, so word 0
+        // is the CLASS vtable and slot 1 of it is not a Dispose function.
+        // MEASURED, 500 reassignments: `AddressSanitizer: SEGV … "PC is at a
+        // non-executable region. Maybe a wild jump?" #0 itmap$M.MyE` with no
+        // intervening frame; plain oracle `Segmentation fault (core dumped)`,
+        // exit 139.
+        //
+        // The discriminator is the same `bz_obj_is_string(val,
+        // vtableTablePtr())` the other three sites use, and it discriminates in
+        // the right direction HERE FOR THE SAME REASON: ITERATOR vtables are not
+        // registered, so they answer "string" and keep the slot-1 dispatch they
+        // need; a user class's vtable IS registered (user and imported classes
+        // alike, #1843's `finalizeVtableTable` for lazily-created specialized
+        // vtables), so it answers "not a string" and takes the class arm. No
+        // extra predicate is needed because `isOwnedIteratorInterfaceField(fs)`
+        // already established that the slot's declared type is an
+        // iterator-interface head.
+        //
+        // The class arm is `emitDisposeAndReclaim` — LITERALLY the `else` arm
+        // below, i.e. what a user class in an `owned` slot gets everywhere
+        // else: freed exactly once, its own `owned` fields discharged by its
+        // destructor rather than reinterpreted as an iterator frame. Both arms
+        // converge on `contBB`, which already carries the store as its
+        // terminator, so no new terminator hazard is introduced.
+        auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+        llvm::Value* isStr = builder_.CreateCall(
+            isStrFn, {oldVal, vtableTablePtr()}, "ocls.iter.isstr");
+        llvm::Value* isVtable =
+            builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+        llvm::Value* notNull = builder_.CreateICmpNE(
+            oldVal, llvm::ConstantPointerNull::get(ptrTy()));
+        llvm::Value* isUserClass =
+            builder_.CreateAnd(isVtable, notNull, "ocls.iter.userclass");
+        auto* iterObjBB = llvm::BasicBlock::Create(
+            llvm_, "ocls.iter.obj", currentFn_);
+        auto* iterSlot1BB = llvm::BasicBlock::Create(
+            llvm_, "ocls.iter.slot1", currentFn_);
+        builder_.CreateCondBr(isUserClass, iterObjBB, iterSlot1BB);
+        builder_.SetInsertPoint(iterObjBB);
+        emitDisposeAndReclaim(oldVal);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(iterSlot1BB);
         llvm::Value* vt = builder_.CreateLoad(ptrTy(), oldVal);
         llvm::Value* dispSlot =
             builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(1)});
