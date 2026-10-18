@@ -1,0 +1,97 @@
+{
+  "Module with a Main class": {
+    "prefix": "module",
+    "body": [
+      "module ${1:App};",
+      "",
+      "class ${2:Program}",
+      "  public static method Main(): int",
+      "    ${0}",
+      "    return 0;",
+      "  end Main;",
+      "end ${2:Program};"
+    ],
+    "description": "A module declaration and a class with Main"
+  },
+  "Class": {
+    "prefix": "class",
+    "body": [
+      "class ${1:Name}",
+      "  ${0}",
+      "end ${1:Name};"
+    ],
+    "description": "Class declaration"
+  },
+  "Record": {
+    "prefix": "record",
+    "body": [
+      "record ${1:Name}(${2:X}: ${3:int});"
+    ],
+    "description": "Positional record"
+  },
+  "Method": {
+    "prefix": "method",
+    "body": [
+      "public method ${1:Name}(${2}): ${3:int}",
+      "  ${0}",
+      "end ${1:Name};"
+    ],
+    "description": "Method with a block body"
+  },
+  "If": {
+    "prefix": "if",
+    "body": [
+      "if ${1:condition} then",
+      "  ${0}",
+      "end;"
+    ],
+    "description": "if … then … end"
+  },
+  "For": {
+    "prefix": "for",
+    "body": [
+      "for var ${1:item} in ${2:items} do",
+      "  ${0}",
+      "end;"
+    ],
+    "description": "for … in … do … end"
+  },
+  "While": {
+    "prefix": "while",
+    "body": [
+      "while ${1:condition} do",
+      "  ${0}",
+      "end;"
+    ],
+    "description": "while … do … end"
+  },
+  "Try": {
+    "prefix": "try",
+    "body": [
+      "try",
+      "  ${1}",
+      "catch",
+      "  var ${2:ex}: ${3:Exception} => ${0}",
+      "end;"
+    ],
+    "description": "try … catch arms … end"
+  },
+  "Using": {
+    "prefix": "usingvar",
+    "body": [
+      "using var ${1:name} := ${0};"
+    ],
+    "description": "A disposed-at-scope-end owned local"
+  },
+  "Try finally": {
+    "prefix": "tryfinally",
+    "body": [
+      "try",
+      "  ${1}",
+      "finally",
+      "  ${0}",
+      "end;"
+    ],
+    "description": "try … finally … end"
+  }
+}

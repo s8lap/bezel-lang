@@ -1,0 +1,54 @@
+{
+  "name": "bezel-lang",
+  "displayName": "Bezel",
+  "description": "Syntax highlighting, editing rules and snippets for the Bezel language",
+  "version": "0.1.0",
+  "publisher": "bezel-lang",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/s8lap/bezel-lang",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets"
+  ],
+  "keywords": [
+    "bezel",
+    "ownership",
+    "syntax"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "bezel",
+        "aliases": [
+          "Bezel",
+          "bezel"
+        ],
+        "extensions": [
+          ".bzl"
+        ],
+        "firstLine": "^\\s*module\\s+[A-Za-z_][A-Za-z0-9_.]*\\s*;",
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "bezel",
+        "scopeName": "source.bezel",
+        "path": "./syntaxes/bezel.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "bezel",
+        "path": "./snippets/bezel.json"
+      }
+    ]
+  }
+}
