@@ -2131,6 +2131,31 @@ private:
         // `bz_array_free(arr, null)` it replaces. IOwningList<T> is statically
         // owning — it gets the static disposer path and never needs this.
         bool collArrayDynamicFree = false;
+        // fix #6433 / §28.1 / §28.3 / §28.5 / §28.11 / §8.1 (v0.338): the
+        // slot's DECLARED type is a POLYMORPHIC collection-interface head
+        // (ICollection<T> / IReadOnlyCollection<T> / IOwningCollection<T> —
+        // `isCollIfaceHead` in LlvmBackend_Setup.cpp's
+        // `registerUnwindOwnedParam`). Unlike `collArrayDynamicFree`'s LIST
+        // heads, whose sole implementer pair (`Array<T>` / `OwningArray<T>`,
+        // stdlib §4.5) makes the array arm sound, these heads are implemented by
+        // collections with MUTUALLY INCOMPATIBLE runtime representations (a
+        // `bz_array_t` / `bz_llist_t` / `bz_dict_t`), so neither
+        // `bz_array_free` nor any other single emit call is sound at this site.
+        // When set, `emitDisposals` splits on `bz_obj_is_string` — a REGISTERED
+        // class vtable is a USER CLASS (§8.1 makes one a legal implementer) and
+        // takes `emitDisposeAndReclaim`, the mechanism §28.5 states ("runtime
+        // dispatch resolves disposal to the underlying class's `Dispose()`")
+        // for an interface-typed owned value; the `else`-arm is
+        // `bz_runtime_dispose` (#3026's kind-tag dispatcher over the three
+        // tagged backings), the SAME pair the explicit `.Dispose()` call site
+        // already emits for these heads.
+        // `collectionElemDisposer` carries the element disposer the static
+        // head's owning/borrowing split derives (null for the two borrowing
+        // heads; for `IOwningCollection<T>` the
+        // `elementPolicyFor(elem, owning=true)` thunk). It is consulted ONLY on
+        // the `else`-arm — a user class discharges its own fields through its
+        // destructor, never through an element cascade.
+        bool collIfaceRuntimeKind = false;
         // #394 / stdlib §4.9 + #401 / stdlib §4.8: a `using var` bound to a
         // hash-backed dictionary (Dictionary<K,V>/OwningDictionary<K,V>). At scope
         // end it is freed via bz_dict_free. `dictValueDisposer` is the per-VALUE

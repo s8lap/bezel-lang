@@ -24208,6 +24208,162 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // sibling / outer disposal registered against the same slot reads null
     // on its later unwind path and skips — without the null, a duplicate
     // entry would double-free. // per §28.3, §28.11
+    // fix #6433 / §28.1 / §28.3 / §28.5 / §28.11 / §8.1 (v0.338): a
+    // POLYMORPHIC COLLECTION-INTERFACE HEAD as the declared type of a sync
+    // `owned` parameter (`Take(owned x: ICollection<int>)` and its two sibling
+    // heads). This arm sits one family out from the concrete-name
+    // collection branch below and, unlike it, matches NO concrete builtin name
+    // — a head is not a concrete class — while `rt->declaration == nullptr`
+    // makes `isClassOrInterfaceRef` reject it below too. So the §28.3 auto-drop
+    // registration was skipped ENTIRELY: the diagnostic this very call site
+    // prints ("owned parameter `x` is implicitly disposed at the end of the
+    // method (§28.3 must-use / auto-drop)") promised a release that never ran.
+    //
+    // §28.1's type requirement admits `owned` at the method-parameter position on
+    // "a class type other than `Type`, **an interface type**, or a bare type
+    // parameter", and §28.3 requires the undischarged value to be "disposed
+    // exactly once on every path by the affine auto-drop". For an interface-typed
+    // owned value the spec states the MECHANISM in §28.5 — "runtime dispatch
+    // resolves disposal to the underlying class's `Dispose()`" — at its FIELD
+    // position; this site applies that same mechanism at the parameter position,
+    // which §28.3's dispose-exactly-once demands once §28.1 admits the type. The
+    // three citations together leave no reading under which this parameter may
+    // simply not be discharged, so it is an implementation defect rather than a
+    // spec ambiguity — and the emitted code is exactly §28.5's mechanism, so
+    // nothing depends on how a narrower reading would have resolved.
+    //
+    // MEASURED, 500 calls per row, `bezelc --sanitize=address` +
+    // `ASAN_OPTIONS=detect_leaks=1`, pre-fix (the exact legs the seven leak
+    // rows in the regression test reproduce), EVERY row silent (`internal:`
+    // count 0 — not one leaked byte attributed to a runtime frame):
+    //
+    //   Take(owned x: ICollection<int>)         <- new Array<int>(1)   29940 B /  998
+    //   Take(owned x: ICollection<int>)         <- new MyColl()        41916 B / 1497
+    //   Take(owned x: ICollection<int>)         <- new LinkedList<int>() 28000 B / 500
+    //   Take(owned x: ICollection<int>)         <- new Set<int>()    175648 B /  998
+    //   Take(owned x: IReadOnlyCollection<int>) <- new Array<int>(1)   29940 B /  998
+    //   Take(owned x: IOwningCollection<C>)     <- new OwningArray<C>  91816 B /  998
+    //   Take(owned x: IOwningCollection<C>)     <- new OwningList<C>   28000 B /  500
+    //
+    // The user-class row leaks the class's own `owned` fields too, because
+    // nothing reaches its destructor — which is why 41916 B is larger than the
+    // 29940 B the same head leaks for a plain array backing. The `Set` row is
+    // larger still because a `bz_dict_t` carries its own hash table.
+    //
+    // WHY THIS ARM CANNOT BE THE CONCRETE-NAME BRANCH'S SHAPE. The three LIST
+    // heads admit exactly one implementer pair (`Array<T>` / `OwningArray<T>`,
+    // stdlib §4.5), so the array arm is sound for them. These heads do not:
+    // MEASURED, `ICollection<int>` accepts `new Array<int>(1)` (a `bz_array_t`),
+    // `new LinkedList<int>()` (a `bz_llist_t`, count at offset 16 where
+    // `bz_array_t` has it at 8) and `new Set<int>()` (a `bz_dict_t`), and
+    // `IReadOnlyCollection<int>` accepts those plus `Stack<int>` / `Queue<int>`.
+    // Selecting the free from the declared type here would be a WILD FREE, not
+    // a leak.
+    //
+    // So the free is chosen at RUN TIME, and the discriminating information
+    // ALREADY EXISTS — this is not a new runtime foundation:
+    //   * `Disposal::collIfaceRuntimeKind` routes the release in `emitDisposals`
+    //     through `bz_obj_is_string` (a REGISTERED class vtable -> the user
+    //     class's own `Dispose()`, §28.5) and otherwise `bz_runtime_dispose`,
+    //     which is #3026's kind-tag dispatcher over the three tagged backings —
+    //     the SAME helper the explicit `.Dispose()` path already emits for
+    //     these very heads (LlvmBackend_Calls2.cpp's `isCollectionInterfaceName`
+    //     arm). #3026's tag was built for exactly this population: "a
+    //     polymorphic collection-interface receiver ... whose concrete backing
+    //     is unknown at the call site cannot pick the matching `bz_*_free`
+    //     statically".
+    //   * The element disposer is derived from the STATIC head's owning /
+    //     borrowing split, the same shape that arm uses: `IOwningCollection` is
+    //     owning and takes `elementPolicyFor(elem, owning=true)`; `ICollection`
+    //     and `IReadOnlyCollection` are borrowing and take NULL. A BORROWING
+    //     head with a `string` element takes `stringElementReleaseThunk()` —
+    //     `elementPolicyFor` yields a NULL thunk for that row (§28.11 v0.135)
+    //     but the array inserter retained a +1 per element that the free must
+    //     release, the same correction `registerUsingDisposal`'s
+    //     `listInterfaceTypeOfLocal` arm makes below.
+    //
+    // `isCollIfaceHead` deliberately EXCLUDES the three list heads: those are
+    // #6415's scope (its own producer recorded that it "still declines, and
+    // still LEAKS" them and filed the residual here), and its discriminator
+    // is the narrower array-only one. Re-admitting them from this arm would
+    // overlap that fix at the same site.
+    {
+        std::string_view ifaceHead{};
+        if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration) {
+            const std::string_view h = builtinTypeName(rt);
+            // #6415's three LIST heads, excluded by NAME rather than through
+            // `isListInterfaceName` — that helper additionally requires an
+            // `astNode` name (it reads `rt->astNode->name->parts`), which an
+            // imported-module TypeRef carrying only `importedName` does not
+            // have, and this arm's head source is `builtinTypeName`, which does
+            // read that shape. Matching the name keeps the two fixes disjoint at
+            // the same site in every spelling.
+            const bool isListHead =
+                h == "IList" || h == "IReadOnlyList" || h == "IOwningList";
+            // `isCollectionInterfaceName` is `Emitter::`'s own sanctioned
+            // accessor: exactly IReadOnlyCollection / ICollection /
+            // IOwningCollection.
+            //
+            // The ENUMERABLE heads (`IEnumerable<T>` / `IOwningEnumerable<T>`)
+            // are DELIBERATELY NOT admitted, and the reason is measured, not
+            // stylistic. An enumerable head is ITERATED, so the argument-
+            // conversion path materialises a backing collection into a vtable-
+            // backed enumerator WRAPPER whose word 0 is an UNREGISTERED
+            // iterator vtable — a THIRD representation (#6414 measured the same
+            // one at the owned enumerable FIELD site). Two consequences, both
+            // observed:
+            //   * #3026's kind tag cannot help: the wrapper's offset 48 carries
+            //     no sentinel, so `bz_runtime_dispose` returns WITHOUT DOING
+            //     ANYTHING. MEASURED on a revision that routed every head
+            //     there: `IEnumerable<int>` + `new Array<int>(1)` still leaked
+            //     30,000 B / 1000 allocs while `IReadOnlyCollection<int>` +
+            //     the SAME argument was clean, from BYTE-IDENTICAL callee
+            //     code — the difference is entirely in what the CALLER passes.
+            //   * The wrapper's OWNER is the CALLER, not the callee. MEASURED,
+            //     with a BORROWED `x: IEnumerable<int>` parameter the caller
+            //     still disposes the wrapper after the call (and the array then
+            //     leaks 30,000 B, its own separate defect). Making the callee
+            //     release the wrapper as well — which is what the iterator
+            //     vtable contract at this slot calls for — turns that into a
+            //     heap-use-after-free ASan catches in `main` one instruction
+            //     after `Take` returns.
+            // So the enumerable heads need the ARGUMENT-LOWERING ownership
+            // transfer for an enumerable argument reconciled first (who owns
+            // the materialised wrapper), which is a different site and a
+            // different subsystem from this discharge. Recording the residual
+            // rather than half-fixing it here is the same call #6415's producer
+            // made for the list heads, one family out.
+            if (!h.empty() && !isListHead && isCollectionInterfaceName(rt))
+                ifaceHead = h;
+        }
+        if (!ifaceHead.empty()) {
+            bool ifaceIsOwning = ifaceHead == "IOwningCollection";
+            const sema::TypeRef* elem =
+                (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
+            ElementPolicy ep = elementPolicyFor(elem, ifaceIsOwning);
+            Disposal d{slot, nullptr};
+            d.collection = true;
+            d.collectionElemDisposer = ep.disposerThunk;
+            if (!d.collectionElemDisposer && !ifaceIsOwning && elem &&
+                !elem->nullable &&
+                elem->kind == sema::TypeRef::Kind::Primitive &&
+                elem->primitive == sema::PrimitiveType::String &&
+                ep.cat == ElementPolicy::Category::RuntimeManaged)
+                d.collectionElemDisposer = stringElementReleaseThunk();
+            // §28.5 / §28.11: the release is chosen at run time because the
+            // declared type erases the backing — NOT because the disposer is
+            // unknown. `collArrayDynamicFree` (the list heads' "consult the
+            // stamped disposer header" flag) is deliberately NOT set: the
+            // backing here may be an llist or a dict, whose stamped-disposer
+            // convention is `bz_runtime_dispose`'s job, and
+            // `bz_array_free_dynamic` reads an array-layout offset off all
+            // three.
+            d.collIfaceRuntimeKind = true;
+            d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+            disposeStack_.front().push_back(d);
+            return;
+        }
+    }
     if (isLinkedListTypeName(rt) || isDictTypeName(rt) ||
         isCollectionTypeName(rt)) {
         Disposal d = buildCollectionTempDisposal(slot, rt);

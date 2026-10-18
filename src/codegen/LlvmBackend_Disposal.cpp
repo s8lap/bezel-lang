@@ -9176,6 +9176,115 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* contBB = llvm::BasicBlock::Create(llvm_, "coll.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, frBB);
             builder_.SetInsertPoint(frBB);
+            // fix #6433 / §28.1 / §28.3 / §28.5 / §28.11 / §8.1 (v0.338): the
+            // slot's declared type is a POLYMORPHIC collection-interface head,
+            // so the runtime backing is NOT determined by the declared type.
+            // MEASURED, the implementing set per head (probe over every
+            // stdlib §4 collection, 500 calls, `bezelc --sanitize=address` +
+            // `ASAN_OPTIONS=detect_leaks=1`):
+            //
+            //   ICollection<T>        <- Array, LinkedList, Set
+            //   IReadOnlyCollection<T><- Array, LinkedList, Set, Stack, Queue
+            //   IOwningCollection<T>  <- OwningArray / OwningLinkedList / OwningSet
+            //   + a USER CLASS at each of them (§8.1 makes
+            //     `class MyColl: ICollection<int>` legal and sema accepts the
+            //     assignment with no diagnostic)
+            //
+            // (The ENUMERABLE heads `IEnumerable<T>` / `IOwningEnumerable<T>`
+            // are deliberately NOT routed here: an enumerable argument is
+            // materialised by the CALLER into a vtable-backed enumerator
+            // wrapper whose vtable is UNREGISTERED and whose offset 48 carries
+            // no kind tag, so this pair would neither free it nor mis-free it —
+            // it would leave it, and the wrapper's own owner is the caller.
+            // `registerUnwindOwnedParam` records the measurement and why.)
+            //
+            // THREE runtime kinds, and the two discriminator helpers that
+            // already exist for them — the same composition #3026 emits at the
+            // explicit `.Dispose()` call site (LlvmBackend_Calls2.cpp's
+            // `isCollectionInterfaceName` arm) and the same
+            // `bz_obj_is_string` split #6402 / #6413 / #6414 use at the owned
+            // FIELD sites.
+            //
+            // WHY BOTH, IN THIS ORDER. `bz_obj_is_string(val,
+            // vtableTablePtr())` answers "not a string" (== 0) exactly when
+            // word 0 is a REGISTERED vtable, i.e. a user class instance — that
+            // is the §28.5 arm (it states "runtime dispatch resolves disposal to
+            // the underlying class's `Dispose()`" for an interface-typed owned
+            // value, at its field position; see the §28.1/§28.3 synthesis in
+            // `registerUnwindOwnedParam`), taken through
+            // `emitDisposeAndReclaim`, so the object's own `owned` fields are
+            // discharged by its destructor rather than reinterpreted as an
+            // array. `bz_runtime_dispose` (#3026) then dispatches the remaining
+            // population on the kind tag at offset 48 (bz_array_t /
+            // bz_llist_t) and offset 88 (bz_dict_t), calling the matching
+            // `bz_*_free`. Soundness of the second half here rests on the same
+            // closed-population argument #6402 records: a concrete built-in
+            // collection's word 0 is `arr->data` — a heap pointer, never a
+            // listed vtable (and NULL for an empty backing, which the
+            // null-terminator scan stops at, so it answers "string") — and a
+            // user class declaring the head has a REGISTERED vtable (user and
+            // imported classes alike, with #1843's `finalizeVtableTable`
+            // covering lazily-created specialized vtables), so it is routed
+            // away above and never reaches the kind probe. There is no
+            // `Object`-typed escape hatch at an interface head, so the #417
+            // "receiver reachability is NOT determined by what the object
+            // declares" caveat does not apply.
+            //
+            // The probe is UNCONDITIONAL here, exactly as it already is at the
+            // explicit `.Dispose()` site #3026 established: an untagged pointer
+            // (BZ_RUNTIME_KIND_NONE, or any value neither probe matches) makes
+            // `bz_runtime_dispose` return without doing anything — a bounded
+            // leak, never a wild free. That is the trade the runtime header
+            // records for this helper, and this change does not widen it.
+            //
+            // §28.3 requires the undischarged `owned` value to be disposed
+            // exactly once on every path, so the null-store below is
+            // load-bearing: a sibling / outer disposal registered against the
+            // same slot reads null on its later pass and skips.
+            if (it->collIfaceRuntimeKind) {
+                auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                          {ptrTy(), ptrTy()});
+                llvm::Value* isStr = builder_.CreateCall(
+                    isStrFn, {arr, vtableTablePtr()}, "colliface.isstr");
+                llvm::Value* isVtable =
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                llvm::Value* notNull = builder_.CreateICmpNE(
+                    arr, llvm::ConstantPointerNull::get(ptrTy()));
+                llvm::Value* isUserClass = builder_.CreateAnd(
+                    isVtable, notNull, "colliface.userclass");
+                auto* objBB = llvm::BasicBlock::Create(
+                    llvm_, "colliface.obj", currentFn_);
+                auto* kindBB = llvm::BasicBlock::Create(
+                    llvm_, "colliface.kind", currentFn_);
+                auto* ifaceContBB = llvm::BasicBlock::Create(
+                    llvm_, "colliface.cont", currentFn_);
+                builder_.CreateCondBr(isUserClass, objBB, kindBB);
+                builder_.SetInsertPoint(objBB);
+                emitDisposeAndReclaim(arr);
+                builder_.CreateBr(ifaceContBB);
+                builder_.SetInsertPoint(kindBB);
+                llvm::Value* disp = it->collectionElemDisposer
+                    ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
+                    : llvm::ConstantPointerNull::get(ptrTy());
+                auto* kindFn = declareC("bz_runtime_dispose",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy()});
+                builder_.CreateCall(kindFn, {arr, disp});
+                // fix #1878 (§28.4, v0.306): the owning head's element cascade
+                // is a disposal point too — the same count the array arm below
+                // makes, and for the same reason: the thunk dispatches each
+                // element's own vtable Dispose, user code reached WITHOUT
+                // emitDynamicDispose.
+                if (elementDisposerRunsUserCode(it->collectionElemDisposer))
+                    ++userCodeDisposalCount_;
+                builder_.CreateBr(ifaceContBB);
+                builder_.SetInsertPoint(ifaceContBB);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                continue;
+            }
             // fix #2630 / §28.5/§28.11 / stdlib §4.3: a `using var` typed by a
             // BORROWING list interface (IReadOnlyList<T>/IList<T>) whose static
             // head erases the dynamic backing — could be borrowing Array<T>
