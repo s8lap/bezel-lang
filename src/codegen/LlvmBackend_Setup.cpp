@@ -25863,11 +25863,16 @@ static bool calleeResolvedBySema(const ast::CallExpr& call,
 // keeps the producer/consumer balance entirely inside codegen.
 bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     if (!init) return false;
-    // fix #5321 / §23.3 / §28.9: sentinel returned by inlinedGetterBody
-    // for a multi-statement block getter where ALL return statements are
-    // +1 string producers. The sentinel is a non-null, non-dereferenceable
-    // pointer (reinterpret_cast<const Expr*>(1)) that signals "treat this
-    // as a producer" without needing to return a real Expr*.
+    // fix #5321 / §23.3 / §28.9, widened by #6449: sentinel returned by
+    // inlinedGetterBody for a MULTI-STATEMENT block-bodied `string` getter.
+    // #5321 returned it only when ALL return statements were +1 string
+    // producers; #6449 returns it for such a getter UNCONDITIONALLY, because
+    // that getter now normalizes every exit to +1 (the mint in `lowerReturn`)
+    // and "sometimes +1, sometimes a borrow" is not an answer this predicate
+    // could have given either way. The sentinel is a non-null,
+    // non-dereferenceable pointer (reinterpret_cast<const Expr*>(1)) that
+    // signals "treat this as a producer" without needing to return a real
+    // Expr*.
     static const ast::Expr* const kMultiStmtProducerSentinel =
         reinterpret_cast<const ast::Expr*>(1);
     if (init == kMultiStmtProducerSentinel) return true;
@@ -26872,54 +26877,57 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // the getter hands back +1 (not a borrow), so
                     // the getter as a whole is a producer. (When
                     // not all returns are producers, conservatively
-                    // stay in the borrow path.)
+                    // stay in the borrow path.) — SUPERSEDED IN ITS
+                    // NEGATIVE HALF by #6449 below; see that comment
+                    // for why the "conservative borrow path" was
+                    // not conservative but leaking.
                     if (!acc.isSet &&
                         acc.bodyKind ==
                             ast::PropertyAccessorBodyKind::Block &&
                         !acc.stmts.empty()) {
-                        // fix #5321 / §23.3 / §28.9: recursively collect ALL
-                        // ReturnStmt nodes from the statement tree (if/elif/else,
-                        // while, for, do-end, try/catch/finally, case). A return
-                        // inside a nested branch IS a return path of the getter.
-                        std::vector<const ast::ReturnStmt*> allReturns;
-                        std::function<void(const ast::Stmt*)> collectReturns =
-                            [&](const ast::Stmt* s) {
-                                if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
-                                    allReturns.push_back(rs);
-                                } else if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
-                                    for (auto& b : is->ifBranch.body) collectReturns(b.get());
-                                    for (auto& br : is->elifBranches)
-                                        for (auto& b : br.body) collectReturns(b.get());
-                                    for (auto& b : is->elseBody) collectReturns(b.get());
-                                } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
-                                    for (auto& b : ws->body) collectReturns(b.get());
-                                } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
-                                    for (auto& b : fs->body) collectReturns(b.get());
-                                } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
-                                    for (auto& b : d->body) collectReturns(b.get());
-                                } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
-                                    for (auto& b : ts->body) collectReturns(b.get());
-                                    for (auto& c : ts->catches) collectReturns(c.body.get());
-                                    for (auto& b : ts->finallyBody) collectReturns(b.get());
-                                } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-                                    for (auto& arm : cs->arms)
-                                        for (auto& a : arm.stmts) collectReturns(a.get());
-                                }
-                            };
-                        for (const auto& stmt : acc.stmts) collectReturns(stmt.get());
-                        bool allReturnsAreProducers = true;
-                        for (const ast::ReturnStmt* rs : allReturns) {
-                            if (!rs->value || !isPlusOneStringProducer(rs->value.get())) {
-                                allReturnsAreProducers = false;
-                                break;
-                            }
-                        }
-                        if (allReturnsAreProducers && !allReturns.empty()) {
-                            getter = reinterpret_cast<const ast::Expr*>(1);  // sentinel: non-null, never dereferenced
-                            break;
-                        }
-                        // Multi-statement body where not all returns are producers
-                        // (or there are no returns at all): stay in borrow path.
+                        // fix #6449 (§23.3 / §28.9, v0.338): a STANDALONE
+                        // block-bodied `string` getter is a +1 producer
+                        // UNCONDITIONALLY. Before this the classification was
+                        // "EVERY return is a +1 producer" (#5321's arm), and a
+                        // body MIXING a producer return with a borrow return
+                        // fell to the borrow path — while the getter, emitted
+                        // out-of-line by `ensurePropertyBlockGetter`, returned
+                        // its body's value VERBATIM, so the producer edge's +1
+                        // escaped to nobody. MEASURED on #6449: `SUMMARY:
+                        // AddressSanitizer: 8000 byte(s) leaked in 400
+                        // allocation(s)` over 200 reads of a mixed getter,
+                        // attributed to `bz$prop$Tag$get`, with the
+                        // all-producer and all-borrow controls clean.
+                        //
+                        // "Sometimes +1, sometimes a borrow" is not an answer
+                        // this predicate can return, so the answer cannot be
+                        // decided by inspecting the body at all — the getter
+                        // has to normalize first, and it does: the sibling arm
+                        // in `lowerReturn` (LlvmBackend_Stmts.cpp) retains on
+                        // every return edge of a standalone block getter that
+                        // is not already a +1 producer, so EVERY exit hands
+                        // back exactly +1. That is the same unconditional-`+1`
+                        // contract `ensureVirtualStringGetterOwnershipThunk`
+                        // (#4952, vtable/itable slots) and
+                        // `emitExportedPropertyGetters` (#5342, cross-module
+                        // `$propget` stubs) already assert just above, and the
+                        // two halves of this pair are not separable: the mint
+                        // without this classification inflates, the
+                        // classification without the mint is a
+                        // use-after-free. The all-producer arm's own comment
+                        // records the residue this closes.
+                        //
+                        // #5321's `return`-walk over the accessor body is GONE,
+                        // not merely unread: "which returns are producers" is no
+                        // longer a question this predicate asks, and the walk
+                        // ran on every classification of a block-bodied
+                        // property read. Its shape coverage (if/elif/else, while,
+                        // for, do-end, try/catch/finally, case) remains correct
+                        // as a description of where a `return` can hide — the
+                        // mint arm in `lowerReturn` fires on each of them the
+                        // same way, because it keys on the return EDGE and not
+                        // on which construct holds it.
+                        getter = reinterpret_cast<const ast::Expr*>(1);  // sentinel: non-null, never dereferenced
                         break;
                     }
                 }

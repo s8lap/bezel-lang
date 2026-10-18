@@ -1625,6 +1625,43 @@ private:
     // has a default, so a call site that has a symbol in scope cannot
     // silently drop the key.
     const sema::PropertySymbol* currentAccessorPropSym_ = nullptr;
+    // fix #6449 (§23.3 / §28.9, v0.338): true ONLY while
+    // `ensurePropertyBlockGetter` is emitting a STANDALONE block-bodied
+    // property getter body — the `get => do … end;` spelling that every read
+    // site lowers to a CALL (`bz$prop$<name>$get`). It is what opens the
+    // `string` +1 mint in `lowerReturn`, and `isPlusOneStringProducer`'s
+    // `inlinedGetterBody` block arm is the classification that makes a
+    // consumer discharge exactly that +1. The two halves are the same
+    // contract: every exit of a standalone block getter hands back a
+    // normalized +1, and every read of one is classified +1.
+    //
+    // WHY A DEDICATED FLAG AND NOT `accessorReturnTypeNode_` /
+    // `accessorReturnTypeFn_`. Those are set by THREE emitters —
+    // `ensurePropertyBlockGetter`, `ensurePropertyAccessorFn` (the vtable /
+    // itable slot filler) and `ensureIndexerBlockGetter` — and they are
+    // DIFFERENT read faces with their own normalization each: a slot read goes
+    // through `ensureVirtualStringGetterOwnershipThunk` (#4952) and an indexer
+    // read has no normalizer at all. This fix claims ONLY the standalone face,
+    // so minting on the shared `accessorReturnTypeNode_` would hand the other
+    // two a second reference that nothing there is contracted to drop.
+    //
+    // The slot face's own normalization is NOT claimed to be complete, and
+    // this flag does not paper over it: MEASURED on both legs of this fix, a
+    // `virtual` string property whose accessor body has MORE THAN ONE
+    // statement leaks one string per call whatever that body is — an
+    // ALL-PRODUCER body leaks `8000 byte(s) in 400 allocation(s)` and so does
+    // the mixed body, both attributed to `bz$C$Tag$propget`, byte-identical
+    // with and without this change. The thunk reads a block getter's body only
+    // when it is EXACTLY one `return <expr>;`, so a multi-statement body
+    // answers "unknown", takes the wrap, and retains on top of a +1 the
+    // accessor already transferred. That is a separate defect with a separate
+    // owner; see the commit body.
+    //
+    // A MEMBER of `NestedBodyScope` (saved + nulled + restored by that one
+    // guard): a nested body emission inside a getter — a lambda body, a nested
+    // getter — must not inherit the caller's per-body mode, which is the same
+    // discipline #2170/#2694/#2702 established for the other per-body fields.
+    bool inStandalonePropBlockGetter_ = false;
     // §27.5 / #673: for boxed NON-FOR-VAR locals, maps each cell-holder alloca
     // (newSlot) to the ORIGINAL pre-boxing alloca (the variable's original
     // storage slot).  After boxing, the original slot is kept in sync on every
@@ -17262,6 +17299,13 @@ private:
         llvm::BasicBlock*    inlinedAccessorEnd_;
         bool                 asyncChainedReturn_;   // #2731 item 1
         bool                 asyncBorrowedReturn_;   // #3125
+        // fix #6449 (§23.3 / §28.9, v0.338): the standalone block-getter
+        // +1 mint mode. Saved + cleared + restored here because it is a
+        // per-body mode in exactly the sense the rest of this guard
+        // enumerates — a lambda body, a nested getter or any other nested
+        // emission must not inherit the enclosing standalone getter's
+        // contract and mint against it. See the member's own note above.
+        bool                 inStandalonePropBlockGetter_;  // #6449
         // --- root-scope registration channels (#2731 item 3) ---
         std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>>
                              pendingOwnedParams_;

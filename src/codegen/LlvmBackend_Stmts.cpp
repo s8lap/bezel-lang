@@ -3583,6 +3583,65 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     propBlockGetterReturnKinds_[currentAccessorPropSym_] = k;
                 }
             }
+        // fix #6449 (§23.3 "Block-form properties" / §28.9 "Runtime-managed
+        // types", v0.338): the STANDALONE block-bodied `string` property getter
+        // hands back a normalized +1 on EVERY exit.
+        //
+        // The arm at LlvmBackend_Stmts.cpp ~3688 that mints a method's `string`
+        // return is keyed on `currentReturnTypeNode_`, which #2694/#2703 keeps
+        // NULL inside an accessor body — that suppression is deliberate and
+        // correct as long as BOTH sides of the contract hold: an accessor's
+        // read face is a lend (+0) and no call site discharges anything. What
+        // made it stop holding is that a block-bodied getter is emitted
+        // OUT-OF-LINE (`ensurePropertyBlockGetter` → `bz$prop$<name>$get`),
+        // so its body's value flows to the reader verbatim, and #5321's
+        // all-producer arm taught `isPlusOneStringProducer` to classify such a
+        // read +1 only when EVERY return is a +1 producer. A body that MIXES a
+        // producer return with a borrow return classified false, no consumer
+        // registered a discharge, and the producer edge's +1 escaped the
+        // accessor: MEASURED on #6449, `SUMMARY: AddressSanitizer: 8000
+        // byte(s) leaked in 400 allocation(s)` over 200 reads, attributed to
+        // `bz$prop$Tag$get`, with the all-producer and all-borrow controls
+        // clean on the same build.
+        //
+        // The two halves of the fix are one contract and must land together:
+        // this mint normalizes EVERY exit to +1, and the matching classification
+        // change in `isPlusOneStringProducer`'s `inlinedGetterBody` block arm
+        // makes every read of such a getter +1. Landing this arm alone would
+        // hand a consumer a +1 it treats as a borrow — an inflate; landing the
+        // classification alone would release a reference never minted — a
+        // use-after-free. §28.9's "the two accessor body spellings … are
+        // semantically indistinguishable at every read site" is what the pair
+        // buys, and §28.9's "the implementation reclaims the production; how is
+        // not specified" is what leaves the choice of normalization open; it is
+        // the same contract `ensureVirtualStringGetterOwnershipThunk` (#4952)
+        // already guarantees for a vtable/itable slot and
+        // `emitExportedPropertyGetters` (#5342) for a cross-module `$propget`
+        // stub, which is why the read face still transfers no NET obligation:
+        // retain inside, release at the reader.
+        //
+        // The two transfer exclusions mirror the lambda-body `string` arm
+        // above and the method-return arm below EXACTLY, for the same reason —
+        // a returned expression that ALREADY carries its own +1 must not be
+        // retained on top of it, or the surplus reference is never dropped.
+        // `returnReprTypeNode()` is the accessor's OWN declared type, handed
+        // out only while `currentFn_` IS the accessor function that registered
+        // it (`accessorReturnTypeNode_`/`accessorReturnTypeFn_`), so this arm
+        // sees `pd->type` and nothing else. The nullable spelling mints too,
+        // matching the method-return arm's #2196 reasoning: `bz_string_retain`
+        // is a no-op on null, so a `return null;` is still a null carry rather
+        // than a +1.
+        if (const ast::Type* accRet6449 = returnReprTypeNode())
+            if (inStandalonePropBlockGetter_ && v && rs->value &&
+                v->getType()->isPointerTy()) {
+                const sema::TypeRef* accRetTy6449 = ctx_.resolvedType(*accRet6449);
+                if (accRetTy6449 &&
+                    accRetTy6449->kind == sema::TypeRef::Kind::Primitive &&
+                    accRetTy6449->primitive == sema::PrimitiveType::String &&
+                    !isPlusOneStringProducer(rs->value.get()) &&
+                    !returnedStringLocalOwnsPlusOne(rs->value.get()))
+                    emitStringRetain(v);
+            }
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the

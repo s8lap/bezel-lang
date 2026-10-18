@@ -5746,6 +5746,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       inlinedAccessorEnd_(e.inlinedAccessorEnd_),
       asyncChainedReturn_(e.asyncChainedReturn_),
       asyncBorrowedReturn_(e.asyncBorrowedReturn_),
+      inStandalonePropBlockGetter_(e.inStandalonePropBlockGetter_),  // fix #6449
       pendingOwnedParams_(e.pendingOwnedParams_),
       pendingArgsDisposal_(e.pendingArgsDisposal_),
       pendingChainOutDisposals_(e.pendingChainOutDisposals_),  // fix #4975
@@ -5765,6 +5766,9 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.inlinedAccessorEnd_        = nullptr;
     e.asyncChainedReturn_        = false;
     e.asyncBorrowedReturn_       = false;
+    e.inStandalonePropBlockGetter_ = false;   // fix #6449: a nested body (a
+    // lambda, a nested getter) is not the standalone getter's own body, so it
+    // must not inherit its +1 mint.
     e.pendingOwnedParams_.clear();
     e.pendingArgsDisposal_.reset();
     e.pendingChainOutDisposals_.clear();  // fix #4975
@@ -5808,6 +5812,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.inlinedAccessorEnd_        = inlinedAccessorEnd_;
     e_.asyncChainedReturn_        = asyncChainedReturn_;
     e_.asyncBorrowedReturn_       = asyncBorrowedReturn_;
+    e_.inStandalonePropBlockGetter_ = inStandalonePropBlockGetter_;  // fix #6449
     e_.pendingOwnedParams_        = std::move(pendingOwnedParams_);
     e_.pendingArgsDisposal_       = std::move(pendingArgsDisposal_);
     e_.pendingChainOutDisposals_  = std::move(pendingChainOutDisposals_);  // fix #4975
@@ -5989,6 +5994,20 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     // keeps the claim honest rather than half-claimed.
     const sema::PropertySymbol* savedAccessorPropSym = currentAccessorPropSym_;
     currentAccessorPropSym_ = psKey;
+    // fix #6449 (§23.3 / §28.9, v0.338): open the standalone-getter +1 mint
+    // for the duration of THIS body only. Every read of a block-bodied
+    // property is a CALL into this function (CG33b, LlvmBackend_Exprs.cpp's
+    // bare and qualified arms, and the `?.` arm), and
+    // `isPlusOneStringProducer`'s `inlinedGetterBody` block arm now classifies
+    // every such read as +1 — so this is where that claim is paid. Without it
+    // the classification would release a reference the getter never minted
+    // (a use-after-free), which is the #5342 failure mode in reverse.
+    // Saved and restored here, alongside `currentAccessorPropSym_` above, for
+    // the same reason: this channel must survive the whole body emission and
+    // be closed by the same explicit block, not by `NestedBodyScope` (whose
+    // job is the opposite — stopping a NESTED body inheriting it).
+    const bool savedStandalonePropBlockGetter = inStandalonePropBlockGetter_;
+    inStandalonePropBlockGetter_ = true;
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
@@ -6011,6 +6030,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
+    inStandalonePropBlockGetter_ = savedStandalonePropBlockGetter;  // fix #6449
     // fix #6397 (§28.9 / §29.2, v0.338): close the accessor-body attribution
     // channel opened above. Deliberately in this explicit block and NOT in
     // `NestedBodyScope`: the guard clears state a nested body must not
