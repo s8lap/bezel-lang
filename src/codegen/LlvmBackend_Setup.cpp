@@ -18658,10 +18658,47 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
                         dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
                         srcIsNamedOwner = true;
-                    } else if (auto* ps =
-                                   dynamic_cast<sema::PropertySymbol*>(sym)) {
-                        srcIsNamedOwner =
-                            sema::isAutoPropertyStorageSymbol(ps, ctx_);
+                    } else if (dynamic_cast<sema::PropertySymbol*>(sym) !=
+                               nullptr) {
+                        // narrow #6387 siblings (§28.9 / §28.6 / §28.2,
+                        // v0.338): a property READ is a LEND — "a getter
+                        // never transfers a reclamation obligation to its
+                        // reader" — so EVERY property read is a named owner
+                        // here and the wrapper must never reclaim it. This is
+                        // the same widening #6387 applied at
+                        // LlvmBackend_Assign.cpp's `wrapAsIEnumerableForTarget`
+                        // user-class arm, which is the identical idiom on the
+                        // identical `/*ownsSrc=*/!srcIsNamedOwner` handoff.
+                        //
+                        // The arm this replaces asked
+                        // `isAutoPropertyStorageSymbol` — "does this property
+                        // have compiler-generated backing storage?" — a
+                        // DIFFERENT question, whose NO answer was read here as
+                        // "this read produces a fresh value the wrapper may
+                        // own". MEASURED for a hand-written getter
+                        // (`property Seq: SelfA get => _a; end Seq;` bound by
+                        // `var e: IEnumerable<int> := h.Seq;`):
+                        // heap-use-after-free, READ of size 8 in
+                        // `Holder$DisposeCore`, freed by
+                        // `bz$userenumenum$SelfA$SelfA$Dispose` (the wrapper
+                        // reclaiming the holder's field), allocated in
+                        // `Holder$ctor`. The FIELD-receiver twin of the same
+                        // program (which takes the `FieldSymbol` arm above and
+                        // never consults the predicate) is clean — so the
+                        // property arm is the discriminator, not the shape.
+                        //
+                        // Nothing is given up: this arm is entered only when the
+                        // INITIALIZER's static type is a USER CLASS, and sema
+                        // REJECTS a getter returning a freshly-produced owned
+                        // value of exactly that shape ("a property or indexer
+                        // getter may not return a freshly-produced owned value
+                        // — a getter is a borrow-producing position ... expose
+                        // the factory as a method returning `owned T`",
+                        // §28.6), so the "fresh value" reading has no case
+                        // here. An auto-property is a `PropertySymbol` and its
+                        // answer does not change; §28.2 keeps the holder's
+                        // release point the only reclamation point.
+                        srcIsNamedOwner = true;
                     }
                 }
                 v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR,

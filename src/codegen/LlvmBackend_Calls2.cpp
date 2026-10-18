@@ -9784,11 +9784,46 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 dynamic_cast<sema::FieldSymbol*>(sym) !=
                                     nullptr) {
                                 srcIsNamedOwner = true;
-                            } else if (auto* ps = dynamic_cast<
-                                           sema::PropertySymbol*>(sym)) {
-                                srcIsNamedOwner =
-                                    sema::isAutoPropertyStorageSymbol(
-                                        ps, ctx_);
+                            } else if (dynamic_cast<sema::PropertySymbol*>(
+                                           sym) != nullptr) {
+                                // narrow #6387 siblings (§28.9 / §28.6 /
+                                // §28.2, v0.338): a property READ is a LEND,
+                                // so EVERY property read is a named owner and
+                                // the wrapper this feeds must never reclaim its
+                                // source. Same widening, same reasoning, as
+                                // #6387 applied at LlvmBackend_Assign.cpp's
+                                // `wrapAsIEnumerableForTarget` user-class arm
+                                // — this is that arm's twin: the same
+                                // `/*ownsSrc=*/!srcIsNamedOwner` handoff, from
+                                // the `.GetEnumerator()` receiver instead of a
+                                // local-decl initializer.
+                                //
+                                // MEASURED for a hand-written getter
+                                // (`property Seq: SelfA get => _a; end Seq;`
+                                // driven by `using var e :=
+                                // h.Seq.GetEnumerator();`):
+                                // heap-use-after-free, READ of size 8 in
+                                // `Holder$DisposeCore`, freed by
+                                // `bz$userenumenum$SelfA$SelfA$Dispose` (the
+                                // wrapper reclaiming the holder's field),
+                                // allocated in `Holder$ctor`. The FIELD-
+                                // receiver twin (`h.A.GetEnumerator()`, same
+                                // program otherwise) is CLEAN — it takes the
+                                // `FieldSymbol` arm above and never consults
+                                // the predicate — so the property arm is the
+                                // discriminator, not the program shape.
+                                //
+                                // Nothing is given up: this arm is entered only
+                                // when the RECEIVER's static type is a USER
+                                // CLASS (`recvTy->declaration->kind ==
+                                // ast::TypeDeclKind::Class`, tested above), and
+                                // sema REJECTS a getter returning a
+                                // freshly-produced owned value of exactly that
+                                // shape (§28.6), so the "fresh value" reading
+                                // the old answer encoded has no case here. An
+                                // auto-property is a `PropertySymbol` and its
+                                // answer does not change.
+                                srcIsNamedOwner = true;
                             }
                         }
                         llvm::Value* wrapped = wrapUserClassAsIEnumerable(

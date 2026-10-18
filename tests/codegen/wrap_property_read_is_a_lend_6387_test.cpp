@@ -51,23 +51,36 @@
 // is what stops inverting the moment the defect is fixed.
 //
 // SCOPE — READ THIS BEFORE ASSUMING THIS FILE IS THE WHOLE FIX. The predicate
-// this fix corrects is written out FOUR times, and this commit changes ONE of
-// them (the one this file's own source lives in). The other three are in
-// files this lane does not own:
-//   * src/codegen/LlvmBackend_Setup.cpp:18655  — the LOCAL-DECL coercion
-//     producer (`var e: IEnumerable<int> := h.Prop;`). MEASURED RED at this
-//     file's parent: same `Holder$DisposeCore` /
-//     `bz$userenumenum$SelfA$SelfA$Dispose` signature. STILL RED after this
-//     commit.
-//   * src/codegen/LlvmBackend_Calls2.cpp:9778  — the `.GetEnumerator()`
-//     receiver producer. Carries the identical predicate verbatim.
-//   * src/codegen/LlvmBackend_Stmts.cpp:9863 and its TWIN — the for-in
-//     CONSUMER's `sourceIsNamedLocal` (the same predicate appears twice in
-//     that file; the twin is the splice hazard). MEASURED RED at this file's
-//     parent via the direct `for var x in h.Prop` read. STILL RED after this
-//     commit.
-// The fix is one edit in each of the four files, and the same §28.9 sentence
-// settles all four. Filed for a follow-up; see the commit body.
+// this fix corrects is written out NINE times across four codegen files, and
+// this commit changed ONE of them (the one this file's own source lives in).
+//
+// CORRECTION, measured after this commit landed. The follow-up's original
+// wording here said "the same §28.9 sentence settles all four sites". THAT WAS
+// WRONG, and the correction is a PRODUCER vs CONSUMER split, not a file list:
+//
+//   * SET TO `true` — this file's own source, and two later sites in
+//     src/codegen/LlvmBackend_Setup.cpp and src/codegen/LlvmBackend_Calls2.cpp.
+//     Each is a PRODUCER feeding `/*ownsSrc=*/!srcIsNamedOwner` into
+//     `wrapUserClassAsIEnumerable` — i.e. deciding whether the wrapper reclaims
+//     its SOURCE. §28.9 settles this end: "a getter never transfers a
+//     reclamation obligation to its reader."
+//
+//   * NOT SET TO `true` — src/codegen/LlvmBackend_Stmts.cpp (the for-in), and
+//     the consumer-side registrations in Setup.cpp / Calls2.cpp. Those decide
+//     who reclaims the WRAPPER FRAME, a different object with a different
+//     owner, and §28.9 says nothing about it. Applying this file's sentence
+//     there is MEASURED to LEAK (6400 bytes in 200 objects, allocated in the
+//     property getter, when a getter WIDENS its body to a declared
+//     `IEnumerable<T>` and mints a frame at the read site) and to turn this
+//     file's own two landed rows RED.
+//
+// So the `PropertySymbol` arm cannot be the right lever at the consumer end:
+// `property Items: IEnumerable<int> get => _items` over an `owned Array<int>`
+// and `property Seq: SelfA get => _a` are both `PropertySymbol` reads with the
+// same declared type, and no symbol-level predicate separates them. The
+// authority that already does is `propReadIterWrappedExprs_`
+// (LlvmBackend_impl.hpp), which records "this property read minted a wrap
+// frame" on a MINT and erases it on a DECLINE — CLAIM = MINT.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
