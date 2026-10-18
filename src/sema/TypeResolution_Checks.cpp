@@ -6355,20 +6355,53 @@ static TypeRef* applyBaseMemberSubst(
                             /*aliasChainParams=*/true});
 }
 
-// §12.1 (#6299): the positions, in each class's `baseTypes`, of the base-type
-// path from `from` down to `target` (depth-first, first path found). Returns
-// false when `target` is not reachable through `baseTypes`.
+// §12.1 (#6299, v0.338): the positions, in each class's `baseTypes`, of the
+// base-type path from `from` down to `target` (depth-first, first path found).
+// Returns false when `target` is not reachable through `baseTypes`.
+//
+// The walk is TOTAL — it terminates on the SHAPE of the base-type graph, not
+// on a count (#6416). It used to carry a bare `depth > 64` literal, which is
+// the WRONG direction for this call site: §12.1 states override matching with
+// no depth qualifier ("parameter types … must match the base member
+// exactly"), and a base chain 65 classes long is legal Bezel at every level.
+// Past the bound the walk returned "not reachable", `buildBaseClassGenericSubst`
+// therefore composed an EMPTY substitution, the base member's `P(a: T)` was
+// read unsubstituted, and a correct `E: C65<string>` overriding `P(a: string)`
+// was REJECTED with a §12.1 override-mismatch diagnostic naming a rule it
+// satisfied. Raising the literal would leave the same hole one constant
+// higher, and DIAGNOSING at the bound would reject a program the spec admits
+// for a reason Appendix C.1 does not list; removing the bound is the only
+// spec-faithful repair, exactly as for the sibling §12.9 walks in #6391 and
+// #6408.
+//
+// What replaces the count is a per-path cycle guard: `onChain` holds the
+// symbols on the CURRENT enclosing path, inserted on entry and erased on
+// every exit, so a class reachable by two different base paths is still
+// walked on both. It fires only on a symbol already on the enclosing path —
+// a genuine cycle — which a program this compiler accepts cannot contain,
+// because §12.10 rejects an inheritance cycle ("no type may, directly or
+// transitively, list itself among its base classes") during class-graph
+// construction, before an override check reaches this walk. That ordering is
+// MEASURED, not assumed:
+// `sema_base_type_path_depth_total_6416.inheritance_cycle_reports_12_10_not_override_mismatch`
+// (tests/sema/base_type_path_depth_total_6416_test.cpp) compiles a three-class
+// cycle and pins §12.10's own diagnostic, so the guard cannot pre-empt it into
+// a silent acceptance.
 static bool baseTypePathTo(const TypeSymbol* from, const TypeSymbol* target,
-                           std::vector<std::size_t>& path, int depth) {
-    if (!from || depth > 64) return false;
+                           std::vector<std::size_t>& path,
+                           std::unordered_set<const TypeSymbol*>& onChain) {
+    if (!from || !onChain.insert(from).second) return false;
     for (std::size_t bi = 0; bi < from->baseTypes.size(); ++bi) {
         const TypeSymbol* b = from->baseTypes[bi];
         if (!b) continue;
         path.push_back(bi);
-        if (b == target || baseTypePathTo(b, target, path, depth + 1))
+        if (b == target || baseTypePathTo(b, target, path, onChain)) {
+            onChain.erase(from);
             return true;
+        }
         path.pop_back();
     }
+    onChain.erase(from);
     return false;
 }
 
@@ -6398,7 +6431,8 @@ void Resolver::buildBaseClassGenericSubst(
     // records no argument at some level leaves the map empty, as before.
     if (!derivedClass || !baseClass) return;
     std::vector<std::size_t> path;
-    if (!baseTypePathTo(derivedClass, baseClass, path, 0)) return;
+    std::unordered_set<const TypeSymbol*> onChain;
+    if (!baseTypePathTo(derivedClass, baseClass, path, onChain)) return;
     std::unordered_map<std::string_view, TypeRef*> bound;  // child's params → derived-scope args
     const TypeSymbol* child = derivedClass;
     for (std::size_t bi : path) {
