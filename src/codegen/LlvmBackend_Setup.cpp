@@ -32850,6 +32850,101 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     // per §4.6/§4.7: LinkedList/OwningLinkedList free via bz_llist_free.
     // §28.5/§28.11, #894: OwningDictionary fields free via bz_dict_free.
     bool isLL = collTy && isLinkedListTypeName(collTy);
+    // fix #6413 (§28.7 / §28.5 / §12.4, v0.338): a LIST INTERFACE HEAD is the
+    // ONE `owned` collection field whose RUNTIME KIND the declared type does not
+    // determine. Every other `collTy` reaching here is a CONCRETE built-in name,
+    // and those are closed to inheritance — §12.4: "Compiler-known classes are
+    // closed to inheritance unless their text opens them" — so `class MyL:
+    // Array<int>` is rejected outright and a concrete-typed slot can only ever
+    // hold the header-less bz_array_t / bz_llist_t / bz_dict_t struct that the
+    // free below expects. The LIST HEADS are different, and §28.5 says so in so
+    // many words: "Interface-typed owned fields are admitted because runtime
+    // dispatch resolves disposal to the underlying class's Dispose(); an `owned
+    // IConnection` field disposes whichever class implementation it currently
+    // holds." `IList<T>` IS an interface type, so `class MyL: IList<int>` is
+    // legal and sema accepts storing one into `owned _f: IList<int>` with no
+    // diagnostic.
+    //
+    // On such a value word 0 is a VTABLE POINTER, so the free below reads
+    // `arr->data` / `arr->count` / `arr->elem_disposer` OFF THE VTABLE and
+    // WILD-FREES. MEASURED on this tree's base (plain rc=139
+    // `Segmentation fault (core dumped)`; ASan `SEGV ... in
+    // __asan::Allocator::Deallocate` <- free <- bz_array_free_dynamic
+    // (bezel_runtime_collections.cpp:351) <- bz$M.Holder$Reset), 500
+    // reassignments per row:
+    //
+    //   owned _f: IList<int>;  _f := new MyL();  _f := new MyL();   <- this site
+    //   owned _f: IOwningList<Cell>;  _f := new MyL();  _f := new MyL();
+    //   owned _f: IReadOnlyList<int>;  _f := new MyL();  _f := new MyL();
+    //
+    // §28.7 is the rule this branch restores: "The disposal is null-guarded and
+    // dynamically dispatched, exactly the machinery scope-end disposal already
+    // uses." This IS that drop-on-overwrite site, so its disposal has to be the
+    // same dynamic dispatch the scope-end site uses — not a second, narrower
+    // guess at the value's kind derived from the same static type that is
+    // already known not to determine it. (That is why the fix is a RUNTIME
+    // discrimination and not a narrowing: #6368's async-capture fix-forward
+    // narrows to the concrete names, and the narrowing was MEASURED UNSAFE at
+    // the scope-end field twin #6402 — it declined the free on array-backed
+    // list-interface `owned` fields across 30 rows in five suites. The same
+    // array-backed spellings reach THIS site, so the same narrowing would trade
+    // a crash for a leak here.)
+    //
+    // THE DISCRIMINATOR is `bz_obj_is_string(val, vtableTablePtr())` — the same
+    // helper and the same emitted vtable table #417 uses to separate an
+    // `Object` slot's string from its class instance, and the same one #6402
+    // uses at the scope-end twin of this branch. Its contract is a whitelist
+    // NEGATION, so it is sound only where the slot admits a closed population,
+    // which is exactly this one: a registered user class vtable answers "not a
+    // string" and takes the class arm; any other word 0 — including a
+    // concrete built-in collection, an iterator wrapper, or any unregistered
+    // vtable — answers "string" and takes the array arm. §12.4 does not
+    // enumerate the admitted population here; a concrete built-in's word 0 is
+    // `arr->data` (a heap pointer, not a listed vtable; NULL for an empty
+    // backing, which the null-terminator scan stops at), and a user class's
+    // vtable IS registered (user and imported classes alike, with #1843's
+    // finalizeVtableTable covering lazily-created specialized vtables). There
+    // is no `Object`-typed escape hatch here — an interface head is not the root
+    // type — so the #417 "receiver reachability is NOT determined by what the
+    // object declares" caveat does not apply. A value whose word 0 is an
+    // UNREGISTERED vtable still answers "string" and takes the array arm, but
+    // such a value was wild-freed before this change too, so this makes no
+    // previously-correct program incorrect.
+    //
+    // The user-class arm is `emitDisposeAndReclaim` — LITERALLY the arm
+    // lowerOwnedClassFieldStore takes one screen below for a user class in an
+    // `owned` class/interface field, i.e. what a user class in an `owned` slot
+    // gets everywhere else. So the class is freed exactly once and its own
+    // `owned` fields are discharged by its destructor (MyL's `owned _a:
+    // Array<int>` is freed through MyL's OWN field arm, never reinterpreted as
+    // an array). No slot nulling is needed here and none is done: this site
+    // already null-guarded through `doDispose` (= oldVal != null), stores
+    // `newVal` immediately at `contBB`, and — unlike #6402's loop — has exactly
+    // one predecessor block for the store, so the displaced value is reachable
+    // only along this path.
+    if (isListInterfaceName(collTy)) {
+        auto* isStrFn = declareC("bz_obj_is_string", i32(),
+                                  {ptrTy(), ptrTy()});
+        llvm::Value* isStr = builder_.CreateCall(
+            isStrFn, {oldVal, vtableTablePtr()}, "ocf.collif.isstr");
+        // bz_obj_is_string answers "not a string" (== 0) exactly when word 0 is
+        // a REGISTERED vtable, i.e. a user class instance.
+        llvm::Value* isVtable =
+            builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+        llvm::Value* notNull = builder_.CreateICmpNE(
+            oldVal, llvm::ConstantPointerNull::get(ptrTy()));
+        llvm::Value* isUserClass =
+            builder_.CreateAnd(isVtable, notNull, "ocf.collif.userclass");
+        auto* objBB = llvm::BasicBlock::Create(
+            llvm_, "ocf.collif.obj", currentFn_);
+        auto* arrBB = llvm::BasicBlock::Create(
+            llvm_, "ocf.collif.arr", currentFn_);
+        builder_.CreateCondBr(isUserClass, objBB, arrBB);
+        builder_.SetInsertPoint(objBB);
+        emitDisposeAndReclaim(oldVal);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(arrBB);
+    }
     // #2608: drop-on-overwrite twin of the scope-end site in
     // LlvmBackend_Disposal.cpp. The DISPLACED backing of an `owned` field typed
     // by a borrowing list interface may itself be owning (stdlib §4.3 — the
