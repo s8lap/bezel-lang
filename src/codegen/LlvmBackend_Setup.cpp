@@ -27306,20 +27306,39 @@ bool Emitter::isPrimitiveToStringCG27c(const ast::Expr* expr) const {
 bool Emitter::isUserMethodStringReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
-    // fix #6440 (latent hazard from #6395): a string-returning CALL whose callee
-    // sema resolved is deliberately excluded from this recognizer. A resolved
-    // MethodSymbol may return a BORROW of a field rather than an owned value
-    // (e.g. `method GetName(): string return self._name end` — a field accessor
-    // that returns a borrow of the receiver's `_name` slot). The caller-side
-    // release this recognizer enables would then free a value the callee still
-    // references (UAF). The same guard was added to the two sibling recognizers
-    // in #4653 (LlvmBackend_Setup.cpp, `isFreshBorrowingArrayMaterializerLocal`
-    // and `isFreshOwnerlessArrayMaterializerExpr`) for the identical reason.
-    // This guard is latent today: every Bezel method returning `String` mints
-    // +1 on its return path (#2196), so a user method returning a borrow of its
-    // receiver's field does not exist yet. The guard is what keeps it from
-    // existing after the next change to that mint.
-    if (calleeResolvedBySema(*call, ctx_)) return false;
+    // There is deliberately NO `calleeResolvedBySema` gate here, and the five
+    // sites that carry one do not transfer to this recognizer. That helper is
+    // `ctx.exprSymbol(*call.callee) != nullptr` — a test for whether the callee
+    // is a USER member at all. It discriminates only inside a recognizer keyed
+    // on a member NAME, where the matched shape is a BUILTIN intrinsic that
+    // carries no symbol: `isFreshBorrowingArrayMaterializerLocal` and
+    // `isFreshOwnerlessArrayMaterializerExpr` (ToArray/Sorted/Reversed/Split),
+    // `isFreshOwnerlessDictMaterializerExpr` (ToDictionary),
+    // `isFreshGroupByToArrayLocal` (GroupBy(...).ToArray()) and
+    // `isPlusOneStringProducer`'s `.Aggregate` arm. At each of those,
+    // "sema resolved something" means "a user method merely shares this name" —
+    // the impostor #4653 measured. This recognizer has no name to discriminate
+    // on: being a user method IS its admission criterion, and the very next line
+    // casts that same exprSymbol to `MethodSymbol`. The guard therefore
+    // returned false for EVERY user method and made the rest of this function
+    // unreachable (#6440).
+    //
+    // The premise that motivated it was that a resolved callee may return a
+    // BORROW (`method Get(): string return this.Tag end`), which would make the
+    // caller-side release a UAF. That premise is false against the callee's own
+    // lowering, and `emitReturn` (LlvmBackend_Stmts.cpp, the `emitStringRetain`
+    // arm in its ReturnStmt string branch) is where it is refuted: for a
+    // declared `string`/`string?` return it either TRANSFERS an existing +1 (the
+    // value is a +1 producer, or a returned local that owns one) or emits
+    // `emitStringRetain(v)` — the borrow case included. A field read is not a
+    // producer, so it takes the retain and leaves the caller holding an
+    // independent +1. Normalization is over the DECLARED return type, not over
+    // the body's shape, so "returns a borrow" is exactly the case that still
+    // mints. `return_borrowed_field_loop_no_uaf_28_3`
+    // (tests/codegen/escaping_string_refcount_test.cpp) pins that shape, and
+    // with the guard present the +1 it mints had no caller-side discharge:
+    // 27 rows leaked, one unreleased reference per user-method string call site.
+    // per §28.3, §28.9, v0.338
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
     if (!ms) return false;                         // builtin string method / not a method
     if (ms->isOperator) return false;              // operator overloads excluded
