@@ -18796,6 +18796,56 @@ void ExprTC::runMethodBody(
             (tfCallee30_5->member == "FromOwnedResult" ||
              tfCallee30_5->member == "FromResult" ||
              tfCallee30_5->member == "FromException");
+        // fix-forward #6405 (§30.5, v0.338): the DECLARED wrapper must be
+        // `Task<T>` — Pattern A — before §5.1 yields this position to the
+        // producer-side check. Two independent grounds, both read off the
+        // spec's own wording and off codegen, not inferred:
+        //
+        // (a) The rule this suppression defers to is scoped in its own words
+        //     to Pattern A. §30.5 "Result lifetime and task disposal",
+        //     *Producer-side return-type rules*, the bolded clause:
+        //     "**No fourth kind: a non-`await` borrow return is rejected.**
+        //     A `return` in an `async` body — an `async` method's or an
+        //     `async` lambda's — whose return type is `Task<T>` for class or
+        //     interface T, whose operand is a **borrow** and not a `return
+        //     await` ... is a **compile error at the return site**". The
+        //     `OwningTask<T>` row is a SIBLING row of that list and carries no
+        //     such clause: "`OwningTask<T>` for **class or interface** T: the
+        //     task produces a single owned result. Awaiting transfers
+        //     ownership to the awaiter ... This is **Pattern B**." There is no
+        //     "fourth kind" prohibition to defer to, so there is nothing for
+        //     §30.5 to own at a Pattern B producer and nothing for this
+        //     suppression to defer.
+        //
+        // (b) There is no producer-side rejection behind the suppression for a
+        //     Pattern B producer, so deferring is silent acceptance, not a
+        //     hand-off. `detectAsyncPatternAKind` (LlvmBackend_Async.cpp)
+        //     reports §30.5 kind 1 only under a non-null
+        //     `asyncPatternAResultDisposer_`, which is attached for Pattern A
+        //     only — a Pattern B producer has none, so the program reaches
+        //     codegen and RUNS. MEASURED on 2425187c: the three Pattern B
+        //     cells `OwningTask<class|interface|Object>` in an ARROW body
+        //     `=> Task.FromOwnedResult(...)` compile (rc 0); the same
+        //     spellings in the STATEMENT arm all reject (§30.6). The arrow
+        //     arm accepting what the statement arm rejects on the same method
+        //     is the signature of a hole, not of a hand-off.
+        //
+        // `currentMethodDecl_` is set only at the `async` METHOD site (the
+        // operator and property `runMethodBody` calls never set it, and never
+        // set `inAsyncContext_` either, so they cannot reach this guard); a
+        // null or non-`Task<T>` wrapper leaves `declaredIsPatternA30_5` false
+        // and §5.1 keeps the position, which is the pre-#6405 verdict.
+        const TypeRef* declaredRet30_5 =
+            (currentMethodDecl_ && currentMethodDecl_->returnType)
+                ? ctx_.resolvedType(*currentMethodDecl_->returnType)
+                : nullptr;
+        const bool declaredIsPatternA30_5 =
+            declaredRet30_5 &&
+            declaredRet30_5->kind == TypeRef::Kind::Named &&
+            declaredRet30_5->astNode && declaredRet30_5->astNode->name &&
+            declaredRet30_5->astNode->name->parts.size() == 1 &&
+            declaredRet30_5->headName() == "Task" &&
+            !declaredRet30_5->genericArgs.empty();
         // §30.5's "Pattern A" scoping: class or interface T (and the
         // runtime-managed spellings that share the pointer representation).
         const TypeRef* elemTy30_5 = currentReturnType_;
@@ -18823,7 +18873,8 @@ void ExprTC::runMethodBody(
                         : !isValueBuiltinByName(elemTy30_5->headName());
         }
         const bool section30_5OwnsPosition =
-            inAsyncContext_ && elementIsRefType30_5 && isTaskFactoryCall30_5 &&
+            inAsyncContext_ && declaredIsPatternA30_5 &&
+            elementIsRefType30_5 && isTaskFactoryCall30_5 &&
             isTaskShapedRef(ctx_.exprType(*exprBody));
         if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
             !section30_5OwnsPosition) {
