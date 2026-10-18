@@ -2919,6 +2919,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // inline.
         detectAsyncPatternAKind(rs->value.get());
         llvm::Value* v = nullptr;
+        // fix #6452: this edge minted its own §29.2 wrapper frame (the
+        // `recv.Drain()` return face below). The #6397 publication further
+        // down reads only `wrapAsIEnumerableForTarget`'s OWN `outWrapMade`,
+        // and on this edge that second call declines — the value already
+        // carries the declared `IOwningEnumerable<T>` head — so the bit it
+        // publishes would be `false` over a frame that really was minted. The
+        // ERASE on a decline is load-bearing (#6397's own note: a claim over
+        // an unminted frame frees it out from under the holder), so an
+        // INVERTED claim is just as wrong as a missing one. This local is the
+        // return edge's own verdict, OR-ed in below; it is `false` for every
+        // other return shape, so that arm is untouched.
+        bool drainReturnFrameMinted = false;
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     rs->value.get())) {
@@ -2971,6 +2983,101 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
             }
             if (!v) v = lowerExpr(*rs->value);
+            // fix #6452 (§28.3 *Returning a deferred-activation frame* / §29.2 /
+            // §29.1 / §28.6; stdlib §4.5 / §4.13, v0.338): the RETURN face of
+            // the builtin `recv.Drain()` view. #4750 / #4772 gave the
+            // LOCAL-DECL face a mint (LlvmBackend_Setup.cpp, `if (!v && init)`),
+            // but the `return recv.Drain();` spelling reached NOTHING:
+            // `lowerCallExpr` has no `Drain` arm (only the for-in desugaring and
+            // the GetOwningEnumerator dispatch recognise the shape, by walking
+            // back to the initializer), so `v` stayed null, the §29.2 coercion
+            // further down was gated on `v && rs->value` and never ran, and the
+            // method returned the `v ? v : null` fallback — a NULL. The only
+            // signal was the internal `#2491` warning, which the §3 / #605
+            // permissive posture deliberately leaves a Warning, so the program
+            // COMPILED CLEAN and then SEGV'd in user code:
+            //
+            //     public method View(): IOwningEnumerable<R>
+            //       return Items.Drain();        // -> null
+            //     end View;
+            //     using var v: IOwningEnumerable<R> := h.View();   // SEGV
+            //
+            // MEASURED at edf42bd3: `warning: internal: return-value expression
+            // failed to lower to a value (degraded to a zero/null return
+            // value) — #2491` and then `AddressSanitizer: SEGV on unknown
+            // address 0x000000000000 ... in bz$M.P$Run`. Four independent
+            // routes carry that note pre-fix — the forward-array, LIFO and
+            // node-list backings plus a plain-parameter receiver
+            // (tests/lit/drain_return_no_internal_degrade_note_6452.bzl).
+            //
+            // The shape is SPEC-ADMITTED, which is why the answer is a real
+            // value and not a diagnostic. §28.3: "A non-iterator method may
+            // therefore compose and return such a frame ... provided every
+            // borrow the returned frame carries is sourced from the method's
+            // own parameters or receiver (directly or through the receiver's
+            // fields, the receiver-sourced notion of §28.6)". A `this`-rooted
+            // drain is that receiver-sourced case — pinned as admitted by
+            // `drain_view_return_site_2175.return_this_field_drain_admitted_
+            // control_spec_28_3`, which asserts hasErrors() == false. The
+            // scope-bound forms §28.3 REJECTS (`recv.Drain()` over a `using
+            // var` / plain owned local / `owned` parameter) are rejected by the
+            // ownership pass at the return site (#2175, the (a1)/(a2)/(a3)
+            // rows) and never reach codegen, so nothing here re-opens them.
+            //
+            // The body is the local-decl face VERBATIM — same gate, same
+            // `wrapAsIEnumerableForTarget` call, same flags. That is the point:
+            // #3392 is the recorded cost of letting the two faces' predicates
+            // drift, so the return face asks the SAME authority rather than
+            // re-deriving which leaf to mint, and a future leaf added to
+            // `owningDrainWrapForHead` reaches both faces the day it is added.
+            // §29.2's coercion further down then sees a value that already
+            // carries the declared `IOwningEnumerable<T>` head and declines, so
+            // exactly one frame is minted and it is minted once.
+            //
+            // Two constraints this arm holds to, both measured rather than
+            // assumed:
+            //   * `#3377` — the fresh-producer receiver exclusions
+            //     (`!CallExpr && !NewExpr` on the drain target) are the same
+            //     ones the local-decl face carries. `MakePool().Drain()` is
+            //     deliberately left alone: re-lowering it would evaluate the
+            //     producer twice, and taking its frame's `this` capture as
+            //     something this edge owns is exactly the leak #3377 records.
+            //     `srcOwnedByCallee=false` keeps the wrap a BORROW of the
+            //     collection, so the holder still frees the (emptied) array —
+            //     the return edge claims the FRAME only.
+            //   * `#2703` / axiom A4 — nothing here reads or writes
+            //     `currentReturnTypeNode_`. The +0 read-face suppression for an
+            //     accessor body is not this arm's to move.
+            if (!v && rs->value) {
+                auto* dce = dynamic_cast<const ast::CallExpr*>(rs->value.get());
+                auto* dma = dce ? dynamic_cast<const ast::MemberAccessExpr*>(
+                                      dce->callee.get())
+                                : nullptr;
+                const sema::TypeRef* viewTy = ctx_.exprType(*rs->value);
+                if (dma && dma->member == "Drain" && dma->target &&
+                    dce->args.empty() &&
+                    builtinTypeName(viewTy) == "IOwningEnumerable" &&
+                    !dynamic_cast<const ast::CallExpr*>(dma->target.get()) &&
+                    !dynamic_cast<const ast::NewExpr*>(dma->target.get())) {
+                    std::string_view srcHead =
+                        builtinTypeName(ctx_.exprType(*dma->target));
+                    if (common::isOwningCollectionHead(srcHead) &&
+                        !common::isDictionaryName(srcHead)) {
+                        llvm::Value* coll = lowerExpr(*dma->target);
+                        if (coll && coll->getType()->isPointerTy()) {
+                            bool made = false;
+                            llvm::Value* frame = wrapAsIEnumerableForTarget(
+                                coll, viewTy, dma->target.get(),
+                                /*ownLazyPipeline=*/false, &made,
+                                /*srcOwnedByCallee=*/false);
+                            if (made && frame && frame != coll) {
+                                v = frame;
+                                drainReturnFrameMinted = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
         // §30.5 / #1332 (v0.162): read and reset the chained-return flag now that
         // lowerExpr has completed (lowerAwait already used the flag to suppress the
@@ -3557,6 +3664,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     /*outWrapMade=*/&wrapMade6397,
                     /*srcOwnedByCallee=*/
                     returnSourceIsCalleeOwnedCollection(rs->value.get()));
+                // fix #6452: this edge minted its own frame earlier (the
+                // `recv.Drain()` return face), so this call declining does not
+                // mean "no frame". OR the edge's own verdict in — see the
+                // declaration's note on why an INVERTED claim is as wrong as a
+                // missing one.
+                wrapMade6397 = wrapMade6397 || drainReturnFrameMinted;
                 if (currentAccessorPropSym_) {
                     // fix #6397: publish BOTH verdicts the for-in consumer
                     // reads. The field bit is decided from the SAME node this
