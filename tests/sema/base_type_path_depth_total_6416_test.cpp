@@ -282,3 +282,85 @@ BEZEL_TEST(sema_base_type_path_depth_total_6416,
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "terminated by signal"));
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "did not finish within"));
 }
+
+// ===========================================================================
+// INTERFACE-DIAMOND COVERAGE for the onChain guard.  An interface graph can
+// re-enter the same node along different edges; the guard must allow this
+// without hanging and must still fire on a genuine cycle.
+//
+// Shape: three interfaces I1, I2, I3 each extend J, and the class E extends
+// all three PLUS a base class D listed LAST.  The walk to D re-enters J three
+// times before reaching D.  With single-inheritance on the class side, this is
+// the natural re-entry pattern.
+//
+// Interface members (§11.8) are abstract-only, no `public` or `virtual`
+// modifier, semicolon-terminated.  Class D provides a `virtual` implementation
+// of J's method; E overrides it with `override`.
+//
+// These rows are GREEN on the current tree — they pin behaviour that already
+// works.  The anti-inversion control (the mismatch twin) is the one that
+// matters: a guard that wrongly suppressed the walk would silently ACCEPT it.
+// ===========================================================================
+
+BEZEL_TEST(sema_base_type_path_depth_total_6416,
+           interface_diamond_correct_override_accepted) {
+    auto r = runAot(
+        "module M; "
+        "public interface J<T> method P(a: T): int; end J; "
+        "public interface I1: J<string> end I1; "
+        "public interface I2: J<string> end I2; "
+        "public interface I3: J<string> end I3; "
+        "public class D public constructor() end constructor; "
+        "  public virtual method P(a: string): int => 42; end D; "
+        "public class E: I1, I2, I3, D "
+        "public constructor() end constructor; "
+        "public override method P(a: string): int => 42; end E; "
+        "class C public static method Main(): int => 0; end C; ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, kParamMismatch));
+}
+
+BEZEL_TEST(sema_base_type_path_depth_total_6416,
+           interface_diamond_mismatched_override_rejected) {
+    auto r = runAot(
+        "module M; "
+        "public interface J<T> method P(a: T): int; end J; "
+        "public interface I1: J<string> end I1; "
+        "public interface I2: J<string> end I2; "
+        "public interface I3: J<string> end I3; "
+        "public class D public constructor() end constructor; "
+        "  public virtual method P(a: string): int => 42; end D; "
+        "public class E: I1, I2, I3, D "
+        "public constructor() end constructor; "
+        "public override method P(a: int): int => 42; end E; "
+        "class C public static method Main(): int => 0; end C; ");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, kParamMismatch));
+}
+
+BEZEL_TEST(sema_base_type_path_depth_total_6416,
+           interface_long_chain_correct_override_accepted) {
+    std::string prog = "module M; ";
+    prog += "public interface J<T> method P(a: T): int; end J; ";
+    for (int i = 1; i <= 60; ++i) {
+        std::string prev = (i == 1) ? "J<string>" : ("K" + std::to_string(i - 1));
+        prog += "public interface K" + std::to_string(i) + ": " + prev + " end K" +
+                std::to_string(i) + "; ";
+    }
+    prog += "public interface I1: J<string> end I1; ";
+    prog += "public interface I2: J<string> end I2; ";
+    prog += "public class D public constructor() end constructor; ";
+    prog += "  public virtual method P(a: string): int => 42; end D; ";
+    prog += "public class E: K60, I1, I2, D ";
+    prog += "public constructor() end constructor; ";
+    prog += "public override method P(a: string): int => 42; end E; ";
+    prog += "class C public static method Main(): int => 0; end C; ";
+    auto r = runAot(prog);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, kParamMismatch));
+}
