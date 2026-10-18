@@ -58,7 +58,8 @@
 
 #include <string>
 
-#include "support/aot_support.hpp"  // runAot / runAotChecked — the AOT oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
+#include "support/aot_support.hpp"       // runAot / runAotChecked — the AOT oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -69,19 +70,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked AOT run is SKIPPED (not failed) when the ASan link toolchain is
-// absent (mirrors the #1899/#1925/#1928/#1932 harness helper). Lane worktrees
-// in this project (per `native-asan-leg-vacuous-in-lane-worktrees` memory)
-// have the ASan runtime unavailable — the gate tree has it — so any
-// runAotChecked call here would otherwise vacuously pass. We only mark
-// leak-detection as load-bearing via runAotChecked, with the SKIP-guard.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // `class Res` is the disposable-shaped class from the issue (a destructor
 // makes the destructor visible; `tag` is just so the program has something
@@ -146,7 +134,7 @@ BEZEL_TEST(explicit_dispose_move_init_owned_local_leak_3968,
         "  i := i + 1; "
         "end; "
         "return acc - 100;"));
-    if (wasSkipped(jr)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // Pre-fix: LSan catches the leak (one heap block per loop iteration,
     // 100 of them) and `jr.ran` becomes false. Post-fix: the explicit
     // Dispose reclaims each block, LSan is silent, `jr.ran` stays true.

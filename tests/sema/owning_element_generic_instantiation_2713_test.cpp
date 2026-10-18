@@ -72,14 +72,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // True iff an ERROR diagnostic is THIS defect's per-instantiation rejection.
 // Deliberately NOT a bare `rejects()`: runAot synthesizes an Error diagnostic
 // for a runtime SIGSEGV too, so a coarse helper cannot tell a genuine rejection
@@ -630,7 +622,7 @@ BEZEL_TEST(sema_owning_element_generic_inst_2713,
 BEZEL_TEST(sema_owning_element_generic_inst_2713,
      class_element_generic_holder_runs_clean_2713) {
     JitResult r = runAotChecked(kClassElementDisposes);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 21);
 }

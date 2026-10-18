@@ -57,22 +57,14 @@
 #include <cstddef>
 #include <string>
 
-#include "support/aot_support.hpp"  // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
+#include "support/aot_support.hpp"       // runAotChecked — AOT + ASan/LSan oracle
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — mirrors tests/ownership/arm_meet_ownership_1661_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -147,7 +139,7 @@ const char* kMetersWithId =
 BEZEL_TEST(static_iface_constraint_disposal_1425,
            sum_accumulator_disposes_each_instance_exactly_once_spec_11_8) {
     JitResult r = runAotChecked(kMetersWithId);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // WITHOUT the fix: LSan reports the 3 direct leaks (Zero()'s result plus
     // the two displaced intermediate `+` results) -> r.ran false.
     BEZEL_EXPECT_TRUE(r.ran);
