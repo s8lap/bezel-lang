@@ -9,8 +9,7 @@
 //!   rather than on the failing TKey would reject this program.
 //! cites: 5, 14.2, 3.6 (hashable row), 27.7.1
 //! expect: run
-//! stdout:
-//!   True
+//! output: True
 //!   True
 module Conf;
 
