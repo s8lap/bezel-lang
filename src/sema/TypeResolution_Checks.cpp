@@ -14329,10 +14329,20 @@ struct VarianceHeads {
 // #3152). `m` is drawn from `enclosing->members`, and every `enclosing` is an
 // element of `heads.enclosingChain`, which is built by exactly ONE walk: the
 // `varianceSites` collection below, rooted at `ctx_.module()->children`.
-// MEASURED: `module()->children` has exactly TWO writers in the tree —
-// `SymbolCollection.cpp:2603` (the module's own top-level declarations) and
-// `TypeResolution_Names.cpp:5484` (a §21.10 local type, itself locally
-// declared) — while `ModuleLoader` writes imported symbols into
+// MEASURED: `module()->children` has exactly TWO writers in the tree. They are
+// named here by FUNCTION, which is a recipe that survives the next neighbouring
+// hunk, rather than by LINE, which is a position and has already failed twice
+// here: 27bed773 cited a `TypeResolution_Names.cpp` line that was unrelated
+// constraint code even in the tree it was written against, and the line it
+// meant has since shifted again (5871 at 27bed773, 6018 when #6450 was filed,
+// further since). A line number is still given below, labelled MOVEABLE, as a
+// convenience only — never as the referent.
+//   * `collectSymbols` in `SymbolCollection.cpp`, whose `mod->children` append
+//     is the module's own top-level declarations (line MOVEABLE, 2603 at 0a28f12).
+//   * the `ast::LocalTypeDecl` arm of `Resolver::resolveTypesInStmt` in
+//     `TypeResolution_Names.cpp`, which appends a §21.10 local type, itself
+//     locally declared (line MOVEABLE, 6112 at 0a28f12).
+// — while `ModuleLoader` writes imported symbols into
 // `SemaContext::importedByModule_`, NEVER into the module being compiled's
 // children. Every element of the chain, and therefore every member read here,
 // is consequently a LOCAL declaration: `m->decl` IS the real local
