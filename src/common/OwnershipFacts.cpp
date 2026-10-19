@@ -494,7 +494,10 @@ bool isFreshOwnedClassProducer(const ast::Expr* e, const sema::SemaContext& ctx,
     // temporary position: no §28.3 disposal obligation was registered and the
     // object LEAKED. `TypeSymbol::kind` carries the same fact on both sides —
     // `SymbolCollection::collectTypeDecl` locally, `fromMetaTypeDeclKind` at
-    // ModuleLoader.cpp:327 and :2435 for an import.
+    // `Loader::reconstructTypeSymbol`, ModuleLoader.cpp:793 —
+    // `t->kind = fromMetaTypeDeclKind(td.kind);`; the NESTED-type-shell twin is
+    // `registerNestedTypeShells` at :6207 —
+    // `t->kind = fromMetaTypeDeclKind(ntd.kind);` — for an import.
     const sema::TypeRef* rt = ctx.exprType(*e);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;

@@ -2383,7 +2383,9 @@ Symbol* Resolver::lookupName(std::string_view name, Scope* scope) {
 // LOCAL type's body scope with the `TypeSymbol` `collectTypeDecl` just built
 // for it (the matching pop is in the same arm). `ModuleLoader` never calls
 // either: it populates `importedByModule_` and reconstructs an imported
-// type's `enclosingTypePath` directly (`ModuleLoader.cpp:799` and `:6220`), so
+// type's `enclosingTypePath` directly (ModuleLoader.cpp:799 —
+// `t->enclosingTypePath = parent.arityEnclosingPath();` — and the
+// `registerNestedTypeShells` twin at `:6220`), so
 // an imported type never acquires a `typeBodyScopes_` entry and never reaches
 // this predicate. Every member consulted here is therefore locally collected
 // and carries a `decl`.

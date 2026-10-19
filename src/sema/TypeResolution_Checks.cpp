@@ -8198,11 +8198,11 @@ bool Resolver::methodIsAbstract(MethodSymbol* ms) {
         if (mod == "abstract") return true;
     }
     // SEAM-ACCESSOR: `ms->modifiers` (checked just above) already carries "abstract" for
-    // an imported method — ModuleLoader.cpp:758 wires MethodSymbol
-    // modifiers on both sides (#3152's audit §3). This AST fallback only
-    // WIDENS the local, syntax-derived case (`abstract method Foo();` with
-    // no explicit modifier token is not a real shape, but if it were, this
-    // is where it would be caught); the cast is unreachable for an import
+    // an imported method — `Loader::convertMember` wires MethodSymbol modifiers on both
+    // sides (ModuleLoader.cpp:934, `m->modifiers = intern(mm.modifiers);`; #3152's audit
+    // §3). This AST fallback only WIDENS the local, syntax-derived case
+    // (`abstract method Foo();` with no explicit modifier token is not a real shape, but
+    // if it were, this is where it would be caught); the cast is unreachable for an import
     // because the modifiers check above already returned true.
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         if (md->bodyKind == ast::MethodBodyKind::Abstract) return true;

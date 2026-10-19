@@ -30,10 +30,13 @@
 //     if (calleeMd2 && pos2 < calleeMd2->params.size() && ...)
 //         lsym->declType = ctx_.resolvedType(*calleeMd2->params[pos2].type);
 //
-// An IMPORTED method has no `ast::MethodDecl` at all — ModuleLoader.cpp:337-346
+// An IMPORTED method has no `ast::MethodDecl` at all — `Loader::convertMember`
+// (ModuleLoader.cpp:940 — `m->params = convertParams(mm.params, scope);`)
 // reconstructs a `sema::MethodSymbol` with a null `decl`, and the formal
 // parameter types survive only as `sema::ParameterSymbol::resolvedDeclType`
-// (ModuleLoader.cpp:258). So `lsym->declType` stayed NULL, and two things
+// (`Loader::convertParams`, ModuleLoader.cpp:558 —
+// `p->resolvedDeclType = convert(mp.type);`). So `lsym->declType` stayed NULL,
+// and two things
 // followed:
 //
 //   * the recipient identifier never got an exprType either (the
@@ -517,9 +520,11 @@ BEZEL_TEST(xmod_method_out_var_2657,
 // ===========================================================================
 // T12 — an imported EXTENSION method's inline `out var` (§26.1). Not merely a
 // bonus shape: an imported extension method's `sema::MethodSymbol` is built by
-// a DIFFERENT ModuleLoader path (ModuleLoader.cpp:2205-2225, the
-// `registerImportedExtension` loop) than an ordinary imported method, and it
-// too leaves `decl` null while filling `params` via `convertParams` — so it has
+// a DIFFERENT ModuleLoader path (`Loader::convertMember`'s extension-member
+// loop, ModuleLoader.cpp:6902 — `loader.convertParams(mm.params, scope)` —
+// which ends in `ctx.registerImportedExtension` at :6910) than an
+// ordinary imported method, and it too leaves `decl` null while filling
+// `params` via `convertParams` — so it has
 // the same blind spot, reached by another route. §26.1 puts the receiver on the
 // `ExtensionDecl` rather than in the parameter list, so the argument positions
 // line up with `params` exactly as for a static method and the same positional

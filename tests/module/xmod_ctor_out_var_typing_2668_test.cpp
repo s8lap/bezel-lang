@@ -27,8 +27,10 @@
 //     if (ctorDecl && posn < ctorDecl->params.size() && ...)
 //         lsym->declType = ctx_.resolvedType(*ctorDecl->params[posn].type);
 //
-// An IMPORTED constructor has no `ast::ConstructorDecl` — ModuleLoader.cpp:
-// 455-473 reconstructs a `sema::ConstructorSymbol` whose `ParameterSymbol`s
+// An IMPORTED constructor has no `ast::ConstructorDecl` —
+// `Loader::convertMember`'s `MetaMemberKind::Constructor` arm,
+// ModuleLoader.cpp:1192 — `case MetaMemberKind::Constructor: {` —
+// reconstructs a `sema::ConstructorSymbol` whose `ParameterSymbol`s
 // carry `resolvedDeclType` instead — so `ctorDecl` stays null and the
 // recipient's `declType` stays null.
 //

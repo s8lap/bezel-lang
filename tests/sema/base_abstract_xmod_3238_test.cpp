@@ -10,7 +10,8 @@
 // every AST-reading named-property check in this file carries — see the
 // `!pd`/scope comments around L18106 and L2979). An imported
 // PropertySymbol has no `decl`, so the import-time `ps->modifiers` (set by
-// ModuleLoader::convertMember at ModuleLoader.cpp:851 from the metadata)
+// ModuleLoader::convertMember at ModuleLoader.cpp:980 —
+// `f->modifiers = intern(mm.modifiers);` — from the metadata)
 // was never consulted, and the gate was a no-op on the cross-module
 // shape. The compiled program then reached codegen's #3199 / #2837
 // cross-module property/indexer ABI emits:

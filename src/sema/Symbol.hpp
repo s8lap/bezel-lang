@@ -767,7 +767,10 @@ struct MemberSymbol : Symbol {
     // are routed through `memberIsPure` too.
     bool isPure = false;
     // §22.16 / #2054: this member's declaration-derived contract records,
-    // reconstructed from an imported artifact (ModuleLoader.cpp:736, :4312).
+    // reconstructed from an imported artifact (`toContractRecords` writes it at
+    // ModuleLoader.cpp:897 —
+    // `member->contractRecords = toContractRecords(mm.contracts);` for a class
+    // member, and at :6905 for an imported extension method).
     //
     // ⚠ NOTHING READS THIS YET, and that is deliberate rather than an
     // oversight — see issue 3611. §22.16's clauses are enforced CALLEE-side
@@ -1971,9 +1974,11 @@ const ast::CallExpr* deferredNamedThisChain(const TypeSymbol& t,
 // local source is the `ast::MethodDecl` (or `ast::OperatorDecl`) `params`, and
 // the IMPORTED source is the reconstructed `ParameterSymbol` list on
 // `MethodSymbol::params`, which ModuleLoader populates from `MetaParam` for
-// every imported method (class members at ModuleLoader.cpp:524, extension
-// members at :2891) — `MemberSymbol::decl` is set only where the loader
-// re-parsed body text for a GENERIC type, so for a non-generic imported class
+// every imported method (class members at `Loader::convertMember`,
+// ModuleLoader.cpp:940 — `m->params = convertParams(mm.params, scope);` —
+// extension members at :6902) — `MemberSymbol::decl` is set only where the
+// loader re-parsed body text for a GENERIC type, so for a non-generic
+// imported class
 // every method's `decl` is null.
 //
 // #3176 is #2659's defect on the method path, and it is measured: an unmarked
@@ -2046,9 +2051,11 @@ const TypeRef* formalParamResolvedType(const ConstructorSymbol& cs,
 // re-parse) and the `returnOwned` wire bit, and the AST answer wins — i.e.
 // this accessor changes NOTHING for that case. `SemaContext::
 // importedReturnOwned` is populated only by `ModuleLoader` (via
-// `setImportedReturnType`, for class members at ModuleLoader.cpp:531 and for
-// imported EXTENSION methods at :2897), so a locally synthesized decl-less
-// `MethodSymbol` still answers `false` exactly as before.
+// `setImportedReturnType`, for class members at ModuleLoader.cpp:6382 —
+// `ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);` — and for
+// imported EXTENSION methods at :6907 —
+// `loader.returnOwned_[ms] = mm.returnOwned;`), so a locally synthesized
+// decl-less `MethodSymbol` still answers `false` exactly as before.
 bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx);
 
 // §22 / §27 / §28.3 (v0.307, #4988 — sister accessor to `methodReturnsOwned`

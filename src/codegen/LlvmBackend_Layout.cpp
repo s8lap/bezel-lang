@@ -2447,7 +2447,9 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
                 // sema::TypeSymbol from the metadata and never sets `decl` (there
                 // is no AST node in the importer) — but it DOES populate
                 // `genericParams` positionally from the metadata
-                // (ModuleLoader.cpp:339). Reading the parameter NAMES off
+                // (`Loader::convertMember`, ModuleLoader.cpp:939 —
+                // `convertGenericParams(mm.genericParams, scope)`).
+                // Reading the parameter NAMES off
                 // `base->decl` therefore made this walk `break` for every
                 // cross-module base, dropping `D : Base<string>` to the
                 // UNSPECIALIZED (placeholder) layout in which the inherited

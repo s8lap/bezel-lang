@@ -4,8 +4,10 @@
 WHY (umbrella #3152, audit docs/proposals/papers/imported-symbol-audit-2026-08-13.md).
 `ModuleLoader` never assigns `Symbol::decl` for an imported type - there is no
 `ast::TypeDecl` to assign, because the importing compilation has no AST for a
-dependency's types at all (`reconstructTypeSymbol` at ModuleLoader.cpp:325,
-`loadMetadataPass1` at :2433). So
+dependency's types at all (`Loader::reconstructTypeSymbol` at
+ModuleLoader.cpp:750 —
+`sema::TypeSymbol* reconstructTypeSymbol(const MetaTypeDecl& td,` —
+and `loadMetadataPass1` at :6237). So
 
     dynamic_cast<const ast::TypeDecl*>(ts->decl)      // null for EVERY import
 

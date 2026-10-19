@@ -6545,7 +6545,9 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // `ms->isOperator` is the both-sources spelling of the old
         // `dynamic_cast<ast::OperatorDecl*>(ms->decl) != nullptr`: it is set
         // exactly for an OperatorDecl locally (SymbolCollection.cpp:200) and
-        // from the wire bit on import (ModuleLoader.cpp:522), so the gate stays
+        // from the wire bit on import (`Loader::convertMember`,
+        // ModuleLoader.cpp:937 — `m->isOperator = mm.isOperator;`), so the
+        // gate stays
         // exactly as narrow as it was.
         if (auto* sym = ctx_.exprSymbol(*be))
             if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))

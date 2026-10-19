@@ -27,7 +27,9 @@
 //     const auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
 //     return rtd && rtd->kind == ast::TypeDeclKind::Class;
 //
-// `ModuleLoader::reconstructTypeSymbol` (`src/module/ModuleLoader.cpp:325-345`)
+// `ModuleLoader::reconstructTypeSymbol`
+// (`src/module/ModuleLoader.cpp:750 —
+// `sema::TypeSymbol* reconstructTypeSymbol(const MetaTypeDecl& td,`)
 // never sets `Symbol::decl` for an imported type — there is no AST TypeDecl to
 // assign: the importer's compilation unit has no AST for a dependency's types
 // at all. So `dynamic_cast<const ast::TypeDecl*>(nullptr)` yields null for
@@ -43,7 +45,10 @@
 //   post-fix: no leak, exit 0  (Src._live == 0)
 //
 // THE FIX. `TypeSymbol::kind` is populated by `reconstructTypeSymbol`
-// (`t->kind = fromMetaTypeDeclKind(td.kind)`, ModuleLoader.cpp:327 / :2435), so
+// (`Loader::reconstructTypeSymbol`, ModuleLoader.cpp:793 —
+// `t->kind = fromMetaTypeDeclKind(td.kind);` — with the NESTED-shell twin
+// `registerNestedTypeShells` at :6207 —
+// `t->kind = fromMetaTypeDeclKind(ntd.kind);`), so
 // reading the kind directly off the symbol — `rt->declaration->kind ==
 // ast::TypeDeclKind::Class` — answers the question on the imported side as
 // well as the local side. This is the fix landed as family F5 of umbrella

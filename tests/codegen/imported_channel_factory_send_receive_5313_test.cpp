@@ -19,7 +19,8 @@
 //      `importedName` — an IMPORTED builtin.
 //
 // Shape (c) exists because `ModuleLoader::convert()`
-// (src/module/ModuleLoader.cpp:344-385) builds the TypeRef for a name read
+// (src/module/ModuleLoader.cpp:344-385 — `case TypeKind::Named: {`) builds
+// the TypeRef for a name read
 // out of a dependency's `.bezel.meta`; there is no AST for another module's
 // source, so `astNode` is null. `lookupNamed` returns null exactly when the
 // named type is NOT an exported user type of the dependency, and that is

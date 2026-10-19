@@ -6445,7 +6445,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // nothing to resolve. When the bound names another of THIS
         // method's own type parameters (`where T: U`), `convert`
         // cannot resolve "U" to a declared type, so per §2.5/§29.3's
-        // importedName carriage (ModuleLoader.cpp:353-354) the bound
+        // importedName carriage (`Loader::convert`, ModuleLoader.cpp:384-385 —
+        // `ref->declaration == nullptr && !mt.namedName.empty()`) the bound
         // TypeRef has declaration=nullptr and importedName="U" —
         // `headName()` recovers "U" exactly as the local arm's
         // `item.typeArg->name->parts.back()` does for the syntactic
@@ -6931,8 +6932,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // modifiers` mirrors the declared modifier list on
                 // BOTH sides (SymbolCollection.cpp:204 sets it from
                 // `md->modifiers` verbatim for a local method;
-                // ModuleLoader.cpp:6495 sets it from `MetaMember::
-                // modifiers` for an imported one), so this reads
+                // `Loader::convertMember` sets it from `MetaMember::
+                // modifiers` for an imported one (ModuleLoader.cpp:934 —
+                // `m->modifiers = intern(mm.modifiers);`), so this reads
                 // identically to `md->modifiers` when `md` is
                 // non-null and works when it is null (an imported
                 // method has no `ast::MethodDecl` at all).
@@ -20800,8 +20802,9 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // `ModuleMetadataBuilder.cpp` already carries every
             // `ConstructorSymbol` (the convenience ctor rides alongside the
             // primary's positional fields; the loader's
-            // `MetaMemberKind::Constructor` arm at `ModuleLoader.cpp:956`
-            // reconstructs each one into the imported class's `members`),
+            // `MetaMemberKind::Constructor` arm at ModuleLoader.cpp:1192 —
+            // `case MetaMemberKind::Constructor: {` — reconstructs each one
+            // into the imported class's `members`),
             // so the import-side asymmetry the LOCAL deferral above hides
             // (local combined → sema defers and `lowerNew`'s `ctorForArgs`
             // resolves against the explicit ctor) is a SEMANTIC lookup gap:
@@ -31764,7 +31767,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         bool pAbstract = false;
         // Mirror the named-method form L2373-2379 (#874): read the SYMBOL's
-        // modifiers FIRST (populated on import at ModuleLoader.cpp:851), then
+        // modifiers FIRST (populated on import at ModuleLoader.cpp:980 —
+        // `f->modifiers = intern(mm.modifiers);`), then
         // fall back to the AST decl's modifiers for the local case. The pure
         // decl-only scan missed every IMPORTED abstract property — the
         // imported PropertySymbol has no `decl` — so `base.P` on an imported
@@ -31902,8 +31906,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // Both-sources fallback (#4086, §27.6 / §5.1, v0.294): the
                 // imported-method formation previously read `par->declType`
                 // only, which is null for parameters reconstructed from the
-                // binary module manifest — ModuleLoader at ModuleLoader.cpp:411
-                // sets `resolvedDeclType` (the loader's own resolved TypeRef)
+                // binary module manifest — `Loader::convertParams` at
+                // ModuleLoader.cpp:558 sets `resolvedDeclType`
+                // (`p->resolvedDeclType = convert(mp.type);`, the loader's own
+                // resolved TypeRef)
                 // for these. Without the fallback the formation's funcParams
                 // is left null for every imported parameter, and any explicit
                 // target-type formation site `var f: (int) -> owned Cell :=

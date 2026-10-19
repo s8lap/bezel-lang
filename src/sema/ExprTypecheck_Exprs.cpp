@@ -4862,7 +4862,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // Mirror the named-method form L2373-2379 (#874) and
                         // the named-property sibling above: read the SYMBOL's
                         // modifiers FIRST (populated on import at
-                        // ModuleLoader.cpp:851), then fall back to the AST
+                        // ModuleLoader.cpp:980 —
+                        // `f->modifiers = intern(mm.modifiers);`), then fall
+                        // back to the AST
                         // decl's modifiers for the local case. The pure
                         // decl-only scan missed every IMPORTED abstract
                         // indexer — the imported PropertySymbol has no `decl`
@@ -9881,10 +9883,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             }
         }
         // fix #2657 (§22.4 "Inline `out` declarations" / §2.5, v0.236): an
-        // IMPORTED method has NO `ast::MethodDecl` — ModuleLoader.cpp:337-346
+        // IMPORTED method has NO `ast::MethodDecl` — `Loader::convertMember`
+        // (ModuleLoader.cpp:940 —
+        // `m->params = convertParams(mm.params, scope);`)
         // reconstructs a `sema::MethodSymbol` from the artifact's metadata with
         // no `decl`, and the formal parameter types survive only as
-        // `sema::ParameterSymbol::resolvedDeclType` (ModuleLoader.cpp:258).
+        // `sema::ParameterSymbol::resolvedDeclType` (`Loader::convertParams`,
+        // ModuleLoader.cpp:558 — `p->resolvedDeclType = convert(mp.type);`).
         // The `calleeMd2`-only lookup below therefore left `lsym->declType`
         // NULL for every `out var` recipient of an imported method, which is
         // the root of #2657: with no declType the identifier never gets an
@@ -11064,7 +11069,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // #2657 / #3186 / #3188 use to type `out var` recipients across
                 // a module boundary), not the AST `calleeMd2->params[pos].type`
                 // directly. Pre-fix the AST arm answered null for every imported
-                // callee (ModuleLoader.cpp:337-346), so the hint was never
+                // callee (`Loader::convertMember`, ModuleLoader.cpp:940 —
+                // `m->params = convertParams(mm.params, scope);`), so the hint
+                // was never
                 // derived for `H.TakeU(3000000000)` against an imported
                 // `TakeU(u: uint)` — the literal was rejected ("does not fit in
                 // `int`") while the byte-identical local twin widened and ran.
@@ -11381,7 +11388,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         const ast::ConstructorDecl* ctorDecl = nullptr;
         // partial #2668 (§22.4 "Inline `out` declarations" / §2.5, v0.236): the
         // CONSTRUCTOR twin of #2657. An IMPORTED constructor has no
-        // `ast::ConstructorDecl` — ModuleLoader.cpp:455-473 reconstructs a
+        // `ast::ConstructorDecl`; `Loader::convertMember`'s
+        // `MetaMemberKind::Constructor` arm, ModuleLoader.cpp:1192 —
+        // `case MetaMemberKind::Constructor: {` — reconstructs a
         // `sema::ConstructorSymbol` whose `ParameterSymbol`s carry
         // `resolvedDeclType` — so the `dynamic_cast` filter below drops every
         // imported constructor and leaves `ctorDecl` null. The `out var`

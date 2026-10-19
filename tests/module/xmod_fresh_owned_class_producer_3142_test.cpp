@@ -22,7 +22,11 @@
 //
 // The fact is carried on the symbol on both sides: `TypeSymbol::kind`, written
 // by `SymbolCollection::collectTypeDecl` locally and by `fromMetaTypeDeclKind`
-// at ModuleLoader.cpp:327 / :2435 for an import. The fix reads that.
+// at `Loader::reconstructTypeSymbol`, ModuleLoader.cpp:793 —
+// `t->kind = fromMetaTypeDeclKind(td.kind);` — and its NESTED-shell twin,
+// `registerNestedTypeShells` at :6207 —
+// `t->kind = fromMetaTypeDeclKind(ntd.kind);` — for an import.
+// The fix reads that.
 //
 // ── MEASURED, on this base, with a real two-module build ───────────────────
 //   (`bezelc -c dep.bzl` then `bezelc --sanitize=address --import dep.o app.bzl`)

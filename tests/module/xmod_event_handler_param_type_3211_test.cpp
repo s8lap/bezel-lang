@@ -72,7 +72,7 @@
 // payload type from `SemaContext::importedMemberType` when `es->decl` is null,
 // treating a Unit type — the exporter's encoding of an omitted `: T` — as "no
 // payload", exactly as the local `!ed->type` path does. The side table is
-// populated by ModuleLoader.cpp:925 (`fieldTypes_[e] = convert(mm.type)`) from
+// populated by ModuleLoader.cpp:1461 (`fieldTypes_[e] = convert(mm.type)`) from
 // `MetaMember::type`, which ModuleMetadataBuilder.cpp:1308 writes from the
 // exporter's `ast::EventDecl::type`. The asymmetry this fix removes is that
 // codegen could already LOWER a cross-module payload handler that sema

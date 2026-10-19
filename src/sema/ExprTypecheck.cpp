@@ -11384,7 +11384,9 @@ bool ExprTC::typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
 // scrutinee compiled CLEAN, while the identical program in one module was
 // rejected ("its generic instantiation can never match a value of the scrutinee
 // interface type"). `TypeSymbol::modifiers` is populated on both sides
-// (SymbolCollection locally, ModuleLoader.cpp:329/:2437 for an import), and
+// (SymbolCollection locally, `Loader::reconstructTypeSymbol`,
+// ModuleLoader.cpp:795 — `t->modifiers = intern(td.modifiers);` — for an
+// import), and
 // `typeSymbolHasModifier` / `typeIsAbstractOrClosed` (Symbol.hpp, v0.242/#3052)
 // are where the `closed`-subsumes-`abstract` rule is stated once — the
 // hand-rolled scan was also outside that rule.

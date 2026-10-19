@@ -40,11 +40,13 @@
 // `checkImportedCallArity` only runs when `md == nullptr && isImported(ms)`.
 // For a GENERIC class method, `ModuleLoader` re-parses the body in a fresh
 // context to monomorphize generic call sites and attaches the resulting
-// `ast::MethodDecl` to the imported `MethodSymbol` (ModuleLoader.cpp:4255) —
+// `ast::MethodDecl` to the imported `MethodSymbol` (ModuleLoader.cpp:4630 —
+// `importedMs->decl = parsedMdBase;`) —
 // so the local `checkArgsAgainstParams` path runs instead, and that path
 // already substitutes class-level params correctly. The imported path runs
 // ONLY when the re-parse fails its §14.1/#783 SOUNDNESS GATE
-// (ModuleLoader.cpp:3931): the body references something outside the
+// (ModuleLoader.cpp:4547 — `if (unboundReference) return false;`):
+// the body references something outside the
 // synthetic class's own members, so the fresh re-parse can't reproduce it
 // faithfully and `ms->decl` stays null. The regression shape therefore
 // requires a method whose parameter type references the receiver class's

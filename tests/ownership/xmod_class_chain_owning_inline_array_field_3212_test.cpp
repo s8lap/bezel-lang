@@ -28,7 +28,8 @@
 // WHAT THE FIX IS. Read the wire-carried field type via
 // `ctx_.importedMemberType(fs)` when `fs->decl` is null and the symbol is
 // imported. The wire side encodes the type with `TypeKind::InlineArray`
-// plus `arrayOwned` preserved (ModuleLoader.cpp:225-231), published into
+// plus `arrayOwned` preserved (`Loader::convert`, ModuleLoader.cpp:432 —
+// `ref->arrayOwned = mt.arrayOwned;`), published into
 // the `fieldTypes_` side table that `SemaContext::importedMemberType`
 // reads. The discrimination (`tr->kind == InlineArray && tr->arrayOwned`)
 // is identical between local and imported — only the *source* of `tr` is

@@ -27,8 +27,11 @@
 //   * §22.5 / §27 / §28.3 — the dual-sourcing pattern this accessor
 //     implements (mirrors `methodReturnsOwned` per #3189).
 //   * §2.5 / ModuleLoader — populates `ctx.importedReturnType` for
-//     imported class members (ModuleLoader.cpp:531) and imported EXTENSION
-//     methods (:2897). The accessor consults this side-table when the
+//     imported class members (ModuleLoader.cpp:6382 —
+//     `ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);`) and
+//     imported EXTENSION methods (:6907 —
+//     `loader.returnOwned_[ms] = mm.returnOwned;`).
+//     The accessor consults this side-table when the
 //     AST arm is null.
 //
 // Rows:
@@ -150,7 +153,7 @@ BEZEL_TEST(method_return_resolved_type_4988,
     const_cast<MethodSymbol*>(ms)->decl = nullptr;
     BEZEL_EXPECT_TRUE(ms->decl == nullptr);
     // Install the loader's side-table entry — the same call ModuleLoader
-    // makes for a non-generic imported class member (ModuleLoader.cpp:531).
+    // makes for a non-generic imported class member (ModuleLoader.cpp:6382).
     TypeRef* strRef = makePrimitiveTypeRef(*r.ctx, PrimitiveType::String);
     r.ctx->setImportedReturnType(ms, strRef, /*returnOwned=*/false);
     TypeRef* rt = sema::methodReturnResolvedType(*ms, *r.ctx);

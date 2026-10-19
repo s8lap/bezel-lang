@@ -2506,10 +2506,13 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                     if (pt) slotTy = lowerTypeRef(pt);
                 } else if (!md && pos < ms->params.size()) {
                     // fix #2657 (§22.4 / §2.5, v0.236): an IMPORTED method has
-                    // NO `ast::MethodDecl` — ModuleLoader.cpp:337-346 builds a
-                    // `sema::MethodSymbol` with a null `decl` whose formals are
-                    // `ParameterSymbol`s carrying `resolvedDeclType`
-                    // (ModuleLoader.cpp:258). Without this arm the cascade fell
+                    // NO `ast::MethodDecl` — `Loader::convertMember` builds one
+                    // with a null `decl` whose formals are `ParameterSymbol`s
+                    // carrying `resolvedDeclType` (ModuleLoader.cpp:940 —
+                    // `m->params = convertParams(mm.params, scope);` — and
+                    // `Loader::convertParams`, ModuleLoader.cpp:558 —
+                    // `p->resolvedDeclType = convert(mp.type);`).
+                    // Without this arm the cascade fell
                     // all the way through to the `i32()` DEFAULT at the top of
                     // this function: a 4-byte integer alloca standing in for
                     // whatever the imported callee's out parameter really is,
@@ -3107,8 +3110,10 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
     const ast::ConstructorDecl* ctorDecl = nullptr;
     std::vector<const ast::ConstructorDecl*> cds;
     // fix #2639 (§2.5 import resolution / §22.4, v0.236): an IMPORTED
-    // constructor has NO `ast::ConstructorDecl` — ModuleLoader.cpp:455-473
-    // reconstructs a `sema::ConstructorSymbol` from the artifact's metadata
+    // constructor has NO `ast::ConstructorDecl`; `Loader::convertMember`'s
+    // `MetaMemberKind::Constructor` arm, ModuleLoader.cpp:1192 —
+    // `case MetaMemberKind::Constructor: {` — reconstructs each one into a
+    // `sema::ConstructorSymbol` from the artifact's metadata
     // whose `params` are `ParameterSymbol`s carrying an already-resolved
     // `resolvedDeclType` (there is no syntactic ast::Type to attach). The
     // `dynamic_cast<const ast::ConstructorDecl*>(cs->decl)` filter below

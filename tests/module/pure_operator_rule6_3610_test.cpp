@@ -425,7 +425,9 @@ BEZEL_TEST(pure_operator_rule6_3610, constraint_static_operator_rejected) {
 // ===========================================================================
 // X1 / X2 — the artifact boundary (§2.8.2). The operator's `pure` rides
 // `MetaMember::isPure` (ModuleMetadataBuilder.cpp:1227 writes it from
-// `ast::OperatorDecl::isPure`; ModuleLoader.cpp:735 restores it), so BOTH
+// `ast::OperatorDecl::isPure`; `Loader::convertMember` restores it at
+// ModuleLoader.cpp:927 —
+// `member->modifiers.push_back(ctx.internString("pure"));`), so BOTH
 // verdicts must survive the round trip. ⚠ #3618 records that the
 // accessor-level `pure get` has NO such slot — which is why this fix is
 // confined to the OPERATOR forms and leaves rule 6's "accessor read" alone:

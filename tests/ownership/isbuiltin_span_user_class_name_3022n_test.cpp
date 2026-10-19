@@ -7,7 +7,10 @@
 // `moduleName`. An IMPORTED user class named `Span` / `ReadOnlySpan` /
 // `ArraySpan` / `ReadOnlyArraySpan` reaches the `!declaration->decl` arm
 // (a non-local TypeSymbol carries no user TypeDecl — see
-// ModuleLoader.cpp:1440 / 1662), so a local user class was already
+// `ModuleLoader::reconstructTypeSymbol`,
+// src/module/ModuleLoader.cpp:750 —
+// `sema::TypeSymbol* reconstructTypeSymbol(const MetaTypeDecl& td,` — which
+// never sets `decl`), so a local user class was already
 // excluded by the `decl != null` outer check; but the imported case was
 // admitted as a borrow-bearing span and §9.7 transitivity wrongly
 // classified the enclosing record as borrow-bearing.

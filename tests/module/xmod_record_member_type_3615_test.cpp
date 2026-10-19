@@ -44,9 +44,16 @@
 // or performs the test", so both are rule-4 violations in as many words.
 //
 // THE §6b EXCLUSION DIFF — what the unified lookup ADMITS that the two old copies
-// EXCLUDED. `SemaContext::importedMemberTypes_` is written by exactly one caller,
-// `ModuleLoader.cpp:4331` (`ctx.setImportedMemberType`), so `importedMemberType`
-// is null for every LOCAL symbol and the widening is confined to imports. Within
+// EXCLUDED. `SemaContext::importedMemberTypes_` is written only from the
+// importer, and by EIGHT call sites rather than one: `ctx.setImportedMemberType(m,
+// ty);` at ModuleLoader.cpp:6384 (`loadMetadataPass2`) and again at :6942 (the
+// pass-4 replay of the very same pairs, which is idempotent), plus the six
+// fresh-context carriers `freshCtx.setImportedMemberType` at :3975 with :3978
+// (`carrySiblingSignatureTypes5160`), :5499 with :5503 (`parseAndAttachFieldInit`)
+// and :5943 with :5946 (`parseAndAttachInvariants`) — each pair the field/`ps`
+// twins. So
+// `importedMemberType` is null for every LOCAL symbol and the widening is
+// confined to imports. Within
 // imports it is exactly two sets:
 //   (a) a #2516 imported POSITIONAL field (non-null synthetic `posParam`) — the
 //       old field gate said no, `storageComponentType` says yes;

@@ -18,7 +18,9 @@
 // #3194 shape); the witness's parameter types ride `resolvedDeclType` (no
 // ast::Type node), and were reconstructed by ModuleLoader. Prior to #3183,
 // ModuleLoader did NOT reconstruct `arraySizeValue` (it "deliberately does not
-// reconstruct `arraySize`" — old comment at src/module/ModuleLoader.cpp:224-231),
+// reconstruct `arraySize`"; #3183's fix is now `Loader::convert`,
+// src/module/ModuleLoader.cpp:462 —
+// `ref->arraySizeValue = metaInlineArrayExtent(mt.arraySize);`),
 // so the imported witness's parameter type reached `typeRefEqual` with
 // `arraySizeValue == -1` and every arity compared equal. The §11.2 check
 // ACCEPTED the mismatch; the itable slot stored a witness that expected a wider
