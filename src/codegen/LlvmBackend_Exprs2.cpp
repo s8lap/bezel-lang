@@ -10490,6 +10490,48 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (!diverged_) {
                         releaseBorrowedStringArgPins(ctorStringPins);
                     }
+                    // fix #6204 (§22.16, v0.338): construction exit on the
+                    // INLINE arm — the `new` site of a CONSTRUCTED GENERIC
+                    // class.
+                    //
+                    // §22.16, "The instrumentation set" (v0.338):
+                    //
+                    //   "- **Construction exit**: the normal completion of the
+                    //      **most-derived constructor** of a construction, of
+                    //      any visibility, after its body and its `ensures`
+                    //      clauses."
+                    //
+                    // The call arm above already emits this check, but
+                    // `needsInlineForLayout = !genericSubst_.empty()`
+                    // (LlvmBackend_Exprs2.cpp:10193) routes EVERY constructed
+                    // generic down the `inlineCtorBody` arm instead, and that
+                    // arm had no check at all — so §22.16's construction-exit
+                    // row was silently absent for every generic construction.
+                    // MEASURED on this HEAD before the fix: `class D<T>` with
+                    // `invariant(_x >= 0)` and a one-argument constructor,
+                    // `new D<int>(0 - 1)` inside a
+                    // `try`/`catch ContractViolationException`, completed
+                    // normally where §22.16 requires the exception.
+                    //
+                    // The generic substitution is STILL ACTIVE here — it is
+                    // restored only at the function's single exit
+                    // (`genericSubst_ = std::move(savedSubst)`, ~10685) — so
+                    // the clause's `T`-typed reads lower against the same
+                    // substituted layout `inlineCtorBody` just wrote, exactly
+                    // as the setter arm's `invCls4614` check
+                    // (LlvmBackend_Assign.cpp) already relies on.
+                    //
+                    // `diverged_` is the "normal completion" test, mirroring the
+                    // call arm's `emitNewPendingCheck` branch: an inlined
+                    // constructor that throws routes here through the enclosing
+                    // unwind chain, and §22.16 says a throw exits check nothing.
+                    // `disposeAndFreeOnThrow = true` is the same flag the call
+                    // arm passes — at construction exit `obj` IS the allocation
+                    // the `new` site owns, so §22.9's unwind shape is
+                    // Dispose + free before the exception propagates.
+                    if (!diverged_)
+                        emitInvariantCheck(obj, rt->declaration,
+                                           /*disposeAndFreeOnThrow=*/true);
                 }
                 // fix #2319 / §22.3: flush the copy-OUT half of every
                 // accessor-mediated `ref`/`out` argument. Skipped on the
