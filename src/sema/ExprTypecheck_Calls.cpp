@@ -19295,10 +19295,12 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // imported generic whose `lookupNamed` fails — every builtin, i.e.
     // `Span<T>`, `Array<T>`, `Dictionary<K, V>`, `IGrouping<TKey, T>`, … —
     // as Named + declaration=null + astNode=null + genericArgs, recording the
-    // name ONLY in `importedName` (ModuleLoader.cpp:186). That is the same
-    // shape as the lazy sentinel, and `colName` above cannot tell them apart
-    // because it reads `headName()` only when `astNode` is non-null. Without
-    // this term an imported class-`T` `Span<T>`/`ReadOnlySpan<T>` receiver —
+    // name ONLY in `importedName` (`Loader::convert`, ModuleLoader.cpp:384-385
+    // — the `declaration == nullptr && !mt.namedName.empty()` guard and its
+    // assignment). That is the same shape as the lazy sentinel, and `colName`
+    // above cannot tell them apart because it reads `headName()` only when
+    // `astNode` is non-null. Without this term an imported class-`T`
+    // `Span<T>`/`ReadOnlySpan<T>` receiver —
     // whose `Contains(value: T?)` / `IndexOf(value: T?)` are NULLABLE per
     // stdlib §4.14 lines 2464/2612 — would be checked against a non-nullable
     // `genericArgs[0]` and REJECT LEGAL CODE, because the

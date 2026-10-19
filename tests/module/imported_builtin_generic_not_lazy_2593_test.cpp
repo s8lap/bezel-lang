@@ -5,7 +5,9 @@
 // (`Span<T>`, `Array<T>`, `Dictionary<K, V>`, `IGrouping<TKey, T>`, …), since
 // none of them is an exported user type in the dependency. The reconstructed
 // TypeRef is `Named` with `declaration == nullptr` AND `astNode == nullptr`,
-// carrying the type name ONLY in `importedName` (ModuleLoader.cpp:186).
+// carrying the type name ONLY in `importedName` (`Loader::convert`,
+// src/module/ModuleLoader.cpp:384-385 — the `declaration == nullptr &&
+// !mt.namedName.empty()` guard and its assignment).
 //
 // That is byte-for-byte the same shape as the LAZY LINQ sentinel that #2593's
 // `isLazyEnumerable` predicate keys on. Without an explicit
