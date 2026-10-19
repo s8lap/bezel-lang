@@ -1106,6 +1106,74 @@ if ! python3 scripts/check_string_view_ownership.py --strict \
 fi
 say "string-view-ownership phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_strviewown.log"))"
 
+# ── DANGLING-CAPTURE PHASE (#6475) ─────────────────────────────────────────
+# The phase immediately above is a TEXT ratchet over src/ AND tests/; this one
+# covers src/ only, with the compiler's OWN analysis of the actual type.
+#
+# ⚠ SCOPE OF THIS PHASE — read before assuming it closes a gap. It catches a
+# view captured from a TEMPORARY argument (`push_back(std::string("x"))`).
+# It does NOT catch a view captured from an IDENTIFIER argument
+# (`push_back(localStdStringVar)` where `local` dies with its scope): that
+# shape is missed by -Wdangling-capture, by -Wdangling-gsl, by
+# bugprone-dangling-handle, AND by the text phase above, and is filed as
+# #6479. tests/ is not gated here either — the PCH does not exist until the
+# test binary is built — so tests/ rests on the text phase alone.
+#
+# Why it is not already gated, measured rather than assumed:
+#  * clang 21.1.8 (Fedora 21.1.8-6.fc43) has -Wdangling-capture DEFAULT-ON: it
+#    fires with no -W flag at all, with -Wno-all, and with -Wall alone. So the
+#    diagnostic is already produced by every build.
+#  * but BEZEL_WERROR is OFF by default (CMakeLists.txt:111), so the warning
+#    prints into the build log and NOTHING blocks on it.
+#  * and clang-tidy, which reports the same site via bugprone-dangling-handle,
+#    runs only as an ADVISORY phase (below, ~line 1814) that always exits 0,
+#    and that silently SKIPS — also exit 0 — when compile_commands.json is
+#    absent. Two instruments, neither blocking. That is the defect.
+#
+# SCOPE src/ ONLY, and that is a measured constraint rather than a preference.
+# Every tests/ TU in compile_commands.json carries a forced PCH include
+# (-Xclang -include-pch -Xclang .../bezel_tests_pch.dir/cmake_pch.hxx.pch)
+# that exists only after the test binary is BUILT. Sweeping tests/ before that
+# makes clang die with "unable to read PCH file" and emit no diagnostic for ANY
+# file — a checker reporting 0 because the compiler never ran. The phase
+# therefore fails CLOSED if any TU does not compile, which is what makes that
+# trap impossible to repeat silently. The tests/ scope is not left uncovered:
+# the phase above is build-free and scans src/ AND tests/ as text.
+#
+# The baseline is 0, and it is EXACT, not a ceiling: above fails, below fails
+# as STALE HEADROOM. The count is DISTINCT SOURCE LOCATIONS, not diagnostic
+# instances — one bad line in a widely-included header is emitted once per
+# including TU (MEASURED: a single planted line in src/ast/Node.hpp produced 47
+# raw instances but 1 location), so counting instances would make the baseline
+# a function of the #include graph.
+#
+# Like every sibling phase: --self-test runs first and is not optional. It
+# compiles planted fixtures with the REAL clang and asserts the per-shape
+# outcome, so a check whose instrument had gone dead fails rather than
+# reporting a confident 0.
+say "dangling-capture phase: instrument self-test + ratchet (#6475)"
+if ! python3 scripts/check_dangling_capture.py --self-test \
+      > "$LOGDIR/${TAG}_danglingcap.log" 2>&1; then
+  say "CYCLE FAILURE: check_dangling_capture SELF-TEST failed — the"
+  say "  instrument is broken or -Wdangling-capture is no longer firing, so"
+  say "  its verdict means nothing. See $LOGDIR/${TAG}_danglingcap.log"
+  sed -n '1,30p' "$LOGDIR/${TAG}_danglingcap.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_dangling_capture.py --strict \
+      >> "$LOGDIR/${TAG}_danglingcap.log" 2>&1; then
+  say "CYCLE FAILURE: a value is captured by reference into storage that dies"
+  say "  at the end of its full-expression — clang's own -Wdangling-capture"
+  say "  fired in src/ (#6475). The view dangles and reads back as the EMPTY"
+  say "  string, at exit 0, with no crash. Push a static literal, an owning"
+  say "  copy, or ctx.internString(...). See $LOGDIR/${TAG}_danglingcap.log"
+  sed -n '/dangling_capture:/,$p' "$LOGDIR/${TAG}_danglingcap.log" \
+    2>/dev/null | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "dangling-capture phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_danglingcap.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
