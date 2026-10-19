@@ -4159,6 +4159,29 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
         // Return i1 bool — the branch condition MUST be i1 (M3 fix).
+        //
+        // fix #6388 (§28.3 *Unbound owned temporaries*, §28.9, stdlib §4.6/§4.3,
+        // v0.338): the `Remove` twin of the `Contains` reclaim above, on the
+        // same reasoning and the same helper. `Remove` is a BORROWING use of an
+        // unbound `owned` receiver: it unlinks at most one node and hands back a
+        // bool. The removed node was already disposed by
+        // `bz_llist_remove_node` (with this list's own `disp`, which is null for
+        // a borrowing `LinkedList<T>` — stdlib §4.6), so that node is NOT
+        // reachable from `recv` any more and the reclaim does not double-free
+        // it; the remaining nodes and the header are exactly what
+        // `bz_llist_free` still owns. MEASURED on this fix's parent, 101
+        // iterations, `f.Make().Remove(2)` over a 3-element producer leaks
+        // 11,312 B in 303 allocations — the 101 headers plus the nodes of the
+        // iterations where element 2 was already unlinked by the previous
+        // iteration's `Remove` and so are not reclaimed either.
+        //
+        // The gate is unchanged from `Contains` and from the `Count` arm: an
+        // unbound `owned`-returning CALL receiver of the plain (borrowing)
+        // `LinkedList<T>` family only. `OwningLinkedList` is excluded by
+        // construction and its elements cascade through
+        // `bz_llist_remove_node`'s non-null disposer above, so nothing this
+        // reclaim frees is something that arm already disposed.
+        freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
         return found;
     }
     // --- Contains(item): bool — node-walk with structural equality ---
@@ -4216,6 +4239,40 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         auto* phi = builder_.CreatePHI(i1(), 2, "llc.result");
         phi->addIncoming(builder_.getTrue(),  foundBB);
         phi->addIncoming(builder_.getFalse(), condBB);
+        // fix #6388 (§28.3 *Unbound owned temporaries*, §28.9, stdlib §4.6/§4.7,
+        // v0.338): the walk above is a BORROWING use of the receiver — it reads
+        // elements and compares them, handing back a bool that retains no
+        // reference into the list. §28.3 lists "the receiver of a further call"
+        // as a borrowing use and disposes such a temporary "at the end of the
+        // full expression in which it is produced, after every use of it within
+        // that expression has completed"; the walk is complete and the phi
+        // holds only constants, so the backing is dead from here on.
+        //
+        // The SAME helper, on the SAME gate, that the sibling `Count` arm above
+        // (line 3975) already calls for exactly this receiver — `LinkedList` is
+        // in `isPlainBuiltinCollectionHead`, so `isUnboundOwnedBorrowingArrayCallExpr`
+        // admits the `owned`-returning `f.Make()` receiver and
+        // `freeUnboundOwnedBorrowingArrayTemp`'s `freeIsLlist` arm frees the
+        // `bz_llist_t*` with `bz_llist_free`. This arm was simply missing the
+        // call: `Count`, `Sum`, `Any`, `First`, `Last`, `Max`, `ToArray` and
+        // `FirstOrNull` are all clean at 0 B on this tree, `Contains` alone is
+        // not. MEASURED on this fix's parent, 101 iterations,
+        // `f.Make().Contains(2)` over a 3-element producer leaks 14,140 B in 404
+        // allocations (`bz_llist_alloc`, bezel_runtime_collections.cpp:1887 plus
+        // `bz_llist_add_last` nodes); `bz_llist_free` is emitted 0 times there
+        // and once here.
+        //
+        // NO-OP for every receiver that has an owner of its own (a named local,
+        // a field, a parameter, a `move`) — those are not unbound temporaries,
+        // so the helper never matches and no use-after-free is possible. The
+        // `OwningLinkedList` receiver is excluded by construction
+        // (`isPlainBuiltinCollectionHead` excludes the `Owning*` family, which
+        // owes an element CASCADE rather than a backing free, and is freed by
+        // `freeUnboundOwnedOwningCollectionTemp`). The element disposer is null
+        // for a borrowing `LinkedList<T>`: `bz_llist_free`'s second argument
+        // walks the node values, and a borrowing list's slots are borrows the
+        // caller does not own (stdlib §4.6/§5).
+        freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy);
         return phi;
     }
     // #6380 (§28.3 *unbound owned temporaries*, §28.9, stdlib §4.6/§4.7,
