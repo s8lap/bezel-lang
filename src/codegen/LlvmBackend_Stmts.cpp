@@ -3770,13 +3770,88 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     bool returnsField6397 =
                         dynamic_cast<sema::FieldSymbol*>(
                             ctx_.exprSymbol(*rs->value)) != nullptr;
+                    // fix #6463 (§29.2 *Desugaring of `for`* / §28.3 *Borrow
+                    // lifetime rules* / §28.9 / §4.5, v0.338): the LAUNDERED
+                    // spelling's frame is minted by the LOCAL-DECL face, one
+                    // statement earlier, so the §29.2 coercion HERE declines
+                    // and `outWrapMade` is `false` over a frame that really
+                    // was built. MEASURED, the reader's answer then goes the
+                    // wrong way and the frame leaks: `var v := _items.Drain();
+                    // return v;` in a block-bodied `property Q:
+                    // IOwningEnumerable<R>`, read as `var e:
+                    // IOwningEnumerable<R> := h.Q;`, reports
+                    // `Direct leak of 32 byte(s) in 1 object(s) allocated from
+                    // bz$prop$Q$get` (the frame) — the reader asked the map,
+                    // saw no mint, took the LEND branch, and nobody reclaimed
+                    // it. Without the launder (the #6452 direct spelling) the
+                    // ownership pass rejects the program (§28.6's
+                    // borrow-producing-accessor rule), so this is the only
+                    // reachable edge on which the verdict is inverted.
+                    //
+                    // WHY THE DIRECT SPELLING IS NOT "FIXED" HERE. The
+                    // ownership pass REJECTS `return _items.Drain();` in a
+                    // block getter (§28.6, measured at #6404; pinned by
+                    // `drain_view_return_frame_lowered_6452.
+                    // block_getter_drain_return_still_rejected_spec_28_6` and
+                    // `drain_return_block_getter_rejected_28_6_6452.bzl`),
+                    // while the LAUNDERED form is admitted, and the asymmetry
+                    // is deliberate — it is a SPEC question about what §28.6's
+                    // accessor carve means once the borrow is laundered through
+                    // a local, and it is recorded as such in
+                    // `getterEscapeIsMintAnnouncingFrame`'s comment above
+                    // ("INTERNALLY INCONSISTENT — direct reject, laundered
+                    // accept"). This arm does not touch which spellings are
+                    // ADMITTED: it only stops publishing a verdict that is the
+                    // opposite of what the wrap creators observed.
+                    //
+                    // THE AUTHORITY ASKED, and why it is the local-decl face's
+                    // own verdict rather than a re-derivation. `v`'s frame was
+                    // minted by `lowerLocalDecl`'s #4750 / #4772 gate calling
+                    // `wrapAsIEnumerableForTarget`, and that face already
+                    // publishes its own observation in
+                    // `iterFormatWrappedDecls_` (its `v != preIterWrap`
+                    // self-report, #2975 / #3384) — the SAME set
+                    // `registerIterableSourceDisposal` reads as its
+                    // `wrappedHere` term, which is the reader whose wrong
+                    // verdict produces the leak measured above. (Its SIBLING
+                    // `iterableSourceClaimedDecls_` is the set the `move`
+                    // nulling arm consults as `isClaimedIterableSource`;
+                    // that one records the CLAIM, not the mint, so it is not
+                    // the authority for this question.) This
+                    // asks that authority rather than re-deciding which leaf to
+                    // mint, which is #3392's recorded cost of letting the three
+                    // faces' predicates drift. MEASURED available at exactly
+                    // this point: the local is lowered earlier in the same
+                    // `lowerScopedBlock`, so its entry is live here.
+                    //
+                    // DIRECTION. This can only ever ADD a mint verdict, and only
+                    // over a frame the wrap creator demonstrably built
+                    // (`iterFormatWrappedDecls_` is written by exactly one site,
+                    // under `v && v != preIterWrap`, and ERASED on a decline),
+                    // so it cannot publish a claim over a frame that was never
+                    // minted — the #6397 UAF direction stays closed by
+                    // construction. The unsafe direction would be the opposite
+                    // one: DROPPING a claim on a genuinely minted frame, which
+                    // is the leak measured above.
+                    bool localMinted6463 = false;
+                    if (const auto* id6463 =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                rs->value.get()))
+                        if (const auto* ls6463 =
+                                dynamic_cast<const sema::LocalSymbol*>(
+                                    ctx_.exprSymbol(*id6463)))
+                            localMinted6463 =
+                                ls6463->decl &&
+                                iterFormatWrappedDecls_.count(ls6463->decl) !=
+                                    0;
                     unsigned k = propBlockGetterReturnKinds_.count(
                                      currentAccessorPropSym_)
                                      ? propBlockGetterReturnKinds_[
                                            currentAccessorPropSym_]
                                      : 0u;
-                    k = (wrapMade6397 ? (k | kPropGetterReturnMint)
-                                      : (k & ~kPropGetterReturnMint));
+                    k = ((wrapMade6397 || localMinted6463)
+                             ? (k | kPropGetterReturnMint)
+                             : (k & ~kPropGetterReturnMint));
                     k = (returnsField6397 ? (k | kPropGetterReturnField)
                                           : (k & ~kPropGetterReturnField));
                     propBlockGetterReturnKinds_[currentAccessorPropSym_] = k;
