@@ -842,26 +842,161 @@ BEZEL_TEST(sema_extension,
 
 // §26.4 accept-control (per the issue's "Regression tests" section):
 // `extension Dictionary<K, Array<V>>` is the spec's other worked example —
-// two bare identifiers in argument positions at distinct nesting depths.
-// The function-slot diagnostic must not fire here either.
+// two bare identifiers in argument positions at DISTINCT NESTING DEPTHS
+// (`K` in `Dictionary`'s own argument position, `V` one level deeper inside
+// `Array<…>`). The function-slot diagnostic must not fire here either:
+// neither identifier sits in a function type's parameter or return slot, so
+// §26.4 binds both.
+//
+// The program as originally written (issue #6517) was a PARSE ERROR — its
+// single `end;` closed the METHOD, not the extension, so the extension block
+// was never closed and `class C` parsed as a nested declaration. Three
+// PARSER diagnostics came out, the §26.4 walk never ran, and the row's
+// assertion — that no diagnostic contains "function slot" — was satisfied by
+// a program that never reached sema. It could not fail: delete §26.4's
+// function-slot diagnostic outright and it still passed. The `end;` closing
+// the method (and the `end;` closing the extension) are load-bearing here,
+// and the comment says why.
+//
+// Four conjuncts, each falsifiable — see the negative-control row below,
+// which drives this same body to this same diagnostic on a head one slot-move
+// away:
+//
+//   (1) the §26.4 function-slot diagnostic must NOT fire — the row's
+//       documented purpose, and the conjunct the negative control breaks.
+//   (2) NEITHER identifier may fail to bind. `V` is load-bearing in the body:
+//       the parameter is typed `Array<V>`, so a head that bound `K` but not
+//       `V` resolves the body's `V` against module scope and emits
+//       "unresolved type name `V`". This is the conjunct separating "both
+//       bound" from "both silently unbound" — the head-binding question this
+//       row is actually about.
+//   (3) the diagnostic that DOES fire is pinned POSITIVELY and by name. The
+//       member read is deliberately a PROPERTY (`this.FirstKey`, no
+//       parentheses): stdlib §4.8 declares `Count`/`Keys`/`Values`/`Add`/
+//       `ContainsKey`/`Remove`/`TryGetValue`/`GetOrNull`/`GetOrAdd`/`Clear`
+//       on `Dictionary`, and `FirstKey` is `SortedDictionary`'s (§4.17), so
+//       the property read is REJECTED at sema with a diagnostic naming the
+//       receiver type. (The CALL spelling `this.FirstKey()` reaches no sema
+//       member check at all — it falls through to codegen's #2457 "produced
+//       no value" backstop, which this in-process parse+sema helper does not
+//       run — so the call spelling would leave conjunct (3) with nothing to
+//       pin.) A program emitting NO diagnostic at all satisfies (1) and (2)
+//       vacuously; (3) forbids that, and it is also what would have caught
+//       the parse-error program.
+//   (4) exactly one diagnostic — so a second one appearing (a head-binding
+//       regression, say) is caught rather than absorbed.
+//
+// The body shape is incidental (as the original comment said), but it is now
+// PINNED rather than tolerated: it is the evidence that sema ran.
 BEZEL_TEST(sema_extension,
            two_bare_identifiers_in_nested_args_still_both_bind_4448) {
     auto r = parseSemaAll(
         "module M; "
         "extension Dictionary<K, Array<V>> "
-        "  public method KeyAndFirstVal(): K "
-        "    var k := this.FirstKey(); "
-        "    return k; "
+        "  public method TakeFrom(values: Array<V>): K "
+        "    var key := this.FirstKey; "
+        "    return key; "
+        "  end; "
         "end; "
         "class C public static method Main(): int return 0; end Main; end C;");
-    // Note: this particular body may still error elsewhere (FirstKey may
-    // not exist on Dictionary), but the function-slot diagnostic must not
-    // fire — there is no function type in the target. We assert the
-    // diagnostic did NOT fire rather than asserting the program compiles
-    // clean: the body shape is incidental; the diagnostic target is the
-    // head.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    int diagCount = 0;
+    bool sawFunctionSlot = false;
+    bool sawUnresolvedTypeName = false;
+    bool sawFirstKeyMember = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        BEZEL_EXPECT_EQ(d.message.find("function slot"),
-                        std::string::npos);
+        ++diagCount;
+        if (d.message.find("function slot") != std::string::npos)
+            sawFunctionSlot = true;
+        if (d.message.find("unresolved type name") != std::string::npos)
+            sawUnresolvedTypeName = true;
+        // The stdlib §4.8 "not part of this collection's documented surface"
+        // diagnostic, pinned by BOTH halves: the member name AND the receiver
+        // type it was looked up on. Naming the receiver type is what shows the
+        // head resolved `Dictionary` with `K`/`V` bound, rather than the
+        // lookup happening on some other type.
+        if (d.message.find("no member `FirstKey`") != std::string::npos &&
+            d.message.find("`Dictionary`") != std::string::npos)
+            sawFirstKeyMember = true;
+    }
+    // (1) Neither identifier is in a function slot, so §26.4 binds both and
+    // the function-slot diagnostic must not fire. This conjunct is the row's
+    // documented purpose.
+    BEZEL_EXPECT_FALSE(sawFunctionSlot);
+    // (2) Both identifiers actually bound — an unbound `V` surfaces in the
+    // body as "unresolved type name `V`".
+    BEZEL_EXPECT_FALSE(sawUnresolvedTypeName);
+    // (3) The one diagnostic that does fire is the stdlib §4.8 member
+    // diagnostic on `Dictionary`, which is what proves sema ran at all.
+    BEZEL_EXPECT_TRUE(sawFirstKeyMember);
+    // (4) and it is the only one.
+    BEZEL_EXPECT_EQ(diagCount, 1);
+}
+
+// §26.4 NEGATIVE CONTROL for the row above (#6517). The accept-control's
+// conjunct (1) is an ABSENCE, so on its own it cannot show that the
+// diagnostic it forbids is reachable at all. This row puts the §26.4
+// function-slot diagnostic back into the very head the accept-control
+// blesses — one slot-move away, same body, same helper — and asserts the
+// diagnostic DOES fire. If §26.4's function-slot diagnostic were withdrawn, or
+// its argument-position walk stopped reaching these positions, THIS row goes
+// red while the accept-control stays green: the pair is what makes the
+// accept-control's absence a claim about a live diagnostic rather than a
+// tautology.
+//
+// Both spellings are covered because the accept-control's subject is two
+// identifiers at two distinct depths: `K` at `Dictionary`'s OWN argument
+// position, `V` nested inside `Array<…>`. Moving either into a function slot
+// must be rejected — §26.4's nesting clause composes ONLY through generic
+// arguments, so neither depth is special.
+BEZEL_TEST(sema_extension,
+           two_bare_identifiers_nested_args_control_function_slot_fires_4448) {
+    // Control A: `V` moved into a function slot inside the nested `Array<…>`.
+    {
+        auto r = parseSemaAll(
+            "module M; "
+            "extension Dictionary<K, Array<(V) -> V>> "
+            "  public method TakeFrom(values: Array<V>): K "
+            "    var key := this.FirstKey; "
+            "    return key; "
+            "  end; "
+            "end; "
+            "class C public static method Main(): int return 0; end Main; end C;");
+        bool sawFunctionSlot = false;
+        int section264Hits = 0;
+        for (const auto& d : r.diagnostics.diagnostics()) {
+            if (d.message.find("\xC2\xA7""26.4") != std::string::npos)
+                ++section264Hits;
+            if (d.message.find("function slot") != std::string::npos)
+                sawFunctionSlot = true;
+        }
+        BEZEL_EXPECT_TRUE(sawFunctionSlot);
+        BEZEL_EXPECT_EQ(section264Hits, 1);
+    }
+    // Control B: `K` moved into a function slot at `Dictionary`'s OWN argument
+    // position. (This spelling draws a second, independent diagnostic — the
+    // §3.6/§8.3 hashable-key-type rejection, since a function type is not
+    // hashable — which is why this control asserts on the §26.4 function-slot
+    // conjunct and its count, not on a total diagnostic count.)
+    {
+        auto r = parseSemaAll(
+            "module M; "
+            "extension Dictionary<(K) -> K, Array<V>> "
+            "  public method TakeFrom(values: Array<V>): K "
+            "    var key := this.FirstKey; "
+            "    return key; "
+            "  end; "
+            "end; "
+            "class C public static method Main(): int return 0; end Main; end C;");
+        bool sawFunctionSlot = false;
+        int section264Hits = 0;
+        for (const auto& d : r.diagnostics.diagnostics()) {
+            if (d.message.find("\xC2\xA7""26.4") != std::string::npos)
+                ++section264Hits;
+            if (d.message.find("function slot") != std::string::npos)
+                sawFunctionSlot = true;
+        }
+        BEZEL_EXPECT_TRUE(sawFunctionSlot);
+        BEZEL_EXPECT_EQ(section264Hits, 1);
     }
 }
