@@ -19476,7 +19476,7 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             //
             // Gated to the three KEYED families because `TryGetValue`/
             // `GetOrNull` are not dictionary-only: `OwningSlotMap<T>` (stdlib
-            // §4.20) declares `GetOrNull(handle: SlotHandle): T?` and
+            // §4.21) declares `GetOrNull(handle: SlotHandle): T?` and
             // `TryGetValue(handle: SlotHandle, out value: T?): bool`, whose
             // pos-0 parameter is a HANDLE, not `genericArgs[0]` (which is the
             // slot's element type there). Routing those through this list would
