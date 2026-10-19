@@ -3192,6 +3192,97 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return ncPhi;
             }
         }
+        // fix #6512 (stdlib §5 / §7.5, v0.338): `g?.Key` on an
+        // `IGrouping<TKey, T>` receiver. stdlib §5 declares exactly one own
+        // member on IGrouping — `readonly property Key: TKey` — and §7.5 puts
+        // no nullability precondition on the receiver, so `?.` on the
+        // non-nullable grouping a `for` loop yields performs the access and
+        // yields `TKey?`. The `.` form reaches `bz_grouping_key` through the
+        // MemberAccessExpr arm below; a NullCondMemberExpr is a distinct AST
+        // node, so that arm never ran and the access lowered to nothing
+        // (#2961), leaving the enclosing store dropped at exit 0.
+        //
+        // Lower the receiver ONCE; a null receiver yields null, otherwise run
+        // the `.` form's own Key lowering over a synthetic `.` node whose target
+        // is a pinned placeholder carrying the already-lowered receiver (the
+        // makePrimIntrinsicThunk pattern), then wrap as a present `TKey?`.
+        if (nm->member == "Key") {
+            const sema::TypeRef* igKeyRcvTy = ctx_.exprType(*nm->target);
+            if (igKeyRcvTy &&
+                igKeyRcvTy->kind == sema::TypeRef::Kind::Named &&
+                !igKeyRcvTy->declaration && !igKeyRcvTy->genericArgs.empty() &&
+                igKeyRcvTy->genericArgs[0] &&
+                igKeyRcvTy->headName() == "IGrouping") {
+                llvm::Value* igKeyRcv = lowerExpr(*nm->target);
+                if (!igKeyRcv || !igKeyRcv->getType()->isPointerTy())
+                    return nullptr;
+                llvm::Type* igKeyTy = lowerTypeRef(igKeyRcvTy->genericArgs[0]);
+                if (!igKeyTy ||
+                    (!igKeyTy->isIntegerTy() && !igKeyTy->isPointerTy()) ||
+                    (igKeyTy->isIntegerTy() &&
+                     igKeyTy->getIntegerBitWidth() > 32))
+                    return nullptr;
+                auto* igKeyEntryBB = builder_.GetInsertBlock();
+                auto* igKeyAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "igkey.access", currentFn_);
+                auto* igKeyEndBB = llvm::BasicBlock::Create(
+                    llvm_, "igkey.end", currentFn_);
+                builder_.CreateCondBr(
+                    builder_.CreateICmpEQ(
+                        igKeyRcv, llvm::ConstantPointerNull::get(ptrTy())),
+                    igKeyEndBB, igKeyAccessBB);
+                builder_.SetInsertPoint(igKeyAccessBB);
+                auto igKeySlot = entryAlloca(igKeyTy);
+                auto* igKeyFn = declareC("bz_grouping_key",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy()});
+                builder_.CreateCall(igKeyFn, {igKeyRcv, igKeySlot});
+                llvm::Value* igKeyV =
+                    builder_.CreateLoad(igKeyTy, igKeySlot, "grp.key.nc");
+                // A nullable REFERENCE is a bare nullable pointer here (a null
+                // ptr IS the null value) — the same shape CG41's `x?.M`
+                // reference-member arm returns a phi of. Only a nullable VALUE
+                // (TKey = int and friends) is the tagged {i8 hasVal; T} struct.
+                // Wrapping a string key in the struct instead makes every
+                // consumer that expects a raw string pointer GEP into the
+                // struct ("GEP base pointer is not a vector or a vector of
+                // pointers" / "Load operand must be a pointer") — measured on
+                // `(g?.Key ?? "?").Length`.
+                const bool igKeyIsRef = igKeyTy->isPointerTy();
+                llvm::Type* igKeyNst = igKeyIsRef
+                                           ? static_cast<llvm::Type*>(ptrTy())
+                                           : static_cast<llvm::Type*>(
+                                                 llvm::StructType::get(
+                                                     llvm_, {nullablePrimHasValTy(),
+                                                             igKeyTy}));
+                // The wrapped value MUST be built while the insert point is
+                // still igKeyAccessBB — after CreateBr(igKeyEndBB) it would
+                // land in igKeyEndBB below the phi ("PHI nodes not grouped at
+                // top of basic block" + "Instruction does not dominate all
+                // uses").
+                llvm::Value* igKeyWrapped = igKeyV;
+                if (!igKeyIsRef)
+                    igKeyWrapped = builder_.CreateInsertValue(
+                        builder_.CreateInsertValue(
+                            llvm::UndefValue::get(igKeyNst),
+                            llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                            {0u}),
+                        igKeyV, {1u});
+                auto* igKeyAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(igKeyEndBB);
+                builder_.SetInsertPoint(igKeyEndBB);
+                auto* igKeyPhi = builder_.CreatePHI(igKeyNst, 2);
+                igKeyPhi->addIncoming(
+                    igKeyIsRef
+                        ? static_cast<llvm::Value*>(
+                              llvm::ConstantPointerNull::get(ptrTy()))
+                        : static_cast<llvm::Value*>(
+                              llvm::ConstantAggregateZero::get(igKeyNst)),
+                    igKeyEntryBB);
+                igKeyPhi->addIncoming(igKeyWrapped, igKeyAccessEnd);
+                return igKeyPhi;
+            }
+        }
         // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
         // collection head, typed `int?` by resolveNullCondMember. The receiver
         // is lowered ONCE; a null receiver yields null, otherwise the `.` form's

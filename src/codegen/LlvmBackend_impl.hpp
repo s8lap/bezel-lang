@@ -1957,6 +1957,12 @@ private:
     // the `?.` count arm in lowerExpr (see there). Kept alive for the whole
     // compilation so the exprType entries set on them never outlive their key.
     std::vector<std::unique_ptr<ast::MemberAccessExpr>> nullCondCountSynth_;
+    // fix #6512: holder for the synthetic `g.Count()` CallExpr that
+    // lowerNullCondCall builds (with its pinned-placeholder MemberAccessExpr
+    // callee) so the `?.` form reaches the SAME `bz_grouping_count` lowering
+    // the `.` form uses via tryLowerBuiltinClassCall. Owned by the function
+    // for the whole codegen run; see nullCondCountSynth_ above.
+    std::vector<std::unique_ptr<ast::CallExpr>> nullCondGroupingCallSynth_;
     // §27.7.1 (v0.180, #1544): cached property-getter-reference thunk per
     // property symbol — the SAME #1170 stability reasoning as methodThunks_
     // above, applied to a property used as a function value (§27.6, `var f:

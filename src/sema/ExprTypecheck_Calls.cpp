@@ -32493,6 +32493,58 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             }
         }
     }
+    // fix #6512 (stdlib §5 / §7.5, v0.338): `?.` on an `IGrouping<TKey, T>`
+    // receiver. IGrouping TypeRefs are synthetic (no declaration), so
+    // `memberTargetType` above returns null, `lookupMember` finds nothing, and
+    // every `?.` access on a grouping fell through BOTH the generic member path
+    // and the #3155 catch-all below (whose `knownCompleteUserType` gate needs a
+    // non-null `targetType`). The access was left untyped, the enclosing store
+    // degraded to its previous value, and the program exited 0 answering
+    // wrongly — signalled only by the `internal:` #2961 backstop.
+    //
+    // §7.5 states NO nullability precondition on the receiver and that the
+    // result is ALWAYS nullable, so `?.` on the non-nullable grouping a `for`
+    // loop over `IGrouping<TKey, T>` yields performs the access; only the
+    // RESULT is lifted. (§7.5's sibling rejection, #5452, applies to a TYPE
+    // NAME — a static receiver, not a value. A non-nullable VALUE receiver is
+    // a different case and is admitted, as it already is for string, Array and
+    // user classes.)
+    //
+    // stdlib §5 declares exactly one own member on IGrouping —
+    // `readonly property Key: TKey` — and §5's `extension IEnumerable<T>`
+    // declares `public method Count(): int`. Both therefore name REAL members,
+    // so the correct result is a VALUE, not a diagnostic:
+    //   `Key`     -> TKey?   (§7.5 lift)
+    //   `Count()` -> int?    (§7.5 lift; `Count` is a METHOD, so it is a
+    //                          member only in direct-call callee position —
+    //                          the `calleeOfCallCtx_` gate §27.6 sets while
+    //                          visiting a call's callee, the same bare-vs-callee
+    //                          distinction the `.` form uses).
+    // Typed here so typeCall's NullCondMemberExpr block propagates the call's
+    // type forward, and lowered in codegen by the `?.` arms that reach the same
+    // `bz_grouping_key` / `bz_grouping_count` intrinsics the `.` form uses.
+    if (!member && recvTyForDiag &&
+        recvTyForDiag->kind == TypeRef::Kind::Named &&
+        !recvTyForDiag->declaration && recvTyForDiag->astNode &&
+        recvTyForDiag->astNode->name &&
+        !recvTyForDiag->astNode->name->parts.empty() &&
+        recvTyForDiag->headName() == "IGrouping") {
+        if (nm.member == "Key" && !recvTyForDiag->genericArgs.empty() &&
+            recvTyForDiag->genericArgs[0]) {
+            TypeRef* key = ctx_.makeTypeRef(*recvTyForDiag->genericArgs[0]);
+            key->nullable = true;  // §7.5: the result is always nullable
+            ctx_.setExprType(&nm, key);
+            return;
+        }
+        if (nm.member == "Count" && &nm == calleeOfCallCtx_) {
+            // stdlib §5 `public method Count(): int` in
+            // `extension IEnumerable<T>`; typeCall's §7.5 lift keeps it `int?`.
+            ctx_.setExprType(
+                &nm, ctx_.primitiveTypeRef(PrimitiveType::Int,
+                                           /*nullable=*/true));
+            return;
+        }
+    }
     if (!member) {
         // #3019 (§9.2/§9.3/§35.7): the `?.` form of a direct Equals/GetHashCode
         // call is the SAME use-site violation as the `.` form — route it

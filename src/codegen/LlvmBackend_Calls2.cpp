@@ -20771,6 +20771,82 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         }
         return nullptr;
     }
+    // fix #6512 (stdlib §5 / §7.5, v0.338): `g?.Count()` on an
+    // `IGrouping<TKey, T>` receiver. stdlib §5's `extension IEnumerable<T>`
+    // declares `public method Count(): int`, so this names a real member and
+    // §7.5 (no nullability precondition on the receiver; result always
+    // nullable) makes the correct result a VALUE — `int?` — not a diagnostic.
+    // A `?.` call's callee is a NullCondMemberExpr, so this function reached
+    // neither the generic method dispatch (`ms` is null: IGrouping TypeRefs are
+    // synthetic and carry no MemberSymbol) nor
+    // tryLowerBuiltinClassCall's IGrouping `Count()` arm (which keys on a
+    // MemberAccessExpr callee) — the call lowered to nothing, the enclosing
+    // store was dropped, and the program exited 0 answering wrongly with only
+    // the `internal:` #2961 backstop.
+    //
+    // Lower the receiver ONCE; a null receiver yields null, otherwise run the
+    // `.` form's own `Count()` lowering over a synthetic `Count()` call whose
+    // callee target is a pinned placeholder carrying the already-lowered
+    // receiver (the makePrimIntrinsicThunk pattern), then wrap as a present
+    // `int?`.
+    if (nm.member == "Count" && call.args.empty() && nm.target) {
+        const sema::TypeRef* igcRcvTy = ctx_.exprType(*nm.target);
+        if (igcRcvTy && igcRcvTy->kind == sema::TypeRef::Kind::Named &&
+            !igcRcvTy->declaration && igcRcvTy->astNode &&
+            igcRcvTy->astNode->name &&
+            !igcRcvTy->astNode->name->parts.empty() &&
+            igcRcvTy->headName() == "IGrouping") {
+            llvm::Value* igcRcv = lowerExpr(*nm.target);
+            if (!igcRcv || !igcRcv->getType()->isPointerTy()) return nullptr;
+            auto* igcEntryBB = builder_.GetInsertBlock();
+            auto* igcAccessBB = llvm::BasicBlock::Create(
+                llvm_, "igcnt.access", currentFn_);
+            auto* igcEndBB = llvm::BasicBlock::Create(
+                llvm_, "igcnt.end", currentFn_);
+            builder_.CreateCondBr(
+                builder_.CreateICmpEQ(
+                    igcRcv, llvm::ConstantPointerNull::get(ptrTy())),
+                igcEndBB, igcAccessBB);
+            builder_.SetInsertPoint(igcAccessBB);
+            auto igcPlaceholder = std::make_unique<ast::IdentifierExpr>();
+            igcPlaceholder->name = "Count";
+            ctx_.setExprType(igcPlaceholder.get(),
+                             const_cast<sema::TypeRef*>(igcRcvTy));
+            exprValueOverride_[igcPlaceholder.get()] = igcRcv;
+            auto igcDotted = std::make_unique<ast::MemberAccessExpr>();
+            igcDotted->span = nm.span;
+            igcDotted->member = "Count";
+            igcDotted->target = std::move(igcPlaceholder);
+            const ast::Expr* igcPlaceholderKey = igcDotted->target.get();
+            ctx_.setExprType(igcDotted.get(),
+                             ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+            auto igcCall = std::make_unique<ast::CallExpr>();
+            igcCall->span = call.span;
+            igcCall->callee = std::move(igcDotted);
+            ctx_.setExprType(igcCall.get(),
+                             ctx_.primitiveTypeRef(sema::PrimitiveType::Int));
+            llvm::Value* igcCount = lowerExpr(*igcCall);
+            exprValueOverride_.erase(igcPlaceholderKey);
+            nullCondGroupingCallSynth_.push_back(std::move(igcCall));
+            if (!igcCount || !igcCount->getType()->isIntegerTy(32))
+                return nullptr;
+            auto* igcNst = llvm::StructType::get(
+                llvm_, {nullablePrimHasValTy(), i32()});
+            llvm::Value* igcWrapped = builder_.CreateInsertValue(
+                builder_.CreateInsertValue(
+                    llvm::UndefValue::get(igcNst),
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u}),
+                igcCount, {1u});
+            auto* igcAccessEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(igcEndBB);
+            builder_.SetInsertPoint(igcEndBB);
+            auto* igcPhi = builder_.CreatePHI(igcNst, 2);
+            igcPhi->addIncoming(
+                llvm::ConstantAggregateZero::get(igcNst), igcEntryBB);
+            igcPhi->addIncoming(igcWrapped, igcAccessEnd);
+            return igcPhi;
+        }
+    }
     if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
     llvm::FunctionType* fnTy = methodFnType(ms);
     if (!fnTy) return nullptr;
