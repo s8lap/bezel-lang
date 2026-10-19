@@ -795,21 +795,49 @@ BEZEL_TEST(sema_extension,
     // WHY conjunct (2) is here — the anti-vacuity guard, NOT a head-binding
     // claim. `BEZEL_EXPECT_FALSE(sawFunctionSlot)` on its own is satisfied by
     // any program that never reached §26.4's walk: dropping the `>` in this
-    // head yields a parse diagnostic and nothing else, and the absence
+    // head yields parse diagnostics and no function-slot one, and the absence
     // conjunct still passes. Pinning that one specific diagnostic DID fire,
     // and that it was the ONLY one, is what makes the absence above mean
     // "§26.4 declined to call this a function slot" rather than "nothing
     // got far enough to say".
     //
     // It is NOT evidence that the head bound T, and an earlier revision of
-    // this comment claimed it was. MEASURED on the current tree: a head that
-    // did NOT bind its type argument —
-    // `extension IEnumerable<Array<NoSuchType>>` — produces the IDENTICAL
-    // member diagnostic, still alone (1 of 1), and no unresolved-type
-    // diagnostic at all. (Isolating control: the same unknown name as the
-    // HEAD ITSELF, `extension NoSuchTypeX<T>`, IS diagnosed
-    // `unresolved type name \`NoSuchTypeX\``, so the silence is specific to
-    // the generic-ARGUMENT position — filed as #6518, out of scope here.)
+    // this comment claimed it was. Conjunct (2) is INSENSITIVE to how the
+    // argument positions were spelled: `extension IEnumerable<Array<NoSuchType>>`
+    // yields the same single member diagnostic as this head, byte for byte
+    // apart from the filename.
+    //
+    // That equality is NOT the compiler failing to bind. §26.4 (v0.338,
+    // *Type-parameter binding*) binds both spellings: "In the extended type's
+    // argument positions, each bare single-segment non-nullable identifier
+    // introduces a fresh block-level type parameter — always, shadowing any
+    // same-named type in scope", and it declines the alternative — "resolving
+    // the identifier against scope and only binding when unresolved" —
+    // "is declined: it would let an unrelated type declaration elsewhere
+    // silently re-mean an extension block" (the ruling is recorded again at
+    // changelog v0.160, #1346). So `NoSuchType` in that head is a bound
+    // parameter spelled with a type-shaped word, not a name that failed to
+    // resolve, and no diagnostic is owed for it. The compiler says so itself
+    // where it can: with a same-named type in scope, `extension Array<NoSuchType>`
+    // gives "warning: type parameter `NoSuchType` in this extension block
+    // shadows the type `NoSuchType` that is in scope (§26.4); the extension
+    // type parameter always takes precedence".
+    //
+    // It is a usable parameter, not a placeholder: MEASURED, an
+    // `extension Array<NoSuchType>` block using it as a parameter type, a
+    // return type and a local type compiles with no diagnostic and RUNS,
+    // inferring `NoSuchType` as `int` from the receiver and returning the
+    // passed value — the same program spelled `T` behaving identically. The
+    // controls that DO fire show the compiler is not lax about names in
+    // signatures: the same identifier qualified in an argument position
+    // (`Array<NoSuchType.Nope>`) or used as the head itself
+    // (`extension NoSuchTypeX<T>`) is diagnosed `unresolved type name`.
+    //
+    // What is still open is a usability question, not a gap here: §26.4's
+    // one affordance is the shadowing warning, and it needs a same-named type
+    // in scope, so an invented name is silent. Tracked at #6522
+    // (`spec-question`, OPEN). #6518 asked for this to be diagnosed and was
+    // closed `not planned` — spec-mandated, per the same §26.4 clause.
     // Do not re-derive a head-binding guarantee from conjunct (2).
     //
     // Both conjuncts are non-vacuous:
