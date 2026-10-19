@@ -114,11 +114,12 @@
 // on this one arm (base-measured 223 bytes / 4 allocations — §28.3's own
 // "else it leaks" failure mode, the safe direction) until the slice's missing
 // element retain is fixed on its own oracle. That defect is pre-existing and
-// independent — it aborts on the BASE with a fully BOUND receiver and through
-// the named `Array<T>.Slice(r)` method, neither of which any registration here
-// touches — so it is NOT fixed in this file, and the row below asserts only
-// what this file can own: the slice arm runs, exits 0, and prints the right
-// contents.
+// independent — on the BASE it ABORTS with a fully BOUND receiver through the
+// INDEXER form (`refcount over-release (string)`, exit 134), which no
+// registration here touches. The named `Array<T>.Slice(r)` method does not
+// abort; it leaks 72 bytes / 2 allocations. So it is NOT fixed in this file,
+// and the row below asserts only what this file can own: the slice arm runs,
+// exits 0, and prints the right contents.
 
 #include <initializer_list>
 #include <regex>

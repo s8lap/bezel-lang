@@ -720,16 +720,22 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         // agree on who owns each element FIRST, and that agreement is a
         // SEPARATE, PRE-EXISTING defect with its own oracle: `bz_array_slice`
         // copies the element pointers without retaining them, so the slice's
-        // own disposal releases a reference it does not hold — which reproduces
-        // on the base 7a0c320f with a fully BOUND receiver and through the named
-        // `Array<T>.Slice(r)` method, neither of which this registration
-        // touches. (WHICH SIDE gives way is that issue's ruling to make, and
-        // this lane does not make it: §15.6 describes the result as "copies of
-        // the references (or values)" and says a slice holds "copies of the
-        // element borrows, so disposing the slice never disposes elements" for
-        // class-typed T, while §28.11's shared-reference slot row — the row a
-        // `string` element takes — gives the slot a release, which is what the
-        // disposal classifier emits today.)
+        // own disposal releases a reference it does not hold. MEASURED on the
+        // base 7a0c320f: the INDEXER form with a fully BOUND receiver aborts
+        // with `refcount over-release (string)` (exit 134). The named
+        // `Array<T>.Slice(r)` method does NOT — it LEAKS (72 bytes in 2
+        // allocations under LSan); it does not over-release. Neither shape is
+        // touched by this registration, but only the first is an abort: do not
+        // write a crash-pinning test against the named method, which cannot
+        // fail on the defect it targets. (WHICH SIDE gives way is that issue's
+        // ruling to make, and this lane does not make it: §15.6 describes the
+        // result as "copies of the references (or values)" and says a slice
+        // holds "copies of the element borrows, so disposing the slice never
+        // disposes elements" for class-typed T. Note that §28.11's operation
+        // table gives the shared-reference column "no user-visible work" in its
+        // DISPOSE row; the release the classifier emits today comes from the
+        // STORAGE being released with the instance, not from a slot-release
+        // row.)
         // Filing it there keeps this lane a fix-forward of a rejected commit
         // rather than a second fix. §28.3's stated failure mode for an
         // undischarged temporary is a leak, which is the safe direction; it must
