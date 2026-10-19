@@ -6111,6 +6111,39 @@ private:
     llvm::Value* emitChoiceToString(llvm::Value* val,
                                     const sema::TypeSymbol* choiceTy,
                                     const sema::TypeRef* instTy = nullptr);
+    // fix #6459 (§8.3 / §35.7, v0.338): the ONE §35.7 case-payload type
+    // resolution, shared by `emitChoiceEquality`, `emitChoiceHashCode` and
+    // `emitChoiceToString`. All three read the SAME payload list and must
+    // agree, or `=` and `GetHashCode` disagree (§8.3's hash-equality
+    // invariant) — which is exactly how the three copies below drifted.
+    //
+    // The defect: the pre-#6459 resolver substituted only a payload spelled
+    // as a BARE type parameter (`Ok(v: T?)` at `W<Col>` — the #4278/#6169
+    // shape). A payload spelled as a type parameter BURIED INSIDE another
+    // generic's argument list — `Wp(v: W<T>)` at `VQ<Col>` — was left
+    // unsubstituted: `rawTy->declaration` is non-null (it names `W`), so the
+    // bare-parameter loop never ran, and the payload reached
+    // `emitValueEquality`/`emitValueHashCode` typed `W<T>` with `T` still a
+    // parameter. Neither emitter has an arm for a Named-with-args whose args
+    // are not yet concrete, so both fell to their SHAPE fallback: the
+    // struct-compare hashed every slot of the choice struct IN SLOT ORDER
+    // instead of switching on the tag and folding only the ACTIVE case's
+    // payload. A freshly constructed choice leaves its INACTIVE payload slots
+    // `undef` (#2083's header documents this), so the fold read uninitialised
+    // memory — MEASURED on the repro: the same binary printed
+    // `ha=573780 hb=573315`, then `hb=573377`, then `hb=575299`, across
+    // consecutive runs of ONE executable, and `a = b` flipped with it. That
+    // is the "uninitialised slot" the issue pointed at, and it is why a
+    // fix to the comparison alone would not have been enough: the hash fold
+    // reads the same undef slots.
+    //
+    // The fix substitutes through the WHOLE payload type, not just a bare
+    // top-level parameter, so `W<T>` at `VQ<Col>` arrives as `W<Col>` and the
+    // emitters' existing Named-with-concrete-args choice arm takes over.
+    // per §8.3, §35.7, §14.1
+    sema::TypeRef choicePayloadTypeResolved(const ast::Param& pf,
+                                            const sema::TypeSymbol* choiceTy,
+                                            const sema::TypeRef* instTy);
     // fix #2661 (spec §8.5, v0.252): the §8.5 POSITIONAL-RECORD default for the
     // standard library's span records — "The defaults above are generated for
     // **every** type of the applicable kind, wherever declared — user modules

@@ -8843,6 +8843,51 @@ llvm::Value* Emitter::emitInlineArrayEquality(llvm::Value* l, llvm::Value* r,
 // nullability in; nullable is idempotent, so an argument that is itself
 // nullable (`W<Col?>`) stays nullable. `emitChoiceHashCode` carries the same
 // pair of resolutions and the same fix. // per §9.2, §8.4, §35.7
+//
+// fix #6459 (§8.3 / §35.7, v0.338): all three of those resolutions collapse
+// into `choicePayloadTypeResolved` below, which substitutes the payload type
+// through the WHOLE type rather than only a bare top-level parameter — see
+// that function's header for the measured uninitialised-read mechanism.
+sema::TypeRef Emitter::choicePayloadTypeResolved(const ast::Param& pf,
+                                                const sema::TypeSymbol* choiceTy,
+                                                const sema::TypeRef* instTy) {
+    using K = sema::TypeRef::Kind;
+    if (!pf.type) return {};
+    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
+    if (!rawTy) return {};
+    // The §14.1 substitution this payload is read under. `instTy` (the
+    // receiver's concrete instantiation) is authoritative when the caller has
+    // one; otherwise the ambient `genericSubstSemaTy_` a `RecordSubstGuard`
+    // installed for the receiver stands in. An empty map is the identity.
+    std::unordered_map<std::string_view, const sema::TypeRef*> subst;
+    if (instTy && !instTy->genericArgs.empty() && choiceTy &&
+        !choiceTy->genericParams.empty() &&
+        instTy->genericArgs.size() == choiceTy->genericParams.size()) {
+        for (std::size_t i = 0; i < choiceTy->genericParams.size(); ++i)
+            if (choiceTy->genericParams[i])
+                subst.emplace(choiceTy->genericParams[i]->name,
+                              instTy->genericArgs[i]);
+    }
+    if (subst.empty()) subst = genericSubstSemaTy_;
+    // `substituteTypeRefLocal` walks Named genericArgs recursively and
+    // preserves a bare parameter's `?` across the substitution (`T? -> Col?`,
+    // #6169's requirement), so it covers the bare-parameter case #4278 added
+    // AND the buried-parameter case #6459 adds in one step. An identity
+    // substitution returns its argument unchanged (no allocation), which keeps
+    // this a no-op for a non-generic choice.
+    const sema::TypeRef* resolved = substituteTypeRefLocal(rawTy, subst);
+    // `substituteTypeRefLocal` reads the bare-parameter head through
+    // `TypeRef::headName()`. A payload type whose OWN nullability was declared
+    // at the payload site (`Ok(v: T?)` resolving to a bare `T` that carries
+    // `?` on the ref) keeps it, but a resolution that dropped it — e.g. the
+    // substitution landed on a non-nullable argument — is restored here.
+    // Nullable is idempotent, so an argument that is itself nullable
+    // (`W<Col?>`) stays nullable. per §9.2, §8.4, §35.7
+    sema::TypeRef out = *resolved;
+    if (rawTy->nullable && !out.nullable) out.nullable = true;
+    return out;
+}
+
 llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                                          const sema::TypeSymbol* choiceTy,
                                          const sema::TypeRef* instTy) {
@@ -8892,46 +8937,10 @@ llvm::Value* Emitter::emitChoiceEquality(llvm::Value* l, llvm::Value* r,
             llvm::Value* rf = builder_.CreateExtractValue(
                 r, {static_cast<unsigned>(1 + ci),
                     static_cast<unsigned>(pi)}, "cheq.rf");
-            sema::TypeRef pTy;  // resolved payload type for emitValueEquality
-            if (pf.type) {
-                // fix #4278: when `instTy` is provided (the concrete instantiation,
-                // e.g. `Maybe<string>`), directly substitute a bare type-parameter
-                // payload (`T`) using `instTy->genericArgs` — bypassing
-                // `ctx_.resolvedType` which may return null for a type parameter
-                // whose resolution context is not active in codegen. Match by name
-                // against `choiceTy`'s generic params (same mechanism
-                // `substitutedChoicePayloadType` uses). A no-op for a concrete
-                // payload type (the payload TypeRef has a declaration or is not
-                // in `choiceTy`'s generic param list).
-                if (instTy && !instTy->genericArgs.empty()) {
-                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
-                    if (rawTy && rawTy->kind == sema::TypeRef::Kind::Named &&
-                        !rawTy->declaration) {
-                        std::string_view head = rawTy->headName();
-                        for (std::size_t i = 0;
-                             i < choiceTy->genericParams.size(); ++i) {
-                            if (choiceTy->genericParams[i] &&
-                                choiceTy->genericParams[i]->name == head &&
-                                i < instTy->genericArgs.size()) {
-                                pTy = *instTy->genericArgs[i];
-                                pTy.nullable = pTy.nullable || rawTy->nullable;
-                                break;
-                            }
-                        }
-                    }
-                    // If not a type param, fall through to the resolved type.
-                    if (pTy.kind == sema::TypeRef::Kind::Error) {
-                        if (rawTy) pTy = *rawTy;
-                    }
-                } else {
-                    // Top-level call or no instTy: use the prior path.
-                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
-                    if (const sema::TypeRef* rt = resolveTypeParamRef(rawTy))
-                        pTy = *rt;
-                    // fix #6169 — see the header note above.
-                    pTy.nullable = pTy.nullable || (rawTy && rawTy->nullable);
-                }
-            }
+            // fix #4278 / #6169 / #6459 — see the header notes above and on
+            // `choicePayloadTypeResolved`, which is the single resolution all
+            // three §35.7 emitters now share.
+            sema::TypeRef pTy = choicePayloadTypeResolved(pf, choiceTy, instTy);
             caseEq = builder_.CreateAnd(caseEq,
                                         emitValueEquality(lf, rf, &pTy));
         }
@@ -9007,37 +9016,10 @@ llvm::Value* Emitter::emitChoiceHashCode(llvm::Value* val,
             // still present (layout is unchanged), but the field is not folded
             // into the case hash accumulator.
             if (pf.equality && pf.equality->isSkip) continue;
-            sema::TypeRef pTy;
-            if (pf.type) {
-                // fix #4278: same substitution logic as emitChoiceEquality.
-                if (instTy && !instTy->genericArgs.empty()) {
-                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
-                    if (rawTy && rawTy->kind == sema::TypeRef::Kind::Named &&
-                        !rawTy->declaration) {
-                        std::string_view head = rawTy->headName();
-                        for (std::size_t i = 0;
-                             i < choiceTy->genericParams.size(); ++i) {
-                            if (choiceTy->genericParams[i] &&
-                                choiceTy->genericParams[i]->name == head &&
-                                i < instTy->genericArgs.size()) {
-                                pTy = *instTy->genericArgs[i];
-                                // fix #6169 — see emitChoiceEquality's header.
-                                pTy.nullable = pTy.nullable || rawTy->nullable;
-                                break;
-                            }
-                        }
-                    }
-                    if (pTy.kind == sema::TypeRef::Kind::Error) {
-                        if (rawTy) pTy = *rawTy;
-                    }
-                } else {
-                    const sema::TypeRef* rawTy = ctx_.resolvedType(*pf.type);
-                    if (const sema::TypeRef* rt = resolveTypeParamRef(rawTy))
-                        pTy = *rt;
-                    // fix #6169 — see emitChoiceEquality's header.
-                    pTy.nullable = pTy.nullable || (rawTy && rawTy->nullable);
-                }
-            }
+            // fix #4278 / #6169 / #6459 — the SAME resolution `emitChoiceEquality`
+            // uses, so §8.3's hash-equality invariant cannot be broken by the
+            // two folds disagreeing. See `choicePayloadTypeResolved`.
+            sema::TypeRef pTy = choicePayloadTypeResolved(pf, choiceTy, instTy);
             llvm::Value* pfVal = builder_.CreateExtractValue(
                 val, {static_cast<unsigned>(1 + ci),
                       static_cast<unsigned>(pi)}, "ch.pf");
