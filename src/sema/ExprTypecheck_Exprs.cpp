@@ -3960,6 +3960,118 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             reportHashKeyInlineArrayLiteral(
                                 ctx_.diagnostics(), tt,
                                 ix->indices[0].value.get(), {});
+                        // fix #6500 (§23.4 + §15.6, v0.338; stdlib §4.8): a
+                        // RANGE index on a dictionary is not an index access at
+                        // all. stdlib §4.8/§4.9/§4.17 declare exactly ONE
+                        // indexer each — `public property [key: K]: V` — and
+                        // §23.4 admits an index only when it fits a DECLARED
+                        // indexer's parameter-type list. A `Range<int>` fits
+                        // `[key: K]` only where `K` IS a `Range<T>`, which is
+                        // the `Dictionary<Range<int>, V>` case stdlib §9.8's
+                        // auto-hashable `Range<T>` admits and #6207 pins. Where
+                        // `K` is `int` / `string` / `Guid` / a record, no
+                        // indexer is applicable and the expression has no
+                        // meaning — §15.6's range slicing is admitted on
+                        // `Array<T>` alone (plus `string`, stdlib §1), and a
+                        // dictionary is not among them.
+                        //
+                        // MEASURED on the pre-fix base, this branch did not
+                        // consult the index's TYPE at all and typed every
+                        // `d[<anything>]` as `V`, so each key representation
+                        // failed differently and NONE of them was the
+                        // range-as-key behaviour:
+                        //   * `Dictionary<string,V>` — codegen's string-key
+                        //     encoder GEP'd and loaded a `bz.string` header out
+                        //     of the `%bz.range` struct:
+                        //       "Load operand must be a pointer.
+                        //        %str.data = load ptr, %bz.range { i64 0, i64 1,
+                        //        i64 1, i8 1 }, align 8" -> the verifier rejects
+                        //     the module and `bezelc` exits 1 with an internal
+                        //     codegen error (#6500). Same for the `Range`
+                        //     VARIABLE spelling (`d[r]`) and for the SET
+                        //     (`d[0..1] := v`) — a second call site, so it is
+                        //     covered by the same sema check rather than left.
+                        //   * `Dictionary<int,V>` — SILENTLY WRONG, which is the
+                        //     more expensive half. The int-key encoder took the
+                        //     range struct's word 0 (`Start`) as the key, so
+                        //     `d[0..1]` reads `d[0]`:
+                        //       MEASURED: `var d := [0: "AA", 7: "BB"];
+                        //       d[0..1]` prints `[AA]` and `d[7..9]` prints
+                        //       `[BB]`, both at exit 0. Nothing is rejected and
+                        //       nothing throws; a user who writes `d[0..1]`
+                        //       meaning a slice silently gets one entry.
+                        // Neither is a warrant for the index, so neither is
+                        // preserved: a clean diagnostic is the outcome the spec
+                        // asks for, and this is the same rejection the two
+                        // sibling range guards above already make (inline array
+                        // #746 R41-E, `OwningArray<T>` #1079) for the very
+                        // same reason.
+                        if (!ix->indices.empty() && ix->indices[0].value) {
+                            // Both spellings, exactly as the string-slice and
+                            // array-slice arms above: a syntactic range literal
+                            // (`d[0..1]`) and a Range-typed VALUE (`d[r]`).
+                            bool rangeIdx =
+                                dynamic_cast<const ast::RangeExpr*>(
+                                    ix->indices[0].value.get()) != nullptr;
+                            if (!rangeIdx) {
+                                if (auto* it =
+                                        ctx_.exprType(*ix->indices[0].value))
+                                    rangeIdx =
+                                        it->kind == TypeRef::Kind::Named &&
+                                        it->declaration == builtinClassSym(
+                                                            "Range");
+                            }
+                            // The EXEMPTION is the key type, not the index
+                            // spelling: `Dictionary<Range<int>, V>[1..5]` is a
+                            // §8.3 / stdlib §9.8 auto-hashable key lookup and
+                            // stays admitted (#6207's whole test file). A key
+                            // TypeRef is a range when it carries the same
+                            // `builtinClassSym("Range")` stamp — Range keeps
+                            // that declaration through name resolution (unlike
+                            // most other value builtins, which resolve with
+                            // `declaration = nullptr`), so pointer equality is
+                            // the test both this and the arms above use.
+                            const TypeRef* keyT = tt->genericArgs[0];
+                            bool keyIsRange =
+                                keyT && keyT->kind == TypeRef::Kind::Named &&
+                                keyT->declaration == builtinClassSym("Range");
+                            // A BARE TYPE PARAMETER key (`Dictionary<T, V>` in
+                            // a generic body, §14.2 rule 2) is undecidable
+                            // here: at `T := Range<int>` the index is admitted
+                            // and at `T := int` it is not, and the decision
+                            // belongs to the instantiation, not to this
+                            // declaration. Fail OPEN there — a declaration-less
+                            // single-part Named TypeRef is "a reserved builtin,
+                            // or a type parameter" (BuiltinRegistry.hpp), so
+                            // `common::isReservedBuiltinTypeName` is the
+                            // project's own positive test for which one this
+                            // is, and claiming only a name the registry knows
+                            // keeps a missed built-in costing a rejection that
+                            // does not fire rather than a false one. MEASURED
+                            // on the pre-fix base: `method F<T>(k: T)` with
+                            // `Dictionary<T, string>` indexed by `0..1`
+                            // compiles, and it still compiles here.
+                            bool keyIsBareParam = false;
+                            if (keyT && keyT->kind == TypeRef::Kind::Named &&
+                                !keyT->declaration && keyT->genericArgs.empty())
+                                keyIsBareParam =
+                                    !common::isReservedBuiltinTypeName(
+                                        keyT->headName()) &&
+                                    !common::isBuiltinExceptionName(
+                                        keyT->headName());
+                            if (rangeIdx && !keyIsRange && !keyIsBareParam)
+                                ctx_.diagnostics().report(
+                                    Severity::Error, e.span.begin,
+                                    std::string("range index `[a..b]` is not "
+                                                "admitted on `") +
+                                        std::string(cn) +
+                                        "<K, V>` — its indexer takes a key of "
+                                        "type `K`, not a `Range<int>` (§23.4, "
+                                        "stdlib §4.8); range slicing is "
+                                        "admitted on `Array<T>` (§15.6), so "
+                                        "iterate `Keys` or copy the entries into "
+                                        "an array to take a sub-range");
+                        }
                         ctx_.setExprType(&e, tt->genericArgs[1]);
                     }
                     // §3.3 (#883): ReadOnlyStringSpan[i] → char (the i-th code
