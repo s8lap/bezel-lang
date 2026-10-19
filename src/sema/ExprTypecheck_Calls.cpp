@@ -19454,7 +19454,69 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             // RemoveAt takes int index, RemoveNode takes LinkedListNode<T>.)
             m == "Remove" ||
             // OwningDictionary keyed take.
-            m == "PopValue" || m == "TryPopValue"))
+            m == "PopValue" || m == "TryPopValue" ||
+            // fix #6527 (§5.1, v0.338; stdlib §4.8/§4.9/§4.17): the keyed
+            // READ twins of `ContainsKey` — `GetOrNull(key: K): V?` and
+            // `TryGetValue(key: K, out value: V?): bool`. Both declare their
+            // pos-0 parameter exactly as `ContainsKey` does, and both were
+            // missing from this list, so their key slot reached codegen
+            // unchecked. MEASURED on the pre-fix base, exit 0, no diagnostic,
+            // no exception — a SILENTLY WRONG read, the same failure the
+            // indexer arm of this mechanism had before #6500:
+            //   `Dictionary<int, string> := [0: "AA"]`:
+            //     d.GetOrNull(0..1)  -> [AA]  (the range's word 0 is the key)
+            //     d.GetOrNull(3.5)   -> [AA]  (double -> int, not in §5.1)
+            //     d.TryGetValue(3.5, out v) -> ok=True, v=AA
+            //   while `d.ContainsKey(0..1)` and `d.ContainsKey(3.5)` on the
+            //   SAME dictionary are both already rejected by this very check.
+            // Adding the two names here is what makes the four agree; they are
+            // not range-specific and neither is the gap — §5.1's implicit
+            // conversion table is numeric widening only, so a `Range<int>` and
+            // a `double` are inadmissible in a `K` slot alike.
+            //
+            // Gated to the three KEYED families because `TryGetValue`/
+            // `GetOrNull` are not dictionary-only: `OwningSlotMap<T>` (stdlib
+            // §4.20) declares `GetOrNull(handle: SlotHandle): T?` and
+            // `TryGetValue(handle: SlotHandle, out value: T?): bool`, whose
+            // pos-0 parameter is a HANDLE, not `genericArgs[0]` (which is the
+            // slot's element type there). Routing those through this list would
+            // check a `SlotHandle` against the element type and reject valid
+            // code; it is not reached, because the family gate above admits
+            // only the element collections, the keyed collections, the span
+            // buffers, the atomics, the task sources and the §5 enumerables,
+            // and `OwningSlotMap` is none of them.
+            //
+            // The BARE TYPE PARAMETER carve-out, which is a fail-OPEN and is
+            // #6500's precedent for this exact mechanism, not a new ruling: a
+            // `Dictionary<T, V>` in a generic body is undecidable at the
+            // DECLARATION — at `T := Range<int>` `d.GetOrNull(1..5)` is a §8.3
+            // key lookup and at `T := int` it is inadmissible, and §14.1
+            // (*Instantiation and its site*) / §14.2 rule 2 read an interior
+            // use at the instantiations the declaration forms, not at the
+            // declaration. So the key slot is left unchecked there and the
+            // decision falls to the instantiation.
+            //
+            // MEASURED, and this is why the carve-out is load-bearing rather
+            // than decorative: on the pre-fix base
+            //     method F<T>() with `using var d := new Dictionary<T, int>()`,
+            //         `var x := d.GetOrNull(1..5); var ok := d.TryGetValue(1..5,
+            //         out var y);`
+            // COMPILES at `F<Range<int>>()` and reads the stored value. Adding
+            // the two names without this carve-out newly REJECTED that program —
+            // a generic body is by construction the one place the key type is
+            // not yet known, so the check would fire on every value passed
+            // through a `T`-keyed dictionary, which is a false rejection in the
+            // §14.2 rule 2 direction. The pre-existing members in the same list
+            // (`ContainsKey`, `Contains`, `Remove`) DO reject in that position
+            // on this base; #6500 recorded the indexer's fail-open and this
+            // adopts it for the two members added here rather than extending a
+            // known over-rejection. Those three are left exactly as they were —
+            // changing them is a separate call, not this fix's.
+            (m == "GetOrNull" || m == "TryGetValue") && isKeyedCollection &&
+            !(itemTy && itemTy->kind == TypeRef::Kind::Named &&
+              !itemTy->declaration && itemTy->genericArgs.empty() &&
+              !common::isReservedBuiltinTypeName(itemTy->headName()) &&
+              !common::isBuiltinExceptionName(itemTy->headName()))))
             return true;
         // Borrowing-only pos-0 mutators: plain `item: T`. The owning twins
         // declare `owned item: T` and go through the same gate below (the

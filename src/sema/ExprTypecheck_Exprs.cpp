@@ -8098,6 +8098,80 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         if (be.left)
             reportHashKeyInlineArrayLiteral(ctx_.diagnostics(), inRt,
                                             be.left.get(), {});
+        // fix #6527 (§5.1, v0.338; §17.5, v0.338; stdlib §4.8): the comment
+        // above this block already states the rule — "`x in c` IS the call
+        // `c.Contains(x)`, so the left operand is admitted exactly when that
+        // call's argument admits it". For a DICTIONARY receiver that parity
+        // was not implemented: the argument-conversion check that
+        // `d.Contains(k)` / `d.ContainsKey(k)` reach (checkBuiltinCollection-
+        // CallArgs' pos-0 slot, ExprTypecheck_Calls.cpp) is keyed on a
+        // `CallExpr`, and `in` is a `BinaryExpr` that lowers to no call, so the
+        // left operand was never checked against the key type at all.
+        //
+        // MEASURED on the pre-fix base, exit 0, no diagnostic — the same
+        // silent-wrong-read shape #6500 established for the indexer, where the
+        // int-key encoder takes the value's first word as the key:
+        //   `Dictionary<int, string> := [0: "AA"]`:
+        //     0..1 in d  ->  True     (should be False: no such key)
+        //     3.5  in d  ->  True     (should be False; §5.1 has no double->int)
+        //   while `d.ContainsKey(0..1)` and `d.ContainsKey(3.5)` are BOTH
+        //   already rejected by the §5.1 check on the same dictionary. Four
+        //   ways of asking one question about one absent key, three rejecting.
+        //
+        // The check is the SAME `checkAssignable` the call form uses, with the
+        // same needle, so `1.5 in arr` and `arr.Contains(1.5)` now agree — the
+        // pre-fix `in` reached codegen there and died in LLVM IR verification
+        // ("Both operands to ICmp instruction are not of the same type!").
+        // `fromExpr` is passed so §5.1's constant-narrowing clause applies
+        // identically to both spellings (`3 in s` over a `Set<byte>` is a §5.1
+        // constant narrowing, admitted).
+        //
+        // Scoped to the KEYED families, deliberately: `checkBuiltinCollection-
+        // CallArgs` also checks the ELEMENT collections' `Contains`, but `in`
+        // over an `Array`/`Set` receiver is not the #6527 subject and widening
+        // the sweep there is a separate, wider question (the element families
+        // admit a wider legitimate left-operand set — e.g. §8.4 equality through
+        // a type parameter — that the keyed case does not). A BARE TYPE
+        // PARAMETER key (`Dictionary<T, V>` in a generic body, §14.2 rule 2) is
+        // undecidable at the declaration and fails OPEN, exactly as #6500's
+        // indexer guard does, so `Helper.F<Range<int>>()` still resolves.
+        if (be.left && inLt && inRt && inRt->kind == TypeRef::Kind::Named &&
+            !inRt->genericArgs.empty() && inRt->genericArgs[0]) {
+            std::string_view inHead = inRt->aliasResolvedHead.empty()
+                                           ? inRt->headName()
+                                           : std::string_view(
+                                                 inRt->aliasResolvedHead);
+            if (inHead == "Dictionary" || inHead == "OwningDictionary" ||
+                inHead == "SortedDictionary") {
+                TypeRef* keyT = inRt->genericArgs[0];
+                bool keyIsBareParam = false;
+                if (keyT && keyT->kind == TypeRef::Kind::Named &&
+                    !keyT->declaration && keyT->genericArgs.empty())
+                    keyIsBareParam =
+                        !common::isReservedBuiltinTypeName(keyT->headName()) &&
+                        !common::isBuiltinExceptionName(keyT->headName());
+                if (!keyIsBareParam) {
+                    // A `RangeExpr` node reaches sema with a default-
+                    // constructed span (the parser's `stampSpan` runs on the
+                    // whole `in` node, not on the range child it adopted from
+                    // the precedence climber), so anchoring there prints
+                    // `0:0`. MEASURED on this build before the guard:
+                    // `Console.WriteLine($"x={(0 .. 1 in d)}")` reported
+                    // `pz.bzl:0:0:`. Fall back to the enclosing `in` node's
+                    // span, which is the span the sibling nullable-left
+                    // diagnostic below already uses, so both `in` diagnostics
+                    // on one expression land in the same place.
+                    SourceLocation inLoc =
+                        be.left->span.begin.line != 0 ? be.left->span.begin
+                                                      : be.span.begin;
+                    checkAssignable(
+                        inLt, keyT, inLoc,
+                        std::string("left operand of `in` over `") +
+                            std::string(inHead) + "`",
+                        be.left.get());  // §7.4 / §27.6 — narrowing-aware
+                }
+            }
+        }
         if (inLt && inLt->nullable && inRt &&
             inRt->kind == TypeRef::Kind::Named &&
             inRt->declaration == ctx_.builtinClassSym("Range") &&
