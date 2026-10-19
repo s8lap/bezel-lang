@@ -1623,8 +1623,39 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
                 // §8.3 default and is always memory-safe.
                 if (!eq) eq = builder_.CreateICmpEQ(a, b);
             }
+        } else if (elemTy->isStructTy() || elemTy->isArrayTy()) {
+            // fix #6271 (§3.6 / §15.1.2, v0.338): a STRUCT- or ARRAY-shaped
+            // element — a value-builtin like `Guid` ({i64,i64}), or an
+            // INLINE ARRAY `[N]T`, which lowers to `[N x T]` — cannot reach the
+            // `CreateICmpEQ` below: `ICmpInst` accepts only integer, pointer
+            // and vector operands, so an `[2 x i32]` reaching it tripped
+            // `ICmpInst::AssertOK` and bezelc died at
+            // "Invalid operand types for ICmp instruction /
+            //  %2 = icmp eq [2 x i32] %eq.a, %eq.b" — a compile-time IR
+            // VERIFICATION FAILURE, not a wrong answer.
+            //
+            // MEASURED on this fix's parent (4104a219), `Distinct()` over
+            // `Array<[2]int>`: exactly that verifier abort.
+            //
+            // §3.6 (v0.338) makes an inline array of a hashable element
+            // hashable, so this program is valid and must compile and run; the
+            // gap was in the `elemRec` test above, which is a RECORD predicate
+            // and so excludes an inline array entirely. The canonical helper
+            // is `emitValueEquality`, whose own inline-array arm recurses
+            // slot-by-slot under the array's element type (§15.1.2) — the same
+            // authority `=` and record-field equality already use, and the same
+            // one `buildValueEqTrampoline`'s `lt->isStructTy() || isArrayTy()`
+            // arm uses for a generic-dict inline-array key. Passing `elemRef`
+            // lets a nested element type (`[2]string`) reach §4.6 content
+            // equality instead of a raw pointer compare.
+            //
+            // `elemRec` and `emitStructEquality` are deliberately NOT widened
+            // to inline arrays: `emitValueEquality` dispatches on the DECLARED
+            // type and already owns the inline-array row, so routing through it
+            // keeps ONE authority rather than two.
+            eq = emitValueEquality(a, b, elemRef);
         } else {
-            eq = builder_.CreateICmpEQ(a, b);  // value equality
+            eq = builder_.CreateICmpEQ(a, b);  // value equality (int/bool/char)
         }
         builder_.CreateRet(builder_.CreateZExt(eq, i32()));
         builder_.restoreIP(savedIP);
@@ -1784,6 +1815,29 @@ llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
     // existing value-hash trampoline (tested path; string hashes by content).
     if (elemRef && (elemRec || (elemRef->kind == sema::TypeRef::Kind::Primitive &&
                                 elemRef->primitive != sema::PrimitiveType::Object)))
+        return buildValueHashTrampoline(elemRef);
+    // fix #6271 (§3.6 / §15.1.2, v0.338): an INLINE-ARRAY element is a hashable
+    // VALUE type under §3.6, but `elemRec` is a RECORD predicate and the
+    // `Kind::Primitive` test excludes an inline array, so this function fell
+    // through to the identity-hash fallback below. That fallback's tail is
+    // `CreateZExtOrBitCast(v, i64())`, and `ZExt` accepts only integer and
+    // pointer operands — an `[2 x i32]` reaching it tripped the verifier at
+    // "ZExt only operates on integer / %1 = zext [2 x i32] %hash.v to i64",
+    // aborting the compile.
+    //
+    // MEASURED on this fix's parent (4104a219), `ToSet()` over `Array<[2]int>`:
+    // both that `ZExt` abort AND the equality trampoline's `icmp` abort.
+    //
+    // §3.6 (v0.338): an inline array of a hashable element IS hashable, so the
+    // program is valid. The fix routes it to `buildValueHashTrampoline`, whose
+    // `emitValueHashCode` folds the array's slot hashes in slot order — §8.3's
+    // "Hash combining element hashes in slot order" for the inline-array row.
+    // Routing BOTH halves of the pair (hash here, equality in
+    // `buildLinqTrampoline` kind 3) to the same value helpers is what keeps
+    // §8.3's `a.Equals(b) ⇒ a.GetHashCode() = b.GetHashCode()` inside the
+    // membership dict; the two previously disagreed in the worst way, one
+    // aborting on the value and the other not existing.
+    if (elemRef && elemRef->kind == sema::TypeRef::Kind::InlineArray)
         return buildValueHashTrampoline(elemRef);
     // Fallback: hash the element bytes by loading the pointer-width value and
     // returning its bit pattern as a uint64. For a class pointer `T*` this is
