@@ -15856,17 +15856,32 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
             rcn = rt->headName();
     }
     if (!common::isOwningCollectionHead(rcn)) return;
-    // #6462 / §28.3 v0.338: an `owned` PARAMETER is SCOPE-BOUND. §28.3's
-    // local-scope bullet states it outright — "an `owned` parameter is
-    // scope-bound: the method disposes its undischarged value at its own end
-    // (*Auto-drop (affine)*)" — and *Auto-drop (affine)* puts that discharge
-    // at the end of the METHOD. So *Returning a deferred-activation frame*'s
-    // reject list reaches it ("a borrow of anything else — a scope-bound
-    // local, a `using var`, a temporary ... since the frame would outlive the
-    // source"), and here it does: the view is handed to the caller and the
-    // parameter's array is released on the same edge. §22.4 writes the
-    // classification on the formal; `owned` and `out owned` are the two
-    // spellings discharged at scope end.
+    // #6462 / §28.3 v0.338: an `owned` PARAMETER is SCOPE-BOUND. §28.3
+    // *Borrow lifetime rules* states it outright, in the FIELD-STORE bullet's
+    // clause 2 — "an `owned` parameter is scope-bound: the method disposes its
+    // undischarged value at its own end (*Auto-drop (affine)*)" — and
+    // *Auto-drop (affine)* puts that discharge at the end of the METHOD. So
+    // *Returning a deferred-activation frame*'s reject list reaches it ("a
+    // borrow of anything else — a scope-bound local, a `using var`, a
+    // temporary ... since the frame would outlive the source"), and here it
+    // does: the view is handed to the caller and the parameter's array is
+    // released on the same edge.
+    //
+    // §22.3 writes the classification on the formal, and it is `owned` ALONE.
+    // `out owned` is a PRODUCER parameter, NOT a scope-end-discharged holder:
+    // §22.3's `out` bullet says "ownership reaches the caller only on normal
+    // return, so the value has exactly one owner at every instant". On the
+    // normal-return edge the callee therefore TRANSFERS the value and disposes
+    // nothing, so an `out owned` parameter's value outlives the call exactly as
+    // a PLAIN parameter's does — the same premise the admitted control rests
+    // on. Rejecting it would over-reject a sound program, and the diagnostic
+    // would state a falsehood ("disposed at the end of this method") about a
+    // holder that is not disposed there. The compiler's own must-use lint
+    // already draws this line: an undischarged `owned` parameter draws §28.3's
+    // auto-drop warning and an `out owned` one does not. MEASURED both arms
+    // (1 warning vs 0), and pinned by
+    // `drain_view_owned_parameter_6462.out_owned_parameter_drain_return_still_`
+    // `admitted_spec_22_3` so a later widening trips a test, not a review.
     //
     // The class was MISSING rather than mis-decided. `run()` seeds `owned` /
     // `out owned` parameters into `states_` as Owned, but a ParameterSymbol is
@@ -15876,11 +15891,11 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
     // as codegen's `drainReceiverSourceDiesAtScopeEnd`
     // (LlvmBackend_Stmts.cpp), which declined to MINT here for exactly this
     // reason; that narrow stays, and is not widened — the reject belongs to
-    // this pass, upstream of it. // per §28.3 v0.338, §22.4, stdlib §4.5
+    // this pass, upstream of it. // per §28.3 v0.338, §22.3, stdlib §4.5
     // v0.195, #6462
     auto ownedParamDiesAtMethodEnd = [](sema::Symbol* sym) {
         const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym);
-        return ps && (ps->modifier == "owned" || ps->modifier == "out owned");
+        return ps && ps->modifier == "owned";
     };
     // Identify the receiver. A bare IdentifierExpr whose symbol is a tracked
     // scope-bound owned local, a `using var`, or an `owned` parameter is the
@@ -15893,7 +15908,7 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
         if (id->name == "this") return;  // `this` outlives the call
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         // Read the formal's own modifier, NOT the seeded `states_` entry: the
-        // classification is a property of the declaration (§22.4), so the
+        // classification is a property of the declaration (§22.3), so the
         // verdict does not depend on whether this pass seeded a state for it.
         const bool ownedParam = ownedParamDiesAtMethodEnd(sym);
         const LocalOwnership* st = sym ? lookupStateFor(*id) : nullptr;
@@ -15922,8 +15937,12 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
                  ? std::string("a `using var` disposed at the "
                                "callee's scope end")
                  : ownedParam
-                       ? std::string("an `owned` parameter disposed at the end "
-                                     "of this method")
+                       ? std::string(
+                             sawYield_ || isAsync_
+                                 ? "an `owned` parameter disposed by the "
+                                   "frame at teardown (§29.8/§30.1)"
+                                 : "an `owned` parameter disposed at the end "
+                                   "of this method")
                        : std::string(
                              "a scope-bound owned local disposed at the "
                              "callee's scope end")) +
@@ -15974,8 +15993,12 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
                      ? std::string("a `using var` disposed at the "
                                    "callee's scope end")
                      : ownedParam
-                           ? std::string("an `owned` parameter disposed at the "
-                                         "end of this method")
+                           ? std::string(
+                                 sawYield_ || isAsync_
+                                     ? "an `owned` parameter disposed by the "
+                                       "frame at teardown (§29.8/§30.1)"
+                                     : "an `owned` parameter disposed at the "
+                                       "end of this method")
                            : std::string(
                                  "a scope-bound owned local disposed at the "
                                  "callee's scope end")) +

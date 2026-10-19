@@ -11,11 +11,15 @@
 // replacement. Its sibling reference in `drain_return_no_internal_degrade_-
 // note_6452.bzl` is updated in the same commit.
 //
-// THE RULE. §28.3 *Borrow lifetime rules*, the local-scope check's clause 2,
-// states the classification outright: "an `owned` parameter is scope-bound:
-// the method disposes its undischarged value at its own end (*Auto-drop
-// (affine)* below), so a borrow of it is rejected here exactly as a borrow of
-// a scope-bound local is." *Owned-local discharge requirement*'s *Auto-drop
+// THE RULE. §28.3 *Borrow lifetime rules*, in the FIELD-STORE bullet's
+// clause 2 (the bullet opening "A borrow may be stored in a field of an object
+// only if..."), states the classification outright: "an `owned` parameter is
+// scope-bound: the method disposes its undischarged value at its own end
+// (*Auto-drop (affine)* below), so a borrow of it is rejected here exactly as
+// a borrow of a scope-bound local is." (That is the field-store bullet's
+// address, NOT the section's separate local-scope bullet — the "assigned to a
+// local whose scope strictly encloses" rule — but the quoted words are what
+// carry the verdict.) *Owned-local discharge requirement*'s *Auto-drop
 // (affine)* puts that discharge at "the end of the method". So the parameter
 // does NOT outlive the call — the premise every admitted parameter-sourced
 // frame rests on — and §28.3 *Returning a deferred-activation frame* rejects at
@@ -28,8 +32,11 @@
 // (*Returning a deferred-activation frame*, *Borrow lifetime rules* item 4,
 // and the bare-type-parameter callee side's item 4). The discharge's TIMING is
 // what makes the parameter scope-bound; it is not a different site to check at.
-// §22.4 writes the classification on the formal — `owned` and `out owned` —
-// which is the predicate both arms of the check read.
+// §22.3 writes the classification on the formal, and it is `owned` ALONE —
+// `out owned` is a PRODUCER (§22.3: "ownership reaches the caller only on
+// normal return"), whose value is transferred rather than disposed at method
+// end, so it outlives the call and stays admitted. That is the predicate both
+// arms of the check read.
 //
 // BOTH SPELLINGS ARE HERE, and the second RUN line asserts the EXACT COUNT of
 // the diagnostic (two, one per spelling), because a narrow that asked only

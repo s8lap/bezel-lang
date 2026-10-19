@@ -1,5 +1,5 @@
 // fix #6462 / §28.3 v0.338 *Returning a deferred-activation frame* +
-// *Owned-local discharge requirement* (affine auto-drop); §22.4 (parameter
+// *Owned-local discharge requirement* (affine auto-drop); §22.3 (parameter
 // modifiers); stdlib §4.5 v0.195 (Drain mints a fresh drain-view frame over
 // the array).
 //
@@ -28,11 +28,15 @@
 // controls being admitted is irrelevant to this class — (a4) is a PLAIN
 // parameter, a different class. The verdict comes from §28.3's own words:
 //
-//   * *Borrow lifetime rules*, the local-scope check's clause 2, states the
-//     classification outright: "an `owned` parameter is scope-bound: the
-//     method disposes its undischarged value at its own end (*Auto-drop
-//     (affine)* below), so a borrow of it is rejected here exactly as a
-//     borrow of a scope-bound local is."
+//   * *Borrow lifetime rules*, in the FIELD-STORE bullet's clause 2 ("The
+//     check" — the bullet that opens "A borrow may be stored in a field of an
+//     object only if...", spec :6650), states the classification outright: "an
+//     `owned` parameter is scope-bound: the method disposes its undischarged
+//     value at its own end (*Auto-drop (affine)* below), so a borrow of it is
+//     rejected here exactly as a borrow of a scope-bound local is." (The
+//     ADDRESS is the field-store bullet, NOT the section's separate
+//     local-scope bullet, which is the "assigned to a local whose scope
+//     strictly encloses" rule. The quoted words are what carry the verdict.)
 //   * *Owned-local discharge requirement*, *Auto-drop (affine)*, puts that
 //     discharge at "the end of the method" for an `owned` parameter — so the
 //     parameter does NOT outlive the call, which is the premise the (a4)
@@ -44,10 +48,17 @@
 //     is keyed on SCOPE-BOUND, and an `owned` parameter is scope-bound by the
 //     first bullet. The frame does outlive the source here: the view is handed
 //     to the caller and the parameter's array is released on the same edge.
-//   * §22.4 writes the classification on the formal — `owned` and `out owned`
-//     are the two spellings discharged at scope end — which is the predicate
-//     this fix reads, and the same predicate codegen's
-//     `drainReceiverSourceDiesAtScopeEnd` reads.
+//   * §22.3 writes the classification on the formal, and it is `owned` ALONE.
+//     `out owned` is a PRODUCER parameter, NOT a scope-end-discharged holder:
+//     §22.3's `out` bullet says "ownership reaches the caller only on normal
+//     return, so the value has exactly one owner at every instant", so on the
+//     normal-return edge the callee TRANSFERS the value and disposes nothing —
+//     the parameter outlives the call exactly as a plain parameter's does.
+//     Rejecting it over-rejects a sound program and the diagnostic would state
+//     a falsehood about it. The compiler's own must-use lint already draws the
+//     line (an undischarged `owned` parameter draws §28.3's auto-drop warning,
+//     an `out owned` one does not — MEASURED, 1 warning vs 0). Row (6) below
+//     pins that asymmetry, so a later widening trips a test and not a review.
 //
 // THE SITE. The discharge is at function exit, but the RULE is still at the
 // return site: §28.3 says "rejected at the return site" in three places
@@ -72,6 +83,14 @@
 //       `R.live` returns to 0, so each is discharged exactly once. This is
 //       the leak half of the oracle; the crash half is that the rejected
 //       shapes produce no binary at all.
+//   (6) CONTROL, `out owned` PARAMETER — `View(out owned p: OwningArray<R>)`.
+//       Still ADMITTED, and this is the row that holds the `owned` ALONE
+//       predicate. `out owned` is a producer (§22.3: "ownership reaches the
+//       caller only on normal return"), so the array does NOT die at method
+//       end and the returned view aliases storage the caller now owns — the
+//       same sound shape as (3). Widening `ownedParamDiesAtMethodEnd` back to
+//       include it would over-reject this program, so the widening trips THIS
+//       test rather than waiting for a reviewer.
 //
 // NOT ESTABLISHED HERE, and recorded rather than taken: the LAUNDERED
 // spelling `var v := items.Drain(); return v;` reaches this check through the
@@ -268,4 +287,39 @@ BEZEL_TEST(drain_view_owned_parameter_6462,
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "3"));
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "0"));
     BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+// ===========================================================================
+// (6) CONTROL — an `out owned` PARAMETER is still ADMITTED. The pairing
+// control for (1) on the OTHER owned spelling, and the row that holds the
+// `owned`-alone predicate.
+//
+// `out owned` is a PRODUCER parameter, not a scope-end-discharged holder:
+// §22.3's `out` bullet says "ownership reaches the caller only on normal
+// return, so the value has exactly one owner at every instant". On the
+// normal-return edge the callee TRANSFERS the value and disposes nothing, so
+// `p`'s array outlives the call — exactly as a PLAIN parameter's does in (3) —
+// and the returned view aliases storage the CALLER now owns. Rejecting this
+// shape would over-reject a sound program, and the diagnostic it emitted would
+// have stated a falsehood ("disposed at the end of this method") about a
+// holder that is not disposed there.
+//
+// It differs from (1) by one modifier word, which is what makes it a control
+// on the predicate rather than a second positive. MEASURED that the compiler's
+// own must-use lint already draws the same line: an undischarged `owned`
+// parameter draws §28.3's auto-drop warning and an `out owned` one does not
+// (1 warning vs 0), so the ownership pass and the lint agree.
+// ===========================================================================
+BEZEL_TEST(drain_view_owned_parameter_6462,
+           out_owned_parameter_drain_return_still_admitted_spec_22_3) {
+    auto r = parseAndCheckOwnership(
+        std::string(kR) +
+        "class Good "
+        "  public static method View(out owned p: OwningArray<R>): "
+        "IOwningEnumerable<R> "
+        "    p := new OwningArray<R>(); "
+        "    p.Add(new R()); "
+        "    return p.Drain(); "
+        "  end View; "
+        "end Good;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
