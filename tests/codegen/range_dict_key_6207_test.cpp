@@ -45,10 +45,14 @@
 // a `Set<T>` ELEMENT's identity runs through the array-backed dedup insert, not
 // through the pair of trampolines this fix touches.
 
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains
 #include "support/aot_support.hpp"  // runAot
 #include "test_harness.hpp"
 
+#include <regex>
 #include <string>
+#include <utility>
+#include <vector>
 
 using bezel::test::runAot;
 
@@ -68,6 +72,100 @@ std::string out(const std::string& mainBody, const std::string& decls = "") {
     if (!r.ran) return "<did not run>";
     if (r.exitCode != 0) return "<exit " + std::to_string(r.exitCode) + ">";
     return r.stdoutText;
+}
+
+// ── Why `r.ran == false` is not an oracle (issue #6207 review, finding 1) ──
+//
+// A `BEZEL_EXPECT_EQ(false, r.ran)` row is satisfied by ANY rejection. The
+// non-author review MEASURED three programs through this very harness that
+// differ from a pinned program only in text and pass the same assertion: a
+// SYNTAX error (`set_parseerr`, reported at 5:5) and outright GARBAGE
+// (`set_garbage`, reported at 5:5 through 5:11). So the row as written could
+// not tell "the materialiser rejected this element type" from "this program is
+// not valid Bezel at all", and a typo introduced into the program under test
+// would silently keep it green.
+//
+// The replacement discriminates on WHERE the diagnostic points, not on what it
+// says. `renderedLocations` recovers the `<path>:<line>:<col>: ` prefixes the
+// DRIVER prints (Driver.cpp:632/644/773/785) from the captured stderr, and the
+// row pins the set-literal element's own span. That has the two properties the
+// bare `r.ran` lacks:
+//
+//   RENAME-PROOF. A rename of the diagnostic's MESSAGE leaves every location
+//   untouched, so the row survives one. Pinning the `#1070` string instead
+//   would freeze a diagnostic the author had no stake in — the original
+//   author's stated reason for the weak shape, and a real concern, but not a
+//   reason to accept an unfalsifiable row.
+//
+//   FALSIFIABLE. An unrelated rejection reports somewhere ELSE, so it fails.
+//   MEASURED on the base: the pinned rejection is at the set literal's own
+//   element span; the parse error at 5:5, the garbage at 5:5-5:11, and an
+//   unresolved identifier at a different COLUMN of the same line. `rejectedAt`
+//   requires EVERY rendered location to be the expected one, so a stray second
+//   diagnostic anywhere fails it too.
+//
+// Reject-only by construction (the `r.ran` early-out below), which is the
+// shape `scripts/check_vacuous_tests.py` classifies as CLASS A: an Error and a
+// successful compile are mutually exclusive, so the assertion cannot be a
+// tautology given a companion `EXPECT_TRUE(r.ran)`.
+
+// Every `<path>:<line>:<col>: ` location rendered in `r`'s diagnostics, as
+// (line, column) pairs. A genuine `CompileOutcome::Rejected` packs the driver's
+// ENTIRE stderr into ONE Diagnostic at `SourceLocation{}` (aot_support.hpp), so
+// the locations live in the message TEXT — which is why this scans text rather
+// than reading a structured `d.location`, and why `failedAtCompileTimeWithRealLocation`
+// regex-scans for the same reason.
+std::vector<std::pair<int, int>> renderedLocations(const bezel::test::JitResult& r) {
+    static const std::regex kLoc(R"(:(\d+):(\d+): )");
+    std::vector<std::pair<int, int>> locs;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        for (std::sregex_iterator it(d.message.begin(), d.message.end(), kLoc),
+                                  end;
+             it != end; ++it)
+            locs.emplace_back(std::stoi((*it)[1].str()),
+                              std::stoi((*it)[2].str()));
+    }
+    return locs;
+}
+
+// The (line, column) at which `marker` first appears in `src`, 1-based — the
+// span the diagnostic under test points at. Derived from the program text
+// rather than hardcoded, so reformatting the program cannot silently leave a
+// stale expectation behind. Returns (-1, -1) when `marker` is absent, which
+// makes `rejectedAt` false rather than vacuously true.
+std::pair<int, int> spanOf(const std::string& src, const std::string& marker) {
+    std::size_t at = src.find(marker);
+    if (at == std::string::npos) return {-1, -1};
+    int line = 1;
+    for (std::size_t i = 0; i < at; ++i)
+        if (src[i] == '\n') ++line;
+    int col = 1;
+    for (std::size_t i = at; i > 0 && src[i - 1] != '\n'; --i) ++col;
+    return {line, col};
+}
+
+// True iff `r` is a genuine compile-time rejection whose EVERY rendered
+// location is exactly `at`. Excludes the synthetic non-reject outcomes for the
+// same reason `failedAtCompileTimeWithRealLocation` does: a Crashed or TimedOut
+// diagnostic APPENDS whatever partial stderr the compiler emitted before dying,
+// and that fragment can carry a real-looking location.
+bool rejectedAt(const bezel::test::JitResult& r, std::pair<int, int> at) {
+    if (r.ran) return false;  // a silent acceptance is the failure, not a pass
+    for (const char* nonReject :
+         {"compiler CRASHED", "terminated by signal", "did not finish within",
+          "did not terminate within", "AddressSanitizer fired"})
+        if (bezel::test::diagnosticMessageContains(r, nonReject)) return false;
+    auto locs = renderedLocations(r);
+    if (locs.empty()) return false;
+    for (const auto& l : locs)
+        if (l != at) return false;
+    return true;
+}
+
+// `src` rejected, and every diagnostic it produced points at `marker`'s span in
+// that same `src` — never at a parse error, a scope error, or any other site.
+bool rejectedAtMarker(const std::string& src, const std::string& marker) {
+    return rejectedAt(runAot(src), spanOf(src, marker));
 }
 
 }  // namespace
@@ -278,16 +376,26 @@ BEZEL_TEST(range_dict_key_6207,
 //
 // The RED arm is the point: these rows are red on a compiler that admits
 // `Set<Range<int>>` as generic-backed and are green here and on the base.
+//
+// The rejection rows assert WHERE the diagnostic points, not merely THAT one
+// was produced — see `rejectedAtMarker` for the measurement that forced this
+// (`r.ran == false` alone is satisfied by a syntax error, by garbage, and by an
+// unresolved identifier). The assertion is rename-proof: it pins the set
+// literal's own source span, which a rename of the diagnostic's message does
+// not move.
 
 BEZEL_TEST(range_dict_key_6207,
            set_of_range_literal_still_rejects_spec_8_3_stdlib_4_10) {
-    auto r = runAot(prog("    var s: Set<Range<int>> := [1..5, 7..9];\n"
-                         "    Console.WriteLine(s.Count);\n"
-                         "    return 0;\n"));
-    // A silent-acceptance inversion here is the defect class this row exists to
-    // catch: `r.ran` true with the program compiled means a previously-rejected
-    // program began compiling, which is the failure — not a pass.
-    BEZEL_EXPECT_EQ(false, r.ran);
+    // `rejectedAtMarker` is the whole oracle — see the helper's comment for why
+    // `r.ran == false` alone was not one. A silent-acceptance inversion here is
+    // the defect class this row exists to catch: `r.ran` true with the program
+    // compiled means a previously-rejected program began compiling, which is
+    // the failure — not a pass — and `rejectedAt` returns false on it.
+    BEZEL_EXPECT_TRUE(
+        rejectedAtMarker(prog("    var s: Set<Range<int>> := [1..5, 7..9];\n"
+                              "    Console.WriteLine(s.Count);\n"
+                              "    return 0;\n"),
+                         "1..5, 7..9"));
 }
 
 BEZEL_TEST(range_dict_key_6207,
@@ -295,14 +403,17 @@ BEZEL_TEST(range_dict_key_6207,
     // The FIELD-initialised spelling reaches the same materialiser through a
     // different local-decl path (`lowerLocalDecl`'s #559 guard), so it is pinned
     // separately: a materialiser that returns null here is the shape that once
-    // dropped a declaration with no diagnostic at all.
-    auto r = runAot(prog("    var h := new Holder();\n"
-                         "    Console.WriteLine(h.S.Count);\n"
-                         "    return 0;\n",
-                         "class Holder\n"
-                         "  public S: Set<Range<int>> := [1..5, 7..9];\n"
-                         "end Holder;\n"));
-    BEZEL_EXPECT_EQ(false, r.ran);
+    // dropped a declaration with no diagnostic at all. The `Holder` declaration
+    // is spliced in BEFORE `Main`, so the literal sits at line 3 — `spanOf`
+    // derives that from the program rather than hardcoding it.
+    BEZEL_EXPECT_TRUE(rejectedAtMarker(
+        prog("    var h := new Holder();\n"
+             "    Console.WriteLine(h.S.Count);\n"
+             "    return 0;\n",
+             "class Holder\n"
+             "  public S: Set<Range<int>> := [1..5, 7..9];\n"
+             "end Holder;\n"),
+        "1..5, 7..9"));
 }
 
 BEZEL_TEST(range_dict_key_6207,
@@ -310,12 +421,14 @@ BEZEL_TEST(range_dict_key_6207,
     // A `Set<Range<int>>` literal in a position whose OWN container is a
     // dictionary: the outer `Dictionary<int, …>` key path works (that is this
     // fix), and the inner `Set` literal must still be rejected — so this row
-    // pins that the two surfaces are decided independently.
-    auto r = runAot(prog("    var d := new Dictionary<int, Set<Range<int>>>();\n"
-                         "    d[1] := [1..5];\n"
-                         "    Console.WriteLine(d[1].Count);\n"
-                         "    return 0;\n"));
-    BEZEL_EXPECT_EQ(false, r.ran);
+    // pins that the two surfaces are decided independently. Only the ONE
+    // element is in the literal, so the span marker is the single range.
+    BEZEL_EXPECT_TRUE(rejectedAtMarker(
+        prog("    var d := new Dictionary<int, Set<Range<int>>>();\n"
+             "    d[1] := [1..5];\n"
+             "    Console.WriteLine(d[1].Count);\n"
+             "    return 0;\n"),
+        "1..5"));
 }
 
 BEZEL_TEST(range_dict_key_6207,
@@ -402,14 +515,19 @@ BEZEL_TEST(range_dict_key_6207, control_scalar_key_unaffected_spec_4_8) {
 
 // The sorted containers reject a `Range` element on stdlib §4.17/§4.18's
 // `CompareTo` constraint (spec §14.2) — a different, EARLIER gate than the
-// trampolines, and one this fix must not disturb.
+// trampolines, and one this fix must not disturb. The span markers are the
+// container names: this gate reports at the collection's own type argument, so
+// pinning where it points also distinguishes it from the #1070 materialiser
+// rejection the three rows above pin (a different site, and a different gate).
 BEZEL_TEST(range_dict_key_6207,
            control_sorted_containers_still_reject_range_spec_14_2) {
-    auto ss = runAot(prog("    var s := new SortedSet<Range<int>>();\n"
-                          "    return 0;\n"));
-    BEZEL_EXPECT_EQ(false, ss.ran);
-    auto sd = runAot(prog("    var d := new SortedDictionary<Range<int>, "
-                          "int>();\n"
-                          "    return 0;\n"));
-    BEZEL_EXPECT_EQ(false, sd.ran);
+    BEZEL_EXPECT_TRUE(
+        rejectedAtMarker(prog("    var s := new SortedSet<Range<int>>();\n"
+                              "    return 0;\n"),
+                         "SortedSet<Range<int>>"));
+    BEZEL_EXPECT_TRUE(
+        rejectedAtMarker(prog("    var d := new SortedDictionary<Range<int>, "
+                              "int>();\n"
+                              "    return 0;\n"),
+                         "SortedDictionary<Range<int>, int>"));
 }

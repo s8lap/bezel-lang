@@ -23379,6 +23379,57 @@ private:
     // own §4.6 content equality; `lowerObjectEquals` still copes with a string
     // arriving dynamically through an `Object`, which is why `Object` IS
     // admitted.
+    //
+    // ── KNOWN FALSE POSITIVE, DELIBERATELY LEFT (fix #6207) ──
+    //
+    // (1) WHICH TYPE ANSWERS THIS FALSELY. `Range<T>`. `SemaContext::builtinClassSym`
+    //     (SemaContext.hpp) stamps EVERY builtin class name — `Range` included —
+    //     with `ts->kind = ast::TypeDeclKind::Class`, and marks the value builtins
+    //     (`Range` among them) `isValueBuiltin = true` WITHOUT changing that kind.
+    //     A `Range<T>` TypeRef KEEPS that declaration (TypeResolution_Names.cpp
+    //     re-attaches `ctx_.builtinClassSym("Range")`; most other value builtins
+    //     resolve with `declaration = nullptr`), so the `TypeDeclKind::Class` test
+    //     below admits it — even though a range's `{i64,i64,i64,i8}` storage has NO
+    //     vtable at word 0. `Start` is word 0, so a `Range` dispatched as a
+    //     reference is a fully-initialised integer read as a vtable pointer.
+    //
+    // (2) THIS IS DELIBERATE. #6207 fixed the dictionary-KEY path by giving
+    //     `buildValueHashTrampoline` / `buildValueEqTrampoline` (LlvmBackend_Calls3.cpp)
+    //     a `Range<T>` arm ahead of their `hasObjectHeaderEquality` dispatch, which
+    //     calls the `emitRangeStorageHash` / `emitRangeStorageEquals` pair #4126
+    //     introduced. Those two trampolines are the consumers for which the answer
+    //     "yes" is CORRECT: a key's stored identity is the §8.3 hash/equality pair,
+    //     which the arm supplies. The arms must stay ahead of this predicate, so the
+    //     predicate's own answer was left alone rather than narrowed.
+    //
+    // (3) MEASURED CONSEQUENCE OF NARROWING IT. A prior attempt at #6207 added a
+    //     `!ty->declaration->isValueBuiltin` carve-out and was REJECTED for a
+    //     SILENT-ACCEPTANCE INVERSION, because this predicate is load-bearing
+    //     beyond the trampolines. `collectionElemIsClass` (LlvmBackend_Disposal.cpp)
+    //     IS this predicate, reached through a different name, and the carve-out
+    //     flips it false for `Range`. Then `materializeArrayBackedSetLiteral`'s
+    //     opening `if (!collectionElemIsClass(setTy, 0)) return nullptr;`
+    //     (LlvmBackend_Setup.cpp) bails on a `Set<Range<int>>` literal, and
+    //     `lowerLocalDecl`'s #559 guard — the one whose code comment reads
+    //     "materialization failed; safe no-op", whose body is a bare `return;`
+    //     for a `Set`/`OwningSet` declared type (LlvmBackend_Setup.cpp) — then
+    //     DROPS the local's storage WITH NO DIAGNOSTIC OF ITS OWN. MEASURED: `var s: Set<Range<int>> := [1..5, 7..9];`
+    //     followed by a read of `s.Count` went from a compile-time rejection
+    //     carrying a located `#1070` diagnostic to an executable that exits 0 and
+    //     PRINTS NOTHING. That is the top defect class (a rejection deleted), and
+    //     it is why the false positive is recorded here instead of removed. The
+    //     #4642 incident documented in the comment block on
+    //     `collectionElemIsClass` (LlvmBackend_Disposal.cpp) is the same hazard one
+    //     level down and is the prior art for it.
+    //
+    // SCOPE OF THE CLAIM, so a later reader does not over-generalise it: the ~12
+    // non-comment call sites of this predicate are NOT all exercised by `Range`.
+    // What the carve-out measured was the SET-LITERAL path above. The sorted
+    // containers reject a `Range` earlier and on a different gate — stdlib
+    // §4.17/§4.18's `CompareTo` constraint (spec §14.2) — and `Array<Range<int>>`
+    // never consults this predicate on its element. Do not read "narrowing is
+    // safe for the other consumers" as measured; only the set-literal
+    // materialiser was.
     bool hasObjectHeaderEquality(const sema::TypeRef* ty) const {
         if (!ty) return false;
         if (ty->kind == sema::TypeRef::Kind::Primitive)
