@@ -1599,7 +1599,7 @@ private:
     // side of this change. The body-less imported accessor (the common case)
     // declines at `blockGetterOf`'s `ps->decl` check in BOTH keyings, so it
     // cannot distinguish them; it is a no-regression control, not evidence.
-    // See issue #6379 for the face that is still structurally unreachable.
+    // See issue #6487 for the face that is still structurally unreachable.
     static constexpr unsigned kPropGetterBodyMint    = 1u << 2;
     std::unordered_map<const sema::PropertySymbol*, unsigned>
         propBlockGetterReturnKinds_;

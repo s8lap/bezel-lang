@@ -5538,6 +5538,181 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 }
 
 
+// fix #6447 (§28.2, §28.9, §29.2, v0.338) — see the declaration's comment for
+// what this answers and why FALSE is the safe direction. The rule is:
+//
+//     the getter hands back a holder's own storage  iff  EVERY `return` in
+//     the body denotes a FIELD read, directly or through locals whose EVERY
+//     definition in that body is itself a field read — AND the mint channel
+//     is live for this property (see the face guard below).
+//
+// §28.9 states the property read is a lend for every declared type and that
+// "the two accessor body spellings of §23.3 … are semantically
+// indistinguishable at every read site", which is why the answer may be taken
+// from the body rather than from the lowering face.
+bool Emitter::blockGetterReturnsFieldLend(sema::Symbol* sym) {
+    const ast::PropertyAccessor* acc = blockGetterOf(sym);
+    if (!acc) return false;
+
+    // ⚠ THE FACE GUARD, AND WHAT IT COSTS. A field-lend claim is only sound
+    // when the §29.2 widening it must not collide with is VISIBLE to the
+    // consumer. Every consumer already sees it through `minted6397`, whose
+    // `!minted` term overrides a lend claim — but only where the mint was
+    // actually PUBLISHED. MEASURED: the vtable/itable face
+    // (`ensurePropertyAccessorFn`) lowers a BLOCK getter body without setting
+    // `currentAccessorPropSym_`, so `lowerReturn` publishes nothing there and
+    // the map holds NO ENTRY for such a property (`mapEntry=0`, versus
+    // `mapEntry=1` for the same program spelled without `virtual`). On that
+    // face `gk6397` is 0, `minted6397` is false, and `!minted` cannot protect
+    // anything: a claim made here would be the ONLY word on the question.
+    //
+    // Concretely, on
+    //   property Seq: IEnumerable<int> get do var t := _items; return t; end
+    // over `owned _items: Array<int>`, declared `virtual`, the getter's return
+    // needs the §29.2 widening, §29.2 mints a FRAME the reader owns, and an
+    // unguarded claim withdraws the loop's reclamation of it. MEASURED on this
+    // predicate's first draft, which lacked this guard:
+    //
+    //   SUMMARY: AddressSanitizer: 6400 byte(s) leaked in 200 allocation(s)
+    //
+    // with the correct `s=1200` printed first, where the parent compiles that
+    // program clean.
+    //
+    // A map entry is exactly the right signal and costs nothing to read: the
+    // writer at `lowerReturn` assigns the entry UNCONDITIONALLY for every
+    // return edge it lowers, so an entry means "the block-getter face ran this
+    // accessor's edges and set-or-cleared `kPropGetterReturnMint` on each",
+    // which is what makes `!minted` a real veto rather than a vacuous one.
+    //
+    // WHAT THIS DEFERS. Declining on the no-entry face leaves the `virtual` /
+    // interface-dispatch laundering cells of #6447 open — they keep faulting
+    // exactly as they do today. Closing them means publishing the mint on that
+    // face (setting `currentAccessorPropSym_` around its `lowerScopedBlock`,
+    // which is what `ensurePropertyBlockGetter` already does), and that is NOT
+    // free: `kPropGetterReturnMint` has a second reader, the #6405 arm of
+    // `registerIterableSourceDisposal` in LlvmBackend_Setup.cpp, which turns
+    // the bit into `ownsSource`. Turning a claim ON there needs its own oracle.
+    // That is issue #6487's structurally unreachable face, already named in
+    // `propBlockGetterReturnKinds_`'s declaration, and it is a separate fix.
+    const auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+    if (!ps || propBlockGetterReturnKinds_.count(ps) == 0) return false;
+
+    // ⚠ THE §29.2 WIDENING GUARD, AND WHY IT IS HERE RATHER THAN LEFT TO
+    // `minted6397`. When a getter's body returns a value whose type is not
+    // the property's declared type, §29.2's wrap-creator mints a FRESH
+    // wrapper frame and the reader — not the holder — owns it. Every consumer
+    // already knows this through `minted6397`, whose `!minted` term overrides
+    // a field-lend claim. But that term is only as good as the mint
+    // PUBLICATION, and on the vtable/itable face (`ensurePropertyAccessorFn`)
+    // nothing is published at all: MEASURED on
+    // `property Seq: IEnumerable<int> get do var t := _items; return t; end`
+    // over `owned _items: Array<int>`, declared `virtual`, the arm reads
+    // `gk == 0` — no `kPropGetterReturnMint`, no `kPropGetterBodyMint` — so
+    // `minted6397` is false and `!minted` cannot protect a field-lend claim
+    // from the widening this getter genuinely performs. Claiming the lend
+    // there withdraws the loop's reclamation of the minted frame: MEASURED,
+    // `SUMMARY: AddressSanitizer: 6400 byte(s) leaked in 200 allocation(s)`
+    // where the parent compiles that program clean.
+    //
+    // So this predicate declines on that whole face: where no entry is
+    // published, it says no. That is sufficient for the widening above and
+    // deliberately BROADER — it declines every getter on the face, not only
+    // the widening ones, which is why cells beyond the widening stay open.
+    // Note what this costs and does not: it narrows only THIS predicate, so every
+    // Pass 1 — every top-level statement must be a shape this can decide
+    // from. Control flow, a nested body, a call, a `for`-in head: none of
+    // those are walked, so ANY of them makes the answer unknown, and unknown
+    // must read FALSE. This is the codebase's standing conservative-escape
+    // convention, and it is what keeps the reassignment case out without a
+    // flow analysis: `var t := _b; t := new SelfA(1); return t;` reaches
+    // pass 2 and is rejected there by its second definition, while a getter
+    // that never mentions the returned local at all stops in this pass.
+    std::vector<const ast::Expr*> returns;
+    for (const auto& sp : acc->stmts) {
+        if (const auto* rs = dynamic_cast<const ast::ReturnStmt*>(sp.get())) {
+            // `return;` in a value-returning getter: not a field read.
+            if (!rs->value) return false;
+            returns.push_back(rs->value.get());
+            continue;
+        }
+        // A local binding defines its local; whether that definition is a
+        // field read is pass 2's question.
+        if (dynamic_cast<const ast::LocalDecl*>(sp.get())) continue;
+        if (dynamic_cast<const ast::LocalConstDecl*>(sp.get())) continue;
+        if (const auto* as =
+                dynamic_cast<const ast::AssignmentStmt*>(sp.get())) {
+            // Only `:=` DEFINES a value that is handed on. A compound op
+            // (`+=`, `*=`, …) computes a new value from the old one, and an
+            // `owned`-marked RHS is a MOVE (§28.7), so neither yields a field
+            // read back. `IncrementStmt` (`t++`) is not an assignment and so
+            // falls through to the decline below, which is the answer it
+            // needs.
+            if (as->op != ":=" || as->valueHasOwnedMarker) return false;
+            continue;
+        }
+        return false;
+    }
+    if (returns.empty()) return false;
+
+    // Pass 2 — resolve one expression to a field read, following locals. The
+    // depth bound terminates a `var a := b; var b := a;` cycle, which
+    // definite assignment rejects but which must not be a stack overflow if a
+    // future relaxation lets it through.
+    std::function<bool(const ast::Expr*, unsigned)> isFieldRead =
+        [&](const ast::Expr* e, unsigned depth) -> bool {
+        if (depth > 8) return false;
+        if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*e)))
+            return true;
+        const auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        const auto* ls =
+            dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        // A PARAMETER has a decl too, but one with no initializer, so its
+        // definition set is empty and it declines below — which is correct:
+        // the getter would be handing back the CALLER's object, which the
+        // holder does not own.
+        if (!ls || !ls->decl) return false;
+
+        // EVERY definition of this local within this body. The decl
+        // initializer plus each `:=` that targets it. Requiring ALL of them
+        // is the reassignment guard: one definition that is not a field read
+        // is enough to make the whole local unprovable, so an accessor that
+        // launders a field and then overwrites it with a fresh value keeps the
+        // claim it has today instead of becoming a leak.
+        std::vector<const ast::Expr*> defs;
+        if (const auto* ld =
+                dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+            if (ld->initializer) defs.push_back(ld->initializer.get());
+        } else if (const auto* lc =
+                       dynamic_cast<const ast::LocalConstDecl*>(ls->decl)) {
+            if (lc->value) defs.push_back(lc->value.get());
+        }
+        for (const auto& sp : acc->stmts) {
+            const auto* as = dynamic_cast<const ast::AssignmentStmt*>(sp.get());
+            if (!as || !as->target) continue;
+            // A non-identifier target (`a.x := …`, `a[i] := …`) defines some
+            // other storage, not this local, so it says nothing about it.
+            const auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(as->target.get());
+            if (!tid) continue;
+            const auto* tls =
+                dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+            if (!tls || tls->decl != ls->decl) continue;
+            if (!as->value) return false;
+            defs.push_back(as->value.get());
+        }
+        if (defs.empty()) return false;
+        for (const ast::Expr* d : defs)
+            if (!isFieldRead(d, depth + 1)) return false;
+        return true;
+    };
+
+    for (const ast::Expr* r : returns)
+        if (!isFieldRead(r, 0)) return false;
+    return true;
+}
+
+
 // fix #2702 (§23.3 "Block-form properties" / §23.4 "Indexers" / §30.5 /
 // §28.4, v0.240): save + neutralise the emitter state that a NESTED body
 // emission must not inherit; the destructor restores it.
@@ -14830,7 +15005,8 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     // measurement (bezelc -c + --import) found the imported delegating shape
     // gives the same answer before and after, but hand measurement establishes
     // UNAFFECTEDNESS, which CI cannot distinguish from untested. Structural gap
-    // tracked as #6379.
+    // opened by #6379 (now closed — the harness landed); the gap itself is
+    // still open and is tracked as #6487.
     //
     // Dropping `vtableOf(enumTs)` also drops its IMPORTED-`enumTs` skip, which
     // had left a delegating imported enumerator on the direct family. The new
