@@ -37,9 +37,14 @@
 // **#4646**, at the generic assignment arm of `lowerStmt` — see
 // `tests/codegen/invariant_auto_property_store_instrumented_4646_test.cpp`,
 // which reuses this file's `instrumentedSetterClass` gate so the two shapes
-// cannot drift apart. The VIRTUAL / interface-dispatched setter (which needs
-// the setter's own §22.16 unchecked face before it can be instrumented without
-// introducing an over-check) stays recorded on #4646.
+// cannot drift apart. The VIRTUAL / interface-dispatched setter is instrumented
+// by **#6205**, at the store site in `lowerVirtualPropertySet` rather than in
+// the accessor thunk: `ensurePropertyAccessorFn` emits the accessor's BODY
+// only, so there is no checked prologue on that path for an unchecked face to
+// suppress, and §22.16's `this`-reentrancy exemption is decided from the
+// store's own receiver syntax by the same `instrumentedSetterClass` gate the
+// two arms here share. See
+// `tests/codegen/invariant_virtual_setter_instrumented_6205_test.cpp`.
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
