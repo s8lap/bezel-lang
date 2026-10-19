@@ -19565,6 +19565,18 @@ private:
     // §3/§5) mean the per-element disposer is null (string-release for
     // `Array<string>`), identical to #1004.
     bool isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const;
+    // fix #6357: true if `e` is a `new` EXPRESSION of a plain (borrowing)
+    // builtin collection — `(new Set<int>()).Count`, `(new Array<int>()).Length`.
+    // The CALL-face recognizers above all require a `CallExpr`, so a `new`
+    // receiver reached none of them; §28.3 names "a `new` expression" as a
+    // producer of an unbound owned temporary, so this face owes the same
+    // end-of-full-expression disposal the call face already makes. Narrow by
+    // construction: `isPlainBuiltinCollectionHead` excludes the `Owning*` family
+    // (element cascade, `freeUnboundOwnedOwningCollectionTemp`) and every user
+    // class (`isFreshOwnedClassProducer`'s population, discharged elsewhere), so
+    // only the declaration-less borrowing collections match and a bound/`move`d
+    // receiver is never freed twice.
+    bool isUnboundOwnedBuiltinCollectionNewExpr(const ast::Expr* e) const;
     // #1006(b) / #1004: emit the end-of-full-expression bz_array_free of an
     // UNBOUND fresh borrowing-`Array<T>` temporary `recvVal` (a #1004 materializer
     // call OR a #1006b `owned`-returning user-method call given by `recvExpr`),

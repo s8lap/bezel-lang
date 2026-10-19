@@ -38311,6 +38311,75 @@ bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
 }
 
 
+// fix #6357 (§28.3 *Unbound owned temporaries*, §28.9, stdlib §4.4–§4.10,
+// v0.338): the `new`-EXPRESSION face of an unbound owned builtin-collection
+// temporary — `(new Set<int>()).Count`, `(new Array<int>()).Length`,
+// `(new LinkedList<int>()).ToArray()`.
+//
+// The three recognizers above all end in a `dynamic_cast<CallExpr*>`, so a
+// receiver that is a `new` expression matches NONE of them and the whole
+// reclaim is skipped. That is a gap in the CLASSIFIER, not a misclassification:
+// `isFreshOwnedClassProducer` (OwnershipFacts.cpp:452), the shared owned-producer
+// predicate, also answers false here — it ends in
+// `rt->declaration->kind == TypeDeclKind::Class`, and every builtin collection
+// is DECLARATION-LESS (stdlib §4.4–§4.11 declare them without a TypeDecl), so
+// it is false for all of them including `Array`. #6352 widened this file's
+// CALL-face recognizer to the whole borrowing family and correctly could not
+// reach this face; widening it further on the call axis would not help, because
+// there is no call here.
+//
+// §28.3 states this producer explicitly. "Unbound owned temporaries" says a
+// value is one when it is "the result of an `owned`-returning call (**or other
+// owned producer**) that is not bound to any name, not `move`d, and not
+// returned"; the same section's "The rule is uniform across the source of the
+// temporary" paragraph says the `owned` return qualifier "is the single signal
+// that drives the reclaim", and §15.4.1 names the producers of this exact
+// class of value as "a `new` expression, a nested collection literal ... or an
+// `owned`-returning call". So a `new` of a builtin collection in
+// member-read position is an unbound owned temporary and is owed a disposal at
+// the full-expression boundary, exactly as the call face is.
+//
+// SOUNDNESS — why this is narrow, and why it cannot double-free.
+//   * the receiver must be a `NewExpr`. A named local / field / parameter /
+//     `move` receiver is an IdentifierExpr or MemberAccessExpr and never
+//     matches, so its own owner still discharges it — the same discriminator
+//     the three sibling recognizers use;
+//   * the result type must be a head in `isPlainBuiltinCollectionHead`, the
+//     ONE registry naming the eight BORROWING collection classes. `Owning*`
+//     heads are excluded by construction, so no element cascade is skipped
+//     (`freeUnboundOwnedOwningCollectionTemp` owns that family), and a user
+//     class is excluded too — `new Foo()` of a heap CLASS is already the
+//     subject of `isFreshOwnedClassProducer`, and this predicate does not
+//     overlap it;
+//   * the free itself is `freeUnboundOwnedBorrowingArrayTemp`'s existing
+//     three-way `isLL / isDict / else` dispatch, unchanged, so this predicate
+//     only ADOPTS a receiver into a free that was already written and already
+//     carries the per-element disposer rule (`bz_llist_free` /
+//     `bz_dict_free` / `bz_array_free` by the receiver's own backing).
+//
+// MEASURED on this fix's parent, 400 iterations of `(new Set<int>()).Count`:
+// 141,152 B in 802 allocations (`bz_dict_alloc_generic` +
+// bezel_runtime_collections.cpp:1083, one table plus one header per
+// iteration); `bz_dict_free` is emitted 0 times. The `Array<int>` twin
+// `(new Array<int>()).Count` leaks the same way — `bz_array_free` is likewise
+// never emitted — which is why the predicate is keyed on the head registry
+// rather than on `Set`.
+bool Emitter::isUnboundOwnedBuiltinCollectionNewExpr(const ast::Expr* e) const {
+    if (!e) return false;
+    // The expression must BE the `new`, not a call wrapping one. A call
+    // receiver is the call face, already carried by
+    // `isUnboundOwnedBorrowingArrayCallExpr`; admitting it here too would be
+    // harmless (the free is emitted once, at one site) but would give two
+    // recognizers the same population, which is how the copy-form drift in
+    // #6396 started.
+    if (!dynamic_cast<const ast::NewExpr*>(e)) return false;
+    const sema::TypeRef* rt = ctx_.exprType(*e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    return common::isPlainBuiltinCollectionHead(builtinTypeName(rt));
+}
+
+
 // #1006(b) / #1004 / §28.3 / stdlib §3 / §5: if `recvExpr` is an UNBOUND fresh
 // borrowing-`Array<T>` temporary — either a builtin materializer call
 // (`X.ToArray()`/`X.Sorted()`/`X.Reversed()`, #1004) OR an `owned`-returning user
@@ -38342,7 +38411,11 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
         return;
     }
     if (!isFreshOwnerlessArrayMaterializerExpr(recvExpr) &&
-        !isUnboundOwnedBorrowingArrayCallExpr(recvExpr)) return;
+        !isUnboundOwnedBorrowingArrayCallExpr(recvExpr) &&
+        // fix #6357: the `new`-expression face — `(new Set<int>()).Count`. See
+        // `isUnboundOwnedBuiltinCollectionNewExpr` for why the three recognizers
+        // above cannot reach it and why this one is narrow enough to be sound.
+        !isUnboundOwnedBuiltinCollectionNewExpr(recvExpr)) return;
     // fix #6352 (§28.3, §28.9, stdlib §4.6/§4.8/§4.10, v0.338): pick the runtime
     // free by the RECEIVER'S OWN backing, now that
     // `isUnboundOwnedBorrowingArrayCallExpr` admits the whole borrowing
