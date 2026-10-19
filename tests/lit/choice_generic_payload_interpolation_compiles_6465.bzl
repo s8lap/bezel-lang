@@ -1,6 +1,6 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
-// NODIAG-NOT: error:
+// NODIAG-NOT: :{{[0-9]+}}:{{[0-9]+}}:
 
 // fix #6465 (codegen, the struct-typed interpolation-hole dispatch in
 // LlvmBackend_Exprs.cpp, v0.338): that branch classified the hole's choice at
@@ -22,6 +22,18 @@
 // payload cannot be dispatched. The second pins that the compiler is SILENT on
 // this program — supplying the instantiation must not have bought a
 // diagnostic, which would trade a wrong rendering for a false rejection.
+//
+// That second RUN line's needle is the `:line:col:` SHAPE, and it has to be.
+// The first version of this file anchored on a bare severity word instead, and
+// that needle could never match anything: bezelc emits diagnostics as
+// `file:line:col: message` with NO severity word — the same fact ~21 other
+// reject tests here record in their own headers, e.g.
+// builtin_iface_shadow_reject_3139.bzl. MEASURED on that version: a program
+// carrying a real diagnostic still passed the FileCheck invocation, so the
+// line was green on a rejected program — a vacuous assertion that could not
+// have caught the false rejection it was written to catch. Anchoring on the
+// shape bezelc actually prints makes it load-bearing: MEASURED, it now rejects
+// a program carrying a real diagnostic and passes this silent one.
 //
 // This is the FOURTH spelling of the #6169 / #6458 payload-substitution class
 // and the first with a different mechanism: the other three substituted and
