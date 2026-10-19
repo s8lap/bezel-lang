@@ -802,16 +802,23 @@ BEZEL_TEST(sema_extension,
     // got far enough to say".
     //
     // It is NOT evidence that the head bound T, and an earlier revision of
-    // this comment claimed it was. Conjunct (2) is INSENSITIVE to how the
-    // argument positions were spelled: `extension IEnumerable<Array<NoSuchType>>`
-    // yields the same single member diagnostic as this head, byte for byte
-    // apart from the filename.
+    // this comment claimed it was. Conjunct (2) is INSENSITIVE to how a bare
+    // single-segment identifier in an argument position is spelled — `T`,
+    // `NoSuchType`, or at a deeper nesting `Array<Array<NoSuchType>>` — each
+    // yielding the same single member diagnostic as this head, byte for byte
+    // apart from the filename (MEASURED, at either nesting depth).
+    //
+    // That insensitivity is bounded to the class §26.4 binds, NOT universal.
+    // `int` is likewise unchanged, but it is a concrete instantiation and so
+    // binds nothing; `T?` adds a nullable-marked head rejection (§26.4) and
+    // `Pair<T, T>` a duplicate type parameter and an unresolved `Pair`
+    // (§14.1). All of these are MEASURED too.
     //
     // That equality is NOT the compiler failing to bind. §26.4 (v0.338,
-    // *Type-parameter binding*) binds both spellings: "In the extended type's
-    // argument positions, each bare single-segment non-nullable identifier
-    // introduces a fresh block-level type parameter — always, shadowing any
-    // same-named type in scope", and it declines the alternative — "resolving
+    // *Type-parameter binding*) binds `T` and `NoSuchType` alike: "In the
+    // extended type's argument positions, each bare single-segment non-nullable
+    // identifier introduces a fresh block-level type parameter — always, shadowing
+    // any same-named type in scope", and it declines the alternative — "resolving
     // the identifier against scope and only binding when unresolved" —
     // "is declined: it would let an unrelated type declaration elsewhere
     // silently re-mean an extension block" (the ruling is recorded again at
