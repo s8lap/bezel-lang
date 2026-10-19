@@ -178,13 +178,6 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 }  // namespace
 
 // =====================================================================
@@ -229,7 +222,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: heap-use-after-free
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -269,7 +261,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -307,7 +298,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -343,7 +333,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -391,7 +380,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -429,7 +417,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -476,7 +463,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -517,7 +503,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -562,7 +547,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -615,7 +599,6 @@ BEZEL_TEST(codegen_closure_captured_cell_mutated_shared_nested_uaf_4240,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

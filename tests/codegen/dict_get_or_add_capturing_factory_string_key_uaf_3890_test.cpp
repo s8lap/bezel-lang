@@ -102,16 +102,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — mirrors dict_get_or_add_capturing_factory_leak_3871_test.cpp /
-// dict_call_arg_key_local_release_3886_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 std::string prog(const std::string& mainBody) {
     return
         "module M; "
@@ -150,7 +140,6 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_string_key_uaf_3890,
         "end; "
         "return 0; "));
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -184,7 +173,6 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_string_key_uaf_3890,
         "end; "
         "return 0; "));
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -215,7 +203,6 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_string_key_uaf_3890,
         "end; "
         "return 0; "));
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

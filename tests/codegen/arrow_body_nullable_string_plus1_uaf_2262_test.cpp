@@ -45,13 +45,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // True if `text` carries an ASan / LSan report headline — the FAIL-WITHOUT
 // oracle. Mirrors tests/support/aot_support.hpp:hasSanitizerReport but
 // inlined so the test is self-contained (the harness's helper is internal).
@@ -210,7 +203,6 @@ BEZEL_TEST(arrow_body_nullable_string_plus1_uaf_2262,
            arrow_body_field_nullable_string_loop_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kArrowBodyFieldNullableString);
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // 5 iterations, each release balanced
     BEZEL_EXPECT_FALSE(hasSanitizerReport(r.stdoutText));  // ASan/LSan-clean
     // ASan errors print to stderr; runAotChecked surfaces them via stdoutText
@@ -230,7 +222,6 @@ BEZEL_TEST(arrow_body_nullable_string_plus1_uaf_2262,
            arrow_body_param_nullable_string_loop_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kArrowBodyParamNullableString);
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(hasSanitizerReport(r.stdoutText));
     for (const auto& d : r.diagnostics.diagnostics())
@@ -249,7 +240,6 @@ BEZEL_TEST(arrow_body_nullable_string_plus1_uaf_2262,
            arrow_body_field_non_nullable_string_loop_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kArrowBodyFieldNonNullableString);
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(hasSanitizerReport(r.stdoutText));
     for (const auto& d : r.diagnostics.diagnostics())
@@ -268,7 +258,6 @@ BEZEL_TEST(arrow_body_nullable_string_plus1_uaf_2262,
            block_body_field_nullable_string_loop_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kBlockBodyFieldNullableString);
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(hasSanitizerReport(r.stdoutText));
     for (const auto& d : r.diagnostics.diagnostics())
@@ -288,7 +277,6 @@ BEZEL_TEST(arrow_body_nullable_string_plus1_uaf_2262,
            arrow_body_null_nullable_string_loop_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kArrowBodyNullNullableString);
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(hasSanitizerReport(r.stdoutText));
     for (const auto& d : r.diagnostics.diagnostics())

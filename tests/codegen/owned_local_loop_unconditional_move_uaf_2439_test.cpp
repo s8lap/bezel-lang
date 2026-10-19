@@ -61,17 +61,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic — guard
-// so an environment gap does not masquerade as this fix's own regression
-// (mirrors the #2436/#2429/#2411 tests' identical guard).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 bool diagContains(const JitResult& r, const std::string& needle) {
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find(needle) != std::string::npos) return true;
@@ -218,7 +207,6 @@ BEZEL_TEST(owned_local_loop_unconditional_move_uaf_2439,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     // 3 mints, 3 consumes each disposed exactly once — settles at 0. A
@@ -250,7 +238,6 @@ BEZEL_TEST(owned_local_loop_unconditional_move_uaf_2439,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
