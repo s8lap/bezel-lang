@@ -18099,8 +18099,55 @@ void MethodOwnership::scanGetterReturns(
                     // local is scope-bound — a `using var` (disposed at scope
                     // end) or a plain owned local (auto-dropped there). A
                     // borrow-typed local is not the hazard this rule names.
-                    const auto* ld =
-                        dynamic_cast<const ast::LocalDecl*>(ls->decl);
+                    //
+                    // A `const` local is structurally NOT a §28.3 frame source,
+                    // so the `if (!ld) continue` below is a deliberate exclusion
+                    // and this site is correct as written. §28.3's rule names
+                    // "a scope-bound local, a `using var`, a temporary" — a
+                    // value whose extent or disposal ends at scope end.
+                    // §21.1 (v0.338) says the opposite for `const`: "the
+                    // binding never takes a disposal obligation and never
+                    // holds an affine (consumable) value", and "`const`
+                    // bindings never change state — not by assignment, not by
+                    // consumption, not by disposal; an owned,
+                    // never-reassigned, scope-disposed local already exists:
+                    // `using var`". A.6 (v0.338) has no `using const` form at
+                    // all (`LocalDecl ::= "var" Identifier …`,
+                    // `LocalConstDecl ::= "const" Identifier …`), so BOTH
+                    // disjuncts below — `usingVar`, and `ownedPlainLocal`'s
+                    // "auto-dropped at scope end" — are false for every
+                    // `const` local by grammar and by §21.1.
+                    //
+                    // MEASURED, not inferred: `const x := MakeItems(); return
+                    // x.Where(…)` inside a getter COMPILES on this tree and
+                    // leaks 56 B under LSan, but it does NOT dangle — a `const`
+                    // holds no obligation, so nothing is freed at scope end
+                    // and the returned frame's borrow outlives no disposed
+                    // source. That leak is §21.1's own rejection being
+                    // unenforced in an accessor body, tracked at #2749 item 3.
+                    // Widening this cast to admit a `LocalConstDecl` would make
+                    // it fire there with the text "owned local `x` is
+                    // auto-dropped at scope end" — a false claim about a value
+                    // that is never dropped, and it would report a §21.1
+                    // defect under a §28.3 diagnostic, suppressing the one
+                    // that owns it.
+                    //
+                    // The shape that DOES dangle is the alias, and it does so
+                    // on BOTH spellings equally: `using var items := …; var
+                    // alias := items; return alias.Where(…)` and its
+                    // `const alias := items;` twin each heap-use-after-free
+                    // under ASan when the caller enumerates the frame. It is
+                    // NOT this cast's gap: an identifier initializer has
+                    // producerState Borrowed, so neither spelling reaches
+                    // either disjunct, and the borrow-typed exclusion above is
+                    // #6484's deliberate boundary.
+                    //
+                    // LOCALDECL-ONLY: §21.1 + A.6 (v0.338) — a `const` binding
+                    // takes no disposal obligation and has no `using` form, so
+                    // neither scope-bound disjunct can hold for one; the
+                    // dangling shape is the borrow-typed alias, not the const.
+                    const auto* ld = dynamic_cast<const ast::LocalDecl*>(
+                        ls->decl);
                     if (!ld) continue;
                     const ast::Expr* linit = declInitializer(ls->decl);
                     const bool usingVar = ld->isUsing;
