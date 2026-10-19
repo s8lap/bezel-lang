@@ -96,8 +96,17 @@ taken as license not to look for the cheaper one. The measurements:
     `-Wdangling-capture` does not FAIL a build today — it is visible in the log
     and in clang-tidy, but nothing gates on it. This script is what turns the
     hazard into a hard gate failure today. Keep it as defense-in-depth; do not
-    record it as the only option. Ratcheting the compiler warning would cover
-    the identifier-argument gap below for free, and is tracked separately.
+    record it as the only option. CORRECTED (R32): an earlier revision of this
+    comment claimed that ratcheting the compiler warning would cover the
+    identifier-argument gap below "for free". That is FALSE, and it is now
+    measured. -Wdangling-capture fires on a dangling TEMPORARY argument --
+    `parts.push_back(std::string("x"))` -- and is SILENT on a dangling
+    IDENTIFIER argument -- `parts.push_back(localStdStringVar)`. The same is
+    true of -Wdangling-gsl and of clang-tidy's bugprone-dangling-handle: each
+    reports 0 on a file containing only that shape. So no instrument covers
+    that gap today — not this script, and not the compiler. #6475 tracks
+    gating the compiler warning over the shapes it DOES see; the
+    identifier-argument gap is tracked separately and is still open.
 
 So this is a TEXT ratchet over the named containers, and its honest limits are:
 
