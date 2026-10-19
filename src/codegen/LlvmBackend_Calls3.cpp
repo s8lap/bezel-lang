@@ -16,12 +16,19 @@ namespace bezel::codegen {
 // array slot (mirrors collectionElemSize's element-size choices).
 // per §9 (bug D): pass the DataLayout so that a record StructType returns its
 // actual allocation size instead of the hardcoded 8.
+// fix #6273 (§15.1.2, v0.338): the ArrayType arm is the same defect in the
+// lazy (LINQ) element-size ladder — an `[N]T` inline-array element lowers to
+// `[N x T]`, which matched no scalar case and no StructType, so it took the
+// `return 8` fall-through and every lazy pipeline over `Array<[N]T>` mixed an
+// 8-byte stride with a 12/16-byte element. See `collectionElemSize`'s comment
+// for the measurement and the boundary.
 static int64_t lazyElemSize(llvm::Type* ty, const llvm::DataLayout& dl) {
     if (!ty) return 8;
     if (ty->isIntegerTy(32) || ty->isFloatTy()) return 4;
     if (ty->isIntegerTy(1) || ty->isIntegerTy(8)) return 1;
     if (ty->isIntegerTy(16)) return 2;
-    if (ty->isStructTy()) return (int64_t)dl.getTypeAllocSize(ty);
+    if (ty->isStructTy() || ty->isArrayTy())
+        return (int64_t)dl.getTypeAllocSize(ty);
     return 8;  // i64 / double / pointer (string, class)
 }
 

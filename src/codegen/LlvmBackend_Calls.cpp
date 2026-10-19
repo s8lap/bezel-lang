@@ -798,7 +798,25 @@ int64_t Emitter::collectionElemSize(const sema::TypeRef* collTy) {
     // element, so only the first 8 bytes were stored/loaded and the second
     // field (Age) was read from the wrong offset.  Use the DataLayout to get
     // the exact allocation size for any non-scalar element type.
-    if (et->isStructTy())
+    //
+    // fix #6273 (§15.1.2, v0.338): an INLINE-ARRAY element type lowers to an
+    // llvm::ArrayType (`[N x T]`, Layout.cpp's InlineArray arm), which is
+    // neither of the scalar cases nor a StructType — so it took the `return 8`
+    // fall-through. An `[N]T` whose payload exceeds 8 bytes (`[3]int` = 12,
+    // `[2]string` = 16, `[2](int) -> int` = 16) was therefore stored with an
+    // 8-byte stride: `bz_array_ptr_at(arr, i, 8)` handed the scan a pointer
+    // into the MIDDLE of element i, `CreateLoad` read 12/16 bytes across the
+    // following slot, and every equality answer came from overlapping bytes.
+    // MEASURED on `var h: [3]int := [1,2,3]; var hs: Array<[3]int> := [h];`:
+    // `hs.Contains(h)` answered FALSE, and a bare read-back `s[0]` after
+    // binding gave `10,11,0` for a stored `[10,11,12]` — the third slot past
+    // the 8-byte stride. An element of exactly 8 bytes or fewer (`[1]int`,
+    // `[2]int`, `[1](int) -> int`) was unaffected, which is the whole of the
+    // issue's "wider than 8 bytes" boundary. §15.1.2 makes two inline arrays
+    // equal iff their elements are pairwise equal, so the answer must be True.
+    // The DataLayout arm is the whole fix: `getTypeAllocSize([N x T])` is
+    // exactly `N * sizeof(T)` with the type's own trailing padding.
+    if (et->isStructTy() || et->isArrayTy())
         return (int64_t)module_->getDataLayout().getTypeAllocSize(et);
     return 8;  // ptr, i64, double
 }
