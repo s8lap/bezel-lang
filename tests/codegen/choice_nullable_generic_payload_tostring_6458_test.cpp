@@ -184,10 +184,13 @@ BEZEL_TEST(choice_nullable_generic_payload_tostring_6458,
 }
 
 // NOT the interpolation-hole spelling `$"{n}"` — that one is a DIFFERENT
-// call site (`LlvmBackend_Exprs.cpp`'s hole dispatch passes no `instTy` at
-// all, so there is no substitution to OR the `?` into, and it renders the
-// payload slot EMPTY: `W.Ok(v: )` for BOTH a null and a present payload).
-// §35.7 specifies `field1: value1`. Filed as #6465.
+// call site, and a defect in its own right: `LlvmBackend_Exprs.cpp`'s hole
+// dispatch passed no `instTy` at all, so nothing was substituted (not even
+// the `?`), and it rendered the payload slot EMPTY: `W.Ok(v: )` for BOTH a
+// null and a present payload. §35.7 specifies `field1: value1`. That site
+// was FIXED by #6465, which passes the hole's own instantiation; the
+// rendering it asserts is now pinned by
+// `choice_generic_payload_interpolation_tostring_6465_test.cpp`.
 
 // §9.2: a NON-NULLABLE `T` payload is the rendering control for this fix. It
 // must render exactly as it did before — the `pTy.nullable` OR added at both

@@ -1213,7 +1213,41 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // active case entirely (a distinct gap from, and
                             // found while regression-testing, #2479's own
                             // bare-T-receiver scope).
-                            pv = emitChoiceToString(ev, ts);
+                            //
+                            // fix #6465: `structRt` — the instantiation this
+                            // same branch already asks isAutoEqualityBearingChoice
+                            // to classify AT — is also the instantiation the
+                            // renderer needs, and it was not being passed. With
+                            // `instTy` defaulted to null, emitChoiceToString
+                            // falls to its resolveTypeParamRef else-arm, which
+                            // returns its argument UNCHANGED when the active
+                            // substitution has no entry for the head. At a hole
+                            // in a non-generic body there is no such entry, so a
+                            // payload spelled `T` resolved to the bare type
+                            // PARAMETER; emitValueToString could not render
+                            // that and emitted the empty string, for a PRESENT
+                            // payload as much as an absent one.
+                            //
+                            // §8.5 makes each payload render as its own
+                            // ToString renders it, and §18.5's rule that an
+                            // absent value renders as the four-character text
+                            // `null` — "Rendering `null` rather than the empty
+                            // string keeps absent values diagnosable in output".
+                            // So the hole rendered `W.Ok(v: )` where the
+                            // identical value's `.ToString()` on the same binary
+                            // rendered `W.Ok(v: null)`. The direct call reached
+                            // the right answer only incidentally: MEASURED at
+                            // the two sites, the active substitution holds
+                            // `T -> Col` while the member call is dispatched and
+                            // is EMPTY while the hole is lowered, so the same
+                            // else-arm found the binding in one and returned the
+                            // bare parameter in the other. Depending on whatever
+                            // else happens to be substituted at the render is
+                            // how a hole and a call can disagree about one value.
+                            // Passing the instantiation takes that dependence
+                            // off: the branch classifies at the instantiation
+                            // and now renders at it too.
+                            pv = emitChoiceToString(ev, ts, structRt);
                         } else if (ts->kind == ast::TypeDeclKind::Choice) {
                             // §35.7's open question (see lowerValueSemMethodOn's
                             // Choice/ToString branch for the full citation):
