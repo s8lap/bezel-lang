@@ -2623,9 +2623,49 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (auto* collGetVal = lowerCollectionIndexerGet(*ix))
             return collGetVal;
         // §15.1: inline array `a[i]` — GEP the array slot and load.
+        //
+        // fix #6236 (§15.1, v0.338): the base was resolved with `lvalueAddr`,
+        // so an inline array that is an RVALUE — a call result (`Mk()[1]`), a
+        // `DictionaryEntry`'s `Key` (`e.Key[i]`), any temporary — had no place
+        // and the whole read fell through to nullptr. `lowerExpr` then
+        // reported the #3079 "argument failed to lower, so the whole statement
+        // emits nothing" for a `Console.WriteLine(Mk()[1])`, or the #1386
+        // placeholder `0` for the same expression inside an interpolated
+        // string — a silently WRONG value at exit 0.
+        //
+        // §15.1 (v0.338) makes an inline array a VALUE type and `a[i]` its
+        // element read; nothing restricts the indexed operand to a named place.
+        // An rvalue base needs only the value: lower it, spill it to an entry
+        // alloca, and GEP into the spill — the same shape every other
+        // aggregate-value read in this file already uses.
+        //
+        // SCOPE, deliberately narrow. This is the READ path only; it is NOT
+        // added to `lvalueAddr`, which serves assignment targets as well, and
+        // `Mk()[1] := 9` is not a writable place under §28.3 (the temporary is
+        // not a binding). Making the read work must not make the write compile.
+        // The guard is the DECLARED base type: only an `[N]T` base reaches the
+        // spill, so no other operand shape's lowering changes. The base is
+        // lowered exactly ONCE, before the spill, so a call with side effects
+        // is evaluated once.
         llvm::Type* ety = nullptr;
         llvm::Value* addr = lvalueAddr(*ix->target, ety);
-        if (!addr || !ety) return nullptr;
+        if (!addr || !ety) {
+            const sema::TypeRef* baseTy = ctx_.exprType(*ix->target);
+            if (!baseTy || baseTy->kind != sema::TypeRef::Kind::InlineArray)
+                return nullptr;
+            llvm::Value* baseVal = lowerExpr(*ix->target);
+            if (!baseVal) return nullptr;
+            auto* baseArrTy = llvm::dyn_cast<llvm::ArrayType>(baseVal->getType());
+            if (!baseArrTy) return nullptr;
+            // An entry-block alloca, so the spill dominates every use including
+            // the IndexOutOfRangeException throw the bounds check below emits
+            // on its own edge. A plain `CreateAlloca` in the current block
+            // would not dominate the throw block.
+            llvm::AllocaInst* spill = entryAlloca(baseArrTy);
+            builder_.CreateStore(baseVal, spill);
+            addr = spill;
+            ety = baseArrTy;
+        }
         auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(ety);
         if (!arrTy) return nullptr;
         llvm::Value* idx = lowerExpr(*ix->indices[0].value);
