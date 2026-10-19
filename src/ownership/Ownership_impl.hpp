@@ -4407,6 +4407,78 @@ private:
     // owning choice is correctly NOT flagged here. // per §35.4, §9.7 (v0.220)
     bool isBorrowBearingChoice(const sema::TypeRef* rt) const;
 
+    // §9.7's COLLECTION bullet / §28.11 *Value-copy members* (fix #6468,
+    // v0.338) — the CONSTRUCTION channel of the same store rule that
+    // checkCollectionBorrowStoreEscape enforces at `.Add`/`Insert`/
+    // indexer-set and checkBorrowStoreEscape at a direct assignment.
+    //
+    // The two existing checks read the RHS/argument's own TYPE. A shape
+    // (i) COPY has no borrow-bearing type of its own — its result is an
+    // `Array<T>` / `Dictionary<K,V>` — so neither reaches it, and every
+    // construction form slipped past: the collection literal (§15.4,
+    // judged "element by element"), the inline array's `ToArray` (§15.1),
+    // range slicing (§15.6) and the other §28.11 shape-(i) materializers
+    // (`Sorted`, `Reversed`, `Slice`, `Split`, `ToSet`, `ToDictionary`, …).
+    // §28.11 states a copy's destination is "the field, collection or
+    // return slot it is placed in" and judges it "as a store of each
+    // placed value into the destination", so the check belongs where the
+    // destination is already classified.
+    //
+    // `dest` is the CALLER's already-computed destination class, reused
+    // verbatim so this channel and checkBorrowStoreEscape cannot drift:
+    // the field and out/ref-param cases are the positions that provably
+    // outlive every local of this frame, and the `targetLocal` case defers
+    // to the same `localDepth_` declaring-block comparison every sibling
+    // uses. Each diagnostic is located at the PLACED VALUE that carries the
+    // borrow, not at the whole RHS, so the caret names the offending element.
+    // `dest` is the assignment TARGET, consulted for the destination's own
+    // type: a collection literal "has no standalone type" (§15.4) so its
+    // `exprType` is null and the family's gate must read the annotation that
+    // supplies the target type instead.
+    //
+    // §9.7's collection bullet admits NO trust residual for a value type
+    // that holds borrows — "the store admits no trust residual for a
+    // record-carried borrow" — so a borrow-bearing RECORD / CHOICE / SPAN
+    // element is rejected on the destination ALONE (mirroring the
+    // `kind == RecvKind::Escapes` record leg of
+    // checkCollectionBorrowStoreEscape, likewise source-independent). A
+    // CLASS / INTERFACE element type is §28.11's own store rule with its
+    // residual: parameter-, receiver- and field-sourced elements are
+    // ADMITTED, and only an element whose borrow source is a scope-bound
+    // binding of this frame is rejected. isNullSourceRecordExpr /
+    // isNullSourceChoiceExpr exempt the §9.7 null-source form in both
+    // regimes. // per §9.7, §28.11, v0.338
+    bool checkCollectionCopyStoreEscape(
+        const ast::Expr& rhs, const ast::Expr& dest, bool destOutlivesFrame,
+        sema::LocalSymbol* targetLocal, EscapeScope scope);
+
+    // The construction forms §28.11 *Value-copy members* names as copies
+    // into the destination — its closing sentence: "An inline array's
+    // `ToArray` (§15.1), range slicing (§15.6) and a direct
+    // `FromCollectionLiteral` call are shape (i)'s copies; a collection
+    // literal is judged element by element (§15.4)." Returns the element
+    // expressions a construction places into its destination, or an empty
+    // vector when `e` is not one of those forms.
+    //
+    // A collection literal yields its own elements (§15.4's element-by-
+    // element judgement, for both the sequence form and the dictionary
+    // literal's key AND value positions — §15.4 makes the key position of
+    // a borrowing `Dictionary<K,V>` a borrowing position). A shape-(i) copy
+    // yields the elements it copies, which §28.11 sources from "its
+    // receiver, from each argument that is a collection, span or
+    // `IEnumerable`": the copy's placed values are judged by the SOURCE
+    // collection's own element borrows rather than re-derived from the
+    // result.
+    //
+    // Every shape is keyed on a NAME — `isBuiltinOwnedMaterializerCall`
+    // for the §28.11 materializers, which itself requires that sema
+    // resolved NOTHING (the premise that makes the member a builtin) — so
+    // no user member can be misread as a construction. Returns an empty
+    // vector — never a guess — for a shape it does not recognize. // per
+    // §15.4, §28.11
+    std::vector<const ast::Expr*> collectionCopyPlacedValues(
+        const ast::Expr& e) const;
+
     // §30.1 (v0.179, #1438): an `async` method / async iterator may not declare
     // a parameter, result, or (for an async iterator) element type that is a
     // borrow-bearing record (isBorrowBearingRecordOrSpan). An async method

@@ -10304,6 +10304,378 @@ sema::LocalSymbol* MethodOwnership::borrowingArrayLiteralLocalFieldStoreSource(
     return ls;
 }
 
+// fix #6468 (§15.4 / §28.11 *Value-copy members*, v0.338): recognize the
+// construction forms and return the element expressions each places into its
+// destination. See the declaration comment (Ownership_impl.hpp) for the spec
+// derivation; the two rules that govern the shapes:
+//
+//   - §28.11: "An inline array's `ToArray` (§15.1), range slicing (§15.6)
+//     and a direct `FromCollectionLiteral` call are shape (i)'s copies; a
+//     collection literal is judged element by element (§15.4)." — plus the
+//     other shape-(i) materializers §28.11's own text enumerates ("`Sorted`,
+//     `Reversed`, `Slice`, `Split`, …"), all of which
+//     `common::isBuiltinOwnedMaterializerCall` already names.
+//   - §28.11: "Each placed value carries the sources of its origin: a value
+//     from the receiver or from a collection or span argument carries what
+//     an element read from it carries" — so a shape-(i) copy's placed values
+//     are the SOURCE collection's elements, not anything re-derived from the
+//     result. Reading them off the receiver is what makes
+//     `_keep := xs.ToArray()` a store of `xs`'s element borrows, and equally
+//     what makes a FIELD- or PARAMETER-sourced `xs` admit (its elements'
+//     sources are the caller's, §28.11's residual).
+//
+// `Array<T>.FromCollectionLiteral(span)` is named by §28.11 but is NOT
+// recognized here: it is rejected today by a member-lookup defect that reports
+// `'Array' has no static method or property 'FromCollectionLiteral'` (§3.4)
+// before any ownership check can read it, so no program reaches this function
+// in that shape. That defect is filed separately — it shares no mechanism with
+// this one and folding it in would make both harder to review and to revert.
+//
+// Every branch returns an EMPTY vector for a shape it does not recognize, so
+// an unrecognized construction is a silent non-rejection rather than a guess.
+std::vector<const ast::Expr*>
+MethodOwnership::collectionCopyPlacedValues(const ast::Expr& e) const {
+    std::vector<const ast::Expr*> out;
+    // §15.4: the collection literal, judged element by element. The
+    // dictionary-literal form stores at BOTH positions — `keys` and
+    // `elements` — because §15.4 makes "the key and value positions alike" of
+    // a borrowing `Dictionary<K,V>` borrowing positions, and §28.11's store
+    // rule "reaches the key slot".
+    if (const auto* cl =
+            dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys)
+            if (k) out.push_back(k.get());
+        for (const auto& v : cl->elements)
+            if (v) out.push_back(v.get());
+        return out;
+    }
+    // §15.6: the range-slice INDEXER form `arr[0..2]`, a shape-(i) copy in its
+    // own right (§28.11 names it alongside `ToArray`). The receiver is the
+    // source collection. Gated on the same sanctioned predicate §21.1 uses
+    // (`isBuiltinArrayRangeSliceIndex`), which requires a builtin `Array<T>`
+    // receiver that sema resolved as a slice — so a user `Slice` member and
+    // an ordinary `arr[i]` index both decline.
+    if (const auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        if (common::isBuiltinArrayRangeSliceIndex(*ix, ctx_) && ix->target)
+            return collectionCopyPlacedValues(*ix->target);
+        return out;
+    }
+    // A bare-identifier SOURCE COLLECTION: resolve it to the construction it
+    // was bound from, so `xs.ToArray()` is judged by `xs`'s OWN element
+    // borrows. §28.11: "a value from the receiver or from a collection or span
+    // argument carries what an element read from it carries" — and an element
+    // read of `xs` carries whatever the literal `xs` was built from. This is
+    // the same one-hop resolution `borrowingArrayLiteralFieldStoreSource`
+    // performs for the field-store case (read that function's header comment
+    // for why `states_` cannot answer it: a bare `[...]` local is classified
+    // Borrowed by producerState for DISPOSAL-BOOKKEEPING, so the general
+    // borrow-source machinery structurally cannot see it as a live source).
+    //
+    // The recursion is bounded by the local's DECLARATION, not by a dataflow
+    // walk, so it terminates: it descends only into a LocalDecl / LocalConstDecl
+    // initializer and only while that is itself one of the shapes above. A
+    // PARAMETER or FIELD receiver resolves to a ParameterSymbol / FieldSymbol
+    // and is deliberately NOT followed — §28.11's store rule admits
+    // "parameter-sourced … receiver-sourced, and field-sourced borrows" under
+    // its residual, and the caller's storage is exactly what outlives this
+    // frame. A local with no recognized initializer declines (an empty vector,
+    // i.e. no rejection) rather than guessing.
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (!dynamic_cast<sema::ParameterSymbol*>(sym) &&
+            !dynamic_cast<sema::FieldSymbol*>(sym)) {
+            if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                if (!ls->decl) return out;
+                const ast::Expr* init = nullptr;
+                if (const auto* ld =
+                        dynamic_cast<const ast::LocalDecl*>(ls->decl))
+                    init = ld->initializer.get();
+                else if (const auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(
+                             ls->decl))
+                    init = lcd->value.get();
+                if (init)
+                    return collectionCopyPlacedValues(*init);
+            }
+        }
+    }
+    const auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!call) return out;
+    // §28.11's shape-(i) materializers: `ToArray` (§15.1), `Sorted`,
+    // `Reversed`, `Slice`, `Split`, `ToSet`, `ToDictionary`. The predicate
+    // requires that sema resolved NOTHING for the callee, which is what makes
+    // the member a stdlib builtin rather than a user's own method — so a user
+    // `ToArray()` of the same name can never be read as a construction.
+    if (common::isBuiltinOwnedMaterializerCall(*call, ctx_)) {
+        // The copied elements come from the RECEIVER, then from each argument
+        // that is itself a collection / span / `IEnumerable` (§28.11's "from
+        // its receiver, from each argument that is a collection, span or
+        // `IEnumerable` over one of the result's element types"). Arguments
+        // are scanned in order and the receiver first, so the diagnostic
+        // points at the earliest-placed borrow.
+        if (call->callee) {
+            if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call->callee.get())) {
+                if (ma->target) {
+                    std::vector<const ast::Expr*> fromRecv =
+                        collectionCopyPlacedValues(*ma->target);
+                    out.insert(out.end(), fromRecv.begin(), fromRecv.end());
+                }
+            }
+        }
+        for (const auto& a : call->args) {
+            if (!a.value || !a.modifier.empty()) continue;
+            std::vector<const ast::Expr*> fromArg =
+                collectionCopyPlacedValues(*a.value);
+            out.insert(out.end(), fromArg.begin(), fromArg.end());
+        }
+        return out;
+    }
+    return out;
+}
+
+// fix #6468 (§9.7's collection bullet / §28.11, v0.338): the store rule at a
+// collection CONSTRUCTION. See the declaration comment for the derivation and
+// for why the destination class arrives as a parameter rather than being
+// recomputed. Returns true when a diagnostic was reported.
+//
+// THE TWO REGIMES ARE §28.11's OWN, AND THEY DIFFER:
+//
+//   - A VALUE TYPE THAT HOLDS BORROWS (a borrow-bearing record, choice or
+//     builtin span as the element type) is §9.7's collection bullet, which
+//     "admits no trust residual for a record-carried borrow". The destination
+//     ALONE decides: an escaping destination rejects, with no source lookup
+//     at all. This mirrors the `kind == RecvKind::Escapes` record leg of
+//     checkCollectionBorrowStoreEscape, which is likewise source-independent
+//     for the same reason (§9.7's "regime uniformity" — a record-carried
+//     borrow's access paths bypass the disposed-flag check).
+//   - A CLASS / INTERFACE element type is §28.11's OWN store rule, WITH its
+//     recorded residual: "parameter-sourced (a parameter that is not
+//     `owned`), receiver-sourced, and field-sourced borrows are admitted". So
+//     the rejection needs a scope-bound source, read with the same
+//     `ownedLocalBorrowSource` authority the `.Add` leg uses at the matching
+//     destination class. A plain parameter's borrow is the caller's and is
+//     admitted; a field's likewise.
+//
+// Both exempt §9.7's null-source form, and both are TYPE-gated first so that
+// every element type that holds no borrow (int, string, a value record, a
+// sendable element) is left to copy freely — §28.11: "A copy whose elements
+// carry no borrow … is a copy and nothing more."
+bool MethodOwnership::checkCollectionCopyStoreEscape(
+    const ast::Expr& rhs, const ast::Expr& dest, bool destOutlivesFrame,
+    sema::LocalSymbol* targetLocal, EscapeScope scope) {
+    const std::vector<const ast::Expr*> placed =
+        collectionCopyPlacedValues(rhs);
+    if (placed.empty()) return false;
+
+    // §28.11 GOVERNS THE COLLECTION FAMILIES ONLY. Its element slot policy is
+    // stated over `Array<T>` / `Set<T>` / `Dictionary<K,V>` / … and their
+    // owning twins — heap-backed containers whose slots are reached through a
+    // reference. An INLINE ARRAY `[N]T` is a VALUE type governed by §15.1, and
+    // §28.11's move-only row names the owning-inline-array form as a separate
+    // thing rather than folding it into the collection families. Without this
+    // gate the check over-rejects the inline-array twin of #4478: a
+    // borrow-bearing record in a VALUE-typed `[1]BorrowRec` field slot is
+    // accepted on the pre-fix tree (that test's own control row), and §8.6's
+    // boxing rule — not §28.11 — is what governs the interface-typed `[1]
+    // IHolder` case beside it. An inline-array destination therefore declines
+    // here; the inline-array store rules live in checkBorrowStoreEscape's own
+    // #4478 legs, which stay the authority for them.
+    //
+    // The gate is the COLLECTION's type. For a shape-(i) copy the result IS the
+    // constructed collection and its `exprType` answers. For a collection
+    // LITERAL it cannot: §15.4 states a literal "has no standalone type" and
+    // is typed only by the context that supplies a target type, so its
+    // `exprType` is null — the annotation is the only place the family is
+    // visible, and it is read off the assignment TARGET here. Both spellings
+    // therefore resolve to the same question ("are these slots §28.11
+    // collection slots?"), which is what keeps the two construction forms from
+    // disagreeing about whether they are in scope at all.
+    //
+    // A declaration-less Named TypeRef whose head is one of §28.11's families; a
+    // user-declared type is never one, and its ingress members carry their own
+    // §28.14 obligations rather than this rule.
+    const sema::TypeRef* rt = ctx_.exprType(rhs);
+    if (!rt) rt = ctx_.exprType(dest);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    {
+        std::string_view head;
+        if (!rt->aliasResolvedHead.empty())
+            head = rt->aliasResolvedHead;
+        else if (rt->astNode && rt->astNode->name &&
+                 !rt->astNode->name->parts.empty())
+            head = rt->headName();
+        else if (!rt->importedName.empty())
+            head = rt->importedName;
+        // §28.11's two families, verbatim. `Owning*` is included because
+        // §28.11 states one element slot policy for BOTH families; the owning
+        // family's ingress takes `owned` (§28.8 transfer), so a BORROW-bearing
+        // element reaching one is exactly the mismatch this rejects.
+        const bool collectionFamily =
+            head == "Array" || head == "Dictionary" ||
+            head == "SortedDictionary" || head == "Set" ||
+            head == "SortedSet" || head == "Stack" || head == "Queue" ||
+            head == "LinkedList" || head == "OwningArray" ||
+            head == "OwningDictionary" || head == "OwningSet" ||
+            head == "OwningStack" || head == "OwningQueue" ||
+            head == "OwningLinkedList" || head == "OwningSlotMap";
+        if (!collectionFamily) return false;
+    }
+
+    // §28.11 / §9.7: a copy whose elements carry no borrow is a copy and
+    // nothing more. The element type is read off each PLACED value (the
+    // literal's own element type; the source collection's element type for a
+    // shape-(i) copy, since the copy preserves T). `isBorrowableType` is the
+    // §28.11 class/interface gate and is deliberately conservative (unknown →
+    // borrowable); the §3.6 "holds borrows" gate is the value-type one, and is
+    // read over the same nullable stripping the spec's §3.6 row requires
+    // (each predicate strips `V?` to `V` itself — see their declarations).
+    for (const ast::Expr* v : placed) {
+        if (!v) continue;
+        const sema::TypeRef* vt = ctx_.exprType(*v);
+        if (!vt) continue;
+        const bool holdsBorrows =
+            isBorrowBearingRecord(vt) || isBorrowBearingChoice(vt) ||
+            isBorrowBearingRecordOrSpan(vt);
+        const bool borrowSlot = isBorrowableType(vt);
+        if (!holdsBorrows && !borrowSlot) continue;
+
+        // §9.7's null-source exemption, in both regimes: a value whose
+        // borrow-carrying components are all `null` carries no borrow to
+        // bound. The §28.11 class/interface regime has no such form (a class
+        // element is a borrow by construction), so this applies only to the
+        // holds-borrows side.
+        if (holdsBorrows) {
+            const bool nullSource =
+                isBorrowBearingChoice(vt)
+                    ? isNullSourceChoiceExpr(*v)
+                    : (isBorrowBearingRecord(vt)
+                           ? isNullSourceRecordExpr(*v)
+                           : false);  // a builtin span has no null-source form
+            if (nullSource) continue;
+        }
+
+        // REGIME 1 — a value type that holds borrows, rejected on the
+        // destination alone (§9.7: no trust residual).
+        if (holdsBorrows) {
+            bool reject = destOutlivesFrame;
+            if (!reject && targetLocal && scope == EscapeScope::Method) {
+                // The local-destination face: §9.7 rejects a store "whose
+                // binding's scope strictly encloses a carried source's
+                // scope". The source is read off the placed value's own
+                // carried provenance (the same authority
+                // carriedBorrowSourceOfValueExpr serves the outer-local arm
+                // below), and an UNKNOWN depth on either side declines —
+                // exactly as that arm does, and as §28.11's residual posture
+                // requires for what the structural check cannot decide.
+                if (sema::Symbol* src =
+                        carriedBorrowSourceOfValueExpr(*v)) {
+                    auto depthOfDecl = [&](const ast::Node* d) -> int {
+                        auto it = localDepth_.find(d);
+                        return it == localDepth_.end() ? -1 : it->second;
+                    };
+                    const int td = targetLocal->decl
+                                       ? depthOfDecl(targetLocal->decl)
+                                       : -1;
+                    const int sd = src->decl ? depthOfDecl(src->decl) : -1;
+                    reject = (td >= 0 && sd >= 0 && td < sd);
+                }
+            }
+            if (reject) {
+                const bool spanForm = isBuiltinSpanTypeRef(vt);
+                std::string msg;
+                if (spanForm) {
+                    msg =
+                        "a span copied into a collection at this construction "
+                        "would outlive the backing store it views — a value "
+                        "type that holds borrows may not reach a destination "
+                        "its carried sources' scopes do not bound, and the "
+                        "collection here is a field or escapes this method "
+                        "(§9.7 collection bullet, stdlib §4.14 / §4.15; store "
+                        "the backing Array / OwningBuffer instead and "
+                        "re-derive the span at the use site)";
+                } else {
+                    const std::string carrier =
+                        isBorrowBearingChoice(vt) ? "choice" : "record";
+                    msg = std::string("a borrow-bearing ") + carrier +
+                          " copied into a collection at this construction "
+                          "would outlive the source of a borrow it contains — "
+                          "a value type that holds borrows is stored past its "
+                          "bound at a destination its carried sources' scopes "
+                          "do not bound, and this store admits no trust "
+                          "residual (§9.7 collection bullet / §28.11 element "
+                          "slot policy; store the source instead, or use a "
+                          "destination in a block that outlives every carried "
+                          "source)";
+                }
+                report(Severity::Error, v->span.begin, msg);
+                return true;
+            }
+            continue;
+        }
+
+        // REGIME 2 — a class / interface element type: §28.11's store rule
+        // WITH its residual, so a source must be found. `LocalOrOwnedParam`
+        // matches the `.Add` leg's choice at a destination that provably
+        // outlives this frame (an `owned` parameter is disposed at the
+        // method's end, §28.3 *Auto-drop (affine)*, so its borrow dangles the
+        // moment this method returns); a local destination defers to the
+        // declaring-block comparison, for which an `owned` parameter has no
+        // operand and needs none.
+        const OwnedSourceKinds kinds =
+            destOutlivesFrame ? OwnedSourceKinds::LocalOrOwnedParam
+                              : OwnedSourceKinds::LocalOnly;
+        sema::Symbol* src = ownedLocalBorrowSource(*v, kinds);
+        if (!src && scope == EscapeScope::LambdaBody)
+            src = enclosingFrameOwnedLocalBorrowSource(*v, kinds);
+        if (!src) {
+            // §28.11's residual: a parameter-, receiver- or field-sourced
+            // element is ADMITTED here, so there is no rejection to report.
+            // The trust-admission report itself belongs to the `.Add`
+            // channel (checkCollectionBorrowStoreEscape), which is where the
+            // spec's "the trust-admission report names a parameter-, receiver-
+            // or field-path-sourced element at its store" is discharged; this
+            // channel adds the missing rejection and does not re-report.
+            continue;
+        }
+        bool reject = destOutlivesFrame;
+        if (!reject && targetLocal && scope == EscapeScope::Method) {
+            auto depthOfDecl = [&](const ast::Node* d) -> int {
+                auto it = localDepth_.find(d);
+                return it == localDepth_.end() ? -1 : it->second;
+            };
+            const int td =
+                targetLocal->decl ? depthOfDecl(targetLocal->decl) : -1;
+            const int sd = src->decl ? depthOfDecl(src->decl) : -1;
+            reject = (td >= 0 && sd >= 0 && td < sd);
+        }
+        if (!reject) continue;
+        const std::string srcName(src->name);
+        const std::string scopeEnd =
+            isOwnedParamSymbol(src) ? "method" : "block";
+        const std::string destDesc =
+            destOutlivesFrame
+                ? "reachable beyond this method's scope (a field, or a "
+                  "caller-owned parameter location)"
+                : "bound in an enclosing scope";
+        report(Severity::Error, v->span.begin,
+               "borrow of `" + srcName +
+                   "` copied into a collection at this construction would "
+                   "outlive its source — `" +
+                   srcName + "` is a scope-bound binding disposed at the end "
+                   "of its " + scopeEnd +
+                   ", while the collection here is " + destDesc +
+                   ", which outlives it (§28.11 borrowing-collection store "
+                   "rule, read at the construction per its *Value-copy "
+                   "members* clause; keep `" +
+                   srcName +
+                   "` alive at least as long as the collection, or store into "
+                   "an owning-family collection and transfer ownership)");
+        return true;
+    }
+    return false;
+}
+
 bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
                                              EscapeScope scope) {
     if (as.op != ":=") return false;
@@ -10786,7 +11158,34 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
         }
     }
 
-    // §9.7 / §4.14 / §4.15 (v0.307): the OUTER-LOCAL face of the borrow-
+    // fix #6468 (§9.7's collection bullet / §28.11 *Value-copy members*,
+    // v0.338): the CONSTRUCTION channel. Every leg above reads the RHS's own
+    // TYPE, but a shape-(i) copy's type is the constructed `Array<T>` /
+    // `Dictionary<K,V>` — never borrow-bearing — so no construction form was
+    // ever reached: not the collection literal (§15.4, judged element by
+    // element), not `ToArray` (§15.1), not range slicing (§15.6), not the
+    // other §28.11 materializers. §28.11 judges a copy "as a store of each
+    // placed value into the destination", and names the destination as "the
+    // field, collection or return slot it is placed in" — the very
+    // classification `dest` / `targetLocal` above already carry. Runs only
+    // for a target this function has classified (a field, an out/ref
+    // parameter, or a local decided by declaring-block depth); a target that
+    // is none of those is `Dest::None` with no `targetLocal` and the function
+    // has already returned above. The construction check itself declines when
+    // it recognizes no construction, so a plain RHS is untouched.
+    //
+    // `destOutlivesFrame` is the `Dest::Field` / `Dest::OutParam` case (the
+    // target's storage provably outlives every local of this frame); a local
+    // target leaves `dest` at `Dest::None` and is decided by `targetLocal`'s
+    // declaring-block depth instead.
+    if (dest != Dest::None || targetLocal) {
+        if (checkCollectionCopyStoreEscape(*as.value, *as.target,
+                                           dest != Dest::None, targetLocal,
+                                           scope))
+            return true;
+    }
+
+
     // bearing-record / builtin-span store escape. §9.7's FIRST borrow-lifetime
     // bullet — "a borrow-bearing record value may not outlive the source of
     // any borrow it contains" — is enforced today at the three destinations
