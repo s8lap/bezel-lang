@@ -657,6 +657,52 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
         RecordSubstGuard keySubst(this, ty);
         return buildChoiceHashTrampoline(ty->declaration);
     }
+    // fix #6207 (spec §8.3 body-only-record row / stdlib §9.8, v0.338): `Range<T>`
+    // is the compiler-intrinsic RECORD stdlib §9.8 declares, so §8.3's
+    // body-only-record row gives it "property-by-property value equality" and
+    // hash "of the same". `recordTypeOfRef` does not see it as a record — the
+    // `Class`-stamped builtin stub `builtinClassSym("Range")` hands out is
+    // `TypeDeclKind::Class`, not `TypeDeclKind::Record` — so this arm is where a
+    // `Range<T>` KEY gets its §8.3 pair, and it must sit BEFORE the
+    // `hasObjectHeaderEquality` arm below. That predicate tests only
+    // `kind == Class || kind == Interface`, and a `Range<T>` TypeRef KEEPS its
+    // builtin declaration (ExprTypecheck_Exprs.cpp and TypeResolution_Names.cpp
+    // both re-attach `builtinClassSym("Range")`, where most other value builtins
+    // resolve with `declaration = nullptr`), so without this arm the key is
+    // classified as a REFERENCE and `lowerObjectGetHashCode` reads word 0 of the
+    // `{i64,i64,i64,i8}` range storage as a vtable pointer.
+    //
+    // MEASURED (issue #6207): `Dictionary<Range<int>, int>` compiled with no
+    // diagnostic and SEGV'd (rc 139) in `bz_obj_is_string` at address `0x1` for
+    // `1..5`, `0x7` for `7..9`, `0x3` for `3..4` — the faulting address is
+    // exactly that range's `Start`, i.e. a fully-initialised integer dereferenced
+    // as an object pointer.
+    //
+    // The body is `emitRangeStorageHash`, the ONE definition fix #4126 introduced
+    // for this type and already shares with the direct `r.GetHashCode()` member
+    // (`lowerValueSemMethodOn`, LlvmBackend_Calls2.cpp) and the box vtable thunk
+    // (`ensureRangeBoxVtable`), so the boxed, unboxed and dictionary-key spellings
+    // cannot drift and §8.3's "if `a.Equals(b)` then `a.GetHashCode() =
+    // b.GetHashCode()`" holds across all three by construction. §8.3's
+    // order-sensitivity requirement ("the combining function **must be
+    // order-sensitive**"; plain XOR does not satisfy it) is `emitRangeStorageHash`'s
+    // own rotate-before-XOR combiner.
+    if (isRangeType(ty)) {
+        llvm::Type* rlt = lowerTypeRef(ty);
+        auto* rfty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+        auto* rfn = llvm::Function::Create(
+            rfty, llvm::Function::InternalLinkage, "bz$valkey$hash", module_.get());
+        auto savedIPr = builder_.saveIP();
+        llvm::Function* savedFnr = currentFn_;
+        currentFn_ = rfn;
+        builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", rfn));
+        llvm::Value* rv = builder_.CreateLoad(rlt, rfn->getArg(0), "key.rngval");
+        llvm::Value* rh = emitRangeStorageHash(rv);
+        builder_.CreateRet(builder_.CreateZExt(rh, i64()));
+        builder_.restoreIP(savedIPr);
+        currentFn_ = savedFnr;
+        return rfn;
+    }
     llvm::Type* lt = lowerTypeRef(ty);
     auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
@@ -756,6 +802,20 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
     // vtable slot rather than falling to the plain pointer ICmp below, which
     // would silently ignore an override the hash trampoline DOES honour and
     // break §8.3's hash/equality agreement inside the table.
+    // fix #6207 (spec §8.3 body-only-record row / stdlib §9.8, v0.338): the
+    // equality half of `buildValueHashTrampoline`'s Range arm above, and it must
+    // precede the `hasObjectHeaderEquality` dispatch below for the same reason —
+    // that predicate classifies the `Class`-stamped `Range` builtin stub as a
+    // reference. `emitRangeStorageEquals` is the ONE definition #4126 introduced,
+    // already shared with the direct `r.Equals(other)` member and the box vtable
+    // thunk, so the hash and equality halves read the same pair and §8.3's law
+    // holds across the boxed, unboxed and dictionary-key spellings.
+    if (isRangeType(ty)) {
+        builder_.CreateRet(emitRangeStorageEquals(a, b));
+        builder_.restoreIP(savedIP);
+        currentFn_ = savedFn;
+        return fn;
+    }
     llvm::Value* eq =
         hasObjectHeaderEquality(ty) ? lowerObjectEquals(a, b) : nullptr;
     if (eq) {
