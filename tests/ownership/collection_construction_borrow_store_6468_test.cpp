@@ -172,10 +172,26 @@ BEZEL_TEST(collection_construction_store_6468,
 
 // RANGE SLICING, the third shape §28.11 names: "`ToArray` (§15.1), range
 // slicing (§15.6) and a direct `FromCollectionLiteral` call are shape (i)'s
-// copies". #6468 could not probe this spelling (its author reported the
-// `xs[0..1]` attempt died at run time and suspected a probe artifact); the
-// §15.6 form is `xs[0..2]` over a two-element source, which reaches the same
-// rule.
+// copies".
+//
+// The probe is `xs[0..1]` over a TWO-element source, which is IN BOUNDS. An
+// earlier version of this comment claimed the opposite: it recorded that
+// `#6468`'s author saw `xs[0..1]` "die at run time", called that a probe
+// artifact, and substituted `xs[0..2]` over the same two-element source.
+//
+// That was inverted, and the substituted form was the broken one. §16.4 /
+// spec line 3171 is explicit — "`..` produces **inclusive** iteration; `..<`
+// excludes the upper bound" — so on a two-element array `xs[0..2]` asks for
+// index **2**, which does not exist. MEASURED on this tip, both arms
+// compiling clean (rc 0):
+//
+//   xs[0..2] over [10,20]  → Unhandled exception: System.IndexOutOfRangeException, exit 70
+//   xs[0..1] over [10,20]  → prints 2, exit 0
+//
+// `xs[0..1]` was never an artifact. It is the legal §15.6 form, and it reaches
+// the same rule — which is why it is the row's shape now. The out-of-bounds
+// form was green here only because this row is compile-only; had it ever
+// become a `runAot` row it would have thrown rather than exercised the rule.
 BEZEL_TEST(collection_construction_store_6468,
            range_slice_record_element_into_field_rejected) {
     auto r = parseAndCheckOwnership(
@@ -189,11 +205,37 @@ BEZEL_TEST(collection_construction_store_6468,
         "  public method Stash() "
         "    using var it := new Item(); "
         "    var xs: Array<Pair> := [new Pair(it), new Pair(it)]; "
-        "    _kp := xs[0..2]; "
+        "    _kp := xs[0..1]; "
         "  end Stash; "
         "end Box;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(rejectsHoldsBorrowsConstruction(r, "record"));
+}
+
+// The ADDITIVE twin of the row above, and the reason that row is not vacuous:
+// the SAME §15.6 range-slice spelling into the SAME field destination, with
+// elements that carry no borrow, is a program §28.11 ADMITS ("a copy whose
+// elements carry no borrow"). Both are in-bounds slices of a two-element source.
+//
+// Without this row the reject above would still be green if the rule were keyed
+// on the SLICE rather than on what the slice carries — it would be rejecting
+// every §15.6 range slice in the language. This is the "the diagnostic NAMES
+// what is rejected" discipline applied to the acceptance side: the two rows
+// bracket the boundary exactly as `Set<Range<int>> := [1..5]` and
+// `Set<Range<int>> := []` bracket it in #6207's fix-forward.
+BEZEL_TEST(collection_construction_store_6468,
+           range_slice_borrow_free_element_into_field_accepted) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Box "
+        "  public owned _kp: Array<int>; "
+        "  public constructor() _kp := new Array<int>(); end constructor; "
+        "  public method Stash() "
+        "    var xs: Array<int> := [7, 9]; "
+        "    _kp := xs[0..1]; "
+        "  end Stash; "
+        "end Box;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // §9.7's second named spelling: "`var ys := xs.ToArray();` over a local
