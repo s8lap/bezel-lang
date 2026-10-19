@@ -779,7 +779,45 @@ BEZEL_TEST(sema_extension,
         "  public method FirstCount(): int => this.Count; "
         "end; "
         "class C public static method Main(): int return 0; end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // Note: the HEAD is what this row is about — `T` sits in
+    // `Array<...>`'s argument position, so §26.4's binding walk reaches it
+    // and the function-slot diagnostic must not fire. The BODY is
+    // incidental: `this.Count` names no member, because stdlib §4.12
+    // declares `IEnumerable<out T>` with exactly one member
+    // (`GetEnumerator`) and the count is stdlib §5's
+    // `method Count(): int` — a METHOD, spelled with parentheses (#6389).
+    // So the program is correctly REJECTED, and `!hasErrors()` would make
+    // the body shape load-bearing on a row whose stated target is the head.
+    // We assert the function-slot diagnostic specifically — as our
+    // Dictionary sibling below already does — and additionally pin the
+    // diagnostic that DOES fire, which is what shows the head bound T
+    // rather than failing to: a head that failed to bind T would report an
+    // unresolved-type diagnostic instead, not this member one.
+    //
+    // Both conjuncts are non-vacuous:
+    //   (1) fails on `extension IEnumerable<Array<(T) -> T>>` — the same
+    //       body under a head that DOES put T in a function slot, which
+    //       emits "…function slot… (§26.4)".
+    //   (2) fails if #6389's rejection is withdrawn, or if any second
+    //       diagnostic (a head-binding regression, say) appears.
+    int diagCount = 0;
+    bool sawFunctionSlot = false;
+    bool sawCountMember = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        ++diagCount;
+        if (d.message.find("function slot") != std::string::npos)
+            sawFunctionSlot = true;
+        if (d.message.find("no member `Count`") != std::string::npos &&
+            d.message.find("IEnumerable<T>") != std::string::npos)
+            sawCountMember = true;
+    }
+    // (1) T is in an argument position: the §26.4 function-slot diagnostic
+    // must NOT fire. This is the row's documented purpose.
+    BEZEL_EXPECT_FALSE(sawFunctionSlot);
+    // (2) and the single diagnostic that does fire is #6389's stdlib §5
+    // operator member diagnostic — the head itself is clean.
+    BEZEL_EXPECT_TRUE(sawCountMember);
+    BEZEL_EXPECT_EQ(diagCount, 1);
 }
 
 // §26.4 accept-control (per the issue's "Regression tests" section):
