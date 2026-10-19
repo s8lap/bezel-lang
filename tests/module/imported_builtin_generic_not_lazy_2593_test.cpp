@@ -25,10 +25,10 @@
 // diagnostic that also misnames the receiver `IEnumerable<T>.Contains`.
 //
 // Both sibling copies of this predicate already carry the same guard for the
-// same reason — `isLazyEnumerableType` in LlvmBackend_Calls3.cpp:38-39 (whose
-// comment names §2.5/§29.3 and #495 explicitly) and the copy in
-// DefiniteAssignment.cpp:691 ("Must match isLazyEnumerableType() in codegen").
-// This test pins the third.
+// same reason — `Emitter::isLazyEnumerableType` in LlvmBackend_Calls3.cpp:35
+// (whose comment names §2.5/§29.3 and #495 explicitly) and
+// `isLazyEnumerableExprType` in DefiniteAssignment.cpp:1259 ("Must match
+// isLazyEnumerableType() in codegen"). This test pins the third.
 //
 // It is a POSITIVE control, and it asserts the absence of the §7 DIAGNOSTIC
 // rather than overall compile success — deliberately. The imported class-`T`

@@ -19306,10 +19306,10 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // `genericArgs[0]` and REJECT LEGAL CODE, because the
     // `spanBufferSkipClassT` exemption below keys on a `colName` that is
     // empty for the imported form. Both sibling copies of this predicate
-    // carry the same term for the same reason: `isLazyEnumerableType` in
-    // LlvmBackend_Calls3.cpp:38-39 and the copy in DefiniteAssignment.cpp:691
-    // ("Must match isLazyEnumerableType() in codegen"). Keep all three in
-    // step.
+    // carry the same term for the same reason: `Emitter::isLazyEnumerableType`
+    // in LlvmBackend_Calls3.cpp:35 and `isLazyEnumerableExprType` in
+    // DefiniteAssignment.cpp:1259 ("Must match isLazyEnumerableType() in
+    // codegen"). Keep all three in step.
     //
     // Restricted to `Contains` by NAME, not by arity. stdlib §5 declares
     // exactly one operator whose parameter is the bare element type —
@@ -26825,7 +26825,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // cannot be stranded.
                 //
                 // The predicate is byte-for-byte codegen's `isLazyEnumerableType`
-                // (src/codegen/LlvmBackend_Calls3.cpp:28) and sema's
+                // (src/codegen/LlvmBackend_Calls3.cpp:35) and sema's
                 // `isLazyEnumerableExprType`
                 // (src/sema/DefiniteAssignment.cpp:1259), both of which state
                 // that they must match each other. The `importedName.empty()`
