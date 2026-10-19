@@ -10386,6 +10386,18 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
                     fieldLend6397 =
                         dynamic_cast<sema::FieldSymbol*>(
                             ctx_.exprSymbol(*eg6397)) != nullptr;
+            // fix #6447 (§28.2, §28.9, v0.338): the map above answers only on
+            // the face that published it, so its `false` is not evidence of a
+            // claim — it is the ABSENCE of one, and it is absence on the
+            // vtable/itable face for EVERY block-bodied getter, plus absence
+            // for a laundering one (`get do var t := _a; return t; end`) on
+            // every face, because `lowerReturn`'s own test is one hop and
+            // stops at the local. `computedGetterOf` is null for a block body,
+            // so nothing above could see either case. Ask the BODY instead;
+            // see `blockGetterReturnsFieldLend` for the rule and for why a
+            // wrong `true` can only cost a leak.
+            if (!fieldLend6397)
+                fieldLend6397 = blockGetterReturnsFieldLend(ps6397);
             sourceIsNamedLocal =
                 sema::isAutoPropertyStorageSymbol(ps6397, ctx_) ||
                 (fieldLend6397 && !minted6397);
@@ -10927,6 +10939,14 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                     fieldLend6397b =
                         dynamic_cast<sema::FieldSymbol*>(
                             ctx_.exprSymbol(*eg6397b)) != nullptr;
+            // fix #6447 (§28.2, §28.9, v0.338): the TWIN of the term in
+            // `lowerIEnumerableBuiltinFor`. Both `for`-in consumers derive
+            // `fieldLend` from the same two places and MUST agree — one arm
+            // answering `true` where its twin answers `false` gives the same
+            // program two reclamation verdicts depending on which overload
+            // its source type selects.
+            if (!fieldLend6397b)
+                fieldLend6397b = blockGetterReturnsFieldLend(ps6397b);
             sourceIsNamedOwner =
                 sema::isAutoPropertyStorageSymbol(ps6397b, ctx_) ||
                 (fieldLend6397b && !minted6397b);

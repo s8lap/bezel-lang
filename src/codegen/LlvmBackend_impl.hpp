@@ -7871,6 +7871,30 @@ private:
     // computedGetterOf above.
     const ast::PropertyAccessor* blockGetterOf(sema::Symbol* sym);
 
+    // fix #6447 (§28.2, §28.9, §29.2, v0.338): does this property's BLOCK-form
+    // getter hand back storage some holder already keeps alive — i.e. does
+    // EVERY `return` in its body denote a FIELD read, possibly reached through
+    // locals bound to field reads?
+    //
+    // This is the block-bodied counterpart of the question `computedGetterOf`
+    // already answers for the expression-bodied spelling, and it is asked of
+    // the accessor's AST DIRECTLY rather than read out of
+    // `propBlockGetterReturnKinds_`. Directness is the point: the map is
+    // written by whichever lowering face emitted the accessor, and the
+    // vtable/itable face (`ensurePropertyAccessorFn`) publishes no per-return
+    // verdict at all, so a map-keyed answer is structurally absent on the
+    // `virtual` / interface-dispatch spelling. Provenance through a body is a
+    // syntactic property of the body, so it has no reason to depend on the
+    // face that happened to lower it.
+    //
+    // FALSE IS ALWAYS THE SAFE ANSWER. Every caller feeds the verdict into
+    // `fieldLend && !minted` → `sourceIsNamedLocal`, whose FALSE branch
+    // registers the loop-end reclamation. So a wrong `true` can only cost a
+    // leak, never a use-after-free. It also declines outright on any face
+    // where §29.2's mint is never published, so `!minted` cannot veto — see
+    // the face guard at the definition.
+    bool blockGetterReturnsFieldLend(sema::Symbol* sym);
+
     // Emit (or retrieve cached) a standalone LLVM function for a block-form
     // property getter body (`get => do…end;`).  Calling it with `this` as the
     // sole argument returns the getter's value — avoids premature `ret` in the
