@@ -810,7 +810,6 @@ s15_1_0005	fail	divergence
 s15_1_0006	pass	
 s15_1_0007	pass	
 s15_1_0008	pass	
-s15_1_0009	fail	output mismatch: expected '4\n9', got '4' (for-accumulator lowering, #3079 argument-failed-to-lower)
 s15_1_0010	pass	
 s15_1_0011	pass	
 s15_1_1_0001	pass	
