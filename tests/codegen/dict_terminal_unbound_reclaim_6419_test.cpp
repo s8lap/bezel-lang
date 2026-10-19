@@ -767,40 +767,50 @@ BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
         "606");
 }
 
-// THE TABLE IS STILL RECLAIMED. The escape axis declines the VALUE DISCHARGE,
-// not the free — so on the `.First` arm the header, the bucket array, the
-// insertion-order spine and every per-key byte copy are still reclaimed (the
-// returned entry points into none of them: its Key is rebuilt fresh by
-// `decodeDictStringKeyAt`, its Value is a `bz_string*` the dict free does not
-// own). This row pins that with a LEAK CEILING, which is the only observable
-// that distinguishes "declined the discharge" from "declined the reclaim".
+// THE TABLE IS STILL RECLAIMED, AND THE VALUE COLUMN IS NOW DISCHARGED. This
+// row began life as a LEAK CEILING — the only observable that could
+// distinguish "declined the value DISCHARGE" from "declined the whole reclaim"
+// back when #6419's escape axis had to decline the discharge (its measured
+// 7,272 B / 404 allocs sat ~2.7x below a 20,000 B ceiling and ~2.5x above the
+// 49,894 B / 909 allocs of the blunt remedy it rejected). A ceiling passes at
+// 0 exactly as readily as at 7,272, so as an ORACLE it was a tolerance, not an
+// assertion: it could not tell "discharged" from "declined".
 //
-// Measured at 101 iterations over the 2-entry `strValProducer()`
-// (`bezelc --sanitize=address`, ASAN_OPTIONS=detect_leaks=1), and the ceiling
-// row was MEASURED green/red against a build carrying the blunt remedy rather
-// than assumed:
+// fix #6470 (v0.338) removed the reason for the tolerance. The terminal now
+// MINTS the +1 on the decoded value (so the returned entry's Value is the
+// caller's own reference rather than a borrow of the receiver's `e.val`,
+// per §28.11's operations table reading a shared-reference slot as "reference
+// out"), the reclaim discharges the value column in full, and a
+// `dictEntryValueRelease` Disposal discharges the caller's +1 at the entry
+// local's scope end. Nothing leaks on this shape any more, so the bound is
+// tightened from a ceiling to an EXACT ZERO.
 //
-//   this fix                                   7,272 B / 404 allocs
-//   the blunt remedy (decline the whole free) 49,894 B / 909 allocs
-//   dc3c8f2a                                   no leak summary at all — the
-//                                              heap-use-after-free aborts before
-//                                              LSan reports
+// Why zero is a sound bound rather than a precision claim: LSan is conservative
+// and its totals jitter, which is exactly why the sibling rows pin ceilings.
+// But jitter only moves the number when bytes are genuinely LIVE-but-unreachable
+// under LSan's scan, and every byte this fix could strand was unreachable the
+// moment `bz_dict_free` returned — so the failing direction (LSan reporting
+// MORE than the truth) is the only one reachable here, and it reports strictly
+// more, never less. A tight `== 0` is therefore the correct bound at this
+// regime, and it is the only assertion that would have failed on #6419's
+// parent: MEASURED 7272 B / 404 allocs there, 0 B after.
 //
-// The ceiling sits ~2.7x above the measured value and ~2.5x below the blunt
-// remedy, so it survives LSan's conservative-scan jitter in either direction
-// while still failing the remedy this fix rejects. PROVEN, not asserted: with
-// the blunt remedy built, this row reports
-// `assertion failed: leaked <= kCeiling` — so it is not a vacuous green that
-// would also have passed before the fix.
+// The exemption row this used to justify itself against
+// (`scripts/gate/sanitizer_leak_exempt.txt`, `status:defect issue:6470`) is
+// DELETED in the same commit — the defect it recorded is fixed, and the file's
+// last `defect` row leaves it at 0 defect / 32 trade / 9 residue. The table
+// free this row also pins is untouched by the fix: the header, bucket array,
+// insertion-order spine and per-key byte copies are still reclaimed, and the
+// returned entry points into none of them (its Key is rebuilt fresh by
+// `decodeDictStringKeyAt`; its Value is the separate reference the terminal
+// minted).
 //
-// (Note the `dc3c8f2a` line: on that tree this row is a VACUOUS green, because
-// a use-after-free suppresses the leak summary entirely and `leakedBytes`
-// returns 0. That is why the UAF it would otherwise cover is pinned by the
-// three crash-oracle rows above, on a separate oracle, rather than by this
-// one.)
+// (The `dc3c8f2a` caveat recorded on the old ceiling still stands and is why
+// the UAF this row could not see is pinned by the three crash-oracle rows
+// above, on a separate oracle: a use-after-free suppresses the leak summary
+// entirely, so `leakedBytes` would report 0 for it.)
 BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
            first_still_reclaims_the_dictionary_backing_on_an_escaping_value_arm_spec_28_3) {
-    const long kCeiling = 20000;
     const long leaked = leakedBytes(
         strValProducer() +
         "class C public "
@@ -816,5 +826,5 @@ BEZEL_TEST(dict_terminal_unbound_reclaim_6419,
         "    return 0; "
         "  end Main; "
         "end C; ");
-    BEZEL_EXPECT_TRUE(leaked <= kCeiling);
+    BEZEL_EXPECT_EQ(leaked, 0);
 }
