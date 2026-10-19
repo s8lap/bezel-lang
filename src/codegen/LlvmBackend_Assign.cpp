@@ -575,6 +575,104 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (!isArr && !isDict) return nullptr;
     llvm::Value* recv = lowerExpr(*ix.target);
     if (!recv) return nullptr;
+    // fix #6476 / §28.3 *Unbound owned temporaries*, §28.11 *Collection element
+    // ownership*, stdlib §4.8, v0.338 — the receiver-temp discharge the
+    // indexer-get path owes and did not emit.
+    //
+    // THE DEFECT. §28.3 names the borrowing uses of an unbound owned temporary,
+    // and "a member or INDEX access" is one of them: `P.MakeDict()["aa"]` binds
+    // the call's `owned Dictionary` to no name, and the index access is the only
+    // use of it. §28.3's rule is that such a temporary "is disposed at the END
+    // of the FULL EXPRESSION in which it is produced, after every use of it
+    // within that expression has completed". This function is that path's
+    // discharge point and emitted nothing.
+    //
+    // MEASURED on this lane's base (7a0c320f, which already carries #6470), 101
+    // iterations, `bezelc --sanitize=address`, `ASAN_OPTIONS=detect_leaks=1`:
+    //
+    //   n := n + P.MakeDict()["aa"].Length
+    //     SUMMARY: AddressSanitizer: 45955 byte(s) leaked in 606 allocation(s)
+    //
+    // and the leak is the WHOLE TABLE — `bz_dict_alloc` (header), its bucket
+    // array, the `bz_dict_set_str` key byte-copy and every stored string — six
+    // allocations per iteration, 606 for 101. It is NOT #6470's missing value
+    // discharge: the LEAK REPRO is unchanged from the figure reported before
+    // #6470 landed, and the value column is separately measured correct below.
+    //
+    // WHY THE VALUE COLUMN IS ALREADY RIGHT (so this is not a #6470 twin).
+    // §28.11's operations table reads a `string` slot through "indexer-get /
+    // default iteration" as "reference out" — the caller's own +1 — and
+    // MEASURED that the rest of the backend already implements it: with the
+    // dictionary bound to a local and the value read into a local that OUTLIVES
+    // the dictionary's `do ... end` scope, the program prints the right bytes
+    // at exit 0 with no leak and no use-after-free (`p7` in this lane's
+    // scratch). So the value read out is genuinely the caller's reference, the
+    // table free may discharge its own co-owned +1 in full, and this fix is the
+    // receiver's disposal ALONE — no mint, no new +1 anywhere.
+    //
+    // WHY IT MUST BE A SCOPE-END DISPOSAL AND NOT AN INLINE FREE. The value
+    // this function hands back is read out of the receiver table, and the
+    // CONSUMER reads it AFTER this function returns: `["aa"].Length` reads the
+    // `bz_string` header the slot points at. Freeing the table at the return of
+    // `lowerCollectionIndexerGet` would free the very header the next
+    // instruction loads — a use-after-free. §28.3 requires exactly this
+    // deferral ("after every use of it within that expression has completed"),
+    // and for an expression statement the full-expression end and the statement
+    // end coincide (§21.9), so the scope-end pass is that boundary. Where the
+    // indexer-get sits inside a LARGER expression, the scope end is later than
+    // the full-expression end — the table merely outlives its boundary, which is
+    // the safe direction, and the caller holds its own +1 on the value either
+    // way.
+    //
+    // REGISTRATION IS AT THE PRODUCTION, NOT AT THE RETURN, so the
+    // `KeyNotFoundException` the absent-key guard below raises is covered too:
+    // §28.3's exception-path paragraph discharges an already-produced,
+    // not-yet-consumed unbound owned temporary during unwinding, and an
+    // `emitGuardThrow` edge reaches the scope's unwind pass with the table
+    // already produced. Registering after the decode would leave that path
+    // leaking — the same reasoning `registerFreshNewReceiverTempUnwind` records
+    // for the accessor forms.
+    //
+    // THE GATE IS THE ONE THE SANCTIONED RECLAIM USES. `isFreshOwnerlessDict-
+    // MaterializerExpr` / `isFreshOwnerlessArrayMaterializerExpr` /
+    // `isUnboundOwnedBorrowingArrayCallExpr` are the same three predicates
+    // `freeUnboundOwnedBorrowingArrayTemp` reads, so this registration and that
+    // inline free cover the SAME population and can never disagree about it: a
+    // bound / `move`d / returned / owned-argument receiver is not one of those
+    // three shapes, is not registered here, and is freed by its own owner — no
+    // double-free. The owning `Owning*` family is excluded by construction
+    // (`isPlainBuiltinCollectionHead` / `isOwningPrefixedName`), so it keeps
+    // cascading through `freeUnboundOwnedOwningCollectionTemp` (#1909) and
+    // reaches no bare backing free here.
+    //
+    // `buildCollectionTempDisposal` is the ONE (slot, TypeRef) → Disposal
+    // classifier — the same helper `registerUsingDisposal` calls for a named
+    // `using var` collection local and `registerUnwindOwnedParam` for an
+    // `owned` parameter, so the three ends cannot drift. It picks the runtime
+    // free from the receiver's OWN backing (`bz_array_free` / `bz_llist_free` /
+    // `bz_dict_free`) and, for a dict, the §28.11 disposer aimed at the column
+    // `bz_dict_free` actually walks (`genericArgs[1]`, the VALUE column) — the
+    // same column alignment #6419 established for the inline reclaim. That
+    // discharges the table's co-owned +1 per stored string
+    // value, which is the table's own and not the caller's: exactly once, since
+    // the value was minted by the CONSUMER's binding retain, not out of `e.val`.
+    if (disposeStack_.empty() || emittingDisposerBody_) {
+        // No enclosing scope to discharge through, or a disposer body — the
+        // pre-existing leak, the safe direction (§28.3's "else it leaks").
+    } else if (isFreshOwnerlessDictMaterializerExpr(ix.target.get()) ||
+               isFreshOwnerlessArrayMaterializerExpr(ix.target.get()) ||
+               isUnboundOwnedBorrowingArrayCallExpr(ix.target.get())) {
+        // `entryAllocaNullPtr` (#2733): a disposal pass can be reached on a
+        // path that never ran this store, and the slot must read null there.
+        llvm::AllocaInst* tempSlot = entryAllocaNullPtr();
+        builder_.CreateStore(recv, tempSlot);
+        Disposal d = buildCollectionTempDisposal(tempSlot, recvTy);
+        // Fires on BOTH exits: the reference dies on the normal edge (the
+        // full-expression boundary §28.3 names) and on the unwind edge (its
+        // exception-path paragraph), and a given exit goes one way only.
+        d.unwindOnly = false;
+        disposeStack_.back().push_back(d);
+    }
     // §28.2 v0.135 / issue #621: checked disposal mode guard for the built-in
     // array-backed collection indexer getter. bz_array_mark_disposed sets a
     // `disposed` byte on the bz_array_t header and quarantines the struct
