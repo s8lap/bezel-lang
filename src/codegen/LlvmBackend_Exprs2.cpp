@@ -3442,6 +3442,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         auto savedDictEntryKeyReleaseElig = dictEntryKeyReleaseEligible_;
         llvm::Function* savedDictEntryKeyReleaseEligFn =
             dictEntryKeyReleaseEligibleFn_;
+        // fix #6470: same save/restore for the DictionaryEntry VALUE-column
+        // eligibility set — same producer, same staleness hazard, same reason
+        // (LANE_RULES §8's two-halves-of-one-contract rule).
+        auto savedDictEntryValueReleaseElig = dictEntryValueReleaseEligible_;
+        llvm::Function* savedDictEntryValueReleaseEligFn =
+            dictEntryValueReleaseEligibleFn_;
         // #2142 / #2143: same save/restore for the Set-literal / Dict-literal
         // reclaim eligibility sets — populated by the SAME
         // collectBorrowingArrayFreeEligible call emitAsyncLambda makes above, so
@@ -3509,6 +3515,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         dictEntryKeyReleaseEligible_ =
             std::move(savedDictEntryKeyReleaseElig);                       // #3720
         dictEntryKeyReleaseEligibleFn_ = savedDictEntryKeyReleaseEligFn;    // #3720
+        dictEntryValueReleaseEligible_ =
+            std::move(savedDictEntryValueReleaseElig);              // fix #6470
+        dictEntryValueReleaseEligibleFn_ =
+            savedDictEntryValueReleaseEligFn;                       // fix #6470
         setLiteralFreeEligible_ = std::move(savedSetLiteralFreeElig);      // #2142
         setLiteralFreeEligibleFn_ = savedSetLiteralFreeEligFn;             // #2142
         dictLiteralFreeEligible_ = std::move(savedDictLiteralFreeElig);    // #2143

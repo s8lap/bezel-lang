@@ -2919,6 +2919,42 @@ private:
         // back to for a runtime-managed value it cannot prove non-escaping).
         // Fires on BOTH the normal and unwind exit, mirroring `grouping`.
         bool dictEntryKeyRelease = false;
+        // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8
+        // (v0.338): the VALUE-column sibling of `dictEntryKeyRelease` above,
+        // for the same terminal-local shape but a STRING-V dictionary
+        // (`Dictionary<K, string>` over any K). `slot` is the same 2-field
+        // `{K key; V value}` struct alloca; field 1 is loaded and
+        // `bz_string_release`d, then nulled, at scope end.
+        //
+        // WHY this exists — §28.11's operations table gives a `string` V (a
+        // "shared-reference" slot per the category table's
+        // "runtime-managed reference (`string`, …) | shared references" row)
+        // the reading "reference out": `entry.Value` hands the caller a
+        // reference the caller OWNS and must discharge. stdlib §4.8 scopes
+        // its borrow claim explicitly to "**for class-typed values**", so it
+        // does not contradict this. LlvmBackend_Calls.cpp's isDict block
+        // therefore MINTS the +1 (`emitStringRetain` on the decoded value,
+        // before the table free) so the returned entry's field 1 is the
+        // caller's own reference rather than a borrow of the receiver's
+        // `e.val`, and the table free can discharge the value column in
+        // full. This Disposal is the other half of that mint: without it the
+        // mint is a leak wearing the fix's clothes. MEASURED on this lane's
+        // parent over 101 iterations of `var e := P.MakeDict().First();
+        // n := n + e.Value.Length;` under `--sanitize=address`:
+        // `7272 byte(s) leaked in 404 allocation(s)` — exactly the 2
+        // concatenation-producer values × 2 allocations each, with the Key
+        // half already at zero.
+        //
+        // Registered ONLY for a local the StringEscapeWalker proved never
+        // escapes (dictEntryValueReleaseEligible_ — the same walk
+        // dictEntryKeyReleaseEligible_ uses), so nothing else holds the
+        // reference: no UAF, no double-free. An escaping local is simply
+        // never registered, so its minted +1 leaks — §28.3's stated safe
+        // direction and the identical trade the `dictEntryKeyRelease`
+        // comment above records for the Key. Fires on BOTH the normal and
+        // unwind exit (the reference dies either way, and a given exit goes
+        // one way only), mirroring `dictEntryKeyRelease` exactly.
+        bool dictEntryValueRelease = false;
         // fix #4129 (§29.12 / §28.3, stdlib §4.8, v0.295): a `for var entry in
         // dict` entry-iteration's own key/value SNAPSHOT SPINE arrays — the
         // malloc'd arrays bz_dict_keys_str/bz_dict_keys_gen/bz_dict_values_str/
@@ -16830,6 +16866,14 @@ private:
               // member's own declaration comment.
               dictEntryKeyReleaseEligible_(e.dictEntryKeyReleaseEligible_),
               dictEntryKeyReleaseEligibleFn_(e.dictEntryKeyReleaseEligibleFn_),
+              // fix #6470: dictEntryValueReleaseEligible_ is populated by the
+              // SAME collectBorrowingArrayFreeEligible call this scope
+              // guards, so it needs the identical save/restore protection
+              // (LANE_RULES §8's two-halves-of-one-contract rule) — omitting
+              // it is the leak direction the comment block above records.
+              dictEntryValueReleaseEligible_(e.dictEntryValueReleaseEligible_),
+              dictEntryValueReleaseEligibleFn_(
+                  e.dictEntryValueReleaseEligibleFn_),
               setLiteralFreeEligible_(e.setLiteralFreeEligible_),
               setLiteralFreeEligibleFn_(e.setLiteralFreeEligibleFn_),
               dictLiteralFreeEligible_(e.dictLiteralFreeEligible_),
@@ -16861,6 +16905,10 @@ private:
                 std::move(dictEntryKeyReleaseEligible_);           // fix #3720
             e_.dictEntryKeyReleaseEligibleFn_ =
                 dictEntryKeyReleaseEligibleFn_;                    // fix #3720
+            e_.dictEntryValueReleaseEligible_ =
+                std::move(dictEntryValueReleaseEligible_);          // fix #6470
+            e_.dictEntryValueReleaseEligibleFn_ =
+                dictEntryValueReleaseEligibleFn_;                  // fix #6470
             e_.setLiteralFreeEligible_ = std::move(setLiteralFreeEligible_);
             e_.setLiteralFreeEligibleFn_ = setLiteralFreeEligibleFn_;
             e_.dictLiteralFreeEligible_ = std::move(dictLiteralFreeEligible_);
@@ -16890,6 +16938,8 @@ private:
         llvm::Function* groupingFreeEligibleFn_;
         std::unordered_set<const void*> dictEntryKeyReleaseEligible_;  // #3720
         llvm::Function* dictEntryKeyReleaseEligibleFn_;                // #3720
+        std::unordered_set<const void*> dictEntryValueReleaseEligible_;    // #6470
+        llvm::Function* dictEntryValueReleaseEligibleFn_;                  // #6470
         std::unordered_set<const void*> setLiteralFreeEligible_;
         llvm::Function* setLiteralFreeEligibleFn_;
         std::unordered_set<const void*> dictLiteralFreeEligible_;
@@ -19046,6 +19096,21 @@ private:
     // struct field via bz_string_release, not a whole-object free).
     std::unordered_set<const void*> dictEntryKeyReleaseEligible_;
     llvm::Function* dictEntryKeyReleaseEligibleFn_ = nullptr;
+    // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8 (v0.338):
+    // the VALUE-column analog of dictEntryKeyReleaseEligible_ just above — the
+    // same First/Last/Single/ElementAt terminal-local shape but a STRING-V
+    // dictionary (`Dictionary<K, string>`, any K, since §28.11's operations
+    // table reads a shared-reference slot as "reference out" regardless of the
+    // key type). Membership arms a scope-end release of the entry struct's
+    // field-1 string (LlvmBackend_Disposal.cpp's `dictEntryValueRelease`
+    // Disposal). It is a SEPARATE set from dictEntryKeyReleaseEligible_ above
+    // because the two key off different generic arguments (slot 0 vs slot 1),
+    // so a `Dictionary<string, int>` is a key-only candidate and a
+    // `Dictionary<int, string>` a value-only one — the same escape walk serves
+    // both, but one set cannot express the distinction. An escaping local is
+    // excluded → the minted +1 just leaks (the same safe direction).
+    std::unordered_set<const void*> dictEntryValueReleaseEligible_;
+    llvm::Function* dictEntryValueReleaseEligibleFn_ = nullptr;
     // #2142 / §28.9 / §28.11: the Set<T> analog of borrowingArrayFreeEligible_ —
     // plain `var s: Set<T> := [ ... ]` collection-literal locals (dict-backed,
     // bz_dict_t*) that the type-agnostic escape walk proves never escape. Set<T>
@@ -19272,6 +19337,21 @@ private:
     // or UAF against whatever DOES own that other path's Key.
     bool isFreshDictEntryKeyReleaseTerminalLocal(
         const LocalDeclInitView& view) const;
+    // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8 (v0.338):
+    // the VALUE-column sibling of
+    // `isFreshDictEntryKeyReleaseTerminalLocal` immediately above — the same
+    // terminal-local candidate shape, but keyed on generic slot 1 (V) being a
+    // non-nullable `string` instead of slot 0 (K). §28.11's operations table
+    // reads a shared-reference slot as "reference out" for ANY key type, while
+    // the Key rebuild only exists for a string K, so the two candidates are
+    // genuinely independent: `Dictionary<string,string>` matches both,
+    // `Dictionary<int,string>` only this one, `Dictionary<string,int>` only
+    // the sibling. A nullable `string?` V is excluded — the terminal's mint
+    // and the table free's discharge are both keyed on the non-nullable
+    // spelling. Membership in `dictEntryValueReleaseEligible_` arms the
+    // `dictEntryValueRelease` Disposal, which discharges the terminal's mint.
+    bool isFreshDictEntryValueReleaseTerminalLocal(
+        const LocalDeclInitView& view) const;
     // fix #3878 / §29.1 / §28.9 / §28.11 (v0.294): true if the local described
     // by `view` is a plain `const`/`var` bound directly to an explicit
     // `<expr>.TakeCurrent()` call on a builtin (declaration-less)
@@ -19458,30 +19538,49 @@ private:
     //     own words for `bz_dict_values_str`/`_gen` are "the values themselves
     //     are owned by the dictionary and must NOT be freed by the caller".
     //     MEASURED heap-use-after-free, freed by `bz$strElemRelease`.
+    //     **RESOLVED by fix #6470** (see below): that arm now mints the +1 on
+    //     the decoded value (`emitStringRetain`) so the returned entry's Value
+    //     is the CALLER's own reference rather than a borrow of `e.val`, and
+    //     passes `false` here — which is what lets the value column discharge
+    //     in full instead of stranding the dict's +1 on every entry (MEASURED
+    //     7272 B / 404 allocs over 101 iterations before that fix).
     //   * `lowerDictEntryFor`'s loop-exit reclaim (LlvmBackend_Stmts.cpp), when
     //     a closure captures the loop variable and may ESCAPE the loop: the
     //     boxed cell is a shallow copy holding the same `e.val`, so calling the
     //     closure after the loop reads freed memory. Same free stack.
     //     (That site already reads the same `forVarCapturedEscaping` predicate
     //     for its KEY release — fix #4161 — so the two share one authority.)
+    //     **STILL OPEN** — that arm is the for-in loop's own consumption shape,
+    //     which has no plain-local scope-end to hang a discharge on; it still
+    //     passes `true` and still leaks.
     //
     // When it is set, the table is still freed (its backing, buckets, order
     // spine and per-key byte copies are the table's own and nothing else reads
     // them) and only the VALUE discharge is declined: those +1s leak, which is
     // §28.3's stated safe direction and strictly less than the leak the whole
-    // reclaim would cost. Minting the +1 HERE instead (so the caller's
-    // reference is its own) is NOT the alternative, for the reason
-    // `freeFreshInputTempUnlessStringElementEscapes` already records for the
-    // `Array<string>` element-returning terminals: it would need
-    // `isPlusOneStringProducer` to learn these arms are +1 producers, and
-    // nothing on the `DictionaryEntry` consumption side releases the extra +1
-    // — an unconditional retain is a leak wearing the fix's clothes.
+    // reclaim would cost.
+    //
+    // fix #6470 (§28.11, stdlib §4.8, v0.338) took the alternative this comment
+    // used to record as NOT taken — minting the +1 at the terminal so the
+    // caller's reference is its own — which required BOTH halves the earlier
+    // note named: the terminal's `emitStringRetain` (LlvmBackend_Calls.cpp) and
+    // a matching discharge on the `DictionaryEntry` consumption side (the
+    // `dictEntryValueRelease` Disposal, registered in `lowerLocalDecl` from
+    // `dictEntryValueReleaseEligible_` and emitted in
+    // LlvmBackend_Disposal.cpp). `isPlusOneStringProducer` did NOT need to
+    // learn these arms are +1 producers after all: that predicate governs
+    // whether a CONSUMER re-retains a produced string, and here the extra +1
+    // is discharged by a dedicated scope-end Disposal on the entry local
+    // rather than by a consumer's transfer — the same shape #3720 already
+    // established for the entry's Key. The mint and the discharge must not be
+    // separated: the mint alone leaks, the discharge alone is a
+    // use-after-free.
     //
     // Every other call site passes the default `false`, and that default is
     // CORRECT for all of them: each one's result is an `int`, a `bool`, a
     // `unit`, or nothing at all. The enumeration behind that claim is in
     // #6419's fix-forward commit body — a new VALUE-returning dict arm must
-    // pass `true` here or it inherits a use-after-free.
+    // pass `true` here unless it mints the caller's +1 the way #6470's does.
     void freeUnboundOwnedBorrowingArrayTemp(const ast::Expr* recvExpr,
                                             llvm::Value* recvVal,
                                             const sema::TypeRef* recvTy,

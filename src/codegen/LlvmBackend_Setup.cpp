@@ -11088,6 +11088,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // same pass (mirrors groupingFreeEligible_ just above).
     dictEntryKeyReleaseEligible_.clear();
     dictEntryKeyReleaseEligibleFn_ = fn;
+    // fix #6470: DictionaryEntry-VALUE-release eligibility, populated by the
+    // same pass (mirrors the Key sibling just above).
+    dictEntryValueReleaseEligible_.clear();
+    dictEntryValueReleaseEligibleFn_ = fn;
     // #2142: Set<T>-literal eligibility, populated by the same pass.
     setLiteralFreeEligible_.clear();
     setLiteralFreeEligibleFn_ = fn;
@@ -19737,6 +19741,31 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         !disposeStack_.empty()) {
         Disposal d{slot, nullptr};
         d.dictEntryKeyRelease = true;
+        disposeStack_.back().push_back(d);
+    }
+    // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8 (v0.338):
+    // the STRING-V sibling of the registration just above — a plain `var`/
+    // `const e := d.First()/.Last()/.Single()/.ElementAt(i)` over a
+    // `Dictionary<K,string>`, proven non-escaping, holds the SOLE reference
+    // to the +1 LlvmBackend_Calls.cpp's isDict block now mints on the entry's
+    // field 1 (added in the same commit: the terminal retains the decoded
+    // value so the returned entry's Value is the CALLER's reference rather
+    // than a borrow of the receiver's `e.val`, which in turn lets the table
+    // free discharge the value column in full instead of declining it).
+    // Release field 1 at scope end via `dictEntryValueRelease` (GEP field 1 +
+    // `bz_string_release`, LlvmBackend_Disposal.cpp's `emitDisposals`). Both
+    // halves of that contract must land together — the mint alone is a leak,
+    // and this discharge alone has nothing to discharge. Gated on
+    // currentFn_ matching the analyzed function (a lambda/thunk body lowered
+    // mid-function inherits no eligibility → the minted +1 just leaks, never
+    // double-freed), mirroring every sibling in this family. An ESCAPING local
+    // is likewise never registered (the walk excludes it), so the +1 leaks
+    // there too — §28.3's stated safe direction.
+    if (v && currentFn_ == dictEntryValueReleaseEligibleFn_ &&
+        dictEntryValueReleaseEligible_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.dictEntryValueRelease = true;
         disposeStack_.back().push_back(d);
     }
     // fix #1747 / §28.9 / §9.7 / §28.3: if this plain `var` RECORD local was
@@ -37899,6 +37928,57 @@ bool Emitter::isFreshDictEntryKeyReleaseTerminalLocal(
     return false;
 }
 
+// fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8 (v0.338): the
+// VALUE-column sibling of `isFreshDictEntryKeyReleaseTerminalLocal` just above.
+// Identical candidate shape (same four method names, same dict-receiver gate,
+// same `!isUsing && init` LocalDecl preconditions) but keyed on generic slot 1
+// (V) being a non-nullable `string` rather than slot 0 (K) — because §28.11's
+// operations table reads a shared-reference slot as "reference out" for ANY
+// key type, while the Key rebuild only exists for a string K. A
+// `Dictionary<string,string>` matches BOTH predicates (the two Disposals are
+// independent and release field 0 and field 1 respectively); a
+// `Dictionary<int,string>` matches only this one; a `Dictionary<string,int>`
+// only the other.
+bool Emitter::isFreshDictEntryValueReleaseTerminalLocal(
+        const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
+    // Result type must be the synthetic (declaration-less) DictionaryEntry
+    // whose VALUE (V, generic slot 1) is a non-nullable `string` — the shape
+    // LlvmBackend_Calls.cpp's isDict block hands the caller a +1 on, which
+    // `dictEntryValueRelease` discharges at scope end. A non-string V reaches
+    // the same codegen arm but is decoded as a boxed struct or a scalar with
+    // no separate heap ownership of this shape, so this predicate correctly
+    // excludes it. A NULLABLE `string?` V is excluded too: its slot may hold
+    // null, and the terminal's mint and the table free's discharge are both
+    // keyed on the non-nullable spelling — admitting it here would pair a
+    // discharge with no matching mint.
+    const sema::TypeRef* rt = ctx_.exprType(*view.init);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->headName() != "DictionaryEntry") return false;
+    if (rt->genericArgs.size() < 2 || !rt->genericArgs[1]) return false;
+    const sema::TypeRef* vt = rt->genericArgs[1];
+    if (vt->kind != sema::TypeRef::Kind::Primitive ||
+        vt->primitive != sema::PrimitiveType::String || vt->nullable)
+        return false;
+    // The initializer must be a terminal CALL to exactly one of the four
+    // method names LlvmBackend_Calls.cpp's isDict block lowers this way, over
+    // a Dictionary/SortedDictionary receiver — the identical condition, spelled
+    // identically to the sibling above, so the two cannot drift.
+    auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || !isDictTypeName(recvTy)) return false;
+    std::string_view mm = ma->member;
+    if (mm == "First" || mm == "Last" || mm == "Single")
+        return call->args.empty();
+    if (mm == "ElementAt")
+        return call->args.size() == 1 && call->args[0].value != nullptr;
+    return false;
+}
+
 
 // fix #3878 / §29.1 / §28.9 / §28.11 (v0.294): see the declaration comment in
 // LlvmBackend_impl.hpp. §29.1's "`Current` semantics on borrowing and owning
@@ -38584,6 +38664,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     dictMaterializerFreeEligible_.clear();  // #1028
     groupingFreeEligible_.clear();          // #1930
     dictEntryKeyReleaseEligible_.clear();    // #3720
+    dictEntryValueReleaseEligible_.clear();  // fix #6470
     setLiteralFreeEligible_.clear();        // #2142
     dictLiteralFreeEligible_.clear();       // #2143
     takeCurrentDictFreeEligible_.clear();   // fix #3880
@@ -38596,6 +38677,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     // fix #4308 sibling: OWNING-array twin of the borrowing-array candidates.
     std::vector<const ast::Node*> groupByToArrayCandidates;
     std::vector<const ast::Node*> dictEntryKeyCandidates;  // #3720
+    std::vector<const ast::Node*> dictEntryValueCandidates;  // fix #6470
     std::vector<const ast::Node*> setLiteralCandidates;   // #2142
     std::vector<const ast::Node*> dictLiteralCandidates;  // #2143
     std::vector<const ast::Node*> takeCurrentDictCandidates;  // fix #3880
@@ -38690,6 +38772,13 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // the if/else chain below tests.
             if (isFreshDictEntryKeyReleaseTerminalLocal(v))
                 dictEntryKeyCandidates.push_back(node);
+            // fix #6470 / §28.11 (v0.338): the STRING-V sibling of the branch
+            // above — same terminal-local shape, keyed on generic slot 1.
+            // Independent candidacy (a `Dictionary<string,string>` matches
+            // both, `Dictionary<int,string>` only this one), in its own
+            // candidates vector so it feeds its own eligibility set.
+            if (isFreshDictEntryValueReleaseTerminalLocal(v))
+                dictEntryValueCandidates.push_back(node);
             if (isFreshBorrowingArrayMaterializerLocal(v))
                 candidates.push_back(node);
             // fix #4308 sibling: the OWNING-array twin of the branch above —
@@ -38904,6 +38993,19 @@ void Emitter::collectBorrowingArrayFreeEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             dictEntryKeyReleaseEligible_.insert(static_cast<const void*>(ld));
+    }
+    // fix #6470 / §28.11 (v0.338): the SAME walk, over the STRING-V candidates,
+    // into the VALUE-column set. A local proven never to escape holds the
+    // SOLE reference to the +1 LlvmBackend_Calls.cpp's isDict block minted on
+    // the entry's field 1, so the scope-end `bz_string_release` that
+    // `dictEntryValueRelease` emits runs exactly once per exit (no UAF, no
+    // double-free). An escaping local is excluded → the minted +1 leaks, the
+    // same safe direction the Key branch just above falls back to.
+    for (const ast::Node* ld : dictEntryValueCandidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            dictEntryValueReleaseEligible_.insert(static_cast<const void*>(ld));
     }
     // #2142 / §28.9 / §28.11: same conservative escape walk as the Array-literal
     // pass above (borrowingArrayMode, safeViewAliases) — Set<T> is a borrowing-

@@ -9091,6 +9091,63 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* dtValDecoded = decodeDictValueAt(
                 dtValLlvm, dtValsArr, dtIdx, "dictterm.vrec");
 
+            // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8
+            // (v0.338): MINT the +1 on the decoded value, before the table free
+            // below, for a non-nullable `string` V.
+            //
+            // WHY. §28.11's element-category table classifies a `string` slot as
+            // a shared reference ("runtime-managed reference (`string`, …) |
+            // shared references"), and its operations table's "indexer-get /
+            // default iteration" row reads a shared-reference slot as
+            // "**reference out**" — so `DictionaryEntry<K,V>.Value` for a string
+            // V hands the caller a reference the caller OWNS and must
+            // discharge. stdlib §4.8's "for class-typed values, `entry.Value`
+            // is a borrow" is explicitly scoped to CLASS-typed values, so it
+            // does not contradict this reading. (Measured on this lane's
+            // parent: `scratch/escape.bzl` reads a string out of a dict into a
+            // local that OUTLIVES the dict's `do ... end` scope and still
+            // prints the right bytes with exit 0 — the indexer-get RETAINS, so
+            // reference-out is the behaviour the codebase already implements
+            // everywhere else.)
+            //
+            // `decodeDictValueAt` produced `dtValDecoded` by passing a
+            // pointer-typed V straight through "as a borrow" — it IS the
+            // receiver's own `e.val`, which is why #6419 had to DECLINE the
+            // table free's value discharge on this arm (freeing it read freed
+            // memory: MEASURED heap-use-after-free freed by `bz$strElemRelease`
+            // on dc3c8f2a). Minting here converts that borrow into the
+            // caller's own reference, so the table free below can discharge the
+            // value column IN FULL: the dict's own +1 (taken at `.Add`) is
+            // released by `bz_dict_free`'s disposer, and the +1 minted here is
+            // the caller's, discharged by the `dictEntryValueRelease`
+            // Disposal when the entry local's scope ends (registered in
+            // lowerLocalDecl, emitted in LlvmBackend_Disposal.cpp). The two
+            // halves of that contract MUST land together — the mint without
+            // the discharge is a leak, and the discharge without the mint is a
+            // use-after-free.
+            //
+            // The conjuncts spelling "non-nullable string in generic slot 1"
+            // are the SAME ones `freeUnboundOwnedBorrowingArrayTemp` uses to
+            // decide whether to install the value disposer, deliberately
+            // spelled identically so the mint and the discharge cannot drift
+            // apart — a mint without its matching discharge would be a leak,
+            // and a discharge without its matching mint a use-after-free.
+            // A NULLABLE `string?` V is excluded on both sides: its slot may
+            // hold null, and neither the runtime's per-column disposer nor
+            // `dictEntryValueRelease`'s candidacy admits that spelling.
+            //
+            // When the receiver is NOT reclaimed (a named local `d`), this mint
+            // still balances: `d`'s own disposal releases the dict's +1 and
+            // the entry local's scope-end release discharges this one.
+            const sema::TypeRef* dtRecvVEl =
+                (recvTy && recvTy->genericArgs.size() > 1)
+                    ? recvTy->genericArgs[1] : nullptr;
+            const bool dtValueIsString = dtRecvVEl &&
+                !dtRecvVEl->nullable &&
+                dtRecvVEl->kind == sema::TypeRef::Kind::Primitive &&
+                dtRecvVEl->primitive == sema::PrimitiveType::String;
+            if (dtValueIsString) emitStringRetain(dtValDecoded);
+
             // Free every per-key blob (bz_dict_keys_gen mallocs one per
             // entry regardless of which index is chosen — mirrors
             // lowerDictEntryFor's incBB free, run here in one pass since
@@ -9139,39 +9196,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // final use of `recv`.
             //
             // fix-forward #6419 (§28.11 *Collection element ownership*, stdlib
-            // §4.8, v0.338): the `dictValueColumnEscapes` argument is the
-            // escape axis and it is `true` here, which is the whole content of
-            // this fix-forward. The
-            // `DictionaryEntry<K,V>` this arm is about to RETURN holds
-            // `dtValDecoded`, and `decodeDictValueAt` produced that by passing a
-            // pointer-typed V straight through "as a borrow" — it IS the table's
-            // own `e.val`. `bz_dict_values_str`/`_gen` say so in their own
-            // header ("the values themselves are owned by the dictionary and
-            // must NOT be freed by the caller"), and this arm's own opening
-            // comment already records the consequence for `OwningDictionary`:
-            // the value "is disposed exactly once, at the dictionary's own
-            // scope end — never here".
+            // §4.8, v0.338) set `dictValueColumnEscapes` to `true` here: the
+            // `DictionaryEntry<K,V>` this arm returns held `dtValDecoded`, and
+            // `decodeDictValueAt` produced that by passing a pointer-typed V
+            // straight through "as a borrow" — it IS the table's own `e.val` —
+            // so the value DISCHARGE had to be declined or the caller read
+            // freed memory. That was correct given a borrow, but it stranded
+            // the table's +1 on EVERY entry of the column (not just the one
+            // that escapes): MEASURED 7272 B / 404 allocs over 101 iterations
+            // of `var e := P.MakeDict().First(); n := n + e.Value.Length;`.
             //
-            // So the table is still reclaimed (header, buckets, order spine,
-            // every key byte-copy — nothing the returned entry points into: its
-            // Key is rebuilt fresh by `decodeDictStringKeyAt`, its Value is a
-            // `bz_string*` the free does not own), and only the §28.11 value
-            // DISCHARGE is declined. Declining the whole reclaim instead — what
-            // `freeFreshInputTempUnlessStringElementEscapes` does one block
-            // over for an `Array<string>` element terminal — would give back the
-            // table leak too, and the measurement shows the table free is sound
-            // here.
+            // fix #6470 (§28.11, stdlib §4.8, v0.338) mints the +1 above (see
+            // the `dtValueIsString` block), which turns that borrow into the
+            // caller's OWN reference — §28.11's operations table reads a
+            // shared-reference slot as "reference out", so that is the correct
+            // semantics — and the argument is therefore back to `false`: the
+            // table free now discharges the value column in full, releasing the
+            // dict's own +1 per entry, while the caller's +1 (the one minted
+            // above) is discharged by `dictEntryValueRelease` at the entry
+            // local's scope end. The table itself is reclaimed exactly as
+            // before — header, buckets, order spine, every key byte-copy, none
+            // of which the returned entry points into (its Key is rebuilt
+            // fresh by `decodeDictStringKeyAt`, its Value is the separate
+            // reference minted above).
             //
-            // MEASURED on this fix's parent (dc3c8f2a), 101 iterations,
-            // `bezelc --sanitize=address`, `Dictionary<string,string>` AND the
-            // int-keyed `Dictionary<int,string>` twin:
-            // `==ERROR: AddressSanitizer: heap-use-after-free ... freed by
-            // thread T0 here: #0 free #1 bz$strElemRelease`, exit 1. The base
-            // (dc3c8f2a^) runs the same program to completion, correct stdout,
-            // leaks only — so dc3c8f2a introduced this, and declining the
-            // discharge removes it.
+            // The `false` here is the WHOLE content of this fix: a new
+            // VALUE-returning dict arm still has to pass `true` while its
+            // result aliases the receiver's own `e.val` unchecked — this arm
+            // is only sound because of the mint above and the matching
+            // `dictEntryValueRelease` discharge, and the two must not be
+            // separated. (The `Array<string>` element terminals one function
+            // over, in `freeFreshInputTempUnlessStringElementEscapes`, still
+            // decline outright — they are the Array family, tracked separately
+            // as #6393.)
             freeUnboundOwnedBorrowingArrayTemp(ma->target.get(), recv, recvTy,
-                                               /*dictValueColumnEscapes=*/true);
+                                               /*dictValueColumnEscapes=*/false);
 
             llvm::Value* dtEntryVal = llvm::UndefValue::get(dtEntryStTy);
             dtEntryVal = builder_.CreateInsertValue(dtEntryVal, dtKeyDecoded, {0u});

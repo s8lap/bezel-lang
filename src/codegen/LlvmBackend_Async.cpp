@@ -1834,6 +1834,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         dictMaterializerFreeEligibleFn_ = resumeFn;
         groupingFreeEligibleFn_ = resumeFn;
         dictEntryKeyReleaseEligibleFn_ = resumeFn;  // fix #3720
+        dictEntryValueReleaseEligibleFn_ = resumeFn;  // fix #6470
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
         takeCurrentDictFreeEligibleFn_ = resumeFn;  // fix #3880
@@ -2552,6 +2553,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             dictMaterializerFreeEligible_.clear();
             groupingFreeEligible_.clear();
             dictEntryKeyReleaseEligible_.clear();  // fix #3720
+            dictEntryValueReleaseEligible_.clear();  // fix #6470
             setLiteralFreeEligible_.clear();   // #2142
             dictLiteralFreeEligible_.clear();  // #2143
             takeCurrentDictFreeEligible_.clear();  // fix #3880
@@ -2562,6 +2564,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         dictMaterializerFreeEligibleFn_ = resumeFn;
         groupingFreeEligibleFn_ = resumeFn;
         dictEntryKeyReleaseEligibleFn_ = resumeFn;  // fix #3720
+        dictEntryValueReleaseEligibleFn_ = resumeFn;  // fix #6470
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
         takeCurrentDictFreeEligibleFn_ = resumeFn;  // fix #3880
@@ -3899,6 +3902,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         dictMaterializerFreeEligibleFn_ = resumeFn;   // #1028
         groupingFreeEligibleFn_ = resumeFn;           // #1930
         dictEntryKeyReleaseEligibleFn_ = resumeFn;    // fix #3720
+        dictEntryValueReleaseEligibleFn_ = resumeFn;    // fix #6470
         setLiteralFreeEligibleFn_ = resumeFn;         // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;        // #2143
         takeCurrentDictFreeEligibleFn_ = resumeFn;    // fix #3880

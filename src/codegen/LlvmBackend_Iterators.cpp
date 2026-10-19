@@ -2238,6 +2238,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         dictMaterializerFreeEligibleFn_ = moveNextFn;
         groupingFreeEligibleFn_ = moveNextFn;
         dictEntryKeyReleaseEligibleFn_ = moveNextFn;  // fix #3720
+        dictEntryValueReleaseEligibleFn_ = moveNextFn;  // fix #6470
         setLiteralFreeEligibleFn_ = moveNextFn;   // #2142
         dictLiteralFreeEligibleFn_ = moveNextFn;  // #2143
         takeCurrentDictFreeEligibleFn_ = moveNextFn;  // fix #3880

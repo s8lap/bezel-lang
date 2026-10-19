@@ -8553,6 +8553,36 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             }
             continue;
         }
+        // fix #6470 / §28.11 *Collection element ownership*, stdlib §4.8
+        // (v0.338): the VALUE-column sibling of the `dictEntryKeyRelease` arm
+        // just above, for a `Dictionary<K,string>` terminal local. `slot`
+        // holds the same 2-field `{K key; V value}` struct alloca; field 1 is
+        // the reference LlvmBackend_Calls.cpp's isDict block minted with
+        // `emitStringRetain` (so the returned entry's Value is the CALLER's
+        // own reference, per §28.11's operations table reading a shared-
+        // reference slot as "reference out" — and, that being so, the table
+        // free now discharges the value column in full instead of declining
+        // it, which is what made #6419's arms leak). Release field 1 at
+        // scope end — on BOTH the normal and unwind exit (the reference dies
+        // either way; a given exit goes one way only, so exactly once per
+        // exit) — then null it, matching the Key arm and
+        // stringRelease/recordStringFields semantics. The local was proven
+        // non-escaping by the walk behind dictEntryValueReleaseEligible_,
+        // so nothing else holds the reference: bz_string_release frees it
+        // exactly once (no UAF, no double-free), and is null-/sentinel-safe.
+        if (it->dictEntryValueRelease) {
+            if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(
+                    it->slot->getAllocatedType())) {
+                llvm::Value* valAddr =
+                    builder_.CreateStructGEP(st, it->slot, 1, "dictev.addr");
+                llvm::Value* valVal =
+                    builder_.CreateLoad(ptrTy(), valAddr, "dictev.val");
+                emitStringRelease(valVal);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), valAddr);
+            }
+            continue;
+        }
         // fix #4129 (§29.12/§28.3, stdlib §4.8, v0.295): a `for var entry in
         // dict` loop's key/value snapshot spine — see the field declarations
         // in LlvmBackend_impl.hpp for the full derivation. Mirrors
