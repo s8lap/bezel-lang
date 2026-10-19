@@ -387,8 +387,40 @@ llvm::Value* Emitter::lowerArrayRangeSlice(llvm::Value* recv,
     emitGuardThrow(oor, "IndexOutOfRangeException");
     auto* slFn = declareC("bz_array_slice", ptrTy(),
                           {ptrTy(), i64(), i64(), i64()});
-    return builder_.CreateCall(
+    llvm::Value* sliced = builder_.CreateCall(
         slFn, {recv, lo, endExcl, builder_.getInt64(esz)}, "sl.arr");
+    // fix #6492 / §15.6 / §28.9 / §28.11, v0.338: the slice is a COPY-MATERIALISER
+    // and must co-own a +1 per runtime-managed element, exactly as every other one
+    // does. `bz_array_slice` memcpy's the element POINTERS and stops there; without
+    // this retain the source array and the slice hold ONE `bz_string*` between them
+    // and both disposers release it — the measured failure, on a program that
+    // compiles clean and prints the right count and then aborts at teardown:
+    //
+    //   var src: Array<string> := P.MakeArr();   // a.Add($"elem-{i}")
+    //   var s:   Array<string> := src[0..1];
+    //   Console.WriteLine(s.Count);              // 2
+    //   bezel: fatal: refcount over-release (string) — two releases for one
+    //   reference; terminating per §28.9          [exit 134, SIGABRT]
+    //
+    // §15.6 makes the requirement itself: slicing "produces a new Array<T>
+    // containing copies of the references (or values) in the range" and calls the
+    // result "a fresh container, exactly like ToArray()". ToArray retains (the
+    // `bz_lazy_to_array` / `bz_array_retain_strings` pairing at LlvmBackend_Calls3.cpp
+    // ~2880 and the lazy-ctor twin in LlvmBackend_Exprs2.cpp ~7190), and §28.9's
+    // exactly-once forbids a copy that transfers a reference without taking one.
+    // The retain is placed by `emitArrayRetainStringsIfStringArray`, the codebase's
+    // single decision point for this predicate (#602 batch 4) — not a fourth
+    // hand-rolled spelling of it. `recvTy` supplies the element type: a slice is
+    // always `Array<T>` over the receiver's own `T`, so the receiver's type is the
+    // right thing to key on, and the helper's non-nullable-`string` gate keeps it
+    // inert for every other element kind.
+    //
+    // NOT the suppressed release #6476's fix-forward installed on this arm: that
+    // suppression is on the RECEIVER's §28.3 discharge and is this issue's
+    // sibling. This retain pairs with the slice's OWN disposal, which already
+    // installs stringElementReleaseThunk and releases exactly this +1.
+    emitArrayRetainStringsIfStringArray(recvTy, sliced);
+    return sliced;
 }
 
 // issue #388 / stdlib §4.4-§4.9: lower a HEAP-collection indexer read `a[i]` /
