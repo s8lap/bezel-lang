@@ -790,16 +790,34 @@ BEZEL_TEST(sema_extension,
     // the body shape load-bearing on a row whose stated target is the head.
     // We assert the function-slot diagnostic specifically — as our
     // Dictionary sibling below already does — and additionally pin the
-    // diagnostic that DOES fire, which is what shows the head bound T
-    // rather than failing to: a head that failed to bind T would report an
-    // unresolved-type diagnostic instead, not this member one.
+    // diagnostic that DOES fire.
+    //
+    // WHY conjunct (2) is here — the anti-vacuity guard, NOT a head-binding
+    // claim. `BEZEL_EXPECT_FALSE(sawFunctionSlot)` on its own is satisfied by
+    // any program that never reached §26.4's walk: dropping the `>` in this
+    // head yields a parse diagnostic and nothing else, and the absence
+    // conjunct still passes. Pinning that one specific diagnostic DID fire,
+    // and that it was the ONLY one, is what makes the absence above mean
+    // "§26.4 declined to call this a function slot" rather than "nothing
+    // got far enough to say".
+    //
+    // It is NOT evidence that the head bound T, and an earlier revision of
+    // this comment claimed it was. MEASURED on the current tree: a head that
+    // did NOT bind its type argument —
+    // `extension IEnumerable<Array<NoSuchType>>` — produces the IDENTICAL
+    // member diagnostic, still alone (1 of 1), and no unresolved-type
+    // diagnostic at all. (Isolating control: the same unknown name as the
+    // HEAD ITSELF, `extension NoSuchTypeX<T>`, IS diagnosed
+    // `unresolved type name \`NoSuchTypeX\``, so the silence is specific to
+    // the generic-ARGUMENT position — filed as #6518, out of scope here.)
+    // Do not re-derive a head-binding guarantee from conjunct (2).
     //
     // Both conjuncts are non-vacuous:
     //   (1) fails on `extension IEnumerable<Array<(T) -> T>>` — the same
     //       body under a head that DOES put T in a function slot, which
     //       emits "…function slot… (§26.4)".
     //   (2) fails if #6389's rejection is withdrawn, or if any second
-    //       diagnostic (a head-binding regression, say) appears.
+    //       diagnostic appears.
     int diagCount = 0;
     bool sawFunctionSlot = false;
     bool sawCountMember = false;
@@ -815,7 +833,9 @@ BEZEL_TEST(sema_extension,
     // must NOT fire. This is the row's documented purpose.
     BEZEL_EXPECT_FALSE(sawFunctionSlot);
     // (2) and the single diagnostic that does fire is #6389's stdlib §5
-    // operator member diagnostic — the head itself is clean.
+    // operator member diagnostic. This is the ANTI-VACUITY guard, not a
+    // claim that the head bound T — see the measurement in the comment
+    // above.
     BEZEL_EXPECT_TRUE(sawCountMember);
     BEZEL_EXPECT_EQ(diagCount, 1);
 }

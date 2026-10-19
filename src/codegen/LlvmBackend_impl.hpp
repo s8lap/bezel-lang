@@ -23426,10 +23426,28 @@ private:
     // non-comment call sites of this predicate are NOT all exercised by `Range`.
     // What the carve-out measured was the SET-LITERAL path above. The sorted
     // containers reject a `Range` earlier and on a different gate — stdlib
-    // §4.17/§4.18's `CompareTo` constraint (spec §14.2) — and `Array<Range<int>>`
-    // never consults this predicate on its element. Do not read "narrowing is
-    // safe for the other consumers" as measured; only the set-literal
-    // materialiser was.
+    // §4.17/§4.18's `CompareTo` constraint (spec §14.2).
+    //
+    // `Array<Range<int>>` is NOT exempt from this predicate. An earlier revision
+    // of this note claimed the opposite — that the predicate is never consulted
+    // on this receiver's element — and that was MEASURED FALSE.
+    // `tryLowerCollectionInstanceCall` (LlvmBackend_Calls.cpp)
+    // builds `arrElemIsClass` as
+    // `… || hasObjectHeaderEquality(arrElemRef)` with
+    // `arrElemRef = recvTy->genericArgs[0]` — the receiver's ELEMENT — and
+    // consumes it at 13 sites (13 = every non-comment `arrElemIsClass` use in
+    // that file, excluding its own definition), including the
+    // `IndexOf`/`Contains` per-element
+    // `emitRemoveElementEquality` calls. That arm is reached by an `Array<T>`
+    // receiver (`!arrIsOwning` there is the `Array`-only gate), so the predicate
+    // IS asked about `Range<int>` on this path.
+    //
+    // It is not a live hazard there, and that was checked rather than assumed:
+    // an `Array<Range<int>>` with `Add` + `IndexOf` prints `2` and `1` and exits
+    // 0. But read that as "this consumer's BEHAVIOUR does not change", not as
+    // "this consumer is out of scope" — the carve-out's effect AT THIS SITE was
+    // not separately measured. Do not read "narrowing is safe for the other
+    // consumers" as measured; only the set-literal materialiser was.
     bool hasObjectHeaderEquality(const sema::TypeRef* ty) const {
         if (!ty) return false;
         if (ty->kind == sema::TypeRef::Kind::Primitive)
