@@ -62,11 +62,21 @@
 // fire on the issue's own repro, and an arm written against the LAZY shape
 // alone does not fire on an interface-typed local. Both are pinned here.
 //
-// THE `importedName.empty()` CLAUSE IS LOAD-BEARING and has its own control
-// row. A builtin interface RECONSTRUCTED FROM MODULE METADATA has the same
-// Named / no-declaration / no-astNode shape but carries its name in
-// `importedName`; that receiver is the #995 vtable object, NOT a `bz_lazy_t*`.
-// Dropping the clause would reject a legal cross-module `IEnumerable<T>` local.
+// THE `importedName.empty()` CLAUSE IS LOAD-BEARING. A builtin interface
+// RECONSTRUCTED FROM MODULE METADATA has the same Named / no-declaration /
+// no-astNode shape but carries its name in `importedName`; that receiver is the
+// #995 vtable object, NOT a `bz_lazy_t*`. Dropping the clause would reject a
+// legal cross-module `IEnumerable<T>` local.
+//
+// This file does NOT pin that clause with a row — an earlier version of this
+// comment claimed it did, and that was false: every row here is single-module,
+// so a same-module `IEnumerable<int>` local carries an `astNode` and never
+// reaches the imported shape. The clause's load-bearingness was established by
+// DELETING it and observing the false reject of a legal two-module program, not
+// by a test. Pinning it needs a cross-module row, which cannot be written as a
+// single-module test for the reason given above; see
+// `tests/module/imported_builtin_generic_not_lazy_2593_test.cpp` for the
+// two-file harness shape. Filed as #6504.
 //
 // ORACLE. `runAot` with the diagnostic ASSERTED, not merely "it failed": a test
 // that only asserts failure passes on any compile error at all, including an
