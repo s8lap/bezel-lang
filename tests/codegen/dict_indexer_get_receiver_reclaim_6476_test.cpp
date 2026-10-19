@@ -95,7 +95,32 @@
 // passes at 0 as readily as at 7,272, so it cannot distinguish "discharged"
 // from "declined" — that is how R31 shipped a tolerated leak and called it
 // fixed. Every `leakedBytes` row below asserts `== 0`.
+//
+// ONE ARM IS CARVED OUT, AND IT IS A CRASH ROW, NOT A LEAK ROW: the RANGE
+// SLICE. §28.3 lists "a member or index access" as a borrowing use of an
+// unbound owned temporary, but `arr[r]` (§15.6 / §16.3) is not that — it
+// MATERIALIZES A NEW ARRAY whose element pointers are copied straight out of
+// the receiver (`bz_array_slice` does no `bz_array_retain_strings`), so the
+// receiver's storage is still live behind the slice. Discharging the receiver
+// on this arm releases each `bz_string` and then the slice's own disposal
+// releases it again. MEASURED on 797aff14, over runtime-allocated strings:
+//
+//   var s: Array<string> := P.MakeArr()[0..1];
+//   bezel: fatal: refcount over-release (string) — two releases for one
+//   reference; terminating per §28.9                      [exit 134, SIGABRT]
+//
+// and exit 0 on the base 7a0c320f. A leak must never be traded for a crash, so
+// the carve-out is the fix-forward's whole job: the receiver goes UNDISCHARGED
+// on this one arm (base-measured 223 bytes / 4 allocations — §28.3's own
+// "else it leaks" failure mode, the safe direction) until the slice's missing
+// element retain is fixed on its own oracle. That defect is pre-existing and
+// independent — it aborts on the BASE with a fully BOUND receiver and through
+// the named `Array<T>.Slice(r)` method, neither of which any registration here
+// touches — so it is NOT fixed in this file, and the row below asserts only
+// what this file can own: the slice arm runs, exits 0, and prints the right
+// contents.
 
+#include <initializer_list>
 #include <regex>
 #include <string>
 
@@ -160,15 +185,25 @@ long leakedBytes(const std::string& program) {
 
 // The CRASH oracle: run to completion, correct stdout, exit 0. `r.ran` is the
 // load-bearing assertion — false iff the generated program died on a memory
-// error.
-void expectRunsClean(const std::string& program, const char* expected) {
+// error. A row whose printed CONTENT is more than one value uses the
+// `expectRunsCleanAll` form below: EVERY expected value must appear in stdout,
+// so a row cannot pass by merely avoiding the fault — a program that produced
+// an empty or short-circuited slice, or one whose elements came from somewhere
+// else, fails here.
+void expectRunsCleanAll(const std::string& program,
+                        std::initializer_list<const char*> expected) {
     JitResult r = runAotCheckedLenient(program);
     // Loud-first, silent-second, in that order.
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (skipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find(expected) != std::string::npos);
+    for (const char* e : expected)
+        BEZEL_EXPECT_TRUE(r.stdoutText.find(e) != std::string::npos);
+}
+
+void expectRunsClean(const std::string& program, const char* expected) {
+    expectRunsCleanAll(program, {expected});
 }
 
 // A LEAK-oracle row: LSan armed by `runAotChecked` itself, program runs clean.
@@ -515,6 +550,65 @@ BEZEL_TEST(dict_indexer_get_receiver_reclaim_6476,
         "end C; ";
     BEZEL_EXPECT_EQ(leakedBytes(program), 0);
     expectRunsClean(program, "303");
+}
+
+// THE RANGE-SLICE ARM — the CRASH row this fix-forward exists for, and the one
+// the review of 797aff14 rejected the parent commit over.
+//
+// `P.MakeArr()[0..1]` is the same unbound owned temporary reaching the same
+// indexer-get path, but the index is a Range, so §15.6 / §16.3 make the whole
+// expression a SLICE: `lowerArrayRangeSlice` calls `bz_array_slice`, which
+// memcpy's the element pointers into a new array and retains nothing. The
+// receiver and the slice then co-own every element. With the receiver's §28.3
+// registration ahead of the slice early-return (797aff14), the scope-end pass
+// releases each element and the slice's own disposal releases it a second time.
+//
+// RUNTIME-ALLOCATED STRINGS ARE LOAD-BEARING. `a.Add($"elem-{i}")` interpolates
+// at run time and the result is refcounted; a plain literal is immortal and
+// this arm exits 0 with the fault present — measured, and it is why this row
+// must not be written with one.
+//
+// The assertion is CONTENT, not survival: `n` accumulates the sliced Count and
+// `m` accumulates the length of the sliced first element, both 101 times, and
+// `elem-0` itself is printed, so an empty or short-circuited slice fails here
+// even though it would not fault. MEASURED: 797aff14 SIGABRTs (exit 134) on the
+// first iteration; 7a0c320f and this fix print 202 / 606 / elem-0 at exit 0.
+//
+// NO LEAK ASSERTION HERE, DELIBERATELY. The receiver is undischarged on this arm
+// (base-measured 223 B / 4 allocs), so a `leakedBytes == 0` assertion would be
+// false and would turn a correct fix into a red row. That leak belongs to the
+// slice's missing `bz_array_retain_strings`, which reproduces on the base with
+// a BOUND receiver and through `.Slice(r)` too and is filed on its own oracle.
+BEZEL_TEST(dict_indexer_get_receiver_reclaim_6476,
+           a_range_sliced_indexer_get_does_not_double_release_its_receiver_spec_28_3) {
+    std::string program =
+        "module M; "
+        "class P public "
+        "  static method MakeArr(): owned Array<string> "
+        "    var a: Array<string> := new Array<string>(); "
+        "    for var i in 0..<3 do a.Add($\"elem-{i}\"); end for; "
+        "    return a; "
+        "  end MakeArr; "
+        "end P; "
+        "class C public "
+        "  static method Main(): int "
+        "    var i := 0; "
+        "    var n := 0; "
+        "    var m := 0; "
+        "    while " + std::string(kIterations) + " do "
+        "      var s: Array<string> := P.MakeArr()[0..1]; "
+        "      n := n + s.Count; "
+        "      m := m + s[0].Length; "
+        "      Console.WriteLine(s[0]); "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(n); "
+        "    Console.WriteLine(m); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ";
+    // 101 x (Count 2) = 202; 101 x len("elem-0") = 606.
+    expectRunsCleanAll(program, {"elem-0", "202", "606"});
 }
 
 // THE SCALAR-METHOD CONTROL — the arm that was ALREADY correct and must stay

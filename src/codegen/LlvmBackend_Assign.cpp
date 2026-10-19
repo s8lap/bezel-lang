@@ -285,6 +285,23 @@ const sema::PropertySymbol* Emitter::selectIndexer(
 }
 
 
+namespace {
+// §15.6 / §16.3 (v0.182, #1579): THE range-slice index predicate — a
+// Range-typed index expression, or any `RangeExpr` AST node used as an index.
+// This is the single definition of the question "will the indexer-get slice
+// arm run for this index?", and BOTH of the places that need to know answer it
+// here: `lowerArrayRangeSlice`'s own early-out below, and the §28.3
+// receiver-discharge carve-out in `lowerCollectionIndexerGet` that #6476's
+// fix-forward needs. One definition, so the carve-out cannot drift out of step
+// with the arm it is carving out of — which would either reintroduce the
+// double-release (guard says "not a slice", the arm slices anyway) or silently
+// stop charging the discharge for a scalar index.
+bool isRangeSliceIndex(bool idxTypeIsRange, const ast::Expr& idxExpr) {
+    return idxTypeIsRange ||
+           dynamic_cast<const ast::RangeExpr*>(&idxExpr) != nullptr;
+}
+}  // namespace
+
 // fix #682/#1079 / stdlib §4.4 / spec §16.3 (v0.182, #1579): Range-slice an
 // Array<T> — extracted from lowerCollectionIndexerGet's `arr[r]` handling so
 // the named `Array<T>.Slice(r)` method (§16.3: "`arr[r]` as the
@@ -296,13 +313,8 @@ const sema::PropertySymbol* Emitter::selectIndexer(
 llvm::Value* Emitter::lowerArrayRangeSlice(llvm::Value* recv,
                                            const sema::TypeRef* recvTy,
                                            const ast::Expr& idxExpr) {
-    auto* idxTy = ctx_.exprType(idxExpr);
-    bool isRangeIdx = isRangeType(idxTy);
-    if (!isRangeIdx) {
-        if (dynamic_cast<const ast::RangeExpr*>(&idxExpr))
-            isRangeIdx = true;  // any RangeExpr used as an index
-    }
-    if (!isRangeIdx) return nullptr;
+    if (!isRangeSliceIndex(isRangeType(ctx_.exprType(idxExpr)), idxExpr))
+        return nullptr;
 
     int64_t esz = collectionElemSize(recvTy);
     // Get array length for open-ended endpoints and bounds-checking.
@@ -659,6 +671,69 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (disposeStack_.empty() || emittingDisposerBody_) {
         // No enclosing scope to discharge through, or a disposer body — the
         // pre-existing leak, the safe direction (§28.3's "else it leaks").
+    } else if (isArr && isRangeSliceIndex(
+                   isRangeType(ctx_.exprType(*ix.indices[0].value)),
+                   *ix.indices[0].value)) {
+        // fix-forward #6476 (the §28.3 registration above, from 797aff14):
+        // THE RANGE-SLICE CARVE-OUT. A slice is NOT an index access for
+        // §28.3's purposes: `arr[r]` does not hand the caller an element
+        // borrowed out of the receiver, it MATERIALIZES A NEW ARRAY that the
+        // receiver's storage is aliased into, so the receiver is not dead once
+        // the full expression ends — its elements are still the slice's
+        // elements. §15.6 is the clause: slicing "produces a new Array<T>
+        // containing copies of the references (or values) in the range" and is
+        // "a fresh container, exactly like ToArray()".
+        //
+        // MEASURED on 797aff14 (this lane's parent tip), runtime-allocated
+        // strings (`a.Add($"elem-{i}")`; with plain literals the string is
+        // immortal and the fault does not fire), 101-iteration and single-shot
+        // alike:
+        //
+        //   var s: Array<string> := P.MakeArr()[0..1];
+        //   Console.WriteLine(s.Count);   // 2
+        //   Console.WriteLine(s[0]);      // elem-0
+        //   bezel: fatal: refcount over-release (string) — two releases for
+        //   one reference; terminating per §28.9        [exit 134, SIGABRT]
+        //
+        // and exit 0 on the base 7a0c320f. `bz_array_slice` copies the element
+        // POINTERS across with no `bz_array_retain_strings`, so the receiver
+        // and the slice end up co-owning ONE `bz_string*` that the receiver's
+        // `Add` had retained for itself alone; disposing the receiver releases
+        // it and the slice's own disposal then releases it a second time. The
+        // missing retain is a defect of `lowerArrayRangeSlice`, not of this
+        // registration.
+        //
+        // The predicate is `isRangeSliceIndex`, the SAME one the slice arm
+        // gates on, and `isArr` restricts it to the array-shaped receivers that
+        // arm serves — so a dictionary receiver keeps its discharge whatever
+        // its index looks like. This is a strict SUBTRACTION from the
+        // registration above: no other shape changes, and the slice arm lands
+        // exactly where the base left it.
+        //
+        // WHAT THIS DEFERS, deliberately: the §28.3 obligation itself is NOT
+        // denied — `P.MakeArr()` really is an unbound owned temporary and
+        // really should be discharged at the end of its full expression. It is
+        // UNDISCHARGED here (measured on the base for the same program:
+        // 223 bytes in 4 allocations under LSan — the receiver array header,
+        // its bucket block, the interpolated string and its bytes), because
+        // discharging it correctly requires the slice array and the receiver to
+        // agree on who owns each element FIRST, and that agreement is a
+        // SEPARATE, PRE-EXISTING defect with its own oracle: `bz_array_slice`
+        // copies the element pointers without retaining them, so the slice's
+        // own disposal releases a reference it does not hold — which reproduces
+        // on the base 7a0c320f with a fully BOUND receiver and through the named
+        // `Array<T>.Slice(r)` method, neither of which this registration
+        // touches. (WHICH SIDE gives way is that issue's ruling to make, and
+        // this lane does not make it: §15.6 describes the result as "copies of
+        // the references (or values)" and says a slice holds "copies of the
+        // element borrows, so disposing the slice never disposes elements" for
+        // class-typed T, while §28.11's shared-reference slot row — the row a
+        // `string` element takes — gives the slot a release, which is what the
+        // disposal classifier emits today.)
+        // Filing it there keeps this lane a fix-forward of a rejected commit
+        // rather than a second fix. §28.3's stated failure mode for an
+        // undischarged temporary is a leak, which is the safe direction; it must
+        // never trade that for a crash.
     } else if (isFreshOwnerlessDictMaterializerExpr(ix.target.get()) ||
                isFreshOwnerlessArrayMaterializerExpr(ix.target.get()) ||
                isUnboundOwnedBorrowingArrayCallExpr(ix.target.get())) {
