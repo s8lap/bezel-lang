@@ -15778,7 +15778,10 @@ void MethodOwnership::checkOneLambdaAsyncPatternABorrowedIdentifierReturn(
 // collection head, where `recv` is a tracked scope-bound owned local or
 // `using var`. A `this`-rooted chain (the receiver is a field of `this`)
 // is admitted — `this` outlives the call. A bare-identifier-receiver
-// parameter is admitted — the parameter outlives the call. A non-Drain
+// PLAIN parameter is admitted — the parameter outlives the call. An
+// `owned` parameter is NOT: it is scope-bound by §28.3's own words and the
+// callee discharges it at its own end, so it joins the reject classes
+// (#6462, v0.338 — see the note at the predicate below). A non-Drain
 // call is not affected (Drain is the only builtin with the
 // receiver-aliases-view property; a user-method Drain is classified by the
 // ordinary user-call rules and never reaches this check). // per §28.3
@@ -15853,104 +15856,135 @@ void MethodOwnership::checkReturnDrainFromScopeBoundReceiver(
             rcn = rt->headName();
     }
     if (!common::isOwningCollectionHead(rcn)) return;
+    // #6462 / §28.3 v0.338: an `owned` PARAMETER is SCOPE-BOUND. §28.3's
+    // local-scope bullet states it outright — "an `owned` parameter is
+    // scope-bound: the method disposes its undischarged value at its own end
+    // (*Auto-drop (affine)*)" — and *Auto-drop (affine)* puts that discharge
+    // at the end of the METHOD. So *Returning a deferred-activation frame*'s
+    // reject list reaches it ("a borrow of anything else — a scope-bound
+    // local, a `using var`, a temporary ... since the frame would outlive the
+    // source"), and here it does: the view is handed to the caller and the
+    // parameter's array is released on the same edge. §22.4 writes the
+    // classification on the formal; `owned` and `out owned` are the two
+    // spellings discharged at scope end.
+    //
+    // The class was MISSING rather than mis-decided. `run()` seeds `owned` /
+    // `out owned` parameters into `states_` as Owned, but a ParameterSymbol is
+    // not a LocalDecl and so never lands in `everOwnedPlainLocals_`, while
+    // `implicitDischarge` is the `using var` flag — both pre-existing
+    // disjuncts answered false and the shape reached codegen. Same predicate
+    // as codegen's `drainReceiverSourceDiesAtScopeEnd`
+    // (LlvmBackend_Stmts.cpp), which declined to MINT here for exactly this
+    // reason; that narrow stays, and is not widened — the reject belongs to
+    // this pass, upstream of it. // per §28.3 v0.338, §22.4, stdlib §4.5
+    // v0.195, #6462
+    auto ownedParamDiesAtMethodEnd = [](sema::Symbol* sym) {
+        const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym);
+        return ps && (ps->modifier == "owned" || ps->modifier == "out owned");
+    };
     // Identify the receiver. A bare IdentifierExpr whose symbol is a tracked
-    // scope-bound local / `using var` is the rejecting shape. A field-rooted
-    // chain (MemberAccessExpr whose target is receiver-sourced) is admitted.
-    // Anything else (a parameter, a call result, a method reference, …) is
-    // admitted: the parameter / caller-frame source outlives the call.
+    // scope-bound owned local, a `using var`, or an `owned` parameter is the
+    // rejecting shape. A field-rooted chain (MemberAccessExpr whose target is
+    // receiver-sourced) is admitted. Anything else (a PLAIN parameter — which
+    // outlives the call — a call result, a method reference, …) is admitted.
     const ast::Expr* recv = ma->target.get();
     // `this`-rooted: the receiver is `this` or a chain off it — admitted.
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv)) {
         if (id->name == "this") return;  // `this` outlives the call
-        // Tracked local: scope-bound owned local or `using var` — reject.
-        // A non-tracked local (e.g. an out-of-method binding) is conservatively
-        // admitted; the runtime is the caller's problem.
-        if (auto* sym = ctx_.exprSymbol(*id)) {
-            if (auto* st = lookupStateFor(*id)) {
-                // `using var` (implicitDischarge) OR a plain owned local
-                // recorded in everOwnedPlainLocals_ — both disposed at this
-                // method's exit; a borrow derived from either is an escape.
-                const bool usingVar = st->implicitDischarge;
-                const bool plainOwnedLocal =
-                    st->state == OwnershipState::Owned &&
-                    everOwnedPlainLocals_.count(sym) != 0;
-                if (!usingVar && !plainOwnedLocal) return;
-                report(
-                    Severity::Error, e.span.begin,
-                    std::string("cannot return `") +
-                    std::string(ma->target->span.begin.column > 0
-                                    ? id->name
-                                    : "scope-bound receiver") +
-                    "`.Drain()` — the drain view aliases the receiver's "
-                    "owning-collection array (stdlib §4.5 v0.195), and the "
-                    "receiver is " +
-                    (usingVar
-                         ? std::string("a `using var` disposed at the "
-                                       "callee's scope end")
-                         : std::string(
-                               "a scope-bound owned local disposed at the "
-                               "callee's scope end")) +
-                    ", so the returned view dangles (§28.3 *Returning a "
-                    "deferred-activation frame*, v0.226; bind the receiver "
-                    "in the caller's scope and return the drain from there, "
-                    "or move the array out of the local first via `move`)");
-                return;
-            }
-            // Tracked but in some other state (moved-from / disposed / etc.) —
-            // the existing state-error paths diagnose, do not double-report
-            // a return-site drain escape. Admit.
-            return;
-        }
-        // Untracked bare identifier: a parameter (outlives the call —
-        // admitted) or an unresolved import (admitted conservatively).
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        // Read the formal's own modifier, NOT the seeded `states_` entry: the
+        // classification is a property of the declaration (§22.4), so the
+        // verdict does not depend on whether this pass seeded a state for it.
+        const bool ownedParam = ownedParamDiesAtMethodEnd(sym);
+        const LocalOwnership* st = sym ? lookupStateFor(*id) : nullptr;
+        // `using var` (implicitDischarge), a plain owned local recorded in
+        // everOwnedPlainLocals_, or an `owned` parameter — all three disposed
+        // at this method's exit; a borrow derived from any is an escape.
+        const bool usingVar = st && st->implicitDischarge;
+        const bool plainOwnedLocal =
+            st && st->state == OwnershipState::Owned &&
+            everOwnedPlainLocals_.count(sym) != 0;
+        // Everything else — a tracked binding in another state (moved-from /
+        // disposed, where the existing state-error paths diagnose rather than
+        // double-report), a non-tracked local, a PLAIN parameter, an
+        // unresolved import — is admitted exactly as before.
+        if (!ownedParam && !usingVar && !plainOwnedLocal) return;
+        report(
+            Severity::Error, e.span.begin,
+            std::string("cannot return `") +
+            std::string(ma->target->span.begin.column > 0
+                            ? id->name
+                            : "scope-bound receiver") +
+            "`.Drain()` — the drain view aliases the receiver's "
+            "owning-collection array (stdlib §4.5 v0.195), and the "
+            "receiver is " +
+            (usingVar
+                 ? std::string("a `using var` disposed at the "
+                               "callee's scope end")
+                 : ownedParam
+                       ? std::string("an `owned` parameter disposed at the end "
+                                     "of this method")
+                       : std::string(
+                             "a scope-bound owned local disposed at the "
+                             "callee's scope end")) +
+            ", so the returned view dangles (§28.3 *Returning a "
+            "deferred-activation frame*, v0.226; bind the receiver "
+            "in the caller's scope and return the drain from there, "
+            "or move the array out of the local first via `move`)");
         return;
     }
     // A MemberAccessExpr receiver (`obj.Items.Drain()`): the chain's ROOT
     // determines the borrow source. `this`-rooted (`this.f.Drain()`) is
     // admitted — `this` outlives the call. A chain rooted at a tracked
-    // scope-bound owned local or `using var` is the same hazard as the
-    // bare-identifier case (the chain's source is the local's storage,
-    // disposed at the callee's scope end). A parameter-rooted chain is
-    // admitted — the parameter outlives the call. Walk down the chain
-    // until we reach the root identifier and check the tracked state.
+    // scope-bound owned local, a `using var`, or an `owned` parameter is the
+    // same hazard as the bare-identifier case (the chain's source is that
+    // holder's storage, disposed at the callee's scope end). A chain rooted at
+    // a PLAIN parameter is admitted — the parameter outlives the call. Walk
+    // down the chain until we reach the root identifier and ask the same three
+    // questions the bare-identifier arm asks of it; asking about the ROOT, not
+    // the direct receiver, is load-bearing (`p.Items.Drain()` over
+    // `owned p: Bag` has an ordinary field as its direct receiver and escalates
+    // exactly like the direct spelling).
     if (auto* rma = dynamic_cast<const ast::MemberAccessExpr*>(recv)) {
         const ast::Expr* root = rma;
         while (auto* hop = dynamic_cast<const ast::MemberAccessExpr*>(root))
             root = hop->target.get();
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(root)) {
             if (id->name == "this") return;  // `this.f.Drain()` — admitted
-            if (auto* sym = ctx_.exprSymbol(*id)) {
-                if (auto* st = lookupStateFor(*id)) {
-                    const bool usingVar = st->implicitDischarge;
-                    const bool plainOwnedLocal =
-                        st->state == OwnershipState::Owned &&
-                        everOwnedPlainLocals_.count(sym) != 0;
-                    if (!usingVar && !plainOwnedLocal) return;  // parameter or borrowed
-                    report(
-                        Severity::Error, e.span.begin,
-                        std::string("cannot return `") +
-                        std::string(id->name) +
-                        "`.Drain()` — the drain view aliases the receiver's "
-                        "owning-collection array (stdlib §4.5 v0.195), and the "
-                        "chain's source `" +
-                        std::string(id->name) +
-                        "` is " +
-                        (usingVar
-                             ? std::string("a `using var` disposed at the "
-                                           "callee's scope end")
-                             : std::string(
-                                   "a scope-bound owned local disposed at the "
-                                   "callee's scope end")) +
-                        ", so the returned view dangles (§28.3 *Returning a "
-                        "deferred-activation frame*, v0.226; bind the source "
-                        "in the caller's scope and return the drain from "
-                        "there, or move the array out of the local first via "
-                        "`move`)");
-                    return;
-                }
-                return;  // untracked (parameter / import) — admitted
-            }
-            return;  // unresolved — admit conservatively
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            const bool ownedParam = ownedParamDiesAtMethodEnd(sym);
+            const LocalOwnership* st = sym ? lookupStateFor(*id) : nullptr;
+            const bool usingVar = st && st->implicitDischarge;
+            const bool plainOwnedLocal =
+                st && st->state == OwnershipState::Owned &&
+                everOwnedPlainLocals_.count(sym) != 0;
+            // A plain parameter, a tracked binding in another state, or an
+            // unresolved import — admitted, as before.
+            if (!ownedParam && !usingVar && !plainOwnedLocal) return;
+            report(
+                Severity::Error, e.span.begin,
+                std::string("cannot return `") +
+                std::string(id->name) +
+                "`.Drain()` — the drain view aliases the receiver's "
+                "owning-collection array (stdlib §4.5 v0.195), and the "
+                "chain's source `" +
+                std::string(id->name) +
+                "` is " +
+                (usingVar
+                     ? std::string("a `using var` disposed at the "
+                                   "callee's scope end")
+                     : ownedParam
+                           ? std::string("an `owned` parameter disposed at the "
+                                         "end of this method")
+                           : std::string(
+                                 "a scope-bound owned local disposed at the "
+                                 "callee's scope end")) +
+                ", so the returned view dangles (§28.3 *Returning a "
+                "deferred-activation frame*, v0.226; bind the source "
+                "in the caller's scope and return the drain from "
+                "there, or move the array out of the local first via "
+                "`move`)");
+            return;
         }
         // Chain rooted in something other than an identifier (e.g. another
         // call). The chain is conservatively admitted — the indexer case

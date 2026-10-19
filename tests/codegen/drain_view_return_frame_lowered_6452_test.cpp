@@ -33,12 +33,17 @@
 // pinned as ADMITTED — `drain_view_return_site_2175.return_this_field_drain_
 // admitted_control_spec_28_3` asserts `hasErrors() == false` over the same
 // method. The scope-bound forms §28.3 REJECTS (`recv.Drain()` over a `using
-// var`, a plain owned local, an `owned` parameter) are rejected by the
+// var`, a plain owned local) are rejected by the
 // ownership pass at the return site — rows
 // `return_using_var_drain_rejected_spec_28_3`,
 // `return_using_var_field_drain_chain_rejected_spec_28_3` and
 // `return_plain_owned_local_drain_rejected_spec_28_3` — so they never reach
-// codegen and nothing here re-opens them.
+// codegen and nothing here re-opens them. The `owned` PARAMETER joined them in
+// #6462 (row (F) below, plus the rows in
+// tests/ownership/drain_view_owned_parameter_6462_test.cpp), which is what
+// finally makes this header's claim about that class true rather than
+// aspirational; before it, the claim was false and #6452's own reviewer
+// measured it so.
 //
 // ROWS.
 //   (A) THE DEFECT — `public method View(): IOwningEnumerable<R> return
@@ -311,8 +316,7 @@ BEZEL_TEST(drain_view_return_frame_lowered_6452,
 }
 
 // ===========================================================================
-// (F) THE OWNED-PARAMETER CLASS STILL TAKES THE OLD PATH (§28.3) — the
-// narrow, and the reason the narrow exists.
+// (F) THE OWNED-PARAMETER CLASS — REJECTED at the return site since #6462.
 //
 // #6452's first cut claimed in a `src/` comment and in its commit body that
 // `recv.Drain()` over an `owned` parameter is "rejected by the ownership pass
@@ -334,28 +338,36 @@ BEZEL_TEST(drain_view_return_frame_lowered_6452,
 //   View(owned items: OwningArray<R>) return items.Drain();  // direct
 //   View(owned p: Bag)                 return p.items.Drain();  // chain
 //
-// ⚠ THIS ROW IS A SCOPE-CLAIM PIN, NOT A BEHAVIOURAL ONE. It calls
-// `parseAndCheckOwnership`, which runs Lexer → Parser → collectSymbols →
-// resolveTypes → typecheckExpressions → checkOwnership and RETURNS. It never
-// reaches codegen, so it is green at base, at the un-narrowed arm and at the
-// narrowing alike: it CANNOT observe `drainReceiverSourceDiesAtScopeEnd`, and
-// nothing here was tuned to make it. What it does pin is the SCOPE claim above
-// — the class still COMPILES, which is the property the narrow must not
-// disturb — and it will go RED the day the ownership pass learns to reject an
-// `owned`-parameter drain. It is kept, not deleted, and it is not asked to
-// discriminate; its runtime half is `drain_return_owned_parameter_still_
-// degrades_6452.bzl` in tests/lit, because the content is the `#2491`
-// NEEDLE and the gtest AOT harness discards stderr on a successful compile.
-// Asserting a crash from gtest would pin a defect as if it were a
-// requirement; asserting it from lit pins the DIAGNOSTIC that says so, which
-// is the part a future fix must change.
+// ⚠ BEHAVIOUR FLIP, #6462. This row asserted `hasErrors() == false` and its
+// own header said it "will go RED the day the ownership pass learns to reject
+// an `owned`-parameter drain". That day is this commit. §28.3 states the
+// classification outright — *Borrow lifetime rules*' local-scope clause 2:
+// "an `owned` parameter is scope-bound: the method disposes its undischarged
+// value at its own end" — and *Owned-local discharge requirement*'s *Auto-drop
+// (affine)* puts that discharge at the end of the METHOD, so the parameter
+// does not outlive the call and *Returning a deferred-activation frame*'s
+// scope-bound reject list reaches it. The assertion is INVERTED here and the
+// row is renamed: `owned_parameter_drain_return_still_compiles_spec_28_3` →
+// `owned_parameter_drain_return_rejected_spec_28_3`.
 //
-// That lit row asserts the exact count of `#2491` occurrences (two, one per
-// spelling), not just the presence of one — a single FileCheck directive
-// matches the first occurrence and moves on, so presence alone would survive a
-// narrowing that handled the direct receiver and missed the chain root.
+// It is now a BEHAVIOURAL row, not a scope-claim pin: it observes the
+// ownership pass's verdict directly. The admitted classes keep their own rows
+// — `this_field_drain_return_still_no_errors_spec_28_3` below for the receiver,
+// `plain_parameter_drain_return_still_admitted_spec_28_3` and the runtime row
+// in tests/ownership/drain_view_owned_parameter_6462_test.cpp for the plain
+// parameter — and the same-program detail the lit row needed (the exact
+// diagnostic text, over both spellings) is now that row's job too: the lit
+// twin `drain_return_owned_parameter_still_degrades_6452.bzl` was replaced by
+// `drain_return_owned_parameter_rejected_6462.bzl`, because the gtest AOT
+// harness discards captured compiler stderr on a successful compile and this
+// content is a NEEDLE.
+//
+// The #6452 codegen narrow (`Emitter::drainReceiverSourceDiesAtScopeEnd`) is
+// UNCHANGED and is neither widened nor narrowed further. The reject belongs to
+// the ownership pass, upstream of codegen; the narrow stays as a second line
+// of defence for any spelling that check does not reach.
 BEZEL_TEST(drain_view_return_frame_lowered_6452,
-           owned_parameter_drain_return_still_compiles_spec_28_3) {
+           owned_parameter_drain_return_rejected_spec_28_3) {
     const std::string src =
         "module M; "
         "class R public constructor() end constructor; end R; "
@@ -386,10 +398,22 @@ BEZEL_TEST(drain_view_return_frame_lowered_6452,
         "  end View; "
         "end Chained; ";
     auto r = parseAndCheckOwnership(src);
-    // No rejection — that is the pre-existing state, and this row's job is to
-    // say so. Were #6452 ever to teach the ownership pass to reject this
-    // class, this assertion is the one that should go red first.
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // Rejected — #6462. The class was un-rejected here because the ownership
+    // pass's receiver test asked two questions that both name a LOCAL; a
+    // ParameterSymbol is never a LocalDecl, so it could satisfy neither. BOTH
+    // spellings must be rejected, which is why the assertion counts them: a
+    // narrow that asked only about the direct receiver would reject (F1) and
+    // admit (F2).
+    int ownedParamDrainErrors = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("`.Drain()`") == std::string::npos) continue;
+        if (d.message.find("an `owned` parameter disposed at the end of this "
+                           "method") == std::string::npos)
+            continue;
+        ++ownedParamDrainErrors;
+    }
+    BEZEL_EXPECT_EQ(ownedParamDrainErrors, 2);
 }
 
 // ===========================================================================

@@ -55,14 +55,18 @@
 //     correctly. It must keep being silent, so a fix that merely suppressed the
 //     note would go green here and red there. This is what makes the file a
 //     gate on the VALUE rather than on the text.
-//   * `drain_return_owned_parameter_still_degrades_6452.bzl` — the receiver
-//     class this fix deliberately DECLINES, because an `owned` parameter is
-//     discharged at the callee's scope end and a frame minted over it dangles.
-//     It still draws the `#2491` note, in both spellings. This is what makes
-//     "no `#2491` on this arm" a claim about a SCOPE rather than about the note
-//     being suppressed wholesale — and it is the row that stops the scope from
-//     widening silently, since an arm that admitted this class would start
-//     minting here and the CHECKs below would stop matching.
+//   * `drain_return_owned_parameter_rejected_6462.bzl` — the receiver class
+//     this fix DECLINED, because an `owned` parameter is discharged at the
+//     callee's scope end and a frame minted over it dangles. #6462 later
+//     closed the class properly: the ownership pass now rejects it at the
+//     RETURN SITE, upstream of codegen, so this file no longer reaches this arm
+//     at all and the row asserts that rejection in both spellings. It was
+//     `drain_return_owned_parameter_still_degrades_6452.bzl` before that, and
+//     it asserted the `#2491` note in both spellings instead. This is what
+//     makes "no `#2491` on this arm" a claim about a SCOPE rather than about
+//     the note being suppressed wholesale — and it is the row that stops the
+//     scope from widening silently, since an arm that admitted this class
+//     would start minting here and the CHECKs below would stop matching.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
