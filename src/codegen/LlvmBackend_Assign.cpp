@@ -11064,8 +11064,37 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
     // `ownedWrapElementDisposer` for why sharing one Dispose across two
     // element types that both lower to `ptr` is an over-release hazard.
     llvm::Function* elDisp = ownedWrapElementDisposer(iEnumTy);
+    // fix #6439 (§28.6 / §28.11, v0.338): the head decides whether the array's
+    // RECORDED header disposer may be consulted at this free site.
+    //
+    // `IEnumerable<T>` — the wrap installs the BORROWING `Current` (#2710):
+    // iteration lends, the collection still holds every class element at
+    // Dispose, so the header is authoritative and consulting it closes
+    // #6439's store-time cascade leak (2x16 B measured, property never read).
+    //
+    // `IOwningEnumerable<T>` — §29.1/§29.2 slot 3 is `TakeCurrent`: ownership
+    // LEFT the collection at each yield, and this wrap does not drain
+    // (`bz_array_drain_next` absent from the IR, MEASURED), so the header
+    // names pointers the loop already freed. Consulting it here is a
+    // double-dispose. Keep the element-type-derived disposer verbatim.
+    bool consultHeader = builtinTypeName(iEnumTy) != "IOwningEnumerable";
+    // The head is part of the cache key for the same reason #3450 put the
+    // disposer there: two element types that both lower to `ptr` must not
+    // share one Dispose, and neither must the two HEADS over one element type
+    // now that the head changes the BODY.
+    //
+    // The segment marks the NON-cascading (owning) head, so every borrowing
+    // name is unchanged. That is not cosmetic: `IOwningEnumerable<T>`
+    // constrains `where T: class` (stdlib §4.13), so the owning head is
+    // reachable only for a class element and therefore only under the `ptr`
+    // elemName — a borrowing `ptr` wrap and an owning `ptr` wrap are exactly
+    // the pair that would otherwise collide. Every non-`ptr` name keeps its
+    // pre-fix spelling (including the `i32` rows pinned by
+    // `tests/lit/enumerator_vtable_cache_internal_linkage_3477.bzl`), and the
+    // one shape that gains a segment is the one that had no name before.
     std::string prefix =
-        "bz$arrenumown$" + elemName + ownedWrapDisposerKey(elDisp) + "$";
+        "bz$arrenumown$" + elemName + ownedWrapDisposerKey(elDisp) +
+        (consultHeader ? "" : "$iow") + "$";
 
     // Owning Dispose: bz_array_free(self->arr, <element disposer>); free(self).
     // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the element disposer is
@@ -11098,14 +11127,20 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
         llvm::Value* elDispVal = elDisp
             ? llvm::cast<llvm::Value>(elDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
+        // fix #6439 (§28.6 / §28.11, v0.338): route through the head-aware
+        // helper rather than calling `bz_array_free` with the element-type
+        // disposer outright, so the BORROWING `IEnumerable<T>` head consults
+        // the header recorded at construction. See the cache-key comment above
+        // for why the owning head must keep its element-type disposer.
         auto* freeArrFn = module_->getOrInsertFunction(
-            "bz_array_free", llvm::FunctionType::get(
-                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))
+            "bz_array_free_owning_wrap", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i32()}, false))
             .getCallee();
         b.CreateCall(
             llvm::FunctionType::get(
-                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
-            freeArrFn, {arrPtr, elDispVal});
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i32()}, false),
+            freeArrFn, {arrPtr, elDispVal,
+                        llvm::ConstantInt::get(i32(), consultHeader ? 1 : 0)});
         auto* freeFn = module_->getOrInsertFunction(
             "free", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
@@ -12593,8 +12628,21 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
     // cache-key segment that keeps two `ptr`-lowered element types from
     // sharing one Dispose.
     llvm::Function* elDisp = ownedWrapElementDisposer(iEnumTy);
+    // fix #6439 (§28.6 / §28.11, v0.338): the array twin's head gate, asked
+    // rather than re-spelled. `IEnumerable<T>` borrows and keeps every element
+    // at Dispose, so the header disposer recorded at construction is
+    // authoritative; `IOwningEnumerable<T>` has already moved ownership out to
+    // the loop via §29.1's `TakeCurrent` and this wrap does not drain, so the
+    // header would name freed pointers. In the cache key because the head now
+    // changes the Dispose BODY, for the same reason #3450 keyed on the
+    // disposer: two `ptr`-lowered element types, or the two heads over one
+    // element type, must not share one function. The segment marks the
+    // NON-cascading (owning) head — reachable only for a class element, so
+    // only under `ptr` — which leaves every borrowing name unchanged.
+    bool consultHeader = builtinTypeName(iEnumTy) != "IOwningEnumerable";
     std::string prefix =
-        "bz$stackenumown$" + elemName + ownedWrapDisposerKey(elDisp) + "$";
+        "bz$stackenumown$" + elemName + ownedWrapDisposerKey(elDisp) +
+        (consultHeader ? "" : "$iow") + "$";
 
     // Owning Dispose: bz_array_free(self->arr, <element disposer>); free(self).
     auto* dispFn = module_->getFunction(prefix + "Dispose");
@@ -12614,14 +12662,19 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
         llvm::Value* elDispVal = elDisp
             ? llvm::cast<llvm::Value>(elDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
+        // fix #6439 (§28.6 / §28.11, v0.338): head-aware free, so the
+        // BORROWING `IEnumerable<T>` head consults the construction-time header
+        // disposer (this array twin's leak, 2x16 B) while the owning head keeps
+        // the element-type disposer verbatim. See the cache-key comment above.
         auto* freeArrFn = module_->getOrInsertFunction(
-            "bz_array_free", llvm::FunctionType::get(
-                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))
+            "bz_array_free_owning_wrap", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i32()}, false))
             .getCallee();
         b.CreateCall(
             llvm::FunctionType::get(
-                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
-            freeArrFn, {arrPtr, elDispVal});
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i32()}, false),
+            freeArrFn, {arrPtr, elDispVal,
+                        llvm::ConstantInt::get(i32(), consultHeader ? 1 : 0)});
         auto* freeFn = module_->getOrInsertFunction(
             "free", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();

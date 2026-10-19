@@ -334,6 +334,51 @@ void bz_array_free_dynamic(void* arrp) {
     bz_array_free(arrp, ((bz_array_t*)arrp)->elem_disposer);
 }
 
+// #6439 (§28.6 / §28.11, v0.338): the OWNING enumerable WRAP's slot-1 free, for
+// the BORROWING `IEnumerable<T>` head only. Same header-consulting rule as
+// `bz_array_free_dynamic`, with `fallback` standing in for a header the
+// construction site left NULL — which is the shape that made the wrap leak its
+// string elements before #2710 derived `fallback` from the element type.
+//
+// WHY THE HEAD IS THE DISCRIMINATOR, and why the header alone is not enough.
+// The wrap's slot-1 Dispose frees the backing array for an `IEnumerable<T>`
+// field; whether the array's class elements are still LIVE at that point is a
+// property of which vtable the wrap installed, not of the array:
+//
+//   * `IEnumerable<T>` head — the wrap installs the BORROWING `Current`
+//     (#2710's rule): iteration LENDS each element and the collection keeps
+//     every one of them, so at Dispose the header's answer is authoritative
+//     and consulting it is required. Skipping it is #6439's leak (2x16 B,
+//     measured, with the property never read — a store-time cascade gap).
+//
+//   * `IOwningEnumerable<T>` head — §29.1/§29.2 make slot 3 `TakeCurrent`, so
+//     ownership LEAVES the collection at each yield. Whichever wrap serves that
+//     head, the elements the loop consumed are gone and the array must not be
+//     asked to dispose them again. `wrapArrayAsIEnumerable` gets this right by
+//     routing to the draining wrap (`owningDrainWrapForHead`), whose
+//     `bz_array_drain_next` REMOVES each slot; the OWNING twins
+//     (`wrapOwnedArrayAsIEnumerable` / `wrapOwnedStackAsIEnumerator`) do NOT
+//     drain — MEASURED: zero `bz_array_drain_next` calls in the IR of a
+//     callee-owned `IOwningEnumerable<Item>` return — so there the loop has
+//     already discharged each element while the array still holds the pointer,
+//     and consulting the header is a DOUBLE DISPOSE (heap-use-after-free in
+//     `bz$elemDispose` <- `bz_array_free`, reproduced on the unsound
+//     header-always variant).
+//
+// So the head is passed as an explicit flag rather than inferred: a
+// header-always rule would over-dispose on the owning head, and no
+// header-consulting rule at all leaks on the borrowing one. The owning head
+// keeps its element-type-derived disposer verbatim.
+void bz_array_free_owning_wrap(void* arrp, void (*fallback)(void*),
+                               int32_t consult_header) {
+    if (!arrp) return;
+    auto* arr = (bz_array_t*)arrp;
+    void (*disp)(void*) = consult_header && arr->elem_disposer
+                              ? arr->elem_disposer
+                              : fallback;
+    bz_array_free(arrp, disp);
+}
+
 void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;

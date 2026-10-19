@@ -118,6 +118,18 @@ void bz_array_set_elem_disposer(void* arr, void (*dispose_elem)(void*));
 // `bz_array_free(arr, nullptr)`, so this can never over-dispose.
 void bz_array_free_dynamic(void* arr);
 
+// #6439 (§28.6 / §28.11, v0.338): the OWNING enumerable wrap's slot-1 free.
+// `consult_header` is set only for the BORROWING `IEnumerable<T>` head, where
+// iteration lends and the collection still holds every element at Dispose —
+// there the header disposer recorded at construction is authoritative and
+// skipping it leaks the array's class elements. It is CLEARED for the
+// `IOwningEnumerable<T>` head, where §29.1's `TakeCurrent` has already moved
+// ownership out to the loop and the header would name freed pointers.
+// `fallback` is the element-type-derived disposer (`ownedWrapElementDisposer`),
+// used when the header carries none.
+void bz_array_free_owning_wrap(void* arr, void (*fallback)(void*),
+                               int32_t consult_header);
+
 // §28.2 v0.135 / issue #621: checked-disposal-mode quarantine. Marks the
 // array as disposed (for the indexer guard) and disposes elements, but does
 // NOT free the header block — mirrors class-instance quarantine in the codegen.
