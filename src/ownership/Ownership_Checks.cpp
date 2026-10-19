@@ -17557,6 +17557,179 @@ void MethodOwnership::scanGetterReturns(
                        getterFreshOwnedEscapeDiagnostic());
         });
     }
+
+    // fix #6484 (§28.3, v0.338): the CARRIED-BORROW rule for a getter return.
+    //
+    // The two rules above are about the value a getter returns being a FRESH
+    // OWNED producer (§28.6). §28.3's *Returning a deferred-activation frame*
+    // paragraph states the orthogonal rule that governs this position, and it
+    // names its own subject: "provided every borrow the returned frame carries
+    // is sourced from the method's own parameters or receiver (directly or
+    // through the receiver's fields, the receiver-sourced notion of §28.6); …
+    // A returned frame carrying a borrow of anything else — a scope-bound
+    // local, a `using var`, a temporary — is rejected at the return site, since
+    // the frame would outlive the source" (v0.338).
+    //
+    // A getter has no parameters, so §28.3's admission for this position is
+    // exactly the receiver-sourced one — and the `get => _items.Drain()` shape
+    // the §28.6 bullet-2 carve admits is receiver-sourced, so this rule does
+    // not touch it (measured: still ACCEPTED, see the matrix in the commit).
+    //
+    // MEASURED ACCEPTED before this fix (#6484, at ba713eb9): a getter that
+    // binds the deferred-activation frame to a local and returns THAT local
+    // walks the `escapesFreshOwned` peel above, which asks only whether the
+    // chain reaches a FRESH OWNED producer. It does not ask what BORROW the
+    // frame carries, so the walk dead-ends at the `.Where(...)` call and the
+    // escape is admitted:
+    //
+    //     get => do using var items2 := MakeItems();
+    //               var frame := items2.Where(lambda(x) => true);
+    //               return frame; end;
+    //
+    // ASan at that program: `heap-use-after-free`, freed by `bz$elemDispose`,
+    // allocated in `MakeItems`, called from `bz$prop$Items$get` — the caller
+    // reads the frame's elements after the getter's scope disposed them.
+    //
+    // WHY A SEPARATE PASS AND NOT AN EXTENSION OF THE PEEL. The peel's subject
+    // is the returned value's OWNERSHIP CLASSIFICATION (fresh or not); this
+    // rule's subject is the frame's CARRIED SOURCES. A single fresh frame can
+    // be admissible on the first and inadmissible on the second at once — that
+    // is exactly the mint-announcing case: `MakeItems()` is a fresh owned
+    // producer, yet for a mint-announcing return type the container itself is
+    // announced (announcement table row 2) while the CARRIED borrows are still
+    // governed by §28.3. Folding this into the peel would have to make the
+    // producer test and the carried-source test share one walk, and the two
+    // disagree on where each stops. Kept separate, each keeps its own scope.
+    //
+    // SCOPE, and why it is this narrow:
+    //   * Only a getter whose declared return type is a DEFERRED-ACTIVATION
+    //     KIND is subject. §28.3's paragraph opens by scoping itself to "a
+    //     return whose declared type is one of the deferred-activation kinds";
+    //     a getter typed at an ordinary borrowable class is governed by the
+    //     §28.3 borrow-lifetime rule instead, which for a METHOD is
+    //     `checkBorrowEscapesOnReturn` — and that check reads `states_`, which
+    //     a getter body never populates (see the accessor driver above: a
+    //     getter gets narrow checks, not the full pass). Extending the METHOD
+    //     rule to getters is a much larger blast radius and is reported, not
+    //     taken; what is fixed here is the frame rule, whose own scope is this.
+    //   * Only a root that is a LOCAL DECLARED BY THIS GETTER BODY counts. A
+    //     `this`-rooted or parameter-rooted chain is §28.3's admitted
+    //     receiver-sourced case. The same `declared` set the peel above builds
+    //     is reused, so "declared by this body" means one thing in this file.
+    //   * A REASSIGNED local stops the walk, exactly as in the peel: §28.7's
+    //     drop-on-overwrite retires the source and the surviving value is
+    //     whatever was stored, so `var s := <scope-bound>; s := _field;
+    //     return s.Where(…);` borrows the FIELD and is legal. The self-
+    //     assignment exclusion is reused verbatim for the same reason.
+    //   * A value-typed return is a copy, not a borrow — `returnedExprMayBorrow`
+    //     is the existing single home for that test and is consulted, not
+    //     re-derived.
+    //
+    // PER §28.3 (v0.338).
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        forEachNestedStmt(*s, [&](const ast::Stmt& inner) {
+            const auto* rs = dynamic_cast<const ast::ReturnStmt*>(&inner);
+            if (!rs || !rs->value) return;
+            // Follow the returned binding to the frame construction it was
+            // laundered through, then collect that construction's sources.
+            // A frame returned DIRECTLY (`return items2.Where(…)`) needs no
+            // peel — `framesCarryingBorrowOfBodyLocal` starts at the returned
+            // expression either way.
+            std::set<const ast::Node*> frameDecls;
+            {
+                const ast::Expr* cur = lookThroughForceUnwrap(rs->value.get());
+                for (int step = 0; step < 32 && cur; ++step) {
+                    const auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(cur);
+                    if (!id) break;
+                    auto* ls = dynamic_cast<const sema::LocalSymbol*>(
+                        ctx_.exprSymbol(*id));
+                    if (!ls || !ls->decl) break;
+                    const ast::Expr* init = declInitializer(ls->decl);
+                    if (!init) break;
+                    frameDecls.insert(ls->decl);
+                    cur = lookThroughForceUnwrap(init);
+                }
+            }
+            for (const ast::Node* fd : frameDecls) {
+                if (std::find(reassigned.begin(), reassigned.end(), fd) !=
+                    reassigned.end())
+                    continue;  // §28.7 discharged the source
+                const ast::Expr* fs = declInitializer(fd);
+                if (!fs) continue;
+                const auto* ce = dynamic_cast<const ast::CallExpr*>(fs);
+                // Only a DEFERRED-ACTIVATION frame carries borrows. An ordinary
+                // call's result is not a frame that outlives the call, so its
+                // arguments are not sources of anything the caller holds.
+                if (!ce || !isDeferredActivationCallResult(*ce)) continue;
+                // The value-typed test reads the FRAME's type, not the laundered
+                // binding's: `returnedExprMayBorrow` on the returned identifier
+                // asks what the BINDING's expression type is, and sema types a
+                // `var frame := <lazy query>` binding by its ELEMENT type
+                // (`Item`), which is value-typed and would read as a copy. The
+                // frame's own type is the deferred-activation head, and that is
+                // what decides borrow-vs-copy here.
+                if (!returnedExprMayBorrow(*ce)) continue;
+                std::vector<std::pair<const ast::IdentifierExpr*, int>> srcs;
+                collectReturnBorrowRoots(*ce, kRootTop, srcs);
+                for (const auto& [root, how] : srcs) {
+                    (void)how;
+                    auto* ls =
+                        dynamic_cast<const sema::LocalSymbol*>(
+                            ctx_.exprSymbol(*root));
+                    if (!ls || !ls->decl) continue;
+                    // Not declared by this getter body ⇒ `this`, a parameter,
+                    // or another enclosing scope's local: §28.3's admitted
+                    // receiver-sourced case, or not this rule's subject.
+                    if (std::find(declared.begin(), declared.end(), ls->decl) ==
+                        declared.end())
+                        continue;
+                    // §28.7's drop-on-overwrite retires the SOURCE, not just
+                    // the frame binding: `var items2 := MakeItems();
+                    // items2 := _items; return items2.Where(…)` borrows the
+                    // FIELD after the store, which outlives the getter, so the
+                    // reassignment must be read on `items2` itself. The
+                    // self-assignment exclusion is already applied when the
+                    // `reassigned` set was built (`noteStore`), so a `t := t;`
+                    // no-op is correctly NOT a discharge and does not stop this.
+                    if (std::find(reassigned.begin(), reassigned.end(),
+                                  ls->decl) != reassigned.end())
+                        continue;
+                    // A BARE identifier argument borrows the local only if the
+                    // local is scope-bound — a `using var` (disposed at scope
+                    // end) or a plain owned local (auto-dropped there). A
+                    // borrow-typed local is not the hazard this rule names.
+                    const auto* ld =
+                        dynamic_cast<const ast::LocalDecl*>(ls->decl);
+                    if (!ld) continue;
+                    const ast::Expr* linit = declInitializer(ls->decl);
+                    const bool usingVar = ld->isUsing;
+                    const bool ownedPlainLocal =
+                        linit &&
+                        producerState(*linit) == OwnershipState::Owned;
+                    if (!usingVar && !ownedPlainLocal) continue;
+                    const std::string why =
+                        usingVar ? std::string("`using var` `") +
+                                       std::string(root->name) +
+                                       "` is disposed at scope end"
+                                 : std::string("owned local `") +
+                                       std::string(root->name) +
+                                       "` is auto-dropped at scope end";
+                    report(Severity::Error, root->span.begin,
+                           std::string("a getter may not return a frame that "
+                                       "borrows `") +
+                               std::string(root->name) + "` — " + why +
+                               ", so the returned frame outlives its source; "
+                               "materialize the result (return an `owned` "
+                               "collection), or bind the source in the caller's "
+                               "scope and return the borrow from there "
+                               "(§28.3 returning a deferred-activation frame)");
+                    return;  // one diagnostic per return
+                }
+            }
+        });
+    }
 }
 
 // #1066 / §9.7 (v0.153): a borrow-carrying field type. Used ONLY by
