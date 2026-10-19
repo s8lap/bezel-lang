@@ -8618,8 +8618,50 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
             ptrTy(), vptr, {builder_.getInt32(setIt->second)});
         fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
     }
+    // fix #6205 (§22.16, v0.338): the setter ENTRY/EXIT boundaries of the
+    // virtual/interface-dispatch store arm.
+    //
+    // §22.16, "The instrumentation set" (v0.338):
+    //
+    //   "- **Entry and normal exit** of every `public` **setter** — block-form,
+    //      auto-property, indexer, `set(owned)` alike."
+    //
+    // This arm is reached for `obj.P := v` whenever `P` is `virtual`/an
+    // interface member, and it dispatches to the accessor thunk
+    // (`ensurePropertyAccessorFn`) rather than INLINING the accessor body the
+    // way `lowerPropertySetValue` (LlvmBackend_Assign.cpp) does — which is why
+    // that function's two `emitInvariantCheck` calls (`invCls4614`, #4614(b))
+    // could not be inherited here: nothing was emitted on this path at all.
+    // `ensurePropertyAccessorFn` emits the accessor's BODY only; it never
+    // emits §22.16's two boundary checks, so the check belongs at the store
+    // site, beside the call.
+    //
+    // MEASURED on this HEAD before the fix: `class B` with
+    // `invariant(_x >= 0);` and a `public virtual property Q` whose block-form
+    // setter assigns `value`, then `b.Q := 0 - 5` inside a
+    // `try`/`catch ContractViolationException`, returned 42 where §22.16
+    // requires 99. Dropping `virtual` from the same declaration raises (99) —
+    // so the dispatch choice, not the declaration, was the whole difference.
+    //
+    // The predicate is `instrumentedSetterClass` itself — the same one
+    // `lowerPropertySetValue` asks — so the two arms cannot drift: §22.16's
+    // `this`-REENTRANCY EXEMPTION is decided from the store's own receiver
+    // syntax (`this.P := v`, `base.P := v`, a bare `P := v` inside an instance
+    // member), which is statically decidable here exactly as it is there, and
+    // the declaring-class/mode/visibility gates are the same ones. (`base.P`
+    // additionally declines earlier in this function, at the §12.3 arm.)
+    const sema::TypeSymbol* invCls6205 = instrumentedSetterClass(target, ps, pd);
+    if (invCls6205) emitInvariantCheck(recv, invCls6205);
     builder_.CreateCall(fnTy, fnPtr, {recv, v});
     emitPendingCheck();
+    // The normal-EXIT half. `emitPendingCheck` above branches away when the
+    // accessor threw, so the terminator test is what keeps "normal exit" from
+    // becoming "every exit" — the same guard `lowerPropertySetValue` uses at
+    // its own post-body join (`invCls4614 && !builder_.GetInsertBlock()->
+    // getTerminator()`), and for the same §22.16 reason: "throw exits check
+    // nothing".
+    if (invCls6205 && !builder_.GetInsertBlock()->getTerminator())
+        emitInvariantCheck(recv, invCls6205);
     // fix #2490/#2500/#2506 (§23.3/§4.6/§27.5/§28.9, v0.236): the virtual/
     // interface-dispatch twin of lowerImportedPropertySetValue's ARGUMENT-PASS
     // release — see that function's comment for the full rationale. The callee
