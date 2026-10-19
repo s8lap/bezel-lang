@@ -85,7 +85,7 @@ const PropertySymbol* findPropertyByName(const TypeSymbol* iface,
 // the synthesized-loop body. The test seam drives the helper with a
 // non-empty `modifier` so the symbol-side assignment is observable.
 std::unique_ptr<ast::Param> makeAstParam(std::string_view name,
-                                         std::string_view typeName,
+                                         const char* typeName,
                                          std::string_view modifier) {
     auto p = std::make_unique<ast::Param>();
     p->name = name;
@@ -93,7 +93,17 @@ std::unique_ptr<ast::Param> makeAstParam(std::string_view name,
     auto ty = std::make_unique<ast::Type>();
     ty->kind = ast::TypeKind::Named;
     ty->name = std::make_unique<ast::QualifiedName>();
-    ty->name->parts.push_back(std::string(typeName));
+    // fix #6469: `QualifiedName::parts` is a `vector<string_view>`
+    // (src/ast/Node.hpp:42), so this used to construct a temporary std::string
+    // and push a view into it — storage that died at the end of that
+    // statement. It is the same defect the #6460 fix shipped and had to
+    // rewrite (commit 978588d0): the view reads back as the EMPTY head name
+    // through `TypeRef::headName()`
+    // (src/sema/TypeRef.hpp:80) rather than crashing, so `exitCode == 0`
+    // never sees it. The parameter is `const char*`, not `string_view`, so a
+    // caller cannot hand in a temporary's bytes by accident: every call site
+    // below passes a string literal, whose storage is static.
+    ty->name->parts.push_back(typeName);
     p->type = std::move(ty);
     return p;
 }

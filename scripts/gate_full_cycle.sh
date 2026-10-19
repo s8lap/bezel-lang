@@ -1059,6 +1059,53 @@ if ! python3 scripts/check_seam_accessor_conformance.py --strict \
 fi
 say "seam-accessor-conformance phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seamaccessor.log"))"
 
+# ── STRING-VIEW OWNERSHIP PHASE (#6469) ────────────────────────────────────
+# `ast::QualifiedName::parts` is a `std::vector<std::string_view>`
+# (src/ast/Node.hpp:42), and 139 `vector<string_view>` declarations exist
+# across src/ and tests/. Pushing a `std::string` TEMPORARY into one leaves a
+# view into storage that dies at the end of that full-expression. The defect
+# is invisible to EVERY oracle this project owns: it does not crash, it
+# compiles clean (a string_view binds to a std::string rvalue — that implicit
+# conversion IS the trap), and `runAot`'s `exitCode == 0` and `assertNoLeak`
+# are both satisfied because the program still runs.
+#
+# The #6460 fix (978588d0) shipped `qn->parts.push_back(std::string(colName))`
+# in typeCall's collection-literal factory arm; the temporary died with the
+# statement, so `TypeRef::headName()` (src/sema/TypeRef.hpp:80) read
+# `parts[0]` as the EMPTY string and `ys.Count` / `ys[0]` lowered to NOTHING
+# at exit 0, while the identical program under an explicit `var ys:
+# Array<int>` annotation worked. Only a stdout oracle separates those two.
+#
+# This is the cheap guard #6469 asked for (its Proposal, option 2). The
+# baseline is 0: the two live instances the detector found were in
+# tests/sema/method_symbol_param_{modifier_3308,out_null_postcond_3313}_test.cpp
+# and are fixed by this commit.
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# every sibling phase above: the detector's self-test plants the #6469 shape
+# verbatim and three of the look-alike shapes that must NOT count.
+say "string-view-ownership phase: detector self-test + ratchet (#6469)"
+if ! python3 scripts/check_string_view_ownership.py --self-test \
+      > "$LOGDIR/${TAG}_strviewown.log" 2>&1; then
+  say "CYCLE FAILURE: check_string_view_ownership SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_strviewown.log"
+  sed -n '1,30p' "$LOGDIR/${TAG}_strviewown.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_string_view_ownership.py --strict \
+      >> "$LOGDIR/${TAG}_strviewown.log" 2>&1; then
+  say "CYCLE FAILURE: a std::string TEMPORARY (or a .c_str()/.data()/"
+  say "  .substr() of one) is being pushed into a vector<string_view> — the"
+  say "  view dangles and reads back as the EMPTY string, at exit 0, with no"
+  say "  crash and no diagnostic (#6469). Push a static literal, or"
+  say "  ctx.internString(...). See $LOGDIR/${TAG}_strviewown.log"
+  sed -n '/string_view_ownership:/,$p' "$LOGDIR/${TAG}_strviewown.log" \
+    2>/dev/null | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "string-view-ownership phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_strviewown.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
