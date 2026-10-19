@@ -57,15 +57,31 @@
 // `Owning*` family stays excluded by construction and keeps cascading through
 // `freeUnboundOwnedOwningCollectionTemp` (#1909).
 //
-// A LEAK PIN MUST PROVE ITS DETECTOR RAN. `runAotChecked` defaults to
-// `ASAN_OPTIONS=detect_leaks=0`, so a plain row is VACUOUS for a leak — green on
-// a broken tree while showing a clean sanitizer trio. Every leak row below arms
-// the leak oracle with `BEZEL_AOT_DETECT_LEAKS=strict` (save/restored, so a gate
-// running the knob cannot leak into a sibling row) and asserts
-// `!checkedToolchainSkipped(r)` BEFORE any skip-absorbing guard — an
-// `if (skipped) return;` ahead of that assertion inverts the oracle, reporting a
-// clean pass on a box whose ASan link was unavailable. No `LSAN_OPTIONS` is set:
-// these are found at LSan defaults.
+// A LEAK PIN MUST PROVE ITS DETECTOR RAN. `runAot` defaults to
+// `ASAN_OPTIONS=detect_leaks=0`, so a leak row on THAT harness is VACUOUS —
+// green on a broken tree while showing a clean sanitizer trio. Every leak row
+// below therefore runs on `runAotChecked`, which arms LeakSanitizer BY
+// CONSTRUCTION: `runAotChecked(source)` is `runAotCheckedImpl(source,
+// "runAotChecked", /*detectLeaks=*/true)` (tests/support/aot_support.hpp:3801),
+// and that flag is what builds `ASAN_OPTIONS=detect_leaks=1` (:3722-3724).
+//
+// The knob `BEZEL_AOT_DETECT_LEAKS` (off | report | strict, #4638) is NOT the
+// arming mechanism and is deliberately NOT set here. It is read only by the
+// `runAot` leak-mode path (tests/support/force_sanitize.hpp); `runAotCheckedImpl`
+// never reads it, so setting it changed nothing about these rows. An earlier
+// revision of this file wrapped every row in a `LeakEnv("strict")` save/restore
+// RAII and claimed in this header that it armed the oracle — a claim that was
+// false, and the kind that reads as coverage it does not provide. The RAII is
+// gone with the claim.
+//
+// The sibling `runAotCheckedLenient` is the opposite leg: `detectLeaks=false`,
+// so it runs `detect_leaks=0` and CANNOT see a leak. It is used ONLY for the
+// crash half of each pair, never for a leak assertion.
+//
+// Every leak row also asserts `!checkedToolchainSkipped(r)` BEFORE any
+// skip-absorbing guard — an `if (skipped) return;` ahead of that assertion
+// inverts the oracle, reporting a clean pass on a box whose ASan link was
+// unavailable. No `LSAN_OPTIONS` is set: these are found at LSan defaults.
 //
 // EVERY LEAK ROW IS PAIRED WITH A CRASH ORACLE. `leakedBytes` structurally
 // CANNOT see a use-after-free: the abort suppresses LSan's summary, so a UAF
@@ -80,7 +96,6 @@
 // from "declined" — that is how R31 shipped a tolerated leak and called it
 // fixed. Every `leakedBytes` row below asserts `== 0`.
 
-#include <cstdlib>
 #include <regex>
 #include <string>
 
@@ -93,27 +108,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
 namespace {
-
-// Save/restore BEZEL_AOT_DETECT_LEAKS around a row — see the file header.
-class LeakEnv {
-public:
-    explicit LeakEnv(const char* value) {
-        const char* prev = std::getenv("BEZEL_AOT_DETECT_LEAKS");
-        had_ = prev != nullptr;
-        if (had_) prev_ = prev;
-        if (value) ::setenv("BEZEL_AOT_DETECT_LEAKS", value, /*overwrite=*/1);
-        else       ::unsetenv("BEZEL_AOT_DETECT_LEAKS");
-    }
-    ~LeakEnv() {
-        if (had_) ::setenv("BEZEL_AOT_DETECT_LEAKS", prev_.c_str(), 1);
-        else      ::unsetenv("BEZEL_AOT_DETECT_LEAKS");
-    }
-    LeakEnv(const LeakEnv&) = delete;
-    LeakEnv& operator=(const LeakEnv&) = delete;
-private:
-    bool had_ = false;
-    std::string prev_;
-};
 
 // The harness SKIPS (loudly, counted) when clang is absent; a row that asserts
 // through that would be asserting on an unarmed oracle. A sanitizer finding is
@@ -154,7 +148,7 @@ std::string strValProducer() {
 // Bytes LSan reports for `program`, or 0 when it reports none. The trap this
 // shape hides is why every caller pairs it with a crash row — see the header.
 long leakedBytes(const std::string& program) {
-    LeakEnv scope("strict");
+    // `runAotChecked` arms LSan by construction (see the header). No env knob.
     JitResult r = runAotChecked(program);
     static const std::regex kLeak(R"(AddressSanitizer: (\d+) byte\(s\) leaked)");
     for (const auto& d : r.diagnostics.diagnostics()) {
@@ -177,9 +171,8 @@ void expectRunsClean(const std::string& program, const char* expected) {
     BEZEL_EXPECT_TRUE(r.stdoutText.find(expected) != std::string::npos);
 }
 
-// A LEAK-oracle row: strict LSan armed and the program runs clean.
+// A LEAK-oracle row: LSan armed by `runAotChecked` itself, program runs clean.
 void expectNoLeak(const std::string& program, const char* expected) {
-    LeakEnv scope("strict");
     JitResult r = runAotChecked(program);
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (skipped(r)) return;
@@ -357,23 +350,41 @@ BEZEL_TEST(dict_indexer_get_receiver_reclaim_6476,
 // uncaught KeyNotFoundException as a non-zero exit WITHOUT the sanitizer
 // finding anything — `runAotCheckedLenient` is what makes an uncaught exception
 // a legitimate non-zero exit rather than an oracle failure (tests/README).
+//
+// THIS IS A SHAPE ORACLE, NOT A LEAK ORACLE, AND MUST NOT BE COUNTED AS ONE.
+// An earlier revision of this file also asserted the absence of "byte(s) leaked"
+// here, on the stated grounds that "the temporary is discharged by the unwind".
+// That assertion could never fire, for TWO INDEPENDENT reasons:
+//
+//   1. `runAotCheckedLenient` is `runAotCheckedImpl(source, …,
+//      /*detectLeaks=*/false)` (aot_support.hpp:3825), which builds
+//      `ASAN_OPTIONS=detect_leaks=0` (:3722-3724). LeakSanitizer is switched OFF
+//      at runtime; no leak text can be produced on this leg at all.
+//   2. Even with LSan armed, the program exits through `bz_unhandled_exception`,
+//      which calls `_exit(70)` (src/runtime/bezel_runtime_itable.cpp:260-269,
+//      §33.3 / #1609) — `_exit` bypasses LSan's atexit hook, so the summary is
+//      never printed even on the arming leg.
+//
+// So the row was green on the base AND on the tip for a reason that had nothing
+// to do with the receiver. The real unwind coverage is the CAUGHT row below,
+// which is the same shape with the throw handled, so neither `_exit` nor
+// `detect_leaks=0` applies and LSan genuinely reports.
 void expectRunsAndExitsNonZero(const std::string& program) {
     JitResult r = runAotCheckedLenient(program);
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (skipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(r.exitCode != 0);
-    // A leak sanitizer finding on this path would still be a defect, so assert
-    // its absence too: the temporary is discharged by the unwind.
+    // Only the CRASH half is available here — see the note above. The
+    // generated-code AddressSanitizer is still active under `detect_leaks=0`,
+    // so a use-after-free on the unwind edge is still visible.
     for (const auto& d : r.diagnostics.diagnostics()) {
-        BEZEL_EXPECT_TRUE(d.message.find("byte(s) leaked") == std::string::npos);
         BEZEL_EXPECT_TRUE(d.message.find("use-after-free") == std::string::npos);
     }
 }
 
 BEZEL_TEST(dict_indexer_get_receiver_reclaim_6476,
-           an_absent_key_throw_still_discharges_the_receiver_spec_28_3) {
-    LeakEnv scope("strict");
+           an_uncaught_absent_key_throw_exits_nonzero_spec_28_3) {
     std::string program =
         strValProducer() +
         "class C public "
@@ -387,6 +398,60 @@ BEZEL_TEST(dict_indexer_get_receiver_reclaim_6476,
         "  end Main; "
         "end C; ";
     expectRunsAndExitsNonZero(program);
+}
+
+// THE REAL §28.3 EXCEPTION-PATH ROW — and the one that carries the leak
+// assertion the uncaught row above could not.
+//
+// §28.3's exception-path paragraph discharges an already-produced,
+// not-yet-consumed unbound owned temporary during unwinding. The registration
+// is placed at the PRODUCTION rather than after the absent-key decode precisely
+// so this edge is covered: the table exists when `emitGuardThrow` branches to
+// the scope's unwind pass, and without a registration at the production there
+// would be nothing to discharge.
+//
+// The throw is CAUGHT rather than uncaught, and that is the whole point: the
+// uncaught path reaches `bz_unhandled_exception`'s `_exit(70)`, which bypasses
+// LSan's atexit hook, and its harness leg pins `detect_leaks=0` besides — so an
+// uncaught row can never observe a leak. Catching the exception returns the
+// program to a normal `exit`, LSan runs its atexit hook, and the oracle is real.
+//
+// MEASURED at 101 iterations, `bezelc --sanitize=address`:
+//   base 7a0c320f : 45955 byte(s) leaked in 606 allocation(s)   <- the issue's figure
+//   tip  797aff14 : 0 leaked, stdout 303
+// `n` accumulates 3 per caught throw, so the catch arm is observably TAKEN — a
+// silently-swallowed exception would make this row green without exercising the
+// unwind at all.
+BEZEL_TEST(dict_indexer_get_receiver_reclaim_6476,
+           a_caught_absent_key_throw_discharges_the_receiver_spec_28_3) {
+    std::string program =
+        "module M; import System.Collections.Generic; "
+        "class P public "
+        "  static method MakeDict(): owned Dictionary<string, string> "
+        "    var d: Dictionary<string, string> := new Dictionary<string, string>(); "
+        "    d.Add(\"aa\", \"va\" + \"a\"); "
+        "    return d; "
+        "  end MakeDict; "
+        "end P; "
+        "class C public "
+        "  static method Main(): int "
+        "    var i := 0; "
+        "    var n := 0; "
+        "    while " + std::string(kIterations) + " do "
+        "      try "
+        "        n := n + P.MakeDict()[\"zz\"].Length; "
+        "      catch e: KeyNotFoundException => "
+        "        n := n + 3; "
+        "      end; "
+        "      i := i + 1; "
+        "    end while; "
+        "    Console.WriteLine(n); "
+        "    return 0; "
+        "  end Main; "
+        "end C; ";
+    BEZEL_EXPECT_EQ(leakedBytes(program), 0);
+    // 101 catches x 3. If the catch arm were not taken, `n` would be 0.
+    expectRunsClean(program, "303");
 }
 
 // THE DISCARD ROW. `_ := P.MakeDict()["aa"];` is §17.13's discard: the
