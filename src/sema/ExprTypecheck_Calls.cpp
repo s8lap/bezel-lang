@@ -26759,6 +26759,119 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // same-named user extension (§26.5) keeps the call accepted.
         if (ma.target && (ma.member == "Count" || ma.member == "Length")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
+                // fix #6389 (stdlib §4.12 + §5, v0.338): the LAZY-LINQ SENTINEL
+                // face of the undeclared `.Count` / `.Length` reads. It is a
+                // DIFFERENT TypeRef shape from the named `IEnumerable<T>` one
+                // that the arms below handle, and it is the shape the ISSUE'S
+                // OWN REPRO produces.
+                //
+                // The named form is an interface-annotated local, a parameter,
+                // a field or a cross-module reconstruction: it carries the head
+                // name in `astNode->name` or in `importedName`, so `isBuiltin`
+                // below is true and `isSyncIterFormatEnumerableHead` can be
+                // keyed on it. The LAZY SENTINEL carries no name AT ALL — §5's
+                // deferred operators are typed by `makeLazyEnumerable` (this
+                // file, in the LINQ typing), which sets `kind = Named`,
+                // `declaration = nullptr`, `astNode = nullptr` and puts the
+                // element type in `genericArgs[0]`. `headName()` is therefore
+                // empty and `isBuiltin` is false for it, so a named-head reject
+                // cannot reach `f.Make().Where(p).Length`.
+                //
+                // MEASURED on this fix's parent (`r30-c1` @ b1a94683) over a
+                // 3-element producer — the answer is 3, and BOTH spellings
+                // compiled, emitted a wrong value and exited 0. Neither was a
+                // rejection:
+                //
+                //   .Length -> 1   codegen's string-`.Length` fallback
+                //                   (src/codegen/LlvmBackend_Exprs.cpp:4197)
+                //                   claimed the receiver — its
+                //                   `isStringFallbackTarget()` predicate is
+                //                   POSITIVE on a receiver that yields no
+                //                   information, and this sentinel yields none
+                //                   — then GEP'd the `bz_lazy_t*` as a
+                //                   `bz.string*` and read field 1. Verified in
+                //                   the emitted IR:
+                //                     %33 = getelementptr inbounds nuw %bz.string, ptr %linq.owncl, i32 0, i32 1
+                //                     %str.len = load i64, ptr %33
+                //                   reading the LAZY STRUCT's first field as a
+                //                   string length.
+                //   .Count  -> 0   no arm claimed it; the read degraded to the
+                //                   #1386/#2434 zero backstop with a Warning —
+                //                   a wrong answer emitted rather than rejected.
+                //
+                // The issue this came from (#6389) reported only the 74,336 B /
+                // 707-alloc leak the same shape strands. The wrong VALUE is the
+                // larger defect, and it is why a codegen-side reclaim alone
+                // would have been the WRONG fix: it would have fixed the byte
+                // count and left both wrong values in place.
+                //
+                // WHY A REJECT AND NOT A LOWERING. stdlib §4.12 declares
+                // `IEnumerable<out T>` with exactly one member,
+                // `method GetEnumerator(): owned IEnumerator<T>`; the element
+                // count is §5's `method Count(): int`, a METHOD spelled with
+                // parentheses. There is no property for either bare spelling to
+                // resolve to. The adjacent `isCountOnlyCollection` arm below is
+                // the same shape of decision for the four heads that DO declare
+                // `Count` and no `Length` (stdlib §4.1); here NEITHER name is
+                // declared, so the remedy names the §5 operator WITH ITS
+                // PARENTHESES — `e.Count()` is MEASURED to compile and return
+                // 3, `e.Count` does not compile.
+                //
+                // Rejecting also REMOVES the leak rather than papering over it:
+                // an expression that does not compile emits no
+                // `bz_lazy_own_source` / `bz_lazy_where` chain, so the 74,336 B
+                // cannot be stranded.
+                //
+                // The predicate is byte-for-byte codegen's `isLazyEnumerableType`
+                // (src/codegen/LlvmBackend_Calls3.cpp:28) and sema's
+                // `isLazyEnumerableExprType`
+                // (src/sema/DefiniteAssignment.cpp:1259), both of which state
+                // that they must match each other. The `importedName.empty()`
+                // clause is LOAD-BEARING: a builtin interface RECONSTRUCTED
+                // FROM MODULE METADATA has the same Named / no-declaration /
+                // no-astNode shape but carries its name in `importedName`, and
+                // that receiver is the #995 vtable object, NOT a `bz_lazy_t*`.
+                // Dropping that clause would reject a legal cross-module
+                // `IEnumerable<T>` local.
+                //
+                // The gate is `&ma != calleeOfCallCtx_` — "this member access
+                // is NOT the callee of a call", i.e. this is the BARE spelling.
+                // The parenthesised spelling `e.Count()` is stdlib §5's operator
+                // and must stay accepted, and on this sentinel shape that is
+                // decided by the callee slot rather than by an extension lookup:
+                // MEASURED, `lookupExtensionMember` answers FALSE for `Count`
+                // here, because §5's LINQ operators are resolved by the LINQ
+                // typing (`makeLazyEnumerable`'s own block) and not by the
+                // §26.5 extension table — so a clause of the form the block
+                // below uses ("callee AND some extension exists ⇒ accept") would
+                // REJECT `e.Count()`, which MEASURED compiles and returns 3.
+                // The callee slot is the discriminator that holds.
+                if (ma.member == "Length" && &ma != calleeOfCallCtx_ &&
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    !tt->astNode && !tt->genericArgs.empty() &&
+                    tt->importedName.empty()) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "no member `Length` on a lazy LINQ sequence "
+                        "(`IEnumerable<T>`, stdlib §4.12): it declares no length "
+                        "— use the `Count()` operator (stdlib §5)");
+                    return;
+                }
+                if (ma.member == "Count" && &ma != calleeOfCallCtx_ &&
+                    tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    !tt->astNode && !tt->genericArgs.empty() &&
+                    tt->importedName.empty()) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "no member `Count` on a lazy LINQ sequence "
+                        "(`IEnumerable<T>`, stdlib §4.12): it declares no count "
+                        "property — use the `Count()` operator (stdlib §5)");
+                    return;
+                }
                 bool isBuiltin =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
                     tt->astNode && tt->astNode->name &&
@@ -26776,6 +26889,41 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // that §4.1 also declares with `Count` only.
                     msg = "no member `Length` on `" + std::string(cn) +
                           "<T>`: use `Count` (stdlib §4.1)";
+                // fix #6389 (stdlib §4.12 / §5, v0.338): the NAMED
+                // `IEnumerable<T>` twin of the lazy-sentinel arms above, on the
+                // three heads `isSyncIterFormatEnumerableHead` names
+                // (`IEnumerable`, `IOwningEnumerable`, `IOrderedEnumerable`).
+                // Those heads declare NEITHER `Count` nor `Length` as a
+                // property: stdlib §4.12 declares exactly one member,
+                // `method GetEnumerator(): owned IEnumerator<T>`, and the
+                // element count is §5's `method Count(): int` — a METHOD, spelled
+                // with parentheses. This receiver SHAPE is the interface-typed
+                // local / parameter / field (it carries the head name in
+                // `astNode->name`, which is what makes `isBuiltin` above true),
+                // and it is the #995 vtable object rather than a `bz_lazy_t*`.
+                // MEASURED on this fix's parent: both bare spellings compiled,
+                // emitted a wrong value and exited 0. `.Length` reached codegen's
+                // string-`.Length` fallback and read the vtable object's field 1
+                // as a string length; `.Count` degraded to the #1386/#2434 zero
+                // backstop with a Warning. See the lazy-sentinel arms above for
+                // the full account and for why a reject is the right answer
+                // rather than a lowering.
+                //
+                // The remedy names the §5 operator WITH ITS PARENTHESES, which is
+                // the distinction a reader needs: `e.Count()` is MEASURED to
+                // compile and return 3, `e.Count` does not compile. The `msg`
+                // gate below is the §26.5 form the other arms in this block use,
+                // so a same-named user extension keeps the call accepted.
+                else if (ma.member == "Length" && &ma != calleeOfCallCtx_ &&
+                         common::isSyncIterFormatEnumerableHead(cn))
+                    msg = "no member `Length` on `" + std::string(cn) +
+                          "<T>`: it declares no length — use the `Count()` "
+                          "operator (stdlib §5)";
+                else if (ma.member == "Count" && &ma != calleeOfCallCtx_ &&
+                         common::isSyncIterFormatEnumerableHead(cn))
+                    msg = "no member `Count` on `" + std::string(cn) +
+                          "<T>`: it declares no count property — use the "
+                          "`Count()` operator (stdlib §5)";
                 if (!msg.empty() &&
                     (&ma != calleeOfCallCtx_ ||
                      !lookupExtensionMember(tt, ma.member, nullptr,
@@ -32202,6 +32350,36 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         // same-named user extension, §26.5); `Count()` on an `OwningBuffer` is
         // the §5 LINQ operator and stays accepted unless `T` is a value type
         // (§4.14). The #6071 `string` arm above stays callee-gated.
+        // fix #6389 (stdlib §4.12 + §5, v0.338): the LAZY-LINQ SENTINEL twin of
+        // the `.`-form arms added above. Same predicate, same two messages, same
+        // rationale — the `.` form's comment carries the full account of the
+        // miscompile it prevents and of why the `importedName.empty()` clause
+        // keeps a legal cross-module `IEnumerable<T>` receiver out of the arm.
+        //
+        // This face is reachable and was MEASURED reaching it: a lazy sentinel
+        // declares no members at all, so the `?.` property path falls through
+        // to the same string-`.Length` shape the bare `.` form did. Without this
+        // arm `e?.Length` would keep compiling to the same wrong value the bare
+        // spelling now rejects, and the file would hold two different answers
+        // for one question depending on the receiver's punctuation.
+        if (!member && recvTy && &nm != calleeOfCallCtx_ &&
+            (nm.member == "Count" || nm.member == "Length") &&
+            recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+            !recvTy->astNode && !recvTy->genericArgs.empty() &&
+            recvTy->importedName.empty()) {
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                nm.member == "Length"
+                    ? "no member `Length` on a lazy LINQ sequence "
+                      "(`IEnumerable<T>`, stdlib §4.12): it declares no length "
+                      "— use the `Count()` operator (stdlib §5)"
+                    : "no member `Count` on a lazy LINQ sequence "
+                      "(`IEnumerable<T>`, stdlib §4.12): it declares no count "
+                      "property — use the `Count()` operator (stdlib §5)");
+            return;
+        }
         if (!member && recvTy &&
             (nm.member == "Count" || nm.member == "Length") &&
             recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
@@ -32222,6 +32400,25 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 // fix #6125 (stdlib §4.1, v0.338): `?.` twin of the bare arm.
                 msg = "no member `Length` on `" + std::string(cn) +
                       "<T>`: use `Count` (stdlib §4.1)";
+            // fix #6389 (stdlib §4.12 / §5, v0.338): `?.` twins of the bare
+            // block's `isSyncIterFormatEnumerableHead` arms, same predicate and
+            // same two messages. Both receiver shapes reach this block and both
+            // need it: the lazy sentinel (no `astNode`, the `.`-form's
+            // `#6389` arms above cover it) and the NAMED interface-typed local
+            // (`astNode` present, `isBuiltin` true). Fixing only one spelling
+            // would leave the other compiling to the same wrong value, and
+            // `e?.Length` on a vtable receiver reaches codegen's
+            // string-`.Length` fallback on an object that is not a string.
+            else if (nm.member == "Length" && &nm != calleeOfCallCtx_ &&
+                     common::isSyncIterFormatEnumerableHead(cn))
+                msg = "no member `Length` on `" + std::string(cn) +
+                      "<T>`: it declares no length — use the `Count()` "
+                      "operator (stdlib §5)";
+            else if (nm.member == "Count" && &nm != calleeOfCallCtx_ &&
+                     common::isSyncIterFormatEnumerableHead(cn))
+                msg = "no member `Count` on `" + std::string(cn) +
+                      "<T>`: it declares no count property — use the "
+                      "`Count()` operator (stdlib §5)";
             if (!msg.empty()) {
                 SourceLocation loc = nm.span.begin;
                 if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
