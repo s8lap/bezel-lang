@@ -2,7 +2,7 @@
   "name": "bezel-lang",
   "displayName": "Bezel",
   "description": "Syntax highlighting, editing rules and snippets for the Bezel language",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "bezel-lang",
   "license": "Apache-2.0",
   "repository": {
@@ -42,6 +42,16 @@
         "language": "bezel",
         "scopeName": "source.bezel",
         "path": "./syntaxes/bezel.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.bezel.codeblock",
+        "path": "./syntaxes/bezel.markdown.tmLanguage.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.bezel": "bezel"
+        }
       }
     ],
     "snippets": [
