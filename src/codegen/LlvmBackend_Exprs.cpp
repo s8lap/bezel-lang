@@ -9368,6 +9368,16 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     lTy->primitive == sema::PrimitiveType::Char) {
                     // Implement as: scan through string code points for a match.
                     llvm::Value* needle = lowerExpr(*bin.left);
+                    // fix #6547 (§17.5 / §7.4, v0.338): the string-receiver
+                    // `in` arm needs the same unwrap the Range arms above take —
+                    // sema admits the left operand exactly when
+                    // `s.Contains(x)`'s `char` argument is admitted, so a
+                    // nullable-typed left operand reaching here is one §7.4
+                    // narrowed non-null and its `{i8, i32}` box must be reduced
+                    // to the scalar `CreateICmpEQ` below compares against.
+                    // Without it this emitted `icmp i32, {i8,i32}` and died in
+                    // IR verification — the #2625 `CreateICmp` audit row.
+                    needle = unwrapNarrowedNullableOperand(needle, bin.left.get());
                     llvm::Value* haystack = lowerExpr(*bin.right);
                     if (!needle || !haystack) return nullptr;
                     llvm::Value* len = loadStringLen(haystack);

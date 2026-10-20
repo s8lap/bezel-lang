@@ -1733,7 +1733,14 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             auto* argTy = ctx_.exprType(*call.args[0].value);
             if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
                 argTy->primitive == sema::PrimitiveType::Char) {
-                llvm::Value* needle = lowerExpr(*call.args[0].value);
+                // fix #6547 (§7.4 / stdlib §9.6, v0.338): sema rejects an
+                // un-narrowed `char?` here ("the argument to `string.Contains`
+                // is nullable but the target type is non-nullable"), so a
+                // nullable-typed argument reaching this arm is one §7.4
+                // narrowed non-null and its `{i8, i32}` box must be reduced to
+                // the code point `CreateICmpEQ` below compares against.
+                llvm::Value* needle = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[0].value), call.args[0].value.get());
                 if (!needle) return nullptr;
                 llvm::Value* len = loadStringLen(self);
                 auto* idxS = entryAlloca(i64());
@@ -1780,7 +1787,9 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             auto* argTy = ctx_.exprType(*call.args[0].value);
             if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
                 argTy->primitive == sema::PrimitiveType::Char) {
-                llvm::Value* needle = lowerExpr(*call.args[0].value);
+                // fix #6547: same narrowed-`char?` unwrap as Contains above.
+                llvm::Value* needle = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[0].value), call.args[0].value.get());
                 if (!needle) return nullptr;
                 llvm::Value* len = loadStringLen(self);
                 auto* idxS = entryAlloca(i64());
@@ -1821,7 +1830,11 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             auto* argTy = ctx_.exprType(*call.args[0].value);
             if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
                 argTy->primitive == sema::PrimitiveType::Char) {
-                llvm::Value* needle = lowerExpr(*call.args[0].value);
+                // fix #6547: same narrowed-`char?` unwrap as Contains above.
+                // (The `startIndex` operand's own narrowing hole is the #2614
+                // int-parameter family, audited separately; out of this fix.)
+                llvm::Value* needle = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[0].value), call.args[0].value.get());
                 if (!needle) return nullptr;
                 llvm::Value* startV = lowerExpr(*call.args[1].value);
                 if (!startV) return nullptr;
@@ -1895,7 +1908,9 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* argTy = ctx_.exprType(*call.args[0].value);
         if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive == sema::PrimitiveType::Char) {
-            llvm::Value* needle = lowerExpr(*call.args[0].value);
+            // fix #6547: same narrowed-`char?` unwrap as Contains above.
+            llvm::Value* needle = unwrapNarrowedNullableOperand(
+                lowerExpr(*call.args[0].value), call.args[0].value.get());
             if (!needle) return nullptr;
             llvm::Value* len = loadStringLen(self);
             // Scan from len-1 down to 0.
@@ -1983,8 +1998,14 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* at0 = ctx_.exprType(*call.args[0].value);
         if (at0 && at0->kind == sema::TypeRef::Kind::Primitive &&
             at0->primitive == sema::PrimitiveType::Char) {
-            llvm::Value* oldCh = lowerExpr(*call.args[0].value);
-            llvm::Value* newCh = lowerExpr(*call.args[1].value);
+            // fix #6547: same narrowed-`char?` unwrap as Contains above, on
+            // BOTH operands — sema gates each (`oldChar` and `newChar` are
+            // `char` parameters, stdlib §9.6), and the body both compares
+            // `oldCh` against a code point and truncates `newCh` to `i8`.
+            llvm::Value* oldCh = unwrapNarrowedNullableOperand(
+                lowerExpr(*call.args[0].value), call.args[0].value.get());
+            llvm::Value* newCh = unwrapNarrowedNullableOperand(
+                lowerExpr(*call.args[1].value), call.args[1].value.get());
             if (!oldCh || !newCh) return nullptr;
             auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
             auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
@@ -2596,7 +2617,10 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // Split(separator: char) — pass self + the separator code point.
         if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive == sema::PrimitiveType::Char) {
-            llvm::Value* sepCh = lowerExpr(*call.args[0].value);
+            // fix #6547: same narrowed-`char?` unwrap as Contains above. Without
+            // it the `CreateSExt` two lines below sexted the `{i8, i32}` box.
+            llvm::Value* sepCh = unwrapNarrowedNullableOperand(
+                lowerExpr(*call.args[0].value), call.args[0].value.get());
             if (!sepCh) return nullptr;
             if (!sepCh->getType()->isIntegerTy(32))
                 sepCh = builder_.CreateSExt(sepCh, i32());
