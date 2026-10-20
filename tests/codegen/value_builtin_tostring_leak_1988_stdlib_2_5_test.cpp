@@ -48,22 +48,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway (mirrors #1982/#1934).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Build a "render N times, count byte-correct results" program for a value-builtin.
 // `decl` binds the receiver; `render` is the ToString call; `expected` is the exact
@@ -95,7 +86,7 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
     JitResult r = runAotChecked(loopCount(
         "var v := DateTime.FromUnixTimeSeconds(0); ",
         "v.ToString()", "1970-01-01T00:00:00"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);           // compiled + LSan-clean (result freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 40);    // every render byte-correct
 }
@@ -109,7 +100,7 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
     JitResult r = runAotChecked(loopCount(
         "var v := DateTime.FromUnixTimeSeconds(0); ",
         "v.ToString(\"yyyy-MM-dd\")", "1970-01-01"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -122,7 +113,7 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
     JitResult r = runAotChecked(loopCount(
         "var v := TimeSpan.FromSeconds(90.0); ",
         "v.ToString()", "0.00:01:30"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -135,7 +126,7 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
     JitResult r = runAotChecked(loopCount(
         "var v := new DateOnly(2024, 3, 15); ",
         "v.ToString()", "2024-03-15"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -148,7 +139,7 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
     JitResult r = runAotChecked(loopCount(
         "var v := new TimeOnly(13, 45, 30); ",
         "v.ToString()", "13:45:30"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -161,7 +152,7 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
     JitResult r = runAotChecked(loopCount(
         "var v := Guid.Empty; ",
         "v.ToString()", "00000000-0000-0000-0000-000000000000"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }

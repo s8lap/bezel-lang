@@ -23,20 +23,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -84,7 +77,7 @@ BEZEL_TEST(bind_atom_k85_2098, unconsumed_clauses_disposed_reverse_spec_28_3) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     const std::string& out = r.stdoutText;
@@ -111,7 +104,7 @@ BEZEL_TEST(bind_atom_k85_2098, clause_consumed_by_owned_arg_spec_28_3) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D7"), 1);
@@ -135,7 +128,7 @@ BEZEL_TEST(bind_atom_k85_2098, exception_edge_parity_spec_k3_15) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     const std::string& out = r.stdoutText;
@@ -162,7 +155,7 @@ BEZEL_TEST(bind_atom_k85_2098, marked_transfer_clause_adopts_spec_k3_4) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D3"), 1);
@@ -185,7 +178,7 @@ BEZEL_TEST(bind_atom_k85_2098, atom_classifies_as_body_using_var_spec_28_3) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     const std::string& out = r.stdoutText;
@@ -212,7 +205,7 @@ BEZEL_TEST(bind_atom_k85_2098, borrow_clause_no_boundary_disposal_spec_k2) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D5"), 1);

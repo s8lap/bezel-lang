@@ -58,8 +58,8 @@
 // oracle, and a row that pins it can go green while the sanitizer is not
 // running at all. Each row asserts `r.ran` AND the exact `exitCode` AND — for
 // the rows that compute — the printed value, so a wrong answer cannot hide
-// behind a leak that happens to be fixed. `wasSkipped` returns early ONLY on a
-// toolchain SKIP (an absent ASan link), never on a leak or a crash.
+// behind a leak that happens to be fixed. a toolchain SKIP (an absent ASan link) FAILS
+// loudly via `checkedToolchainSkipped`, it is never absorbed.
 
 #include <cstddef>
 #include <cstdio>
@@ -67,21 +67,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 std::string stdoutOf(const JitResult& r) { return r.stdoutText; }
 
@@ -115,7 +107,7 @@ BEZEL_TEST(owned_enumerable_field_cascade_6439,
         "  end Main; "
         "end P;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // LSan reports the leak as ran + nonzero exit
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -149,7 +141,7 @@ BEZEL_TEST(owned_enumerable_field_cascade_6439,
         "  end Main; "
         "end P;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -190,7 +182,7 @@ BEZEL_TEST(owned_enumerable_field_cascade_6439,
         "  end Main; "
         "end P;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 300 holders x (1+2+...+300) = 300 x 45150 = 13545000. Asserted on
     // STDOUT, not on the exit code: exit codes are truncated to 8 bits, so an
@@ -225,7 +217,7 @@ BEZEL_TEST(owned_enumerable_field_cascade_6439,
         "  end Main; "
         "end P;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -282,7 +274,7 @@ BEZEL_TEST(owned_enumerable_field_cascade_6439,
         "  end Main; "
         "end P;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);  // 3 + 4, and no double dispose
 }
@@ -322,7 +314,7 @@ BEZEL_TEST(owned_enumerable_field_cascade_6439,
         "  end Main; "
         "end P;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);  // 3 + 4, and no double dispose
 }

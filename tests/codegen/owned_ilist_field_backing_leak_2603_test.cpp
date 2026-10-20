@@ -71,20 +71,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan toolchain skip-guard (matches the #2598 / #2587 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // ----------------------------------------------------------------------
 // Probe A — CARDINAL: owned IList<string> field backing-storage leak (the
@@ -278,7 +271,7 @@ const char* kOwnedIReadOnlyListStringField =
 BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
            owned_ilist_string_field_backing_freed_spec_28_9_28_11) {
     JitResult r = runAotChecked(kOwnedIListStringField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);           // LSan-clean (the #2603 leak flips this)
     BEZEL_EXPECT_EQ(r.exitCode, 44);    // 300 mod 256 — independent value check
 }
@@ -292,7 +285,7 @@ BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
 BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
            owned_ilist_string_field_elements_released_spec_28_9_28_11) {
     JitResult r = runAotChecked(kOwnedIListStringDynamic);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 244);   // 500 mod 256
 }
@@ -307,7 +300,7 @@ BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
 BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
            owned_ilist_string_field_reassign_frees_old_spec_28_9_28_11) {
     JitResult r = runAotChecked(kOwnedIListStringReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 94);    // 350 mod 256
 }
@@ -320,7 +313,7 @@ BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
 BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
            owned_array_string_field_remains_clean_spec_28_9_28_11) {
     JitResult r = runAotChecked(kOwnedArrayStringField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);    // 300 mod 256
 }
@@ -335,7 +328,7 @@ BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
 BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
            owned_ilist_int_field_unaffected_spec_28_9_28_11) {
     JitResult r = runAotChecked(kOwnedIListIntField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 144);   // 400 mod 256
 }
@@ -349,7 +342,7 @@ BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
 BEZEL_TEST(codegen_owned_ilist_field_backing_leak_2603,
            owned_ireadonlylist_string_field_backing_freed_spec_28_9_28_11) {
     JitResult r = runAotChecked(kOwnedIReadOnlyListStringField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

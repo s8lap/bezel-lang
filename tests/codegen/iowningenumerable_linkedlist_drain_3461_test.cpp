@@ -113,6 +113,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -120,15 +121,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -185,7 +177,7 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on 0c5ecd1: ASan heap-use-after-free in bz$elemDispose <-
     // bz_llist_free <- C$DisposeCore — the field's disposer pass reached the
     // elements the loop had already discharged.
@@ -223,7 +215,7 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: the one discharged element was still in the field's list, so the
     // holder's disposer pass faulted on it. Post-fix the two undrained elements
     // are disposed exactly once, by the field's holder — LSan (via r.ran) is
@@ -262,7 +254,7 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // total == 35 (5+10+20 once), Remaining == 0. Pre-fix the second loop
     // replayed all three elements (total 70) on top of the fault.
@@ -293,7 +285,7 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "order=51020"));
     // §29.1's borrowing `Current` lends; all three elements are still there.
@@ -350,7 +342,7 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // list 1,2 head-to-tail; array 3,4 front-to-back; both drained.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "list=12 arr=34 left=0"));
@@ -433,7 +425,7 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on 0c5ecd1: `order=12 left=2` reaches stdout, then SIGSEGV in the
     // local's own scope-end disposal pass over elements the loop discharged.
     BEZEL_EXPECT_TRUE(r.ran);

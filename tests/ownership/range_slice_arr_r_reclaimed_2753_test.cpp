@@ -73,6 +73,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"        // runAot / runAotChecked
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -83,15 +84,6 @@ using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked AOT run is SKIPPED (not failed) when the ASan link toolchain is
-// absent (mirrors the #1817 / #1899 / #1928 harness helper).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // A standard `Main()` body for the slice fixture — a 3-element `Array<int>` and
 // the binding under test, second-positioned so the slice escapes the scope of
@@ -138,7 +130,7 @@ bool hasAutoDropOnSlice(const OwnershipResult& r, const std::string& name) {
 BEZEL_TEST(range_slice_arr_r_reclaimed_2753,
            plain_var_binding_no_leak_spec_28_3) {
     JitResult r = runAotChecked(fixture("var s := a[0..2];"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);            // no leak, no crash
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -155,7 +147,7 @@ BEZEL_TEST(range_slice_arr_r_reclaimed_2753,
 BEZEL_TEST(range_slice_arr_r_reclaimed_2753,
            using_var_binding_no_leak_spec_28_3) {
     JitResult r = runAotChecked(fixture("using var s := a[0..2];"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -179,7 +171,7 @@ BEZEL_TEST(range_slice_arr_r_reclaimed_2753,
         "    return s.Count; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
@@ -200,7 +192,7 @@ BEZEL_TEST(range_slice_arr_r_reclaimed_2753,
         "    var s := a[r]; "
         "    return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -228,7 +220,7 @@ BEZEL_TEST(range_slice_arr_r_reclaimed_2753,
         "    return s.Count; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // 0..2 inclusive → 3 elements
 }
@@ -253,7 +245,7 @@ BEZEL_TEST(range_slice_arr_r_reclaimed_2753,
         "    return a[0]; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }

@@ -87,20 +87,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan toolchain skip-guard (matches the #2603 / #2598 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // ----------------------------------------------------------------------
 // Probe A — CARDINAL: owned IOwningList<Cell> field backing-storage leak (the
@@ -310,7 +303,7 @@ const char* kOwnedIOwningListCtorParam =
 BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
            owned_iowninglist_cell_field_backing_freed_spec_28_5_28_11) {
     JitResult r = runAotChecked(kOwnedIOwningListCellField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);           // LSan-clean (the #2606 leak flips this)
     BEZEL_EXPECT_EQ(r.exitCode, 100);   // 100 mod 256 — independent value check
 }
@@ -325,7 +318,7 @@ BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
 BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
            owned_iowninglist_cell_field_elements_disposed_spec_28_11) {
     JitResult r = runAotChecked(kOwnedIOwningListElementDisposal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);     // Cell.n = 0 — elements disposed
 }
@@ -339,7 +332,7 @@ BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
 BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
            owned_iowninglist_cell_field_reassign_exactly_once_spec_28_11) {
     JitResult r = runAotChecked(kOwnedIOwningListReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);     // Cell.n = 0 — exactly-once, no double-free
 }
@@ -352,7 +345,7 @@ BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
 BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
            owned_owningarray_cell_field_remains_clean_spec_28_5_28_11) {
     JitResult r = runAotChecked(kOwnedOwningArrayCellField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);     // Cell.n = 0
 }
@@ -365,7 +358,7 @@ BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
 BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
            owned_ilist_string_field_remains_borrowing_spec_28_11) {
     JitResult r = runAotChecked(kOwnedIListStringField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);    // 300 mod 256
 }
@@ -380,7 +373,7 @@ BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
 BEZEL_TEST(codegen_owned_iowninglist_field_backing_leak_2606,
            owned_iowninglist_ctor_param_field_disposed_spec_22_10_28_11) {
     JitResult r = runAotChecked(kOwnedIOwningListCtorParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);     // Cell.n = 0
 }

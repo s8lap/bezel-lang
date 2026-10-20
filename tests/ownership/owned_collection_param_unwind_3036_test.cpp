@@ -74,6 +74,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -81,14 +82,6 @@ using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -146,7 +139,7 @@ BEZEL_TEST(owned_collection_param_unwind_3036,
         "    end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // WITHOUT the fix: LSan "184 byte(s) leaked in 2 allocation(s)" (the
     // bz_array_t header + its slot storage) PLUS the two Cell instances,
     // → r.ran false.
@@ -190,7 +183,7 @@ BEZEL_TEST(owned_collection_param_unwind_3036,
         "    end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 43);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
@@ -223,7 +216,7 @@ BEZEL_TEST(owned_collection_param_unwind_3036,
         "    end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 43);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);
@@ -255,7 +248,7 @@ BEZEL_TEST(owned_collection_param_unwind_3036,
         "    end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 43);
 }
@@ -292,7 +285,7 @@ BEZEL_TEST(owned_collection_param_unwind_3036,
         "    return b.Count + 41; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // A non-gated registration on the discharged path would be an ASan
     // heap-use-after-free / double-free here → r.ran false.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -335,7 +328,7 @@ BEZEL_TEST(owned_collection_param_unwind_3036,
         "    end; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 43);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);

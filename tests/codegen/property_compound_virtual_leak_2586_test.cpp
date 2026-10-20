@@ -91,6 +91,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -98,14 +99,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan toolchain skip-guard (mirrors #2576's test).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // ----------------------------------------------------------------------
 // Probe A — CARDINAL: virtual CLASS compound assign with a LITERAL rhs.
@@ -323,7 +316,7 @@ const char* kVirtualCompoundInt =
 BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
            virtual_compound_literal_rhs_does_not_leak_spec_23_3_28_9) {
     JitResult r = runAotChecked(kVirtualCompoundLiteral);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);  // LSan-clean (the #2586 res leak flips this)
 }
 
@@ -335,7 +328,7 @@ BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
 BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
            virtual_compound_producer_rhs_does_not_leak_spec_23_3_28_9) {
     JitResult r = runAotChecked(kVirtualCompoundProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -348,7 +341,7 @@ BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
 BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
            virtual_compound_borrow_remains_clean_spec_23_3_28_9) {
     JitResult r = runAotChecked(kVirtualCompoundBorrow);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -360,7 +353,7 @@ BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
 BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
            iface_compound_literal_rhs_does_not_leak_spec_23_3_28_9) {
     JitResult r = runAotChecked(kIfaceCompoundLiteral);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -372,7 +365,7 @@ BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
 BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
            nonvirtual_compound_remains_clean_spec_23_3_28_9) {
     JitResult r = runAotChecked(kNonVirtualControl);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -385,7 +378,7 @@ BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
 BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
            virtual_compound_int_rhs_unaffected_spec_23_3_28_9) {
     JitResult r = runAotChecked(kVirtualCompoundInt);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // VALUE assertion: sum 0..99 = 4950, mod 256 = 86.
     BEZEL_EXPECT_EQ(r.exitCode, 86);
@@ -400,7 +393,7 @@ BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
 BEZEL_TEST(codegen_property_compound_virtual_leak_2586,
            virtual_compound_value_correct_spec_23_3_28_9) {
     JitResult r = runAot(kVirtualCompoundLiteral);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 186);  // 5050 mod 256
 }

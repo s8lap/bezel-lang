@@ -56,16 +56,6 @@ using bezel::test::failedAtCompileTimeWithRealLocation;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 bool hasErrorContaining(const JitResult& r, const std::string& needle) {
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.severity == bezel::Severity::Error &&
@@ -212,7 +202,7 @@ const char* kNullableOperandNeedle =
 BEZEL_TEST(null_cond_grouping_member_6512,
            nullcond_count_sums_group_sizes_spec_5_7_5) {
     JitResult r = runAotChecked(kNullCondCountSum);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 4);  // two groups of two; NOT 0 (pre-fix), NOT -2
 }
@@ -220,7 +210,7 @@ BEZEL_TEST(null_cond_grouping_member_6512,
 BEZEL_TEST(null_cond_grouping_member_6512,
            nullcond_count_and_key_agree_with_dot_form_spec_5_7_5) {
     JitResult r = runAotChecked(kNullCondAgreesWithDotForm);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);  // (2+2+0+0) + (2+2+1+1)
 }
@@ -228,7 +218,7 @@ BEZEL_TEST(null_cond_grouping_member_6512,
 BEZEL_TEST(null_cond_grouping_member_6512,
            dot_form_key_sum_is_the_control_spec_5) {
     JitResult r = runAotChecked(kDotFormKeySum);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // keys 0 and 1
 }
@@ -236,7 +226,7 @@ BEZEL_TEST(null_cond_grouping_member_6512,
 BEZEL_TEST(null_cond_grouping_member_6512,
            nullcond_key_reads_the_group_key_spec_5_7_5) {
     JitResult r = runAotChecked(kNullCondKeySum);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // same as the `.`-form control above
 }
@@ -244,7 +234,7 @@ BEZEL_TEST(null_cond_grouping_member_6512,
 BEZEL_TEST(null_cond_grouping_member_6512,
            nullcond_count_is_performed_not_short_circuited_spec_7_5) {
     JitResult r = runAotChecked(kNullCondCountIsPresent);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 4);  // two groups of two; MEASURED 0 pre-fix
 }
@@ -252,7 +242,7 @@ BEZEL_TEST(null_cond_grouping_member_6512,
 BEZEL_TEST(null_cond_grouping_member_6512,
            nullcond_key_is_performed_not_short_circuited_spec_7_5) {
     JitResult r = runAotChecked(kNullCondKeyIsPresent);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // keys 0 and 1; MEASURED 0 pre-fix
 }

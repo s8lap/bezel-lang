@@ -34,22 +34,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // `.First()` bound to a plain `var g` (the issue's primary repro), then read
 // (Key + Count) and returned. xs = [1,3,2] → groups in creation order: key 1
@@ -172,7 +163,7 @@ const char* kFirstIntoOwningArray =
 BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
            bare_groupby_first_bound_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kFirstBound);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);          // compiled + LSan-clean (groups reclaimed once)
     BEZEL_EXPECT_EQ(r.exitCode, 102);  // First() = key 1, Count 2 → 1*100 + 2
 }
@@ -180,7 +171,7 @@ BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
 BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
            bare_groupby_last_bound_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kLastBound);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // Last() = key 0, Count 1 → 0*100 + 1
 }
@@ -188,7 +179,7 @@ BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
 BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
            bare_groupby_elementat_bound_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kElementAtBound);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 102);  // ElementAt(0) = key 1, Count 2
 }
@@ -196,7 +187,7 @@ BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
 BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
            bare_groupby_single_bound_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kSingleBound);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // one group {2,4,6}, Count 3
 }
@@ -204,7 +195,7 @@ BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
 BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
            bare_groupby_firstornull_bound_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kFirstOrNullBound);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // FirstOrNull() non-null → Count 3
 }
@@ -212,7 +203,7 @@ BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
 BEZEL_TEST(groupby_element_terminal_groups_leak_1930,
            bare_groupby_first_into_owning_array_no_double_free_spec_5) {
     JitResult r = runAotChecked(kFirstIntoOwningArray);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // no leak AND no double-free (arr owns the added grouping)
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // ToArray 2 + Add 1
 }
